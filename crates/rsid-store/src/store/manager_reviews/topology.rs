@@ -515,9 +515,30 @@ impl Store {
                     [head.to_string()],
                     |row| row.get(0),
                 )?;
-                Ok(TopologyReviewOutcome::Unsettled(
-                    code.unwrap_or_else(|| "manager_review_failed".into()),
-                ))
+                let code = code.unwrap_or_else(|| "manager_review_failed".into());
+                // #3640: a launch that ended in the catch-all keeps its original
+                // error text (the action receipt's `outcome_detail`), so the
+                // topology node names the real cause.
+                let detail: Option<String> = if code == "manager_v2_lifecycle_unconfirmed" {
+                    self.conn
+                        .query_row(
+                            "SELECT json_extract(o.outcome_json, '$.outcome_detail')
+                               FROM manager_review_assignments a
+                               JOIN harness_manager_v2_operations o
+                                 ON o.id=a.action_operation_id
+                              WHERE a.assignment_id=?1",
+                            [head.to_string()],
+                            |row| row.get(0),
+                        )
+                        .optional()?
+                        .flatten()
+                } else {
+                    None
+                };
+                Ok(TopologyReviewOutcome::Unsettled(match detail {
+                    Some(detail) if !detail.is_empty() => format!("{code}: {detail}"),
+                    _ => code,
+                }))
             }
             "submitted" => self.topology_review_receipt_outcome(&assignment),
             other => Ok(TopologyReviewOutcome::Unsettled(format!(

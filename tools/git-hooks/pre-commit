@@ -7,8 +7,7 @@
 #
 # It reads $CLAUDE_AGENT_ROLE — exported by pipeline agents per the spawn
 # prompts in master_implement.md / team_implement.md. Empty role means a
-# human commit; the hook exits 0 with no enforcement so Jake's normal
-# workflow is unaffected.
+# human commit; branch/path and staged-artifact validation are skipped.
 #
 # Rule table (from the ticket):
 #   pipeline-research  → branch=main, path=thoughts/shared/research/**
@@ -17,8 +16,11 @@
 #
 # Unknown roles fail closed — surfaces harness-spec drift fast.
 #
-# The corpus provenance gate (#622/#623) runs BEFORE the role check and is
-# deliberately role-independent; see its block comment below.
+# The shared rerere and corpus provenance gates run BEFORE the role check
+# and are deliberately role-independent; see their blocks below.
+
+# Shared merge configuration applies to operator and agent commits alike.
+sh "$(dirname "$0")/check-rerere" || exit 1
 
 # ── Corpus provenance gate (Issues #622, #623) ──────────────────────────────
 # A benchmark corpus/answer-key markdown is a pinned artifact: a fabricated SHA
@@ -60,6 +62,14 @@ if [ -n "$staged_corpus" ]; then
   else
     echo "pre-commit: [skip] scripts/check-corpus-pins.sh not found; not checking staged corpus pins" >&2
   fi
+fi
+
+# New Python is refused for every role, including operator commits (#407).
+# RSI_REPO_GUARD_NO_BUILD=1 is inherited by this and every guard call below:
+# the wrapper runs matching prebuilt guards or refuses, without a Cargo fallback.
+repo_guard="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)/scripts/repo-guard"
+if [ -f crates/rsi-repo-guards/src/new_python.rs ]; then
+  "$repo_guard" new-python --staged || exit 1
 fi
 
 ROLE="${CLAUDE_AGENT_ROLE:-}"
@@ -160,14 +170,23 @@ is_manifest() {
   ' "$1" 2>/dev/null
 }
 
+# ── Rust repository guards (#360) ──────────────────────────────────────────
+# The static guards below are subcommands of crates/rsi-repo-guards, run through
+# scripts/repo-guard of this hook's own checkout. By default it builds the crate
+# with the caller's Cargo target (reusing a fresh binary). In no-build mode it
+# requires a content-matching, capable prebuilt. Resolution failures refuse the
+# commit. A working tree that predates a guard (no module source) skips it.
+repo_guard="$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)/scripts/repo-guard"
+guard_src=crates/rsi-repo-guards/src
+
 # ── Identity-assertion guard ────────────────────────────────────────────────
 # Rejects a staged test that requires an entity's OWN name to be invisible.
 # Such a test pins data loss as a requirement and defeats the next agent sent
 # to fix it. Narrow by construction (see scripts/check-identity-assertions.sh).
 staged_rs="$(git diff --cached --name-only --diff-filter=d -- '*.rs')"
-if [ -n "$staged_rs" ] && [ -f tools/check_identity_assertions.py ]; then
+if [ -n "$staged_rs" ] && [ -f "$guard_src/identity_assertions.rs" ]; then
   # shellcheck disable=SC2086
-  if ! python3 tools/check_identity_assertions.py $staged_rs; then
+  if ! "$repo_guard" identity-assertions $staged_rs; then
     echo "pre-commit: identity-assertion guard failed (see above)." >&2
     exit 1
   fi
@@ -178,9 +197,9 @@ fi
 # above tools/portable-shell-baseline.json, and a staged baseline that raises a
 # count over HEAD's (see scripts/check-portable-shell.sh).
 staged_shell="$(git diff --cached --name-only --diff-filter=d -- 'scripts/*' tools/portable-shell-baseline.json)"
-if [ -n "$staged_shell" ] && [ -f tools/check_portable_shell.py ]; then
+if [ -n "$staged_shell" ] && [ -f "$guard_src/portable_shell.rs" ]; then
   # shellcheck disable=SC2086
-  if ! python3 tools/check_portable_shell.py --base HEAD $staged_shell; then
+  if ! "$repo_guard" portable-shell --base HEAD $staged_shell; then
     echo "pre-commit: portable-shell guard failed (see above)." >&2
     exit 1
   fi
@@ -188,21 +207,21 @@ fi
 
 # Theme reads in tests must hold the shared pin across rendering/assertions.
 staged_theme_rs="$(git diff --cached --name-only --diff-filter=d -- 'crates/rsi/src/*.rs')"
-if [ -n "$staged_theme_rs" ] && [ -f tools/check_theme_test_guards.py ]; then
+if [ -n "$staged_theme_rs" ] && [ -f "$guard_src/theme_test_guards.rs" ]; then
   # shellcheck disable=SC2086
-  if ! python3 tools/check_theme_test_guards.py $staged_theme_rs; then
+  if ! "$repo_guard" theme-test-guards $staged_theme_rs; then
     echo "pre-commit: theme-test guard failed (see above)." >&2
     exit 1
   fi
 fi
 
 # ── Personal-path guard ─────────────────────────────────────────────────────
-# Rejects staged files (outside thoughts/) that embed a personal home path or a
-# public IP literal (see scripts/check-personal-paths.sh, Issue #730).
+# Rejects staged ADDED lines (outside thoughts/) that embed a personal home path
+# or a public IP literal (see scripts/check-personal-paths.sh, Issue #730).
+# Lines already committed in any merge parent are not re-judged (#161, #3286).
 staged_all="$(git diff --cached --name-only --diff-filter=d)"
-if [ -n "$staged_all" ] && [ -f tools/check_personal_paths.py ]; then
-  # shellcheck disable=SC2086
-  if ! python3 tools/check_personal_paths.py $staged_all; then
+if [ -n "$staged_all" ] && [ -f "$guard_src/personal_paths.rs" ]; then
+  if ! "$repo_guard" personal-paths --staged; then
     echo "pre-commit: personal-path guard failed (see above)." >&2
     exit 1
   fi
@@ -212,8 +231,8 @@ fi
 # Rejects staged ADDED lines (thoughts/ included) that contain an identifier
 # from the operator's private list (~/.rsi/operator-identifiers). A no-op when
 # the list is absent. Findings never echo the identifier.
-if [ -f tools/check_operator_identifiers.py ]; then
-  if ! python3 tools/check_operator_identifiers.py --staged; then
+if [ -f "$guard_src/operator_identifiers.rs" ]; then
+  if ! "$repo_guard" operator-identifiers --staged; then
     echo "pre-commit: operator-identifier guard failed (see above)." >&2
     exit 1
   fi

@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -65,6 +66,9 @@ class SupervisorTests(unittest.TestCase):
             "RSID_SUPERVISOR_SHUTDOWN_MARKER": str(self.state / "shutdown-begun"),
             "RSID_SUPERVISOR_INCIDENT_FILE": str(self.state / "forced-shutdown-incident"),
             "RSID_SUPERVISOR_RESTART_BUDGET_FILE": str(self.state / "deploy-restart-budget"),
+            "RSID_SUPERVISOR_INTENDED_STOP_FILE": str(self.state / "intended-stop"),
+            # Tests that exercise the settle window set it themselves (#3433).
+            "RSID_SUPERVISOR_UNANNOUNCED_SETTLE_SECONDS": "0",
         })
         patched.start()
         self.addCleanup(patched.stop)
@@ -202,6 +206,42 @@ os.execv(sys.argv[2], sys.argv[2:])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "none")
 
+    def run_until_exhausted(self, argv, env=None, timeout=30):
+        """Run the supervisor until it reports an exhausted restart budget, check
+        it is still alive (it backs off, it does not exit, #3492), then stop it.
+        Returns (returncode, stderr, seconds until the budget was reported)."""
+        began = time.monotonic()
+        process = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        )
+        lines: list[str] = []
+        seen = threading.Event()
+        reported: list[float] = []
+
+        def pump() -> None:
+            for line in process.stderr:
+                lines.append(line)
+                if "budget exhausted" in line and not seen.is_set():
+                    reported.append(time.monotonic() - began)
+                    seen.set()
+
+        thread = threading.Thread(target=pump, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(seen.wait(timeout), "".join(lines))
+            time.sleep(0.3)
+            self.assertIsNone(process.poll(), "the supervisor exited: " + "".join(lines))
+            process.send_signal(signal.SIGTERM)
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+        thread.join(timeout=5)
+        process.stderr.close()
+        process.stdout.close()
+        return process.returncode, "".join(lines), reported[0]
+
     def make_supervisor(self, directory: Path) -> Path:
         supervisor = directory / "rsid-supervisor.sh"
         supervisor.write_text(SUPERVISOR.read_text())
@@ -223,15 +263,11 @@ os.execv(sys.argv[2], sys.argv[2:])
                 'mv rsid-supervisor.sh.next rsid-supervisor.sh\n'
                 'exit 75\n',
             )
-            process = subprocess.Popen(
-                [str(supervisor), str(daemon)], stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True,
-            )
-            _, stderr = process.communicate(timeout=15)
-            self.assertEqual(process.returncode, 75, stderr)
+            returncode, stderr, _ = self.run_until_exhausted([str(supervisor), str(daemon)])
+            self.assertEqual(returncode, 0, stderr)
             starts = (directory / "starts").read_text().splitlines()
             self.assertEqual(len(starts), 4)
-            self.assertEqual([int(line.split()[1]) for line in starts], [process.pid] * 4)
+            self.assertEqual(len({int(line.split()[1]) for line in starts}), 1, starts)
             self.assertEqual(stderr.count("refreshing rsid supervisor"), 3)
             self.assertIn("restart budget exhausted", stderr)
             self.assertTrue(supervisor.with_name("rsid-supervisor.sh.last-good").is_file())
@@ -359,28 +395,24 @@ os.execv(sys.argv[2], sys.argv[2:])
             self.assertEqual(result.returncode, 42, result.stderr)
             self.assertEqual((directory / "starts").read_text().splitlines(), ["started"])
 
-    def test_persistent_watchdog_exit_stops_after_bounded_backoff(self) -> None:
+    def test_persistent_watchdog_exit_waits_out_the_budget_after_bounded_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             directory = Path(root)
             daemon = self.make_daemon(
                 directory,
                 'echo started >> "$(dirname "$0")/starts"\nexit 75\n',
             )
-            result = subprocess.run(
-                [str(SUPERVISOR), str(daemon)],
-                capture_output=True,
-                text=True,
-                # The asserted backoff is 1 + 2 + 4 = 7 s; allow 3x for a loaded host (#136).
-                timeout=21,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 75, result.stderr)
+            # The asserted backoff is 1 + 2 + 4 = 7 s; the helper allows 30 s (#136).
+            returncode, stderr, _ = self.run_until_exhausted([str(SUPERVISOR), str(daemon)])
+            self.assertEqual(returncode, 0, stderr)
             self.assertEqual(len((directory / "starts").read_text().splitlines()), 4)
-            self.assertIn("restart budget exhausted", result.stderr)
+            self.assertIn("restart budget exhausted", stderr)
+            # #3492: it waits for room instead of exiting and leaving no rsid.
+            self.assertIn("not exiting: restarting the daemon in", stderr)
             # A crash-style exit 75 (no deploy marker) keeps the 1, 2, 4 s backoff.
             for seconds in (1, 2, 4):
-                self.assertIn(f"waiting {seconds}s", result.stderr)
-            self.assertNotIn("no backoff", result.stderr)
+                self.assertIn(f"waiting {seconds}s", stderr)
+            self.assertNotIn("no backoff", stderr)
 
     def test_deploy_requested_exit_75_restarts_without_backoff_and_keeps_the_budget(self) -> None:
         # #2355: the daemon writes the deploy marker, then exits 75. The restart
@@ -393,23 +425,16 @@ os.execv(sys.argv[2], sys.argv[2:])
                 'echo "database=/nonexistent" > "$(dirname "$0")/fake-rsid.deploy-inflight"\n'
                 'exit 75\n',
             )
-            began = time.monotonic()
-            result = subprocess.run(
-                [str(SUPERVISOR), str(daemon)],
-                capture_output=True,
-                text=True,
-                timeout=12,
-                check=False,
-                env=fast_poll_env(),
+            returncode, stderr, elapsed = self.run_until_exhausted(
+                [str(SUPERVISOR), str(daemon)], env=fast_poll_env()
             )
-            elapsed = time.monotonic() - began
-            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertEqual(returncode, 0, stderr)
             self.assertEqual(len((directory / "starts").read_text().splitlines()), 4)
-            self.assertIn("restart budget exhausted", result.stderr)
-            self.assertEqual(result.stderr.count("deploy restart"), 3, result.stderr)
-            self.assertNotIn("waiting", result.stderr)
+            self.assertIn("restart budget exhausted", stderr)
+            self.assertEqual(stderr.count("deploy restart"), 3, stderr)
+            self.assertNotIn("waiting", stderr)
             # Three backoffs would cost 1 + 2 + 4 s; the budget is unchanged.
-            self.assertLess(elapsed, 2.0, result.stderr)
+            self.assertLess(elapsed, 2.0, stderr)
 
     def test_stale_deploy_marker_does_not_waive_the_backoff(self) -> None:
         # A marker older than this child's start was not written by it.
@@ -453,17 +478,12 @@ os.execv(sys.argv[2], sys.argv[2:])
             fake_sleep.write_text("#!/bin/sh\nexit 0\n")
             fake_sleep.chmod(0o755)
             env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-            result = subprocess.run(
-                [str(SUPERVISOR), str(daemon)],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-                env=env,
+            returncode, stderr, _ = self.run_until_exhausted(
+                [str(SUPERVISOR), str(daemon)], env=env, timeout=8
             )
-            self.assertEqual(result.returncode, 75, result.stderr)
+            self.assertEqual(returncode, 0, stderr)
             self.assertEqual(len((directory / "starts").read_text().splitlines()), 6)
-            self.assertIn("restart budget exhausted (5 in 3600 seconds)", result.stderr)
+            self.assertIn("restart budget exhausted (5 in 3600 seconds)", stderr)
 
     def deploy_layout(
         self, directory: Path, prev_body: str | None, inflight: bool = True, recovery_status: int = 0
@@ -972,6 +992,352 @@ os.execv(sys.argv[2], sys.argv[2:])
             self.assertTrue((directory / "rsid.failed").exists())
             self.assertIn("trigger=daemon_shutdown", (self.state / "forced-shutdown-incident").read_text())
 
+    # ---- #3433: a signal nobody announced is not an intended stop ------------
+
+    # A stub rsid that receives a SIGINT: the marker the real daemon writes on a
+    # signal (reason=ctrl_c, with the sender), then a clean exit 0. The second
+    # run exits 0 with no marker so the supervisor finally stops.
+    SIGNALLED = (
+        'dir="$(dirname "$0")"\n'
+        'echo "$$" >> "$dir/starts"\n'
+        'if [[ -e "$dir/signalled-once" ]]; then exit 0; fi\n'
+        'touch "$dir/signalled-once"\n'
+        '%(announce)s'
+        'echo "pid=$$ reason=%(reason)s sender_pid=4242" > "$RSID_SHUTDOWN_MARKER"\n'
+        'exit 0\n'
+    )
+
+    def run_signalled(self, directory: Path, reason: str = "ctrl_c", announce: str = "") -> subprocess.CompletedProcess:
+        daemon = self.make_daemon(
+            directory, self.SIGNALLED % {"reason": reason, "announce": announce}
+        )
+        return subprocess.run(
+            [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+            timeout=30, check=False, env=fast_poll_env(),
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_unannounced_sigint_is_restarted_and_leaves_an_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            result = self.run_signalled(directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2)
+            self.assertIn("unannounced SIGINT (sender pid 4242", result.stderr)
+            incident = (self.state / "forced-shutdown-incident").read_text()
+            self.assertIn("trigger=unannounced_signal", incident)
+            self.assertIn("signal=INT", incident)
+            first_pid = (directory / "starts").read_text().splitlines()[0]
+            self.assertIn(f"pid={first_pid}", incident)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_unannounced_sigterm_is_restarted_too(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            result = self.run_signalled(directory, reason="sigterm")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2)
+            self.assertIn("unannounced SIGTERM", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_announced_stop_is_not_restarted(self) -> None:
+        # install-release.sh appends `pid=<daemon pid> reason=...` before it
+        # signals the daemon directly; that announcement makes the SIGINT intended.
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            announce = (
+                '(umask 077; echo "pid=$$ reason=install_release" >> '
+                f'"{self.state / "intended-stop"}")\n'
+            )
+            result = self.run_signalled(directory, announce=announce)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 1)
+            self.assertNotIn("unannounced", result.stderr)
+            self.assertFalse((self.state / "forced-shutdown-incident").exists())
+            self.assertFalse((self.state / "intended-stop").exists(), "consumed once")
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_announcement_for_another_pid_does_not_excuse_the_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (self.state / "intended-stop").write_text("pid=1 reason=install_release\n")
+            (self.state / "intended-stop").chmod(0o600)
+            time.sleep(1.1)  # the file's mtime is older than the launch
+            result = self.run_signalled(directory)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2)
+            self.assertIn("unannounced SIGINT", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_operator_drain_exit_is_not_a_signal_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            result = self.run_signalled(directory, reason="drain_restart")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 1)
+            self.assertFalse((self.state / "forced-shutdown-incident").exists())
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_a_stop_that_also_signals_the_supervisor_is_not_restarted(self) -> None:
+        # `systemctl stop` signals the whole unit: the daemon can exit before the
+        # supervisor's own SIGTERM lands. The settle window waits for it.
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            daemon = self.make_daemon(
+                directory,
+                'dir="$(dirname "$0")"\n'
+                'echo "$$" >> "$dir/starts"\n'
+                'echo "pid=$$ reason=sigterm sender_pid=1" > "$RSID_SHUTDOWN_MARKER"\n'
+                'exit 0\n',
+            )
+            env = fast_poll_env()
+            env["RSID_SUPERVISOR_UNANNOUNCED_SETTLE_SECONDS"] = "5"
+            process = subprocess.Popen(
+                [str(SUPERVISOR), str(daemon)], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, env=env,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not (directory / "starts").exists():
+                    self.assertIsNone(process.poll(), "supervisor exited before the daemon ran")
+                    self.assertLess(time.monotonic(), deadline, "daemon did not start")
+                    time.sleep(0.01)
+                time.sleep(0.5)
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=10)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 1)
+            self.assertNotIn("restarting it", stderr)
+            self.assertFalse((self.state / "forced-shutdown-incident").exists())
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_repeated_unannounced_signals_wait_out_the_restart_budget_with_an_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            # One deploy restart per hour plus the reserve: two restarts allowed.
+            Path(os.environ["RSID_SUPERVISOR_RESTART_BUDGET_FILE"]).write_text("1\n120\n")
+            daemon = self.make_daemon(
+                directory,
+                'dir="$(dirname "$0")"\n'
+                'echo "$$" >> "$dir/starts"\n'
+                'echo "pid=$$ reason=ctrl_c sender_pid=9" > "$RSID_SHUTDOWN_MARKER"\n'
+                'exit 0\n',
+            )
+            returncode, stderr, _ = self.run_until_exhausted(
+                [str(SUPERVISOR), str(daemon)], env=fast_poll_env()
+            )
+            self.assertEqual(returncode, 0, stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 3)
+            self.assertIn("restart budget exhausted", stderr)
+            incident = (self.state / "forced-shutdown-incident").read_text()
+            self.assertIn("trigger=restart_budget_exhausted", incident)
+
+    # ---- #3492: one restart budget for crashes, watchdog exits and deploys ----
+
+    # A stub rsid whose Nth run behaves as line N of `kinds`: `deploy` writes a
+    # fresh deploy marker then exits 75, `crash` clears the marker and exits 75,
+    # `stop` exits 0.
+    SEQUENCED = (
+        'dir="$(dirname "$0")"\n'
+        'n=$(cat "$dir/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$dir/n"\n'
+        'kind=$(sed -n "${n}p" "$dir/kinds")\n'
+        'case $kind in\n'
+        '  deploy) echo "database=/nonexistent" > "$dir/fake-rsid.deploy-inflight"; exit 75 ;;\n'
+        '  crash) rm -f "$dir/fake-rsid.deploy-inflight"; exit 75 ;;\n'
+        '  *) exit 0 ;;\n'
+        'esac\n'
+    )
+
+    def sequenced_run(self, directory: Path, kinds: list[str], until_exhausted: bool):
+        (directory / "kinds").write_text("\n".join(kinds) + "\n")
+        daemon = self.make_daemon(directory, self.SEQUENCED)
+        # Budget 2 deploys per hour: the supervisor allows 3 restarts per window.
+        Path(os.environ["RSID_SUPERVISOR_RESTART_BUDGET_FILE"]).write_text("2\n")
+        fake_bin = directory / "fakebin"
+        fake_bin.mkdir()
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text("#!/bin/sh\nexit 0\n")
+        fake_sleep.chmod(0o755)
+        env = fast_poll_env()
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+        if until_exhausted:
+            return self.run_until_exhausted([str(SUPERVISOR), str(daemon)], env=env, timeout=10)
+        result = subprocess.run(
+            [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+            timeout=15, check=False, env=env,
+        )
+        return result.returncode, result.stderr, 0.0
+
+    def published(self) -> dict:
+        text = (self.state / "supervisor-restarts").read_text()
+        values: dict = {"restart": []}
+        for line in text.splitlines():
+            key, _, value = line.partition("=")
+            if key == "restart":
+                values["restart"].append(int(value))
+            else:
+                values[key] = int(value)
+        return values
+
+    def test_a_crash_then_a_deploy_spend_one_budget_and_are_published(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            returncode, stderr, _ = self.sequenced_run(directory, ["crash", "deploy", "stop"], False)
+            self.assertEqual(returncode, 0, stderr)
+            self.assertIn("watchdog restart 1/3", stderr)
+            self.assertIn("deploy restart 2/3", stderr)
+            published = self.published()
+            # The crash and the deploy both sit in the history the daemon reads.
+            self.assertEqual((published["limit"], published["window"]), (3, 3600))
+            self.assertEqual(len(published["restart"]), 2, published)
+            self.assertNotIn("backoff_until", published)
+
+    def test_deploys_then_a_crash_use_the_last_slot_and_the_next_crash_backs_off(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            returncode, stderr, _ = self.sequenced_run(
+                directory, ["deploy", "deploy", "crash", "crash"], True
+            )
+            self.assertEqual(returncode, 0, stderr)
+            # Two deploys and one crash took all three restarts; the fourth exit
+            # waits (the supervisor stays up) instead of leaving the host with no rsid.
+            self.assertIn("deploy restart 1/3", stderr)
+            self.assertIn("deploy restart 2/3", stderr)
+            self.assertIn("watchdog restart 3/3", stderr)
+            self.assertIn("not exiting", stderr)
+            self.assertEqual((directory / "n").read_text().strip(), "4")
+            published = self.published()
+            self.assertEqual(len(published["restart"]), 3, published)
+            # The wait is published for deploy admission and the TUI.
+            self.assertGreater(published["backoff_until"], int(time.time()))
+            incident = (self.state / "forced-shutdown-incident").read_text()
+            self.assertIn("trigger=restart_budget_exhausted", incident)
+
+    def test_an_exhausted_budget_is_waited_out_and_the_daemon_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            daemon = self.make_daemon(
+                directory,
+                'dir="$(dirname "$0")"\n'
+                'echo started >> "$dir/starts"\n'
+                'if [[ $(wc -l < "$dir/starts") -ge 2 ]]; then exit 0; fi\n'
+                'exit 75\n',
+            )
+            env = fast_poll_env()
+            now = int(time.time())
+            # Three restarts already inside the window: the budget is spent.
+            env["RSID_SUPERVISOR_RESTART_TIMES"] = f"{now - 30} {now - 20} {now - 10}"
+            env["RSID_SUPERVISOR_EXHAUSTED_BACKOFF_MAX_SECONDS"] = "2"
+            began = time.monotonic()
+            result = subprocess.run(
+                [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+                timeout=20, check=False, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2)
+            self.assertIn("restarting the daemon in 2s", result.stderr)
+            self.assertGreaterEqual(time.monotonic() - began, 2.0)
+
+    def test_stopping_the_supervisor_ends_an_exhausted_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            daemon = self.make_daemon(directory, 'echo started >> "$(dirname "$0")/starts"\nexit 75\n')
+            env = fast_poll_env()
+            now = int(time.time())
+            env["RSID_SUPERVISOR_RESTART_TIMES"] = f"{now - 30} {now - 20} {now - 10}"
+            env["RSID_SUPERVISOR_EXHAUSTED_BACKOFF_MAX_SECONDS"] = "900"
+            began = time.monotonic()
+            returncode, stderr, _ = self.run_until_exhausted([str(SUPERVISOR), str(daemon)], env=env)
+            self.assertEqual(returncode, 0, stderr)
+            self.assertLess(time.monotonic() - began, 10)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 1)
+
+    # ---- #3507: the intended-stop announcement must be owner-private ---------
+
+    def announced_restart(self, directory: Path, prepare: str, env=None):
+        announce = prepare + f'echo "pid=$$ reason=install_release" >> "{self.state / "intended-stop"}"\n'
+        daemon = self.make_daemon(
+            directory, self.SIGNALLED % {"reason": "ctrl_c", "announce": announce}
+        )
+        return subprocess.run(
+            [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+            timeout=30, check=False, env=env or fast_poll_env(),
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_a_loose_mode_announcement_is_ignored_and_the_restart_happens(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            result = self.announced_restart(directory, "umask 022\n")
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2, result.stderr)
+            self.assertIn("looser than 0600", result.stderr)
+            self.assertIn("unannounced SIGINT", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_a_symlinked_announcement_is_ignored_and_the_restart_happens(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            target = directory / "real-announcement"
+            target.write_text("")
+            target.chmod(0o600)
+            (self.state / "intended-stop").symlink_to(target)
+            result = self.announced_restart(directory, "umask 077\n")
+            # The announcement is real and well-formed behind the link; the link itself is refused.
+            self.assertIn("pid=", target.read_text())
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2, result.stderr)
+            self.assertIn("not a regular file", result.stderr)
+            self.assertIn("unannounced SIGINT", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "a foreign owner needs root to create")
+    def test_a_foreign_owned_announcement_is_ignored_and_the_restart_happens(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            daemon_prepare = f'chown 12345 "{self.state / "intended-stop"}" 2>/dev/null || true\n'
+            announce = (
+                '(umask 077; echo "pid=$$ reason=install_release" >> '
+                f'"{self.state / "intended-stop"}")\n' + daemon_prepare
+            )
+            daemon = self.make_daemon(
+                directory, self.SIGNALLED % {"reason": "ctrl_c", "announce": announce}
+            )
+            result = subprocess.run(
+                [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+                timeout=30, check=False, env=fast_poll_env(),
+            )
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 2, result.stderr)
+            self.assertIn("not owned by this user", result.stderr)
+
+    @unittest.skipIf(sys.platform == "win32", "signals are Unix-only")
+    def test_an_owner_private_announcement_in_the_runtime_dir_is_honoured_without_home(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            runtime = directory / "runtime"
+            runtime.mkdir(mode=0o700)
+            announcement = runtime / "rsi" / "intended-stop"
+            env = fast_poll_env()
+            for key in ("HOME", "RSID_SUPERVISOR_INTENDED_STOP_FILE"):
+                env.pop(key, None)
+            env["XDG_RUNTIME_DIR"] = str(runtime)
+            prepare = f'umask 077\nmkdir -p "{announcement.parent}"\n'
+            announce = prepare + f'echo "pid=$$ reason=install_release" >> "{announcement}"\n'
+            daemon = self.make_daemon(
+                directory, self.SIGNALLED % {"reason": "ctrl_c", "announce": announce}
+            )
+            result = subprocess.run(
+                [str(SUPERVISOR), str(daemon)], capture_output=True, text=True,
+                timeout=30, check=False, env=env,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len((directory / "starts").read_text().splitlines()), 1, result.stderr)
+            self.assertNotIn("unannounced", result.stderr)
+
+    def test_no_shared_tmp_path_is_ever_the_announcement_location(self) -> None:
+        self.assertNotIn("/tmp/rsi-intended-stop", SUPERVISOR.read_text())
+
     def test_snapshot_without_a_grace_line_keeps_the_default(self) -> None:
         # A snapshot written before #2561 has one line; the supervisor must read
         # it, and an invalid second line must fall back to the default grace.
@@ -1047,8 +1413,10 @@ class InheritedHandoffTests(unittest.TestCase):
                 self.assertEqual(dict(os.environ), before)
             self.assertEqual(seen["handoff"], [
                 "RSID_SUPERVISOR_INCIDENT_FILE",
+                "RSID_SUPERVISOR_INTENDED_STOP_FILE",
                 "RSID_SUPERVISOR_RESTART_BUDGET_FILE",
                 "RSID_SUPERVISOR_SHUTDOWN_MARKER",
+                "RSID_SUPERVISOR_UNANNOUNCED_SETTLE_SECONDS",
             ])
 
     def test_refresh_and_fallback_assertions_pass_under_hostile_inherited_handoff(self) -> None:

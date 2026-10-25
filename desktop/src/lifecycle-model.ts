@@ -6,6 +6,9 @@
 // overlay/recent_completions.rs and overlay/question_modal.rs.
 import type { QuestionItem, Session } from './api.js';
 import { type Answer, type PauseLevel, formatAnswers, needsAttention, pendingQuestions } from './approvals-model.js';
+import { hintLine } from './key-hints.js';
+import type { Platform } from './keyengine.js';
+import { sendChord } from './keylabel.js';
 import { sessionLabel } from './model.js';
 
 const LIVE = new Set(['Starting', 'Running', 'WaitingApproval']);
@@ -133,6 +136,8 @@ export interface Notice {
   kind: NoticeKind;
   message: string;
   sessionId?: string;
+  /** The raw daemon error behind an error notice (shown under Details, copyable). */
+  detail?: string;
   at: number;
   ttl: number;
   dismissed: boolean;
@@ -157,19 +162,20 @@ export function noticeTtl(kind: NoticeKind): number {
 }
 
 export function pushNotice(
-  store: NoticeStore, n: { kind: NoticeKind; message: string; sessionId?: string }, now: number,
+  store: NoticeStore, n: { kind: NoticeKind; message: string; sessionId?: string; detail?: string }, now: number,
 ): NoticeStore {
   const last = store.items[store.items.length - 1];
   if (last && !last.dismissed && last.kind === n.kind && last.sessionId === n.sessionId && now - last.at < AGGREGATE_MS) {
     const m = last.message.match(/^\((\d+)\) /);
     const count = m ? Number(m[1]) + 1 : 2;
     const items = store.items.slice(0, -1);
-    items.push({ ...last, message: `(${count}) ${n.message}`, at: now });
+    items.push({ ...last, message: `(${count}) ${n.message}`, at: now, ...(n.detail ? { detail: n.detail } : {}) });
     return { next: store.next, items };
   }
   const note: Notice = {
     id: store.next, kind: n.kind, message: n.message, at: now, ttl: noticeTtl(n.kind), dismissed: false,
     ...(n.sessionId ? { sessionId: n.sessionId } : {}),
+    ...(n.detail ? { detail: n.detail } : {}),
   };
   const items = [...store.items, note];
   return { next: store.next + 1, items: items.length > MAX_NOTICES ? items.slice(items.length - MAX_NOTICES) : items };
@@ -208,8 +214,9 @@ export function dismissAll(store: NoticeStore, now: number): NoticeStore {
 }
 
 /** Notice kind for a toast: a success, a failure (the words the desktop's error toasts use), else info. */
-export function toastKind(message: string, ok: boolean): NoticeKind {
+export function toastKind(message: string, ok: boolean, detail: string | null = null): NoticeKind {
   if (ok) return 'success';
+  if (detail !== null) return 'error';
   return /\b(failed|error|unavailable|could not|cannot|refused)\b/i.test(message) ? 'error' : 'info';
 }
 
@@ -378,9 +385,22 @@ export function questionResponse(st: QuestionState): { ok: true; text: string } 
   return formatAnswers(st.questions, questionAnswers(st));
 }
 
-/** Footer hint for the question modal's current mode. */
-export function questionHint(st: QuestionState): string {
-  return st.mode === 'insert'
-    ? 'Type an answer. Enter submits, Shift-Enter adds a line, Esc goes back to the options.'
-    : 'j/k move, Space or 1-9 choose, Enter/Backspace next or previous question, i type an answer, Ctrl/Cmd-Enter submits, d declines, Esc hides.';
+/**
+ * Footer hint for the question modal's current mode. With Vim keys off the letter keys, 1-9 and
+ * Backspace do nothing, so the hint names what works instead: a click or Space on a focused option
+ * picks it, the arrows move (and carry focus), Enter goes to the next question (local #246).
+ */
+export function questionHint(st: QuestionState, vimOn = true, platform?: Platform): string {
+  if (st.mode === 'insert') return 'Type an answer. Enter submits, Shift-Enter adds a line, Esc goes back to the options.';
+  if (vimOn) return 'j/k move, Space or 1-9 choose, Enter/Backspace next or previous question, i type an answer, Ctrl/Cmd-Enter submits, d lets the agent decide, Esc hides.';
+  const more = st.current + 1 < st.questions.length;
+  const text = hintLine([
+    { do: 'Click an option or press Space on it to pick it' },
+    { do: 'Up/Down move between options' },
+    { do: 'Tab reaches the answer box and the buttons' },
+    ...(more ? [{ do: 'Enter goes to the next question' }] : []),
+    { do: `${platform ? sendChord(platform) : 'Ctrl/Cmd-Enter'} submits` },
+    { do: 'Esc hides' },
+  ], false, platform);
+  return `${text}.`;
 }

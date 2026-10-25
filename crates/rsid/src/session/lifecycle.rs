@@ -877,13 +877,16 @@ fn effective_provider_replacement_config(source: &Session, query: String) -> Lau
         topology_iteration: 0,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     }
 }
 
 pub(super) async fn observe_cleanup_ownership(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
     root: &std::path::Path,
 ) -> OwnershipObservation {
@@ -924,7 +927,7 @@ pub(super) async fn classify_cleanup_candidate_runtime(
     candidate: CleanupCandidate,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
 ) -> CleanupDecision {
     if let CleanupCandidate::Row(row) = &candidate {
         match store
@@ -971,7 +974,7 @@ pub(super) async fn classify_cleanup_session_runtime(
     session_id: Uuid,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
 ) -> CleanupDecision {
     let store_for_read = Arc::clone(store);
     let row = tokio::task::spawn_blocking(move || {
@@ -993,6 +996,109 @@ pub(super) async fn classify_cleanup_session_runtime(
 pub(super) enum InterruptOutcome {
     ActiveInterrupted,
     PendingRetryCancelled,
+}
+
+/// Shared durable halt transition for operator and agent callers. The caller
+/// holds the target spawn guard: scheduled continuations recheck the disabled
+/// rows under that same guard before installing a provider.
+pub(super) async fn record_external_halt(
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+    active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+    event_bus: &Arc<EventBus>,
+    session_id: Uuid,
+    operator_pause: Option<crate::store::manager_actions::OperatorPause>,
+) -> Result<()> {
+    let disabled = store
+        .lock()
+        .await
+        .record_session_halt(session_id, operator_pause)?;
+    if !disabled.is_empty() {
+        record_halt_wake_notice(store, active, completed, event_bus, session_id, disabled).await;
+    }
+    Ok(())
+}
+
+/// Best effort after the halt transaction commits. This is transcript evidence,
+/// never mail or a manager notice (both may dispatch a continuation).
+async fn record_halt_wake_notice(
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+    active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
+    event_bus: &Arc<EventBus>,
+    session_id: Uuid,
+    mut disabled: Vec<Uuid>,
+) {
+    disabled.sort_unstable();
+    let ids = disabled
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut event = ConversationEvent {
+        id: 0,
+        session_id,
+        sequence: 0,
+        event_type: EventType::System,
+        role: None,
+        content: format!(
+            "External halt disabled {} own resume/when wake(s): {ids}. Reason: \
+             disabled_by_halt. Inspect with AgentListWakes {{\"include_disabled\":true}}. \
+             The wakes remain disabled on a later explicit continuation.",
+            disabled.len()
+        ),
+        tool_name: None,
+        tool_input: None,
+        created_at: Utc::now(),
+        offload_id: None,
+        tool_use_id: None,
+        metadata: Some(Box::new(serde_json::json!({
+            "halt_wake_notice": {
+                "disabled_reason": "disabled_by_halt",
+                "count": disabled.len(),
+                "job_ids": disabled,
+            }
+        }))),
+    };
+    let inbox = active
+        .read()
+        .await
+        .get(&session_id)
+        .map(|tracked| tracked.operator_inbox.clone());
+    if let Some(inbox) = inbox {
+        // The monitor owns transcript numbering, including its final drain on
+        // interrupt. A stalled monitor must not hold up the durable stop.
+        let receipt = inbox.push_lifecycle_with_receipt(event);
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), receipt).await,
+            Ok(Ok(true))
+        ) {
+            tracing::warn!(%session_id, "halt wake notice persistence unconfirmed; halt remains accepted");
+        }
+        return;
+    }
+    // The caller holds the spawn guard, so no new monitor can install here.
+    // Keep a hydrated completed transcript in sync as well as the durable row.
+    let mut completed = completed.write().await;
+    let cached = completed
+        .get(&session_id)
+        .map_or(&[][..], |entry| entry.events.as_slice());
+    event.sequence = super::queries::next_transcript_sequence(store, session_id, cached).await;
+    let result = store.lock().await.insert_event(&event);
+    match result {
+        Ok(id) => {
+            event.id = id;
+            if let Some(entry) = completed.get_mut(&session_id)
+                && entry.events_hydrated
+            {
+                entry.events.push(event.clone());
+            }
+            event_bus.publish(DaemonEvent::ConversationEvent { session_id, event });
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "halt wake notice could not be persisted; halt remains accepted");
+        }
+    }
 }
 
 /// Interrupt a session by acting directly on the `active`/`completed` maps.
@@ -1113,7 +1219,7 @@ pub(super) async fn interrupt_active_in_maps_from(
 /// afterwards.
 pub(super) async fn suppress_pending_retry_in_maps(
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Result<Option<u8>> {
     let mut completed = completed.write().await;
@@ -1232,20 +1338,36 @@ impl SessionManager {
     ) -> Vec<crate::session::harness::types::ChatMessage> {
         use crate::session::harness::types::{ChatMessage, MessageRole};
         let mut messages = Vec::new();
+        // #3170: the thinking row the loop stores just ahead of an assistant
+        // answer belongs to that answer; a resumed session rebuilds it.
+        let mut pending_thinking: Option<String> = None;
         for event in events {
             match event.event_type {
+                EventType::Thinking => {
+                    pending_thinking = (!event.content.is_empty()).then(|| event.content.clone());
+                }
                 EventType::Message => {
                     let role = match event.role {
                         Some(Role::User) => MessageRole::User,
                         Some(Role::Assistant) | Some(_) | None => MessageRole::Assistant,
                     };
+                    let thinking = pending_thinking.take();
                     if !event.content.is_empty() {
+                        let is_assistant = role == MessageRole::Assistant;
                         messages.push(ChatMessage {
                             role,
                             content: event.content.clone(),
                             tool_call_id: None,
                             is_error: false,
                             tool_calls: Vec::new(),
+                            reasoning: thinking.filter(|_| is_assistant),
+                            reasoning_details: event
+                                .metadata
+                                .as_deref()
+                                .and_then(|metadata| metadata.get("reasoning_details"))
+                                .and_then(serde_json::Value::as_array)
+                                .filter(|details| !details.is_empty() && is_assistant)
+                                .cloned(),
                         });
                     }
                 }
@@ -1261,6 +1383,8 @@ impl SessionManager {
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false),
                         tool_calls: Vec::new(),
+                        reasoning: None,
+                        reasoning_details: None,
                     });
                 }
                 // #796: a persisted compaction boundary replaces everything
@@ -1319,7 +1443,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<EventBus>,
-        store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         persistence: PersistenceHandle,
         memory_handle: Option<crate::memory::worker::MemoryHandle>,
         runtime_config: Arc<crate::config::RuntimeConfig>,
@@ -1588,6 +1712,12 @@ impl SessionManager {
                     &completed_session.events,
                 ))
                 .await;
+                // #3765: an idle manager seat holding no wake keeps a backstop.
+                Box::pin(super::manager_idle::guard_idle_manager(
+                    &store,
+                    &completed_session.session,
+                ))
+                .await;
             }
             if durable_terminal
                 && status == SessionStatus::Failed
@@ -1700,7 +1830,8 @@ impl SessionManager {
             // succession is queued; its settlement pins this row. Looked up
             // only for an untitled session, the one refinement can touch.
             let succession_queued = completed_session.session.title.is_none()
-                && super::title::manager_succession_holds_title(&store, session_id).await;
+                && (super::title::manager_succession_holds_title(&store, session_id).await
+                    || super::title::session_is_bench_trial(&store, session_id).await);
             if super::title::should_enqueue_title_refinement(
                 session_kind,
                 super::title::is_role_titled_epic_identity(&completed_session.session),
@@ -1829,7 +1960,9 @@ impl SessionManager {
             // Reserve capacity and check live Memory OFF before cloning the
             // completed transcript. The prepared submission also rechecks OFF
             // after the insertion await below, without retaining a send task.
+            // Benchmark (`is_eval`) transcripts never feed observations.
             let observation_submission = if completed_session.events.len() >= 4
+                && !completed_session.session.is_eval
                 && matches!(
                     status,
                     SessionStatus::Completed | SessionStatus::Interrupted
@@ -2412,6 +2545,19 @@ impl SessionManager {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Ok(0);
+        }
+        // #3978: a message stranded on a rotated predecessor moves to its live
+        // successor before the dispatcher looks for work.
+        let redirected = self
+            .store
+            .lock()
+            .await
+            .redirect_rotated_operator_messages()?;
+        if redirected > 0 {
+            tracing::info!(
+                redirected,
+                "Redirected operator messages from rotated predecessors to their live successors"
+            );
         }
         let mut dispatched = 0;
         for _ in 0..16 {
@@ -4061,12 +4207,27 @@ impl SessionManager {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
+        let custom_provider_gate =
+            super::custom_provider_launch::restore(&self.store, &mut config).await;
         config.completion_gates = super::completion_gates_launch::resolve_launch_completion_gates(
             &self.store,
             session_id,
             completed_session.session.continued_from,
             None,
+        )
+        .await?;
+        // #3176: a container-bound session continues against the same container
+        // (re-validated) or refuses; it never continues on the host.
+        config.exec_target = super::exec_target_launch::resolve_launch_exec_target(
+            &self.store,
+            &self.runtime_config,
+            session_id,
+            completed_session.session.continued_from,
+            &rsi_common::exec_target::ExecTarget::Host,
         )
         .await?;
 
@@ -4677,7 +4838,9 @@ impl SessionManager {
         }
         tier_delivery.effect_possible = true;
         #[cfg(test)]
-        let launch_result = if super::launch::take_capacity_provider_spawn_failure(session_id) {
+        let launch_result = if let Err(error) = custom_provider_gate {
+            Err(error)
+        } else if super::launch::take_capacity_provider_spawn_failure(session_id) {
             Err(DaemonError::Process(
                 "injected capacity provider spawn failure".into(),
             ))
@@ -4696,13 +4859,15 @@ impl SessionManager {
             )
         };
         #[cfg(not(test))]
-        let launch_result = super::provider_spawn::spawn_provider_process(
-            provider,
-            &config,
-            &launcher,
-            &admission_permit,
-            &spawn_guard,
-        );
+        let launch_result = custom_provider_gate.and_then(|()| {
+            super::provider_spawn::spawn_provider_process(
+                provider,
+                &config,
+                &launcher,
+                &admission_permit,
+                &spawn_guard,
+            )
+        });
         drop(seat_fence);
         let (mut process, event_rx) = match launch_result {
             Ok(launch) => launch,
@@ -5847,6 +6012,15 @@ impl SessionManager {
             .await
             .set_operator_pause(session_id, pause)?;
         let _guard = super::spawn_single_flight::acquire_spawn_guard(session_id).await;
+        record_external_halt(
+            &self.store,
+            &self.active,
+            &self.completed,
+            &self.event_bus,
+            session_id,
+            Some(pause),
+        )
+        .await?;
         self.interrupt_session(session_id).await
     }
 
@@ -6127,6 +6301,9 @@ impl SessionManager {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
 
         // Launch as a new session (new UUID), linked via continued_from.  The
@@ -6832,6 +7009,13 @@ impl SessionManager {
                     break;
                 };
                 cursor = Some(intent.id);
+                if crate::topology::store::retire_terminal_node_restart(
+                    &*self.store.lock().await,
+                    intent.id,
+                    intent.session_id,
+                )? {
+                    continue;
+                }
                 let claimed = if review_owned {
                     self.store
                         .lock()
@@ -6879,7 +7063,28 @@ impl SessionManager {
     /// session in order. A dispatch failure fails that intent and moves on.
     pub async fn continue_claimed_restart_intents(&self, claimed: Vec<(Uuid, Uuid)>) {
         for (intent_id, session_id) in claimed {
-            if let Err(error) = self.continue_restart_intent(intent_id, session_id).await {
+            let continued = async {
+                if crate::topology::store::retire_terminal_node_restart(
+                    &*self.store.lock().await,
+                    intent_id,
+                    session_id,
+                )? {
+                    return Ok(());
+                }
+                self.continue_restart_intent(intent_id, session_id).await
+            }
+            .await;
+            if let Err(error) = continued {
+                if crate::deploy_drain::is_held_for_restart(&error) {
+                    // A hold, not a failure (#3426): the drain refused before
+                    // anything ran. The intent stays `claimed` (a claim clears
+                    // no outcome and re-claims a `claimed` row), so the next
+                    // incarnation continues the session. Recording
+                    // `dispatch_failed` here would strand it `Interrupted`.
+                    tracing::info!(intent_id=%intent_id, session_id=%session_id, %error,
+                        "Graceful restart continuation held for the restart drain");
+                    continue;
+                }
                 tracing::warn!(intent_id=%intent_id, session_id=%session_id, %error,
                     "Graceful restart continuation deferred");
                 let failed = self

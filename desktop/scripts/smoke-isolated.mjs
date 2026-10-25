@@ -10,6 +10,9 @@
 // a test-only binary behind rsid's `e2e-seed` cargo feature, which release builds refuse. It writes through the
 // real Store API into this run's database while the daemon is stopped, and only into a state directory this
 // file marked (MARKER_FILE). No SQL function is stubbed and the daemon has no RPC that imports history.
+// The same seed also carries a FINISHED, SUCCEEDED graph run (local #150, SEEDED_GRAPH_RUN): a saved two-node
+// workflow, its durable execution ending `succeeded` and each node's settled result, so the desktop can show a
+// successful run that no provider had to produce.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,6 +20,28 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { OFFLINE_ENV, startEgressGuard } from './smoke-egress.mjs';
 import { rpcCall } from './smoke-rpc.mjs';
+
+/** The succeeded graph run the seed writes (local #150): ids, node order and each node's recorded result. */
+export const SEEDED_GRAPH_RUN = Object.freeze({
+  workflowId: '5e5e5e5e-0000-4000-8000-000000000150',
+  executionId: '5e5e5e5e-0000-4000-8000-000000001500',
+  title: 'E2E seeded run',
+  nodes: Object.freeze([
+    Object.freeze({ id: 'plan', name: 'Plan the fix', result: 'plan: return 42 from answer()' }),
+    Object.freeze({ id: 'build', name: 'Apply the fix', result: 'build: answer() returns 42' }),
+  ]),
+});
+
+/** The workflow definition of SEEDED_GRAPH_RUN: plan -> build, both session nodes. */
+export function seededGraphDefinition() {
+  const { title, nodes } = SEEDED_GRAPH_RUN;
+  return {
+    version: '1.0', name: title, description: 'a finished, succeeded run written by rsi-e2e-seed',
+    nodes: nodes.map((n) => ({ id: n.id, name: n.name, type: 'action', description: '', instructions: `${n.name}.`, inputs: [], outputs: [], tags: [], hooks: [], pattern_params: {} })),
+    edges: [{ source: nodes[0].id, target: nodes[1].id }],
+    metadata: { topology_steps: JSON.stringify(Object.fromEntries(nodes.map((n) => [n.id, { kind: 'session' }]))) },
+  };
+}
 
 /** Written into every state directory this module creates; `rsi-e2e-seed` refuses a directory without it. */
 export const MARKER_FILE = '.rsi-e2e-isolated-state';
@@ -213,6 +238,12 @@ export async function seedSynthetic(handle) {
         tool_input: { file_path: join(root, 'src', 'lib.rs'), old_string: '41', new_string: '42' } },
       { event_type: 'Message', role: 'Assistant', content: 'I fixed the answer function and it now returns 42.' },
     ],
+    graph_run: {
+      workflow_id: SEEDED_GRAPH_RUN.workflowId, title: SEEDED_GRAPH_RUN.title, project_id: projectId,
+      execution_id: SEEDED_GRAPH_RUN.executionId, repo_root: root, base_commit: git(root, ['rev-parse', 'HEAD'], home).stdout.trim(),
+      definition: seededGraphDefinition(),
+      node_results: Object.fromEntries(SEEDED_GRAPH_RUN.nodes.map((n) => [n.id, n.result])),
+    },
   };
   const specPath = join(dir, 'seed-spec.json');
   writeFileSync(specPath, JSON.stringify(spec));
@@ -220,5 +251,5 @@ export async function seedSynthetic(handle) {
     const r = spawnSync(seeder, ['--state-dir', dir, '--spec', specPath], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, TMPDIR: join(dir, 'tmp') } });
     if (r.status !== 0) throw new Error(`rsi-e2e-seed failed (${r.status}): ${(r.stderr || r.stdout || '').trim()}`);
   });
-  return { root, projectId, issueIds: [issueA.id ?? issueA.issue?.id, issueB.id ?? issueB.issue?.id], groupId: group.id, leafId, rawGroup: group };
+  return { root, projectId, issueIds: [issueA.id ?? issueA.issue?.id, issueB.id ?? issueB.issue?.id], groupId: group.id, leafId, rawGroup: group, graphRun: SEEDED_GRAPH_RUN };
 }

@@ -82,7 +82,7 @@ const fn site(
 }
 
 /// The probes the invariance test runs (`cold_archive_reader_invariance`).
-pub const PROBE_NAMES: [&str; 19] = [
+pub const PROBE_NAMES: [&str; 21] = [
     "load_events",
     "load_events_since",
     "read_session_events_page",
@@ -102,6 +102,8 @@ pub const PROBE_NAMES: [&str; 19] = [
     "system_facts",
     "fk_rows",
     "bundle_event_count",
+    "paste_reference_texts",
+    "paste_reference_event_mark",
 ];
 
 use Class::{
@@ -134,6 +136,14 @@ pub const COLD_READER_CLASSES: &[ReaderClass] = &[
         "store.cold_assistant_window(",
         "program_gate_window",
     ),
+    site(
+        "rsid-store/src/store/operator_messages.rs::const:PASTE_REFERENCE_EVENTS_SQL",
+        Merge,
+        "#86 paste retention reads every live row, then the archive of every session in, or moving to or from, cold storage; a scan a move or restore raced (the cold fingerprint changed) proves nothing",
+        "FROM conversation_events WHERE id>?1 ORDER BY id LIMIT ?2",
+        "self.cold_reference_scan_session(after,",
+        "paste_reference_texts",
+    ),
     // --- logical aggregate ---------------------------------------------------
     site(
         "rsid-store/src/store/events.rs::event_watermark",
@@ -161,12 +171,28 @@ pub const COLD_READER_CLASSES: &[ReaderClass] = &[
     ),
     // --- tail exact: T1 Message / role = 'User' ------------------------------
     site(
+        "rsid-store/src/store/manager_actions/fence.rs::self_wake_has_newer_operator_input",
+        TailExact,
+        "T1: every user-role Message, including its content, timestamp and operator metadata, stays live",
+        "role='User'",
+        "",
+        "user_role_facts",
+    ),
+    site(
         "rsid-store/src/store/summaries.rs::count_assistant_messages",
         TailExact,
         "T1: every Message row stays live",
         "event_type = 'Message' AND role = 'Assistant'",
         "",
         "message_facts",
+    ),
+    site(
+        "rsid-store/src/store/operator_messages.rs::paste_reference_marks",
+        TailExact,
+        "#86 (hub #3322): the newest event id is the newest row, which the live tail always keeps; a move or restore since the mark changes the cold fingerprint the late check compares",
+        "SELECT COALESCE(MAX(id), 0) FROM conversation_events",
+        "",
+        "paste_reference_event_mark",
     ),
     site(
         "rsid-store/src/store/agent_jobs.rs::session_job_settled_since_last_turn",
@@ -340,6 +366,22 @@ pub const COLD_READER_CLASSES: &[ReaderClass] = &[
     ),
     // --- tail exact: T2 newest row / T3 newest provider row ------------------
     site(
+        "rsid-store/src/store/manager_obligations.rs::transfer_seat_obligations_on",
+        TailExact,
+        "T2: the successor's newest transcript sequence stays; transfer records this boundary for inherited predicate delivery",
+        "SELECT coalesce(max(sequence),0) FROM conversation_events WHERE session_id=?2",
+        "",
+        "max_sequence",
+    ),
+    site(
+        "rsid-store/src/store/manager_actions/issue_worker_jobs.rs::carry_worker_job_wakes_on",
+        TailExact,
+        "T2: the successor's newest transcript sequence stays; transfer records this boundary for inherited job completion delivery",
+        "SELECT coalesce(max(sequence),0) FROM conversation_events WHERE session_id=?2",
+        "",
+        "max_sequence",
+    ),
+    site(
         "rsid-store/src/store/agent_coordination.rs::continuation_cursor_tx",
         TailExact,
         "T2: the newest row (maximum sequence) stays",
@@ -478,6 +520,14 @@ pub const COLD_READER_CLASSES: &[ReaderClass] = &[
         "",
     ),
     site(
+        "rsid-store/src/store/seat_digest.rs::seat_launch_turn",
+        StatusDisjoint,
+        "the SQL joins sessions and excludes Archived and Deleted ones; such a seat reports no launch turn (#3386)",
+        "s.status NOT IN ('Archived','Deleted')",
+        "",
+        "",
+    ),
+    site(
         "rsid-store/src/store/manager_actions/issue_worker_capacity.rs::issue_worker_capacity_retry_state",
         StatusDisjoint,
         "reads a Failed worker",
@@ -547,6 +597,14 @@ pub const COLD_READER_CLASSES: &[ReaderClass] = &[
         HoldDisjoint,
         "H20: the usage-limit window",
         "content LIKE '**Process Error%'",
+        "",
+        "",
+    ),
+    site(
+        "rsid-store/src/store/manager_seat.rs::seat_limit_text",
+        StatusDisjoint,
+        "the SQL joins sessions and requires a Failed seat tip, which is never cold (hub #3859)",
+        "s.status='Failed'",
         "",
         "",
     ),

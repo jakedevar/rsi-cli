@@ -320,6 +320,7 @@ pub fn completed_response(response: &Value) -> Result<ChatResponse, ProviderErro
         tool_calls,
         usage: response.get("usage").map(usage).unwrap_or_default(),
         reasoning_content: None,
+        reasoning_details: None,
         stop_reason: response
             .get("status")
             .and_then(Value::as_str)

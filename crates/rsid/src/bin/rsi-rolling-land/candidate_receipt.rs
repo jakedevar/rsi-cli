@@ -72,7 +72,7 @@ fn hex64(value: &str) -> bool {
 }
 
 pub(super) fn default_root() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("RSI_ROLLING_CANDIDATE_RECEIPT_DIR") {
+    if let Some(path) = crate::lander_env::var_os("RSI_ROLLING_CANDIDATE_RECEIPT_DIR") {
         return Ok(PathBuf::from(path));
     }
     dirs::home_dir()

@@ -51,8 +51,7 @@ function afterAction(id: ActionId): void {
   }
   // Another full-window view replaced the pane.
   if (id === 'issues-open' && isSettingsOpen()) {
-    if (settingsPending() > 0) toast('Settings closed; pending settings were discarded');
-    closeSettings();
+    closeSettings({ keepStaged: true });
   }
 }
 

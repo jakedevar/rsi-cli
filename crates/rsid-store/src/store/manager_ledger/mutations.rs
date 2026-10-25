@@ -115,6 +115,25 @@ impl Store {
                 }
                 None
             }
+            ManagerUpdateV2::RequestWithdraw { request_id, .. } => {
+                if !authority.is_manager {
+                    return Err(refused("manager_v2_manager_required"));
+                }
+                // Require both the sending slot's immutable mail address and
+                // its receipt-backed sender lineage, never just Epic coverage.
+                self.manager_v2_request_target(&authority, *request_id)?;
+                let sender: String = self.conn.query_row(
+                    "SELECT sender_session_id FROM harness_manager_messages WHERE id=?1",
+                    [request_id.to_string()],
+                    |row| row.get(0),
+                )?;
+                let sender = Uuid::parse_str(&sender)
+                    .map_err(|_| refused("manager_v2_invalid_stored_identity"))?;
+                if self.manager_lineage_tip(sender).ok() != Some(caller) {
+                    return Err(refused("manager_v2_request_out_of_scope"));
+                }
+                None
+            }
             ManagerUpdateV2::Decision {
                 key,
                 epic_id,
@@ -893,6 +912,61 @@ impl Store {
                     Some(w.epic_id),
                     *expected_row_version,
                     serde_json::to_value(w)?,
+                )
+            }
+            ManagerUpdateV2::RequestWithdraw {
+                request_id,
+                expected_row_version,
+                reason,
+            } => {
+                text(reason, 2048).map_err(refused)?;
+                let epic = self.manager_v2_request_target(a, *request_id)?;
+                let (mail_config, _) = self.manager_mail_route_for_config(config)?;
+                let key = request_id.to_string();
+                let previous = self.manager_v2_record(config, "request", &key)?;
+                let state = previous
+                    .as_ref()
+                    .map(|row| decode::<RequestRecord>(row))
+                    .transpose()?
+                    .map(|record| record.state);
+                let replied = self.manager_request_replied(*request_id)?;
+                if self
+                    .manager_request_settlement(&mail_config, *request_id)?
+                    .is_some()
+                    || self
+                        .manager_v2_record(&mail_config, "request_readdress", &key)?
+                        .is_some()
+                    || state.is_some_and(is_terminal_request_state)
+                    || (replied && state != Some(ManagerRequestStateV2::Running))
+                {
+                    return Err(refused("manager_v2_request_settled"));
+                }
+                // Existing settlement bookkeeping removes the request from
+                // capacity, overdue and intent observations together.
+                self.manager_v2_put_record(
+                    &mail_config,
+                    super::super::harness_manager::REQUEST_SETTLE_KIND,
+                    &key,
+                    Some(epic),
+                    0,
+                    &json!({"disposition":"withdrawn","actor":caller,"reason":reason}),
+                )?;
+                let record = RequestRecord {
+                    request_id: *request_id,
+                    state: ManagerRequestStateV2::Declined,
+                    message: reason.clone(),
+                    work_key: None,
+                    lead_session_id: caller,
+                    execution_evidence: Some(json!({"kind":"manager_disposition",
+                        "disposition":"withdrawn","actor":caller,"reason":reason})),
+                    updated_at: now(),
+                };
+                (
+                    "request",
+                    key,
+                    Some(epic),
+                    *expected_row_version,
+                    serde_json::to_value(record)?,
                 )
             }
             ManagerUpdateV2::Request {

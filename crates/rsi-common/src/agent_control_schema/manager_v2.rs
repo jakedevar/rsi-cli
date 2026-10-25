@@ -344,6 +344,15 @@ fn control() -> Value {
     ));
     variants.push(tagged(
         "action",
+        "withdraw_queued_create",
+        &[
+            ("operation_id", uuid()),
+            ("expected_row_version", integer(1, i64::MAX)),
+        ],
+        &["operation_id", "expected_row_version"],
+    ));
+    variants.push(tagged(
+        "action",
         "retire_lead_continuations",
         &[("epic_id", uuid()), ("expected", lead_fence())],
         &["epic_id", "expected"],
@@ -599,7 +608,7 @@ fn submit_review() -> Value {
                 json!({"type":"string","minLength":1,"maxLength":128}),
             ),
         ],
-        &["assignment_id", "verdict", "findings", "idempotency_key"],
+        &["verdict", "findings", "idempotency_key"],
     )
 }
 
@@ -861,6 +870,16 @@ fn update() -> Value {
         required.extend(required_extra);
         variants.push(tagged("update", name, &fields, &required));
     }
+    variants.push(tagged(
+        "update",
+        "request_withdraw",
+        &[
+            ("request_id", uuid()),
+            ("expected_row_version", integer(0, i64::MAX)),
+            ("reason", string()),
+        ],
+        &["request_id", "expected_row_version", "reason"],
+    ));
     variants.push(tagged(
         "update",
         "request",

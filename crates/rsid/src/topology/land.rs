@@ -30,6 +30,12 @@
 //! - the merge queue is disabled: `blocked(queue_disabled)`, nothing enqueued;
 //! - the queue refuses the source (invalid, duplicate, a filter selecting no
 //!   test): `failed(land_refused)`;
+//! - #3358: an entry replaced in place by a descendant source
+//!   (`AgentEnqueueLandingSource supersedes`, which keeps the queue position and
+//!   the wake) records its successor in its outcome; the waiting land node
+//!   follows the successor (`land_entry_followed` event) and settles on its
+//!   outcome, so a repaired descendant needs no repair round. A cancel without
+//!   a successor stays `failed(land_refused)`;
 //! - the entry ends `published`: `succeeded` with the landed tip in its typed
 //!   output; a refused, failed or superseded entry whose source is nonetheless
 //!   an ancestor of a freshly fetched `origin/rolling` settles the same way
@@ -50,8 +56,11 @@
 //!   and a refused, failed or superseded entry never touches the Issue.
 //!
 //! A queued landing is not bounded by the node wall time: the queue has its
-//! own gate budget and always settles an entry, and failing the node while the
-//! entry might still publish would make the record lie.
+//! own gate budget. An interrupted publication keeps waiting on the same
+//! entry while the queue re-admits it at its original FIFO position. Legacy
+//! terminal entries stay immutable and follow the ordinary refusal path, with
+//! a fresh ancestry check before repair.
+//! Failing the node while the entry might still publish would make the record lie.
 
 use std::path::PathBuf;
 
@@ -98,6 +107,13 @@ pub(crate) struct LandRequest {
 pub(crate) enum LandAcceptance {
     /// The review node and the assignment that accepted `source_commit`.
     Review { node: String, assignment_id: Uuid },
+    /// An accepted source followed only by proven clean merges of rolling.
+    /// Queue admission rechecks both the original verdict and the merge proof.
+    RollingMerge {
+        node: String,
+        assignment_id: Uuid,
+        reviewed_commit: String,
+    },
     /// The `require_verified` session node and the terminal `scoped_test` job
     /// (owned by `session_id`) whose receipt `head` is `source_commit`.
     Verified {
@@ -180,9 +196,16 @@ pub(crate) enum LandStatus {
     Published {
         landed_sha: Option<String>,
     },
-    /// Refused, failed or superseded (or the entry vanished).
+    /// #3358: replaced in place by a descendant source (`supersedes`), which
+    /// kept the queue position and the wake: the land node follows `successor`.
+    Superseded {
+        successor: Uuid,
+    },
+    /// Refused, failed, cancelled (or the entry vanished).
     Refused {
         state: String,
+        /// Stable refusal code first (for conflict classification), followed
+        /// by the bounded queue detail, including any conflicting paths.
         reason: String,
     },
 }
@@ -203,12 +226,29 @@ impl LandStatus {
             RollingQueueEntryState::Published => Self::Published {
                 landed_sha: outcome.and_then(|outcome| outcome.landed_sha),
             },
+            RollingQueueEntryState::Superseded
+                if outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.superseded_by.is_some()) =>
+            {
+                Self::Superseded {
+                    successor: outcome
+                        .and_then(|outcome| outcome.superseded_by)
+                        .unwrap_or_default(),
+                }
+            }
             state @ (RollingQueueEntryState::Refused
             | RollingQueueEntryState::Failed
             | RollingQueueEntryState::Superseded) => Self::Refused {
                 state: state.as_str().to_owned(),
                 reason: outcome
-                    .and_then(|outcome| outcome.refusal.or(outcome.detail))
+                    .and_then(|outcome| {
+                        let detail = outcome.detail.as_deref().map(crate::rolling_queue::tail);
+                        match (outcome.refusal, detail) {
+                            (Some(code), Some(detail)) => Some(format!("{code}: {detail}")),
+                            (code, detail) => code.or(detail),
+                        }
+                    })
                     .unwrap_or_else(|| state.as_str().to_owned()),
             },
         }
@@ -374,13 +414,24 @@ fn land_request(
             });
         let author = crate::topology::review::producer(attempts, first)
             .ok_or_else(|| format!("no node of this execution produced reviewed commit {first}"))?;
-        (
+        let acceptance = if let Some(base) = review
+            .output
+            .as_ref()
+            .and_then(|o| o.pointer("/fields/rolling_merge_base"))
+            .and_then(|v| v.as_str())
+        {
+            LandAcceptance::RollingMerge {
+                node: accepted.clone(),
+                assignment_id: assignment,
+                reviewed_commit: base.to_owned(),
+            }
+        } else {
             LandAcceptance::Review {
                 node: accepted.clone(),
                 assignment_id: assignment,
-            },
-            author.session_id,
-        )
+            }
+        };
+        (acceptance, author.session_id)
     };
     // Re-derived from the stored graph and recorded input on every attempt, so
     // an edited or invalid policy blocks before an entry exists.
@@ -567,6 +618,19 @@ impl<E: NodeEffects> Executor<E> {
             return Ok(true);
         };
         let mut status = self.effects.land_status(entry).await;
+        // #3358: an entry replaced in place by a descendant source kept its
+        // queue position and wake; follow the successor and settle on its
+        // outcome. A cancel without a successor stays a refusal below.
+        if let LandStatus::Superseded { successor } = status {
+            let update = {
+                let store = self.store.lock().await;
+                rows::follow_land_entry(&store, execution.id, attempt, entry, successor)?
+            };
+            if let Some(update) = update {
+                self.publish([update]);
+            }
+            return Ok(true);
+        }
         let waited = match self
             .conflict_wait(execution, attempt, entry, &status)
             .await?
@@ -589,7 +653,8 @@ impl<E: NodeEffects> Executor<E> {
             };
         }
         match status {
-            LandStatus::Pending => Ok(false),
+            // Followed above, before the conflict wait and the ancestry check.
+            LandStatus::Pending | LandStatus::Superseded { .. } => Ok(false),
             LandStatus::Published { landed_sha } => {
                 // #2260: close the input Issue before settling. A transient
                 // error is not an outcome: the entry stays published and the
@@ -704,6 +769,7 @@ impl<E: NodeEffects> Executor<E> {
             let state = match self.effects.land_status(*blocker).await {
                 LandStatus::Pending => return Ok(ConflictWait::Hold),
                 LandStatus::Published { .. } => "published".to_owned(),
+                LandStatus::Superseded { .. } => "superseded".to_owned(),
                 LandStatus::Refused { state, .. } => state,
             };
             ended.push(format!("{blocker} {state}"));
@@ -769,7 +835,9 @@ impl<E: NodeEffects> Executor<E> {
         let kind = match &outcome {
             IssueClose::Closed => "topology_landed",
             IssueClose::Refused(_) => "issue_close_refused",
-            IssueClose::AlreadyClosed | IssueClose::Skipped(_) => return Ok(Some(outcome)),
+            IssueClose::AlreadyClosed | IssueClose::Skipped(_) | IssueClose::Held(_) => {
+                return Ok(Some(outcome));
+            }
         };
         let update = {
             let store = self.store.lock().await;

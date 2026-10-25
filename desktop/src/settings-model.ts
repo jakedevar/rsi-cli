@@ -14,6 +14,11 @@
 //   state.json) are `tui-only` with the reason (no rsid state exists for them);
 //   rows another desktop view serves open it (`overlay`); credential values
 //   are never shown. No rsid-backed row is a placeholder (local #125).
+import { VIM_KEYS_TIP } from './keyengine.js';
+import {
+  NOTIFY_DENIED_LABEL, NOTIFY_DENIED_SUMMARY, NOTIFY_FINISHED_LABEL, NOTIFY_NEEDS_LABEL, NOTIFY_TEST_LABEL, notifyPermissionHint,
+  type NotifyPermission,
+} from './notify-model.js';
 import { MODEL_CONTROL_MODES, modeMessage } from './settings-state-model.js';
 import {
   APPLY_LABELS, DAEMON_WIDGETS, SETTINGS_GROUPS, SETTINGS_ROWS, SETTINGS_SECTIONS, TEXT_EDITORS,
@@ -139,7 +144,7 @@ export type Widget =
   | { type: 'text-editor'; editor: TextEditorRow }
   | { type: 'display' }
   /** Desktop-local rows the DOM side owns. */
-  | { type: 'local'; local: 'theme' | 'roles' | 'reset-theme' | 'vim-keys' | 'text-bg' | 'text-bg-color' | 'budgets' | 'provider-keys' }
+  | { type: 'local'; local: 'theme' | 'roles' | 'reset-theme' | 'vim-keys' | 'text-bg' | 'text-bg-color' | 'budgets' | 'provider-keys' | 'notify-needs' | 'notify-finished' | 'notify-test' | 'notify-open-settings' }
   /** A row an rsid-backed desktop view serves: Enter opens it or runs its action (settings-state.ts, the slice overlays). */
   | { type: 'overlay' }
   /** A TUI-local presentation preference (the TUI's own state.json): no rsid state, so no desktop control. */
@@ -194,6 +199,12 @@ function partialWhy(spec: SettingRow): string {
 }
 
 /** Which widget the desktop gives a registry row. */
+/** Read-only summary rows: the row id and the config key that carries its one-line summary. */
+const SUMMARY_ROW_FIELDS: Record<string, string> = {
+  cloud_spend_status: 'cloud_spend_status',
+  open_router_spend_status: 'openrouter_spend_status',
+};
+
 export function widgetFor(spec: SettingRow, live: unknown): Widget {
   if (spec.owner.kind === 'tui') {
     if (spec.id === 'built_in_theme') return { type: 'local', local: 'theme' };
@@ -212,8 +223,8 @@ export function widgetFor(spec: SettingRow, live: unknown): Widget {
   if (spec.id === 'budget_policies') return { type: 'local', local: 'budgets' };
   if (spec.id === 'provider_credential_slots') return { type: 'local', local: 'provider-keys' };
   if (spec.owner.kind === 'daemon_state' && spec.kind === 'read_only') {
-    // A read-only summary the config carries (e.g. `cloud_spend_status`).
-    return spec.id === 'cloud_spend_status' ? { type: 'display' } : { type: 'partial', why: partialWhy(spec) };
+    // A read-only summary the config carries (`cloud_spend_status`, `openrouter_spend_status`).
+    return spec.id in SUMMARY_ROW_FIELDS ? { type: 'display' } : { type: 'partial', why: partialWhy(spec) };
   }
   if (spec.owner.kind === 'daemon_fields') return { type: 'display' };
   if (spec.owner.kind !== 'daemon') return { type: 'partial', why: partialWhy(spec) };
@@ -221,6 +232,7 @@ export function widgetFor(spec: SettingRow, live: unknown): Widget {
   if (isSecretField(field)) return { type: 'partial', why: 'A credential field: its value is never shown.' };
   const text = TEXT_BY_FIELD.get(field);
   if (text) return { type: 'text-editor', editor: text };
+  if (field.endsWith('_billing_mode')) return { type: 'choice', options: ['auto', 'subscription', 'metered_api', 'cloud'] };
   const w = DAEMON_WIDGETS[field];
   if (spec.kind === 'read_only') return { type: 'display' };
   if (spec.kind === 'action' || !w) return { type: 'partial', why: partialWhy(spec) };
@@ -237,8 +249,8 @@ export function applyLabel(spec: { kind: string; apply: ApplyKind }): string {
 /** The desktop-only row the Vim keys toggle lives in (Workspace › Editing Mode). */
 export const VIM_KEYS_ROW: Omit<PaneRow, 'widget'> & { widget: Widget } = {
   id: 'desktop_vim_keys',
-  label: 'Vim keys (this desktop)',
-  summary: 'Drives the desktop with the TUI\'s modal keys while focus is not in a text field. Kept on this computer; the daemon\'s Editing mode row above is the TUI\'s choice.',
+  label: 'Vim keys in this window',
+  summary: 'Same switch as Vim keys in the top bar. ' + VIM_KEYS_TIP + ' Kept on this computer; the row below, Text editing in the TUI, is a separate choice that does not change this window.',
   keywords: ['vim', 'keys', 'modal', 'desktop'],
   section: 'editing_mode',
   field: null,
@@ -247,18 +259,61 @@ export const VIM_KEYS_ROW: Omit<PaneRow, 'widget'> & { widget: Widget } = {
   destructive: false,
 };
 
+/**
+ * Desktop-only rows for OS notifications (local #294): two switches kept on this computer (no daemon setting) and a
+ * test button. They sit at the end of Workspace › Session List, after the daemon's rows.
+ */
+export const NOTIFY_SECTION = 'session_list';
+export function notifyRows(permission: NotifyPermission = 'unknown'): PaneRow[] {
+  const rows: PaneRow[] = [
+    {
+      id: 'desktop_notify_needs', label: NOTIFY_NEEDS_LABEL,
+      summary: 'Shows a macOS notification, and a number on the Dock icon, when a session asks you a question or wants an approval while this window is not in front. Clicking it opens that session. Kept on this computer.' + notifyPermissionHint(permission),
+      keywords: ['notify', 'notification', 'notifications', 'alert', 'badge', 'dock', 'waiting', 'question', 'approval', 'desktop'],
+      section: NOTIFY_SECTION, field: null, widget: { type: 'local', local: 'notify-needs' }, apply: APPLY_LABELS.immediate, destructive: false,
+    },
+    {
+      id: 'desktop_notify_finished', label: NOTIFY_FINISHED_LABEL,
+      summary: 'Shows a notification when a session finishes or fails while this window is not in front. Off by default. Kept on this computer.',
+      keywords: ['notify', 'notification', 'notifications', 'finished', 'completed', 'failed', 'done', 'desktop'],
+      section: NOTIFY_SECTION, field: null, widget: { type: 'local', local: 'notify-finished' }, apply: APPLY_LABELS.immediate, destructive: false,
+    },
+    {
+      id: 'desktop_notify_test', label: NOTIFY_TEST_LABEL,
+      summary: 'Posts one notification now, so you can see how they look and let macOS ask for permission.' + notifyPermissionHint(permission),
+      keywords: ['notify', 'notification', 'test', 'permission', 'desktop'],
+      section: NOTIFY_SECTION, field: null, widget: { type: 'local', local: 'notify-test' }, apply: 'when activated', destructive: false,
+    },
+  ];
+  // macOS has refused (local #300): one row at the top of the three, with the way back and a button that opens the pane.
+  if (permission === 'denied') {
+    rows.unshift({
+      id: 'desktop_notify_denied', label: NOTIFY_DENIED_LABEL, summary: NOTIFY_DENIED_SUMMARY,
+      keywords: ['notify', 'notification', 'notifications', 'permission', 'denied', 'blocked', 'allow', 'system settings', 'desktop'],
+      section: NOTIFY_SECTION, field: null, widget: { type: 'local', local: 'notify-open-settings' }, apply: 'when activated', destructive: false,
+    });
+  }
+  return rows;
+}
+
+/** The daemon's editing_mode row, worded for this window: the desktop never reads it (it is the TUI's text editing). */
+const TUI_EDITING_LABEL = 'Text editing in the TUI (Standard or Vim)';
+const TUI_EDITING_SUMMARY = 'Standard or Vim text editing in the rsi TUI (the terminal app). It does not change this window: use Vim keys in this window, above, for that. Unset asks again when the TUI next starts.';
+
 /** Every row of a section in page order, with its widget for the live config. */
-export function sectionRows(section: string, config: Config): PaneRow[] {
+export function sectionRows(section: string, config: Config, notifyPermission: NotifyPermission = 'unknown'): PaneRow[] {
   const rows: PaneRow[] = SETTINGS_ROWS.filter((r) => r.section === section).map((spec) => {
     const field = spec.owner.kind === 'daemon' ? spec.owner.args?.[0] ?? null : spec.id === MODE_FIELD ? MODE_FIELD : null;
+    const tuiMode = spec.id === 'editing_mode';
     return {
-      id: spec.id, label: spec.label, summary: spec.summary, ...(spec.detail ? { detail: spec.detail } : {}),
+      id: spec.id, label: tuiMode ? TUI_EDITING_LABEL : spec.label, summary: tuiMode ? TUI_EDITING_SUMMARY : spec.summary, ...(spec.detail ? { detail: spec.detail } : {}),
       keywords: spec.keywords, section: spec.section, field,
       widget: widgetFor(spec, field ? config[field] : undefined),
       apply: applyLabel(spec), destructive: spec.destructive,
     };
   });
-  if (section === VIM_KEYS_ROW.section) rows.push({ ...VIM_KEYS_ROW });
+  if (section === VIM_KEYS_ROW.section) rows.unshift({ ...VIM_KEYS_ROW });
+  if (section === NOTIFY_SECTION) rows.push(...notifyRows(notifyPermission));
   return rows;
 }
 
@@ -273,14 +328,193 @@ export function groupOf(section: string): GroupRow | undefined {
 
 /** The value a row shows: for a daemon row, the staged value when one is pending. */
 export function rowValue(row: PaneRow, config: Config, staging: Staging): unknown {
-  if (row.id === 'cloud_spend_status') return config.cloud_spend_status;
+  const summaryKey = SUMMARY_ROW_FIELDS[row.id];
+  if (summaryKey) return config[summaryKey];
   if (row.widget.type === 'display' && !row.field) {
-    const spec = SETTINGS_ROWS.find((r) => r.id === row.id);
-    const fields = spec?.owner.kind === 'daemon_fields' ? spec.owner.args ?? [] : [];
-    return fields.map((f) => `${f}=${displayValue(config[f]) || 'default'}`).join(' · ');
+    return roleSummary(rowFields(row), config);
   }
   if (!row.field) return undefined;
   return viewValue(staging, row.field, config[row.field]);
+}
+
+// ---------- readable values, clicks and the close prompt (local #269) ----------
+
+/** The daemon fields a row summarizes (a model-role row has several; a plain row has its one). */
+export function rowFields(row: PaneRow): string[] {
+  if (row.field) return [row.field];
+  const spec = SETTINGS_ROWS.find((r) => r.id === row.id);
+  return spec?.owner.kind === 'daemon_fields' ? [...(spec.owner.args ?? [])] : [];
+}
+
+/** What a model-role field is, in words ('title_model_provider' -> 'Provider'); null for a field the label leaves out (the address). */
+function fieldRole(field: string): string | null {
+  if (field.endsWith('_base_url')) return null;
+  if (field.endsWith('_fallback_provider')) return 'Fallback provider';
+  if (field.endsWith('_provider')) return 'Provider';
+  if (field.endsWith('_fallback')) return 'Fallback model';
+  if (field.endsWith('_local')) return 'Local model';
+  return 'Model';
+}
+
+/**
+ * A model-role row's value as a person reads it: 'Provider: openrouter · Fallback model: haiku', or 'Default' when
+ * nothing is set. The raw field names and the address stay in the info card's Details (rowDetails).
+ */
+export function roleSummary(fields: readonly string[], config: Config): string {
+  const parts: string[] = [];
+  for (const f of fields) {
+    const role = fieldRole(f);
+    const v = config[f];
+    if (role === null || v === null || v === undefined || v === '' || v === false) continue;
+    parts.push(v === true ? role : `${role}: ${displayValue(v)}`);
+  }
+  return parts.length > 0 ? parts.join(' · ') : 'Default';
+}
+
+// ---------- each manager seat's coordinator budget (parity with the TUI, hub #3079) ----------
+
+/** The row whose info card lists one line per manager seat. */
+export const SEAT_BUDGET_ROW = 'coordinator_context_cap';
+
+/** One manager seat's resolved budget, in words; `raw` is the TUI's one-line summary for Details. */
+export interface SeatBudget { seat: string; model: string; lines: string[]; raw: string }
+
+const rec = (v: unknown): Record<string, unknown> | null => (typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const str = (v: unknown): string | null => (typeof v === 'string' && v !== '' ? v : null);
+const tokens = (n: number): string => `${n.toLocaleString('en-US')} tokens`;
+const pct = (n: number): string => `${Number(n.toFixed(2))}%`;
+
+const WINDOW_SOURCES: Record<string, string> = {
+  official_documentation: "from the vendor's documentation",
+  provider_catalog: "from the provider's own list",
+  configured: 'set in the configuration',
+  runtime_telemetry: 'measured on this seat',
+  repository_fallback: 'a built-in estimate',
+  legacy_unverified: 'an unverified estimate',
+};
+
+/** A limit's config name as a person reads it ('context_rotation_global_pct' -> 'the global rotation percentage'). */
+export function plainLimit(name: string): string {
+  if (name.startsWith('coordinator_context_cap')) {
+    const scope = name.split('.')[1];
+    return scope ? `the coordinator context cap for ${scope}` : 'the coordinator context cap';
+  }
+  const m = /^context_rotation_([a-z0-9]+)_pct$/.exec(name);
+  return m ? `the ${m[1]} rotation percentage` : name;
+}
+
+/** The TUI's `CoordinatorBudgetV1::summary()` for one seat: the raw names, for the Details block. */
+function rawSummary(b: Record<string, unknown>): string {
+  const w = rec(b.window);
+  const eff = num(b.effective_tokens) !== null && num(b.effective_pct) !== null ? `${num(b.effective_tokens)} tokens (${(num(b.effective_pct) as number).toFixed(2)}%)` : 'disabled or unknown';
+  return `${str(b.provider) ?? '?'}/${str(b.model) ?? 'unknown'}: window ${num(w?.active_tokens) ?? '?'} tokens (${str(rec(w?.evidence)?.source) ?? '?'}); cap ${num(b.coordinator_cap) ?? '?'} ${str(b.coordinator_cap_unit) ?? ''} [${str(b.coordinator_cap_source) ?? ''}]; succession ${(num(b.succession_pct) ?? 0).toFixed(2)}% [${str(b.succession_source) ?? ''}]; effective ${eff} binds ${str(b.binding_limit) ?? 'none'}`;
+}
+
+/** The daemon config's `coordinator_context_budgets`: one entry per live manager seat; none when the daemon sent nothing usable. */
+export function seatBudgets(config: Config | null): SeatBudget[] {
+  const list = config?.coordinator_context_budgets;
+  if (!Array.isArray(list)) return [];
+  const out: SeatBudget[] = [];
+  for (const entry of list) {
+    const seat = rec(entry);
+    const b = rec(seat?.budget);
+    if (!seat || !b) continue;
+    const id = str(seat.session_id) ?? '?';
+    const w = rec(b.window);
+    const active = num(w?.active_tokens);
+    const source = str(rec(w?.evidence)?.source);
+    const cap = num(b.coordinator_cap) ?? 0;
+    const capTokens = num(b.coordinator_cap_tokens);
+    const lines: string[] = [];
+    lines.push(active === null ? 'Context window: not known yet.' : `Context window: ${tokens(active)}${source ? ` (${WINDOW_SOURCES[source] ?? source})` : ''}.`);
+    if (str(b.coordinator_cap_unit) === 'off' || cap === 0) lines.push('Coordinator cap: off for this seat.');
+    else if (str(b.coordinator_cap_unit) === 'percent') lines.push(`Coordinator cap: ${cap}% of the window${capTokens !== null ? `, which is ${tokens(capTokens)}` : ''}.`);
+    else lines.push(`Coordinator cap: ${tokens(cap)}.`);
+    const succ = num(b.succession_pct);
+    const succSource = str(b.succession_source);
+    if (succ !== null) lines.push(`Handing over to a fresh session at ${pct(succ)} full${succSource ? ` (${plainLimit(succSource)})` : ''}.`);
+    const effTokens = num(b.effective_tokens);
+    const effPct = num(b.effective_pct);
+    const limit = str(b.binding_limit);
+    if (b.rotation_enabled === false) lines.push('Rotation is switched off, so this seat is never rotated.');
+    else if (effTokens !== null && effPct !== null) lines.push(`Rotates at ${tokens(effTokens)} (${pct(effPct)})${limit ? `; ${plainLimit(limit)} is the limit that decides it` : ''}.`);
+    else lines.push('Rotation point: not set, because no limit applies.');
+    const provider = str(b.provider) ?? 'Unknown provider';
+    out.push({ seat: id.slice(0, 8), model: `${provider} / ${str(b.model) ?? 'unknown model'}`, lines, raw: `Seat ${id}: ${rawSummary(b)}` });
+  }
+  return out;
+}
+
+/** The technical lines under the info card's Details: each daemon field of the row and its current value. */
+export function rowDetails(row: PaneRow, config: Config | null): string[] {
+  const lines = rowFields(row).map((f) => {
+    if (isSecretField(f)) return `${f}: ${REDACTED}`;
+    const v = config ? displayValue(config[f]) : '';
+    return `${f}: ${v === '' ? '(not set)' : v}`;
+  });
+  if (row.id === SEAT_BUDGET_ROW) lines.push(...seatBudgets(config).map((s) => s.raw));
+  return lines;
+}
+
+/** Rows whose value is a switch-like control: a click on the value flips or steps it; a click elsewhere on the row only selects it. */
+function isValueClickRow(row: PaneRow): boolean {
+  const w = row.widget;
+  return w.type === 'switch' || w.type === 'choice' || (w.type === 'local' && (w.local === 'vim-keys' || w.local === 'text-bg' || w.local === 'notify-needs' || w.local === 'notify-finished'));
+}
+
+/**
+ * What one click on a row does (local #269): it always selects the row; a row that can be edited or opened also starts
+ * that on the same click. A switch or choice changes only when its value is clicked, so selecting by the label never
+ * flips it; a read-only, TUI-only or unavailable row only selects (the info card says why).
+ */
+export function rowClick(row: PaneRow, hasOverlay: boolean, onValue: boolean): 'select' | 'activate' {
+  if (hasOverlay) return 'activate';
+  const w = row.widget;
+  if (isValueClickRow(row)) return onValue ? 'activate' : 'select';
+  if (w.type === 'display' || w.type === 'tui-only' || w.type === 'partial' || w.type === 'overlay') return 'select';
+  return 'activate';
+}
+
+/** The hover text of a row's value: what a click there does, in plain words. */
+export function valueTooltip(row: PaneRow, hasOverlay: boolean): string {
+  if (hasOverlay) return 'Click to open';
+  const w = row.widget;
+  switch (w.type) {
+    case 'switch': return 'Click to turn on or off';
+    case 'choice': return 'Click for the next choice; the left arrow goes back';
+    case 'text': case 'text-editor': return 'Click to edit';
+    case 'local':
+      if (w.local === 'vim-keys' || w.local === 'text-bg' || w.local === 'notify-needs' || w.local === 'notify-finished') return 'Click to turn on or off';
+      if (w.local === 'notify-test') return 'Click to send a test notification';
+      if (w.local === 'notify-open-settings') return 'Click to open System Settings › Notifications';
+      if (w.local === 'reset-theme') return 'Click to reset';
+      return 'Click to change';
+    default: return '';
+  }
+}
+
+/** What the close prompt can answer (local #269). */
+export type CloseChoice = 'apply' | 'discard' | 'keep';
+
+/** The close prompt for N unapplied changes (local #269): Apply, Discard or Keep editing. */
+export interface CloseCopy {
+  title: string;
+  body: string;
+  apply: string;
+  discard: string;
+  keep: string;
+}
+
+export function closeCopy(n: number): CloseCopy {
+  const what = `${n} change${n === 1 ? '' : 's'}`;
+  return {
+    title: 'Apply your changes?',
+    body: `You have ${what} you have not applied yet. Apply saves ${n === 1 ? 'it' : 'them'} to the daemon; Discard drops ${n === 1 ? 'it' : 'them'}.`,
+    apply: n === 1 ? 'Apply change' : `Apply ${n} changes`,
+    discard: 'Discard',
+    keep: 'Keep editing',
+  };
 }
 
 /** Can a row's value be stepped with Enter / Space / + / -? */

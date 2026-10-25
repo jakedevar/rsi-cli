@@ -63,6 +63,11 @@ fn command_with_config(
         "rerere.enabled=false",
         "-c",
         "gc.auto=0",
+        // `GIT_GRAFT_FILE=/dev/null` below makes Git (2.18+) print a multi-line
+        // graft deprecation hint on every call; it would push the real error
+        // out of the bounded stderr tail (#198).
+        "-c",
+        "advice.graftFileDeprecated=false",
     ]);
     for (key, value) in config_overrides {
         command.arg("-c").arg(format!("{key}={value}"));

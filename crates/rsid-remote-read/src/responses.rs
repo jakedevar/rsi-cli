@@ -886,20 +886,22 @@ mod tests {
         conn.execute_batch("ROLLBACK").unwrap();
     }
 
-    #[test]
-    fn observed_history_response_marks_reused_complete_tool_key_ambiguous() {
+    /// Project the newest row of a session holding `kinds` (event types, ids
+    /// 1..) under one complete tool key and return its `pairing_state`.
+    fn pairing_state_of_last_row(kinds: &[&str]) -> PairingStateV1 {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,tool_use_id TEXT);
+            "CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,event_type TEXT,tool_use_id TEXT);
              CREATE INDEX idx_events_tool_use_id ON conversation_events(tool_use_id);",
         )
         .unwrap();
         let project = Uuid::new_v4();
         let session = Uuid::new_v4();
-        for id in [1_i64, 2] {
+        for (index, kind) in kinds.iter().enumerate() {
+            let id = i64::try_from(index).unwrap() + 1;
             conn.execute(
-                "INSERT INTO conversation_events(id,session_id,tool_use_id) VALUES(?1,?2,'shared')",
-                rusqlite::params![id, session.to_string()],
+                "INSERT INTO conversation_events(id,session_id,event_type,tool_use_id) VALUES(?1,?2,?3,'shared')",
+                rusqlite::params![id, session.to_string(), kind],
             )
             .unwrap();
         }
@@ -911,7 +913,10 @@ mod tests {
         let ReadRequestV1::RemoteGetHistoryPageV1(params) = &request else {
             unreachable!()
         };
-        let mut row = raw_event(2, 2);
+        let last = i64::try_from(kinds.len()).unwrap();
+        let last_sequence = i32::try_from(kinds.len()).unwrap();
+        let key = (last_sequence, last);
+        let mut row = raw_event(last_sequence, last);
         row.tool_pair_key = Some("shared".into());
         row.tool_id_display = Some(BoundedText {
             text: "shared".into(),
@@ -920,7 +925,7 @@ mod tests {
         });
         let epoch = Uuid::new_v4();
         let cursor = RemoteCursorSigner::new(epoch)
-            .sign_history_position(&request, [5; 32], Some((2, 2)), true)
+            .sign_history_position(&request, [5; 32], Some(key), true)
             .unwrap();
         conn.execute_batch("BEGIN").unwrap();
         let response = observed_history_response(
@@ -929,19 +934,49 @@ mod tests {
             HistoryObservedPage {
                 page: SourcePage {
                     items: vec![row],
-                    next: Some((2, 2)),
+                    next: Some(key),
                     has_more: true,
                 },
-                head: Some((2, 2)),
-                lower_exclusive: Some((1, 1)),
-                upper_inclusive: Some((2, 2)),
+                head: Some(key),
+                lower_exclusive: (last > 1).then_some((last_sequence - 1, last - 1)),
+                upper_inclusive: Some(key),
             },
             epoch,
             Utc::now(),
             cursor,
         )
         .unwrap();
-        assert_eq!(response.items[0].pairing_state, PairingStateV1::Ambiguous);
+        let state = response.items[0].pairing_state;
         conn.execute_batch("ROLLBACK").unwrap();
+        state
+    }
+
+    #[test]
+    fn observed_history_response_marks_reused_complete_tool_key_ambiguous() {
+        assert_eq!(
+            pairing_state_of_last_row(&["ToolUse", "ToolUse"]),
+            PairingStateV1::Ambiguous
+        );
+        assert_eq!(
+            pairing_state_of_last_row(&["ToolResult", "ToolResult"]),
+            PairingStateV1::Ambiguous
+        );
+        assert_eq!(
+            pairing_state_of_last_row(&["ToolUse", "ToolResult", "ToolResult"]),
+            PairingStateV1::Ambiguous
+        );
+    }
+
+    /// hub #3832: the call row and its single result row are one normal pair.
+    #[test]
+    fn observed_history_response_keeps_a_normal_tool_pair_exact() {
+        assert_eq!(
+            pairing_state_of_last_row(&["ToolUse", "ToolResult"]),
+            PairingStateV1::Exact
+        );
+        assert_eq!(
+            pairing_state_of_last_row(&["ToolUse"]),
+            PairingStateV1::Exact
+        );
     }
 }

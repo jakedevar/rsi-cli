@@ -158,6 +158,10 @@ pub struct AgentJobRow {
 /// test job and put it back in the queue (decoded away like `wake` and `held`).
 pub(crate) const REQUEUED_BY_DEPLOY_KEY: &str = "requeued_by_deploy";
 
+/// #3554: the `params_json` key that records the deploy whose restart a running
+/// job survived (decoded away like `requeued_by_deploy`).
+pub(crate) const SURVIVED_DEPLOY_KEY: &str = "survived_deploy";
+
 const COLUMNS: &str = "id, owner_session_id, kind, name, params_json, cwd, unit_name, log_path, \
     status_path, state, exit_code, result_json, created_at, finished_at, started_at";
 
@@ -187,6 +191,7 @@ fn decode_params(text: &str) -> serde_json::Result<(JobParams, JobWake, Option<S
     // #2278: the deploy that stopped and requeued this job; a record, not a param.
     if let Some(object) = value.as_object_mut() {
         object.remove(REQUEUED_BY_DEPLOY_KEY);
+        object.remove(SURVIVED_DEPLOY_KEY);
     }
     let wake = match value
         .as_object_mut()
@@ -250,6 +255,7 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<AgentJobRow> {
             finished_at: row.get(13)?,
             held: (state == JobState::Queued)
                 .then(|| held.unwrap_or_else(|| JOB_HELD_FOR_DEPLOY.to_string())),
+            hold: None,
             wake,
         },
     })
@@ -463,6 +469,51 @@ impl Store {
             .optional()?)
     }
 
+    /// Daemon launch metadata in the existing result JSON. Settlement always
+    /// carries this stamp forward; no script receipt can supply or replace it.
+    pub fn record_agent_job_profile_verification(
+        &self,
+        id: Uuid,
+        binding: &rsi_common::agent_jobs::ProfileVerificationBindingV1,
+    ) -> Result<()> {
+        let verification = rsi_common::agent_jobs::ProfileVerificationV1 {
+            binding: binding.clone(),
+            completed_commands: 0,
+            warning_verdict: "pending".into(),
+        };
+        let value = serde_json::to_string(&verification)
+            .map_err(|error| DaemonError::Store(error.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE agent_jobs SET result_json=json_set(COALESCE(result_json,'{}'), '$.profile_verification', json(?2)), row_version=row_version+1 WHERE id=?1 AND state IN ('queued','running') AND json_extract(result_json,'$.profile_verification') IS NULL",
+            params![id.to_string(), value],
+        )?;
+        if changed != 1 {
+            return Err(DaemonError::Store(
+                "profile verification requires an unstamped live job".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn record_agent_job_scoped_tool(
+        &self,
+        id: Uuid,
+        provenance: &rsi_common::agent_jobs::ScopedToolProvenanceV1,
+    ) -> Result<()> {
+        let value = serde_json::to_string(provenance)
+            .map_err(|error| DaemonError::Store(error.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE agent_jobs SET result_json=json_set(COALESCE(result_json,'{}'), '$.scoped_tool', json(?2)), row_version=row_version+1 WHERE id=?1 AND state='running'",
+            params![id.to_string(), value],
+        )?;
+        if changed != 1 {
+            return Err(DaemonError::Store(
+                "scoped-test provenance requires a running job".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The project a job was recorded under (`None` for a legacy row or a
     /// job submitted outside any project), or `None` when the job is absent.
     pub fn agent_job_project(&self, id: Uuid) -> Result<Option<Uuid>> {
@@ -590,6 +641,8 @@ impl Store {
     /// rotation predecessor of its live seat (a job that finished before the
     /// successor was published keeps its original owner and receipt). A live
     /// predecessor job is not watchable here: succession already moved it.
+    /// #584: an explicit Issue-worker successor may also watch unsettled
+    /// predecessor test/build jobs; those keep their original owner.
     pub(crate) fn job_watchable_by(&self, owner: Uuid, id: Uuid) -> Result<bool> {
         let job: Option<(String, String)> = self
             .conn
@@ -605,6 +658,9 @@ impl Store {
         if job_owner == owner.to_string() {
             return Ok(true);
         }
+        if self.worker_predecessor_job_observable(owner, id)? {
+            return Ok(true);
+        }
         if matches!(state.as_str(), "queued" | "running") {
             return Ok(false);
         }
@@ -616,6 +672,8 @@ impl Store {
     /// predecessor of the seat owned in this project (or, for a portfolio
     /// seat, under the same node), settled or not, and (b) a job owned by a
     /// session inside its live manager scope, such as a worker's receipt.
+    /// #584: explicit Issue-worker continuations read their scoped predecessor
+    /// test/build evidence, without changing ownership or acceptance custody.
     pub fn get_agent_job_for_reader(&self, caller: Uuid, id: Uuid) -> Result<Option<AgentJobRow>> {
         let Some(row) = self.get_agent_job(id)? else {
             return Ok(None);
@@ -627,10 +685,18 @@ impl Store {
         if self.seat_predecessor_job_observable(caller, id)? {
             return Ok(Some(row));
         }
+        if self.worker_predecessor_job_observable(caller, id)? {
+            return Ok(Some(row));
+        }
         if self
             .manager_session_control_scope(caller, owner, false)?
             .is_some()
         {
+            return Ok(Some(row));
+        }
+        // #604: a review worker (launched with `review_of`) reads the
+        // implementer's verification jobs, read only.
+        if self.review_worker_may_read_job(caller, id, owner)? {
             return Ok(Some(row));
         }
         Ok(None)
@@ -643,14 +709,22 @@ impl Store {
         caller: Uuid,
         limit: usize,
     ) -> Result<Vec<AgentJobRow>> {
-        let Some((owners, project)) = self.manager_job_seat_reach(caller)? else {
-            return self.list_agent_jobs(caller, limit);
-        };
+        let worker_predecessors = self.worker_job_predecessors(caller)?;
+        let (owners, project) = self
+            .manager_job_seat_reach(caller)?
+            .unwrap_or((Vec::new(), None));
+        let workers = serde_json::to_string(&worker_predecessors.iter().map(|s|
+            serde_json::json!({"owner":s.id,"project":s.project_id,"cwd":s.sandbox_root}))
+            .collect::<Vec<_>>())?;
         let mut statement = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM agent_jobs WHERE owner_session_id=?1 \
              OR (owner_session_id IN (SELECT value FROM json_each(?2)) \
                  AND (?3 IS NULL OR project_id=?3)) \
-             ORDER BY sequence DESC LIMIT ?4"
+             OR (kind IN ('test','build') AND EXISTS(SELECT 1 FROM json_each(?4) p \
+                 WHERE owner_session_id=json_extract(p.value,'$.owner') \
+                   AND project_id=json_extract(p.value,'$.project') \
+                   AND cwd=json_extract(p.value,'$.cwd'))) \
+             ORDER BY sequence DESC LIMIT ?5"
         ))?;
         let owners = serde_json::to_string(&owners)
             .map_err(|error| DaemonError::Store(format!("job reader owners: {error}")))?;
@@ -660,6 +734,7 @@ impl Store {
                     caller.to_string(),
                     owners,
                     project.map(|id| id.to_string()),
+                    workers,
                     limit as i64
                 ],
                 map_row,
@@ -677,6 +752,19 @@ impl Store {
         ))?;
         let rows = statement
             .query_map(params![owner.to_string()], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every job still `queued` or `running`, oldest first (#646: reclaim must
+    /// not take a build target a job is about to use).
+    pub fn list_open_agent_jobs(&self) -> Result<Vec<AgentJobRow>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM agent_jobs WHERE state IN ('queued','running') \
+             ORDER BY sequence"
+        ))?;
+        let rows = statement
+            .query_map([], map_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -709,7 +797,8 @@ impl Store {
     /// still continue; the wake row does not exist until then. A `wake: none`
     /// job never resumes the session and does not count.
     pub fn session_has_live_owner_wake_job(&self, owner: Uuid) -> Result<bool> {
-        self.conn
+        let own: bool = self
+            .conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE owner_session_id=?1 \
                  AND state IN ('queued','running') \
@@ -717,7 +806,20 @@ impl Store {
                 [owner.to_string()],
                 |row| row.get(0),
             )
-            .map_err(DaemonError::Database)
+            .map_err(DaemonError::Database)?;
+        if own {
+            return Ok(true);
+        }
+        for predecessor in self.worker_job_predecessors(owner)? {
+            for row in self.list_open_agent_jobs_for_owner(predecessor.id)? {
+                if row.job.wake == JobWake::Owner
+                    && self.worker_predecessor_job_observable(owner, row.job.id)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// #2476: the session's wake for a job that just settled is in flight. A
@@ -769,7 +871,10 @@ impl Store {
     pub fn requeue_agent_job_for_deploy(&self, id: Uuid, deploy: Uuid) -> Result<bool> {
         Ok(self.conn.execute(
             "UPDATE agent_jobs SET state='queued', started_at=NULL, exit_code=NULL, \
-             result_json=NULL, finished_at=NULL, wake_job_id=NULL, \
+             result_json=CASE WHEN json_type(result_json,'$.profile_verification')='object' \
+             THEN json_set(json_object('profile_verification',json_extract(result_json,'$.profile_verification')), \
+             '$.profile_verification.completed_commands',0,'$.profile_verification.warning_verdict','pending') \
+             ELSE NULL END, finished_at=NULL, wake_job_id=NULL, \
              params_json=json_set(params_json,'$.held',?3,'$.requeued_by_deploy',?2), \
              row_version=row_version+1 WHERE id=?1 AND state='running'",
             params![id.to_string(), deploy.to_string(), JOB_HELD_FOR_DEPLOY],
@@ -839,6 +944,34 @@ impl Store {
         else {
             return Ok(None);
         };
+        // Trust only the daemon's pre-launch stamp, including when settlement
+        // parses an omitted/forged receipt or recovers after daemon restart.
+        let mut result = result.clone();
+        result.scoped_tool = row
+            .job
+            .result
+            .as_ref()
+            .and_then(|prior| prior.scoped_tool.clone());
+        // Settlement may report completion, but cannot invent or replace the
+        // submit-time binding. Project-authored JSON never enters this field.
+        result.profile_verification = row
+            .job
+            .result
+            .as_ref()
+            .and_then(|prior| prior.profile_verification.as_ref())
+            .map(|prior| {
+                let mut verified = prior.clone();
+                if let Some(completed) = result
+                    .profile_verification
+                    .as_ref()
+                    .filter(|completed| completed.binding == prior.binding)
+                {
+                    verified.completed_commands = completed.completed_commands;
+                    verified.warning_verdict = completed.warning_verdict.clone();
+                }
+                verified
+            });
+        let result = &result;
         let wake_id = wake.then(Uuid::new_v4);
         let result_json =
             serde_json::to_string(result).map_err(|e| DaemonError::Store(e.to_string()))?;
@@ -880,7 +1013,9 @@ impl Store {
                 created_at: now,
                 updated_at: now,
                 wake_mode: WakeMode::Resume,
-                wake_session_id: Some(job.owner_session_id),
+                wake_session_id: Some(
+                    self.worker_job_completion_recipient(job.owner_session_id, job.id)?,
+                ),
             };
             insert_scheduled_job_conn(&tx, &scheduled)?;
         }
@@ -906,6 +1041,7 @@ mod tests {
             project_id: None,
             name: Some("check".into()),
             params: JobParams::Build(BuildJobParams {
+                release_members: Vec::new(),
                 command: BuildCommand::Check,
                 package: None,
                 workspace: true,
@@ -914,6 +1050,7 @@ mod tests {
                 no_default_features: false,
                 features: Vec::new(),
                 shards: Vec::new(),
+                bins: Vec::new(),
                 cpu_quota_percent: None,
                 sha: None,
             }),
@@ -931,6 +1068,143 @@ mod tests {
             exit_code: Some(0),
             ..AgentJobResultV1::default()
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn profile_binding_is_daemon_only_immutable_and_survives_settlement() {
+        use rsi_common::agent_jobs::{ProfileVerificationBindingV1, ProfileVerificationV1};
+        let store = store();
+        let new = new_job(Uuid::new_v4(), None);
+        let now = Utc::now();
+        store.insert_agent_job(&new, now).unwrap();
+        let binding = ProfileVerificationBindingV1 {
+            version: 1,
+            head: "a".repeat(40),
+            cwd: new.cwd.clone(),
+            clean: true,
+            profile_digest: "b".repeat(64),
+            tools: vec![],
+            argv: vec![],
+            commands: 1,
+            warning_policy: "generic".into(),
+        };
+        store
+            .record_agent_job_profile_verification(new.id, &binding)
+            .unwrap();
+        assert!(
+            store
+                .requeue_agent_job_for_deploy(new.id, Uuid::new_v4())
+                .unwrap()
+        );
+        let queued = store.get_agent_job(new.id).unwrap().unwrap().job;
+        assert_eq!(
+            queued.result.unwrap().profile_verification.unwrap().binding,
+            binding
+        );
+        assert!(store.start_queued_agent_job(new.id, now).unwrap());
+        assert!(
+            store
+                .record_agent_job_profile_verification(new.id, &binding)
+                .is_err()
+        );
+        let mut forged = binding.clone();
+        forged.head = "c".repeat(40);
+        let report = AgentJobResultV1 {
+            profile_verification: Some(ProfileVerificationV1 {
+                binding: forged,
+                completed_commands: 999,
+                warning_verdict: "generic_command_exit".into(),
+            }),
+            ..done()
+        };
+        store
+            .settle_agent_job(new.id, JobState::Succeeded, &report, false, now)
+            .unwrap();
+        let evidence = store
+            .get_agent_job(new.id)
+            .unwrap()
+            .unwrap()
+            .job
+            .result
+            .unwrap()
+            .profile_verification
+            .unwrap();
+        assert_eq!(evidence.binding, binding);
+        assert_eq!(evidence.completed_commands, 0);
+        assert_eq!(evidence.warning_verdict, "pending");
+        let unstamped = new_job(Uuid::new_v4(), None);
+        store.insert_agent_job(&unstamped, now).unwrap();
+        store
+            .settle_agent_job(unstamped.id, JobState::Succeeded, &report, false, now)
+            .unwrap();
+        assert!(
+            store
+                .get_agent_job(unstamped.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .result
+                .unwrap()
+                .profile_verification
+                .is_none()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn daemon_tool_provenance_survives_settlement_and_is_refreshed_after_requeue() {
+        use rsi_common::agent_jobs::{ScopedToolFileV1, ScopedToolProvenanceV1, ScopedToolSource};
+        let store = store();
+        let new = new_job(Uuid::new_v4(), None);
+        let now = Utc::now();
+        store.insert_agent_job(&new, now).unwrap();
+        let mut provenance = ScopedToolProvenanceV1 {
+            source: ScopedToolSource::Candidate,
+            path: "/sandbox/scripts/scoped-test".into(),
+            rev: Some("a".repeat(40)),
+            files: vec![ScopedToolFileV1 {
+                path: "/sandbox/scripts/scoped-test".into(),
+                blob: Some("b".repeat(40)),
+            }],
+        };
+        store
+            .record_agent_job_scoped_tool(new.id, &provenance)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_agent_job(new.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .result
+                .unwrap()
+                .scoped_tool,
+            Some(provenance.clone())
+        );
+        let deploy = Uuid::new_v4();
+        assert!(store.requeue_agent_job_for_deploy(new.id, deploy).unwrap());
+        assert_eq!(
+            store.get_agent_job(new.id).unwrap().unwrap().job.result,
+            None
+        );
+        assert!(store.start_queued_agent_job(new.id, now).unwrap());
+        provenance.source = ScopedToolSource::Sandbox;
+        provenance.rev = Some("c".repeat(40));
+        store
+            .record_agent_job_scoped_tool(new.id, &provenance)
+            .unwrap();
+        let mut reported = done();
+        let mut forged = provenance.clone();
+        forged.source = ScopedToolSource::Rolling;
+        reported.scoped_tool = Some(forged);
+        reported.receipt = Some(serde_json::json!({"ok":true,"tool":{"source":"rolling"}}));
+        store
+            .settle_agent_job(new.id, JobState::Succeeded, &reported, false, now)
+            .unwrap();
+        let finished = store.get_agent_job(new.id).unwrap().unwrap().job;
+        assert_eq!(finished.result.unwrap().scoped_tool, Some(provenance));
+        assert_eq!(finished.state, JobState::Succeeded);
     }
 
     /// #2278: a running job a deploy stopped goes back to `queued` under its own
@@ -1313,6 +1587,7 @@ mod tests {
             let mut sweep = new_job(owner, None);
             sweep.params = JobParams::CloudSweep(CloudSweepJobParams {
                 sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                lane: Default::default(),
             });
             upgraded
                 .insert_agent_job(&sweep, Utc::now())
@@ -1349,6 +1624,7 @@ mod tests {
         let mut ids = Vec::new();
         for (index, params) in [
             JobParams::Build(BuildJobParams {
+                release_members: Vec::new(),
                 command: BuildCommand::Check,
                 package: None,
                 workspace: true,
@@ -1357,6 +1633,7 @@ mod tests {
                 no_default_features: false,
                 features: Vec::new(),
                 shards: Vec::new(),
+                bins: Vec::new(),
                 cpu_quota_percent: None,
                 sha: None,
             }),
@@ -1370,7 +1647,10 @@ mod tests {
                 exact: false,
                 lib_only: true,
                 test_target: None,
+                bin: None,
+                features: Vec::new(),
                 candidate_receipt: None,
+                at_commit: None,
                 qa_lane: None,
                 timeout_minutes: None,
                 cpu_quota_percent: None,
@@ -1435,6 +1715,7 @@ mod tests {
         let mut sweep = new_job(owner, None);
         sweep.params = JobParams::CloudSweep(CloudSweepJobParams {
             sha: "0123456789abcdef0123456789abcdef01234567".into(),
+            lane: Default::default(),
         });
         assert!(
             store.insert_agent_job(&sweep, Utc::now()).is_err(),
@@ -1563,6 +1844,118 @@ mod tests {
             store
                 .conn
                 .execute("DELETE FROM agent_jobs WHERE id=?1", [next.id.to_string()])
+                .is_err()
+        );
+    }
+
+    /// #3181: the bench migration widens the kind CHECK to `bench` and keeps every
+    /// row, every column (`started_at` included), the triggers and the sequence.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_bench_migration_admits_the_kind_and_keeps_every_job_column() {
+        use rsi_common::agent_jobs::BenchJobParams;
+        const BENCH_MIGRATION_VERSION: i32 = 187;
+        let store = store();
+        let owner = Uuid::new_v4();
+        let mut expected = Vec::new();
+        for (index, state) in [JobState::Queued, JobState::Running, JobState::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            let new = new_job(owner, Some(&format!("pre-{index}")));
+            let initial = if state == JobState::Queued {
+                JobState::Queued
+            } else {
+                JobState::Running
+            };
+            store
+                .insert_agent_job_in_state(&new, Utc::now(), initial)
+                .unwrap();
+            if state == JobState::Queued {
+                assert!(store.start_queued_agent_job(new.id, Utc::now()).unwrap());
+            }
+            if state.is_terminal() {
+                store
+                    .settle_agent_job(new.id, state, &done(), true, Utc::now())
+                    .unwrap();
+            }
+            expected.push(store.get_agent_job(new.id).unwrap().unwrap().job);
+        }
+        assert!(
+            expected.iter().any(|job| job.started_at.is_some()),
+            "the fixture holds a started_at to preserve"
+        );
+        // A genuine pre-migration table: the head SQL without the `bench` kind.
+        let head_sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(head_sql.contains(",'bench'"));
+        let old_sql = head_sql.replace(",'bench'", "");
+        store
+            .conn
+            .execute_batch(&format!(
+                "DROP TRIGGER agent_jobs_no_delete;
+                 DROP TRIGGER agent_jobs_terminal_immutable;
+                 DROP INDEX agent_jobs_owner_key;
+                 DROP INDEX agent_jobs_by_state;
+                 DROP INDEX agent_jobs_by_owner;
+                 ALTER TABLE agent_jobs RENAME TO agent_jobs_rebuild_old;
+                 {old_sql};
+                 INSERT INTO agent_jobs SELECT * FROM agent_jobs_rebuild_old ORDER BY sequence;
+                 DROP TABLE agent_jobs_rebuild_old;
+                 {}",
+                crate::store::AGENT_JOBS_CLOUD_SWEEP_OBJECTS
+            ))
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "user_version", BENCH_MIGRATION_VERSION - 1)
+            .unwrap();
+        let mut bench = new_job(owner, Some("bench"));
+        bench.params = JobParams::Bench(BenchJobParams {
+            config: "eval/bench/tb2/runs/smoke.toml".into(),
+            budget_usd: 1.0,
+        });
+        assert!(
+            store.insert_agent_job(&bench, Utc::now()).is_err(),
+            "a database before the migration refuses the bench kind"
+        );
+
+        store.migrate_v187(BENCH_MIGRATION_VERSION - 1).unwrap();
+        for old in expected {
+            let kept = store.get_agent_job(old.id).unwrap().unwrap().job;
+            assert_eq!(
+                serde_json::to_value(kept).unwrap(),
+                serde_json::to_value(old).unwrap(),
+                "every column of every job survives the rebuild"
+            );
+        }
+        let (row, replayed) = store.insert_agent_job(&bench, Utc::now()).unwrap();
+        assert!(!replayed);
+        assert_eq!(row.job.kind, JobKind::Bench);
+        let sequences: Vec<i64> = store
+            .conn
+            .prepare("SELECT sequence FROM agent_jobs ORDER BY sequence")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(sequences.len(), 4);
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(store.conn.execute("DELETE FROM agent_jobs", []).is_err());
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET state='running' WHERE state='failed'",
+                    []
+                )
                 .is_err()
         );
     }

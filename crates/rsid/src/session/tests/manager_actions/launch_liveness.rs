@@ -47,7 +47,7 @@ impl ProbeReport {
 }
 
 impl StoreProbe {
-    fn start(store: std::sync::Arc<tokio::sync::Mutex<crate::store::Store>>) -> Self {
+    fn start(store: std::sync::Arc<rsid_core::store_lock::Mutex<crate::store::Store>>) -> Self {
         let probe = Self {
             samples: std::sync::Arc::default(),
             pending_since: std::sync::Arc::default(),

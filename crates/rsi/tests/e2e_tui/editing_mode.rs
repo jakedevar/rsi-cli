@@ -116,7 +116,10 @@ fn make_codex_stub_resumable(h: &E2eHarness) -> E2eResult<()> {
 async fn start_daemon(h: &mut E2eHarness) -> E2eResult<DaemonClient> {
     h.phase = "editing-mode-daemon";
     make_codex_stub_resumable(h)?;
-    h.start_daemon()?;
+    // The Codex stub launches through the daemon's `systemd-run --user --scope`,
+    // which fails with "Failed to connect to user scope bus" inside a test job
+    // that has no user bus (#3663, #3693): use the hermetic scope runner.
+    h.start_daemon_with_fixture_scopes()?;
     h.wait_for_daemon().await
 }
 

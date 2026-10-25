@@ -734,6 +734,29 @@ pub(crate) struct LegacyTerminalRoot {
     pub cleanup_state: SandboxCleanupState,
 }
 
+/// #4047: a `resume` wake (time-based or predicate) whose next fire is
+/// further away than this does not fence a sandbox's build cache: the owner has no job and
+/// nothing to do for this long, and it rebuilds the target when it resumes.
+/// Six hours is longer than any wake a worker arms to wait out its own work
+/// (a job, a review, a merge-queue landing: minutes to a couple of hours,
+/// where a cold cache would cost the resume a rebuild it did not expect) and
+/// far shorter than the multi-day parks a provider reset or an operator hold
+/// produces, which pinned 22 GiB of two idle Codex workers at the hub disk
+/// floor. A pending predicate (`when`) wake is re-armed every 5-60 s (capped
+/// at its deadline), so a far `next_fire_at` there is a provider-hold
+/// deferral, not a subject about to complete. Terminal watches have no known
+/// fire time and keep fencing.
+pub(crate) const PARKED_WAKE_RECLAIM_HORIZON_HOURS: i64 = 6;
+
+/// Whether `next_fire_at` (the stored RFC3339 timestamp of a wake) lies more
+/// than [`PARKED_WAKE_RECLAIM_HORIZON_HOURS`] after `now`.
+/// An unparsable timestamp is never beyond the horizon: fail closed.
+fn parked_wake_is_beyond_reclaim_horizon(next_fire_at: &str, now: chrono::DateTime<Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(next_fire_at).is_ok_and(|at| {
+        at.with_timezone(&Utc) > now + chrono::Duration::hours(PARKED_WAKE_RECLAIM_HORIZON_HOURS)
+    })
+}
+
 impl Store {
     pub fn ordinary_session_path_inside_live_custody_root(&self, session_id: Uuid) -> Result<bool> {
         let working_dir = self
@@ -1426,6 +1449,7 @@ impl Store {
         binding: SessionCustodyBinding,
         held: Option<CustodyRootGuard>,
     ) -> Result<Session> {
+        self.verify_session_rotation_restore_gate(session_id)?;
         if self.source_worktree_settlement_blocks_unarchive(session_id)? {
             return Err(DaemonError::InvalidParam(
                 "settled source worktree is historical and cannot be unarchived".into(),
@@ -1447,6 +1471,7 @@ impl Store {
         // verified, ownerless Purged terminal state. Pre-V83 rows have no
         // aggregate link, but must still carry the matching historical
         // projection left by `mark_sandbox_purged`.
+        super::sessions::verify_session_rotation_restore_gate_on(&tx, session_id)?;
         let restored = tx.execute(
             "UPDATE sessions
              SET status='Completed',
@@ -1820,6 +1845,18 @@ impl Store {
     /// A committed direct launch that cannot pass its first authorization or
     /// pre-provider preparation remains auditable but is never executable.
     pub fn fail_bound_direct_launch(&mut self, session_id: Uuid, error_code: &str) -> Result<()> {
+        self.fail_bound_direct_launch_detailed(session_id, error_code, None)
+    }
+
+    /// `fail_bound_direct_launch` plus the bounded, already redacted text of the
+    /// underlying error (#3640): the `terminal_reason` keeps its static class and
+    /// the System event that explains the failure carries the detail.
+    pub fn fail_bound_direct_launch_detailed(
+        &mut self,
+        session_id: Uuid,
+        error_code: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1857,7 +1894,17 @@ impl Store {
             &tx,
             session_id,
             &format!("launch_failed:{error_code}"),
-            &format!("Launch failed before the provider produced any output: {error_code}"),
+            &match detail.map(|d| {
+                d.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(300)
+                    .collect::<String>()
+            }) {
+                Some(detail) if !detail.trim().is_empty() => format!(
+                    "Launch failed before the provider produced any output: {error_code}: {detail}"
+                ),
+                _ => format!("Launch failed before the provider produced any output: {error_code}"),
+            },
         )?;
         tx.commit()?;
         Ok(())
@@ -3813,6 +3860,24 @@ impl Store {
             .is_some())
     }
 
+    /// #582: whether an enabled terminal watch owned by a worker is moot for
+    /// build-cache reclaim. A watch only tells the worker that its launcher
+    /// ended (a message-delivery watch, #3364, or a watch on a session in its
+    /// parent chain, e.g. a manager's terminal watch); once the worker's
+    /// latest turn carries its final report, firing it resumes nothing worth
+    /// protecting, so it must not pin the finished worker's target. Any other
+    /// watch (its own children) and every non-terminal wake still fences.
+    fn terminal_watch_is_moot(&self, name: &str, mode: &str, owner: &str) -> Result<bool> {
+        let Some(watched) = mode.strip_prefix("on_terminal:") else {
+            return Ok(false);
+        };
+        let Ok(owner) = Uuid::parse_str(owner) else {
+            return Ok(false);
+        };
+        let watched: Vec<Uuid> = Uuid::parse_str(watched).into_iter().collect();
+        self.finished_worker_launcher_watch(owner, &watched, name)
+    }
+
     /// The first live consumer that fences this custody's `target/`, named for
     /// the reclaim report (#1575): `enabled_wake`, `restart_intent`,
     /// `manager_seat`, `running_job` or `manager_current_session`.
@@ -3823,16 +3888,43 @@ impl Store {
     ) -> Result<Option<&'static str>> {
         // Predicate (`when`) wakes also use the durable `resume` mode.
         // Terminal watches resume their owner, not the watched child.
-        let wake: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sandbox_custody_roots r
-             JOIN scheduled_jobs j ON j.wake_session_id=r.owner_session_id
-             WHERE r.custody_id=?1 AND r.generation=?2 AND j.enabled=1
-               AND (j.wake_mode='resume' OR j.wake_mode LIKE 'on_terminal:%'))",
-            params![custody_id.to_string(), generation as i64],
-            |row| row.get(0),
-        )?;
-        if wake {
-            return Ok(Some("enabled_wake"));
+        //
+        // #3364: a message-delivery terminal watch (`agent-message-*`) owned by
+        // a worker whose latest turn already carries its final report is moot:
+        // the watch fire retires it without resuming the worker (#2501,
+        // `finished_worker_launcher_watch`), so it must not pin the finished
+        // worker's build cache. Every other enabled wake still fences.
+        //
+        // #4047: a `resume` wake (time-based or predicate) whose `next_fire_at`
+        // is more than `PARKED_WAKE_RECLAIM_HORIZON_HOURS` away does not
+        // fence: the owner rebuilds on resume. A pending predicate is
+        // re-armed every poll (5-60 s, capped at its deadline), so a far
+        // value means a deferral (provider hold), not an imminent subject.
+        // Terminal watches keep fencing (no known fire time). Jobs, restart
+        // intents and the seat checks below are untouched, and the filesystem
+        // pass still refuses a sandbox with a live process.
+        let wakes: Vec<(String, String, String, String)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT j.name,j.wake_mode,r.owner_session_id,j.next_fire_at
+                 FROM sandbox_custody_roots r
+                 JOIN scheduled_jobs j ON j.wake_session_id=r.owner_session_id
+                 WHERE r.custody_id=?1 AND r.generation=?2 AND j.enabled=1
+                   AND (j.wake_mode='resume' OR j.wake_mode LIKE 'on_terminal:%')",
+            )?;
+            statement
+                .query_map(params![custody_id.to_string(), generation as i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let now = Utc::now();
+        for (name, mode, owner, next_fire_at) in wakes {
+            if mode == "resume" && parked_wake_is_beyond_reclaim_horizon(&next_fire_at, now) {
+                continue;
+            }
+            if !self.terminal_watch_is_moot(&name, &mode, &owner)? {
+                return Ok(Some("enabled_wake"));
+            }
         }
         // Reclaim migration fixtures can precede the V134 restart journal.
         // An existing catalog must remain readable: errors fail closed.
@@ -4592,7 +4684,7 @@ pub(super) fn bind_on(
 /// for it under the Store (a busy stripe drops the Store and retries), so a long
 /// maintenance proof on this root delays only this unarchive (#1172).
 pub async fn restore_archived_session_with_fresh_custody_store_first(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     session_id: Uuid,
     binding: SessionCustodyBinding,
 ) -> Result<Session> {
@@ -4605,7 +4697,7 @@ pub async fn restore_archived_session_with_fresh_custody_store_first(
 /// Continue): Store first, then the replacement root's stripe without waiting
 /// for it under the Store (#1172).
 pub async fn replace_terminal_session_custody_store_first(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     session_id: Uuid,
     terminal_custody_id: Uuid,
     binding: SessionCustodyBinding,
@@ -4619,7 +4711,7 @@ pub async fn replace_terminal_session_custody_store_first(
 /// then the transfer root's stripe without waiting for it under the Store
 /// (#1172).
 pub async fn fail_established_retry_successor_store_first(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     session_id: Uuid,
     bound: BoundRotationCustody,
     code: SandboxCustodyErrorCodeV1,

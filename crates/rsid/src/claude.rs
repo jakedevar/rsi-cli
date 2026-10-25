@@ -169,6 +169,40 @@ pub struct LaunchConfig {
     /// spawn chokepoint from `crate::structured_handoff`, never by a caller;
     /// `false` leaves every argv exactly as it was.
     pub structured_handoff: bool,
+    /// #3176: where a Harness session's `shell`, `exec_command` and
+    /// `write_stdin` run. `Host` (the default) is the daemon host. A container
+    /// target is set only by daemon code (never by `LaunchSessionParams` or an
+    /// agent verb), validated against the operator's `bench.docker_hosts`, the
+    /// container's compose labels and a pinned image digest before binding and
+    /// before every launch, continuation and rotation, and stored durably per
+    /// session (`session_exec_targets`). A container-bound session never falls
+    /// back to the host.
+    pub exec_target: rsi_common::exec_target::ExecTarget,
+    /// #3177: the bench launch profile. Set only by daemon code (never by
+    /// `LaunchSessionParams` or an agent verb). It selects the bench base prompt
+    /// in place of the worktree base, forces the bench tool allowlist, and
+    /// requires the Harness route (a launch that cannot prove it is refused
+    /// `bench_route_required:<reason>` before any process starts). A session
+    /// bound to a container exec target is always a bench session, so a
+    /// continuation or rotation of one keeps the profile (see
+    /// [`LaunchConfig::bench`]).
+    pub bench_profile: Option<rsi_common::bench_profile::BenchLaunchProfile>,
+    /// #3177: per-launch loop knobs. Each `Some` overrides the daemon-global
+    /// setting (iteration cap, compaction budget, context rotation) for this
+    /// session only; no global setting changes. Default: no override.
+    pub loop_knobs: rsi_common::bench_profile::LoopKnobs,
+}
+
+impl LaunchConfig {
+    /// The bench profile this launch runs under: the explicit one, or the
+    /// default for a session bound to a container exec target (a container
+    /// target is built by daemon code only, and always means a benchmark task).
+    #[must_use]
+    pub fn bench(&self) -> Option<rsi_common::bench_profile::BenchLaunchProfile> {
+        self.bench_profile
+            .clone()
+            .or_else(|| self.exec_target.is_container().then(Default::default))
+    }
 }
 
 /// MCP server name for the agent-control gateway. Claude lists its tools as
@@ -180,6 +214,11 @@ const CLAUDE_DISALLOWED_TOOLS_ARG: &str =
     "--disallowedTools=ScheduleWakeup,CronCreate,CronDelete,CronList";
 
 pub(crate) const AGENT_MCP_SERVER_NAME: &str = "rsi-agent";
+
+/// #3565: the Claude Code override of its `<total_tokens>` reminder and the
+/// value that turns it off. Set on every launch of a managed session.
+pub(crate) const CLAUDE_TOTAL_TOKENS_REMINDER_ENV: &str = "CLAUDE_CODE_TOTAL_TOKENS_REMINDER";
+pub(crate) const CLAUDE_TOTAL_TOKENS_REMINDER_OFF: &str = "off";
 
 /// #2758: the tool arguments of a read-only Claude session, in `=` form because
 /// both flags are variadic. `--tools` names the built-in tools that exist at all
@@ -268,6 +307,23 @@ pub(crate) fn claude_subagent_env(
 pub(crate) fn same_claude_model(a: &str, b: &str) -> bool {
     use rsi_common::claude_catalog::strip_context_variant_suffix;
     strip_context_variant_suffix(a).eq_ignore_ascii_case(strip_context_variant_suffix(b))
+}
+
+fn claude_billing_cap(
+    runtime: &crate::config::RuntimeConfig,
+    model: Option<&str>,
+    login: rsi_common::provider_login::ProviderLoginMethod,
+) -> Option<f64> {
+    let modes = runtime.provider_billing_modes.read();
+    let mode = rsi_common::provider_billing::resolve(
+        "Claude",
+        model,
+        modes.get("claude_billing_mode").map(String::as_str),
+        Some(login.as_str()),
+    );
+    mode.is_metered()
+        .then(|| runtime.claude_max_budget_usd())
+        .flatten()
 }
 
 /// The `--fallback-model` chain a Claude CLI launch of `model` passes (#2762):
@@ -385,8 +441,8 @@ pub(crate) fn apply_bedrock_launch_env(
 /// a prompt that starts with the session's startup preamble
 /// ([`crate::session::preamble::startup_parts`] for its kind and working
 /// directory, the head a fresh launch composes) passes the rest only and
-/// defers the preamble to the hook, when it fits the hook's cap. A prompt that
-/// carries the preamble but is too long keeps it. Any other launch (a resumed
+/// defers the preamble to the hooks, split at startup part boundaries when it
+/// exceeds the per-hook cap. An indivisible part over that cap keeps the prompt. Any other launch (a resumed
 /// turn) puts back a preamble the hook never delivered, in front of its prompt,
 /// unless the prompt already starts with it.
 pub(crate) fn claude_launch_system_prompt(
@@ -413,11 +469,11 @@ pub(crate) fn claude_launch_system_prompt(
     })
 }
 
-/// `(preamble, rest)` when `prompt` starts with the session's startup preamble.
+/// `(parts, rest)` when `prompt` starts with the session's startup preamble.
 fn split_startup_preamble(
     config: &LaunchConfig,
     prompt: Option<&str>,
-) -> Option<(String, Option<String>)> {
+) -> Option<(Vec<String>, Option<String>)> {
     let prompt = prompt?;
     let parts = crate::session::preamble::startup_parts(
         config.session_kind.unwrap_or_default(),
@@ -428,23 +484,21 @@ fn split_startup_preamble(
     }
     let preamble = parts.join("\n\n");
     if prompt == preamble {
-        return Some((preamble, None));
+        return Some((parts, None));
     }
     let rest = prompt.strip_prefix(&format!("{preamble}\n\n"))?.to_string();
-    Some((preamble, Some(rest)))
+    Some((parts, Some(rest)))
 }
 
 fn deferred_or_kept(
     session_id: uuid::Uuid,
     prompt: Option<&str>,
-    (preamble, rest): (String, Option<String>),
+    (parts, rest): (Vec<String>, Option<String>),
 ) -> Option<String> {
-    if !crate::session_start_preamble::fits(&preamble) {
-        tracing::info!(%session_id, chars = preamble.chars().count(), "preamble over the SessionStart context cap; it stays in the prompt");
-        crate::session_start_preamble::forget(session_id);
+    if !crate::session_start_preamble::defer_parts(session_id, &parts) {
+        tracing::info!(%session_id, "preamble part over the SessionStart context cap; it stays in the prompt");
         return prompt.map(str::to_string);
     }
-    crate::session_start_preamble::defer(session_id, preamble);
     rest
 }
 
@@ -1056,6 +1110,18 @@ impl ClaudeClient {
         // stopped-task notifications can abort the next --resume before a reply.
         cmd.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
 
+        // #3565: Claude Code (2.1.305) appends a `<total_tokens>N tokens left`
+        // reminder after every tool result for models that advertise the
+        // capability (`totalTokensReminder`, default `padded-countdown`), 36-47k
+        // tokens per manager seat. rsid measures context fill itself (usage
+        // events, the #1005/#1254 caps), so the model-side counter carries
+        // nothing the rotation depends on. `CLAUDE_CODE_TOTAL_TOKENS_REMINDER`
+        // is the CLI's own override and wins over its settings and rollout.
+        cmd.env(
+            CLAUDE_TOTAL_TOKENS_REMINDER_ENV,
+            CLAUDE_TOTAL_TOKENS_REMINDER_OFF,
+        );
+
         // #2763: subagent governance. Each variable is set only when the
         // operator chose a value, so the defaults leave the environment exactly
         // as it was (the CLI keeps its own model inheritance and its default
@@ -1094,18 +1160,22 @@ impl ClaudeClient {
             .rsi_session_token
             .as_ref()
             .and_then(|_| boundary_mail_hook_command(self.boundary_mail_hook_path.as_deref(), &[]));
-        if let Some(command) = hook_command.as_deref() {
-            // #2766: plus the operator's lifecycle hooks; an empty set (the
-            // default) is exactly the custody and mail hooks.
-            cmd.arg("--settings")
-                .arg(rsi_common::provider_lifecycle_hooks::claude_settings_json(
-                    command, lifecycle,
-                ));
-        }
-        // hub #2919: the session's `SessionStart` hook carries the preamble.
         let session_start_hook = hook_command.is_some()
             && lifecycle
                 .contains(rsi_common::provider_lifecycle_hooks::LifecycleHookEvent::SessionStart);
+        // Prepare the debt before installing handlers so this launch installs
+        // exactly one handler per chunk, also retained for compact/clear.
+        let launch_system_prompt = claude_launch_system_prompt(config, session_start_hook);
+        let parts = config
+            .rsi_session_id
+            .map_or(1, crate::session_start_preamble::part_count);
+        if let Some(command) = hook_command.as_deref() {
+            cmd.arg("--settings").arg(
+                rsi_common::provider_lifecycle_hooks::claude_settings_json_with_parts(
+                    command, lifecycle, parts,
+                ),
+            );
+        }
 
         // #2767: explicit skills delivery. The repository's `.claude/skills`
         // become one content-addressed plugin (`rsi-skills`) named by the launch,
@@ -1148,7 +1218,7 @@ impl ClaudeClient {
 
         // Optional system prompt. hub #2919: without a `SessionStart` hook
         // this is exactly `config.system_prompt`.
-        if let Some(prompt) = claude_launch_system_prompt(config, session_start_hook) {
+        if let Some(prompt) = launch_system_prompt {
             cmd.args([format!("--system-prompt={prompt}")]);
         }
 
@@ -1183,7 +1253,11 @@ impl ClaudeClient {
             if !chain.is_empty() {
                 cmd.args([format!("--fallback-model={}", chain.join(","))]);
             }
-            if let Some(usd) = runtime_config.claude_max_budget_usd() {
+            let login = crate::provider_login::ProviderLoginService::global()
+                .login(crate::provider_login::LoginProvider::Claude);
+            if let Some(usd) =
+                claude_billing_cap(runtime_config, config.model.as_deref(), login.method)
+            {
                 cmd.args([format!("--max-budget-usd={usd}")]);
             }
         }
@@ -1454,6 +1528,9 @@ mod tests {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 
@@ -1752,6 +1829,7 @@ for arg in "$@"; do
 done
 printf '%s|%s|%s|%s|%s' "${CARGO_TARGET_DIR:-}" "${TMPDIR:-}" "${RSI_PROCESS_OWNERSHIP_NAMESPACE:-}" "${RSI_SESSION_ID:-}" "${RSI_MODEL_INVOCATION_ID:-}" > "$(dirname "$0")/claude_exec_env.txt"
 printf '%s' "${CLAUDE_CODE_DISABLE_BACKGROUND_TASKS:-}" > "$(dirname "$0")/claude_background_tasks_env.txt"
+printf '%s' "${CLAUDE_CODE_TOTAL_TOKENS_REMINDER-UNSET}" > "$(dirname "$0")/claude_total_tokens_env.txt"
 printf '%s|%s' "${CLAUDE_CODE_SUBAGENT_MODEL-UNSET}" "${CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS-UNSET}" > "$(dirname "$0")/claude_subagent_env.txt"
 printf '{"type":"result","subtype":"turn_completed","usage":{"input_tokens":0,"output_tokens":0}}\n'
 "#,
@@ -2062,6 +2140,9 @@ worker prompt body\n\
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
         assert_eq!(config.query, "Hello");
         assert_eq!(config.max_turns, Some(5));
@@ -2163,6 +2244,36 @@ worker prompt body\n\
             let event = rx.recv().await.expect("terminal result");
             assert_eq!(event.event_type, "result");
             assert_eq!(event.data["subtype"], "turn_completed");
+        }
+    }
+
+    /// #3565: every managed Claude launch (fresh and resumed) carries the CLI's
+    /// own switch that turns the per-tool-call `<total_tokens>` reminder off.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn claude_launch_turns_the_total_tokens_reminder_off() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (binary_path, _args_path) = install_fake_claude(tmp.path());
+        let client = test_client(binary_path);
+
+        for resume_session_id in [None, Some("previous-turn".to_string())] {
+            let mut config = launch_config_for_provider_test("How is it now?");
+            config.resume_session_id = resume_session_id;
+            let (mut process, _rx) = client
+                .launch(
+                    &config,
+                    CliExecutionCapability::for_test(RuntimeExecutionRoute::ClaudeCli),
+                )
+                .expect("launch fake claude");
+            assert!(process.wait().await.expect("wait fake claude").success());
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("claude_total_tokens_env.txt"))
+                    .expect("read total tokens environment"),
+                "off",
+                "the reminder must be off for resume {:?}",
+                config.resume_session_id
+            );
         }
     }
 
@@ -2389,6 +2500,7 @@ worker prompt body\n\
         lifecycle: Option<&str>,
         sibling: bool,
         session_id: uuid::Uuid,
+        project_preamble: &str,
         system_prompt: impl FnOnce(&str) -> Option<String>,
     ) -> (Vec<String>, String) {
         let tmp = TempDir::new().expect("tempdir");
@@ -2414,7 +2526,7 @@ worker prompt body\n\
             "ROUTER",
         )
         .expect("router");
-        std::fs::write(shared.join("worker_preamble.md"), "WORKER PREAMBLE").expect("preamble");
+        std::fs::write(shared.join("worker_preamble.md"), project_preamble).expect("preamble");
         let preamble = crate::session::preamble::startup_parts(
             rsi_common::types::SessionKind::Standard,
             &project,
@@ -2452,9 +2564,13 @@ worker prompt body\n\
     async fn a_session_start_launch_moves_the_preamble_from_the_system_prompt_to_the_hook() {
         let session = uuid::Uuid::new_v4();
         let rest = "## RSI session identity\nYou are running as provider `Claude`.";
-        let (args, preamble) = session_start_launch(Some("SessionStart"), true, session, |p| {
-            Some(format!("{p}\n\n{rest}"))
-        })
+        let (args, preamble) = session_start_launch(
+            Some("SessionStart"),
+            true,
+            session,
+            "WORKER PREAMBLE",
+            |p| Some(format!("{p}\n\n{rest}")),
+        )
         .await;
         assert!(
             preamble.starts_with("ROUTER\n\nWORKER PREAMBLE"),
@@ -2479,6 +2595,56 @@ worker prompt body\n\
         crate::session_start_preamble::forget(session);
     }
 
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn long_preambles_use_numbered_hooks_unless_a_part_exceeds_the_cap() {
+        use crate::session_start_preamble::{claim_part_for_hook, forget};
+        use rsi_common::provider_lifecycle_hooks::MAX_SESSION_START_CONTEXT_CHARS;
+        for project_chars in [7000, MAX_SESSION_START_CONTEXT_CHARS + 1] {
+            let session = uuid::Uuid::new_v4();
+            let (args, preamble) = session_start_launch(
+                Some("SessionStart"),
+                true,
+                session,
+                &"P".repeat(project_chars),
+                |p| Some(format!("{p}\n\nREST")),
+            )
+            .await;
+            assert!(preamble.chars().count() > MAX_SESSION_START_CONTEXT_CHARS);
+            if project_chars > MAX_SESSION_START_CONTEXT_CHARS {
+                assert_eq!(
+                    system_prompt_arg(&args),
+                    Some(format!("{preamble}\n\nREST"))
+                );
+                assert!(claim_part_for_hook(session, "startup", Some(1)).is_none());
+            } else {
+                assert_eq!(system_prompt_arg(&args).as_deref(), Some("REST"));
+                let position = args.iter().position(|arg| arg == "--settings").unwrap();
+                let settings: serde_json::Value =
+                    serde_json::from_str(&args[position + 1]).unwrap();
+                let handlers = settings["hooks"]["SessionStart"][0]["hooks"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(handlers.len(), 2);
+                let mut bodies = Vec::new();
+                for (index, handler) in handlers.iter().enumerate() {
+                    assert!(
+                        handler["command"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with(&format!("--session-start-part={}", index + 1))
+                    );
+                    let claim = claim_part_for_hook(session, "startup", Some(index + 1)).unwrap();
+                    assert!(claim.text.chars().count() <= MAX_SESSION_START_CONTEXT_CHARS);
+                    bodies.push(claim.text.split_once("\n\n").unwrap().1.to_string());
+                }
+                assert_eq!(bodies.join("\n\n"), preamble);
+            }
+            forget(session);
+        }
+    }
+
     /// hub #2919: a preamble the hook never claimed goes back in front of the
     /// next turn's system prompt, once.
     #[cfg(unix)]
@@ -2486,17 +2652,26 @@ worker prompt body\n\
     #[tokio::test]
     async fn a_missed_claude_session_start_hook_falls_back_to_the_system_prompt() {
         let session = uuid::Uuid::new_v4();
-        let (first, preamble) =
-            session_start_launch(Some("SessionStart"), true, session, |p| Some(p.to_string()))
-                .await;
+        let (first, preamble) = session_start_launch(
+            Some("SessionStart"),
+            true,
+            session,
+            "WORKER PREAMBLE",
+            |p| Some(p.to_string()),
+        )
+        .await;
         assert_eq!(
             system_prompt_arg(&first),
             None,
             "the whole prompt was the preamble"
         );
-        let (resumed, _) = session_start_launch(Some("SessionStart"), true, session, |_| {
-            Some("CONTEXT".to_string())
-        })
+        let (resumed, _) = session_start_launch(
+            Some("SessionStart"),
+            true,
+            session,
+            "WORKER PREAMBLE",
+            |_| Some("CONTEXT".to_string()),
+        )
         .await;
         assert_eq!(
             system_prompt_arg(&resumed),
@@ -2506,9 +2681,13 @@ worker prompt body\n\
             crate::session_start_preamble::claim_for_hook(session, "resume"),
             None
         );
-        let (again, _) = session_start_launch(Some("SessionStart"), true, session, |_| {
-            Some("CONTEXT".to_string())
-        })
+        let (again, _) = session_start_launch(
+            Some("SessionStart"),
+            true,
+            session,
+            "WORKER PREAMBLE",
+            |_| Some("CONTEXT".to_string()),
+        )
         .await;
         assert_eq!(system_prompt_arg(&again).as_deref(), Some("CONTEXT"));
     }
@@ -2528,11 +2707,12 @@ worker prompt body\n\
         ] {
             let session = uuid::Uuid::new_v4();
             let mut composed = String::new();
-            let (args, _) = session_start_launch(lifecycle, sibling, session, |p| {
-                composed = format!("{p}\n\nREST");
-                Some(composed.clone())
-            })
-            .await;
+            let (args, _) =
+                session_start_launch(lifecycle, sibling, session, "WORKER PREAMBLE", |p| {
+                    composed = format!("{p}\n\nREST");
+                    Some(composed.clone())
+                })
+                .await;
             assert_eq!(system_prompt_arg(&args), Some(composed), "{lifecycle:?}");
             assert!(
                 args.iter().all(|arg| !arg.contains("\"SessionStart\"")),
@@ -3249,6 +3429,12 @@ with open(folder + '/alive.lock', 'w') as lock:
                 .expect("runtime config")
                 .update_field("claude_max_budget_usd", &serde_json::json!(5))
                 .expect("budget cap");
+            client
+                .runtime_config
+                .as_ref()
+                .expect("runtime config")
+                .update_field("claude_billing_mode", &serde_json::json!("metered_api"))
+                .expect("metered fixture");
             let (mut process, _rx) = client
                 .launch(
                     &config,
@@ -3375,6 +3561,9 @@ with open(folder + '/alive.lock', 'w') as lock:
             runtime
                 .update_field("claude_max_budget_usd", &budget)
                 .expect("budget");
+            runtime
+                .update_field("claude_billing_mode", &serde_json::json!("metered_api"))
+                .expect("metered fixture");
             let mut config = launch_config_for_provider_test("q");
             config.model = Some(model.to_string());
             let (mut process, _rx) = client
@@ -3431,6 +3620,50 @@ with open(folder + '/alive.lock', 'w') as lock:
             &["claude-haiku-4-5".to_string()],
         );
         assert!(bedrock.is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn subscription_launches_use_plan_limits_and_metered_launches_keep_dollar_caps() {
+        use rsi_common::provider_login::ProviderLoginMethod;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("claude_max_budget_usd", &serde_json::json!(5))
+            .unwrap();
+        assert_eq!(
+            claude_billing_cap(
+                &runtime,
+                Some("claude-opus-5"),
+                ProviderLoginMethod::ClaudeAi
+            ),
+            None
+        );
+        assert_eq!(
+            claude_billing_cap(&runtime, Some("claude-opus-5"), ProviderLoginMethod::ApiKey),
+            Some(5.0)
+        );
+        runtime
+            .update_field("claude_billing_mode", &serde_json::json!("subscription"))
+            .unwrap();
+        assert_eq!(
+            claude_billing_cap(
+                &runtime,
+                Some("us.anthropic.claude-opus-5-v1:0"),
+                ProviderLoginMethod::ClaudeAi
+            ),
+            Some(5.0)
+        );
+        runtime
+            .update_field("claude_billing_mode", &serde_json::json!("metered_api"))
+            .unwrap();
+        assert_eq!(
+            claude_billing_cap(
+                &runtime,
+                Some("claude-opus-5"),
+                ProviderLoginMethod::ClaudeAi
+            ),
+            Some(5.0)
+        );
     }
 
     /// #2767 golden argv: `ambient` (the default) passes no `--plugin-dir`;

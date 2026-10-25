@@ -21,6 +21,10 @@ pub const SANDBOX_BUILD_CACHE_RECLAIM_MAX_CANDIDATES_MAX: u32 = 1024;
 /// hold, so a single noisy reason cannot hide the others (#1575).
 pub const SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX: usize = 24;
 pub const SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON: usize = 4;
+/// Live-consumer refusals are all named, outside the two bounds above (#3364):
+/// the operator needs to see which consumer pins each target, not a sample of
+/// four. This is the separate, larger bound on that one reason.
+pub const SANDBOX_BUILD_CACHE_LIVE_CONSUMER_SAMPLES_MAX: usize = 256;
 /// Longest subject (a top-level `target/` entry name, a process id) a refusal
 /// check carries; longer names are cut, never rejected.
 pub const SANDBOX_RECLAIM_CHECK_SUBJECT_MAX: usize = 40;
@@ -183,6 +187,21 @@ impl SandboxBuildCacheReclaimSkipReason {
             Self::LiveConsumer => "live_consumer",
             Self::TargetUnrecognizedContent => "target_unrecognized_content",
         }
+    }
+
+    /// True for a per-pass budget (bytes, wall time, filesystem or recovery
+    /// entries) that resets at the next pass. A staged reclaim that stops on
+    /// one is resumed by the next pass's intent sweep, so it is not friction
+    /// (#222). `DepthBudget` is not here: it is a property of the tree, and a
+    /// later pass meets the same depth.
+    pub const fn resumes_next_pass(self) -> bool {
+        matches!(
+            self,
+            Self::ByteBudget
+                | Self::DurationBudget
+                | Self::FilesystemEntryBudget
+                | Self::RecoveryEntryBudget
+        )
     }
 }
 
@@ -447,6 +466,11 @@ pub struct SandboxBuildCacheReclaimReportV2 {
     /// #2682 decode it as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stray_targets: Option<SandboxStrayTargetsV1>,
+    /// The registered manager build targets under `<data dir>/build-targets`
+    /// (#3261): bytes held live versus reclaimable, and why each kept one is
+    /// kept. Payloads from before #3261 decode it as absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_targets: Option<SandboxBuildTargetsV1>,
     /// RFC3339 time (nanoseconds) the daemon computed this report. Set on a
     /// status read served from the daemon's preview cache (#2604); absent on
     /// older payloads and on a pass report.
@@ -508,6 +532,96 @@ pub struct SandboxSharedTargetReclaimV1 {
     pub reclaimed_bytes: u64,
     /// An earlier pass's staged deletion is still unfinished.
     pub staged_pending: bool,
+}
+
+/// Most build targets one report names; the totals still count the rest.
+pub const SANDBOX_BUILD_TARGETS_SAMPLES_MAX: usize = 64;
+
+/// Where a registered build target stands (#3261).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBuildTargetState {
+    /// A live consumer holds it (a running job, an installed link or a deploy
+    /// root): it is in use and stays.
+    Live,
+    /// Idle past the age floor with every proof passing: the scratch proof
+    /// would delete it.
+    Reclaimable,
+    /// Kept for the named reason (too young, unpublished git history, ...).
+    Kept,
+}
+
+/// One registered build target and what the scratch pass decided about it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxBuildTargetV1 {
+    /// The allocation's directory name under `build-targets` (never a path).
+    pub name: String,
+    pub state: SandboxBuildTargetState,
+    /// A closed token naming why it stays or why it is reclaimable.
+    pub reason: String,
+    /// Seconds since the newest write below it, when established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    /// Allocated bytes, when the bounded walk covered it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// The worktree the target was allocated for, when it was recorded (#646).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// An open job working in that worktree, when one is known (#646).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+}
+
+/// The registered build targets one pass saw.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxBuildTargetsV1 {
+    /// Targets found, including those past the sample bound.
+    pub total_count: u32,
+    /// Bytes of targets a live consumer holds (a lower bound).
+    pub live_bytes: u64,
+    /// Bytes of targets the pass would reclaim.
+    pub reclaimable_bytes: u64,
+    /// Bytes of targets kept for a reason.
+    pub kept_bytes: u64,
+    /// Largest first, at most [`SANDBOX_BUILD_TARGETS_SAMPLES_MAX`].
+    pub entries: Vec<SandboxBuildTargetV1>,
+}
+
+impl SandboxBuildTargetsV1 {
+    pub fn validate_wire(&self) -> Result<(), &'static str> {
+        if self.entries.len() > SANDBOX_BUILD_TARGETS_SAMPLES_MAX {
+            return Err("build-target sample is unbounded");
+        }
+        for entry in &self.entries {
+            if entry.name.is_empty() || entry.name.len() > 255 || entry.name.contains('/') {
+                return Err("build-target name is not a directory name");
+            }
+            if entry.reason.is_empty()
+                || entry.reason.len() > SANDBOX_RECLAIM_CHECK_TOKEN_MAX
+                || !entry.reason.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err("build-target reason is not a bounded token");
+            }
+            if entry
+                .worktree
+                .as_deref()
+                .is_some_and(|text| text.len() > 4096 || text.chars().any(char::is_control))
+            {
+                return Err("build-target worktree is not a bounded path");
+            }
+            if entry.job_id.as_deref().is_some_and(|text| {
+                text.is_empty()
+                    || text.len() > 64
+                    || !text.bytes().all(|byte| byte.is_ascii_graphic())
+            }) {
+                return Err("build-target job id is not a bounded token");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Most stray entries one report carries; the totals still count the rest.
@@ -610,12 +724,45 @@ impl SandboxBuildCacheReclaimReportV2 {
         if let Some(strays) = &self.stray_targets {
             strays.validate_wire()?;
         }
+        if let Some(targets) = &self.build_targets {
+            targets.validate_wire()?;
+        }
         Ok(self)
     }
 }
 
+/// Whether a report's refusal list has no room left for another sample of
+/// `reason`: the shared sample bound and per-reason bound for every reason but
+/// a live consumer, which is named in full under its own bound (#3364). The
+/// daemon's collector and [`validate_refusals`] agree through this one rule.
+pub fn sandbox_refusal_samples_full(
+    refusals: &[SandboxBuildCacheReclaimRefusalV2],
+    reason: SandboxBuildCacheReclaimSkipReason,
+) -> bool {
+    let live = refusals
+        .iter()
+        .filter(|sample| sample.reason == SandboxBuildCacheReclaimSkipReason::LiveConsumer)
+        .count();
+    if reason == SandboxBuildCacheReclaimSkipReason::LiveConsumer {
+        return live >= SANDBOX_BUILD_CACHE_LIVE_CONSUMER_SAMPLES_MAX;
+    }
+    let for_reason = refusals
+        .iter()
+        .filter(|sample| sample.reason == reason)
+        .count();
+    refusals.len() - live >= SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX
+        || for_reason >= SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON
+}
+
 fn validate_refusals(refusals: &[SandboxBuildCacheReclaimRefusalV2]) -> Result<(), &'static str> {
-    if refusals.len() > SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX {
+    let live = refusals
+        .iter()
+        .filter(|refusal| refusal.reason == SandboxBuildCacheReclaimSkipReason::LiveConsumer)
+        .count();
+    if live > SANDBOX_BUILD_CACHE_LIVE_CONSUMER_SAMPLES_MAX {
+        return Err("sandbox target-cache live-consumer refusal list is unbounded");
+    }
+    if refusals.len() - live > SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX {
         return Err("sandbox target-cache refusal sample is unbounded");
     }
     let mut per_reason: BTreeMap<SandboxBuildCacheReclaimSkipReason, usize> = BTreeMap::new();
@@ -625,6 +772,9 @@ fn validate_refusals(refusals: &[SandboxBuildCacheReclaimRefusalV2]) -> Result<(
             || !refusal.check.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err("sandbox target-cache refusal check is not a bounded token");
+        }
+        if refusal.reason == SandboxBuildCacheReclaimSkipReason::LiveConsumer {
+            continue;
         }
         let count = per_reason.entry(refusal.reason).or_insert(0);
         *count += 1;
@@ -848,6 +998,24 @@ fn is_rfc3339_timestamp(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_per_pass_budgets_resume_next_pass() {
+        let resuming: Vec<_> = SandboxBuildCacheReclaimSkipReason::ALL
+            .into_iter()
+            .filter(|reason| reason.resumes_next_pass())
+            .map(SandboxBuildCacheReclaimSkipReason::as_str)
+            .collect();
+        assert_eq!(
+            resuming,
+            [
+                "recovery_entry_budget",
+                "filesystem_entry_budget",
+                "byte_budget",
+                "duration_budget",
+            ]
+        );
+    }
+
     fn report() -> SandboxBuildCacheReclaimReport {
         let config = SandboxBuildCacheReclaimConfig {
             enabled: true,
@@ -1041,6 +1209,7 @@ mod tests {
             refusals: Vec::new(),
             shared_target: None,
             stray_targets: None,
+            build_targets: None,
             computed_at: None,
             age_ms: None,
         }
@@ -1139,6 +1308,38 @@ mod tests {
             .map(|_| refusal(Reason::TargetAbsent, "target_absent"))
             .collect();
         assert!(one_noisy_reason.validate_wire().is_err());
+
+        // Live consumers are named in full, past the per-reason sample, up to
+        // their own bound (#3364).
+        let mut all_live = report_v2();
+        all_live.refusals = (0..SANDBOX_BUILD_CACHE_LIVE_CONSUMER_SAMPLES_MAX)
+            .map(|_| refusal(Reason::LiveConsumer, "live_consumer:enabled_wake"))
+            .collect();
+        all_live.refusals.extend(
+            (0..SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON)
+                .map(|_| refusal(Reason::TargetAbsent, "target_absent")),
+        );
+        assert!(all_live.clone().validate_wire().is_ok());
+        assert!(sandbox_refusal_samples_full(
+            &all_live.refusals,
+            Reason::LiveConsumer
+        ));
+        // Fifteen fenced candidates are all named, not four.
+        let fifteen: Vec<_> = (0..15)
+            .map(|_| refusal(Reason::LiveConsumer, "live_consumer:enabled_wake"))
+            .collect();
+        assert!(!sandbox_refusal_samples_full(
+            &fifteen,
+            Reason::LiveConsumer
+        ));
+        assert!(!sandbox_refusal_samples_full(
+            &fifteen,
+            Reason::TargetAbsent
+        ));
+        all_live
+            .refusals
+            .push(refusal(Reason::LiveConsumer, "live_consumer:enabled_wake"));
+        assert!(all_live.validate_wire().is_err());
 
         let mut bad_token = report_v2();
         bad_token.refusals = vec![refusal(Reason::LiveConsumer, "has space")];

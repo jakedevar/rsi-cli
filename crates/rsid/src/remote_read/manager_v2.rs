@@ -17,7 +17,7 @@ use rsi_common::harness_manager_v2::{
 };
 use rsi_common::remote_manager_v2::{
     CONVERSATION_PAGE_LIMIT, CONVERSATION_TEXT_BYTES, ConversationItemV2, ConversationRequestV2,
-    ConversationResponseV2, IDEMPOTENCY_PREFIX, ListManagerSeatsRequestV2,
+    ConversationResponseV2, IDEMPOTENCY_PREFIX, ItemKindV2, ListManagerSeatsRequestV2,
     ListManagerSeatsResponseV2, ManagerSeatV2, ProjectSeatsV2, RECENT_OPERATOR_MESSAGES,
     REFUSAL_IDEMPOTENCY_CONFLICT, REFUSAL_INVALID_MESSAGE, REFUSAL_SEAT_NOT_LIVE,
     REFUSAL_SEAT_OUT_OF_SCOPE, SeatRoleV2, SendMessageReceiptV2, SendMessageRequestV2, SpeakerV2,
@@ -26,7 +26,6 @@ use rsi_common::remote_manager_v2::{
 use rsi_common::rpc::RpcRequest;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -61,7 +60,7 @@ pub(super) fn parse_conversation(rpc: &RpcRequest) -> Result<ConversationRequest
 
 pub(super) fn spawn_list_seats_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ListManagerSeatsRequestV2,
 ) -> Result<JoinHandle<RemoteReadCompleted<ListManagerSeatsResponseV2>>> {
     limiter.spawn(move |budget| {
@@ -76,7 +75,7 @@ pub(super) fn spawn_list_seats_read(
 
 pub(super) fn spawn_conversation_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ConversationRequestV2,
 ) -> Result<JoinHandle<RemoteReadCompleted<ConversationResponseV2>>> {
     limiter.spawn(move |budget| {
@@ -248,7 +247,7 @@ pub(crate) fn conversation(
                 sequence: row.sequence,
                 speaker: if row.operator {
                     SpeakerV2::Operator
-                } else if row.assistant {
+                } else if row.assistant || row.kind != ItemKindV2::Message {
                     SpeakerV2::Manager
                 } else {
                     SpeakerV2::System
@@ -257,6 +256,10 @@ pub(crate) fn conversation(
                 truncated,
                 created_at: row.created_at,
                 operator_message_id: row.operator_message_id,
+                kind: row.kind,
+                tool_name: row.tool_name,
+                tool_use_id: row.tool_use_id,
+                idempotency_key: row.idempotency_key,
             }
         })
         .collect();
@@ -861,15 +864,118 @@ mod seat_tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
+    fn tool_events_share_one_call_id_and_message_fields_stay_as_they_were() {
+        let store = Store::open_in_memory().unwrap();
+        let fixture = project_with_manager(&store, "Alpha");
+        let seat = fixture.manager;
+        message(&store, seat, 1, Role::Assistant, "running the gate", None);
+        let tool = |sequence: i32, event_type: EventType, role: Option<Role>, content: &str| {
+            store
+                .insert_event(&ConversationEvent {
+                    id: 0,
+                    session_id: seat,
+                    sequence,
+                    event_type,
+                    role,
+                    content: content.into(),
+                    tool_name: Some("Bash".into()),
+                    tool_input: Some(Box::new(
+                        serde_json::json!({"command": "SECRET-TOKEN-INPUT"}),
+                    )),
+                    created_at: Utc::now(),
+                    offload_id: None,
+                    tool_use_id: Some("toolu_01ABC".into()),
+                    metadata: None,
+                })
+                .unwrap()
+        };
+        tool(2, EventType::ToolUse, Some(Role::Assistant), "cargo check");
+        tool(3, EventType::ToolResult, None, "Finished dev");
+        // An oversized call id is omitted, never cut: the app must not pair on
+        // a prefix.
+        store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: seat,
+                sequence: 4,
+                event_type: EventType::ToolUse,
+                role: Some(Role::Assistant),
+                content: "long id".into(),
+                tool_name: Some("Bash".into()),
+                tool_input: None,
+                created_at: Utc::now(),
+                offload_id: None,
+                tool_use_id: Some("x".repeat(300)),
+                metadata: None,
+            })
+            .unwrap();
+        message(&store, seat, 5, Role::Assistant, "done", None);
+
+        let page = conversation(
+            &store,
+            &ConversationRequestV2 {
+                project_id: fixture.project,
+                seat_session_id: seat,
+                before: None,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        let by_sequence = |sequence: i32| {
+            page.items
+                .iter()
+                .find(|item| item.sequence == sequence)
+                .unwrap()
+        };
+        let (call, result) = (by_sequence(2), by_sequence(3));
+        assert_eq!(call.kind, ItemKindV2::ToolUse);
+        assert_eq!(result.kind, ItemKindV2::ToolResult);
+        assert_eq!(call.tool_use_id.as_deref(), Some("toolu_01ABC"));
+        assert_eq!(call.tool_use_id, result.tool_use_id);
+        assert_eq!(call.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(call.text, "cargo check");
+        assert_eq!(result.text, "Finished dev");
+        assert_eq!(call.speaker, SpeakerV2::Manager);
+        assert_eq!(result.speaker, SpeakerV2::Manager);
+        assert_eq!(by_sequence(4).tool_use_id, None);
+        // The tool input never leaves the store.
+        let wire = serde_json::to_string(&page).unwrap();
+        assert!(!wire.contains("SECRET-TOKEN-INPUT"), "{wire}");
+
+        // A message item keeps exactly its pre-#3797 fields and values.
+        let first = by_sequence(1);
+        assert_eq!(first.kind, ItemKindV2::Message);
+        assert_eq!(first.speaker, SpeakerV2::Manager);
+        assert_eq!(first.text, "running the gate");
+        let json = serde_json::to_value(first).unwrap();
+        let object = json.as_object().unwrap();
+        for key in [
+            "id",
+            "sequence",
+            "speaker",
+            "text",
+            "truncated",
+            "created_at",
+            "operator_message_id",
+        ] {
+            assert!(object.contains_key(key), "{key} missing: {json}");
+        }
+        assert_eq!(object.len(), 7, "a message item adds no new field: {json}");
+        assert_eq!(page.items.len(), 5, "tool rows count against the page");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
     fn a_sent_message_is_delivered_at_the_boundary_and_reads_back_as_the_operators() {
         let mut store = Store::open_in_memory().unwrap();
         let fixture = project_with_manager(&store, "Alpha");
+        let key = Uuid::new_v4();
         let sent = send(
             &mut store,
             fixture.project,
             fixture.manager,
             "ship the migration",
-            Uuid::new_v4(),
+            key,
         )
         .unwrap();
 
@@ -902,6 +1008,9 @@ mod seat_tests {
         assert_eq!(page.items[0].speaker, SpeakerV2::Operator);
         assert_eq!(page.items[0].text, "ship the migration");
         assert_eq!(page.items[0].operator_message_id, Some(sent.message_id));
+        assert_eq!(page.items[0].idempotency_key, Some(key));
+        assert_eq!(page.operator_messages[0].message_id, sent.message_id);
+        assert_eq!(page.operator_messages[0].idempotency_key, Some(key));
         assert_eq!(page.operator_messages[0].state, "delivered");
         assert!(page.operator_messages[0].delivered_at.is_some());
     }

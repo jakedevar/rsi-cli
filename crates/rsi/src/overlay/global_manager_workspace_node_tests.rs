@@ -76,8 +76,11 @@ fn fleet(active: u64) -> ManagerNodeFleetV1 {
             active,
             windows: Default::default(),
         }],
+        plan_windows: Vec::new(),
+        plan_usage_by_role: Vec::new(),
         agents_truncated: false,
         usage_truncated: false,
+        provider_windows: Vec::new(),
     }
 }
 
@@ -583,6 +586,7 @@ fn a_child_seats_rotations_list_under_its_row_in_a_node_console() {
         model: None,
         context_fill_pct: Some(88.0),
         cost_usd: None,
+        launch_turn: None,
         updated_at: Utc::now(),
     }];
     let state = node_state(node, Utc::now());
@@ -652,4 +656,67 @@ fn node_overview_serializes_any_effort_display_and_round_trips() {
     );
     let restored: ManagerNodeWorkspaceV1 = serde_json::from_value(value).unwrap();
     assert_eq!(restored, workspace);
+}
+
+#[tokio::test]
+async fn newer_daemon_policy_renders_overview_with_one_connected_build_skew_banner() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _theme = crate::ui::theme::pin_theme_state();
+    let f = super::tests::fixture();
+    let mut app = crate::app::app_test_helpers::with_session_list(0);
+    app.projects = vec![f.a.clone(), f.b.clone()];
+    let daemon = fake_daemon(&mut app).await;
+    let daemon_sha = if env!("RSI_BUILD_SHA") == "f".repeat(40) {
+        "a".repeat(40)
+    } else {
+        "f".repeat(40)
+    };
+    daemon.serve(
+        "GetDaemonInfo",
+        serde_json::json!({
+            "build_sha": daemon_sha, "started_at": "2026-10-23T00:00:00Z",
+            "uptime_secs": 1, "schema_version": 1, "disk_free": {}, "future_info_field": true
+        }),
+    );
+    let mut newer = serde_json::to_value(global_node(&f)).unwrap();
+    newer["grant"]["project_policy"]["future_policy_field"] = serde_json::json!(true);
+    newer["grant"]["allowed_launches"][0]["future_launch_field"] = serde_json::json!(true);
+    daemon.serve("GetManagerNodeWorkspace", newer);
+    app.start_bootstrap();
+    while !app.poll.connected {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), app.bootstrap.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.apply_bootstrap_event(event);
+    }
+    assert_eq!(app.daemon_build_sha.as_deref(), Some(daemon_sha.as_str()));
+    open_node(&mut app, ManagerNodeRefV1::Portfolio { node_id: GLOBAL_1 }).await;
+    let OverlayState::GlobalManagerWorkspace(state) = &app.overlay else {
+        panic!("console open")
+    };
+    assert_eq!(state.seats().len(), 3);
+    for width in [72, 120] {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+        for _ in 0..2 {
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .chunks(usize::from(width))
+                .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("global manager"), "{text}");
+            assert!(text.contains("rsi"), "{text}");
+            assert!(text.contains(env!("RSI_BUILD_SHA")), "{text}");
+            assert!(text.contains(&daemon_sha), "{text}");
+            let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("Restart with rsi."), "{text}");
+            assert_eq!(text.matches("TUI build").count(), 1);
+        }
+    }
 }

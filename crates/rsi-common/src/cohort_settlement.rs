@@ -15,6 +15,8 @@ pub const SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS: usize = 256;
 pub const SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const SOURCE_WORKTREE_SETTLEMENT_MAX_IDEMPOTENCY_KEY_BYTES: usize = 128;
 pub const SOURCE_WORKTREE_SETTLEMENT_MAX_IDENTITY_BYTES: usize = 4096;
+/// #149: the bound on the unproven survivors one settlement run records.
+pub const SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS: usize = 64;
 pub const SOURCE_WORKTREE_EMPTY_DEPENDENCY_DIGEST: &str =
     "sha256:b50aed72a3b9d4061f8e64f357fb844a53b5eb2cab0e3d096ccc69df32804464";
 pub const SOURCE_WORKTREE_EMPTY_SESSION_PATH_DEPENDENCY_DIGEST: &str =
@@ -277,6 +279,13 @@ pub struct ListSourceWorktreeCohortsParams {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditSourceWorktreeCohortParams {
+    /// Exclusive custody-key selection hint; never removal authority.
+    #[serde(
+        default,
+        with = "optional_canonical_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_custody_id: Option<Uuid>,
     pub repository_identity: String,
 }
 
@@ -290,6 +299,13 @@ impl AuditSourceWorktreeCohortParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentAuditSourceWorktreeCohortParams {
+    /// Exclusive custody-key selection hint; never removal authority.
+    #[serde(
+        default,
+        with = "optional_canonical_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_custody_id: Option<Uuid>,
     pub repository_identity: String,
     /// Omitted: summary when nothing is applyable, full otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +328,13 @@ pub enum AgentSourceWorktreeAuditFieldsV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplySourceWorktreeCohortParams {
+    /// Exclusive custody-key selection hint; never removal authority.
+    #[serde(
+        default,
+        with = "optional_canonical_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after_custody_id: Option<Uuid>,
     pub repository_identity: String,
     pub plan_digest: Sha256Digest,
     pub authorization: String,
@@ -678,9 +701,26 @@ fn validate_retained_roots(
     Ok(())
 }
 
+/// One bounded detail page of a complete, capped V120 identity snapshot.
+/// Follow `last_custody_id` only when `has_more`; a changed snapshot digest
+/// means a new traversal. All roots outside this page remain unexamined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceWorktreeAuditTraversalV1 {
+    #[serde(with = "optional_canonical_uuid_serde")]
+    pub after_custody_id: Option<Uuid>,
+    #[serde(with = "canonical_uuid_serde")]
+    pub last_custody_id: Uuid,
+    pub has_more: bool,
+    pub snapshot_root_count: u32,
+    pub snapshot_digest: Sha256Digest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceWorktreeCohortAuditV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traversal: Option<SourceWorktreeAuditTraversalV1>,
     pub schema_version: u32,
     pub policy_version: u32,
     pub repository_identity: String,
@@ -757,6 +797,26 @@ impl SourceWorktreeCohortAuditV1 {
             return Err("audit report wrote state or exceeds the bounded root count".into());
         }
         validate_audit_counts(&self.counts, self.items.len())?;
+        if let Some(page) = &self.traversal {
+            validate_uuid(page.last_custody_id)?;
+            if let Some(after) = page.after_custody_id {
+                validate_uuid(after)?;
+                if after >= page.last_custody_id {
+                    return Err("audit traversal does not advance".into());
+                }
+            }
+            if self.items.is_empty()
+                || page.snapshot_root_count as usize > SOURCE_WORKTREE_BATCH_MAX_SCAN_ROOTS
+                || page.snapshot_root_count < self.counts.observed
+                || self.items.iter().any(|item| {
+                    page.after_custody_id
+                        .is_some_and(|after| item.custody_id <= after)
+                        || item.custody_id > page.last_custody_id
+                })
+            {
+                return Err("audit traversal does not cover its bounded page".into());
+            }
+        }
         validate_retained_roots(&self.last_run_retained_roots, false)?;
         if !self.last_run_retained_roots.is_empty() && self.run_id.is_none() {
             return Err("audit retained roots need the run that recorded them".into());
@@ -901,6 +961,115 @@ pub struct SourceWorktreeRetainedRootV1 {
     pub diagnostic: Option<String>,
 }
 
+/// Why settlement could not prove a surviving process's ownership (#149).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceWorktreeUnprovenReasonV1 {
+    /// The kernel withheld the process environment (`KERN_PROCARGS2`), as it
+    /// does for a platform or hardened binary, so its RSI stamps are unread.
+    EnvironmentWithheldByMacos,
+}
+
+impl SourceWorktreeUnprovenReasonV1 {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EnvironmentWithheldByMacos => "environment_withheld_by_macos",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "environment_withheld_by_macos" => Ok(Self::EnvironmentWithheldByMacos),
+            other => Err(format!("unknown settlement unproven reason {other}")),
+        }
+    }
+
+    /// The operator-facing wording.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EnvironmentWithheldByMacos => "environment withheld by macOS",
+        }
+    }
+}
+
+/// A live process of the daemon's user that a settlement run's orphan scan
+/// could not prove belongs to the cohort, so it was never signalled (#149).
+/// It is recorded only with path evidence: `session_id`, `custody_id` and
+/// `sandbox_root` name the run root its working directory lies in, and are
+/// all absent when it lies in the cohort repository instead. The operator may
+/// stop it by hand. Never accepted in a request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceWorktreeUnprovenSurvivorV1 {
+    pub sequence: u32,
+    pub pid: u32,
+    pub start_time_micros: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    #[serde(
+        default,
+        with = "optional_canonical_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub session_id: Option<Uuid>,
+    #[serde(
+        default,
+        with = "optional_canonical_uuid_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub custody_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_root: Option<String>,
+    pub reason: SourceWorktreeUnprovenReasonV1,
+}
+
+impl SourceWorktreeUnprovenSurvivorV1 {
+    /// The root this process holds, or `None` for the cohort repository.
+    pub fn holds_root(&self) -> bool {
+        self.sandbox_root.is_some()
+    }
+}
+
+/// Shape check for a run's unproven survivors (#149): bounded, sequences
+/// `0..n`, a positive pid, and a root named entirely or not at all.
+pub fn validate_unproven_survivors(
+    survivors: &[SourceWorktreeUnprovenSurvivorV1],
+) -> Result<(), String> {
+    if survivors.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS {
+        return Err("settlement unproven survivors exceed their bound".into());
+    }
+    for (index, survivor) in survivors.iter().enumerate() {
+        if survivor.sequence as usize != index {
+            return Err("settlement unproven survivor sequence is not canonical".into());
+        }
+        if survivor.pid == 0 || survivor.pid > i32::MAX as u32 {
+            return Err("settlement unproven survivor pid is invalid".into());
+        }
+        if survivor.start_time_micros > i64::MAX as u64 {
+            return Err("settlement unproven survivor start time is invalid".into());
+        }
+        if let Some(executable) = &survivor.executable {
+            validate_bounded_text(executable, "unproven survivor executable", false)?;
+        }
+        match (
+            survivor.session_id,
+            survivor.custody_id,
+            &survivor.sandbox_root,
+        ) {
+            (None, None, None) => {}
+            (Some(session_id), Some(custody_id), Some(root)) => {
+                validate_uuid(session_id)?;
+                validate_uuid(custody_id)?;
+                validate_bounded_text(root, "unproven survivor sandbox root", false)?;
+            }
+            _ => {
+                return Err("settlement unproven survivor names a partial root".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Persisted by the daemon at intent commit; never accepted in an apply request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -979,6 +1148,12 @@ pub struct SourceWorktreeSettlementRunV1 {
     /// `counts.retained` rows.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_roots: Vec<SourceWorktreeRetainedRootV1>,
+    /// Live processes the run's orphan scan could not prove and so never
+    /// signalled (#149, macOS hardened or platform binaries), recorded only
+    /// where their working directory lies in a run root or the cohort
+    /// repository. Empty on Linux and for a run recorded before V188.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproven_survivors: Vec<SourceWorktreeUnprovenSurvivorV1>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1083,6 +1258,7 @@ impl SourceWorktreeSettlementRunV1 {
             return Err("settlement retained roots do not match the retained count".into());
         }
         validate_retained_roots(&self.retained_roots, true)?;
+        validate_unproven_survivors(&self.unproven_survivors)?;
         let terminal = actual
             .settled
             .saturating_add(actual.refused)
@@ -1359,6 +1535,7 @@ mod tests {
                 after_observation: None,
             }],
             retained_roots: Vec::new(),
+            unproven_survivors: Vec::new(),
             created_at: timestamp.clone(),
             updated_at: timestamp,
             finished_at: None,
@@ -1370,6 +1547,7 @@ mod tests {
         let repository_identity = "repo:test".to_string();
         let plan_digest = digest();
         SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: repository_identity.clone(),
@@ -1548,6 +1726,7 @@ mod tests {
         let identity = "/tmp/repository/.git".to_string();
         let plan_digest = digest();
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity.clone(),
             plan_digest: plan_digest.clone(),
             authorization: format!("APPLY {identity} {plan_digest}"),
@@ -1571,6 +1750,7 @@ mod tests {
     fn apply_contract_rejects_digest_phrase_and_key_drift() {
         let identity = "/tmp/repository/.git".to_string();
         let mut params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity.clone(),
             plan_digest: digest(),
             authorization: format!("APPLY {identity} {}", digest()),
@@ -1727,6 +1907,59 @@ mod tests {
         let mut nil = mixed;
         nil.retained_roots[0].custody_id = Uuid::nil();
         assert!(nil.validate_wire().is_err());
+    }
+
+    #[test]
+    fn settlement_receipt_unproven_survivors_are_bounded_and_name_whole_roots() {
+        // #149: a survivor names a whole run root or none (the cohort
+        // repository), in canonical order, and the reason renders for the operator.
+        let survivor = |sequence: u32, root: bool| SourceWorktreeUnprovenSurvivorV1 {
+            sequence,
+            pid: 4242 + sequence,
+            start_time_micros: 1_700_000_000_000_000,
+            executable: Some("/opt/provider/bin/claude".into()),
+            session_id: root.then(Uuid::new_v4),
+            custody_id: root.then(Uuid::new_v4),
+            sandbox_root: root.then(|| "/sandboxes/root-0".to_string()),
+            reason: SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos,
+        };
+        let mut run = settlement_run();
+        run.unproven_survivors = vec![survivor(0, true), survivor(1, false)];
+        let wire = serde_json::to_value(run.clone().validate_wire().unwrap()).unwrap();
+        assert_eq!(
+            wire["unproven_survivors"][0]["reason"],
+            "environment_withheld_by_macos"
+        );
+        assert_eq!(wire["unproven_survivors"][1]["pid"], 4243);
+        assert!(wire["unproven_survivors"][1].get("sandbox_root").is_none());
+        let parsed: SourceWorktreeSettlementRunV1 = serde_json::from_value(wire).unwrap();
+        assert_eq!(parsed.unproven_survivors, run.unproven_survivors);
+        assert!(parsed.unproven_survivors[0].holds_root());
+        assert_eq!(
+            SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos.label(),
+            "environment withheld by macOS"
+        );
+        assert_eq!(
+            SourceWorktreeUnprovenReasonV1::parse("environment_withheld_by_macos"),
+            Ok(SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos)
+        );
+        let legacy = serde_json::to_value(settlement_run()).unwrap();
+        assert!(legacy.get("unproven_survivors").is_none());
+
+        let mut partial = run.clone();
+        partial.unproven_survivors[0].custody_id = None;
+        assert!(partial.validate_wire().is_err());
+        let mut unordered = run.clone();
+        unordered.unproven_survivors[1].sequence = 3;
+        assert!(unordered.validate_wire().is_err());
+        let mut zero = run.clone();
+        zero.unproven_survivors[0].pid = 0;
+        assert!(zero.validate_wire().is_err());
+        let mut over = run;
+        over.unproven_survivors = (0..=SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS as u32)
+            .map(|sequence| survivor(sequence, false))
+            .collect();
+        assert!(over.validate_wire().is_err());
     }
 
     #[test]

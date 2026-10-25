@@ -173,6 +173,15 @@ fn topology_review_reserve_creates_work_and_assignment_with_executor_actor() {
             .unwrap()
     );
     assert_eq!(assignment_row(&f, assignment).0, "allocating");
+    // Both reviewed pipeline starters allocate through this path. The fork
+    // must name the accepted source, even while rolling is at another head.
+    let context: String = f.store.conn.query_row(
+        "SELECT c.payload_json FROM manager_review_assignments a JOIN harness_manager_v2_records c ON c.kind='lifecycle_context' AND c.record_key=a.action_operation_id WHERE a.assignment_id=?1",
+        [assignment.to_string()], |row| row.get(0),
+    ).unwrap();
+    let context: Value = serde_json::from_str(&context).unwrap();
+    assert_eq!(context["source"]["commit"], json!(sha));
+    assert_eq!(context["source"]["historical_commit"], json!(true));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]

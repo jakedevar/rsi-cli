@@ -648,7 +648,12 @@ layer with at least `topology_bulk_fanout_min_openrouter` (operator knob via
 `GetDaemonConfig`/`UpdateDaemonConfig` and the TUI settings row; default 4, `0`
 disables) same-kind session nodes must be OpenRouter; at most 3 session nodes of
 an agent execution run concurrently; manager-requested launches charge
-`max_created_sessions` (`creation_limit`).
+`max_created_sessions` (`creation_limit`) over its rolling `created_sessions_window_hours`
+window, the same count and refusal as a lifecycle `create_session` (#3497). A refusal
+at execute, at launch (the attempt's `error`: `creation_limit: ...`) or from an ancestor
+(`manager_ancestor_allowance_exceeded`) names the window, used/limit, the slots the
+execution needs and when enough creations have left it; the allowance refills on its
+own, so retry after that time (raising the cap is the fallback).
 
 **Errors.** `-32602` with `data: {code, next_action}` (plus `diagnostics[]` for
 definition refusals). Codes include `authority_denied`, `capability_denied`,

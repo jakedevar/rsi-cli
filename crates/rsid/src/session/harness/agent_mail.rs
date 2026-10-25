@@ -10,7 +10,6 @@ use rsi_common::agent_coordination::{
     BoundaryAdmissionV1, BoundaryClassificationV1, BoundaryProviderKindV1, MessageAttemptFenceV1,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[async_trait::async_trait]
@@ -33,7 +32,7 @@ pub(crate) trait HarnessMailDelivery: Send {
 }
 
 pub(crate) struct HarnessAgentMailBoundary {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     arbiter: Arc<AgentMessageArbiter>,
     session_id: Uuid,
     monitor_generation: u64,
@@ -41,7 +40,7 @@ pub(crate) struct HarnessAgentMailBoundary {
 
 impl HarnessAgentMailBoundary {
     pub(crate) fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         arbiter: Arc<AgentMessageArbiter>,
         session_id: Uuid,
         monitor_generation: u64,
@@ -135,7 +134,7 @@ impl HarnessMailBoundary for HarnessAgentMailBoundary {
 }
 
 struct ClaimedHarnessMail {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     grant: Option<Box<ArbitrationGrant>>,
     fence: MessageAttemptFenceV1,
     authority_id: Uuid,
@@ -360,7 +359,9 @@ mod tests {
 
     /// A running session of `provider` with a current turn invocation, a
     /// manager sender, and one queued message for it.
-    fn running_with_mail(provider: SessionProvider) -> (Arc<Mutex<Store>>, Uuid, Uuid, Uuid) {
+    fn running_with_mail(
+        provider: SessionProvider,
+    ) -> (Arc<rsid_core::store_lock::Mutex<Store>>, Uuid, Uuid, Uuid) {
         let store = Store::open_in_memory().expect("store");
         store.set_delivery_boot_id(Uuid::new_v4()).expect("boot id");
         let owner = Uuid::new_v4();
@@ -411,7 +412,12 @@ mod tests {
             .expect("accept")
             .receipt()
             .message_id;
-        (Arc::new(Mutex::new(store)), target, invocation, message_id)
+        (
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
+            target,
+            invocation,
+            message_id,
+        )
     }
 
     fn chat_request() -> ChatRequest {

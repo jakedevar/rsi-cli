@@ -1405,6 +1405,7 @@ async fn landing_uses_the_in_reach_source_sandbox_and_refuses_one_out_of_reach()
     let head = git(&p.repo, &["rev-parse", "HEAD"]);
     let request = |project: Option<Uuid>, source: Uuid, key: &str| {
         rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+            issue: None,
             supersedes: None,
             derive_filters: false,
             fixes_issue: None,
@@ -1414,6 +1415,7 @@ async fn landing_uses_the_in_reach_source_sandbox_and_refuses_one_out_of_reach()
             source_commit: head.clone(),
             test_filters: Vec::new(),
             idempotency_key: key.into(),
+            expedite: None,
         }
     };
     let control = p.manager.agent_control();
@@ -1486,6 +1488,7 @@ async fn a_managers_enqueue_of_a_workers_commit_wakes_the_manager_once_per_outco
     live_leaf(p, worker, g.b, g.b_epic).await;
     let head = git(&p.repo, &["rev-parse", "HEAD"]);
     let request = |key: &str| rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+        issue: None,
         supersedes: None,
         derive_filters: false,
         fixes_issue: None,
@@ -1495,6 +1498,7 @@ async fn a_managers_enqueue_of_a_workers_commit_wakes_the_manager_once_per_outco
         source_commit: head.clone(),
         test_filters: Vec::new(),
         idempotency_key: key.into(),
+        expedite: None,
     };
     let control = p.manager.agent_control();
     let mut entries = Vec::new();
@@ -1626,20 +1630,16 @@ async fn a_sandbox_job_runs_only_in_a_terminal_in_reach_session() {
     let receipt = control
         .agent_submit_job(g.seat, request(done), recorder.clone(), tools())
         .await;
-    if cfg!(target_os = "linux") {
-        let receipt = receipt.unwrap();
-        assert_eq!(receipt.job.owner_session_id, g.seat);
-        let launched = recorder.0.lock().unwrap();
-        assert_eq!(launched.len(), 1);
-        assert!(
-            launched[0].cwd.starts_with(sandbox.path()),
-            "{:?}",
-            launched[0].cwd
-        );
-    } else {
-        // Landing jobs are Linux-only; the authority check still ran first.
-        assert!(code(&receipt.unwrap_err()).contains("job_platform_unsupported"));
-    }
+    // Landing jobs run on every platform since launchd custody (#1209, #193).
+    let receipt = receipt.unwrap();
+    assert_eq!(receipt.job.owner_session_id, g.seat);
+    let launched = recorder.0.lock().unwrap();
+    assert_eq!(launched.len(), 1);
+    assert!(
+        launched[0].cwd.starts_with(sandbox.path()),
+        "{:?}",
+        launched[0].cwd
+    );
 }
 
 /// #1236 (S2): a second root over [C] next to the global over [A, B]. Each
@@ -2042,6 +2042,13 @@ async fn a_portfolio_seat_cannot_continue_a_pm_seat_outside_its_coverage() {
 #[path = "manager_portfolio_levels.rs"]
 mod portfolio_levels;
 
+#[path = "portfolio_profile_verification.rs"]
+mod profile_verification;
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[path = "manager_project_repository.rs"]
+mod project_repository;
+
 /// Post-land review #1272: granted resource limits and lead-action ownership.
 #[path = "manager_review_1272.rs"]
 mod review_1272;
@@ -2121,6 +2128,7 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
         live_leaf(&g.p, worker, g.b, g.b_epic).await;
         let head = git(&g.p.repo, &["rev-parse", "HEAD"]);
         let request = |key: &str| rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+            issue: None,
             supersedes: None,
             derive_filters: false,
             fixes_issue: None,
@@ -2130,6 +2138,7 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
             source_commit: head.clone(),
             test_filters: Vec::new(),
             idempotency_key: key.into(),
+            expedite: None,
         };
         crate::session::effect_fence::seam::install(
             g.seat,
@@ -2166,6 +2175,7 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
         .agent_enqueue_landing_source(
             g.seat,
             rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+                issue: None,
                 supersedes: None,
                 derive_filters: false,
                 fixes_issue: None,
@@ -2175,6 +2185,7 @@ async fn a_landing_enqueue_refuses_a_grant_changed_during_the_source_probe() {
                 source_commit: head,
                 test_filters: Vec::new(),
                 idempotency_key: "steady".into(),
+                expedite: None,
             },
             true,
         )
@@ -2490,12 +2501,10 @@ async fn issue_worker_watch_rearm_follows_portfolio_handoff_and_context_cap() {
         .unwrap();
     crate::session::launch::drop_controller_candidate_test_stream(worker);
     drop(process);
-    for _ in 0..100 {
-        if !p.manager.active.read().await.contains_key(&worker) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // Active removal precedes the finalizer's durable Interrupted write.
+    // Let that write settle before seeding Running for watch repair, or it
+    // can overwrite the fixture and make reconciliation skip the worker.
+    wait_candidate_settled(p, worker, SessionStatus::Interrupted).await;
     p.manager
         .store
         .lock()

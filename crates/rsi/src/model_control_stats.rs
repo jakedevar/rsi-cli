@@ -27,7 +27,7 @@ impl StatsGroup {
             Self::Active => "LIVE MODEL WORK",
             Self::Alerts => "WARNINGS & LIMITS",
             Self::Denied => "BLOCKED REQUESTS",
-            Self::ModelSpend => "SPEND BY MODEL",
+            Self::ModelSpend => "USAGE BY MODEL",
             Self::Tokens => "TOKEN BREAKDOWN",
             Self::Recent => "RECENT ACTIVITY",
             Self::Efficiency => "DELIVERY EFFICIENCY · TODAY (UTC)",
@@ -203,11 +203,11 @@ fn overview_rows(app: &App) -> Vec<StatsRow> {
     let stats = app.cached_usage_stats.as_ref();
     let mut spend = StatsRow::info(
         StatsGroup::Overview,
-        "Total spend",
+        "Metered spend",
         stats
             .map(|s| format!("${:.2}", s.total_cost_usd))
             .unwrap_or_else(loading),
-        "Lifetime recorded model cost across chats. Provider billing may differ from recorded usage.",
+        "Lifetime metered and cloud model usage. Subscription plans contribute tokens and plan windows; provider list-price estimates are excluded.",
     );
     if stats.is_some() {
         spend.tone = StatsTone::Accent;
@@ -323,7 +323,14 @@ fn append_model_rows(rows: &mut Vec<StatsRow>, app: &App) {
         let mut row = StatsRow::info(
             StatsGroup::ModelSpend,
             single_line(&model.model),
-            format!("${:.2} · {} chats", model.cost_usd, model.chats),
+            if model.cost_usd > 0.0 {
+                format!("${:.2} metered · {} chats", model.cost_usd, model.chats)
+            } else {
+                format!(
+                    "{} in / {} out · {} chats",
+                    model.input_tokens, model.output_tokens, model.chats
+                )
+            },
             "Lifetime recorded spend for this model, ordered by highest cost first.",
         );
         row.tone = StatsTone::Accent;
@@ -460,9 +467,14 @@ fn invocation_row(app: &App, group: StatsGroup, invocation: &ModelInvocationView
         ),
         ("Created".into(), record.created_at.clone()),
     ];
-    if let Some(cost) = record.usage.estimated_cost_usd {
+    if let Some(cost) = record.usage.estimated_cost_usd.filter(|_| {
+        crate::provider_billing_view::is_metered(
+            record.provider.as_deref().unwrap_or("Unknown"),
+            record.model.as_deref(),
+        )
+    }) {
         row.details
-            .push(("Recorded cost".into(), format!("${cost:.2}")));
+            .push(("Metered usage".into(), format!("${cost:.2}")));
     }
     if let Some(error) = &record.error_class {
         row.details.push(("Error".into(), error.clone()));
@@ -1164,7 +1176,7 @@ pub(crate) mod tests {
             .filter(|row| row.group == StatsGroup::ModelSpend)
             .collect();
         assert_eq!(models[0].label, "Premium model");
-        assert_eq!(models[0].value, "$125.25 · 0 chats");
+        assert_eq!(models[0].value, "$125.25 metered · 0 chats");
         assert_eq!(models[1].label, "Local model");
         let cache = rows.iter().find(|row| row.label == "Cache reused").unwrap();
         assert_eq!(cache.value, "87.5B  ━━━━━━━━━━");

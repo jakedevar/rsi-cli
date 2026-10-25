@@ -304,6 +304,21 @@ async fn main() -> color_eyre::Result<()> {
     // #1406: `rsi export --clean` / `rsi init --from` are operator CLI
     // commands, not the TUI. They talk to the daemon and exit.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // #3789: `rsi report-issue` needs no daemon (works on an unpaired install).
+    if let Some(parsed) = rsi::report_issue::parse(&args) {
+        let parsed = parsed.unwrap_or_else(|error| {
+            eprintln!("rsi: {error}\n\nusage:\n{}", rsi::report_issue::USAGE);
+            std::process::exit(2);
+        });
+        match rsi::report_issue::run_cli(&parsed) {
+            Ok(text) => println!("{text}"),
+            Err(error) => {
+                eprintln!("rsi: {error}");
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
     if let Some(parsed) = rsi::portable_cli::parse(&args) {
         let command = match parsed {
             Ok(command) => command,
@@ -349,6 +364,7 @@ async fn main() -> color_eyre::Result<()> {
     }));
 
     tracing::info!("rsi TUI starting...");
+    ignore_sigint();
 
     if should_auto_start_daemon() {
         // Auto-start daemon if not running
@@ -388,17 +404,49 @@ async fn main() -> color_eyre::Result<()> {
     let socket_path = DaemonClient::default_socket_path();
     let client = DaemonClient::new(socket_path);
     let mut app = App::new(client);
+    // #3433: a running TUI starts the daemon the way this launch did when its
+    // socket stays unreachable, or shows the exact command to run.
+    app.daemon_recovery.configure(
+        should_auto_start_daemon().then(|| {
+            std::sync::Arc::new(StartupDaemonLauncher {
+                log_dir: log_dir.clone(),
+            }) as std::sync::Arc<dyn rsi::app::daemon_recovery::DaemonLauncher>
+        }),
+        manual_daemon_start_command(),
+    );
 
     // Run event loop
     rsi::event::run_event_loop(&mut terminal, &mut app).await;
 
-    // Clean up pasted image temp files
-    rsi::clipboard::cleanup_paste_dir(&app.paste_dir);
+    // Pasted images may still be named by queued messages: the daemon's
+    // retention rule removes them (local #155), never the TUI.
+    let left = rsi::clipboard::leave_paste_dir_to_daemon(&app.paste_dir);
+    tracing::debug!(left, "pasted images left for daemon retention");
 
     // Terminal restore happens in TerminalGuard::drop at end of scope.
     tracing::info!("rsi TUI exited cleanly");
 
     Ok(())
+}
+
+/// The TUI never dies of a SIGINT (#3434): Ctrl-C is not a quit key, and a
+/// real SIGINT (the terminal outside raw mode, for example while suspended to
+/// an external editor, or a `kill -INT`) must neither close rsi nor be
+/// forwarded to the daemon. A handler, not SIG_IGN, so spawned children keep
+/// the default disposition and the foreground editor still receives its own
+/// Ctrl-C. Must run inside the tokio runtime.
+fn ignore_sigint() {
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+        Ok(mut sigint) => {
+            tokio::spawn(async move {
+                while sigint.recv().await.is_some() {
+                    tracing::info!("ignored SIGINT: rsi quits only with :q or ZZ");
+                }
+            });
+        }
+        Err(error) => tracing::warn!(%error, "cannot install the SIGINT guard"),
+    }
 }
 
 /// Restores the terminal when dropped — on clean exit, `?`-error return, or
@@ -422,6 +470,46 @@ impl Drop for TerminalGuard {
             // now that stderr is visible again.
             eprintln!("rsi crashed; panic details in ~/.rsi/tui.log");
         }
+    }
+}
+
+/// #3433: the startup auto-start, reused by the running TUI's reconnect path so
+/// both share one code path and one unit naming.
+struct StartupDaemonLauncher {
+    log_dir: PathBuf,
+}
+
+impl rsi::app::daemon_recovery::DaemonLauncher for StartupDaemonLauncher {
+    fn start(&self) -> Result<(), String> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            try_auto_start_daemon(&self.log_dir).map_err(|error| error.to_string())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = &self.log_dir;
+            Err("daemon auto-start is not supported on this platform".to_string())
+        }
+    }
+}
+
+/// The command an operator runs by hand to start the daemon, for the banner.
+fn manual_daemon_start_command() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if managed_rsid_service_enabled() {
+            return "systemctl --user start rsid.service".to_string();
+        }
+        return resolve_daemon_launch()
+            .argv
+            .iter()
+            .map(|part| part.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        resolve_daemon_command().display().to_string()
     }
 }
 
@@ -1034,7 +1122,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn managed_socket_connect_succeeds_while_service_activation_is_pending() {
-        let temp = tempfile::tempdir().unwrap();
+        // Short socket dir (#80): the bin cannot reach the lib's test_support.
+        let temp = tempfile::Builder::new()
+            .prefix("rsi-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let path = temp.path().join("daemon.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         super::start_managed_rsid_service_with(&path, |unit| unit == "rsid.socket").unwrap();

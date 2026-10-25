@@ -20,11 +20,20 @@ final class StubGateway: @unchecked Sendable {
         var headers: [String: String] = [:]
         var body = Data()
         var failure: URLError.Code?
+        /// Seconds before the reply arrives (the request stays in flight).
+        var delay: Double = 0
 
         static func json(_ text: String, status: Int = 200, headers: [String: String] = [:]) -> Reply {
             Reply(status: status, headers: headers, body: Data(text.utf8))
         }
         static func fail(_ code: URLError.Code) -> Reply { Reply(failure: code) }
+
+        /// The same reply, `seconds` later.
+        func after(_ seconds: Double) -> Reply {
+            var reply = self
+            reply.delay = seconds
+            return reply
+        }
     }
 
     static let shared = StubGateway()
@@ -32,11 +41,36 @@ final class StubGateway: @unchecked Sendable {
     private let lock = NSLock()
     private var seenRequests: [Seen] = []
     private var queued: [String: [Reply]] = [:]
+    private var inFlight = 0
+    private var operatorInFlight = 0
+    private var peak = 0
+    private var operatorPeak = 0
+    /// Bumped by `reset`, so a late reply to an earlier test is not counted.
+    private(set) var epoch = 0
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
+        epoch += 1
         seenRequests = []
         queued = [:]
+        inFlight = 0
+        operatorInFlight = 0
+        peak = 0
+        operatorPeak = 0
+    }
+
+    /// The most requests in flight at once since the reset: all, and on the
+    /// gateway's operator routes.
+    var peaks: (all: Int, operator: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (peak, operatorPeak)
+    }
+
+    func finished(_ seen: Seen, epoch: Int) {
+        lock.lock(); defer { lock.unlock() }
+        guard epoch == self.epoch else { return }
+        inFlight -= 1
+        if isOperatorRoute(seen.path) { operatorInFlight -= 1 }
     }
 
     /// Queue replies for `METHOD path`; the last one repeats.
@@ -50,15 +84,21 @@ final class StubGateway: @unchecked Sendable {
         return seenRequests
     }
 
-    func respond(_ seen: Seen) -> Reply {
+    func respond(_ seen: Seen) -> (Reply, epoch: Int) {
         lock.lock(); defer { lock.unlock() }
         seenRequests.append(seen)
+        inFlight += 1
+        peak = max(peak, inFlight)
+        if isOperatorRoute(seen.path) {
+            operatorInFlight += 1
+            operatorPeak = max(operatorPeak, operatorInFlight)
+        }
         let route = "\(seen.method) \(seen.path)"
         guard var replies = queued[route], let first = replies.first else {
-            return Reply(status: 404)
+            return (Reply(status: 404), epoch)
         }
         if replies.count > 1 { replies.removeFirst(); queued[route] = replies }
-        return first
+        return (first, epoch)
     }
 }
 
@@ -83,7 +123,42 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
         let seen = StubGateway.Seen(
             method: request.httpMethod ?? "GET", path: request.url?.path ?? "", headers: headers,
             body: body, query: request.url?.query)
-        let reply = StubGateway.shared.respond(seen)
+        let (reply, epoch) = StubGateway.shared.respond(seen)
+        guard reply.delay > 0 else {
+            deliver(reply, seen, epoch)
+            return
+        }
+        // Deliver later on this loading thread's run loop, as URLProtocol requires.
+        let loop = LoadingLoop(loop: CFRunLoopGetCurrent())
+        DispatchQueue.global().asyncAfter(deadline: .now() + reply.delay) {
+            CFRunLoopPerformBlock(loop.loop, CFRunLoopMode.commonModes.rawValue) { self.deliver(reply, seen, epoch) }
+            CFRunLoopWakeUp(loop.loop)
+        }
+    }
+
+    /// The loading thread's run loop, handed to the delivery queue; CFRunLoop
+    /// calls are thread-safe.
+    private struct LoadingLoop: @unchecked Sendable {
+        let loop: CFRunLoop
+    }
+
+    private let state = NSLock()
+    private var stopped = false
+    private var delivered = false
+
+    /// Answer once, unless the task was cancelled meanwhile; either way the
+    /// request leaves the in-flight count.
+    private func deliver(_ reply: StubGateway.Reply, _ seen: StubGateway.Seen, _ epoch: Int) {
+        state.lock()
+        let first = !delivered
+        let answer = first && !stopped
+        delivered = true
+        state.unlock()
+        if answer { send(reply) }
+        if first { StubGateway.shared.finished(seen, epoch: epoch) }
+    }
+
+    private func send(_ reply: StubGateway.Reply) {
         if let code = reply.failure {
             client?.urlProtocol(self, didFailWithError: URLError(code))
             return
@@ -96,7 +171,16 @@ final class StubProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocolDidFinishLoading(self)
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        state.lock()
+        stopped = true
+        state.unlock()
+    }
+}
+
+extension ReadRetry {
+    /// The standard attempts and backoff, with no waiting (tests).
+    static let instant = ReadRetry(jitter: { 1 }, sleep: { _ in })
 }
 
 private let projectId = "proj-1"
@@ -109,7 +193,8 @@ private let receiptKey = "33333333-3333-4333-8333-333333333333"
 private func stubbedClient() -> RemoteClient {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubProtocol.self]
-    return RemoteClient(host: "hub.example.ts.net", session: URLSession(configuration: configuration))
+    return RemoteClient(
+        host: "hub.example.ts.net", session: URLSession(configuration: configuration), retry: .instant)
 }
 
 private func signIn(csrf: String = "csrf-1") {

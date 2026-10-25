@@ -137,6 +137,37 @@ impl RpcServer {
         )?)
     }
 
+    pub(super) async fn handle_clear_provider_usage_hold(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        if request.session_token.is_some() {
+            return Err(DaemonError::PolicyDenied(
+                "ClearProviderUsageHold is operator-only".into(),
+            ));
+        }
+        let params: rsi_common::rpc::ClearProviderUsageHoldParams =
+            serde_json::from_value(request.params.clone())
+                .map_err(|error| DaemonError::InvalidParam(error.to_string()))?;
+        let now = chrono::Utc::now();
+        let store = self.session_manager.store().lock().await;
+        store.invalidate_provider_rate_limits(params.provider, now)?;
+        self.session_manager
+            .event_bus()
+            .publish(DaemonEvent::ProviderRateLimitUpdated {
+                snapshot: rsi_common::rpc::ProviderRateLimitSnapshot::invalidated(
+                    params.provider,
+                    now,
+                ),
+            });
+        for job_id in store.release_provider_window_holds(now)? {
+            self.session_manager
+                .event_bus()
+                .publish(DaemonEvent::ManagerNoticeQueued { job_id });
+        }
+        Ok(serde_json::json!({"provider": params.provider, "cleared": true}))
+    }
+
     pub(super) async fn handle_get_efficiency_metrics(
         &self,
         request: &RpcRequest,
@@ -669,9 +700,17 @@ impl RpcServer {
                 think: false,
                 keep_alive: Some("60m".to_string()),
             };
+            // The operator's explicit call always tries the endpoint (#261);
+            // its outcome still feeds the helper breaker.
             crate::ollama_client::generate(
                 &self.ollama_http,
-                &target.model,
+                &crate::memory::helper_breaker::HelperCall {
+                    purpose: rsi_common::model_control::ModelInvocationPurpose::TextGenerateRpc
+                        .as_str(),
+                    setting_key: "-",
+                    model: &target.model,
+                    gate: false,
+                },
                 Some(&system_owned),
                 &params.prompt,
                 opts,

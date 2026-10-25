@@ -15,7 +15,7 @@ use rsi_common::types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// Result of LLM title+description generation.
@@ -71,12 +71,28 @@ pub(crate) fn should_enqueue_title_refinement(
         && !succession_queued
 }
 
+/// #3935: true when `session_id` is a bench trial session. A trial runs Harness-only on its
+/// pinned route, so no title is generated for it (a title call is a second model route and
+/// fails the post-run route audit). A store error also skips the title, which is cosmetic.
+pub(crate) async fn session_is_bench_trial(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    session_id: Uuid,
+) -> bool {
+    match store.lock().await.get_bench_task_by_session(session_id) {
+        Ok(task) => task.is_some(),
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "bench task lookup failed; skipping title generation");
+            true
+        }
+    }
+}
+
 /// #1390: true while an unresolved manager succession replaces `session_id`.
 /// Title refinement is skipped then: the succession pins the predecessor row,
 /// and a refinement write would refuse it. A store error also skips the
 /// refinement, which is cosmetic.
 pub(crate) async fn manager_succession_holds_title(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
 ) -> bool {
     match store
@@ -449,7 +465,7 @@ fn parse_title_and_description(raw: &str, forced_role: Option<&str>) -> Option<T
 pub(super) async fn forced_role_for_session(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     parent_id: Option<Uuid>,
 ) -> Option<&'static str> {
@@ -460,7 +476,7 @@ pub(super) async fn forced_role_for_session(
 
 /// Generate both title and description from query and optional context.
 pub(crate) async fn generate_title_and_description(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     query: &str,
@@ -490,7 +506,7 @@ pub(crate) async fn generate_title_and_description(
 
 /// Send a pre-built title+description prompt to the LLM backend.
 pub(crate) async fn generate_title_and_description_from_prompt(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     prompt: &str,
@@ -594,7 +610,12 @@ async fn generate_ollama(
     };
     let raw = crate::ollama_client::generate(
         http,
-        model,
+        &crate::memory::helper_breaker::HelperCall {
+            purpose: rsi_common::model_control::ModelInvocationPurpose::SessionTitle.as_str(),
+            setting_key: "title_model_local",
+            model,
+            gate: true,
+        },
         None,
         prompt,
         opts,
@@ -654,7 +675,7 @@ fn title_request(
 }
 
 async fn generate_ollama_admitted(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     http: &reqwest::Client,
@@ -930,14 +951,11 @@ mod http_tests {
     /// this file. A regression in the `GenerateOptions` construction here would
     /// NOT be caught by the `build_body` unit tests in `ollama_client.rs`.
     //
-    // `TEST_OLLAMA_URL_LOCK` is intentionally held across awaits — it exists to
-    // serialise env-var mutation across this binary's HTTP tests. Dropping
-    // before await would defeat its purpose.
-    #[allow(clippy::await_holding_lock)]
+    // `temp_env` holds the one process-wide environment lock for the block and
+    // restores `RSI_OLLAMA_URL` after it (#190).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn title_generate_ollama_posts_expected_body_shape() {
-        let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/api/generate$"))
@@ -947,41 +965,44 @@ mod http_tests {
             )
             .mount(&server)
             .await;
-        // SAFETY: TEST_OLLAMA_URL_LOCK is held above.
-        unsafe {
-            std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
-        }
-        let http = reqwest::Client::new();
-        super::generate_ollama(&http, "TITLE PROMPT", 512, "qwen3:14b")
-            .await
-            .expect("generate_ollama should succeed");
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "expected exactly one request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
-        assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
-        assert_eq!(body["prompt"], serde_json::json!("TITLE PROMPT"));
-        assert_eq!(body["stream"], serde_json::json!(false));
-        assert_eq!(body["think"], serde_json::json!(false));
-        assert_eq!(body["options"]["num_predict"], serde_json::json!(512));
-        let t = body["options"]["temperature"]
-            .as_f64()
-            .expect("temperature is f64");
-        assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
-        assert!(body.get("system").is_none(), "system key must be absent");
-        assert!(
-            body.get("keep_alive").is_none(),
-            "keep_alive key must be absent"
-        );
+        temp_env::async_with_vars(
+            [(
+                "RSI_OLLAMA_URL",
+                Some(format!("{}/api/generate", server.uri())),
+            )],
+            async move {
+                let http = reqwest::Client::new();
+                super::generate_ollama(&http, "TITLE PROMPT", 512, "qwen3:14b")
+                    .await
+                    .expect("generate_ollama should succeed");
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1, "expected exactly one request");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
+                assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
+                assert_eq!(body["prompt"], serde_json::json!("TITLE PROMPT"));
+                assert_eq!(body["stream"], serde_json::json!(false));
+                assert_eq!(body["think"], serde_json::json!(false));
+                assert_eq!(body["options"]["num_predict"], serde_json::json!(512));
+                let t = body["options"]["temperature"]
+                    .as_f64()
+                    .expect("temperature is f64");
+                assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
+                assert!(body.get("system").is_none(), "system key must be absent");
+                assert!(
+                    body.get("keep_alive").is_none(),
+                    "keep_alive key must be absent"
+                );
+            },
+        )
+        .await;
     }
 
     /// #586/#587: the Local Ollama title call settles with token figures
     /// (estimated: Ollama's reply carries none here) and the effort label.
-    #[allow(clippy::await_holding_lock)]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn title_ollama_invocation_settles_estimated_tokens_and_effort() {
-        let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/api/generate$"))
@@ -991,40 +1012,45 @@ mod http_tests {
             )
             .mount(&server)
             .await;
-        // SAFETY: TEST_OLLAMA_URL_LOCK is held above.
-        unsafe {
-            std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
-        }
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::store::Store::open_in_memory().expect("store"),
-        ));
-        let bus = std::sync::Arc::new(crate::bus::EventBus::new(8));
-        let http = reqwest::Client::new();
-        super::generate_ollama_admitted(
-            &store,
-            &bus,
-            uuid::Uuid::new_v4(),
-            &http,
-            "name this session",
-            512,
-            "qwen3:14b",
-        )
-        .await
-        .expect("admitted Ollama title call");
-        let guard = store.lock().await;
-        let row: (Option<i64>, Option<i64>, String, Option<String>) = guard
-            .conn
-            .query_row(
-                "SELECT input_tokens, output_tokens, usage_confidence, effort
+        temp_env::async_with_vars(
+            [(
+                "RSI_OLLAMA_URL",
+                Some(format!("{}/api/generate", server.uri())),
+            )],
+            async move {
+                let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
+                    crate::store::Store::open_in_memory().expect("store"),
+                ));
+                let bus = std::sync::Arc::new(crate::bus::EventBus::new(8));
+                let http = reqwest::Client::new();
+                super::generate_ollama_admitted(
+                    &store,
+                    &bus,
+                    uuid::Uuid::new_v4(),
+                    &http,
+                    "name this session",
+                    512,
+                    "qwen3:14b",
+                )
+                .await
+                .expect("admitted Ollama title call");
+                let guard = store.lock().await;
+                let row: (Option<i64>, Option<i64>, String, Option<String>) = guard
+                    .conn
+                    .query_row(
+                        "SELECT input_tokens, output_tokens, usage_confidence, effort
                  FROM model_invocations WHERE trigger_source = 'session_title'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("settled title row");
-        assert!(row.0.is_some_and(|tokens| tokens > 0), "{row:?}");
-        assert!(row.1.is_some_and(|tokens| tokens > 0), "{row:?}");
-        assert_eq!(row.2, "estimated");
-        assert_eq!(row.3.as_deref(), Some("default"));
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .expect("settled title row");
+                assert!(row.0.is_some_and(|tokens| tokens > 0), "{row:?}");
+                assert!(row.1.is_some_and(|tokens| tokens > 0), "{row:?}");
+                assert_eq!(row.2, "estimated");
+                assert_eq!(row.3.as_deref(), Some("default"));
+            },
+        )
+        .await;
     }
 }
 

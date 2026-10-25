@@ -3,7 +3,7 @@
 //! Three kinds of lock can be held together by archive cleanup, cohort
 //! settlement, archived-sandbox purge, adoption, retry and rotation:
 //!
-//! 1. **Store** (`Arc<tokio::sync::Mutex<Store>>`, the single SQLite writer),
+//! 1. **Store** (`Arc<rsid_core::store_lock::Mutex<Store>>`, the single SQLite writer),
 //! 2. a **custody root lock** (`lock_custody_root`, keyed by exact custody id), and
 //! 3. the **repository mutex** (`git_worktree::with_repository_mutation`, one
 //!    per repository identity, so two roots of one repository share it).
@@ -51,10 +51,11 @@ use rsi_common::types::{
     SandboxCustodyErrorCodeV1, SandboxCustodyErrorV1, SandboxCustodyRecoveryV1,
     SandboxCustodyTransitionV1,
 };
+use rsid_core::store_lock::{LabeledGuard as StoreGuard, Mutex as StoreMutex};
 use std::cell::Cell;
 use std::marker::PhantomData;
+use std::panic::Location;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex as StoreMutex, MutexGuard as StoreGuard};
 use uuid::Uuid;
 
 /// Upper bound a maintenance thread waits for the Store (or, under the
@@ -170,10 +171,12 @@ pub fn is_lock_order_busy_error(error: &DaemonError) -> bool {
 /// instead of risking a deadlock against a Store holder that is waiting for
 /// the same root lock or repository.
 pub trait BlockingStoreLockExt {
+    #[track_caller]
     fn blocking_lock_checked(&self) -> Result<StoreGuard<'_, Store>>;
 }
 
 impl BlockingStoreLockExt for StoreMutex<Store> {
+    #[track_caller]
     fn blocking_lock_checked(&self) -> Result<StoreGuard<'_, Store>> {
         if !holds_stripe_or_repository() {
             return Ok(self.blocking_lock());
@@ -280,12 +283,21 @@ async fn wait_root_quiescent(custody_id: Uuid) {
 /// waiting for the root lock while holding the Store. A busy root lock drops the
 /// Store, waits for the root lock to quiesce, and retries, so a paused
 /// maintenance proof on the same (or a colliding) root lock cannot pin the Store.
-pub async fn lock_store_then_root(
+#[track_caller]
+pub fn lock_store_then_root(
     store: &StoreMutex<Store>,
     custody_id: Uuid,
-) -> (StoreGuard<'_, Store>, CustodyRootGuard) {
+) -> impl std::future::Future<Output = (StoreGuard<'_, Store>, CustodyRootGuard)> {
+    lock_store_then_root_at(store, custody_id, Location::caller())
+}
+
+async fn lock_store_then_root_at<'a>(
+    store: &'a StoreMutex<Store>,
+    custody_id: Uuid,
+    caller: &'static Location<'static>,
+) -> (StoreGuard<'a, Store>, CustodyRootGuard) {
     loop {
-        let guard = store.lock().await;
+        let guard = store.lock_at(caller).await;
         match try_lock_custody_root(custody_id) {
             Some(root) => return (guard, root),
             None => drop(guard),
@@ -317,14 +329,26 @@ async fn wait_root_quiescent_until(custody_id: Uuid, deadline: tokio::time::Inst
 /// the root lock wait. `None` means the budget expired with the root lock (or the
 /// Store) still busy; nothing is held and no durable state changed, so the
 /// caller surrenders with a typed retryable `root_busy`.
-pub async fn lock_store_then_root_within(
+#[track_caller]
+pub fn lock_store_then_root_within(
     store: &StoreMutex<Store>,
     custody_id: Uuid,
     budget: Duration,
-) -> Option<(StoreGuard<'_, Store>, CustodyRootGuard)> {
+) -> impl std::future::Future<Output = Option<(StoreGuard<'_, Store>, CustodyRootGuard)>> {
+    lock_store_then_root_within_at(store, custody_id, budget, Location::caller())
+}
+
+async fn lock_store_then_root_within_at<'a>(
+    store: &'a StoreMutex<Store>,
+    custody_id: Uuid,
+    budget: Duration,
+    caller: &'static Location<'static>,
+) -> Option<(StoreGuard<'a, Store>, CustodyRootGuard)> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let guard = tokio::time::timeout_at(deadline, store.lock()).await.ok()?;
+        let guard = tokio::time::timeout_at(deadline, store.lock_at(caller))
+            .await
+            .ok()?;
         match try_lock_custody_root(custody_id) {
             Some(root) => return Some((guard, root)),
             None => drop(guard),
@@ -342,11 +366,20 @@ pub async fn lock_store_then_root_within(
 /// runtime thread on the root lock: the launch path binds its session through a
 /// Store method that needs the new root's root lock, and a long maintenance proof
 /// on a colliding root lock must delay only that launch, never the Store (#1166).
-pub async fn lock_store_then_binding_root<'a>(
+#[track_caller]
+pub fn lock_store_then_binding_root<'a>(
     store: &'a StoreMutex<Store>,
     binding: &super::sandbox_custody::SessionCustodyBinding,
+) -> impl std::future::Future<Output = (StoreGuard<'a, Store>, Option<CustodyRootGuard>)> {
+    lock_store_then_binding_root_at(store, binding, Location::caller())
+}
+
+async fn lock_store_then_binding_root_at<'a>(
+    store: &'a StoreMutex<Store>,
+    binding: &super::sandbox_custody::SessionCustodyBinding,
+    caller: &'static Location<'static>,
 ) -> (StoreGuard<'a, Store>, Option<CustodyRootGuard>) {
-    lock_store_then_optional_root(store, binding.custody_id()).await
+    lock_store_then_optional_root_at(store, binding.custody_id(), caller).await
 }
 
 /// [`lock_store_then_root`] for a custody id that may be absent (an ordinary,
@@ -354,32 +387,54 @@ pub async fn lock_store_then_binding_root<'a>(
 /// rotation, retry, restore and settlement paths know their root from the bind
 /// or bound identity, and must not wait for its root lock while holding the Store
 /// (#1172).
-pub async fn lock_store_then_optional_root(
+#[track_caller]
+pub fn lock_store_then_optional_root(
     store: &StoreMutex<Store>,
     custody_id: Option<Uuid>,
-) -> (StoreGuard<'_, Store>, Option<CustodyRootGuard>) {
+) -> impl std::future::Future<Output = (StoreGuard<'_, Store>, Option<CustodyRootGuard>)> {
+    lock_store_then_optional_root_at(store, custody_id, Location::caller())
+}
+
+async fn lock_store_then_optional_root_at<'a>(
+    store: &'a StoreMutex<Store>,
+    custody_id: Option<Uuid>,
+    caller: &'static Location<'static>,
+) -> (StoreGuard<'a, Store>, Option<CustodyRootGuard>) {
     match custody_id {
         Some(custody_id) => {
-            let (guard, root) = lock_store_then_root(store, custody_id).await;
+            let (guard, root) = lock_store_then_root_at(store, custody_id, caller).await;
             (guard, Some(root))
         }
-        None => (store.lock().await, None),
+        None => (store.lock_at(caller).await, None),
     }
 }
 
 /// [`lock_store_then_root`] for callers that learn the custody id from the
 /// Store (`live_custody_for_session`). A session with no live custody returns
 /// the Store alone: the caller's authorization then refuses it as before.
-pub async fn lock_store_then_session_root(
+#[track_caller]
+pub fn lock_store_then_session_root(
     store: &StoreMutex<Store>,
     session_id: Uuid,
-) -> (StoreGuard<'_, Store>, Option<CustodyRootGuard>) {
-    lock_store_then_resolved_root(store, |guard| {
-        guard
-            .live_custody_for_session(session_id)
-            .ok()
-            .map(|custody| custody.custody_id)
-    })
+) -> impl std::future::Future<Output = (StoreGuard<'_, Store>, Option<CustodyRootGuard>)> {
+    lock_store_then_session_root_at(store, session_id, Location::caller())
+}
+
+async fn lock_store_then_session_root_at<'a>(
+    store: &'a StoreMutex<Store>,
+    session_id: Uuid,
+    caller: &'static Location<'static>,
+) -> (StoreGuard<'a, Store>, Option<CustodyRootGuard>) {
+    lock_store_then_resolved_root_at(
+        store,
+        |guard| {
+            guard
+                .live_custody_for_session(session_id)
+                .ok()
+                .map(|custody| custody.custody_id)
+        },
+        caller,
+    )
     .await
 }
 
@@ -388,14 +443,26 @@ pub async fn lock_store_then_session_root(
 /// the stripe (or the Store) busy; nothing is held. The resume preauthentication
 /// uses this so a stripe that stays held cannot pin the Store ahead of the
 /// bounded effect admission (#1162).
-pub async fn lock_store_then_session_root_within(
+#[track_caller]
+pub fn lock_store_then_session_root_within(
     store: &StoreMutex<Store>,
     session_id: Uuid,
     budget: Duration,
-) -> Option<(StoreGuard<'_, Store>, Option<CustodyRootGuard>)> {
+) -> impl std::future::Future<Output = Option<(StoreGuard<'_, Store>, Option<CustodyRootGuard>)>> {
+    lock_store_then_session_root_within_at(store, session_id, budget, Location::caller())
+}
+
+async fn lock_store_then_session_root_within_at<'a>(
+    store: &'a StoreMutex<Store>,
+    session_id: Uuid,
+    budget: Duration,
+    caller: &'static Location<'static>,
+) -> Option<(StoreGuard<'a, Store>, Option<CustodyRootGuard>)> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let guard = tokio::time::timeout_at(deadline, store.lock()).await.ok()?;
+        let guard = tokio::time::timeout_at(deadline, store.lock_at(caller))
+            .await
+            .ok()?;
         let custody_id = match guard.live_custody_for_session(session_id) {
             Ok(custody) => custody.custody_id,
             Err(_) => return Some((guard, None)),
@@ -416,15 +483,27 @@ pub async fn lock_store_then_session_root_within(
 /// Store through `resolve`, which runs under the Store guard on every attempt
 /// (a busy root lock drops the Store, so the answer is re-read). `None` returns the
 /// Store alone: the caller's own fence then refuses as before.
-pub async fn lock_store_then_resolved_root<F>(
+#[track_caller]
+pub fn lock_store_then_resolved_root<F>(
     store: &StoreMutex<Store>,
     resolve: F,
-) -> (StoreGuard<'_, Store>, Option<CustodyRootGuard>)
+) -> impl std::future::Future<Output = (StoreGuard<'_, Store>, Option<CustodyRootGuard>)>
+where
+    F: Fn(&Store) -> Option<Uuid>,
+{
+    lock_store_then_resolved_root_at(store, resolve, Location::caller())
+}
+
+async fn lock_store_then_resolved_root_at<'a, F>(
+    store: &'a StoreMutex<Store>,
+    resolve: F,
+    caller: &'static Location<'static>,
+) -> (StoreGuard<'a, Store>, Option<CustodyRootGuard>)
 where
     F: Fn(&Store) -> Option<Uuid>,
 {
     loop {
-        let guard = store.lock().await;
+        let guard = store.lock_at(caller).await;
         let Some(custody_id) = resolve(&guard) else {
             return (guard, None);
         };

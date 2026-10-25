@@ -115,11 +115,34 @@ struct ConversationItem: Decodable, Sendable, Hashable, Identifiable {
     let truncated: Bool
     let createdAt: String
     let operatorMessageId: String?
+    /// `message`, `tool_use` or `tool_result` (hub #3797). The hub omits it on
+    /// a message and an older hub never sends it, so nil means a message.
+    let kind: String?
+    /// A tool item's tool, and the provider call id its use and result share.
+    /// The id is exact or absent (the hub drops one over 256 bytes).
+    let toolName: String?
+    let toolUseId: String?
+    /// The `idempotency_key` the phone sent with the operator message this item
+    /// is (hub #3797); the outbox message id. Nil for a message queued
+    /// elsewhere, and from an older hub.
+    let idempotencyKey: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, sequence, speaker, text, truncated
+        case id, sequence, speaker, text, truncated, kind
         case createdAt = "created_at"
         case operatorMessageId = "operator_message_id"
+        case toolName = "tool_name"
+        case toolUseId = "tool_use_id"
+        case idempotencyKey = "idempotency_key"
+    }
+
+    /// A tool call or its result rather than a message.
+    var toolPhase: ToolPhase? {
+        switch kind {
+        case "tool_use": .use
+        case "tool_result": .result
+        default: nil
+        }
     }
 
     var speakerLabel: String {
@@ -146,6 +169,9 @@ struct OperatorMessageState: Decodable, Sendable, Hashable, Identifiable {
     let updatedAt: String
     let deliveredAt: String?
     let textLen: Int
+    /// The key the phone sent with this message (hub #3797): the outbox message
+    /// id. Nil for a message queued elsewhere, and from an older hub.
+    let idempotencyKey: String?
 
     var id: String { messageId }
 
@@ -156,7 +182,18 @@ struct OperatorMessageState: Decodable, Sendable, Hashable, Identifiable {
         case updatedAt = "updated_at"
         case deliveredAt = "delivered_at"
         case textLen = "text_len"
+        case idempotencyKey = "idempotency_key"
     }
+
+    /// Whether this is the delivery record of `message`: by the key it sent
+    /// when the hub echoes it, else by the hub id its receipt returned.
+    func describes(_ message: OutboxMessage) -> Bool {
+        if let idempotencyKey, idempotencyKey.lowercased() == message.id.lowercased() { return true }
+        return message.hubMessageId == messageId
+    }
+
+    /// The hub has handed the message to the manager.
+    var isDelivered: Bool { state == "delivered" }
 }
 
 /// `GET …/conversation`: 25 message items per page, newest first.
@@ -385,73 +422,13 @@ func messageRefusal(status: Int, code: String, retryAfter: Int?) -> MessageError
 
 // MARK: Draft
 
-/// The compose box for one seat, with the slice-3 key rules: the same text to
-/// the same seat reuses its key; after an unknown outcome the attempt is frozen
-/// (text locked) until a definitive reply or the operator discards it; a new
-/// message gets a new key.
+/// The compose box for one seat: the text being written. Sending moves it to
+/// the outbox (`Outbox`, #505), which owns the key, the retries and the
+/// delivery state, so the box is free again at once.
 struct MessageDraft: Sendable, Hashable {
-    enum Phase: Sendable, Hashable {
-        case idle
-        case sending
-        case sent(MessageReceipt)
-        case failed(MessageError)
-    }
-
     var text = ""
-    private(set) var attempt: MessageRequest?
-    private(set) var uncertain = false
-    private(set) var phase = Phase.idle
-
-    /// After an unknown outcome the text cannot change: only Retry or Discard.
-    var locked: Bool { uncertain }
-    var sending: Bool { phase == .sending }
-
-    /// The request to send now. Throws (nothing sent) for an invalid text.
-    mutating func begin(project: String, seat: String, newKey: () -> String) throws -> MessageRequest {
-        if uncertain, let attempt {
-            phase = .sending
-            return attempt
-        }
-        if let problem = messageProblem(text) { throw MessageError(.invalid, problem) }
-        let request: MessageRequest
-        if let attempt, attempt.text == text, attempt.seat == seat, attempt.project == project {
-            request = attempt
-        } else {
-            request = MessageRequest(project: project, seat: seat, text: text, idempotencyKey: newKey())
-        }
-        attempt = request
-        phase = .sending
-        return request
-    }
-
-    mutating func finish(_ result: Result<MessageReceipt, MessageError>) {
-        switch result {
-        case .success(let receipt):
-            text = ""
-            attempt = nil
-            uncertain = false
-            phase = .sent(receipt)
-        case .failure(let error):
-            if error.mayHaveSent {
-                uncertain = true
-            } else if error.kind == .conflict {
-                // Definitive: this key will never queue this text. Next send gets a new key.
-                attempt = nil
-                uncertain = false
-            } else if error.kind == .seatChanged, !uncertain {
-                attempt = nil
-            }
-            phase = .failed(error)
-        }
-    }
-
-    /// Give up on an unknown attempt (the operator checks the conversation).
-    mutating func discard() {
-        text = ""
-        attempt = nil
-        uncertain = false
-        phase = .idle
-    }
+    /// Why the last Send was refused before anything was saved (an invalid text).
+    var problem: String?
 }
 
 // MARK: Polling

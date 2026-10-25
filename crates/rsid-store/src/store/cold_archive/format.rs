@@ -363,6 +363,232 @@ pub fn decode_rows(raw: &[u8], columns: usize) -> ColdResult<Vec<Vec<Value>>> {
     Ok(rows)
 }
 
+/// Bytes the streaming decoder buffers between the zstd decoder and the row
+/// codec (#178).
+pub const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The largest zstd window (2^26 = 64 MiB) the streaming decoder accepts
+/// (#178): the writer's level-6 frames use 2 MiB at most, and a frame that
+/// asks for more is refused, so the decoder's own memory stays bounded.
+pub const STREAM_WINDOW_LOG_MAX: u32 = 26;
+
+/// What [`decode_rows_streaming`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedRows {
+    pub row_count: i64,
+    /// Bytes of the uncompressed stream.
+    pub raw_bytes: u64,
+    /// Lowercase hex `SHA-256` of the uncompressed stream.
+    pub sha256: String,
+}
+
+/// A reader that hashes and counts what passes through it.
+struct DigestReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for DigestReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        self.bytes += read as u64;
+        Ok(read)
+    }
+}
+
+/// #178: decodes one zstd frame of a `rsi-cold-rows-v1` stream row by row,
+/// passing each row of `columns` values to `visit`, with bounded memory: the
+/// compressed bytes come from `compressed` as the decoder asks for them, the
+/// decoded stream is buffered [`STREAM_BUFFER_BYTES`] at a time, and only one
+/// row is held. A row whose TEXT and BLOB values together hold more than
+/// `max_row_bytes` is refused `cold_archive_over_bound` before the value is
+/// allocated. The same strict rules as [`decode_rows`] apply.
+///
+/// A row is visited before the digest of the whole stream is known: the
+/// caller checks the returned length and digest and must discard what it
+/// collected when they differ or this returns an error.
+pub fn decode_rows_streaming<R: std::io::BufRead>(
+    compressed: R,
+    columns: usize,
+    max_row_bytes: usize,
+    visit: &mut dyn FnMut(Vec<Value>) -> ColdResult<()>,
+) -> ColdResult<StreamedRows> {
+    use std::io::{BufRead, BufReader, Read};
+    if columns == 0 {
+        return Err(ColdError::new(
+            "cold_archive_verify_decode",
+            "a chunk must have at least one column",
+        ));
+    }
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(compressed)
+        .map_err(decompress_error)?
+        .single_frame();
+    decoder
+        .window_log_max(STREAM_WINDOW_LOG_MAX)
+        .map_err(decompress_error)?;
+    let mut raw = BufReader::with_capacity(
+        STREAM_BUFFER_BYTES,
+        DigestReader {
+            inner: decoder,
+            hasher: Sha256::new(),
+            bytes: 0,
+        },
+    );
+    let read_exact = |raw: &mut BufReader<_>, buf: &mut [u8]| {
+        raw.read_exact(buf).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                truncated()
+            } else {
+                decompress_error(error)
+            }
+        })
+    };
+    let mut row_count = 0i64;
+    loop {
+        if raw.fill_buf().map_err(decompress_error)?.is_empty() {
+            break;
+        }
+        let mut row = Vec::with_capacity(columns);
+        let mut row_bytes = 0usize;
+        for _ in 0..columns {
+            let mut tag = [0u8; 1];
+            read_exact(&mut raw, &mut tag)?;
+            let value = match tag[0] {
+                TAG_NULL => Value::Null,
+                TAG_INTEGER => {
+                    let mut bytes = [0u8; 8];
+                    read_exact(&mut raw, &mut bytes)?;
+                    Value::Integer(i64::from_le_bytes(bytes))
+                }
+                TAG_REAL => {
+                    let mut bytes = [0u8; 8];
+                    read_exact(&mut raw, &mut bytes)?;
+                    Value::Real(f64::from_le_bytes(bytes))
+                }
+                tag @ (TAG_TEXT | TAG_BLOB) => {
+                    let mut length = [0u8; 4];
+                    read_exact(&mut raw, &mut length)?;
+                    let length = u32::from_le_bytes(length) as usize;
+                    row_bytes = row_bytes.saturating_add(length);
+                    if row_bytes > max_row_bytes {
+                        return Err(ColdError::new(
+                            super::reader::OVER_BOUND_CODE,
+                            format!(
+                                "row {row_count} holds more than {max_row_bytes} bytes of values"
+                            ),
+                        ));
+                    }
+                    let mut bytes = vec![0u8; length];
+                    read_exact(&mut raw, &mut bytes)?;
+                    if tag == TAG_TEXT {
+                        Value::Text(String::from_utf8(bytes).map_err(|_| {
+                            ColdError::new(
+                                "cold_archive_verify_decode",
+                                "a TEXT value is not valid UTF-8",
+                            )
+                        })?)
+                    } else {
+                        Value::Blob(bytes)
+                    }
+                }
+                other => {
+                    return Err(ColdError::new(
+                        "cold_archive_verify_decode",
+                        format!("unknown value tag {other}"),
+                    ));
+                }
+            };
+            row.push(value);
+        }
+        #[cfg(any(test, feature = "test-seam"))]
+        stream_stats::note_row(row_bytes);
+        visit(row)?;
+        row_count += 1;
+    }
+    let digest = raw.into_inner();
+    Ok(StreamedRows {
+        row_count,
+        raw_bytes: digest.bytes,
+        sha256: hex::encode(digest.hasher.finalize()),
+    })
+}
+
+fn decompress_error(error: std::io::Error) -> ColdError {
+    ColdError::new(
+        "cold_archive_verify_decompress",
+        format!("the chunk does not decompress: {error}"),
+    )
+}
+
+/// #178 (tests only): what the streaming read of the current thread held at
+/// most, so a test can assert the read stayed chunked without measuring
+/// memory.
+#[cfg(any(test, feature = "test-seam"))]
+pub mod stream_stats {
+    use std::cell::Cell;
+
+    /// The streaming reads of one thread since the last [`take`].
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct StreamStats {
+        /// Reads of a stored payload.
+        pub payload_reads: usize,
+        /// The most bytes one payload read asked for.
+        pub largest_payload_read: usize,
+        /// Rows decoded.
+        pub rows: usize,
+        /// The most value bytes one row held.
+        pub largest_row: usize,
+    }
+
+    thread_local! {
+        static STATS: Cell<StreamStats> = const { Cell::new(StreamStats {
+            payload_reads: 0,
+            largest_payload_read: 0,
+            rows: 0,
+            largest_row: 0,
+        }) };
+    }
+
+    pub(crate) fn note_payload_read(asked: usize) {
+        STATS.with(|stats| {
+            let mut now = stats.get();
+            now.payload_reads += 1;
+            now.largest_payload_read = now.largest_payload_read.max(asked);
+            stats.set(now);
+        });
+    }
+
+    pub(crate) fn note_row(bytes: usize) {
+        STATS.with(|stats| {
+            let mut now = stats.get();
+            now.rows += 1;
+            now.largest_row = now.largest_row.max(bytes);
+            stats.set(now);
+        });
+    }
+
+    /// Adds the stats another thread took to this thread's: a stream run on a
+    /// blocking task hands its numbers back to the thread that asked for it.
+    pub fn absorb(other: StreamStats) {
+        STATS.with(|stats| {
+            let mut now = stats.get();
+            now.payload_reads += other.payload_reads;
+            now.largest_payload_read = now.largest_payload_read.max(other.largest_payload_read);
+            now.rows += other.rows;
+            now.largest_row = now.largest_row.max(other.largest_row);
+            stats.set(now);
+        });
+    }
+
+    /// The stats of this thread since the last call, reset.
+    #[must_use]
+    pub fn take() -> StreamStats {
+        STATS.with(|stats| stats.replace(StreamStats::default()))
+    }
+}
+
 /// Re-derives the chunk summary from decoded rows, for verification.
 #[must_use]
 pub fn summarize_decoded(rows: &[Vec<Value>], roles: ColumnRoles) -> DecodedSummary {

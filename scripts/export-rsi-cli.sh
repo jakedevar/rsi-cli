@@ -12,7 +12,7 @@
 #
 # The export is the tree at REV minus private material, with deployment
 # identifiers scrubbed and packaging/rsi-cli/ (public-only GitHub files)
-# overlaid. Checks: tools/check_personal_paths.py and cargo check.
+# overlaid. Checks: the personal-paths guard (scripts/repo-guard) and cargo check.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -88,7 +88,7 @@ cp -a "$WORK/overlay/." "$TREE/"
 printf '\n# Private planning notes live only in the private rsi repo\nthoughts/\n' >> "$TREE/.gitignore"
 
 # Checks.
-(cd "$TREE" && git init -q && git add -A && python3 tools/check_personal_paths.py)
+(cd "$TREE" && git init -q && git add -A && "$ROOT/scripts/repo-guard" personal-paths)
 if grep -lE 'allowed_account_ids.*"[1-9][0-9]{11}"' "$TREE"/infra/aws/*/versions.tf; then
     echo "export: unscrubbed AWS account id" >&2; exit 1
 fi

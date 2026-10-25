@@ -1,10 +1,15 @@
 """Exercise the installed pre-push hook with real local Git pushes."""
 
+from concurrent.futures import ThreadPoolExecutor
+import datetime
+import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 import unittest
+import uuid
+
+from scripts.scratch_git import clean_environment, scratch_git, scratch_tempdir
 
 
 HOOKS = Path(__file__).resolve().parent / "git-hooks"
@@ -27,14 +32,12 @@ def git(
         env[agent_marker] = "test-session"
     if lander_marker:
         env["RSI_ROLLING_LANDER"] = "1"
-    return subprocess.run(
-        ["git", *args], cwd=cwd, env=env, text=True, capture_output=True, check=False
-    )
+    return scratch_git(cwd, *args, env=env, check=False)
 
 
 class PrePushTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix="rsi-pre-push-")
+        self.temp = scratch_tempdir(prefix="rsi-pre-push-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "source"
@@ -50,6 +53,93 @@ class PrePushTest(unittest.TestCase):
         self.assert_git(self.repo, "commit", "-q", "-m", "fixture")
         self.assert_git(self.repo, "config", "core.hooksPath", str(HOOKS))
         self.assert_git(self.repo, "remote", "add", "publish", str(self.remote))
+        self.consent_home = self.root / "home"
+        self.consent_dir = self.consent_home / ".rsi" / "git-push-consents"
+        self.consent_dir.mkdir(parents=True)
+
+    def grant_main_push(self, **overrides: object) -> dict:
+        # AuthorizeMainPush's on-disk v1 contract (git_push_consent.rs).
+        record = {
+            "version": 1, "id": str(uuid.uuid4()),
+            "remote_url": str(self.remote), "ref": "refs/heads/main",
+            "target_sha": git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "expires_at": (datetime.datetime.now(datetime.timezone.utc)
+                           + datetime.timedelta(minutes=5)).isoformat(),
+            "operator_note": "Approve this exact main push once",
+        }
+        record.update(overrides)
+        (self.consent_dir / (record["id"] + ".json")).write_text(json.dumps(record))
+        return record
+
+    def main_hook(self, target: str | None = None,
+                  previous: str = "0" * 40) -> subprocess.CompletedProcess[str]:
+        # Replay a proposed update directly: Git skips hooks for a no-op push.
+        target = target or git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        env = clean_environment(self.repo, os.environ.copy())
+        env.pop("RSI_SESSION_TOKEN", None)
+        env.update(HOME=str(self.consent_home), USERPROFILE=str(self.consent_home),
+                   RSI_SESSION_ID="test-session")
+        return subprocess.run(
+            ["sh", str(HOOKS / "pre-push"), "publish", str(self.remote)],
+            cwd=self.repo, env=env, text=True, capture_output=True,
+            input=f"HEAD {target} refs/heads/main {previous}\n", check=False,
+        )
+
+    def test_exact_operator_consent_allows_one_push_and_records_use(self) -> None:
+        grant = self.grant_main_push()
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/main",
+                     agent_marker="RSI_SESSION_TOKEN",
+                     extra_env={"HOME": str(self.consent_home),
+                                "USERPROFILE": str(self.consent_home)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/main"), grant["target_sha"])
+        receipt = json.loads((self.consent_dir / (grant["id"] + ".used")).read_text())
+        self.assertEqual(receipt["target_sha"], grant["target_sha"])
+        self.assertEqual(receipt["remote_url"], str(self.remote))
+        self.assertEqual(receipt["ref"], "refs/heads/main")
+        datetime.datetime.fromisoformat(receipt["used_at"].replace("Z", "+00:00"))
+        self.assertNotEqual(self.main_hook().returncode, 0)
+
+    def test_consent_refuses_wrong_remote_ref_sha_and_expiry_without_spending(self) -> None:
+        expired = (datetime.datetime.now(datetime.timezone.utc)
+                   - datetime.timedelta(seconds=1)).isoformat()
+        for override in ({"remote_url": str(self.root / "elsewhere.git")},
+                         {"ref": "refs/heads/rolling"},
+                         {"target_sha": "a" * 40}, {"expires_at": expired}):
+            with self.subTest(override=override):
+                self.grant_main_push(**override)
+                result = self.main_hook()
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(list(self.consent_dir.glob("*.used")), [])
+        self.grant_main_push()
+        result = self.main_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_concurrent_hooks_can_consume_a_grant_only_once(self) -> None:
+        self.grant_main_push()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.main_hook(), range(2)))
+        self.assertEqual(sorted(result.returncode for result in results), [0, 1])
+        self.assertEqual(len(list(self.consent_dir.glob("*.used"))), 1)
+
+    def test_consent_allows_fast_forward_and_refuses_forced_rewind_and_deletion(self) -> None:
+        initial = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/main")
+        self.commit_file("next.txt", "next\n")
+        grant = self.grant_main_push()
+        result = self.main_hook(previous=initial)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/main")
+        self.grant_main_push(target_sha=initial)
+        forced = git(self.repo, "push", "--force", "publish", f"{initial}:refs/heads/main",
+                     agent_marker="RSI_SESSION_ID",
+                     extra_env={"HOME": str(self.consent_home),
+                                "USERPROFILE": str(self.consent_home)})
+        self.assertNotEqual(forced.returncode, 0)
+        self.assertEqual(self.remote_ref("refs/heads/main"), grant["target_sha"])
+        self.assertNotEqual(self.main_hook(target="0" * 40).returncode, 0)
+        self.assertEqual(len(list(self.consent_dir.glob("*.used"))), 1)
 
     def assert_git(self, cwd: Path, *args: str) -> None:
         result = git(cwd, *args)
@@ -142,6 +232,23 @@ class PrePushTest(unittest.TestCase):
         self.assertIn("rsi land <session-id|branch>", result.stderr)
         self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
 
+    def test_target_writer_guard_checks_the_pushed_desktop_scripts(self) -> None:
+        source = HOOKS.parents[1]
+        for relative in ("scripts/check-target-reclaim.py", "scripts/target-reclaim-retained.json",
+                         "crates/rsid-store/src/sandbox/target_reclaim.rs",
+                         "crates/rsi-common/src/sandbox_storage.rs"):
+            self.commit_file(relative, (source / relative).read_text())
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        good = self.remote_ref("refs/heads/rolling")
+        self.commit_file("desktop/scripts/build.sh", "mkdir -p target/new-thing\n")
+        # A dirty local repair must not conceal the writer in the pushed tree.
+        (self.repo / "desktop/scripts/build.sh").write_text("mkdir -p target/.rsi-tmp/new-thing\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("desktop/scripts/build.sh:1: target/new-thing", result.stderr)
+        self.assertIn("check-target-reclaim fails", result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
+
     def test_a_file_name_with_spaces_is_still_syntax_checked(self) -> None:
         # #2071: a whitespace-split file list skipped `tools/my script.py`.
         self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
@@ -190,6 +297,50 @@ class PrePushTest(unittest.TestCase):
             lander_marker=True,
         )
         self.assertEqual(lander.returncode, 0, lander.stderr)
+
+    def commit_personal_paths_guard(self) -> None:
+        # The pushed commit carries the guard (#360); the hook runs its own checkout's build.
+        guard = (HOOKS.parents[1] / "crates/rsi-repo-guards/src/personal_paths.rs").read_text()
+        self.commit_file("crates/rsi-repo-guards/src/personal_paths.rs", guard)
+
+    def test_rolling_push_adding_a_personal_path_is_refused(self) -> None:
+        # #3269: the public export refuses a personal home path; so does the push.
+        self.commit_personal_paths_guard()
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        good = self.remote_ref("refs/heads/rolling")
+        account = "jake" + "devar"
+        self.commit_file("docs/log.md", f"socket=/Users/{account}/.rsi/daemon.sock\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("docs/log.md:1: personal path or account name", result.stderr)
+        self.assertIn("check-personal-paths fails", result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
+
+    def test_rolling_push_adding_a_public_ip_is_refused_but_multicast_passes(self) -> None:
+        self.commit_personal_paths_guard()
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.commit_file("docs/net.md", "group=224.0.0.1 doc=203.0.113.10\n")
+        passed = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        public = ".".join(["93", "184", "216", "34"])
+        self.commit_file("docs/net2.md", f"host={public}\n")
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"docs/net2.md:1: public IP literal {public}", result.stderr)
+
+    def test_rolling_push_of_an_oversized_crate_agents_md_is_refused(self) -> None:
+        # #3450: a crate AGENTS.md is loaded into every session that reads the crate.
+        guard = (HOOKS.parents[1] / "crates/rsi-repo-guards/src/agents_md_size.rs").read_text()
+        self.commit_file("crates/rsi-repo-guards/src/agents_md_size.rs", guard)
+        self.commit_file("crates/demo/AGENTS.md", "one line per fact\n")
+        self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        good = self.remote_ref("refs/heads/rolling")
+        self.commit_file("crates/demo/AGENTS.md", "x" * (12 * 1024 + 1))
+        result = git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("crates/demo/AGENTS.md", result.stderr)
+        self.assertIn("check_agents_md_size fails", result.stderr)
+        self.assertEqual(self.remote_ref("refs/heads/rolling"), good)
 
     def test_operator_push_with_valid_python_still_passes(self) -> None:
         self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
@@ -308,10 +459,10 @@ class PrePushTest(unittest.TestCase):
         import shutil
         from unittest import mock
 
-        tool = self.repo / "tools" / "check_operator_identifiers.py"
-        tool.parent.mkdir(exist_ok=True)
-        shutil.copy(HOOKS.parent / "check_operator_identifiers.py", tool)
-        self.assert_git(self.repo, "add", "tools")
+        tool = self.repo / "crates/rsi-repo-guards/src/operator_identifiers.rs"
+        tool.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(HOOKS.parents[1] / "crates/rsi-repo-guards/src/operator_identifiers.rs", tool)
+        self.assert_git(self.repo, "add", "crates")
         self.assert_git(self.repo, "commit", "-q", "-m", "add guard")
         self.assert_git(self.repo, "push", "publish", "HEAD:refs/heads/rolling")
         base = self.remote_ref("refs/heads/rolling")

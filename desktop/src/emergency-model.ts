@@ -14,10 +14,9 @@ export function stopNeedsConfirm(source: ActionSource): boolean {
   return source !== 'key';
 }
 
-export const STOP_CONFIRM_TITLE = 'Stop all model work?';
+export const STOP_CONFIRM_TITLE = 'Stop all AI work now?';
 export const STOP_CONFIRM_BODY =
-  'This denies new model work, cancels active model invocations and interrupts running sessions, each marked HARD paused. '
-  + 'Clear a pause on a session to run it again.';
+  'Running sessions stop and nothing new starts, not even new sessions, until you choose Resume AI work.';
 
 /** What the daemon reports about an emergency stop (the fields the TUI reads). */
 export interface StopReport {
@@ -44,6 +43,48 @@ export function parseStopReport(raw: unknown): StopReport | null {
 export function stopMessage(r: StopReport): string {
   return `Emergency stop applied: ${r.cancelled} cancelled, ${r.interrupted.length} interrupted`;
 }
+
+/** The toast after a stop: the TUI's count line, then the way back (the banner's button). */
+export function stopToast(r: StopReport): string {
+  return `${stopMessage(r)}. ${RESUME_HINT}`;
+}
+
+// ---------- the way back (local #224) ----------
+
+/** The label of the banner button and of the way back named everywhere else. */
+export const RESUME_LABEL = 'Resume AI work';
+/** Where the same switch lives in Settings (the banner button sets the same mode). */
+export const RESUME_SETTINGS_PATH = 'Settings › Safety & Spend › Model Control';
+export const RESUME_HINT = `Choose ${RESUME_LABEL} in the banner at the top to start again.`;
+
+/** What a model-control mode (the TUI slug) means to a person; null for normal and unknown modes. */
+export function bannerText(slug: string | null): string | null {
+  switch (slug) {
+    case 'stop-all': return 'All AI work is stopped. Nothing new can start, not even new sessions or messages.';
+    case 'pause-background': return 'Background AI work is paused. Work you start yourself still runs.';
+    case 'deny-paid': return 'Paid AI work is blocked. Only free and local models can run.';
+    case 'local-only': return 'Only local models can run. Hosted AI work is blocked.';
+    default: return null;
+  }
+}
+
+export const RESUME_CONFIRM_TITLE = 'Resume AI work?';
+/** The one confirm before the banner button changes the mode back to normal. */
+export function resumeConfirmBody(slug: string | null): string {
+  const what = slug === 'stop-all' ? 'New sessions and messages can start again'
+    : 'Every kind of AI work can run again';
+  return `${what}. Sessions the stop interrupted stay stopped until you resume each one.`;
+}
+
+/** The toast after a successful resume. */
+export function resumeMessage(): string {
+  return 'AI work resumed. New sessions and messages can start again.';
+}
+
+/** The banner's tooltip for the row badge a stop leaves; keeps the TUI's HARD meaning. */
+export const STOPPED_BADGE_LABEL = 'Stopped';
+export const STOPPED_BADGE_TIP =
+  'Stopped by Emergency stop (the TUI calls this a HARD pause). Choose Resume on the session, or Resume AI work in the banner.';
 
 /** Operator pauses this app set locally (the TUI's `operator_pauses`); the stop only ever sets HARD. */
 export type LocalPauses = ReadonlyMap<string, 'hard'>;

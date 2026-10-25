@@ -54,7 +54,7 @@ impl AgentControlHandle {
             .host_load
             .as_ref()
             .is_some_and(|gate| gate.hold_now().is_some());
-        let (schema_version, peers, queued_creates, hub_reports, last_deploy) = {
+        let (schema_version, peers, queued_creates, hub_reports, last_deploy, hub_usage) = {
             let store = self.store.lock().await;
             let projection = store
                 .agent_authority_projection(caller)
@@ -89,12 +89,15 @@ impl AgentControlHandle {
             // Hub #2980: this daemon's own newest deploy, from the record the
             // hub reads as `satellites[].last_deploy`.
             let last_deploy = crate::satellite::last_deploy_status(&store)?;
+            // #4008: the hub's own invocations and tokens by provider.
+            let hub_usage = store.provider_usage_rollup(chrono::Utc::now())?;
             (
                 store.schema_user_version()?,
                 peers,
                 queued_creates,
                 hub_reports,
                 last_deploy,
+                hub_usage,
             )
         };
         // The store lock is released before hashing, statvfs, /proc reads or
@@ -112,6 +115,7 @@ impl AgentControlHandle {
                 ..service.snapshot(schema_version)
             },
             satellites,
+            hub_usage,
             deploy_drain: self
                 .deploy_drain
                 .as_ref()

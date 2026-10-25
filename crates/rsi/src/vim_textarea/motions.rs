@@ -5,6 +5,51 @@ use super::state::{CharSearch, CharSearchDir, VimAction, VimState};
 use crossterm::event::{KeyCode, KeyEvent};
 use tui_textarea::{CursorMove, TextArea};
 
+/// Shared w/b/e and W/B/E path. WORD motions continue through the library's
+/// punctuation boundaries until they reach whitespace (or an empty line).
+pub(super) fn move_word(
+    textarea: &mut TextArea<'static>,
+    motion: CursorMove,
+    count: usize,
+    word: bool,
+) {
+    for _ in 0..count {
+        loop {
+            let before = textarea.cursor();
+            textarea.move_cursor(motion);
+            if !word || textarea.cursor() == before {
+                break;
+            }
+            let (row, col) = textarea.cursor();
+            let chars: Vec<char> = textarea.lines()[row].chars().collect();
+            let Some(ch) = chars.get(col) else {
+                // B may first land on the previous line's insertion position.
+                if motion != CursorMove::WordBack || chars.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            let boundary = if motion == CursorMove::WordEnd {
+                chars.get(col + 1).is_none_or(|ch| ch.is_whitespace())
+            } else {
+                col == 0 || chars[col - 1].is_whitespace()
+            };
+            if !ch.is_whitespace() && boundary {
+                break;
+            }
+        }
+    }
+}
+
+/// Normal/visual WORD motions stop on a character; operators may need the
+/// insertion position to include the last character of the buffer.
+pub(super) fn clamp_word_cursor(textarea: &mut TextArea<'static>) {
+    let (row, col) = textarea.cursor();
+    if col > 0 && col == textarea.lines()[row].chars().count() {
+        textarea.move_cursor(CursorMove::Back);
+    }
+}
+
 /// Move cursor to first non-blank character on the current line (^ motion).
 pub(super) fn move_to_first_non_blank(textarea: &mut TextArea<'static>) {
     textarea.move_cursor(CursorMove::Head);

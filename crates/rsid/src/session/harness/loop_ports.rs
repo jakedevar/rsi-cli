@@ -4,6 +4,7 @@
 //! adapters: provider and credentials, model-call admission and settlement, the tool
 //! registry with its policy and process custody, agent mail, and worktree digests.
 
+use crate::bench::trace::TraceSink;
 use crate::error::DaemonError;
 use crate::model_control::call_control::{
     AdmittedModelCall, ModelCallControl, ModelCallKind, ModelCallSettlement, ModelCallUsage,
@@ -18,6 +19,7 @@ use crate::session::harness::types::{
     ChatMessage, ChatRequest, ChatResponse, HarnessToolSpec, StreamChunk, TokenUsage, ToolResult,
 };
 use async_trait::async_trait;
+use rsi_common::bench::BENCH_TRACE_WRITE_FAILED;
 use rsid_harness::compaction::{CompactionError, SummaryOutcome, SummaryTransport};
 use rsid_harness::ports::{
     Admission, FaultKind, GateDigest, GateOutcome, HostedCapabilities, LoopFault, LoopTools,
@@ -73,13 +75,20 @@ pub(super) fn fault_into(mut fault: LoopFault) -> DaemonError {
 pub(super) struct DaemonModelPort {
     provider: Arc<dyn ApiProvider>,
     control: Arc<dyn ModelCallControl>,
+    /// #3178: a bench session's live trace.
+    trace: Option<Arc<TraceSink>>,
 }
 
 impl DaemonModelPort {
-    pub(super) fn new(provider: Box<dyn ApiProvider>, control: Arc<dyn ModelCallControl>) -> Self {
+    pub(super) fn new(
+        provider: Box<dyn ApiProvider>,
+        control: Arc<dyn ModelCallControl>,
+        trace: Option<Arc<TraceSink>>,
+    ) -> Self {
         Self {
             provider: Arc::from(provider),
             control,
+            trace,
         }
     }
 }
@@ -156,6 +165,7 @@ impl ModelPort for DaemonModelPort {
             provider: Arc::clone(&self.provider),
             control: Arc::clone(&self.control),
             state: AdmissionState::Admitted(admitted),
+            trace: self.trace.clone(),
         }))
     }
 
@@ -180,6 +190,7 @@ struct DaemonAdmission {
     provider: Arc<dyn ApiProvider>,
     control: Arc<dyn ModelCallControl>,
     state: AdmissionState,
+    trace: Option<Arc<TraceSink>>,
 }
 
 impl DaemonAdmission {
@@ -193,6 +204,17 @@ impl DaemonAdmission {
                     "model call execution authority already spent",
                 ))
             }
+        }
+    }
+
+    /// Record a call's outcome in the bench trace, if the session has one.
+    fn record_response(&self, result: &std::result::Result<ChatResponse, DaemonError>) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        match result {
+            Ok(response) => trace.model_response(response),
+            Err(error) => trace.model_error(&error.to_string()),
         }
     }
 
@@ -218,10 +240,12 @@ impl Admission for DaemonAdmission {
     async fn chat(&mut self, request: &ChatRequest) -> Result<ChatResponse, LoopFault> {
         let (settlement, execution) = self.take_call()?.into_parts();
         self.state = AdmissionState::Sent(settlement);
-        self.provider
-            .chat(request, execution)
-            .await
-            .map_err(fault_from)
+        if let Some(trace) = &self.trace {
+            trace.model_request(request);
+        }
+        let result = self.provider.chat(request, execution).await;
+        self.record_response(&result);
+        result.map_err(fault_from)
     }
 
     async fn stream_chat(
@@ -232,10 +256,15 @@ impl Admission for DaemonAdmission {
     ) -> Result<ChatResponse, LoopFault> {
         let (settlement, execution) = self.take_call()?.into_parts();
         self.state = AdmissionState::Sent(settlement);
-        self.provider
+        if let Some(trace) = &self.trace {
+            trace.model_request(request);
+        }
+        let result = self
+            .provider
             .stream_chat(request, chunks, cancel, execution)
-            .await
-            .map_err(fault_from)
+            .await;
+        self.record_response(&result);
+        result.map_err(fault_from)
     }
 
     async fn fail(mut self: Box<Self>, error_class: &str) -> Result<(), LoopFault> {
@@ -262,12 +291,26 @@ impl Admission for DaemonAdmission {
                 },
             )
             .await
-            .map_err(fault_from)
+            .map_err(fault_from)?;
+        // #3349: the loop checks trace health only at the next model admission,
+        // and a final response has none. A call whose trace line was lost ends
+        // the session here, after its usage is recorded, with the typed code.
+        if let Some(trace) = &self.trace
+            && !trace.healthy()
+        {
+            return Err(fault_from(DaemonError::PolicyDenied(format!(
+                "{BENCH_TRACE_WRITE_FAILED}: a trace line could not be written, so the trial has no full trace"
+            ))));
+        }
+        Ok(())
     }
 }
 
 /// The session's tool registry, policy and completion-gate runner.
-pub(super) struct DaemonTools(pub(super) Arc<HarnessToolRegistry>);
+pub(super) struct DaemonTools(
+    pub(super) Arc<HarnessToolRegistry>,
+    pub(super) Option<Arc<TraceSink>>,
+);
 
 #[async_trait]
 impl LoopTools for DaemonTools {
@@ -297,6 +340,10 @@ impl LoopTools for DaemonTools {
 
     fn context_editing_enabled(&self) -> bool {
         self.0.context_editing_enabled()
+    }
+
+    fn recovery_max_output_tokens(&self) -> Option<u32> {
+        self.0.recovery_max_output_tokens()
     }
 
     fn execution_mode(&self, name: &str) -> Option<ToolExecutionMode> {
@@ -332,9 +379,17 @@ impl LoopTools for DaemonTools {
         cancel: &CancellationToken,
         events: mpsc::Sender<StreamEvent>,
     ) -> ToolResult {
-        self.0
+        if let Some(trace) = &self.1 {
+            trace.tool_call(name, &args);
+        }
+        let result = self
+            .0
             .execute_with_context(name, args, working_dir, cancel, Some(events))
-            .await
+            .await;
+        if let Some(trace) = &self.1 {
+            trace.tool_result(name, &result);
+        }
+        result
     }
 
     async fn execute_completion_gate(

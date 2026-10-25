@@ -55,6 +55,37 @@ class LandingGuardTest(unittest.TestCase):
         self.assertEqual(report["candidate"], self.base)
         self.assertEqual(report["lost_hunks"], [])
 
+    def test_target_writer_static_guard_reads_the_candidate_even_in_plan_only(self):
+        root = SCRIPT.parents[1]
+        for relative in ("scripts/check-target-reclaim.py", "scripts/target-reclaim-retained.json",
+                         "crates/rsid-store/src/sandbox/target_reclaim.rs",
+                         "crates/rsi-common/src/sandbox_storage.rs"):
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text((root / relative).read_text())
+            self.git("add", relative)
+        self.git("commit", "-q", "-m", "install target writer guard")
+        good = self.git("rev-parse", "HEAD")
+        GUARD.check_target_reclaim(self.repo, good)
+        writer = self.repo / "desktop/scripts/build.sh"
+        writer.parent.mkdir(parents=True)
+        writer.write_text("mkdir -p target/new-thing\n")
+        self.git("add", "desktop/scripts/build.sh")
+        self.git("commit", "-q", "-m", "unregistered target writer")
+        candidate = self.git("rev-parse", "HEAD")
+        writer.write_text("mkdir -p target/.rsi-tmp/new-thing\n")
+        # main's plan-only path is the lander's pre-build policy check.
+        args = [str(SCRIPT), "--repo", str(self.repo), "--base", good,
+                "--source", candidate, "--target", good,
+                "--candidate", candidate, "--plan-only"]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", args), contextlib.redirect_stderr(output):
+            self.assertEqual(GUARD.main(), 2)
+        self.assertIn("desktop/scripts/build.sh:1: target/new-thing", output.getvalue())
+        # Checking the older good commit still works with the bad worktree.
+        writer.write_text("mkdir -p target/new-other\n")
+        GUARD.check_target_reclaim(self.repo, good)
+
     def test_reports_exact_accepted_line_reverted_by_later_resolution(self):
         self.file.write_text("new default\nobsolete line\nkeep\n")
         source = self.commit("accepted default")
@@ -200,6 +231,118 @@ class LandingGuardTest(unittest.TestCase):
              ["cargo", "test", "-p", "other", "--bin", "tool"],
              ["cargo", "test", "-p", "other", "--test", "corpus"]],
         )
+
+    def stale_merge_scenario(self):
+        """A source that merged an older rolling state that rolling then renamed."""
+        trunk = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        other = self.file.with_name("other.rs")
+        other.write_text("fn first() {}\nfn last() {}\n")
+        self.base = self.commit("base with other file")
+        self.git("switch", "-q", "-c", "source")
+        self.file.write_text("new default\nobsolete line\nkeep\n")
+        self.commit("source own change")
+        self.git("switch", "-q", trunk)
+        other.write_text("fn first() {}\nfn test_stale_lock_is_preserved() {}\nfn last() {}\n")
+        self.commit("rolling adds a test")
+        self.git("switch", "-q", "source")
+        self.git("merge", "-q", "--no-ff", "-m", "merge older rolling", trunk)
+        source = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", trunk)
+        other.write_text("fn first() {}\nfn last() {}\n"
+                         "fn test_stale_lock_is_preserved_and_cargo_runs() {}\n")
+        target = self.commit("rolling renames the test on purpose")
+        self.git("merge", "-q", "--no-ff", "-m", "land source", source)
+        return source, target, self.git("rev-parse", "HEAD")
+
+    def run_guard(self, source, target, candidate):
+        args = ["guard", "--repo", str(self.repo), "--base", self.base,
+                "--source", source, "--target", target,
+                "--candidate", candidate, "--plan-only"]
+        output = io.StringIO()
+        with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(output):
+            code = GUARD.main()
+        return code, json.loads(output.getvalue())
+
+    def test_merged_in_rolling_content_later_renamed_is_not_a_reversion(self):
+        source, target, candidate = self.stale_merge_scenario()
+        # Measured from the stale base alone, the merged-in test reads as the
+        # source's own insertion that the candidate lost.
+        stale = GUARD.lost_hunks(self.repo, self.base, source, candidate)
+        self.assertEqual(len(stale), 1)
+        self.assertIn("accepted insertion 'fn test_stale_lock_is_preserved() {}'", stale[0])
+        code, report = self.run_guard(source, target, candidate)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lost_hunks"], [])
+
+    def test_real_reversion_is_still_refused_after_stale_merge(self):
+        source, target, candidate = self.stale_merge_scenario()
+        self.file.write_text("old default\nobsolete line\nkeep\n")
+        candidate = self.commit("bad resolution reverts the source's own change")
+        code, report = self.run_guard(source, target, candidate)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(report["lost_hunks"]), 1)
+        self.assertIn("restored base line 'old default'", report["lost_hunks"][0])
+
+    def criss_cross_scenario(self):
+        """Source and rolling merge each other's earlier state (two merge bases),
+        then rolling rewraps both merged-in lines (rustfmt) before the landing."""
+        trunk = self.git("rev-parse", "--abbrev-ref", "HEAD")
+        other = self.file.with_name("other.rs")
+        extra = self.file.with_name("extra.rs")
+        other.write_text("use a::{\n    a1, a2, a3,\n    a4, a5,\n};\n")
+        extra.write_text("use b::{\n    b1, b2, b3,\n    b4, b5,\n};\n")
+        self.git("add", "crates/fixture")
+        self.base = self.commit("base with two files")
+        self.git("switch", "-q", "-c", "source")
+        extra.write_text("use b::{\n    b1, b2, b3, b0,\n    b4, b5,\n};\n")
+        s1 = self.commit("source adds a line shared with rolling")
+        self.git("switch", "-q", trunk)
+        other.write_text("use a::{\n    a1, a2, a3, a0,\n    a4, a5,\n};\n")
+        m1 = self.commit("rolling adds a line")
+        self.git("merge", "-q", "--no-ff", "-m", "rolling takes the source line", s1)
+        self.git("switch", "-q", "source")
+        self.git("merge", "-q", "--no-ff", "-m", "source takes the rolling line", m1)
+        self.file.write_text("new default\nobsolete line\nkeep\n")
+        source = self.commit("source own change")
+        self.git("switch", "-q", trunk)
+        other.write_text("use a::{\n    a1, a2, a3,\n    a4, a5, a0,\n};\n")
+        extra.write_text("use b::{\n    b1, b2, b3,\n    b4, b5, b0,\n};\n")
+        target = self.commit("rolling rewraps both lines")
+        self.git("merge", "-q", "--no-ff", "-m", "land source", source)
+        return s1, m1, source, target, self.git("rev-parse", "HEAD")
+
+    def test_criss_cross_source_is_measured_against_its_virtual_merge_base(self):
+        s1, m1, source, target, candidate = self.criss_cross_scenario()
+        bases = set(self.git("merge-base", "--all", source, target).split())
+        self.assertEqual(bases, {s1, m1})
+        # Either merge base alone reads the other's merged-in line as the
+        # source's own insertion that the rewrap "restored".
+        for single in (s1, m1):
+            self.assertTrue(GUARD.lost_hunks(self.repo, single, source, candidate), single)
+        narrowed = GUARD.own_base(self.repo, self.base, source, target)
+        self.assertNotIn(narrowed, (self.base, s1, m1))
+        code, report = self.run_guard(source, target, candidate)
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lost_hunks"], [])
+
+    def test_real_reversion_is_still_refused_with_several_merge_bases(self):
+        _s1, _m1, source, target, _candidate = self.criss_cross_scenario()
+        self.file.write_text("old default\nobsolete line\nkeep\n")
+        candidate = self.commit("bad resolution reverts the source's own change")
+        code, report = self.run_guard(source, target, candidate)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(report["lost_hunks"]), 1)
+        self.assertIn("restored base line 'old default'", report["lost_hunks"][0])
+
+    def test_own_base_never_widens_the_accepted_delta(self):
+        self.file.write_text("new default\nobsolete line\nkeep\n")
+        source = self.commit("accepted default")
+        # An already-integrated source keeps its full base-to-source check.
+        self.assertEqual(GUARD.own_base(self.repo, self.base, source, source), self.base)
+        # Base already equals the shared state: unchanged.
+        self.assertEqual(GUARD.own_base(self.repo, self.base, source, self.base), self.base)
+        # A base that is not an ancestor of the shared state stands.
+        self.assertEqual(GUARD.own_base(self.repo, source, source, self.base), source)
 
     def test_toml_parser_falls_back_to_tomli_then_fails_clearly(self):
         real = GUARD.importlib.import_module

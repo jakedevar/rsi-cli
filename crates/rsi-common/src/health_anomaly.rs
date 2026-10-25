@@ -26,11 +26,29 @@ pub const KIND_EXECUTION_BLOCKED: &str = "topology_execution_blocked";
 pub const KIND_ATTEMPT_PAST_WALL_LIMIT: &str = "node_attempt_past_wall_limit";
 /// The hub root filesystem is at or above `health_disk_used_pct`. Subject: `/`.
 pub const KIND_HUB_DISK_HIGH: &str = "hub_disk_high";
-/// A satellite's free disk is below its disk floor. Subject: the peer id.
+/// The hub root filesystem is critical: use at or above [`CRITICAL_DISK_USED_PCT`]
+/// or free space below [`CRITICAL_DISK_FREE_GIB`]. A separate kind, so an
+/// `ignore` of the warm [`KIND_HUB_DISK_HIGH`] key never hides it (hub #3634).
+/// It replaces the warm line while it holds. Subject: `/`.
+pub const KIND_HUB_DISK_CRITICAL: &str = "hub_disk_critical";
+/// This satellite's paired hub has stopped pulling reports. Subject: the
+/// trusted hub installation id (the satellite has no registry peer for it).
+pub const KIND_HUB_NOT_PULLING: &str = "hub_not_pulling";
+/// A satellite is below its governor disk floor or a disk wait exceeds
+/// `health_stuck_minutes`. Subject: the peer id.
 pub const KIND_SATELLITE_DISK_LOW: &str = "satellite_disk_low";
+/// A declared satellite project's manager seat has an empty saved launch list.
+/// Subject: `<peer id>:<project id>`.
+pub const KIND_SATELLITE_MANAGER_NO_LAUNCHES: &str = "satellite_manager_no_launches";
+/// A paired satellite's appointed manager has Failed. Subject: the peer id.
+pub const KIND_SATELLITE_MANAGER_SEAT_FAILED: &str = "satellite_manager_seat_failed";
 /// The hottest CPU sensor held at or above `health_thermal_c` for
 /// [`THERMAL_SUSTAIN_SECS`]. Subject: `hub`.
 pub const KIND_CPU_HOT: &str = "cpu_hot";
+/// The hottest CPU sensor held at or above [`CRITICAL_THERMAL_C`] for
+/// [`THERMAL_SUSTAIN_SECS`]; a separate kind so an ignored warm [`KIND_CPU_HOT`]
+/// never hides it (hub #3634). Replaces the warm line while it holds. Subject: `hub`.
+pub const KIND_CPU_CRITICAL: &str = "cpu_critical";
 /// A provider refused a model as unavailable (`model_unavailable`). Subject:
 /// `<host>:<provider>:<model>` where host is `hub` or the satellite peer id.
 pub const KIND_PROVIDER_MODEL_UNAVAILABLE: &str = "provider_model_unavailable";
@@ -47,29 +65,116 @@ pub const KIND_ROLLING_QA_RED: &str = "rolling_qa_red_untracked";
 /// build is unsupported; never raised on Linux or macOS. Subject: `hub`.
 pub const KIND_RECLAIM_UNSUPPORTED: &str = "reclaim_unsupported";
 
+/// A decision a manager may rule on has been pending longer than
+/// `health_stuck_minutes` (#3240). Subject: the decision key.
+pub const KIND_MANAGER_DECISION_PENDING: &str = "manager_decision_pending";
+
+/// A project manager seat has used at least `CREATION_CAP_WARN_PCT` (80%) of
+/// one of its own creation caps (`max_created_sessions`,
+/// `max_created_containers`), counted as its `manager_v2_creation_limit`
+/// refusal counts it (#206). Subject: `<project_id>:<cap_field>`.
+pub const KIND_MANAGER_CREATION_CAP_NEAR: &str = "manager_creation_cap_near";
+
+/// A local helper-LLM endpoint (titles, summaries, observation extraction,
+/// prompt compile) is not listening, so its circuit breaker is open (#261).
+/// The detail names the purpose, the setting key, the model and the fix.
+/// Clears by itself once a probe gets an answer. Subject: the endpoint
+/// (`localhost:<port>`).
+pub const KIND_HELPER_LLM_UNREACHABLE: &str = "helper_llm_unreachable";
+
+/// The hub is short of memory before the OOM killer acts (hub #3629):
+/// `MemAvailable` is below [`MEMORY_HIGH_AVAILABLE_FRACTION`] of the governor's
+/// `governor_min_avail_mem_gb` floor, or swap use is at or above
+/// [`MEMORY_HIGH_SWAP_USED_PCT`]. No new setting: the floor is the operator's
+/// existing one (0 turns the available-memory arm off). Subject: `hub`.
+pub const KIND_HUB_MEMORY_HIGH: &str = "hub_memory_high";
+
+/// [`KIND_HUB_MEMORY_HIGH`] fires when `MemAvailable` is below this fraction of
+/// the governor floor.
+pub const MEMORY_HIGH_AVAILABLE_FRACTION: f64 = 0.5;
+/// [`KIND_HUB_MEMORY_HIGH`] fires when swap use reaches this percentage.
+pub const MEMORY_HIGH_SWAP_USED_PCT: f64 = 80.0;
+
+/// The daemon stopped without announcing it (anything but an operator deploy
+/// drain: a SIGINT, a SIGTERM, a crash) at least [`RESTART_LOOP_STOPS`] times
+/// within [`RESTART_LOOP_WINDOW_SECS`] (#3480). The detail lists each stop's
+/// time, uptime, reason and the lander entries and job units active at the stop.
+/// Subject: `hub:<time of the newest counted stop>`, so a further stop after
+/// an `ignore` is heard again.
+pub const KIND_DAEMON_RESTART_LOOP: &str = "daemon_restart_loop";
+
+/// The supervisor has spent its restart budget (#3492): deploys, watchdog
+/// exits and unannounced signal stops share ONE budget of
+/// `deploy_restarts_per_hour + 1` restarts per hour, and the restarts it
+/// published fill it (or it is backing off now, with no daemon on purpose).
+/// Deploys are refused until the oldest restart leaves the window, and the
+/// next crash restart waits the budget out. Clears by itself when the window
+/// frees. Subject: `hub:<newest recorded restart, unix seconds>`, so a
+/// further restart after an `ignore` is heard again.
+pub const KIND_SUPERVISOR_RESTART_BUDGET: &str = "supervisor_restart_budget";
+
+/// A plan window will exhaust before its reset at the observed average burn.
+/// Subject: `<provider>:<window>:<reset epoch>` (one ignore key per episode).
+pub const KIND_PROVIDER_WINDOW_PROJECTED_EXHAUSTION: &str = "provider_window_projected_exhaustion";
+
+/// `health_provider_window_used_pct`: minimum utilization before projecting;
+/// 0 disables this condition, otherwise 1..=100 (default 70).
+pub const HEALTH_PROVIDER_WINDOW_USED_PCT_DEFAULT: u32 = 70;
+
 /// Every kind, for docs and the closed-set tests.
-pub const ALL_KINDS: [&str; 11] = [
+/// Infer the length so parallel additions do not conflict on a manual count.
+pub const ALL_KINDS: &[&str] = &[
     KIND_PM_SEAT_BLOCKED,
     KIND_PM_CONTEXT_FULL,
     KIND_EXECUTION_BLOCKED,
     KIND_ATTEMPT_PAST_WALL_LIMIT,
     KIND_HUB_DISK_HIGH,
+    KIND_HUB_DISK_CRITICAL,
+    KIND_HUB_NOT_PULLING,
     KIND_SATELLITE_DISK_LOW,
+    KIND_SATELLITE_MANAGER_NO_LAUNCHES,
+    KIND_SATELLITE_MANAGER_SEAT_FAILED,
     KIND_CPU_HOT,
+    KIND_CPU_CRITICAL,
     KIND_PROVIDER_MODEL_UNAVAILABLE,
     KIND_PROVIDER_AUTH_FAILURE,
     KIND_ROLLING_QA_RED,
     KIND_RECLAIM_UNSUPPORTED,
+    KIND_MANAGER_DECISION_PENDING,
+    KIND_MANAGER_CREATION_CAP_NEAR,
+    KIND_HELPER_LLM_UNREACHABLE,
+    KIND_HUB_MEMORY_HIGH,
+    KIND_DAEMON_RESTART_LOOP,
+    KIND_SUPERVISOR_RESTART_BUDGET,
+    KIND_PROVIDER_WINDOW_PROJECTED_EXHAUSTION,
 ];
+
+/// Critical severity (hub #3634): root disk use at or above this percent, or
+/// free space below [`CRITICAL_DISK_FREE_GIB`], raises [`KIND_HUB_DISK_CRITICAL`]
+/// even when the warm key is ignored. Only while the warm disk check is on.
+pub const CRITICAL_DISK_USED_PCT: f64 = 97.0;
+pub const CRITICAL_DISK_FREE_GIB: f64 = 20.0;
+/// Sustained CPU temperature (C) that raises [`KIND_CPU_CRITICAL`]. Only while
+/// the warm thermal check is on.
+pub const CRITICAL_THERMAL_C: f64 = 92.0;
 
 /// How long the CPU must stay hot before [`KIND_CPU_HOT`] fires ("sustained").
 pub const THERMAL_SUSTAIN_SECS: i64 = 180;
+/// Unannounced daemon stops within [`RESTART_LOOP_WINDOW_SECS`] that make
+/// [`KIND_DAEMON_RESTART_LOOP`] fire.
+pub const RESTART_LOOP_STOPS: usize = 3;
+/// The window those stops are counted in (2 h).
+pub const RESTART_LOOP_WINDOW_SECS: i64 = 7200;
+/// Most stops one [`KIND_DAEMON_RESTART_LOOP`] detail lists (the newest).
+pub const RESTART_LOOP_MAX_LISTED: usize = 6;
 /// How long a PM seat may sit at or above its rotation threshold with no
 /// succession queued before [`KIND_PM_CONTEXT_FULL`] fires: the daemon's own
 /// rotation gets this long to act first.
 pub const CONTEXT_FULL_GRACE_SECS: i64 = 600;
 /// The daemon evaluates a pending `health_anomaly` predicate this often.
 pub const HEALTH_POLL_SECS: i64 = 60;
+/// Satellite-side hub link deadline, independent of blocked-work thresholds.
+pub const HUB_PULL_STALE_SECS: i64 = 15 * 60;
 /// Most condition lines one wake message carries.
 pub const HEALTH_MAX_CONDITIONS: usize = 24;
 /// Most `ignore` keys one predicate may carry, and the longest key.
@@ -198,6 +303,35 @@ pub const fn is_valid_stuck_minutes(value: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_kinds_contains_every_kind_constant_exactly_once() {
+        // Read the declarations rather than maintain a second list that could
+        // omit the same new constant as ALL_KINDS. KIND_* values are string literals.
+        let source = include_str!("health_anomaly.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let mut declared_count = 0;
+        for declaration in source
+            .split("pub const ")
+            .filter(|declaration| declaration.starts_with("KIND_"))
+        {
+            let (name, definition) = declaration.split_once(':').unwrap();
+            let (_, value) = definition.split_once('=').unwrap();
+            let literal = value.split_once(';').unwrap().0.trim();
+            let kind: String = serde_json::from_str(literal)
+                .unwrap_or_else(|error| panic!("{name} must be a string literal: {error}"));
+            assert_eq!(
+                ALL_KINDS.iter().filter(|entry| **entry == kind).count(),
+                1,
+                "{name} must appear in ALL_KINDS exactly once"
+            );
+            declared_count += 1;
+        }
+        assert!(declared_count > 0);
+        assert_eq!(ALL_KINDS.len(), declared_count);
+    }
 
     #[test]
     fn spec_accepts_only_known_kinds_and_bounded_keys() {

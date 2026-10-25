@@ -64,16 +64,19 @@ async fn terminal_watch_holds_own_wakes_and_excludes_pending_siblings_until_fina
                         &WakeWhenState {
                             predicate: WakePredicate {
                                 sha_on_rolling: None,
+                                shas_on_rolling: None,
                                 issue_closed: None,
                                 todo_closed: None,
                                 topology_execution_settled: None,
                                 health_anomaly: None,
                                 settlement_run_settled: None,
                                 jobs_terminal: Some(vec![job.id]),
+                                fire: None,
                             },
                             armed_at: chrono::Utc::now(),
                             deadline: None,
                             repo_dir: None,
+                            delivered_shas: Vec::new(),
                         },
                         false,
                     )

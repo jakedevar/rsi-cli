@@ -3,6 +3,26 @@
 # (Makefile targets of the same name); the daemon wraps it in cargo-slot.
 version = 1
 
+# Frontend-only boot/key verification under a CPU quota; no desktop Cargo build.
+[recipes.desktop-npm]
+runner = "make"
+target = "desktop-npm-test"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+[recipes.desktop-vim-repeat]
+runner = "make"
+target = "desktop-vim-repeat"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# #591: bounded real-browser reproduction plus transport/lifetime regressions.
+[recipes.desktop-browser-loss]
+runner = "make"
+target = "desktop-browser-loss"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
 # Opt-in watchdog challenge latency under one, then two rsid lib compiles.
 [recipes.watchdog-pressure]
 runner = "make"
@@ -71,9 +91,24 @@ target = "e2e-editing-mode-live-switch-repeat"
 timeout_minutes = 90
 cpu_quota_percent = 800
 
+# #3365: the fresh-install appoint-manager e2e test, one gated run (RSI_E2E=1).
+[recipes.e2e-fresh-install-appoint-manager]
+runner = "make"
+target = "e2e-fresh-install-appoint-manager"
+timeout_minutes = 60
+cpu_quota_percent = 800
+
 [recipes.check-touched-shards]
 runner = "make"
 target = "check-touched-shards"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# #3621: capture the scoped_test receipt conformance corpus from the receipts the
+# Python runner printed in real jobs (hub job table, read-only); builds one small crate.
+[recipes.scoped-receipt-corpus]
+runner = "make"
+target = "scoped-receipt-corpus"
 timeout_minutes = 20
 cpu_quota_percent = 200
 
@@ -90,6 +125,26 @@ target = "test-deploy-migration-backup"
 timeout_minutes = 20
 cpu_quota_percent = 200
 
+# The hermetic installer shell test (scripts/tests/test_install_release_start.sh, no Python).
+[recipes.install-release-shell]
+runner = "make"
+target = "test-install-release-shell"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+[recipes.install-release-isolation]
+runner = "make"
+target = "test-install-release-isolation"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
+# Focused Rust installer fixture family: stage, links and provenance (#632, #670).
+[recipes.install-release-rust-isolation]
+runner = "make"
+target = "test-install-release-rust-isolation"
+timeout_minutes = 20
+cpu_quota_percent = 200
+
 # Cross-compile the portable holder and inherited listener sources/tests.
 [recipes.socket-activation-macos]
 runner = "make"
@@ -103,3 +158,24 @@ runner = "make"
 target = "manual"
 timeout_minutes = 20
 cpu_quota_percent = 200
+
+# #3239: build the desktop app (desktop/src-tauri is a standalone workspace no
+# `build` job can name) and run scripts/install-desktop.sh --required into a job-owned
+# throwaway HOME/XDG tree (scripts/desktop-install-job.sh). A cold release build is
+# 600 crates, 20+ minutes on the 4-core hub, so the budget is long.
+[recipes.desktop-install]
+runner = "make"
+target = "desktop-install-job"
+timeout_minutes = 90
+cpu_quota_percent = 400
+
+# #3279 (#3000 criterion 4): run the desktop `graph-run` E2E scenario against an isolated real
+# rsid built with its matching rsi-e2e-seed binary, and write graph-run-receipt.json (source SHA,
+# daemon sha256, command, exit code, graph-seeded-daemon/render/readback statuses). The job exits
+# non-zero unless all three passed, so a skipped or absent run can never read as green. It needs
+# Chrome on the host (else runner_unavailable, exit non-zero). A debug cargo build plus npm ci.
+[recipes.desktop-e2e-graph]
+runner = "make"
+target = "desktop-e2e-graph-job"
+timeout_minutes = 60
+cpu_quota_percent = 400

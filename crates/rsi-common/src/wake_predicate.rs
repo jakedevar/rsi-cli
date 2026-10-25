@@ -12,10 +12,15 @@ use uuid::Uuid;
 
 /// Most job ids one predicate may name.
 pub const WAKE_WHEN_MAX_JOBS: usize = 32;
+/// Most commit ids one predicate may name.
+pub const WAKE_WHEN_MAX_SHAS: usize = 32;
 /// Longest `timeout_seconds` (seven days).
 pub const WAKE_WHEN_MAX_TIMEOUT_SECONDS: i64 = 7 * 24 * 60 * 60;
 /// Most enabled predicate wakes one session may hold, not counting
-/// `topology_execution_settled` wakes (they have their own cap below).
+/// `topology_execution_settled` wakes (they have their own cap below). One
+/// more is refused [`WAKE_WHEN_CAP_REACHED`]; batch commits into one
+/// `shas_on_rolling` wake (with `fire: "each"` for one firing per landing,
+/// #217) instead of one wake per commit.
 pub const WAKE_WHEN_MAX_PER_SESSION: usize = 16;
 /// Most enabled `topology_execution_settled` wakes one session may hold (#3019).
 /// A manager runs every ordinary Issue as a pipeline with one daemon-armed settle
@@ -26,12 +31,21 @@ pub const WAKE_WHEN_MAX_PER_SESSION: usize = 16;
 pub const WAKE_WHEN_MAX_SETTLE_PER_SESSION: usize = 128;
 /// The daemon re-evaluates a pending `jobs_terminal` predicate this often.
 pub const WAKE_WHEN_JOBS_POLL_SECS: i64 = 5;
-/// The daemon re-checks a pending `sha_on_rolling` predicate this often.
+/// The daemon re-checks pending single-commit and batch rolling predicates this often.
 pub const WAKE_WHEN_SHA_POLL_SECS: i64 = 15;
 /// Per-job bound on the refusal text carried by the wake message.
 pub const WAKE_WHEN_REFUSAL_BYTES: usize = 200;
 /// Bound on the whole wake message body the daemon appends.
 pub const WAKE_WHEN_MESSAGE_BYTES: usize = 6_000;
+/// The `delivery` field of an accepted `AgentScheduleWake` mode `when` reply
+/// (#170). The arming call is always made mid-turn, so nothing has fired into
+/// it: the predicate is pending and its report arrives later as a new turn.
+/// `next_fire_at` is the next evaluation, which is often the arming instant.
+pub const WAKE_WHEN_ARMED_DELIVERY: &str = "pending: nothing has been delivered. \
+next_fire_at is the next evaluation, not a delivery. The daemon resumes this session \
+once, as a new turn (<rsid-daemon-message source=\"scheduled-wake\">) carrying a \
+[wake_when] report with each job's stored state and exit_code, when the predicate holds; \
+while this turn runs that wake is held (continuation_target_busy). End your turn now.";
 
 /// Stable refusal codes; each is the whole `InvalidParam` text.
 pub const WAKE_WHEN_PREDICATE_INVALID: &str = "wake_when_predicate_invalid";
@@ -74,7 +88,21 @@ pub const REASON_TODO_MISSING: &str = "todo_missing";
 pub const REASON_EXECUTION_MISSING: &str = "execution_missing";
 pub const REASON_SETTLEMENT_RUN_MISSING: &str = "settlement_run_missing";
 
-/// The typed predicate: exactly one field is set.
+/// When a `shas_on_rolling` wake fires (#217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeFire {
+    /// Once, when every listed commit is on rolling (the default).
+    #[default]
+    All,
+    /// Once per landing: each evaluation that finds commits newly on rolling
+    /// resumes the owner and names them; the wake stays armed until every
+    /// listed commit has landed (or its timeout passes).
+    Each,
+}
+
+/// The typed predicate: exactly one predicate field is set (`fire` is a
+/// modifier of `shas_on_rolling`, not a predicate).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct WakePredicate {
@@ -85,6 +113,13 @@ pub struct WakePredicate {
     /// repository (as last fetched or pushed there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha_on_rolling: Option<String>,
+    /// Every listed 40-hex commit is an ancestor of `origin/rolling`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shas_on_rolling: Option<Vec<String>>,
+    /// Firing mode of `shas_on_rolling` (#217); absent means
+    /// [`WakeFire::All`]. Any other predicate with `fire` is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire: Option<WakeFire>,
     /// The Issue with this display number (in the caller's project) is
     /// `Closed`: the manager closes an Issue once its work is on `rolling`, so
     /// a worker can wait on a dependency's landing without knowing its SHA.
@@ -141,12 +176,13 @@ impl WakePredicate {
     pub fn validate(&self) -> Result<(), &'static str> {
         let set = usize::from(self.jobs_terminal.is_some())
             + usize::from(self.sha_on_rolling.is_some())
+            + usize::from(self.shas_on_rolling.is_some())
             + usize::from(self.issue_closed.is_some())
             + usize::from(self.todo_closed.is_some())
             + usize::from(self.topology_execution_settled.is_some())
             + usize::from(self.health_anomaly.is_some())
             + usize::from(self.settlement_run_settled.is_some());
-        if set != 1 {
+        if set != 1 || (self.fire.is_some() && self.shas_on_rolling.is_none()) {
             return Err(WAKE_WHEN_PREDICATE_INVALID);
         }
         if let Some(ids) = &self.jobs_terminal {
@@ -154,6 +190,17 @@ impl WakePredicate {
             if ids.is_empty()
                 || ids.len() > WAKE_WHEN_MAX_JOBS
                 || ids.iter().any(|id| id.is_nil() || !seen.insert(*id))
+            {
+                return Err(WAKE_WHEN_PREDICATE_INVALID);
+            }
+        }
+        if let Some(shas) = &self.shas_on_rolling {
+            let mut seen = std::collections::BTreeSet::new();
+            if shas.is_empty()
+                || shas.len() > WAKE_WHEN_MAX_SHAS
+                || shas
+                    .iter()
+                    .any(|sha| !is_full_sha(sha) || !seen.insert(sha))
             {
                 return Err(WAKE_WHEN_PREDICATE_INVALID);
             }
@@ -176,10 +223,16 @@ impl WakePredicate {
         }
     }
 
+    /// True for a `shas_on_rolling` wake that fires once per landing (#217).
+    #[must_use]
+    pub fn fires_each(&self) -> bool {
+        self.shas_on_rolling.is_some() && self.fire == Some(WakeFire::Each)
+    }
+
     /// Seconds between daemon evaluations while the predicate is pending.
     #[must_use]
     pub fn poll_seconds(&self) -> i64 {
-        if self.sha_on_rolling.is_some() {
+        if self.sha_on_rolling.is_some() || self.shas_on_rolling.is_some() {
             WAKE_WHEN_SHA_POLL_SECS
         } else if self.health_anomaly.is_some() {
             crate::health_anomaly::HEALTH_POLL_SECS
@@ -211,10 +264,44 @@ pub struct WakeWhenState {
     /// pending. `None` waits until the predicate settles.
     #[serde(default)]
     pub deadline: Option<DateTime<Utc>>,
-    /// Directory of the caller's repository, for `sha_on_rolling`.
+    /// Directory of the caller's repository, for rolling commit predicates.
     #[serde(default)]
     pub repo_dir: Option<String>,
+    /// #217: the commits a `fire: "each"` wake has already reported as on
+    /// rolling, in delivery order. Written only after a delivery succeeded,
+    /// so a held or refused firing reports the same commits again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_shas: Vec<String>,
 }
+
+/// #3387: the daemon-owned `$.quiet_settle` record of a topology settle wake
+/// the daemon armed by default for an `AgentTopologyExecute`. Its presence
+/// marks the wake as quiet-capable: a clean success (the execution
+/// `succeeded`, its Issue Closed, no follow-up, no `changes_requested`, no
+/// refused close) opens no owner turn of its own. The row is held with its
+/// digest line and is delivered with the owner's next wake, or alone as one
+/// batch once the oldest held line is [`QUIET_SETTLE_MAX_HOLD_SECS`] old.
+/// Every other outcome, and any wake the owner armed itself (it has no such
+/// record), wakes the owner at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuietSettle {
+    /// Set once the wake observed a clean success and stopped short of a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<QuietHeld>,
+}
+
+/// One clean success held in the owner's digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuietHeld {
+    /// When the wake first held the success.
+    pub at: DateTime<Utc>,
+    /// The digest line: execution, Issue and landed SHA.
+    pub line: String,
+}
+
+/// Longest a clean success stays in the digest before it is delivered alone
+/// (one batched wake for everything held by then).
+pub const QUIET_SETTLE_MAX_HOLD_SECS: i64 = 30 * 60;
 
 #[cfg(test)]
 mod tests {
@@ -226,21 +313,25 @@ mod tests {
         let ok = WakePredicate {
             jobs_terminal: Some(vec![id]),
             sha_on_rolling: None,
+            shas_on_rolling: None,
             issue_closed: None,
             todo_closed: None,
             topology_execution_settled: None,
             health_anomaly: None,
             settlement_run_settled: None,
+            fire: None,
         };
         assert_eq!(ok.validate(), Ok(()));
         let sha = WakePredicate {
             jobs_terminal: None,
             sha_on_rolling: Some("a".repeat(40)),
+            shas_on_rolling: None,
             issue_closed: None,
             todo_closed: None,
             topology_execution_settled: None,
             health_anomaly: None,
             settlement_run_settled: None,
+            fire: None,
         };
         assert_eq!(sha.validate(), Ok(()));
         let issue = WakePredicate {
@@ -305,60 +396,142 @@ mod tests {
             WakePredicate {
                 jobs_terminal: Some(vec![]),
                 sha_on_rolling: None,
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
             WakePredicate {
                 jobs_terminal: Some(vec![id, id]),
                 sha_on_rolling: None,
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
             WakePredicate {
                 jobs_terminal: Some(vec![id]),
                 sha_on_rolling: Some("a".repeat(40)),
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
             WakePredicate {
                 jobs_terminal: None,
                 sha_on_rolling: Some("A".repeat(40)),
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
             WakePredicate {
                 jobs_terminal: None,
                 sha_on_rolling: Some("abc".into()),
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
             WakePredicate {
                 jobs_terminal: Some((0..=WAKE_WHEN_MAX_JOBS).map(|_| Uuid::new_v4()).collect()),
                 sha_on_rolling: None,
+                shas_on_rolling: None,
                 issue_closed: None,
                 todo_closed: None,
                 topology_execution_settled: None,
                 health_anomaly: None,
                 settlement_run_settled: None,
+                fire: None,
             },
         ] {
             assert_eq!(bad.validate(), Err(WAKE_WHEN_PREDICATE_INVALID), "{bad:?}");
         }
+    }
+
+    /// #217: `fire` modifies `shas_on_rolling` only; `each` is opt-in and
+    /// the default (absent or `all`) keeps the all-at-once wire shape.
+    #[test]
+    fn fire_each_is_an_opt_in_modifier_of_shas_on_rolling_only() {
+        let sha = "a".repeat(40);
+        let each: WakePredicate = serde_json::from_value(serde_json::json!({
+            "shas_on_rolling": [sha],
+            "fire": "each"
+        }))
+        .unwrap();
+        assert_eq!(each.validate(), Ok(()));
+        assert_eq!(each.fire, Some(WakeFire::Each));
+        assert!(each.fires_each());
+        assert_eq!(each.poll_seconds(), WAKE_WHEN_SHA_POLL_SECS);
+        let all: WakePredicate = serde_json::from_value(serde_json::json!({
+            "shas_on_rolling": [sha],
+            "fire": "all"
+        }))
+        .unwrap();
+        assert_eq!(all.validate(), Ok(()));
+        assert_eq!(all.fire, Some(WakeFire::All));
+        assert!(!all.fires_each());
+        let default = WakePredicate {
+            shas_on_rolling: Some(vec![sha.clone()]),
+            ..WakePredicate::default()
+        };
+        assert!(!default.fires_each());
+        assert_eq!(
+            serde_json::to_value(&default).unwrap(),
+            serde_json::json!({"shas_on_rolling": [sha]})
+        );
+        for other in [
+            serde_json::json!({"sha_on_rolling": sha, "fire": "each"}),
+            serde_json::json!({"jobs_terminal": [Uuid::new_v4()], "fire": "each"}),
+            serde_json::json!({"issue_closed": 7, "fire": "all"}),
+            serde_json::json!({"fire": "each"}),
+        ] {
+            let predicate: WakePredicate = serde_json::from_value(other.clone()).unwrap();
+            assert_eq!(
+                predicate.validate(),
+                Err(WAKE_WHEN_PREDICATE_INVALID),
+                "{other}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<WakePredicate>(serde_json::json!({
+                "shas_on_rolling": [sha],
+                "fire": "sometimes"
+            }))
+            .is_err()
+        );
+        // The delivered set rides on the persisted state and is omitted while
+        // empty, so a pre-#217 row reads back unchanged.
+        let state: WakeWhenState = serde_json::from_value(serde_json::json!({
+            "predicate": {"shas_on_rolling": [sha]},
+            "armed_at": "2026-10-20T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(state.delivered_shas, Vec::<String>::new());
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json.get("delivered_shas"), None);
+        let delivered = WakeWhenState {
+            delivered_shas: vec![sha.clone()],
+            ..state
+        };
+        let round: WakeWhenState =
+            serde_json::from_value(serde_json::to_value(&delivered).unwrap()).unwrap();
+        assert_eq!(round, delivered);
     }
 
     #[test]
@@ -422,5 +595,44 @@ mod tests {
             validate_timeout(Some(WAKE_WHEN_MAX_TIMEOUT_SECONDS + 1)),
             Err(WAKE_WHEN_TIMEOUT_INVALID)
         );
+    }
+
+    #[test]
+    fn commit_batch_is_bounded_distinct_and_backward_compatible() {
+        let old_json = serde_json::json!({"sha_on_rolling": "a".repeat(40)});
+        let single: WakePredicate = serde_json::from_value(old_json.clone()).unwrap();
+        assert_eq!(single.validate(), Ok(()));
+        assert_eq!(serde_json::to_value(single).unwrap(), old_json);
+
+        for count in [1, 2, WAKE_WHEN_MAX_SHAS] {
+            let json = serde_json::json!({
+                "shas_on_rolling": (0..count).map(|n| format!("{n:040x}")).collect::<Vec<_>>()
+            });
+            let batch: WakePredicate = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(batch.validate(), Ok(()));
+            assert_eq!(batch.poll_seconds(), WAKE_WHEN_SHA_POLL_SECS);
+            assert_eq!(serde_json::to_value(batch).unwrap(), json);
+        }
+        for shas in [
+            vec![],
+            vec!["a".repeat(40); 2],
+            vec!["A".repeat(40)],
+            vec!["abc".into()],
+            (0..=WAKE_WHEN_MAX_SHAS)
+                .map(|n| format!("{n:040x}"))
+                .collect(),
+        ] {
+            let batch = WakePredicate {
+                shas_on_rolling: Some(shas),
+                ..WakePredicate::default()
+            };
+            assert_eq!(batch.validate(), Err(WAKE_WHEN_PREDICATE_INVALID));
+        }
+        let both = WakePredicate {
+            sha_on_rolling: Some("a".repeat(40)),
+            shas_on_rolling: Some(vec!["b".repeat(40)]),
+            ..WakePredicate::default()
+        };
+        assert_eq!(both.validate(), Err(WAKE_WHEN_PREDICATE_INVALID));
     }
 }

@@ -15,19 +15,28 @@
 //! integration conflict is attributed the same way without a gate: the lander
 //! names the conflicting source, only that entry is refused
 //! (`queue_batch_merge_conflict`) and the batch is re-run without it (#1119).
+//! A red that names a file only one source changes (a compile or panic
+//! location, or a `git diff --check` static-guard finding, #3396) is attributed
+//! to that source directly, with no bisect round (#1974).
 //!
 //! Restart reconcile runs once at boot: a `gating` entry whose source is
 //! already an ancestor of `origin/rolling` settles as published; any other is
-//! returned to `queued` and re-driven. The lander is idempotent (an integrated
-//! source is refused), so re-driving cannot publish twice.
+//! returned to `queued` and re-driven. Legacy terminal rows stay immutable.
+//! A live run whose publication is unknown also
+//! returns to `queued`, retaining its entry id and FIFO sequence without a
+//! terminal wake. Only proven ancestry counts as published; an unreadable
+//! probe re-queues for a fresh gate. Re-driving cannot publish twice.
 //!
 //! A source that reached `origin/rolling` outside the queue (an operator merge
 //! or a direct landing) is never gated: each member's ancestry is re-checked
 //! right before its batch is gated, before every bisect step and after a
 //! lander run that reports a source "already integrated", and a landed member
-//! settles `published` with the tip that contains it (#1208). One batch's
-//! gating is bounded by the operator's `rolling_queue_gate_timeout_mins`; past
-//! it the unsettled members are refused with `queue_gate_timeout`.
+//! settles `published` with the tip that contains it (#1208). Each lander run
+//! of a batch (the full gate and every bisect step) is bounded by the
+//! operator's `rolling_queue_gate_timeout_mins`, the batch by a ceiling that
+//! scales with its bisect depth; past a run's budget the members still suspect
+//! are refused with `queue_gate_timeout` and the members a red run had left
+//! out go back to the queue (#3267).
 
 use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
@@ -36,14 +45,16 @@ use crate::store::rolling_queue::{ClaimedQueueBatch, LanePackages};
 use chrono::Utc;
 use rsi_common::agent_landing_candidate::RollingMergeProbe;
 use rsi_common::rolling_queue::{
-    QUEUE_BATCH_ANCESTRY_UNVERIFIED, QUEUE_BATCH_MERGE_CONFLICT, QUEUE_BATCH_POLICY_REFUSED,
-    QUEUE_BISECT_NO_PROGRESS, QUEUE_CLAIMED_FIX_STILL_RED, QUEUE_FILTER_MATCHES_NO_TESTS,
+    LANDER_FAILURE_CLASS_REMOTE_READ, PublishedCommit, QUEUE_BATCH_ANCESTRY_UNVERIFIED,
+    QUEUE_BATCH_MERGE_CONFLICT, QUEUE_BATCH_POLICY_REFUSED, QUEUE_BISECT_NO_PROGRESS,
+    QUEUE_CLAIMED_FIX_STILL_RED, QUEUE_CRASH_LOOP_STOP_LIMIT, QUEUE_FILTER_MATCHES_NO_TESTS,
     QUEUE_GATE_TIMEOUT, QUEUE_MIGRATION_OUT_OF_ORDER, QUEUE_REGATE_EXHAUSTED,
-    QUEUE_RELEASE_BUILD_FAILED, QUEUE_SOURCE_ALREADY_INTEGRATED,
+    QUEUE_RELEASE_BUILD_FAILED, QUEUE_REMOTE_READ_REQUEUE_LIMIT, QUEUE_REMOTE_READ_UNAVAILABLE,
+    QUEUE_SOURCE_ALREADY_INTEGRATED, QUEUE_SUSPECT_CRASH_LOOP,
     ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS, ROLLING_QUEUE_MAX_BATCH_SIZE, RollingQueueEntryState,
     RollingQueueEntryV1, RollingQueueOutcome,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -53,13 +64,17 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 mod bounded_qa;
+mod compile_probe;
 #[cfg(test)]
 pub(crate) use bounded_qa::has_explicit_filters;
 pub(crate) use bounded_qa::note_explicit_filters;
+mod detached_run;
 mod gate_base_red;
 mod known_failure_snapshot;
 mod lanes;
+mod provisional_probe;
 pub(crate) mod satellite_qa;
+mod tip_conflict;
 
 /// Poll interval of the runner loop.
 const TICK: Duration = Duration::from_secs(5);
@@ -82,6 +97,9 @@ const EXACT_GATE_ENV: &str = "RSI_LANDER_EXACT_GATE";
 pub(crate) const QUEUE_SOURCE_UNREACHABLE: &str = "queue_source_unreachable";
 /// Bytes of a lander's stderr/stdout the queue outcome detail keeps (the newest).
 pub const OUTCOME_TAIL_BYTES: usize = 2000;
+/// Decoded stdout/stderr excerpt retained for the decisive red gate (#3936).
+const GATE_FAILURE_EXCERPT_BYTES: usize = 8 * 1024;
+const GATE_FAILURE_EXCERPT_KEY: &str = "gate_failure_excerpt";
 const MAX_FAILING_TESTS: usize = 32;
 /// Per-run lander logs (#1135): each stream keeps its newest bytes, and only the
 /// newest files stay in the log directory.
@@ -168,14 +186,14 @@ fn inherited_git_env(
 }
 
 /// The git binary every probe here runs. Tests may route it through a shim
-/// (#2912) that stalls selected calls; every other call passes through.
+/// (#2912) that stalls or delays selected calls; every other call passes through.
 #[cfg(test)]
 pub(crate) static TEST_GIT_PROGRAM: std::sync::OnceLock<std::ffi::OsString> =
     std::sync::OnceLock::new();
 
-/// #2912: route every probe git through a shim that stalls one subcommand in a
-/// repository that asks for it (`stall_git`) and passes everything else to the
-/// real git, so it is safe to install once for the whole test process.
+/// #2912: route every probe git through a shim that stalls or delays a subcommand
+/// in a repository that asks for it (`stall_git`, `delay_git`) and passes everything
+/// else to the real git, so it is safe to install once for the whole test process.
 #[cfg(test)]
 pub(crate) fn install_stalling_git_shim() {
     use std::os::unix::fs::PermissionsExt;
@@ -192,7 +210,9 @@ pub(crate) fn install_stalling_git_shim() {
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-C\" ] && [ -f \"$2/.rsi-stall\" ] \
              && [ \"$3\" = \"$(cat \"$2/.rsi-stall\")\" ]; then\n  echo $$ > \"$2/.rsi-stall-pid\"\n  \
-             exec sleep 60\nfi\nexec {} \"$@\"\n",
+             exec sleep 60\nfi\n\
+             if [ \"$1\" = \"-C\" ] && [ -f \"$2/.rsi-delay-$3\" ]; then\n  \
+             sleep \"$(cat \"$2/.rsi-delay-$3\")\"\nfi\nexec {} \"$@\"\n",
             real.display()
         );
         std::fs::write(&shim, script).unwrap();
@@ -208,6 +228,17 @@ pub(crate) fn stall_git(repo: &Path, subcommand: &str) {
     install_stalling_git_shim();
     let _ = std::fs::remove_file(repo.join(".rsi-stall-pid"));
     std::fs::write(repo.join(".rsi-stall"), subcommand).unwrap();
+}
+
+/// Add finite subprocess latency without generating CPU load (#519).
+#[cfg(test)]
+pub(crate) fn delay_git(repo: &Path, subcommand: &str, delay: Duration) {
+    install_stalling_git_shim();
+    std::fs::write(
+        repo.join(format!(".rsi-delay-{subcommand}")),
+        delay.as_secs_f64().to_string(),
+    )
+    .unwrap();
 }
 
 /// Whether the git `stall_git` stalled was started and has since been killed.
@@ -289,7 +320,7 @@ fn run_under_git_deadline(
     let outcome = if remaining.is_zero() {
         None
     } else {
-        run_bounded(command, remaining, BOUNDED_GIT_MAX_OUTPUT)
+        run_bounded_optional(command, remaining, BOUNDED_GIT_MAX_OUTPUT, Stdio::null())
     };
     if outcome.is_none() && std::time::Instant::now() >= deadline {
         GIT_DEADLINE_HIT.set(true);
@@ -315,6 +346,61 @@ fn git(repo: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What fetching a satellite-reported source from `origin` found (#3345).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OriginFetch {
+    /// The commit is in the object store and an `origin` ref contains it, or
+    /// `origin` served it by id.
+    Fetched,
+    /// `origin` answered and does not serve the commit.
+    NotOnOrigin,
+    /// The fetch could not finish (no network, a timeout): proves nothing.
+    Unknown,
+}
+
+/// Fetch `source` from `origin` into `repo` and say whether `origin` has it:
+/// one `git fetch origin` (every branch, so the satellite's pushed branch
+/// arrives), then, when no `origin` ref contains the commit, one fetch of the
+/// commit by id. Bounded by `budget` as a whole (every git call is killed at the
+/// deadline). Blocking; call from `spawn_blocking`.
+pub(crate) fn fetch_origin_source(repo: &Path, source: &str, budget: Duration) -> OriginFetch {
+    let deadline = std::time::Instant::now() + budget;
+    let (outcome, timed_out) = with_git_deadline(deadline, || {
+        let all_fetched = git(repo, &["fetch", "--quiet", "--no-tags", "origin"]).is_some();
+        let contained = || {
+            source_commit_exists(repo, source)
+                && git(
+                    repo,
+                    &[
+                        "for-each-ref",
+                        "--count=1",
+                        "--format=%(refname)",
+                        "--contains",
+                        source,
+                        "refs/remotes/origin",
+                    ],
+                )
+                .is_some_and(|refs| !refs.trim().is_empty())
+        };
+        if contained() {
+            return OriginFetch::Fetched;
+        }
+        let by_id = git(repo, &["fetch", "--quiet", "--no-tags", "origin", source]).is_some();
+        if by_id && source_commit_exists(repo, source) {
+            OriginFetch::Fetched
+        } else if all_fetched {
+            OriginFetch::NotOnOrigin
+        } else {
+            OriginFetch::Unknown
+        }
+    });
+    if timed_out {
+        OriginFetch::Unknown
+    } else {
+        outcome
+    }
 }
 
 /// Whether `source` names a commit in `repo`'s object store.
@@ -534,49 +620,78 @@ const MERGE_PROBE_MAX_OUTPUT: u64 = 1 << 20;
 /// Run `command` (stdout piped) until it exits or `timeout` passes. On timeout
 /// the child's whole process group is killed and reaped and the result is
 /// `None`: a bounded outcome, never a hang (#2706). At most `max_output` bytes
-/// of stdout are read; a larger answer is `None` too.
+/// of stdout are read; a larger answer is `None` too. The child's stderr goes
+/// to `stderr` (a probe discards it, a caller that wants the reason passes a
+/// file).
+fn run_bounded_optional(
+    command: std::process::Command,
+    timeout: Duration,
+    max_output: u64,
+    stderr: Stdio,
+) -> Option<(Option<i32>, Vec<u8>)> {
+    run_bounded(command, timeout, max_output, stderr).ok()
+}
+
+/// Keep infrastructure causes for callers that must refuse an incomplete proof.
 fn run_bounded(
     mut command: std::process::Command,
     timeout: Duration,
     max_output: u64,
-) -> Option<(Option<i32>, Vec<u8>)> {
+    stderr: Stdio,
+) -> std::result::Result<(Option<i32>, Vec<u8>), String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
+    if timeout.is_zero() {
+        return Err("timeout: probe deadline exhausted".into());
+    }
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0)
         .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
+        .map_err(|error| format!("could not start {program}: {error}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = stdout.take(max_output + 1).read_to_end(&mut bytes);
-        bytes
+        stdout
+            .take(max_output + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
     });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            _ => break None,
+            Ok(None) => {
+                break Err(format!(
+                    "timeout: {program} exceeded its probe step deadline"
+                ));
+            }
+            Err(error) => break Err(format!("could not wait for {program}: {error}")),
         }
     };
-    if status.is_none() {
-        // SAFETY: `kill` takes a pid and a signal; the group id is the child's
-        // pid because it was started with `process_group(0)`.
+    if status.is_err() {
+        // SAFETY: the child was started in its own process group.
         unsafe {
             nix::libc::kill(-(child.id() as i32), nix::libc::SIGKILL);
         }
         let _ = child.kill();
         let _ = child.wait();
     }
-    let bytes = reader.join().ok()?;
+    let bytes = reader
+        .join()
+        .map_err(|_| "probe stdout reader panicked")?
+        .map_err(|error| format!("could not read {program} stdout: {error}"))?;
     let status = status?;
-    (bytes.len() as u64 <= max_output).then(|| (status.code(), bytes))
+    if bytes.len() as u64 > max_output {
+        return Err(format!("{program} output exceeded the probe byte limit"));
+    }
+    Ok((status.code(), bytes))
 }
 
 /// Make `command` a probe git: the allowlisted environment, no system, global
@@ -619,7 +734,7 @@ fn probe_git_exit(
     isolate_probe_git(&mut command);
     command.arg("-C").arg(repo).args(args);
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)
+    run_bounded_optional(command, remaining, MERGE_PROBE_MAX_OUTPUT, Stdio::null())
 }
 
 /// The object id `name` names in `repo`, read without opening an object: a
@@ -692,7 +807,8 @@ fn peel_commit(scratch: &Path, id: &str, deadline: std::time::Instant) -> Option
         &format!("{id}^{{commit}}"),
     ]);
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let (code, stdout) = run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)?;
+    let (code, stdout) =
+        run_bounded_optional(command, remaining, MERGE_PROBE_MAX_OUTPUT, Stdio::null())?;
     if code != Some(0) {
         return None;
     }
@@ -700,12 +816,18 @@ fn peel_commit(scratch: &Path, id: &str, deadline: std::time::Instant) -> Option
     (!id.is_empty()).then_some(id)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MergeConflictProbe {
+    Clean,
+    Conflicts(Vec<String>),
+    Unknown { reason: &'static str },
+}
+
 /// #2118: the paths `ours` and `theirs` would conflict on, from an in-memory
 /// `git merge-tree --write-tree` (nothing is written to the work tree, the
-/// index or the source repository's object store). `Some(paths)` (possibly
-/// empty when git names none) is a conflict; `None` is a clean merge or a probe
-/// that could not run (an object missing from `repo`, an old git, a timeout):
-/// never a refusal on doubt.
+/// index or the source repository's object store). Keep clean, conflicting
+/// (possibly with no named paths), and unknown outcomes distinct: an unknown
+/// probe proves nothing about conflict attribution and never refuses enqueue.
 ///
 /// #2706: the probe is side-effect free and bounded. It runs in an isolated git
 /// directory (no system, global or repository config, so no external merge
@@ -717,15 +839,18 @@ fn merge_conflict_paths_with(
     theirs: &str,
     launcher: &[&str],
     timeout: Duration,
-) -> Option<Vec<String>> {
+) -> MergeConflictProbe {
     match merge_probe_with(repo, ours, theirs, launcher, timeout) {
-        Some(RollingMergeProbe::Conflict(paths)) => Some(paths),
-        _ => None,
+        Some(RollingMergeProbe::Clean) => MergeConflictProbe::Clean,
+        Some(RollingMergeProbe::Conflict(paths)) => MergeConflictProbe::Conflicts(paths),
+        _ => MergeConflictProbe::Unknown {
+            reason: "merge probe could not complete (missing object, unsupported git, timeout or invalid output)",
+        },
     }
 }
 
-/// [`merge_conflict_paths_with`] that also tells a clean merge from a probe that
-/// could not run (`None`), for the callers that report "merges cleanly" (#348).
+/// The underlying merge verdict (`None` when the probe could not run), also
+/// used by callers that report "merges cleanly" (#348).
 fn merge_probe_with(
     repo: &Path,
     ours: &str,
@@ -759,7 +884,8 @@ fn merge_probe_with(
         &theirs,
     ]);
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    let (code, stdout) = run_bounded(command, remaining, MERGE_PROBE_MAX_OUTPUT)?;
+    let (code, stdout) =
+        run_bounded_optional(command, remaining, MERGE_PROBE_MAX_OUTPUT, Stdio::null())?;
     if code == Some(0) {
         return Some(RollingMergeProbe::Clean);
     }
@@ -806,8 +932,74 @@ pub(crate) fn rolling_merge_probe(repo: &Path, source: &str) -> RollingMergeProb
     RollingMergeProbe::Unknown
 }
 
-/// The most live entries one enqueue probes.
-const CONFLICT_PROBE_MAX_ENTRIES: usize = 32;
+/// The most live entries one enqueue probes (#3741). A probe is a `git
+/// merge-tree` of roughly 10-50 ms, so the cap is generous; the wall budget
+/// ([`ENQUEUE_CONFLICT_SCAN_BUDGET`]) is the real bound. Entries are probed
+/// nearest-first (descending sequence), so whatever the cap or the budget
+/// skips is the farthest entries, never the ones just ahead.
+pub(crate) const CONFLICT_PROBE_MAX_ENTRIES: usize = 256;
+
+/// How many skipped sequences the incomplete warning lists by name.
+const SKIPPED_SEQUENCES_LISTED: usize = 32;
+
+/// Enqueue distinguishes a source defect from an incomplete infrastructure proof.
+#[derive(Debug)]
+pub(crate) enum ProvisionalSourceRefusal {
+    Unprovable(String),
+    Inconclusive(String),
+}
+
+/// #3397, #3545: validate declarations at enqueue, including still-free numbers.
+/// Unlike the best-effort sweep, enqueue refuses an incomplete proof retryably.
+pub(crate) fn provisional_source_refusal(
+    repo: &Path,
+    source: &str,
+    deadline: std::time::Instant,
+) -> Option<ProvisionalSourceRefusal> {
+    for reference in ["origin/rolling", "rolling"] {
+        if let Some(tip) = probe_git(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{reference}^{{commit}}"),
+            ],
+            deadline,
+        ) {
+            return match provisional_probe::prove_against_tip(repo, tip.trim(), source, deadline) {
+                provisional_probe::Proof::Unprovable(reason) => {
+                    Some(ProvisionalSourceRefusal::Unprovable(reason))
+                }
+                provisional_probe::Proof::Inconclusive { cause } => {
+                    Some(ProvisionalSourceRefusal::Inconclusive(cause.to_string()))
+                }
+                _ => None,
+            };
+        }
+    }
+    // Counting additions also needs rolling. A source without any declaration
+    // remains unaffected even in an older/toy repository with no rolling ref.
+    if probe_git(
+        repo,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            source,
+            "--",
+            PROVISIONAL_DIR,
+        ],
+        deadline,
+    )
+    .is_some_and(|paths| !paths.lines().any(|path| path.ends_with(".json")))
+    {
+        return None;
+    }
+    Some(ProvisionalSourceRefusal::Inconclusive(
+        "could not resolve rolling ref origin/rolling or rolling (missing ref, git read failure or timeout); fetch origin/rolling and check git availability".into(),
+    ))
+}
 
 /// #2907: the wall budget of one enqueue's whole conflict scan. The scan is a
 /// warning, so it never holds the call longer than this; what it did not reach
@@ -829,12 +1021,15 @@ pub(crate) fn queue_conflict_warnings(
 
 /// #2118: the typed warnings for a new `source`: a conflict with the rolling
 /// tip, then with each live entry ahead of it (`ahead`: id, sequence, source
-/// commit). Blocking; call from `spawn_blocking`.
+/// commit). An entry's existing conflicts with rolling are reported on that
+/// entry, rather than attributed to the new source. Blocking; call from
+/// `spawn_blocking`.
 ///
 /// #2907: the whole scan is bounded by `budget`. Each probe runs under the time
 /// left, no probe starts after the budget is spent, and a scan that did not
 /// reach every entry ends with one [`QUEUE_CONFLICT_SCAN_INCOMPLETE`] warning
-/// naming how many probes it skipped, so a missing warning never reads as "no
+/// naming how many probes it skipped and which queue sequences they were
+/// (#3741: entries are probed nearest-first), so a missing warning never reads as "no
 /// conflict" when the scan was cut short.
 ///
 /// [`QUEUE_CONFLICT_SCAN_INCOMPLETE`]: rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE
@@ -844,9 +1039,34 @@ pub(crate) fn queue_conflict_warnings_within(
     ahead: &[(Uuid, i64, String)],
     budget: Duration,
 ) -> Vec<rsi_common::rolling_queue::QueueConflictWarningV1> {
+    queue_conflict_warnings_with_probe(
+        repo,
+        source,
+        ahead,
+        budget,
+        |ours, theirs, timeout| merge_conflict_paths_with(repo, ours, theirs, &["git"], timeout),
+        |ours, theirs, deadline| provisional_probe::classify_conflict(repo, ours, theirs, deadline),
+    )
+}
+
+/// The conflict warnings with the merge probe (`ours`, `theirs`, timeout) and
+/// the renumber classifier (`ours`, `theirs`, deadline) injected. A conflict the
+/// classifier proves renumberable (#3336) is reported as a `*_renumberable_*`
+/// notice, never as a conflict.
+fn queue_conflict_warnings_with_probe(
+    repo: &Path,
+    source: &str,
+    ahead: &[(Uuid, i64, String)],
+    budget: Duration,
+    mut probe: impl FnMut(&str, &str, Duration) -> MergeConflictProbe,
+    mut classify: impl FnMut(&str, &str, std::time::Instant) -> provisional_probe::Renumber,
+) -> Vec<rsi_common::rolling_queue::QueueConflictWarningV1> {
+    use provisional_probe::Renumber;
     use rsi_common::rolling_queue::{
+        ENTRY_CONFLICTS_WITH_ROLLING, ENTRY_RENUMBERABLE_WITH_ROLLING,
         QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICT_WARNING_MAX_FILES,
-        QUEUE_CONFLICTS_WITH_ENTRY, QUEUE_CONFLICTS_WITH_ROLLING, QueueConflictWarningV1,
+        QUEUE_CONFLICTS_WITH_ENTRY, QUEUE_CONFLICTS_WITH_ROLLING, QUEUE_RENUMBERABLE_WITH_ENTRY,
+        QUEUE_RENUMBERABLE_WITH_ROLLING, QueueConflictWarningV1,
     };
     let capped = |mut files: Vec<String>| {
         files.truncate(QUEUE_CONFLICT_WARNING_MAX_FILES);
@@ -854,19 +1074,42 @@ pub(crate) fn queue_conflict_warnings_within(
     };
     let started = std::time::Instant::now();
     let deadline = started + budget;
-    let probe = |ours: &str| {
+    let mut probe = |ours: &str, theirs: &str| {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        merge_conflict_paths_with(
-            repo,
-            ours,
-            source,
-            &["git"],
-            remaining.min(MERGE_PROBE_TIMEOUT),
-        )
+        probe(ours, theirs, remaining.min(MERGE_PROBE_TIMEOUT))
     };
     let spent = || std::time::Instant::now() >= deadline;
+    // Merge probes and renumber proofs share the same total scan deadline.
+    // An unfinished proof is unknown, never a conflict with repair advice.
+    let mut classify = |ours: &str, theirs: &str, files: &[String]| {
+        if files.is_empty() {
+            Renumber::Conflict(None)
+        } else {
+            classify(ours, theirs, deadline)
+        }
+    };
+    let incomplete = |entry_id: Option<Uuid>, entry_sequence: Option<i64>, files, detail| {
+        QueueConflictWarningV1 {
+            code: QUEUE_CONFLICT_SCAN_INCOMPLETE.into(),
+            entry_id,
+            entry_sequence,
+            files: capped(files),
+            detail,
+        }
+    };
+    let reason_note = |reason: &Option<String>| {
+        reason.as_ref().map_or_else(String::new, |reason| {
+            format!(" (its declared provisional migration does not cover them: {reason})")
+        })
+    };
     let mut warnings = Vec::new();
     let mut skipped = 0_usize;
+    // #3741: the queue sequences whose probes were skipped, named in the
+    // incomplete warning.
+    let mut skipped_sequences: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    // #3741: nearest the new queue position first (descending sequence).
+    let mut nearest_first: Vec<&(Uuid, i64, String)> = ahead.iter().collect();
+    nearest_first.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     // #2912: the ref resolve runs under the scan's deadline too. A resolve that
     // does not complete proves nothing about the tip, so it counts as a skipped
     // probe rather than as "no rolling ref".
@@ -877,8 +1120,9 @@ pub(crate) fn queue_conflict_warnings_within(
             &["rev-parse", "--verify", "--quiet", reference],
             deadline,
         ) {
-            Some((Some(0), _)) => {
-                tip = Some(reference);
+            Some((Some(0), stdout)) => {
+                // Pin every probe to the same tip even if the ref advances.
+                tip = Some(String::from_utf8_lossy(&stdout).trim().to_owned());
                 break;
             }
             Some(_) => {}
@@ -888,45 +1132,189 @@ pub(crate) fn queue_conflict_warnings_within(
             }
         }
     }
-    if let Some(tip) = tip {
+    if let Some(tip) = tip.as_deref() {
         if spent() {
             skipped += 1;
-        } else if let Some(files) = probe(tip) {
-            warnings.push(QueueConflictWarningV1 {
-                code: QUEUE_CONFLICTS_WITH_ROLLING.into(),
-                entry_id: None,
-                entry_sequence: None,
-                files: capped(files),
-                detail: "the source conflicts with the rolling tip: merge origin/rolling into the worker's branch, re-verify and enqueue that commit instead".into(),
-            });
-        } else if spent() {
-            skipped += 1;
+        } else {
+            match probe(tip, source) {
+                MergeConflictProbe::Conflicts(files) => {
+                    warnings.push(match classify(tip, source, &files) {
+                        Renumber::Unknown => {
+                            skipped += 1;
+                            incomplete(None, None, files,
+                                "the source's renumber probe against rolling could not decide; conflict classification is unknown".into())
+                        }
+                        Renumber::Renumberable(note) => QueueConflictWarningV1 {
+                            code: QUEUE_RENUMBERABLE_WITH_ROLLING.into(),
+                            entry_id: None,
+                            entry_sequence: None,
+                            files: capped(files),
+                            detail: format!(
+                                "not a conflict: {note}; these files clash only on the migration version with the rolling tip and the lander resolves them, so no merge is needed"
+                            ),
+                        },
+                        Renumber::Conflict(reason) => QueueConflictWarningV1 {
+                            code: QUEUE_CONFLICTS_WITH_ROLLING.into(),
+                            entry_id: None,
+                            entry_sequence: None,
+                            files: capped(files),
+                            detail: format!(
+                                "the source conflicts with the rolling tip: merge origin/rolling into the worker's branch, re-verify and enqueue that commit instead{}",
+                                reason_note(&reason)
+                            ),
+                        },
+                    });
+                }
+                MergeConflictProbe::Clean => {}
+                MergeConflictProbe::Unknown { reason } => {
+                    tracing::debug!(reason, "source-vs-rolling conflict probe incomplete");
+                    skipped += 1;
+                }
+            }
         }
     }
+    // Entries can share a source commit. Probe each commit against this tip
+    // once per scan, retaining all paths until attribution is complete.
+    let mut entry_rolling_conflicts = HashMap::new();
+    let mut entry_rolling_kinds: HashMap<&str, Renumber> = HashMap::new();
     let mut probed = 0_usize;
-    for (id, sequence, commit) in ahead.iter().take(CONFLICT_PROBE_MAX_ENTRIES) {
+    for (id, sequence, commit) in nearest_first
+        .iter()
+        .copied()
+        .take(CONFLICT_PROBE_MAX_ENTRIES)
+    {
         if commit == source {
             continue;
         }
         if spent() {
             skipped += 1;
+            skipped_sequences.insert(*sequence);
             continue;
         }
         probed += 1;
-        if let Some(files) = probe(commit) {
-            warnings.push(QueueConflictWarningV1 {
+        let entry_probe = if let Some(tip) = tip.as_deref() {
+            Some(
+                entry_rolling_conflicts
+                    .entry(commit.as_str())
+                    .or_insert_with(|| {
+                        let result = probe(tip, commit);
+                        if let MergeConflictProbe::Unknown { reason } = &result {
+                            tracing::debug!(reason, "entry-vs-rolling conflict probe incomplete");
+                            skipped += 1;
+                            skipped_sequences.insert(*sequence);
+                        }
+                        result
+                    }),
+            )
+        } else {
+            None
+        };
+        let entry_files = match entry_probe.as_deref() {
+            Some(MergeConflictProbe::Conflicts(files)) => Some(files),
+            _ => None,
+        };
+        if let (Some(files), Some(tip)) = (entry_files, tip.as_deref()) {
+            let kind = entry_rolling_kinds
+                .entry(commit.as_str())
+                .or_insert_with(|| classify(tip, commit, files))
+                .clone();
+            warnings.push(match kind {
+                Renumber::Unknown => {
+                    skipped += 1;
+                    skipped_sequences.insert(*sequence);
+                    incomplete(Some(*id), Some(*sequence), files.to_vec(),
+                        format!("queue entry {id} (sequence {sequence}) ahead: the renumber probe against rolling could not decide; conflict classification is unknown"))
+                }
+                Renumber::Renumberable(note) => QueueConflictWarningV1 {
+                    code: ENTRY_RENUMBERABLE_WITH_ROLLING.into(),
+                    entry_id: Some(*id),
+                    entry_sequence: Some(*sequence),
+                    files: capped(files.to_vec()),
+                    detail: format!(
+                        "not a conflict: queue entry {id} (sequence {sequence}) ahead: {note}; these files clash only on the migration version with the rolling tip and the lander resolves them"
+                    ),
+                },
+                Renumber::Conflict(reason) => QueueConflictWarningV1 {
+                    code: ENTRY_CONFLICTS_WITH_ROLLING.into(),
+                    entry_id: Some(*id),
+                    entry_sequence: Some(*sequence),
+                    files: capped(files.to_vec()),
+                    detail: format!(
+                        "queue entry {id} (sequence {sequence}) ahead already conflicts with the rolling tip: have that entry's worker merge origin/rolling, re-verify and enqueue the repaired commit{}",
+                        reason_note(&reason)
+                    ),
+                },
+            });
+        }
+        if spent() {
+            skipped += 1;
+            skipped_sequences.insert(*sequence);
+            continue;
+        }
+        let mut files = match probe(commit, source) {
+            MergeConflictProbe::Conflicts(files) => files,
+            MergeConflictProbe::Clean => continue,
+            MergeConflictProbe::Unknown { reason } => {
+                tracing::debug!(reason, "entry-vs-source conflict probe incomplete");
+                skipped += 1;
+                skipped_sequences.insert(*sequence);
+                continue;
+            }
+        };
+        // Without the entry's rolling baseline we cannot tell which side owns
+        // these paths, even though the pairwise probe itself succeeded.
+        if matches!(
+            entry_probe.as_deref(),
+            Some(MergeConflictProbe::Unknown { .. })
+        ) {
+            continue;
+        }
+        if !files.is_empty() {
+            if let Some(entry_files) = entry_files {
+                files.retain(|path| !entry_files.contains(path));
+            }
+            if files.is_empty() {
+                continue;
+            }
+        }
+        let kind = classify(commit, source, &files);
+        warnings.push(match kind {
+            Renumber::Unknown => {
+                skipped += 1;
+                skipped_sequences.insert(*sequence);
+                incomplete(Some(*id), Some(*sequence), files,
+                    format!("the source's renumber probe against queue entry {id} (sequence {sequence}) ahead could not decide; conflict classification is unknown"))
+            }
+            Renumber::Renumberable(note) => QueueConflictWarningV1 {
+                code: QUEUE_RENUMBERABLE_WITH_ENTRY.into(),
+                entry_id: Some(*id),
+                entry_sequence: Some(*sequence),
+                files: capped(files),
+                detail: format!(
+                    "not a conflict: {note}; these files clash only on the migration version with queue entry {id} (sequence {sequence}) ahead and the lander resolves them once that entry lands, so no merge or cancellation is needed"
+                ),
+            },
+            Renumber::Conflict(reason) => QueueConflictWarningV1 {
                 code: QUEUE_CONFLICTS_WITH_ENTRY.into(),
                 entry_id: Some(*id),
                 entry_sequence: Some(*sequence),
                 files: capped(files),
                 detail: format!(
-                    "the source conflicts with queue entry {id} (sequence {sequence}) ahead of it: once that entry lands, have the worker merge origin/rolling and re-verify, or cancel this entry until then; if that entry is withdrawn or refused this warning no longer applies"
+                    "the source conflicts with queue entry {id} (sequence {sequence}) ahead of it: once that entry lands, have the worker merge origin/rolling and re-verify, or cancel this entry until then; if that entry is withdrawn or refused this warning no longer applies{}",
+                    reason_note(&reason)
                 ),
-            });
-        } else if spent() {
-            // The probe that ran into the deadline was killed: it proved nothing.
-            skipped += 1;
-        }
+            },
+        });
+    }
+    // Entries past the probe cap are never inspected: say so, so a missing
+    // warning for them never reads as "no conflict".
+    for (_, sequence, _) in nearest_first
+        .iter()
+        .copied()
+        .skip(CONFLICT_PROBE_MAX_ENTRIES)
+    {
+        skipped += 1;
+        skipped_sequences.insert(*sequence);
     }
     tracing::info!(
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -942,12 +1330,37 @@ pub(crate) fn queue_conflict_warnings_within(
             entry_sequence: None,
             files: Vec::new(),
             detail: format!(
-                "the conflict scan stopped after {} s with {skipped} probe(s) not completed, so the absence of a warning for them proves nothing; the entry is queued either way",
-                budget.as_secs().max(1)
+                "the conflict scan stopped after {} s with {skipped} probe(s) not completed{}, so the absence of a warning for them proves nothing; the scan is advisory and never holds or refuses a source, and the lander still checks the merge",
+                budget.as_secs().max(1),
+                skipped_sequences_note(&skipped_sequences)
             ),
         });
     }
     warnings
+}
+
+/// #3741: the " (queue sequences not fully checked: ...)" clause of the
+/// incomplete warning, nearest first, or empty when no entry was skipped.
+fn skipped_sequences_note(sequences: &std::collections::BTreeSet<i64>) -> String {
+    if sequences.is_empty() {
+        return String::new();
+    }
+    let listed: Vec<String> = sequences
+        .iter()
+        .rev()
+        .take(SKIPPED_SEQUENCES_LISTED)
+        .map(i64::to_string)
+        .collect();
+    let more = sequences.len().saturating_sub(SKIPPED_SEQUENCES_LISTED);
+    let tail = if more == 0 {
+        String::new()
+    } else {
+        format!(" and {more} more")
+    };
+    format!(
+        " (queue sequences not fully checked: {}{tail})",
+        listed.join(", ")
+    )
 }
 
 /// #3036: the wall budget of one refused land's scan for conflicting entries
@@ -992,7 +1405,7 @@ pub(crate) fn conflicting_entries_ahead(
         if remaining.is_zero() {
             break;
         }
-        let Some(paths) = merge_conflict_paths_with(
+        let MergeConflictProbe::Conflicts(paths) = merge_conflict_paths_with(
             repo,
             commit,
             source,
@@ -1349,6 +1762,76 @@ pub(crate) fn derive_source_facts(repo: &Path, source: &str) -> SourceFacts {
 /// Wall-clock cap on one filter derivation (`check-touched-shards --filters-only`).
 const DERIVE_FILTERS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// #3372: the most changed files a filter derivation is attempted for. The
+/// checker traces each changed source through the call graph, so a wider diff
+/// (a mechanical rename across hundreds of files) cannot finish inside
+/// [`DERIVE_FILTERS_TIMEOUT`]; it is recorded with `lander_selects` at once
+/// instead of burning the whole budget first.
+const DERIVE_FILTERS_MAX_CHANGED_FILES: usize = 300;
+
+/// The budget one derivation runs under: wall clock and changed-file count.
+#[derive(Debug, Clone, Copy)]
+struct DeriveBudget {
+    timeout: std::time::Duration,
+    max_changed_files: usize,
+}
+
+const DEFAULT_DERIVE_BUDGET: DeriveBudget = DeriveBudget {
+    timeout: DERIVE_FILTERS_TIMEOUT,
+    max_changed_files: DERIVE_FILTERS_MAX_CHANGED_FILES,
+};
+
+/// Per-repository budget overrides, so a test shrinks the budget of its own
+/// fixture repository without touching any other test's derivation.
+#[cfg(test)]
+static DERIVE_BUDGET_OVERRIDES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, DeriveBudget>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn derive_budget(repo: &Path) -> DeriveBudget {
+    #[cfg(test)]
+    if let Some(budget) = DERIVE_BUDGET_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(repo)
+    {
+        return *budget;
+    }
+    let _ = repo;
+    DEFAULT_DERIVE_BUDGET
+}
+
+/// Run derivations of `repo` under a budget of `timeout` and `max_changed_files`.
+#[cfg(test)]
+pub(crate) fn set_derive_budget_for_test(
+    repo: &Path,
+    timeout: std::time::Duration,
+    max_changed_files: usize,
+) {
+    DERIVE_BUDGET_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            repo.to_path_buf(),
+            DeriveBudget {
+                timeout,
+                max_changed_files,
+            },
+        );
+}
+
+/// Why a filter derivation produced no filters (#3372).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DerivationFailure {
+    /// The derivation exceeded its budget (it timed out, or the diff is wider
+    /// than [`DERIVE_FILTERS_MAX_CHANGED_FILES`]). Not a fault of the source:
+    /// the entry is kept and the lander selects its tests
+    /// (`QueueFiltersState::LanderSelects`).
+    OverBudget(String),
+    /// The checker did not start or printed no usable receipt.
+    Failed(String),
+}
+
 /// #1807/#1781/#1786: derive the landing filters of `source` the way a hand
 /// landing does, so no agent copies, prunes or splits them. Runs the repo's
 /// `scripts/check-touched-shards --filters-only --json` on `source` against the
@@ -1365,14 +1848,16 @@ pub(crate) async fn derive_test_filters(repo: &Path, source: &str) -> Vec<String
 }
 
 /// [`derive_test_filters`] that tells a derivation that FAILED (the checker did
-/// not start, timed out, or printed no usable receipt) from one with nothing to
+/// not start or printed no usable receipt) or went OVER BUDGET (#3372: timed
+/// out, or the diff is too wide to trace in time) from one with nothing to
 /// derive (no checker script, no rolling ref: `Ok` of no filters, the always
 /// correct unfiltered gate). #2993: an entry recorded before its derivation
-/// finished is refused on the first, never gated unfiltered by surprise.
+/// finished is refused on a failure, never gated unfiltered by surprise; one
+/// over budget is kept and the lander selects its tests.
 pub(crate) async fn try_derive_test_filters(
     repo: &Path,
     source: &str,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<Vec<String>, DerivationFailure> {
     let script = repo.join("scripts").join("check-touched-shards");
     if !script.is_file() {
         tracing::warn!(repo = %repo.display(), "derive_filters: no scripts/check-touched-shards");
@@ -1393,8 +1878,29 @@ pub(crate) async fn try_derive_test_filters(
     }) else {
         return Ok(Vec::new());
     };
+    let budget = derive_budget(&repo);
+    // #3372: a diff too wide to trace is not run at all; the count is one cheap
+    // git read, so the entry is kept at once instead of after the whole timeout.
+    let counted = {
+        let (probe_repo, probe_base, probe_source) =
+            (repo.clone(), base.to_owned(), source.to_owned());
+        tokio::task::spawn_blocking(move || {
+            changed_file_count(&probe_repo, &probe_base, &probe_source)
+        })
+        .await
+        .unwrap_or_default()
+    };
+    if let Some(count) = counted.filter(|count| *count > budget.max_changed_files) {
+        tracing::warn!(count, "derive_filters: diff too wide to derive");
+        return Err(DerivationFailure::OverBudget(format!(
+            "the source changes {count} files, over the {} the filter derivation traces in time",
+            budget.max_changed_files
+        )));
+    }
     let mut command =
         tokio::process::Command::new(if cfg!(windows) { "python" } else { "python3" });
+    // #3391: the checker is a script from the repository under test.
+    crate::lander_env_policy::apply_tokio(&mut command);
     command
         .arg(&script)
         .args(["--filters-only", "--json", "--repo"])
@@ -1404,31 +1910,40 @@ pub(crate) async fn try_derive_test_filters(
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = match tokio::time::timeout(DERIVE_FILTERS_TIMEOUT, command.output()).await {
+    let output = match tokio::time::timeout(budget.timeout, command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             tracing::warn!(%error, "derive_filters: check-touched-shards did not start");
-            return Err(format!("check-touched-shards did not start: {error}"));
+            return Err(DerivationFailure::Failed(format!(
+                "check-touched-shards did not start: {error}"
+            )));
         }
         Err(_) => {
             tracing::warn!("derive_filters: check-touched-shards timed out");
-            return Err(format!(
+            return Err(DerivationFailure::OverBudget(format!(
                 "check-touched-shards timed out after {} s",
-                DERIVE_FILTERS_TIMEOUT.as_secs()
-            ));
+                budget.timeout.as_secs()
+            )));
         }
     };
     // A nonzero exit still prints a receipt (a failed audit); its filters are
     // still the diff's filters.
     parse_receipt_filters(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
-        format!(
+        DerivationFailure::Failed(format!(
             "check-touched-shards exited {} without a usable suggested_filters receipt",
             output
                 .status
                 .code()
                 .map_or_else(|| "by signal".to_owned(), |code| code.to_string())
-        )
+        ))
     })
+}
+
+/// How many files `source` changes against `base` (#3372), or `None` when git
+/// cannot say (then the checker runs under its wall-clock budget as before).
+fn changed_file_count(repo: &Path, base: &str, source: &str) -> Option<usize> {
+    let range = format!("{base}...{source}");
+    git(repo, &["diff", "--name-only", &range]).map(|names| names.lines().count())
 }
 
 /// #2907: how long `AgentEnqueueLandingSource` waits inline for the filter
@@ -1449,7 +1964,7 @@ const DERIVATION_REUSE: Duration = Duration::from_secs(600);
 type DerivationKey = (PathBuf, String, String);
 
 /// What a derivation ended with: its filters, or why it failed (#2993).
-type DerivationResult = std::result::Result<Vec<String>, String>;
+type DerivationResult = std::result::Result<Vec<String>, DerivationFailure>;
 
 struct Derivation {
     tx: tokio::sync::watch::Sender<Option<DerivationResult>>,
@@ -1494,6 +2009,10 @@ pub(crate) enum SharedDerivation {
     /// The derivation ran and failed; the reason. Not reused: a retry runs it
     /// again.
     Failed(String),
+    /// #3372: the derivation exceeded its budget (timed out, or the diff is too
+    /// wide to trace in time); the reason. Not a fault of the source: the
+    /// caller keeps the entry and the lander selects its tests. Not reused.
+    OverBudget(String),
     /// Still running at the caller's limit. It keeps running in the
     /// background and joins the next caller.
     Running,
@@ -1578,7 +2097,10 @@ pub(crate) async fn derive_test_filters_shared(
         match rx.wait_for(Option::is_some).await {
             Ok(done) => match done.clone() {
                 Some(Ok(filters)) => SharedDerivation::Ready(filters),
-                Some(Err(reason)) => SharedDerivation::Failed(reason),
+                Some(Err(DerivationFailure::Failed(reason))) => SharedDerivation::Failed(reason),
+                Some(Err(DerivationFailure::OverBudget(reason))) => {
+                    SharedDerivation::OverBudget(reason)
+                }
                 None => SharedDerivation::Running,
             },
             Err(_) => {
@@ -1606,7 +2128,7 @@ static FINISHING_DERIVATIONS: std::sync::LazyLock<std::sync::Mutex<HashSet<Uuid>
 /// enqueuer once. At most one task per entry; a call for an entry a task already
 /// finishes does nothing, so the enqueue verb and the loop's sweep never race.
 pub(crate) fn finish_filter_derivation_in_background(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     entry: Uuid,
     repo: PathBuf,
     commit: String,
@@ -1632,7 +2154,7 @@ pub(crate) fn finish_filter_derivation_in_background(
 }
 
 async fn finish_filter_derivation(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     entry: Uuid,
     repo: &Path,
     commit: &str,
@@ -1668,6 +2190,17 @@ async fn finish_filter_derivation(
             rsi_common::rolling_queue::QUEUE_FILTER_DERIVATION_FAILED,
             reason,
         )),
+        SharedDerivation::OverBudget(reason) => {
+            // #3372: not a refusal. Keep the entry with no derived filters; the
+            // lander's bounded closure selection and the automatic full-library
+            // QA cover it.
+            tracing::warn!(%entry, %reason, "rolling queue filter derivation over budget; the lander selects the tests");
+            with_store(store, move |s| {
+                s.mark_rolling_queue_filters_lander_selects(entry, true)
+            })
+            .await?;
+            None
+        }
         SharedDerivation::TipUnreadable | SharedDerivation::Running => Some((
             rsi_common::rolling_queue::QUEUE_TIP_READ_TIMEOUT,
             "the rolling-tip read behind the filter derivation did not finish".to_owned(),
@@ -1685,7 +2218,9 @@ async fn finish_filter_derivation(
 /// Re-attach a derivation to every entry recorded with its filters pending
 /// (#2993): after a daemon restart, or a task that did not record its result.
 /// Called on every queue tick; an entry a task already finishes is skipped.
-pub(crate) async fn resume_pending_filter_derivations(store: &Arc<tokio::sync::Mutex<Store>>) {
+pub(crate) async fn resume_pending_filter_derivations(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+) {
     match with_store(store, |s| s.rolling_queue_entries_deriving_filters()).await {
         Ok(pending) => {
             for (entry, repo, commit) in pending {
@@ -1748,7 +2283,7 @@ pub(crate) fn commit_off_rolling(repo: &Path, commit: &str) -> bool {
 /// After ONE fetch, the published tip for each source that is an ancestor of
 /// `origin/rolling`, in input order (`None`: not landed, or git cannot say).
 pub(crate) fn landed_tips(repo: &Path, sources: &[String]) -> Vec<Option<String>> {
-    let Some(tip) = fetch_tip(repo) else {
+    let Some(tip) = fetch_rolling(repo).ok().and_then(|_| read_origin_tip(repo)) else {
         return vec![None; sources.len()];
     };
     sources
@@ -1757,6 +2292,111 @@ pub(crate) fn landed_tips(repo: &Path, sources: &[String]) -> Vec<Option<String>
             git(repo, &["merge-base", "--is-ancestor", source, &tip]).map(|_| tip.clone())
         })
         .collect()
+}
+
+/// The committer identity only the queue's lander writes (`rsi-rolling-land`:
+/// its integration merges, its renumbered provisional-migration commits and its
+/// pin commits). The manager `Integrate` executor commits as
+/// `integration@rsi.local`, so this separates the two writers of the same
+/// `rsi integration: merge <source> into rolling` subject (#4040).
+const LANDER_COMMITTER_EMAIL: &str = "rsi-rolling-land@rsi.invalid";
+
+/// #4009/#4040: the commit the queue's lander itself published for `source` on
+/// `origin/rolling`. It is the commit committed by the lander's identity that has
+/// `source` as a parent, whatever its subject: the integration merge, the
+/// renumbered provisional-migration commit (parents: target and source) and the
+/// pin commit on a fast-forwarded source all qualify, while a hand push or a
+/// manager `Integrate` with the same subject does not. `None` when no lander
+/// commit names the source (it landed another way, or by fast-forward, which
+/// writes no commit) or git cannot say.
+pub(crate) fn lander_publication_commit(repo: &Path, source: &str) -> Option<String> {
+    let full = git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{source}^{{commit}}"),
+        ],
+    )?
+    .trim()
+    .to_string();
+    let log = git(
+        repo,
+        &[
+            "log",
+            "--format=%H%x09%ce%x09%P",
+            "--ancestry-path",
+            "--reverse",
+            &format!("{full}..origin/rolling"),
+        ],
+    )?;
+    log.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let sha = fields.next()?;
+        let email = fields.next()?;
+        let parents = fields.next()?;
+        (email == LANDER_COMMITTER_EMAIL && parents.split_whitespace().any(|p| p == full))
+            .then(|| sha.to_string())
+    })
+}
+
+/// #4040: the gate receipt of an entry the queue's lander published before the
+/// settle was lost is not on the entry; say so, and name a daemon restart only
+/// when the entry's own events show one (`requeued_after_restart`).
+fn missing_receipt_clause(restarts: u32) -> String {
+    if restarts > 0 {
+        format!(
+            "its gate receipt (gate_timing, fixes_tests verdict) is not on this entry: the \
+             daemon restarted while it was gating (requeued_after_restart x{restarts})"
+        )
+    } else {
+        "its gate receipt (gate_timing, fixes_tests verdict) is not on this entry".to_string()
+    }
+}
+
+/// The outcome text and landed commit for a member found already on
+/// `origin/rolling` (#4009, #4040). Attribution rests on evidence the queue
+/// writes, never on a commit subject: the lander's committer identity naming
+/// the source, else the entry's own `requeued_after_restart` events (the queue
+/// had started gating it before the daemon restarted, so a fast-forward, which
+/// writes no commit, is the queue's too). Only an entry with neither is called
+/// an outside landing. Publication decisions never read this.
+fn already_landed_outcome(
+    source: &str,
+    tip: String,
+    lander_commit: Option<String>,
+    restarts: u32,
+) -> (String, String) {
+    match lander_commit {
+        Some(commit) => {
+            let clause = missing_receipt_clause(restarts);
+            (
+                commit.clone(),
+                format!(
+                    "{source} was published to origin/rolling by the queue's lander as \
+                     {commit}; {clause}"
+                ),
+            )
+        }
+        None if restarts > 0 => (
+            tip,
+            format!(
+                "{source} was on origin/rolling when this entry was re-driven after a daemon \
+                 restart (requeued_after_restart x{restarts}); the queue had started gating \
+                 it and no other writer is recorded, so the queue's earlier lander run most \
+                 likely published it (a fast-forward writes no commit); its gate receipt \
+                 (gate_timing, fixes_tests verdict) is not on this entry"
+            ),
+        ),
+        None => (
+            tip,
+            format!(
+                "{source} was already on origin/rolling (landed outside the queue); \
+                 settled without a gate"
+            ),
+        ),
+    }
 }
 
 /// The migration number the lander actually gave `source`, read from the
@@ -1910,13 +2550,29 @@ pub struct LanderLauncher {
     /// How the host's Landlock ABI is read before the queue worktree is reset;
     /// replaced only by tests.
     fence_abi: write_fence::AbiProbe,
-    /// Wall-time budget of one batch's gating, every lander run included
-    /// (#1208). The runner loop refreshes it from the operator setting
+    /// Wall-time budget of ONE lander run (#1208, #3267): every run of a batch
+    /// (the full gate and each bisect step) gets this much, under a batch
+    /// ceiling that scales with the bisect depth ([`GateBudget`]). The runner
+    /// loop refreshes it from the operator setting
     /// `rolling_queue_gate_timeout_mins` before each batch.
     gate_timeout: Duration,
     /// #2119: run each lander in a scope of `rsi-build.slice`, so the gate's
     /// cargo builds and tests share the hub build budget. Off for tests.
     build_slice: bool,
+    /// #3394: compile-probe wide queued entries against the tip and the entries
+    /// ahead of them before a batch claims them. Needs `workspace`. Off for tests.
+    compile_probe: bool,
+    /// #3435: keep each lander run in files under the queue workspace instead
+    /// of in the daemon's memory, so it survives a daemon restart and the next
+    /// daemon adopts it (`detached_run`). Needs a workspace.
+    detached_runs: bool,
+    /// The identity this daemon process claims runs under; `None` is the
+    /// process's own. Only tests set another, to play the next daemon.
+    run_epoch: Option<String>,
+    /// Test-local additions to the launcher's inherited environment, without
+    /// changing the process environment shared by concurrent tests.
+    #[cfg(test)]
+    inherited_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl LanderLauncher {
@@ -1931,7 +2587,30 @@ impl LanderLauncher {
                 u64::from(ROLLING_QUEUE_DEFAULT_GATE_TIMEOUT_MINS) * 60,
             ),
             build_slice: false,
+            compile_probe: false,
+            detached_runs: false,
+            run_epoch: None,
+            #[cfg(test)]
+            inherited_env: Vec::new(),
         }
+    }
+
+    /// Hold a wide queued entry until `cargo check --workspace --all-targets`
+    /// of the rolling tip, the entries ahead of it and the entry has a verdict,
+    /// and refuse one that does not compile (#3394). It builds in the queue
+    /// workspace, so it does nothing for a launcher that has none.
+    #[must_use]
+    pub fn with_compile_probe(mut self) -> Self {
+        self.compile_probe = true;
+        self
+    }
+
+    /// The directory the compile probe keeps its clone and cargo target in.
+    fn compile_probe_root(&self) -> Option<PathBuf> {
+        self.workspace
+            .as_ref()
+            .filter(|_| self.compile_probe)
+            .map(|root| root.join("compile-probe"))
     }
 
     /// Run each lander in a transient scope of `rsi-build.slice` (#2119) when
@@ -1939,17 +2618,41 @@ impl LanderLauncher {
     #[must_use]
     pub fn with_build_slice(mut self) -> Self {
         self.build_slice = true;
+        self.detached_runs = true;
         self
     }
 
-    /// Bound each batch's gating to `timeout` of wall time (#1208).
+    /// Keep each lander run adoptable across a daemon restart (#3435).
+    #[cfg(all(test, target_os = "linux"))]
+    fn with_detached_runs(mut self) -> Self {
+        self.detached_runs = true;
+        self
+    }
+
+    /// Where detached runs are kept, when they are on and the launcher owns a
+    /// workspace.
+    fn detached_runs_dir(&self) -> Option<PathBuf> {
+        self.detached_runs
+            .then(|| self.workspace.as_ref())
+            .flatten()
+            .map(|root| root.join(detached_run::RUNS_SUBDIR))
+    }
+
+    fn run_epoch(&self) -> &str {
+        match self.run_epoch.as_deref() {
+            Some(epoch) => epoch,
+            None => detached_run::process_epoch(),
+        }
+    }
+
+    /// Bound each lander run of a batch to `timeout` of wall time (#1208).
     #[must_use]
     pub fn with_gate_timeout(mut self, timeout: Duration) -> Self {
         self.gate_timeout = timeout;
         self
     }
 
-    /// The wall-time budget one batch's gating is given.
+    /// The wall-time budget one lander run is given.
     #[must_use]
     pub fn gate_timeout(&self) -> Duration {
         self.gate_timeout
@@ -2921,10 +3624,22 @@ fn repository_key(checkout: &str) -> String {
 /// (#1945). Git runs here, outside the store's write transaction; the claim only
 /// looks the answers up, and an entry enqueued after the probe is not in the
 /// map, so it keeps its own path and waits for a later claim.
+#[cfg(test)]
 async fn claim_batch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     size: usize,
 ) -> Result<Option<ClaimedQueueBatch>> {
+    claim_batch_held(store, size, None).await
+}
+
+/// [`claim_batch`] that does not claim the queued entry whose source is `held`
+/// (#3394), nor anything behind it.
+async fn claim_batch_held(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    size: usize,
+    held: Option<String>,
+) -> Result<Option<ClaimedQueueBatch>> {
+    let is_held = move |source: &str| held.as_deref() == Some(source);
     let checkouts = match size {
         0 | 1 => Vec::new(),
         _ => with_store(store, |s| s.queued_rolling_queue_repo_paths()).await?,
@@ -2932,7 +3647,13 @@ async fn claim_batch(
     if checkouts.len() < 2 {
         // One checkout (or a batch of one): the path is the repository.
         return with_store(store, move |s| {
-            s.claim_rolling_queue_batch(Utc::now(), size)
+            s.claim_rolling_queue_batch_lanes_held(
+                Utc::now(),
+                size,
+                &|path| path.to_string(),
+                &|_| None,
+                &is_held,
+            )
         })
         .await;
     }
@@ -2948,11 +3669,17 @@ async fn claim_batch(
     .await
     .map_err(|error| DaemonError::Process(format!("queue repository probe: {error}")))?;
     with_store(store, move |s| {
-        s.claim_rolling_queue_batch_by(Utc::now(), size, &|checkout| {
-            keys.get(checkout)
-                .cloned()
-                .unwrap_or_else(|| format!("path:{checkout}"))
-        })
+        s.claim_rolling_queue_batch_lanes_held(
+            Utc::now(),
+            size,
+            &|checkout| {
+                keys.get(checkout)
+                    .cloned()
+                    .unwrap_or_else(|| format!("path:{checkout}"))
+            },
+            &|_| None,
+            &is_held,
+        )
     })
     .await
 }
@@ -2990,17 +3717,29 @@ fn repository_key_cached(checkout: &str) -> String {
 /// resolved to package sets (git, outside the store's write transaction) and the
 /// store claims a second batch only for a source disjoint from every gating
 /// batch: an rsi-only entry no longer waits behind an rsid shard batch.
+#[cfg(test)]
 async fn claim_batch_in_lanes(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     size: usize,
+) -> Result<Option<ClaimedQueueBatch>> {
+    claim_batch_in_lanes_held(store, size, None).await
+}
+
+/// [`claim_batch_in_lanes`] that does not claim the queued entry whose source is
+/// `held`, nor anything behind it (#3394).
+async fn claim_batch_in_lanes_held(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    size: usize,
+    held: Option<String>,
 ) -> Result<Option<ClaimedQueueBatch>> {
     let (gating, queued) = with_store(store, |s| {
         s.rolling_queue_lane_candidates(LANE_PROBE_WINDOW)
     })
     .await?;
     if gating.is_empty() || queued.is_empty() {
-        return claim_batch(store, size).await;
+        return claim_batch_held(store, size, held).await;
     }
+    let is_held = move |source: &str| held.as_deref() == Some(source);
     let (keys, packages): (HashMap<String, String>, HashMap<String, LanePackages>) =
         tokio::task::spawn_blocking(move || {
             let mut keys = HashMap::new();
@@ -3017,7 +3756,7 @@ async fn claim_batch_in_lanes(
         .await
         .map_err(|error| DaemonError::Process(format!("queue lane probe: {error}")))?;
     with_store(store, move |s| {
-        s.claim_rolling_queue_batch_lanes(
+        s.claim_rolling_queue_batch_lanes_held(
             Utc::now(),
             size,
             &|checkout| {
@@ -3026,6 +3765,7 @@ async fn claim_batch_in_lanes(
                     .unwrap_or_else(|| format!("path:{checkout}"))
             },
             &|source| packages.get(source).cloned().flatten(),
+            &is_held,
         )
     })
     .await
@@ -3085,6 +3825,31 @@ pub fn tail(text: &str) -> String {
         start += 1;
     }
     trimmed[start..].to_string()
+}
+
+/// One JSON-escaped line for the lander log and the queue outcome. Reserve
+/// equal room for both streams so verbose stdout cannot crowd out a panic on
+/// stderr. Escaping keeps test output from becoming lander receipt fields.
+pub fn gate_failure_excerpt_line(test: &str, stdout: &str, stderr: &str) -> String {
+    let header = format!("failing test: {}\nstdout tail:\n", clip_line(test));
+    const STDERR_HEADER: &str = "\nstderr tail:\n";
+    let stream_bytes = (GATE_FAILURE_EXCERPT_BYTES - header.len() - STDERR_HEADER.len()) / 2;
+    let excerpt = format!(
+        "{header}{}{STDERR_HEADER}{}",
+        newest_bytes(stdout, stream_bytes),
+        newest_bytes(stderr, stream_bytes),
+    );
+    format!("{GATE_FAILURE_EXCERPT_KEY}={}", serde_json::json!(excerpt))
+}
+
+fn gate_failure_excerpt(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        let encoded = line
+            .strip_prefix(GATE_FAILURE_EXCERPT_KEY)?
+            .strip_prefix('=')?;
+        let excerpt: String = serde_json::from_str(encoded).ok()?;
+        Some(newest_bytes(&excerpt, GATE_FAILURE_EXCERPT_BYTES).to_string())
+    })
 }
 
 /// The last `key=value` line's value: a gate re-run after a stale advance
@@ -3301,6 +4066,77 @@ fn without_cargo_warnings(text: &str) -> String {
     kept.join("\n")
 }
 
+/// Whether `line` is a cargo progress line (`Blocking waiting for file lock`,
+/// `Compiling`, `Checking`, ...): status chatter that says nothing about why a
+/// build failed.
+fn is_cargo_progress_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    [
+        "Blocking waiting for file lock",
+        "Compiling ",
+        "Checking ",
+        "Finished ",
+        "Fresh ",
+        "Downloaded ",
+        "Downloading ",
+        "Updating ",
+        "Locking ",
+        "Adding ",
+        "Building [",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
+}
+
+/// `text` without cargo progress lines.
+fn without_cargo_progress(text: &str) -> String {
+    text.lines()
+        .filter(|line| !is_cargo_progress_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A compiler error line: `error[E0425]: ...` or `error: ...`, except cargo's
+/// own closing lines, which name no cause.
+fn is_compiler_error_line(line: &str) -> bool {
+    let is_error = line.starts_with("error[") || line.starts_with("error:");
+    is_error
+        && !line.starts_with("error: could not compile")
+        && !line.starts_with("error: aborting due to")
+        && !line.starts_with("error: test failed")
+        && !line.starts_with("error: build failed")
+}
+
+/// The lead of a failed build's detail: the first compiler error with its
+/// `--> file:line` location and the error count, e.g.
+/// `compile error: error[E0425]: cannot find function `names_in` at
+/// crates/rsid/src/x.rs:639 (1 error)`. `None` when the output holds no
+/// compiler error. Progress lines and `note:` sections never lead, because
+/// only an `error` line is considered.
+fn compile_error_summary(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().map(str::trim_start).collect();
+    let mut count = 0usize;
+    let mut first: Option<(usize, &str)> = None;
+    for (index, line) in lines.iter().enumerate() {
+        if is_compiler_error_line(line) {
+            count += 1;
+            first.get_or_insert((index, line));
+        }
+    }
+    let (index, line) = first?;
+    let location = lines[index + 1..]
+        .iter()
+        .take_while(|next| !is_compiler_error_line(next) && !next.is_empty())
+        .find_map(|next| next.strip_prefix("--> "))
+        .map(|location| format!(" at {}", location.trim()))
+        .unwrap_or_default();
+    let plural = if count == 1 { "error" } else { "errors" };
+    Some(format!(
+        "compile error: {}{location} ({count} {plural})",
+        clip_line(line)
+    ))
+}
+
 /// Map one lander exit (`exit`, stdout evidence lines, stderr message) to a
 /// typed result. `landed` is the ancestry probe used when publication is
 /// uncertain, so a push that succeeded before the lander could report it is
@@ -3333,12 +4169,24 @@ pub(crate) fn classify_run(
     // The libtest failures summary leads the detail, then the stderr tail with
     // cargo warnings dropped (#1831).
     let summary = libtest_failure_summary(&format!("{stdout}\n{stderr}"));
-    let stderr_text = Some(tail(&without_cargo_warnings(stderr))).filter(|text| !text.is_empty());
+    // #3393: a failed build leads with its first compiler error, so a head cut
+    // or a long progress preamble never hides the cause.
+    let compile_error = compile_error_summary(&format!("{stdout}\n{stderr}"));
+    let stderr_text = Some(tail(&without_cargo_progress(&without_cargo_warnings(
+        stderr,
+    ))))
+    .filter(|text| !text.is_empty());
     let detail = {
-        let parts: Vec<String> = [summary, stderr_text, timing.clone()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let parts: Vec<String> = [
+            compile_error,
+            summary,
+            stderr_text,
+            timing.clone(),
+            gate_failure_excerpt(stdout),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         (!parts.is_empty()).then(|| parts.join("\n"))
     };
     let refuse = |code: &str, state: RollingQueueEntryState| RunResult {
@@ -3348,6 +4196,8 @@ pub(crate) fn classify_run(
             refusal: Some(code.to_string()),
             failing_tests: failing_tests(&format!("{stdout}\n{stderr}")),
             detail: detail.clone(),
+            superseded_by: None,
+            published_commits: Vec::new(),
         },
     };
     if exit == Some(0) {
@@ -3361,8 +4211,26 @@ pub(crate) fn classify_run(
         // The push may have landed before the report failed: trust ancestry.
         return match landed() {
             Some(tip) => published(tip),
-            None => refuse("publication_unknown", RollingQueueEntryState::Failed),
+            // Infrastructure loss says nothing about the source. Re-admit
+            // this entry in place; a fresh gate/ancestry check decides it.
+            None => refuse("publication_unknown", RollingQueueEntryState::Queued),
         };
+    }
+    // Hub #3873: the lander could not read the remote `rolling` ref after its
+    // own retries. Infrastructure says nothing about the sources: the batch goes
+    // back to the queue (never bisected, never refused) and the cause is named.
+    if line_value(stdout, "failure_class") == Some(LANDER_FAILURE_CLASS_REMOTE_READ) {
+        let mut result = refuse(
+            QUEUE_REMOTE_READ_UNAVAILABLE,
+            RollingQueueEntryState::Queued,
+        );
+        result.outcome.failing_tests = Vec::new();
+        result.outcome.detail = Some(format!(
+            "cause=remote_read_unavailable (git ls-remote/fetch of rolling failed after the lander's retries; \
+             infrastructure, not a test failure)\n{}",
+            detail.as_deref().unwrap_or_default()
+        ));
+        return result;
     }
     if stderr.contains("stale retries exhausted") {
         return refuse(QUEUE_REGATE_EXHAUSTED, RollingQueueEntryState::Refused);
@@ -3484,6 +4352,28 @@ pub(crate) fn union_filters(
         }
     }
     union
+}
+
+/// A filter stays strict if any member requested it by hand. Missing legacy
+/// provenance is strict too; it can never grant the derived-empty fallback.
+fn union_derived_filters(entries: &[RollingQueueEntryV1]) -> Vec<String> {
+    let explicit: HashSet<&String> = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .test_filters
+                .iter()
+                .filter(|filter| !entry.derived_test_filters.contains(filter))
+        })
+        .collect();
+    entries
+        .iter()
+        .flat_map(|entry| &entry.derived_test_filters)
+        .filter(|filter| !explicit.contains(filter))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// #2167: every member's claimed fixes, first claim first. A batch's gate
@@ -3629,6 +4519,26 @@ enum LanderError {
     TimedOut,
 }
 
+/// Write `derived` aside and rename it into `path`, so a reader never sees half.
+fn write_derived_filters_file(path: &Path, derived: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, derived)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The derived filters in a private temporary file (an undetached run has no
+/// run directory); removed when the returned path drops.
+fn write_temp_derived_filters(derived: &str) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new()
+        .prefix("rsi-derived-filters-")
+        .suffix(".json")
+        .tempfile()?;
+    file.write_all(derived.as_bytes())?;
+    file.flush()?;
+    Ok(file.into_temp_path())
+}
+
 async fn run_lander(
     launcher: &LanderLauncher,
     repo: &Path,
@@ -3642,6 +4552,17 @@ async fn run_lander(
         return Err(LanderError::TimedOut);
     }
     let mut inner = Command::new(&launcher.binary);
+    // #3391: the lander runs agent-written build scripts, test modules and
+    // hooks; it gets the allowlisted environment, never the daemon's whole one.
+    // First, because `env_clear` drops anything set before it.
+    crate::lander_env_policy::apply_tokio(&mut inner);
+    #[cfg(test)]
+    inner.envs(
+        launcher
+            .inherited_env
+            .iter()
+            .map(|(key, value)| (key, value)),
+    );
     inner
         .current_dir(repo)
         .arg("--repo")
@@ -3655,6 +4576,10 @@ async fn run_lander(
     }) {
         inner.args(["--test-filter", &filter]);
     }
+    // #3615: the derived set travels in a file. One environment string over
+    // 128 KiB (MAX_ARG_STRLEN) makes `execve` fail with E2BIG before any gate
+    // runs, and the set grows with the diff. Even small sets use only the file.
+    let derived = serde_json::to_string(&union_derived_filters(entries)).unwrap();
     for name in union_fix_claims(entries) {
         inner.args(["--fixes-test", &name]);
     }
@@ -3680,6 +4605,19 @@ async fn run_lander(
         })?;
         inner.env("CARGO_TARGET_DIR", target);
     }
+    // #3435: the run lives in files, not in this daemon, so the next daemon
+    // can adopt it.
+    if let Some(runs_dir) = launcher.detached_runs_dir() {
+        return run_detached_lander(launcher, inner, &runs_dir, deadline, &derived).await;
+    }
+    // Held until the run ends: the file is removed when this drops.
+    let derived_file = write_temp_derived_filters(&derived).map_err(|error| {
+        LanderError::Unavailable(format!("cannot write the derived filters: {error}"))
+    })?;
+    inner.env(
+        rsi_common::rolling_queue::DERIVED_FILTERS_FILE_ENV,
+        derived_file.as_os_str(),
+    );
     // #2119: the gate's cargo builds and tests run in the hub build slice, so
     // they share its CPU budget with the job units. The scope is only used when
     // the slice could be configured; otherwise the lander runs as before.
@@ -3693,6 +4631,9 @@ async fn run_lander(
             inner
         };
     command
+        // Remove this after wrapping: the scope wrapper reapplies the parent
+        // environment, which can carry a stale inline set from an outer gate.
+        .env_remove(rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3724,6 +4665,88 @@ async fn run_lander(
     result
 }
 
+/// One lander run kept in files under `runs_dir` (#3435): a run a previous
+/// daemon left for the same gate is adopted and waited for, otherwise `inner`
+/// is started in its own scope (when the build slice is on) with its output and
+/// exit status in files. The run is not tied to this daemon: dropping this
+/// future or stopping the daemon leaves it running for the next one, and only
+/// the deadline, a vanished scope or a different gate ends it.
+async fn run_detached_lander(
+    launcher: &LanderLauncher,
+    mut inner: Command,
+    runs_dir: &Path,
+    deadline: tokio::time::Instant,
+    derived: &str,
+) -> std::result::Result<std::process::Output, LanderError> {
+    let key = detached_run::run_key(
+        inner.as_std().get_current_dir(),
+        inner.as_std().get_args().map(std::ffi::OsString::from),
+        derived,
+    );
+    let mut run = detached_run::claim(runs_dir, &key, launcher.run_epoch())
+        .await
+        .map_err(|error| {
+            LanderError::Unavailable(format!("cannot prepare the lander run: {error}"))
+        })?;
+    if run.adopted {
+        tracing::info!(
+            key = %run.record.key,
+            unit = ?run.record.unit,
+            "rolling queue adopted the lander run a previous daemon left running"
+        );
+        return detached_run::wait(&run, deadline).await;
+    }
+    let unavailable = |run: &detached_run::Run, what: &str, error: &dyn std::fmt::Display| {
+        let _ = std::fs::remove_dir_all(runs_dir.join(&run.record.key));
+        LanderError::Unavailable(format!("{what}: {error}"))
+    };
+    // The run directory is private to this run and removed with it (#3615).
+    let derived_path = runs_dir.join(&run.record.key).join("derived-filters.json");
+    write_derived_filters_file(&derived_path, derived)
+        .map_err(|error| unavailable(&run, "cannot write the derived filters", &error))?;
+    inner.env(
+        rsi_common::rolling_queue::DERIVED_FILTERS_FILE_ENV,
+        &derived_path,
+    );
+    let wrapped = crate::build_budget::exit_recording_command(&inner, &run.exit_path());
+    let mut command =
+        if launcher.build_slice && !crate::build_budget::apply("lander").await.is_unavailable() {
+            let (command, unit) = crate::build_budget::detached_lander_scope_command(&wrapped);
+            run.record.unit = Some(unit);
+            command
+        } else {
+            wrapped
+        };
+    let files = std::fs::File::create(run.stdout_path())
+        .and_then(|stdout| Ok((stdout, std::fs::File::create(run.stderr_path())?)));
+    let (stdout, stderr) =
+        files.map_err(|error| unavailable(&run, "cannot open the lander output", &error))?;
+    command
+        // The exit-recording and scope wrappers reapply the parent environment.
+        // Only this run's file may supply its derived filters (#3615).
+        .env_remove(rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        // The run outlives this daemon: nothing here kills it on drop.
+        .kill_on_drop(false);
+    // Its own process group, so a stopped run takes down what it started.
+    command.process_group(0);
+    // The record names the scope before the process exists, so a daemon that
+    // dies right after the spawn still leaves a run its successor can stop.
+    run.save()
+        .map_err(|error| unavailable(&run, "cannot record the lander run", &error))?;
+    let child = command
+        .spawn()
+        .map_err(|error| unavailable(&run, "cannot start the lander", &error))?;
+    run.record.pid = child.id().unwrap_or(0);
+    // Reaped in the background when it ends; this daemon never owns its life.
+    drop(child);
+    run.save()
+        .map_err(|error| unavailable(&run, "cannot record the lander run", &error))?;
+    detached_run::wait(&run, deadline).await
+}
+
 /// How long a finished lander's output may stay open (a descendant that left
 /// its group still holding the pipes), and how long a stopped lander gets to
 /// exit, before the queue moves on (#1251).
@@ -3735,13 +4758,48 @@ const LANDER_SETTLE_LIMITS: crate::process_control::OwnedGroupLimits =
     };
 
 async fn with_store<T: Send + 'static>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     op: impl FnOnce(&Store) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let store = Arc::clone(store);
     tokio::task::spawn_blocking(move || op(&store.blocking_lock()))
         .await
         .map_err(|error| DaemonError::Process(format!("rolling queue store join: {error}")))?
+}
+
+/// Extra lander runs a batch may spend beyond its full gate and the
+/// `ceil(log2(n))` halving steps of a bisect: the tail gate after an isolated
+/// member and the complement gate that confirms or rejects a direct
+/// attribution (#3267).
+const BATCH_EXTRA_RUNS: u32 = 4;
+
+/// The wall-time a batch's gating may spend (#1208, #3267). One lander run is
+/// bounded by `per_run` (the operator's `rolling_queue_gate_timeout_mins`), not
+/// by what the batch's earlier runs left: a 4-member batch with one
+/// non-attributable red needs the full run plus its bisect steps, each about
+/// as long as a first gate, so a single shared 60 minutes could not name the
+/// culprit. The batch as a whole is bounded by a `ceiling` that scales with
+/// the bisect depth (`ceil(log2(n)) + BATCH_EXTRA_RUNS` runs), so a stuck
+/// batch still cannot hold the queue without limit.
+#[derive(Clone, Copy, Debug)]
+struct GateBudget {
+    per_run: Duration,
+    ceiling: tokio::time::Instant,
+}
+
+impl GateBudget {
+    fn new(per_run: Duration, members: usize) -> Self {
+        let depth = members.max(1).next_power_of_two().trailing_zeros();
+        Self {
+            per_run,
+            ceiling: tokio::time::Instant::now() + per_run * (depth + BATCH_EXTRA_RUNS),
+        }
+    }
+
+    /// The wall deadline of a lander run that starts now.
+    fn run_deadline(&self) -> tokio::time::Instant {
+        (tokio::time::Instant::now() + self.per_run).min(self.ceiling)
+    }
 }
 
 /// One lander run over `entries`, classified. `stdout` is kept for the
@@ -3804,7 +4862,7 @@ fn own_published_tip(stdout: &str) -> Option<String> {
 }
 
 async fn run_group(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     batch_id: Uuid,
     repo: &Path,
@@ -3965,9 +5023,10 @@ fn gate_timeout_result(launcher: &LanderLauncher) -> RunResult {
         outcome: RollingQueueOutcome {
             refusal: Some(QUEUE_GATE_TIMEOUT.to_string()),
             detail: Some(format!(
-                "the batch gate ran past its {}-minute wall-time budget \
-                 (operator setting rolling_queue_gate_timeout_mins); the lander was \
-                 stopped and nothing was published for this source: re-enqueue it",
+                "a lander run of the batch gate ran past its {}-minute wall-time budget \
+                 (operator setting rolling_queue_gate_timeout_mins, or the batch's \
+                 bisect ceiling); the lander was stopped and nothing was published \
+                 for this source: re-enqueue it",
                 launcher.gate_timeout.as_secs() / 60
             )),
             ..RollingQueueOutcome::default()
@@ -3979,13 +5038,104 @@ fn is_gate_timeout(result: &RunResult) -> bool {
     result.outcome.refusal.as_deref() == Some(QUEUE_GATE_TIMEOUT)
 }
 
+/// Hub #3873: a run that stopped only because the remote `rolling` ref could
+/// not be read. It is never bisectable and never a refusal.
+fn is_remote_read_unavailable(result: &RunResult) -> bool {
+    result.state == RollingQueueEntryState::Queued
+        && result.outcome.refusal.as_deref() == Some(QUEUE_REMOTE_READ_UNAVAILABLE)
+}
+
+/// The pause before the queue claims again after the `requeues`th remote-read
+/// requeue: 30 s doubling to a 5 minute cap, so an outage is not hammered.
+fn remote_read_backoff(requeues: u32) -> Duration {
+    if cfg!(test) {
+        return Duration::from_millis(5);
+    }
+    let seconds = 30u64.saturating_mul(1 << requeues.saturating_sub(1).min(4));
+    Duration::from_secs(seconds.min(300))
+}
+
+/// Hub #3873: settle `members` after a run whose only failure was an unreadable
+/// remote `rolling` ref. Every member returns to `queued` at its own position
+/// (no bisect, no refusal) after a bounded backoff; one that already spent
+/// [`QUEUE_REMOTE_READ_REQUEUE_LIMIT`] requeues fails typed
+/// `remote_read_unavailable`, so a permanent outage surfaces instead of looping.
+async fn settle_remote_read_unavailable(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    batch_id: Uuid,
+    members: &[RollingQueueEntryV1],
+    result: &RunResult,
+    settled: &mut Vec<(Uuid, RunResult)>,
+) -> Result<()> {
+    let mut requeue = Vec::new();
+    let mut exhausted = Vec::new();
+    let mut spent = 0u32;
+    for entry in members {
+        let id = entry.id;
+        let prior = with_store(store, move |s| s.rolling_queue_remote_read_requeues(id)).await?;
+        if prior >= QUEUE_REMOTE_READ_REQUEUE_LIMIT {
+            exhausted.push((id, prior));
+            continue;
+        }
+        spent = spent.max(prior + 1);
+        requeue.push(id);
+    }
+    bisect_event(
+        store,
+        batch_id,
+        "remote_read_unavailable",
+        None,
+        serde_json::json!({
+            "requeued": requeue.len(),
+            "failed": exhausted.len(),
+            "detail": result.outcome.detail,
+        }),
+    )
+    .await?;
+    if !requeue.is_empty() {
+        let detail = serde_json::json!({
+            "reason": QUEUE_REMOTE_READ_UNAVAILABLE,
+            "limit": QUEUE_REMOTE_READ_REQUEUE_LIMIT,
+            "detail": result.outcome.detail,
+        });
+        let returned = with_store(store, move |s| {
+            s.requeue_remote_read_rolling_queue_entries(batch_id, &requeue, &detail, Utc::now())
+        })
+        .await?;
+        settled.extend(returned.into_iter().map(|id| (id, result.clone())));
+    }
+    if !exhausted.is_empty() {
+        let group: Vec<(Uuid, RunResult)> = exhausted
+            .into_iter()
+            .map(|(id, prior)| {
+                let mut failed = result.clone();
+                failed.state = RollingQueueEntryState::Failed;
+                failed.outcome.detail = Some(format!(
+                    "cause=remote_read_unavailable: the remote rolling ref was unreadable on {} \
+                     consecutive gates (limit {QUEUE_REMOTE_READ_REQUEUE_LIMIT}); the host cannot \
+                     reach the remote. Re-enqueue once it can.\n{}",
+                    prior + 1,
+                    result.outcome.detail.as_deref().unwrap_or_default()
+                ));
+                (id, failed)
+            })
+            .collect();
+        settle_group(store, &group).await?;
+        settled.extend(group);
+    }
+    if spent > 0 {
+        tokio::time::sleep(remote_read_backoff(spent)).await;
+    }
+    Ok(())
+}
+
 /// Settle every member that already reached `origin/rolling` outside the
 /// queue as `published` with the tip that contains it, so a landed commit is
 /// never gated, re-gated or refused (#1208). Returns the members still to
 /// gate, in queue order, and the tip they were checked against when any member
 /// had landed.
 async fn settle_already_landed(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     members: Vec<RollingQueueEntryV1>,
@@ -4035,17 +5185,24 @@ async fn settle_already_landed(
                 .await?;
             }
         }
+        // #4009/#4040: attribute the landing to the queue from evidence only it
+        // writes (the lander's committer identity, the entry's restart events),
+        // and call it an outside landing only when there is none.
+        let (probe_repo, source) = (repo.to_path_buf(), entry.source_commit.clone());
+        let lander_commit =
+            tokio::task::spawn_blocking(move || lander_publication_commit(&probe_repo, &source))
+                .await
+                .map_err(|error| DaemonError::Process(format!("lander commit probe: {error}")))?;
+        let restarts = with_store(store, move |s| s.rolling_queue_restart_requeues(id)).await?;
+        let (landed_sha, detail) =
+            already_landed_outcome(&entry.source_commit, tip, lander_commit, restarts);
         group.push((
             id,
             RunResult {
                 state: RollingQueueEntryState::Published,
                 outcome: RollingQueueOutcome {
-                    landed_sha: Some(tip),
-                    detail: Some(format!(
-                        "{} was already on origin/rolling (landed outside the queue); \
-                         settled without a gate",
-                        entry.source_commit
-                    )),
+                    landed_sha: Some(landed_sha),
+                    detail: Some(detail),
                     ..RollingQueueOutcome::default()
                 },
             },
@@ -4064,7 +5221,7 @@ async fn settle_already_landed(
 /// with the checkout it was queued from instead of failing the whole batch's
 /// lander run (#1945). A batch from one checkout is left to the lander.
 async fn settle_unreachable_sources(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     members: Vec<RollingQueueEntryV1>,
@@ -4125,29 +5282,95 @@ async fn settle_unreachable_sources(
     Ok(kept)
 }
 
-/// Settle `members` after the batch's gate wall-time budget ran out: a member
-/// that landed meanwhile is published, every other one is refused with
+/// What a batch's earlier runs proved when a later run times out (#3267).
+#[derive(Default)]
+struct TimeoutEvidence {
+    /// Members a red run left out while the red persisted: not the cause of
+    /// it, so a timeout returns them to the queue instead of refusing them.
+    cleared: Vec<Uuid>,
+    /// Logs of every lander run of the batch so far, oldest first.
+    logs: Vec<String>,
+    /// Bisect rounds run before the timeout.
+    rounds: usize,
+}
+
+/// The most run logs an outcome detail names; the batch events keep them all.
+const OUTCOME_LOG_LIMIT: usize = 8;
+
+/// Add a `bisect_logs=` line naming the batch's lander run logs to the result,
+/// so a member settled from a bisect points at the evidence (#3267).
+fn with_bisect_logs(mut result: RunResult, logs: &[String]) -> RunResult {
+    if logs.is_empty() {
+        return result;
+    }
+    let from = logs.len().saturating_sub(OUTCOME_LOG_LIMIT);
+    let line = format!("bisect_logs={}", logs[from..].join(","));
+    result.outcome.detail = Some(match result.outcome.detail.take() {
+        Some(detail) => format!("{detail}\n{line}"),
+        None => line,
+    });
+    result
+}
+
+/// Settle `members` after a lander run ran out of its gate wall-time budget: a
+/// member that landed meanwhile is published; a member an earlier red run left
+/// out (`evidence.cleared`) goes back to `queued` at its original position
+/// (#3267); every other one, still a suspect, is refused with
 /// `queue_gate_timeout` (#1208).
 async fn settle_timed_out(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     members: Vec<RollingQueueEntryV1>,
+    evidence: &TimeoutEvidence,
     result: &RunResult,
     settled: &mut Vec<(Uuid, RunResult)>,
 ) -> Result<()> {
     let (rest, _) = settle_already_landed(store, repo, batch_id, members, settled).await?;
+    let (spared, suspects): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|entry| evidence.cleared.contains(&entry.id));
+    let mut requeued = Vec::new();
+    if !spared.is_empty() {
+        let ids: Vec<Uuid> = spared.iter().map(|entry| entry.id).collect();
+        let detail = serde_json::json!({
+            "reason": QUEUE_GATE_TIMEOUT,
+            "bisect_rounds": evidence.rounds,
+            "logs": evidence.logs,
+        });
+        requeued = with_store(store, move |s| {
+            s.requeue_bisected_rolling_queue_entries(batch_id, &ids, &detail, Utc::now())
+        })
+        .await?;
+    }
     bisect_event(
         store,
         batch_id,
         "gate_timeout",
         None,
-        serde_json::json!({ "refused": rest.len(), "detail": result.outcome.detail }),
+        serde_json::json!({
+            "refused": suspects.len(),
+            "requeued": requeued.len(),
+            "detail": result.outcome.detail,
+            "logs": evidence.logs,
+        }),
     )
     .await?;
-    let group: Vec<(Uuid, RunResult)> = rest
+    let mut refusal = result.clone();
+    if !requeued.is_empty() {
+        let line = format!(
+            "bisect_requeued={} (left out of a red run, returned to the queue)",
+            requeued.len()
+        );
+        refusal.outcome.detail = Some(match refusal.outcome.detail.take() {
+            Some(detail) => format!("{detail}\n{line}"),
+            None => line,
+        });
+    }
+    let refusal = with_bisect_logs(refusal, &evidence.logs);
+    let group: Vec<(Uuid, RunResult)> = suspects
         .iter()
-        .map(|entry| (entry.id, result.clone()))
+        .map(|entry| (entry.id, refusal.clone()))
         .collect();
     settle_group(store, &group).await?;
     settled.extend(group);
@@ -4205,11 +5428,47 @@ fn is_bisectable(result: &RunResult) -> bool {
         })
 }
 
+/// The messages `git diff --check` prints after `<path>:<line>: ` (the lander's
+/// static guard, #3396).
+const DIFF_CHECK_MESSAGES: [&str; 6] = [
+    "trailing whitespace",
+    "new blank line at EOF",
+    "space before tab in indent",
+    "indent with spaces",
+    "tab in indent",
+    "leftover conflict marker",
+];
+
+/// The file a `git diff --check` finding line names (`path:line: trailing
+/// whitespace.`), also when the lander's own prefix precedes the first finding
+/// (`... running git [...]: path:line: trailing whitespace.`).
+fn diff_check_path(line: &str) -> Option<&str> {
+    let line = line.trim();
+    let located = DIFF_CHECK_MESSAGES.iter().find_map(|message| {
+        let marker = format!(": {message}");
+        let at = line.rfind(&marker)?;
+        let rest = &line[at + marker.len()..];
+        matches!(rest, "" | ".").then_some(&line[..at])
+    })?;
+    let (path, number) = located.rsplit_once(':')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let path = path.rsplit_once("]: ").map_or(path, |(_, path)| path);
+    let path = path.strip_prefix("./").unwrap_or(path).trim();
+    (!path.is_empty()).then_some(path)
+}
+
 /// Source files a red gate's output points at: rustc `--> path:line:col`
-/// locations and `panicked at path:line:col` sites.
+/// locations, `panicked at path:line:col` sites and `git diff --check`
+/// findings (a static guard that names the offending file, #3396).
 fn failure_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in text.lines() {
+        if let Some(path) = diff_check_path(line) {
+            paths.push(path.to_string());
+            continue;
+        }
         let line = line.trim();
         let located = line
             .strip_prefix("--> ")
@@ -4305,11 +5564,19 @@ fn note_bisect_outcome(result: &RunResult, rounds: usize, reason: &str) -> RunRe
 }
 
 async fn settle(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     id: Uuid,
     result: &RunResult,
 ) -> Result<()> {
-    let (state, outcome) = (result.state, result.outcome.clone());
+    if result.state == RollingQueueEntryState::Queued {
+        with_store(store, move |s| {
+            s.requeue_gating_rolling_queue_entry(id, Utc::now())
+        })
+        .await?;
+        return Ok(());
+    }
+    let (state, mut outcome) = (result.state, result.outcome.clone());
+    attach_published_commits(store, id, state, &mut outcome).await;
     with_store(store, move |s| {
         s.settle_rolling_queue_entry(id, state, &outcome, Utc::now())
     })
@@ -4321,18 +5588,124 @@ async fn settle(
 /// its own outcome row, and each resolved owner gets ONE wake naming every
 /// entry settled here (#1146). Separate calls still wake separately.
 async fn settle_group(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     members: &[(Uuid, RunResult)],
 ) -> Result<()> {
-    let items: Vec<(Uuid, RollingQueueEntryState, RollingQueueOutcome)> = members
+    // An interrupted lander is re-driven under the same entry id and FIFO
+    // sequence, without a terminal wake or a topology repair attempt.
+    for (id, result) in members {
+        if result.state == RollingQueueEntryState::Queued {
+            settle(store, *id, result).await?;
+        }
+    }
+    let mut items: Vec<(Uuid, RollingQueueEntryState, RollingQueueOutcome)> = members
         .iter()
+        .filter(|(_, result)| result.state != RollingQueueEntryState::Queued)
         .map(|(id, result)| (*id, result.state, result.outcome.clone()))
         .collect();
+    for (id, state, outcome) in &mut items {
+        attach_published_commits(store, *id, *state, outcome).await;
+    }
     with_store(store, move |s| {
         s.settle_rolling_queue_entries(&items, Utc::now())
     })
     .await?;
     Ok(())
+}
+
+/// Most commits read from one publication (#3369).
+const PUBLISHED_COMMITS_MAX: usize = 128;
+/// Longest subject kept per published commit, in bytes.
+const PUBLISHED_SUBJECT_MAX: usize = 240;
+/// First-parent merges walked from the landed tip to find the one that took a
+/// source (a batch lands its members as a short chain of merges).
+const PUBLISHED_MERGE_WALK: usize = 64;
+
+/// #3369: before a `published` entry settles, read the subjects of the commits
+/// it newly put on rolling so the store can tell the manager about an Open
+/// Issue a subject names. Best effort and bounded: any git or store failure
+/// leaves the outcome without commits and never blocks the settlement.
+async fn attach_published_commits(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    id: Uuid,
+    state: RollingQueueEntryState,
+    outcome: &mut RollingQueueOutcome,
+) {
+    if state != RollingQueueEntryState::Published {
+        return;
+    }
+    let Some(landed) = outcome.landed_sha.clone() else {
+        return;
+    };
+    let Ok(Some((repo, source))) =
+        with_store(store, move |s| s.rolling_queue_entry_repo_and_source(id)).await
+    else {
+        return;
+    };
+    let repo = PathBuf::from(repo);
+    outcome.published_commits =
+        tokio::task::spawn_blocking(move || published_commits(&repo, &source, &landed))
+            .await
+            .unwrap_or_default();
+}
+
+/// The commits `source` newly put on rolling in the publication that left it at
+/// `landed`, newest first (at most [`PUBLISHED_COMMITS_MAX`]): the commits the
+/// merge of `source` brought in over that merge's first parent. When no such
+/// merge is found (a fast-forward, or a source that landed outside the queue)
+/// only `source` itself is read. Empty when git cannot say.
+fn published_commits(repo: &Path, source: &str, landed: &str) -> Vec<PublishedCommit> {
+    const FORMAT: &str = "--format=%H%x1f%s";
+    if git(repo, &["cat-file", "-e", &format!("{landed}^{{commit}}")]).is_none() {
+        // The lander pushed from elsewhere: one fetch brings the tip in.
+        let _ = fetch_tip(repo);
+    }
+    let base = if landed == source {
+        None
+    } else {
+        git(
+            repo,
+            &[
+                "log",
+                "--first-parent",
+                "-n",
+                &PUBLISHED_MERGE_WALK.to_string(),
+                "--format=%H %P",
+                landed,
+            ],
+        )
+        .and_then(|walk| {
+            walk.lines().find_map(|line| {
+                let mut shas = line.split_whitespace().skip(1);
+                let first = shas.next()?;
+                shas.any(|parent| parent == source)
+                    .then(|| first.to_owned())
+            })
+        })
+    };
+    let max = PUBLISHED_COMMITS_MAX.to_string();
+    let listing = match &base {
+        Some(base) => git(
+            repo,
+            &["log", "-n", &max, FORMAT, source, "--not", base, "--"],
+        ),
+        None => git(repo, &["log", "-n", "1", FORMAT, source, "--"]),
+    };
+    listing
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (sha, subject) = line.split_once('\u{1f}')?;
+            Some(PublishedCommit {
+                sha: sha.to_owned(),
+                subject: subject
+                    .char_indices()
+                    .take_while(|(at, c)| at + c.len_utf8() <= PUBLISHED_SUBJECT_MAX)
+                    .map(|(_, c)| c)
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 /// What one `git merge-base --is-ancestor` probe established.
@@ -4442,7 +5815,7 @@ fn migration_evidence(stdout: &str) -> Vec<(String, u32)> {
 /// rest (still `gating`) in queue order. Best effort: without a readable tip
 /// the lander's own tip + 1 rule decides.
 async fn order_migrations(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     members: Vec<RollingQueueEntryV1>,
     settled: &mut Vec<(Uuid, RunResult)>,
@@ -4510,7 +5883,7 @@ async fn order_migrations(
 /// runnable (empty queue or another entry is gating).
 #[cfg(test)]
 pub(crate) async fn run_next(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
 ) -> Result<Option<(Uuid, RunResult)>> {
     Ok(run_next_batch(store, launcher, 1).await?.into_iter().next())
@@ -4521,7 +5894,7 @@ pub(crate) async fn run_next(
 /// once. Empty when nothing was runnable.
 #[cfg(test)]
 pub(crate) async fn run_next_batch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     batch_size: usize,
 ) -> Result<Vec<(Uuid, RunResult)>> {
@@ -4534,12 +5907,12 @@ pub(crate) async fn run_next_batch(
 
 /// Gate, publish and settle a batch the store already claimed.
 pub(crate) async fn run_claimed_batch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     claimed: ClaimedQueueBatch,
 ) -> Result<Vec<(Uuid, RunResult)>> {
     let batch_id = claimed.batch_id;
-    let deadline = tokio::time::Instant::now() + launcher.gate_timeout;
+    let budget = GateBudget::new(launcher.gate_timeout, claimed.entries.len());
     let mut settled = Vec::new();
     let mut members = claimed.entries;
     let checkouts: HashMap<Uuid, String> = members
@@ -4595,7 +5968,16 @@ pub(crate) async fn run_claimed_batch(
     if members.is_empty() {
         return Ok(settled);
     }
-    let mut run = run_group(store, launcher, batch_id, &repo, &members, None, deadline).await;
+    let mut run = run_group(
+        store,
+        launcher,
+        batch_id,
+        &repo,
+        &members,
+        None,
+        budget.run_deadline(),
+    )
+    .await;
     loop {
         if let Some(culprit) = take_conflict_culprit(&mut members, &run) {
             // An integration conflict belongs to one member: refuse that entry
@@ -4626,10 +6008,34 @@ pub(crate) async fn run_claimed_batch(
         } else {
             break;
         }
-        run = run_group(store, launcher, batch_id, &repo, &members, None, deadline).await;
+        run = run_group(
+            store,
+            launcher,
+            batch_id,
+            &repo,
+            &members,
+            None,
+            budget.run_deadline(),
+        )
+        .await;
     }
     if is_gate_timeout(&run.result) {
-        settle_timed_out(store, &repo, batch_id, members, &run.result, &mut settled).await?;
+        settle_timed_out(
+            store,
+            &repo,
+            batch_id,
+            members,
+            &TimeoutEvidence::default(),
+            &run.result,
+            &mut settled,
+        )
+        .await?;
+        return Ok(settled);
+    }
+    if is_remote_read_unavailable(&run.result) {
+        // Hub #3873: an unreadable remote says nothing about the sources.
+        settle_remote_read_unavailable(store, batch_id, &members, &run.result, &mut settled)
+            .await?;
         return Ok(settled);
     }
     let in_batch = members.len() > 1;
@@ -4724,7 +6130,8 @@ pub(crate) async fn run_claimed_batch(
             first_base,
             known_red,
             attributed,
-            deadline,
+            budget,
+            run.log_path.clone(),
             &mut settled,
         )
         .await?;
@@ -4744,7 +6151,7 @@ pub(crate) async fn run_claimed_batch(
 /// migration numbers the lander assigned, and settle every member once with its
 /// landed SHA or a typed `queue_batch_ancestry_unverified` failure.
 async fn publish_group(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     group: &[RollingQueueEntryV1],
@@ -4773,7 +6180,7 @@ async fn publish_group(
 /// and settles it `published`. Only a definite "not an ancestor" fails it.
 #[allow(clippy::too_many_arguments)]
 async fn publish_group_with(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     group: &[RollingQueueEntryV1],
@@ -4934,7 +6341,7 @@ async fn probe_tip(repo: &Path) -> Option<String> {
 /// lander pushed but before the report was recorded is then repaired by the
 /// restart reconcile from this evidence.
 async fn record_migration_plan(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     repo: &Path,
     batch_id: Uuid,
     group: &[RollingQueueEntryV1],
@@ -4987,7 +6394,7 @@ async fn record_migration_plan(
 }
 
 async fn bisect_event(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     batch_id: Uuid,
     kind: &'static str,
     entry: Option<Uuid>,
@@ -5029,7 +6436,7 @@ fn run_base(stdout: &str, probed: Option<&String>) -> Option<String> {
 /// Every step shrinks the window or the pending list;
 /// `queue_bisect_no_progress` settles the rest if that ever fails to hold.
 async fn bisect_batch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     repo: &Path,
     batch_id: Uuid,
@@ -5038,10 +6445,22 @@ async fn bisect_batch(
     first_base: Option<String>,
     known_red: bool,
     mut attributed: Option<RollingQueueEntryV1>,
-    deadline: tokio::time::Instant,
+    gate_budget: GateBudget,
+    first_log: Option<PathBuf>,
     settled: &mut Vec<(Uuid, RunResult)>,
 ) -> Result<()> {
     let mut pending = members;
+    // What the bisect has proved, kept for a timeout (#3267): members a red
+    // run left out while the red persisted are not the cause of it and go
+    // back to the queue instead of being refused; `logs` are the runs behind
+    // that.
+    let mut proved = TimeoutEvidence {
+        logs: first_log
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        ..TimeoutEvidence::default()
+    };
     // `known_red`: `pending` as a whole is the red candidate the first red
     // observed. With an `attributed` member held back it is not, and the
     // complement is gated whole first: green confirms the attribution (the
@@ -5084,7 +6503,10 @@ async fn bisect_batch(
                         serde_json::json!({ "bisect_rounds": rounds }),
                     )
                     .await?;
-                    let refused = note_bisect_outcome(&evidence, rounds, "attributed_confirmed");
+                    let refused = with_bisect_logs(
+                        note_bisect_outcome(&evidence, rounds, "attributed_confirmed"),
+                        &proved.logs,
+                    );
                     settle(store, entry.id, &refused).await?;
                     settled.push((entry.id, refused));
                 }
@@ -5094,6 +6516,7 @@ async fn bisect_batch(
                     pending.push(entry);
                     window = None;
                     red_base = None;
+                    proved.cleared.clear();
                 }
                 None => {}
             }
@@ -5143,6 +6566,7 @@ async fn bisect_batch(
         if pending.len() != before {
             window = None;
             red_base = None;
+            proved.cleared.clear();
             if observed.is_some() {
                 expected_tip = observed;
             }
@@ -5176,6 +6600,7 @@ async fn bisect_batch(
                 .await?;
                 window = None;
                 red_base = None;
+                proved.cleared.clear();
             }
         }
         if window == Some(1) {
@@ -5191,14 +6616,17 @@ async fn bisect_batch(
                 }),
             )
             .await?;
-            let isolated = note_bisect_outcome(
-                &evidence,
-                rounds,
-                if attribution_rejected {
-                    "attribution_rejected"
-                } else {
-                    "bisect_isolated"
-                },
+            let isolated = with_bisect_logs(
+                note_bisect_outcome(
+                    &evidence,
+                    rounds,
+                    if attribution_rejected {
+                        "attribution_rejected"
+                    } else {
+                        "bisect_isolated"
+                    },
+                ),
+                &proved.logs,
             );
             settle(store, entry.id, &isolated).await?;
             settled.push((entry.id, isolated));
@@ -5217,12 +6645,32 @@ async fn bisect_batch(
             repo,
             &group,
             expected_tip.as_deref(),
-            deadline,
+            gate_budget.run_deadline(),
         )
         .await;
+        proved
+            .logs
+            .extend(run.log_path.iter().map(|path| path.display().to_string()));
+        proved.rounds = rounds;
         if is_gate_timeout(&run.result) {
             pending.extend(attributed.take());
-            settle_timed_out(store, repo, batch_id, pending, &run.result, settled).await?;
+            settle_timed_out(
+                store,
+                repo,
+                batch_id,
+                pending,
+                &proved,
+                &run.result,
+                settled,
+            )
+            .await?;
+            break;
+        }
+        if is_remote_read_unavailable(&run.result) {
+            // Hub #3873: the whole remaining batch returns to the queue; the
+            // unreadable remote proves nothing about any member.
+            pending.extend(attributed.take());
+            settle_remote_read_unavailable(store, batch_id, &pending, &run.result, settled).await?;
             break;
         }
         if run.already_integrated {
@@ -5235,6 +6683,7 @@ async fn bisect_batch(
             if pending.len() != before {
                 window = None;
                 red_base = None;
+                proved.cleared.clear();
                 expected_tip = observed.or(expected_tip);
                 continue;
             }
@@ -5283,6 +6732,7 @@ async fn bisect_batch(
                 };
                 let carried = exact && window.is_some() && red_base.is_some() && red_base == base;
                 if !exact {
+                    proved.cleared.clear();
                     bisect_event(
                         store,
                         batch_id,
@@ -5346,6 +6796,15 @@ async fn bisect_batch(
                     pending.push(entry);
                     attribution_rejected = true;
                 }
+                // The red persisted without everything past this group, and
+                // this group is red again: whoever was left out is not the
+                // cause, and whoever is in it is a suspect again (#3267).
+                proved
+                    .cleared
+                    .retain(|id| !group.iter().any(|member| member.id == *id));
+                proved
+                    .cleared
+                    .extend(pending[take..].iter().map(|entry| entry.id));
                 evidence = result;
                 window = Some(take);
                 red_base = base.clone();
@@ -5385,80 +6844,140 @@ async fn bisect_batch(
     Ok(())
 }
 
+/// The operator-visible detail of a [`QUEUE_SUSPECT_CRASH_LOOP`] refusal.
+fn crash_loop_detail(stops: u32) -> String {
+    format!(
+        "the daemon stopped {stops} times while this entry was gating (restart reconcile); \
+         it is held as suspect and not gated again. Likely a test or step in its gate \
+         signals or stops the daemon. Re-enqueue it alone once that is understood \
+         (bisect it in a lane that cannot signal the hub, #3478)"
+    )
+}
+
 /// One-shot restart reconcile: settle or re-queue every `gating` entry.
 /// Returns `(settled, requeued)`.
 pub(crate) async fn reconcile_gating(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) -> Result<(usize, usize)> {
-    let gating = with_store(store, |s| {
-        s.list_rolling_queue_entries(Some(RollingQueueEntryState::Gating), 64)
-    })
-    .await?;
     let (mut settled, mut requeued) = (0, 0);
-    for (entry, repo_path) in gating {
-        let source = entry.source_commit.clone();
-        let repo = PathBuf::from(repo_path);
-        let probe_repo = repo.clone();
-        let tip = tokio::task::spawn_blocking(move || landed_tip(&repo, &source))
-            .await
-            .map_err(|error| DaemonError::Process(format!("reconcile probe: {error}")))?;
-        let id = entry.id;
-        match tip {
-            Some(tip) => {
-                // The run published before its report was settled. The actual
-                // number wins, in order: the lander receipt the queue saved,
-                // the number in the published provisional commit, and only
-                // then the number the queue planned before the run.
-                let receipt =
-                    with_store(store, move |s| s.rolling_queue_migration_receipt(id)).await?;
-                let recovered = match receipt {
-                    Some(version) => Some(version),
-                    None => {
-                        let (repo, source) = (probe_repo.clone(), entry.source_commit.clone());
-                        tokio::task::spawn_blocking(move || {
-                            published_migration_number(&repo, &source)
+    loop {
+        let gating = with_store(store, |s| {
+            s.list_rolling_queue_entries(Some(RollingQueueEntryState::Gating), 64)
+        })
+        .await?;
+        if gating.is_empty() {
+            break;
+        }
+        let before = (settled, requeued);
+        for (entry, repo_path) in gating {
+            let source = entry.source_commit.clone();
+            let repo = PathBuf::from(repo_path);
+            let probe_repo = repo.clone();
+            let tip = tokio::task::spawn_blocking(move || landed_tip(&repo, &source))
+                .await
+                .map_err(|error| DaemonError::Process(format!("reconcile probe: {error}")))?;
+            let id = entry.id;
+            match tip {
+                Some(tip) => {
+                    // The run published before its report was settled. The actual
+                    // number wins, in order: the lander receipt the queue saved,
+                    // the number in the published provisional commit, and only
+                    // then the number the queue planned before the run.
+                    let receipt =
+                        with_store(store, move |s| s.rolling_queue_migration_receipt(id)).await?;
+                    let recovered = match receipt {
+                        Some(version) => Some(version),
+                        None => {
+                            let (repo, source) = (probe_repo.clone(), entry.source_commit.clone());
+                            tokio::task::spawn_blocking(move || {
+                                published_migration_number(&repo, &source)
+                            })
+                            .await
+                            .map_err(|error| {
+                                DaemonError::Process(format!("reconcile migration probe: {error}"))
+                            })?
+                        }
+                    };
+                    let planned = match recovered {
+                        Some(version) => Some(version),
+                        None => {
+                            with_store(store, move |s| s.planned_rolling_queue_migration(id))
+                                .await?
+                        }
+                    };
+                    if let Some(version) = planned {
+                        with_store(store, move |s| {
+                            s.record_rolling_queue_assigned_migration(id, version)
                         })
-                        .await
-                        .map_err(|error| {
-                            DaemonError::Process(format!("reconcile migration probe: {error}"))
-                        })?
+                        .await?;
                     }
-                };
-                let planned = match recovered {
-                    Some(version) => Some(version),
-                    None => {
-                        with_store(store, move |s| s.planned_rolling_queue_migration(id)).await?
-                    }
-                };
-                if let Some(version) = planned {
-                    with_store(store, move |s| {
-                        s.record_rolling_queue_assigned_migration(id, version)
-                    })
-                    .await?;
-                }
-                let outcome = RollingQueueOutcome {
+                    let mut outcome = RollingQueueOutcome {
                     landed_sha: Some(tip),
                     detail: Some("settled by restart reconcile after ancestry check; selection=unknown reason=publication_recovered_without_gate_receipt".into()),
                     ..RollingQueueOutcome::default()
                 };
-                let woke = with_store(store, move |s| {
-                    s.settle_rolling_queue_entry(
+                    attach_published_commits(
+                        store,
                         id,
                         RollingQueueEntryState::Published,
-                        &outcome,
-                        Utc::now(),
+                        &mut outcome,
                     )
-                })
-                .await?;
-                settled += usize::from(woke.is_some());
+                    .await;
+                    let woke = with_store(store, move |s| {
+                        s.settle_rolling_queue_entry(
+                            id,
+                            RollingQueueEntryState::Published,
+                            &outcome,
+                            Utc::now(),
+                        )
+                    })
+                    .await?;
+                    settled += usize::from(woke.is_some());
+                }
+                None => {
+                    // #3480: this restart is the entry's (prior + 1)th stop while
+                    // it gated. At the limit it is held as suspect (an operator
+                    // visible refusal) instead of gated again, so one batch that
+                    // kills the daemon cannot keep doing it on every start.
+                    let prior =
+                        with_store(store, move |s| s.rolling_queue_restart_requeues(id)).await?;
+                    if prior + 1 >= QUEUE_CRASH_LOOP_STOP_LIMIT {
+                        let outcome = RollingQueueOutcome {
+                            refusal: Some(QUEUE_SUSPECT_CRASH_LOOP.to_owned()),
+                            detail: Some(crash_loop_detail(prior + 1)),
+                            ..RollingQueueOutcome::default()
+                        };
+                        let woke = with_store(store, move |s| {
+                            s.settle_rolling_queue_entry(
+                                id,
+                                RollingQueueEntryState::Refused,
+                                &outcome,
+                                Utc::now(),
+                            )
+                        })
+                        .await?;
+                        if woke.is_some() {
+                            tracing::warn!(
+                                %id,
+                                stops = prior + 1,
+                                "rolling queue entry held as suspect: the daemon stopped while it gated, repeatedly"
+                            );
+                        }
+                        settled += usize::from(woke.is_some());
+                        continue;
+                    }
+                    let done = with_store(store, move |s| {
+                        s.requeue_gating_rolling_queue_entry(id, Utc::now())
+                    })
+                    .await?;
+                    requeued += usize::from(done);
+                }
             }
-            None => {
-                let done = with_store(store, move |s| {
-                    s.requeue_gating_rolling_queue_entry(id, Utc::now())
-                })
-                .await?;
-                requeued += usize::from(done);
-            }
+        }
+        // Drain all interrupted entries in bounded pages. If a malformed entry
+        // cannot move, leave it pending rather than looping or claiming success.
+        if (settled, requeued) == before {
+            break;
         }
     }
     Ok((settled, requeued))
@@ -5471,7 +6990,7 @@ pub(crate) async fn reconcile_gating(
 /// reported in `deploy_drain.held`.
 #[cfg(test)]
 pub(crate) async fn run_drain_aware_batch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     size: usize,
     drain: &crate::deploy_drain::DeployDrain,
@@ -5484,7 +7003,7 @@ pub(crate) async fn run_drain_aware_batch(
 
 /// Whether a deploy holds queue admission (see [`run_drain_aware_batch`]).
 async fn admission_held(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     drain: &crate::deploy_drain::DeployDrain,
 ) -> Result<bool> {
     let queued = with_store(store, |s| {
@@ -5501,7 +7020,7 @@ async fn admission_held(
 /// operator has the queue enabled, and a second batch beside it when their
 /// packages are disjoint (#1224).
 pub async fn run_rolling_queue_loop(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     config: Arc<RuntimeConfig>,
     launcher: LanderLauncher,
     drain: Arc<crate::deploy_drain::DeployDrain>,
@@ -5516,6 +7035,16 @@ pub async fn run_rolling_queue_loop(
         Arc::clone(&drain),
         host_load,
     ));
+    // #3435: a lander run a previous daemon left running is adopted by the
+    // batch that asks for the same gate. One nobody claims in time belongs to
+    // entries that were cancelled or settled elsewhere and must not publish.
+    if let Some(runs_dir) = launcher.detached_runs_dir() {
+        tokio::spawn(detached_run::reap_inherited_after(
+            runs_dir,
+            launcher.run_epoch().to_string(),
+            detached_run::INHERITED_GRACE,
+        ));
+    }
     resume_pending_filter_derivations(&store).await;
     match reconcile_gating(&store).await {
         Ok((settled, requeued)) if settled + requeued > 0 => {
@@ -5534,6 +7063,15 @@ pub async fn run_rolling_queue_loop(
     loop {
         interval.tick().await;
         resume_pending_filter_derivations(&store).await;
+        // #3293: a queued source that already conflicts with the rolling tip
+        // is refused now, not when the queue drains to it.
+        tip_conflict::spawn_sweep(&store);
+        // #3394: a wide queued entry is compile-probed against the tip and the
+        // entries ahead of it; the claim below waits for its first verdict.
+        let probe_root = launcher.compile_probe_root();
+        if let Some(root) = &probe_root {
+            compile_probe::spawn_sweep(&store, root.clone());
+        }
         while let Some(finished) = lanes.try_join_next() {
             match finished {
                 Ok(Ok(results)) => {
@@ -5564,7 +7102,13 @@ pub async fn run_rolling_queue_loop(
                 continue;
             }
         }
-        match claim_batch_in_lanes(&store, size).await {
+        let held = match probe_root {
+            Some(_) => {
+                compile_probe::held_head_for_claim(&store, LANE_PROBE_WINDOW.max(size)).await
+            }
+            None => None,
+        };
+        match claim_batch_in_lanes_held(&store, size, held).await {
             Ok(Some(claimed)) => {
                 if claimed.parallel_lane {
                     tracing::info!(batch = %claimed.batch_id, "rolling queue second lane claimed");
@@ -5580,6 +7124,12 @@ pub async fn run_rolling_queue_loop(
 
 #[cfg(test)]
 mod tests {
+    // Tests marked `#[cfg(target_os = "linux")]` exercise the queue clone and its
+    // destructive git, which are Linux-only by design (#353): the clone is
+    // pinned through `/proc/self/fd/N` handles and the reset runs under a
+    // Landlock write fence. Elsewhere the queue refuses with
+    // `queue_write_fence_unsupported` before touching anything (pinned by the
+    // portable tests below), so there is nothing for these to prove.
     use super::*;
     use rsi_common::rolling_queue::RollingQueueBinding;
     use std::os::unix::fs::PermissionsExt;
@@ -5600,6 +7150,55 @@ mod tests {
             max_paths,
             deadline,
         }
+    }
+
+    const DIFF_CHECK_STDERR: &str = "rsi-rolling-land: static guard failed before any test ran (Failed { code: Some(2) }) running git [\"diff\", \"--check\", \"815af61\", \"6691884\"]: thoughts/notes/scripts/fleet.py:8: trailing whitespace.\n+    prev={}; \nthoughts/notes/scripts/perissue.py:17: trailing whitespace.\n+        nums=set(t.get('nums',[])); \ndocs/a b.md:3: new blank line at EOF.\n";
+
+    fn changed(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_diff_check_finding_names_its_file_including_the_lander_prefix() {
+        assert_eq!(
+            failure_paths(DIFF_CHECK_STDERR),
+            vec![
+                "thoughts/notes/scripts/fleet.py",
+                "thoughts/notes/scripts/perissue.py",
+                "docs/a b.md",
+            ]
+        );
+        // Added source text that merely looks like a finding is not one.
+        assert!(failure_paths("+    x = 'a.py:3: trailing whitespace later'").is_empty());
+        assert!(failure_paths("note: foo:bar: trailing whitespace.").is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_static_guard_whitespace_finding_is_attributed_to_the_one_member_that_changes_the_file() {
+        let files = vec![
+            changed(&["crates/a/src/lib.rs"]),
+            changed(&["crates/b/src/lib.rs"]),
+            changed(&["thoughts/notes/scripts/fleet.py", "thoughts/notes/x.md"]),
+            changed(&["docs/other.md"]),
+        ];
+        assert_eq!(attributable_member(&files, DIFF_CHECK_STDERR, &[]), Some(2));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_whitespace_finding_in_a_file_two_members_change_is_left_to_the_bisect() {
+        let files = vec![
+            changed(&["thoughts/notes/scripts/fleet.py"]),
+            changed(&["thoughts/notes/scripts/fleet.py"]),
+        ];
+        assert_eq!(attributable_member(&files, DIFF_CHECK_STDERR, &[]), None);
+        let unrelated = vec![changed(&["a.rs"]), changed(&["b.rs"])];
+        assert_eq!(
+            attributable_member(&unrelated, DIFF_CHECK_STDERR, &[]),
+            None
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5718,6 +7317,53 @@ mod tests {
         assert_eq!(gate.outcome.failing_tests, vec!["rolling_queue::red"]);
     }
 
+    /// #3936: the same bounded assertion evidence survives in the saved log
+    /// and outcome, even with verbose UTF-8 output on both captured streams.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_red_gate_keeps_a_bounded_output_excerpt_in_its_log_and_outcome() {
+        let stdout_tail = format!("{}\nfixture stdout tail", "界".repeat(8192));
+        let stderr_tail = format!(
+            "{}\nthread 'a::red' panicked at src/a.rs:9:5:\nassertion `left == right` failed\n  left: 0\n right: 1",
+            "é".repeat(8192)
+        );
+        let line = gate_failure_excerpt_line("a::red", &stdout_tail, &stderr_tail);
+        assert_eq!(line.lines().count(), 1, "test output is JSON escaped");
+        let stdout = format!(
+            "gate_failure_excerpt=\"earlier failure\"\n{line}\nfailing_test=a::red\npublication_status=not_published\n"
+        );
+        let stderr = "rsi-rolling-land: new test failures relative to rolling base: a::red";
+        let gate = classify_run(Some(1), &stdout, stderr, || None);
+        assert_eq!(gate.outcome.refusal.as_deref(), Some("gate_failed"));
+        assert_eq!(gate.outcome.failing_tests, ["a::red"]);
+        let excerpt = gate_failure_excerpt(&stdout).expect("captured excerpt");
+        assert!(excerpt.len() <= GATE_FAILURE_EXCERPT_BYTES);
+        for text in [
+            "failing test: a::red",
+            "fixture stdout tail",
+            "panicked at src/a.rs:9:5:",
+            "assertion `left == right` failed\n  left: 0\n right: 1",
+        ] {
+            assert!(excerpt.contains(text), "{text}: {excerpt}");
+        }
+        assert!(gate.outcome.detail.unwrap().ends_with(&excerpt));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gate.log");
+        finish_run_log(&path, "lander exit=1", &stdout, stderr).unwrap();
+        let log = std::fs::read_to_string(path).unwrap();
+        assert_eq!(gate_failure_excerpt(&log), Some(excerpt));
+
+        // Bound decoded evidence independently of the producer's cap, and
+        // ignore malformed records rather than losing the refusal.
+        let oversized = format!(
+            "gate_failure_excerpt={}\ngate_failure_excerpt=invalid\n",
+            serde_json::json!("界".repeat(8192) + "assertion failed")
+        );
+        let kept = gate_failure_excerpt(&oversized).unwrap();
+        assert!(kept.len() <= GATE_FAILURE_EXCERPT_BYTES);
+        assert!(kept.ends_with("assertion failed"));
+    }
+
     const CARGO_WARNINGS: &str = "warning: unused variable: `x`\n --> src/lib.rs:1:1\n  |\n1 | let x = 1;\n  |     ^ help: prefix it\n\nwarning: `demo` (lib) generated 1 warning\n";
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5807,6 +7453,41 @@ mod tests {
                 .is_some_and(|detail| detail.contains("release_check_secs=7"))
         );
         assert_eq!(release_build_failed_crate("nothing here"), None);
+    }
+
+    /// #3393: a cargo log with progress lines, a warning and rustc notes leads
+    /// its detail with the first error, its location and the error count.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_failed_build_detail_leads_with_the_first_compiler_error() {
+        let stderr = "    Blocking waiting for file lock on package cache\n\
+             \x20  Compiling rsid v0.1.0 (/work/crates/rsid)\n\
+             warning: unused import: `Foo`\n  --> crates/rsid/src/a.rs:1:5\n\n\
+             error[E0425]: cannot find function `names_in` in this scope\n\
+             \x20   --> crates/rsid/src/paste_retention.rs:639:13\n\
+             \x20    |\n639 |     names_in(x)\n\
+             \x20    = note: /registry/src/index.crates.io-1/tokio-1.49.0/src/sync/mutex.rs:133:1\n\n\
+             error[E0308]: mismatched types\n\
+             \x20   --> crates/rsid/src/b.rs:7:9\n\n\
+             error: could not compile `rsid` (lib) due to 2 previous errors\n";
+        let result = classify_run(
+            Some(1),
+            "publication_status=not_published\n",
+            stderr,
+            || None,
+        );
+        assert_eq!(result.outcome.refusal.as_deref(), Some("gate_failed"));
+        let detail = result.outcome.detail.expect("detail");
+        assert!(
+            detail.starts_with(
+                "compile error: error[E0425]: cannot find function `names_in` in this scope \
+                 at crates/rsid/src/paste_retention.rs:639:13 (2 errors)"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("Blocking waiting"), "{detail}");
+        assert!(!detail.contains("Compiling"), "{detail}");
+        assert_eq!(compile_error_summary("Compiling x\nFinished dev"), None);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -6030,7 +7711,7 @@ mod tests {
         assert_eq!(landed.state, RollingQueueEntryState::Published);
         assert_eq!(landed.outcome.landed_sha.as_deref(), Some("f00d"));
         let unknown = classify_run(Some(3), "publication_status=unknown\n", "", || None);
-        assert_eq!(unknown.state, RollingQueueEntryState::Failed);
+        assert_eq!(unknown.state, RollingQueueEntryState::Queued);
         assert_eq!(
             unknown.outcome.refusal.as_deref(),
             Some("publication_unknown")
@@ -6042,6 +7723,12 @@ mod tests {
             .arg("-c")
             .arg(script)
             .current_dir(dir)
+            // A fixed identity so a clone that never set `user.name` still
+            // commits on a host with no global gitconfig (#4012).
+            .env("GIT_AUTHOR_NAME", "Queue Fixture")
+            .env("GIT_AUTHOR_EMAIL", "queue-fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Queue Fixture")
+            .env("GIT_COMMITTER_EMAIL", "queue-fixture@example.invalid")
             .status()
             .unwrap();
         assert!(status.success(), "{script}");
@@ -6152,6 +7839,45 @@ mod tests {
         assert!(!commit_off_rolling(&work, &landed));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn published_commits_reads_the_subjects_a_merge_brought_onto_rolling_3369() {
+        let (_dir, _origin, work) = repos();
+        let old_tip = head(&work);
+        sh(
+            &work,
+            "git checkout -q -b feature \
+             && echo 1 > one && git add one && git commit -qm 'feat(hub #3011): first slice' \
+             && echo 2 > two && git add two && git commit -qm 'feat(hub #3011): second slice'",
+        );
+        let source = head(&work);
+        sh(
+            &work,
+            "git checkout -q rolling \
+             && echo r > r && git add r && git commit -qm 'unrelated rolling commit' \
+             && git merge -q --no-ff feature -m 'rsi integration: merge into rolling'",
+        );
+        let landed = head(&work);
+
+        let commits = published_commits(&work, &source, &landed);
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            vec![
+                "feat(hub #3011): second slice",
+                "feat(hub #3011): first slice"
+            ]
+        );
+        assert_eq!(commits[0].sha, source);
+
+        // A fast-forward or an unlocated source reads only the source commit.
+        assert_eq!(published_commits(&work, &landed, &landed).len(), 1);
+        assert_eq!(published_commits(&work, &old_tip, &landed).len(), 1);
+        // An unknown landed commit with no reachable remote reads nothing new
+        // for an unknown source.
+        assert!(published_commits(&work, &"0".repeat(40), &landed).is_empty());
+    }
+
     fn fake_lander(dir: &Path, body: &str) -> LanderLauncher {
         let path = dir.join("fake-lander.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -6163,7 +7889,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_refresh_precedes_gate_and_failure_reason_reaches_gate_log() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let path = dir.path().join("snapshot.json");
         let stale = rsi_common::failure_signature::Snapshot {
             schema_version: 1,
@@ -6214,7 +7942,7 @@ mod tests {
     }
 
     async fn queued(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         repo: &Path,
         commit: &str,
         key: &str,
@@ -6223,7 +7951,7 @@ mod tests {
     }
 
     async fn queued_by(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         repo: &Path,
         commit: &str,
         key: &str,
@@ -6233,7 +7961,7 @@ mod tests {
     }
 
     async fn queued_in_project(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         repo: &Path,
         commit: &str,
         key: &str,
@@ -6269,7 +7997,9 @@ mod tests {
         let (dir, _origin, work) = repos();
         let sha = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = merging_lander(dir.path(), &work, &log, "");
         let id = queued(&store, &work, &sha, "k").await;
         let (settled, result) = run_next(&store, &launcher).await.unwrap().unwrap();
@@ -6289,7 +8019,9 @@ mod tests {
         let first = commit_file(&work, "a", "a", "a");
         let second = commit_file(&work, "b", "b", "b");
         let log = dir.path().join("lander.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = merging_lander(dir.path(), &work, &log, "");
         let a = queued(&store, &work, &first, "a").await;
         let b = queued(&store, &work, &second, "b").await;
@@ -6407,7 +8139,9 @@ mod tests {
         let (dir, _origin, work) = repos();
         let sha = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = merging_lander(dir.path(), &work, &log, "");
         let entry = queued(&store, &work, &sha, "k").await;
         // The deploy was staged long enough ago that the worker-start hold
@@ -6488,6 +8222,7 @@ exit 1
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn the_queue_lands_in_its_own_worktree_with_its_own_cargo_target() {
@@ -6498,7 +8233,9 @@ exit 1
         let operator_head = head(&work);
         let log = dir.path().join("lander.log");
         let workspace = dir.path().join("queue");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = recording_lander(dir.path(), &log, &sha, &workspace);
         queued(&store, &work, &sha, "k").await;
         run_next(&store, &launcher).await.unwrap().unwrap();
@@ -6531,6 +8268,7 @@ exit 1
         assert!(work.join("operator-note.txt").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn the_queue_worktree_is_reused_and_refreshed_between_landings() {
@@ -6538,7 +8276,9 @@ exit 1
         let first = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
         let workspace = dir.path().join("queue");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = recording_lander(dir.path(), &log, &first, &workspace);
         queued(&store, &work, &first, "k1").await;
         run_next(&store, &launcher).await.unwrap().unwrap();
@@ -6578,6 +8318,7 @@ exit 1
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn worktree_dir(workspace: &Path, work: &Path) -> PathBuf {
         let common = git(
             work,
@@ -6589,6 +8330,7 @@ exit 1
         workspace.join("worktrees").join(stable_key(&common))
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_symlinked_worktree_dir_is_refused_and_the_operator_checkout_is_untouched() {
@@ -6606,6 +8348,7 @@ exit 1
         assert_operator_untouched(&work, &before, &note);
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_slot_swapped_for_a_symlink_after_validation_cannot_redirect_the_reset() {
@@ -6637,6 +8380,7 @@ exit 1
     /// destructive `checkout --force` / `clean`. Git must not follow it: the
     /// command is refused and the operator checkout (HEAD, index, tracked and
     /// untracked edits) is exactly as it was.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_git_directory_swapped_for_a_symlink_cannot_redirect_the_reset() {
@@ -6684,6 +8428,7 @@ exit 1
 
     /// #1141: a git directory that is moved (not replaced) is also refused, and
     /// git is never run against the moved copy.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_moved_git_directory_is_refused_before_git_runs() {
@@ -6698,6 +8443,7 @@ exit 1
         assert!(slot.join("queue-scratch.txt").exists());
     }
 
+    #[cfg(target_os = "linux")]
     fn common_dir(work: &Path) -> String {
         git(
             work,
@@ -6710,6 +8456,7 @@ exit 1
 
     /// `(asleep, voluntary context switches)` of the process whose environment
     /// carries `marker`.
+    #[cfg(target_os = "linux")]
     fn probe_marked_process(marker: &str) -> Option<(bool, u64)> {
         let entries = std::fs::read_dir("/proc").ok()?;
         entries.flatten().find_map(|entry| {
@@ -6741,6 +8488,7 @@ exit 1
     /// enters that path, and again after). At the second read the queue slot is
     /// renamed away and replaced by a symlink to `decoy`, so git's `chdir` by
     /// pathname lands in `decoy` (#1160).
+    #[cfg(target_os = "linux")]
     fn reset_with_slot_swapped_in_flight(
         pinned: &PinnedWorktree,
         rev: &str,
@@ -6810,6 +8558,7 @@ exit 1
 
     /// Mode and modification time: what a hook, a filter or a redirected git
     /// could change without touching a file's bytes.
+    #[cfg(target_os = "linux")]
     fn mode_and_mtime(path: &Path) -> (u32, std::time::SystemTime) {
         use std::os::unix::fs::MetadataExt;
         let meta =
@@ -6823,6 +8572,7 @@ exit 1
     /// is redirected (the worktree rewrite or `clean`), the operator checkout's
     /// tracked edits, untracked files, index, HEAD, modes and timestamps must be
     /// exactly as they were, and the reset must fail closed.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_slot_swapped_inside_gits_own_process_cannot_redirect_the_reset() {
@@ -6859,6 +8609,7 @@ exit 1
     /// #1160 major 2: the registration directory keeps its identity when one of
     /// its entries is replaced by a symlink. The reset never follows it: it
     /// fails closed and the operator's index stays byte-identical.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_registration_entry_swapped_for_a_symlink_cannot_rewrite_the_operator_index() {
@@ -6902,6 +8653,7 @@ exit 1
     /// are hard links to operator files, and so are a tracked and an untracked
     /// file in the queue worktree. The reset succeeds and every operator file
     /// keeps its bytes, mode and modification time.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn hard_links_to_operator_files_are_never_written_through() {
@@ -6972,6 +8724,7 @@ exit 1
     /// operator's repository configures may run during the reset. A smudge
     /// filter and a `post-index-change` hook in the operator repo each chmod an
     /// operator file; neither may run, and the checked-out bytes are unfiltered.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_operators_hooks_and_filters_do_not_run_during_the_reset() {
@@ -7038,7 +8791,9 @@ exit 1
         let sha = commit_file(&work, "a", "a", "a");
         let (before, note) = dirty_operator(&work);
         let log = dir.path().join("lander.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut launcher = recording_lander(dir.path(), &log, &sha, &dir.path().join("queue"));
         launcher.fence_abi = || Ok(2);
         queued(&store, &work, &sha, "k").await;
@@ -7062,6 +8817,7 @@ exit 1
 
     /// A hard link to `operator` named `link` (an alias a granted directory
     /// would let a write pass through).
+    #[cfg(target_os = "linux")]
     fn alias_file(operator: &Path, link: &Path) {
         let _ = std::fs::remove_file(link);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
@@ -7069,6 +8825,7 @@ exit 1
     }
 
     /// Operator state whose bytes, mode and timestamps a test pins.
+    #[cfg(target_os = "linux")]
     fn pin_files(files: &[PathBuf]) -> Vec<(Vec<u8>, (u32, std::time::SystemTime))> {
         files
             .iter()
@@ -7076,6 +8833,7 @@ exit 1
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_files_unchanged(
         files: &[PathBuf],
         pinned: &[(Vec<u8>, (u32, std::time::SystemTime))],
@@ -7095,6 +8853,7 @@ exit 1
     }
 
     /// A `#!/bin/sh` script under `dir` that chmods `victim` to 000.
+    #[cfg(target_os = "linux")]
     fn chmod_script(dir: &Path, name: &str, victim: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
@@ -7111,6 +8870,7 @@ exit 1
     /// same pinned, fenced runner as every later reset. A slot swapped for the
     /// operator checkout while the FIRST population's git is in flight is
     /// refused and leaves the operator checkout untouched.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_slot_swapped_during_the_first_population_cannot_redirect_it() {
@@ -7151,6 +8911,7 @@ exit 1
     /// #1160 (first use): creating the worktree must not run the operator's
     /// hooks or filters either (`git worktree add` would run a checkout, its
     /// filters and `post-checkout`).
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_first_creation_runs_no_operator_hook_or_filter() {
@@ -7197,7 +8958,52 @@ exit 1
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_source_fetch_runs_no_hook_or_maintenance_and_writes_no_fetch_head() {
-        let (dir, origin, work) = repos();
+        let checkout = Path::new(rsi_common::manifest_dir!())
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let policy = rsi_repo_guards::scratch_git::Policy::from_process(&checkout).unwrap();
+        let dir = policy.tempdir("rsi-source-fetch-").unwrap();
+        let empty_config = dir.path().join("empty.gitconfig");
+        std::fs::write(&empty_config, "").unwrap();
+        let fixture_git = |repo: &Path, args: &[&str]| {
+            let mut command = policy.command(repo, args).unwrap();
+            // Neither clone may depend on the runner's identity or Git config.
+            command
+                .env("GIT_CONFIG_GLOBAL", &empty_config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_COUNT", "0")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG")
+                .env("GIT_AUTHOR_NAME", "Source Fetch Fixture")
+                .env("GIT_AUTHOR_EMAIL", "source-fetch@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Source Fetch Fixture")
+                .env("GIT_COMMITTER_EMAIL", "source-fetch@example.invalid");
+            command
+        };
+        let run = |command: &mut std::process::Command| {
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "fixture Git failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        run(fixture_git(dir.path(), &["init", "-q", "--bare", "-b", "rolling"]).arg(&origin));
+        run(fixture_git(dir.path(), &["clone", "-q"])
+            .arg(&origin)
+            .arg(&work));
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        run(&mut fixture_git(&work, &["add", "base.txt"]));
+        run(&mut fixture_git(&work, &["commit", "-qm", "base"]));
+        run(&mut fixture_git(
+            &work,
+            &["push", "-q", "origin", "HEAD:rolling"],
+        ));
         let marker = dir.path().join("hook-ran");
         let hook = work.join(".git/hooks/reference-transaction");
         std::fs::write(
@@ -7208,23 +9014,31 @@ exit 1
         std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
         // Automatic gc would run (and pack the loose objects) after any fetch.
-        sh(
+        run(&mut fixture_git(
             &work,
-            "git config gc.auto 1 && git config gc.autoDetach false",
-        );
-        sh(&work, "git config maintenance.autoDetach false");
+            &["config", "--local", "gc.auto", "1"],
+        ));
+        run(&mut fixture_git(
+            &work,
+            &["config", "--local", "gc.autoDetach", "false"],
+        ));
+        run(&mut fixture_git(
+            &work,
+            &["config", "--local", "maintenance.autoDetach", "false"],
+        ));
         // Origin moves ahead through a second clone.
         let other = dir.path().join("other");
-        sh(
-            dir.path(),
-            &format!(
-                "git clone -q {} {} && cd {} && echo n > n.txt && git add n.txt \
-                 && git commit -qm n && git push -q origin HEAD:rolling",
-                origin.display(),
-                other.display(),
-                other.display()
-            ),
-        );
+        run(fixture_git(dir.path(), &["clone", "-q"])
+            .arg(&origin)
+            .arg(&other));
+        std::fs::write(other.join("n.txt"), "n\n").unwrap();
+        run(&mut fixture_git(&other, &["add", "n.txt"]));
+        run(&mut fixture_git(&other, &["commit", "-qm", "n"]));
+        run(&mut fixture_git(
+            &other,
+            &["push", "-q", "origin", "HEAD:rolling"],
+        ));
+        let expected_head = run(&mut fixture_git(&other, &["rev-parse", "HEAD"]));
         let packs = || {
             let mut names: Vec<_> = std::fs::read_dir(work.join(".git/objects/pack"))
                 .unwrap()
@@ -7238,8 +9052,8 @@ exit 1
         let (packs_before, fetch_head_before) = (packs(), fetch_head());
         fetch_rolling(&work).unwrap();
         assert_eq!(
-            git(&work, &["rev-parse", "origin/rolling"]).unwrap(),
-            head(&other) + "\n",
+            run(&mut fixture_git(&work, &["rev-parse", "origin/rolling"])),
+            expected_head,
             "the fetch itself still happens"
         );
         assert_eq!(std::fs::read_to_string(&marker).ok(), None, "no hook ran");
@@ -7250,6 +9064,7 @@ exit 1
     /// The first population, with `plant` run just before git subcommand
     /// `target` with the private git directory's path (as a racing same-uid
     /// process would). Returns the slot.
+    #[cfg(target_os = "linux")]
     fn populate_with_plant(
         dir: &Path,
         work: &Path,
@@ -7278,6 +9093,7 @@ exit 1
     /// not redirect git's common directory (and with it `info/exclude`) to a
     /// directory of the planter's choosing: `clean` still removes the file a
     /// planted exclude would have protected.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_commondir_planted_in_the_private_git_dir_is_ignored() {
@@ -7314,6 +9130,7 @@ exit 1
 
     /// #1170 (R3): a replace ref planted in the private git directory does not
     /// substitute the tree the reset checks out.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_replace_ref_planted_in_the_private_git_dir_is_ignored() {
@@ -7340,6 +9157,7 @@ exit 1
     /// #1170 (R3): `info` is a regular file, so a directory of that name (where
     /// `attributes` would name a filter driver) cannot be added beside the files
     /// the daemon creates exclusively.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_info_directory_cannot_be_planted_in_the_private_git_dir() {
@@ -7354,6 +9172,7 @@ exit 1
     /// #1160: the child gets a clean environment. An inherited `GIT_TRACE`,
     /// `GIT_TRACE2_EVENT` or `GIT_TRACE_SETUP` naming a hard link to an operator
     /// file is never opened for append, and the unfenced runners drop them too.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_inherited_git_trace_cannot_write_through_a_hard_link() {
@@ -7416,6 +9235,7 @@ exit 1
     /// #1160: a split registration index (its shared half beside it) is not
     /// copied as a broken half; the reset publishes a full index, and a second
     /// and third reset (each refreshing it) keep working.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_split_registration_index_is_normalized_and_survives_repeated_resets() {
@@ -7444,6 +9264,7 @@ exit 1
     }
 
     /// #1160: a registration index replaced by a FIFO cannot block the reset.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_registration_index_fifo_is_refused_without_blocking() {
@@ -7471,6 +9292,7 @@ exit 1
     /// Documented behaviour change (#1160): the queue's `clean -fd` no longer
     /// reads the operator's `.git/info/exclude`, so a file ignored only there
     /// is removed from the queue worktree like any other untracked file.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn clean_ignores_the_operators_private_excludes() {
@@ -7496,6 +9318,7 @@ exit 1
     /// after it exists and before git runs cannot enable a hook, replace the
     /// config to turn one on, or redirect an append: the settings that matter
     /// are on git's command line, `logs` is a file, and no ref is updated.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn files_planted_in_the_private_git_dir_in_flight_are_not_honored() {
@@ -7555,6 +9378,7 @@ exit 1
 
     /// #1160: the fence permits writes beneath the handles it was built from
     /// and nothing else, including through a symlink aimed outside them.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_write_fence_allows_its_handles_and_refuses_every_other_write() {
@@ -7597,6 +9421,7 @@ exit 1
     /// `worktrees` handle, so neither a symlinked slot nor a `worktrees`
     /// directory swapped for a symlink to a same-named empty directory
     /// elsewhere can redirect the removal.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_empty_slot_fallback_deletes_fd_relative_and_never_follows_a_swap() {
@@ -7653,6 +9478,7 @@ exit 1
         assert_operator_untouched(&work, &before, &note);
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_plain_non_worktree_directory_is_refused_and_kept() {
@@ -7681,6 +9507,7 @@ exit 1
         assert_operator_untouched(&work, &before, &note);
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_empty_leftover_directory_is_recovered_into_a_real_worktree() {
@@ -7698,6 +9525,7 @@ exit 1
 
     /// Every file under `dir` with its length and modification time: what any
     /// write by the queue, however small, would change.
+    #[cfg(target_os = "linux")]
     fn tree_state(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -7720,6 +9548,7 @@ exit 1
     /// hook (a `reference-transaction` hook and automatic gc are armed) and no
     /// config. The queue's fetch lands in its own clone, which reaches the new
     /// tip while the source's `origin/rolling` stays where it was.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_queue_writes_nothing_into_the_source_repository() {
@@ -7786,6 +9615,7 @@ exit 1
     /// reachable in the queue clone through the read-only alternate, so the
     /// lander's `git clone --shared --no-checkout` of the clone reaches it, and
     /// the clone carries the source's origin so the lander can publish.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_unpublished_source_commit_is_reachable_through_the_clone_by_the_lander() {
@@ -7822,6 +9652,7 @@ exit 1
     /// is retired into a queue clone. The source's registration is left exactly
     /// as it is (git's own `worktree prune` owns it), and nothing else of the
     /// source changes.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_worktree_registered_by_an_earlier_queue_is_replaced_by_a_clone() {
@@ -7852,6 +9683,7 @@ exit 1
     /// source's transport settings that the fetch needs are copied into the
     /// clone's config, quoted, and a value that cannot be written on one line is
     /// dropped.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_offline_source_resets_to_its_head_and_transport_settings_are_copied() {
@@ -7889,6 +9721,7 @@ exit 1
     /// #1170: a config planted in the clone's git directory (or any file
     /// replaced there) is overwritten from the source on the next call, so a
     /// filter driver or a changed remote cannot persist.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_config_replaced_in_the_clone_is_rewritten_from_the_source() {
@@ -7930,7 +9763,9 @@ exit 1
         let (dir, _origin, work) = repos();
         let sha = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = recording_lander(dir.path(), &log, &sha, dir.path());
         let launcher = LanderLauncher::new(launcher.binary().to_path_buf());
         queued(&store, &work, &sha, "k").await;
@@ -7946,7 +9781,9 @@ exit 1
     async fn run_next_passes_the_source_filters_and_the_wall_time_regate_budget() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = fake_lander(
             dir.path(),
             &format!(
@@ -8004,7 +9841,9 @@ exit 1
     async fn a_claimed_fix_reaches_the_lander_and_its_refusal_names_the_tests() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("args.log");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = fake_lander(
             dir.path(),
             &format!(
@@ -8054,7 +9893,9 @@ exit 1
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn an_unavailable_lander_fails_the_entry_and_wakes_the_owner() {
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let launcher = LanderLauncher::new(PathBuf::from("/nonexistent/rsi-rolling-land"));
         let dir = tempfile::tempdir().unwrap();
         queued(&store, dir.path(), &"c".repeat(40), "k").await;
@@ -8172,7 +10013,9 @@ exit 1
     async fn a_shutdown_killed_ancestry_probe_leaves_the_entry_gating_and_reconcile_publishes_it() {
         let (_dir, _origin, work) = repos();
         let source = head(&work);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &source, "1").await;
         let batch_id = Uuid::new_v4();
         {
@@ -8247,7 +10090,9 @@ exit 1
     async fn a_published_gate_over_an_unowned_base_red_files_one_qa_issue_and_names_it() {
         let (_dir, _origin, work) = repos();
         let source = head(&work);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let project = Uuid::new_v4();
         {
             let now = Utc::now();
@@ -8376,7 +10221,9 @@ exit 1
     async fn a_failed_gate_over_an_unowned_base_red_files_one_qa_issue_for_the_base_red() {
         let (dir, _origin, work) = repos();
         let source = head(&work);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let project = Uuid::new_v4();
         {
             let now = Utc::now();
@@ -8487,7 +10334,9 @@ exit 1"#,
             "git checkout -q -b feature && echo x > x && git add x && git commit -qm x",
         );
         let pending_commit = head(&work);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let landed = queued(&store, &work, &landed_commit, "1").await;
         let pending = queued(&store, &work, &pending_commit, "2").await;
         {
@@ -8539,6 +10388,361 @@ exit 1"#,
             .filter(|job| job.name.starts_with("merge-queue-"))
             .count();
         assert_eq!(wakes, 1);
+    }
+
+    /// #3480: an entry that is `gating` at two daemon stops is held as
+    /// suspect with an operator-visible refusal, not gated a third time; the
+    /// first stop still re-drives it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_entry_gating_at_two_daemon_stops_is_held_as_suspect_3480() {
+        let (_dir, _origin, work) = repos();
+        sh(
+            &work,
+            "git checkout -q -b feature && echo x > x && git add x && git commit -qm x",
+        );
+        let commit = head(&work);
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let entry = queued(&store, &work, &commit, "1").await;
+        async fn gate_again(store: &Arc<rsid_core::store_lock::Mutex<Store>>, id: Uuid) {
+            let guard = store.lock().await;
+            let batch = Uuid::new_v4().to_string();
+            guard
+                .conn
+                .execute(
+                    "INSERT INTO rolling_queue_batches(id,state,member_ids_json,member_count,created_at,row_version) \
+                     VALUES (?1,'gating','[]',1,'2026-09-29T00:00:00.000000000Z',1)",
+                    [&batch],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state='gating', batch_id=?2 WHERE id=?1",
+                    [id.to_string(), batch],
+                )
+                .unwrap();
+        }
+        // First stop while gating: re-driven, not yet suspect.
+        gate_again(&store, entry).await;
+        assert_eq!(reconcile_gating(&store).await.unwrap(), (0, 1));
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_rolling_queue_entry(entry)
+                .unwrap()
+                .unwrap()
+                .state,
+            RollingQueueEntryState::Queued
+        );
+        // Re-gated after the restart and the daemon stopped again: suspect.
+        gate_again(&store, entry).await;
+        assert_eq!(reconcile_gating(&store).await.unwrap(), (1, 0));
+        let guard = store.lock().await;
+        let settled = guard.get_rolling_queue_entry(entry).unwrap().unwrap();
+        assert_eq!(settled.state, RollingQueueEntryState::Refused);
+        let outcome = settled.outcome.expect("a refusal outcome");
+        assert_eq!(outcome.refusal.as_deref(), Some(QUEUE_SUSPECT_CRASH_LOOP));
+        assert!(
+            outcome
+                .detail
+                .unwrap_or_default()
+                .contains("stopped 2 times"),
+            "the refusal names the stops"
+        );
+        let wakes = guard
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name.starts_with("merge-queue-"))
+            .count();
+        assert_eq!(wakes, 1, "the enqueuer is told once");
+        drop(guard);
+        // A third boot has nothing left to reconcile.
+        assert_eq!(reconcile_gating(&store).await.unwrap(), (0, 0));
+    }
+
+    /// A kill before terminal settlement leaves a gating entry for the next
+    /// daemon to re-admit in place. Cached ancestry after a failed fetch is
+    /// insufficient publication proof.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn interrupted_gating_restart_preserves_identity_and_fifo_and_fails_closed() {
+        for (on_rolling, fetch_ok) in [(true, true), (false, true), (true, false)] {
+            let (dir, _origin, work) = repos();
+            let source = if on_rolling {
+                head(&work)
+            } else {
+                commit_file(&work, "pending", "pending", "pending")
+            };
+            let database = dir.path().join("restart.db");
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_test_fixture(&database).unwrap(),
+            ));
+            let session = Uuid::new_v4();
+            let id = queued_by(&store, &work, &source, "interrupted", session).await;
+            let before = entry_of(&store, id).await;
+            let later_source = commit_file(&work, "later", "later", "later");
+            let later = queued(&store, &work, &later_source, "later").await;
+            let claim = store
+                .lock()
+                .await
+                .claim_next_rolling_queue_entry(Utc::now())
+                .unwrap()
+                .unwrap();
+            assert_eq!(claim.entry.id, id);
+            assert_eq!(
+                entry_of(&store, id).await.state,
+                RollingQueueEntryState::Gating
+            );
+            assert_eq!(wake_count(&store).await, 0);
+            // The daemon/lander dies here, before writing any terminal state.
+            drop(store);
+            if !fetch_ok {
+                sh(
+                    &work,
+                    "git remote set-url origin /nonexistent/rsi-unreachable-origin.git",
+                );
+            }
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_test_fixture(&database).unwrap(),
+            ));
+            let published = on_rolling && fetch_ok;
+            assert_eq!(
+                reconcile_gating(&store).await.unwrap(),
+                if published { (1, 0) } else { (0, 1) }
+            );
+            assert_eq!(reconcile_gating(&store).await.unwrap(), (0, 0));
+            let recovered = entry_of(&store, id).await;
+            assert_eq!(recovered.id, before.id);
+            assert_eq!(recovered.sequence, before.sequence);
+            assert_eq!(recovered.source_commit, source);
+            assert_eq!(recovered.source_session_id, session);
+            assert_eq!(recovered.owner_epic_id, before.owner_epic_id);
+            assert_eq!(recovered.binding, before.binding);
+            assert_eq!(recovered.work_key, before.work_key);
+            assert_eq!(recovered.enqueued_at, before.enqueued_at);
+            assert_eq!(
+                recovered.state,
+                if published {
+                    RollingQueueEntryState::Published
+                } else {
+                    RollingQueueEntryState::Queued
+                }
+            );
+            assert_eq!(wake_count(&store).await, usize::from(published));
+            if published {
+                assert_eq!(
+                    recovered.outcome.unwrap().landed_sha.as_deref(),
+                    Some(source.as_str())
+                );
+            } else {
+                assert_eq!(recovered.finished_at, None);
+                assert_eq!(recovered.outcome, None);
+                assert!(recovered.sequence < entry_of(&store, later).await.sequence);
+                let claim = store
+                    .lock()
+                    .await
+                    .claim_next_rolling_queue_entry(Utc::now())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(claim.entry.id, id);
+                assert_eq!(claim.entry.sequence, before.sequence);
+            }
+            // The replay key still finds the original entry after reopening
+            // the database and re-admitting it, with no duplicate enqueue.
+            assert_eq!(
+                queued_by(&store, &work, &source, "interrupted", session).await,
+                id
+            );
+            let entries = store
+                .lock()
+                .await
+                .list_rolling_queue_entries(None, 10)
+                .unwrap();
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|(entry, _)| entry.id)
+                    .collect::<Vec<_>>(),
+                vec![id, later]
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_interrupted_batch_requeues_the_same_entries_without_terminal_wakes() {
+        let (dir, _origin, work) = repos();
+        let first = commit_file(&work, "one", "one", "one");
+        let second = commit_file(&work, "two", "two", "two");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = [
+            queued(&store, &work, &first, "one").await,
+            queued(&store, &work, &second, "two").await,
+        ];
+        let launcher = fake_lander(
+            dir.path(),
+            "echo publication_status=unknown; echo 'landing interrupted' >&2; exit 3",
+        );
+        for _ in 0..2 {
+            let results = run_next_batch(&store, &launcher, 2).await.unwrap();
+            assert_eq!(results.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+            let guard = store.lock().await;
+            let entries = guard.list_rolling_queue_entries(None, 10).unwrap();
+            assert_eq!(entries.len(), 2);
+            for ((entry, _), id) in entries.iter().zip(ids) {
+                assert_eq!(entry.id, id);
+                assert_eq!(entry.state, RollingQueueEntryState::Queued);
+            }
+            assert_eq!(guard.list_scheduled_jobs().unwrap().len(), 0);
+        }
+    }
+
+    const REMOTE_READ_LANDER: &str = "echo publication_status=not_published; \
+         echo failure_class=remote_read_unavailable; \
+         echo 'rsi-rolling-land: cannot read remote rolling tip: git ls-remote exited 128' >&2; \
+         exit 1";
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_remote_read_failure_classifies_as_a_requeue_and_a_red_gate_still_refuses() {
+        let remote = classify_run(
+            Some(1),
+            "publication_status=not_published\nfailure_class=remote_read_unavailable\n",
+            "rsi-rolling-land: cannot read remote rolling tip: git ls-remote exited 128",
+            || None,
+        );
+        assert_eq!(remote.state, RollingQueueEntryState::Queued);
+        assert!(is_remote_read_unavailable(&remote));
+        assert!(!is_bisectable(&remote));
+        let detail = remote.outcome.detail.unwrap();
+        assert!(detail.contains("cause=remote_read_unavailable"), "{detail}");
+        let red = classify_run(
+            Some(1),
+            "publication_status=not_published\n",
+            "test q::red ... FAILED",
+            || None,
+        );
+        assert_eq!(red.state, RollingQueueEntryState::Refused);
+        assert!(!is_remote_read_unavailable(&red));
+        assert!(is_bisectable(&red));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_remote_read_failure_after_a_green_gate_requeues_the_batch_without_bisecting() {
+        let (dir, _origin, work) = repos();
+        let first = commit_file(&work, "one", "one", "one");
+        let second = commit_file(&work, "two", "two", "two");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = [
+            queued(&store, &work, &first, "one").await,
+            queued(&store, &work, &second, "two").await,
+        ];
+        let launcher = fake_lander(dir.path(), REMOTE_READ_LANDER);
+        let results = run_next_batch(&store, &launcher, 2).await.unwrap();
+        assert_eq!(results.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+        for (_, result) in &results {
+            assert!(is_remote_read_unavailable(result), "{result:?}");
+        }
+        for id in ids {
+            let entry = entry_of(&store, id).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Queued);
+            assert!(entry.outcome.is_none());
+        }
+        assert_eq!(wake_count(&store).await, 0);
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "requeued_remote_read").len(), 2);
+        assert_eq!(events_of(&guard, "remote_read_unavailable").len(), 1);
+        assert!(events_of(&guard, "bisect_started").is_empty());
+        assert!(events_of(&guard, "bisect_isolated").is_empty());
+        drop(guard);
+        // The batch keeps its positions: it is claimed again in the same order.
+        let again = run_next_batch(&store, &launcher, 2).await.unwrap();
+        assert_eq!(again.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ids);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_permanent_remote_read_outage_fails_typed_after_the_requeue_limit() {
+        let (dir, _origin, work) = repos();
+        let sha = commit_file(&work, "one", "one", "one");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = queued(&store, &work, &sha, "one").await;
+        let launcher = fake_lander(dir.path(), REMOTE_READ_LANDER);
+        for _ in 0..QUEUE_REMOTE_READ_REQUEUE_LIMIT {
+            run_next_batch(&store, &launcher, 1).await.unwrap();
+            assert_eq!(
+                entry_of(&store, id).await.state,
+                RollingQueueEntryState::Queued
+            );
+        }
+        let last = run_next_batch(&store, &launcher, 1).await.unwrap();
+        assert_eq!(last.len(), 1);
+        let entry = entry_of(&store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Failed);
+        let outcome = entry.outcome.unwrap();
+        assert_eq!(
+            outcome.refusal.as_deref(),
+            Some(QUEUE_REMOTE_READ_UNAVAILABLE)
+        );
+        let detail = outcome.detail.unwrap();
+        assert!(detail.contains("cause=remote_read_unavailable"), "{detail}");
+        assert_eq!(wake_count(&store).await, 1);
+        assert!(
+            run_next_batch(&store, &launcher, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_remote_read_failure_in_a_bisect_round_requeues_the_batch_and_isolates_nobody() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        let mark = dir.path().join("first-run-done");
+        // The first run is red and names two members' files (a real bisect);
+        // every later run cannot read the remote.
+        let guard = format!(
+            "if [ ! -f {mark} ]; then touch {mark}; echo 'error[E0425]: boom' >&2; \
+             echo ' --> a:1:1' >&2; echo ' --> d:1:1' >&2; \
+             echo publication_status=not_published; exit 1; fi\n{REMOTE_READ_LANDER}",
+            mark = mark.display()
+        );
+        let launcher = merging_lander(dir.path(), &work, &log, &guard);
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 4, "every member is accounted for once");
+        for id in ids {
+            let entry = entry_of(&store, id).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Queued, "{entry:?}");
+            assert!(entry.outcome.is_none());
+        }
+        assert_eq!(lander_runs(&log).len(), 2, "one gate, one bisect round");
+        assert_eq!(wake_count(&store).await, 0);
+        let guard = store.lock().await;
+        assert_eq!(events_of(&guard, "bisect_started").len(), 1);
+        assert!(events_of(&guard, "bisect_isolated").is_empty());
+        assert_eq!(events_of(&guard, "requeued_remote_read").len(), 4);
     }
 
     fn member(id: u128, derived: Option<u32>, declared: bool) -> MigrationMember {
@@ -8800,6 +11004,7 @@ exit 1"#,
 
     fn queued_entry_view(commit: &str, filters: &[&str]) -> RollingQueueEntryV1 {
         RollingQueueEntryV1 {
+            issue: None,
             sequence: 1,
             id: Uuid::new_v4(),
             source_commit: commit.repeat(40),
@@ -8809,9 +11014,11 @@ exit 1"#,
             work_key: None,
             migration_version: None,
             hot_files: vec![],
+            derived_test_filters: Vec::new(),
             test_filters: filters.iter().map(|f| (*f).to_string()).collect(),
             fixes_tests: Vec::new(),
             filters_state: None,
+            expedite_reason: None,
             state: RollingQueueEntryState::Queued,
             outcome: None,
             enqueued_at: String::new(),
@@ -8898,7 +11105,7 @@ echo published_target_id=$(git rev-parse HEAD)
     }
 
     async fn queue_all(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         work: &Path,
         shas: &[String],
         migration: Option<u32>,
@@ -8922,7 +11129,10 @@ echo published_target_id=$(git rev-parse HEAD)
         ids
     }
 
-    async fn entry_of(store: &Arc<tokio::sync::Mutex<Store>>, id: Uuid) -> RollingQueueEntryV1 {
+    async fn entry_of(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        id: Uuid,
+    ) -> RollingQueueEntryV1 {
         store
             .lock()
             .await
@@ -8958,7 +11168,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 4);
@@ -9001,6 +11213,319 @@ echo published_target_id=$(git rev-parse HEAD)
         assert_eq!(wakes, 4);
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn handwritten_filter_in_any_member_keeps_derived_empty_fallback_strict() {
+        let mut derived = queued_entry_view("a", &["rsid=shard:other-02:test(fixture)"]);
+        derived.derived_test_filters = derived.test_filters.clone();
+        assert_eq!(
+            union_derived_filters(&[derived.clone()]),
+            derived.test_filters
+        );
+        let explicit = queued_entry_view("b", &["rsid=shard:other-02:test(fixture)"]);
+        assert_eq!(
+            union_derived_filters(&[derived, explicit]),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A detached lander run for the tests: output and status in files under
+    /// the queue workspace, no systemd scope.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn detached_lander(dir: &Path, body: &str) -> LanderLauncher {
+        fake_lander(dir, body)
+            .with_workspace(dir.join("queue"))
+            .with_detached_runs()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn run_dir_entries(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("queue").join(detached_run::RUNS_SUBDIR))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn process_is_gone(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // `pid (comm) S ...`: a zombie is already dead, only unreaped.
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+            Err(_) => true,
+        }
+    }
+
+    /// #3435: the detached path returns what the attached one did.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_detached_lander_run_reports_its_output_and_exit_status_and_leaves_no_files() {
+        let dir = crate::test_support::disk_backed_tempdir("detached-lander-output");
+        let launcher = detached_lander(dir.path(), "echo gate_out; echo gate_err >&2; exit 3");
+        let output = run_lander(
+            &launcher,
+            dir.path(),
+            &[queued_entry_view("a", &[])],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"gate_out\n");
+        assert_eq!(output.stderr, b"gate_err\n");
+        assert_eq!(run_dir_entries(dir.path()), 0);
+    }
+
+    /// #3435: a daemon restart in the middle of a gate does not restart the
+    /// gate. The first daemon's future is dropped mid-run (its process is
+    /// gone), the next daemon asks for the same gate and gets the first run's
+    /// result; the lander ran once.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn the_next_daemon_adopts_the_lander_run_a_restart_interrupted() {
+        let dir = crate::test_support::disk_backed_tempdir("detached-lander-adopt");
+        let starts = dir.path().join("starts");
+        let body = format!("echo start >> {}\nsleep 2\necho gated", starts.display());
+        let launcher = detached_lander(dir.path(), &body);
+        let entry = queued_entry_view("a", &[]);
+
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_lander(
+                &launcher,
+                dir.path(),
+                &[entry.clone()],
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                None,
+            ),
+        )
+        .await;
+        assert!(interrupted.is_err(), "the daemon went away mid-run");
+        assert_eq!(
+            run_dir_entries(dir.path()),
+            1,
+            "the run stays for its successor"
+        );
+
+        let mut next = launcher.clone();
+        next.run_epoch = Some("the-next-daemon".into());
+        let output = run_lander(
+            &next,
+            dir.path(),
+            &[entry],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"gated\n");
+        assert_eq!(
+            std::fs::read_to_string(&starts).unwrap().lines().count(),
+            1,
+            "adopting must not gate the batch again"
+        );
+        assert_eq!(run_dir_entries(dir.path()), 0);
+    }
+
+    /// #3435: a different gate never inherits another's result, and the
+    /// inherited run is stopped so two landers do not share one worktree.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_different_gate_stops_the_inherited_run_and_starts_fresh() {
+        let dir = crate::test_support::disk_backed_tempdir("detached-lander-other");
+        let pids = dir.path().join("pids");
+        let body = format!("echo $$ >> {}\nsleep 30\necho gated", pids.display());
+        let launcher = detached_lander(dir.path(), &body);
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(500),
+            run_lander(
+                &launcher,
+                dir.path(),
+                &[queued_entry_view("a", &[])],
+                None,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                None,
+            ),
+        )
+        .await;
+        assert!(interrupted.is_err());
+        let inherited: u32 = std::fs::read_to_string(&pids)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_is_gone(inherited));
+
+        let mut next = launcher.clone();
+        next.run_epoch = Some("the-next-daemon".into());
+        // The new run is bounded by its deadline; it only has to start.
+        let result = run_lander(
+            &next,
+            dir.path(),
+            &[queued_entry_view("b", &[])],
+            None,
+            tokio::time::Instant::now() + Duration::from_millis(700),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(LanderError::TimedOut)));
+        assert_eq!(std::fs::read_to_string(&pids).unwrap().lines().count(), 2);
+        for _ in 0..50 {
+            if process_is_gone(inherited) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            process_is_gone(inherited),
+            "the inherited lander was stopped"
+        );
+        assert_eq!(run_dir_entries(dir.path()), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    /// More than 128 KiB of derived filters (#3615): one environment string
+    /// that large fails `execve` with E2BIG, so the set must arrive intact
+    /// through the file, with no inline copy.
+    fn oversize_derived_entry() -> (RollingQueueEntryV1, Vec<String>) {
+        let filters: Vec<String> = (0..1800)
+            .map(|index| {
+                format!(
+                    "rsid=shard:other-02:test(fixture_{index:05}_{})",
+                    "x".repeat(90)
+                )
+            })
+            .collect();
+        let mut entry = queued_entry_view("a", &[]);
+        entry.test_filters = filters.clone();
+        entry.derived_test_filters = filters.clone();
+        let inline = serde_json::to_string(&filters).unwrap();
+        assert!(
+            inline.len() > 128 * 1024,
+            "the fixture must pass MAX_ARG_STRLEN"
+        );
+        (entry, filters)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    const READ_DERIVED_FILE: &str = "test -z \"${RSI_LANDER_DERIVED_FILTERS+set}\" || exit 7\n\
+         cat \"$RSI_LANDER_DERIVED_FILTERS_FILE\"";
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn lander_receives_more_than_128_kib_of_derived_filters_through_a_file() {
+        let dir = crate::test_support::disk_backed_tempdir("derived-filter-file");
+        let mut launcher = fake_lander(dir.path(), READ_DERIVED_FILE);
+        launcher.inherited_env.push((
+            rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV.into(),
+            "[\"stale-outer-gate\"]".into(),
+        ));
+        let (entry, filters) = oversize_derived_entry();
+        let output = run_lander(
+            &launcher,
+            dir.path(),
+            &[entry],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let received: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(received, filters);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_detached_lander_receives_more_than_128_kib_of_derived_filters() {
+        let dir = crate::test_support::disk_backed_tempdir("derived-filter-file-detached");
+        let mut launcher = detached_lander(dir.path(), READ_DERIVED_FILE);
+        launcher.inherited_env.push((
+            rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV.into(),
+            "[\"stale-outer-gate\"]".into(),
+        ));
+        let (entry, filters) = oversize_derived_entry();
+        let output = run_lander(
+            &launcher,
+            dir.path(),
+            &[entry],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let received: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(received, filters);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_derived_filter_file_is_bounded_and_typed() {
+        use rsi_common::rolling_queue::{DERIVED_FILTERS_FILE_MAX_BYTES, read_derived_filters};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.json");
+        std::fs::write(&path, r#"["a=b","c=d"]"#).unwrap();
+        let read = read_derived_filters(Some(path.as_os_str()), Some("[\"ignored\"]")).unwrap();
+        assert_eq!(read.into_iter().collect::<Vec<_>>(), ["a=b", "c=d"]);
+        std::fs::write(&path, "not json").unwrap();
+        let error = read_derived_filters(Some(path.as_os_str()), None).unwrap_err();
+        assert!(
+            error.starts_with("queue_derived_filters_invalid: "),
+            "{error}"
+        );
+        std::fs::write(
+            &path,
+            vec![b' '; DERIVED_FILTERS_FILE_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        let error = read_derived_filters(Some(path.as_os_str()), None).unwrap_err();
+        assert!(error.contains("over the"), "{error}");
+        let missing = dir.path().join("missing.json");
+        assert!(read_derived_filters(Some(missing.as_os_str()), None).is_err());
+        assert!(read_derived_filters(None, None).unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn lander_receives_derived_filter_provenance() {
+        let dir = crate::test_support::disk_backed_tempdir("derived-filter-transport");
+        let mut launcher = fake_lander(dir.path(), READ_DERIVED_FILE);
+        launcher.inherited_env.push((
+            rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV.into(),
+            "[\"stale-outer-gate\"]".into(),
+        ));
+        let mut entry = queued_entry_view("a", &["rsid=shard:other-02:test(fixture)"]);
+        entry.derived_test_filters = entry.test_filters.clone();
+        let output = run_lander(
+            &launcher,
+            dir.path(),
+            &[entry.clone()],
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(output.status.success());
+        let received: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(received, entry.test_filters);
+    }
+
     /// #2112: the lander reports queue-derived filters as explicit
     /// (`selection=closure reason=explicit_filters`), so the queue records the
     /// async full-library obligation itself on publish. Caller-named filters
@@ -9015,7 +11540,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         // `b` was enqueued with operator-named filters; `c` gates unfiltered.
         note_explicit_filters(ids[1]);
@@ -9084,7 +11611,9 @@ echo published_target_id=$(git rev-parse HEAD)
     #[tokio::test]
     async fn a_disjoint_source_claims_a_second_lane_beside_a_gating_batch_1224() {
         let (_dir, work, sources) = lane_workspace();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &sources, None).await;
         // The daemon source gates first (nothing else is gating: the plain claim).
         let first = claim_batch_in_lanes(&store, 1).await.unwrap().unwrap();
@@ -9102,7 +11631,9 @@ echo published_target_id=$(git rev-parse HEAD)
     #[tokio::test]
     async fn an_overlapping_or_unattributable_source_waits_for_the_gating_batch_1224() {
         let (_dir, work, sources) = lane_workspace();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         // daemon gates; `common` is a dependency of it and `manifest` is a
         // Cargo.toml change: neither may share the gate, and the manifest
         // entry behind `common` stays behind it.
@@ -9154,6 +11685,1050 @@ echo published_target_id=$(git rev-parse HEAD)
         assert_eq!(warnings[0].files, ["shared"]);
     }
 
+    /// Push a commit that writes `files` (path, content) to the remote
+    /// `rolling` and refresh the work clone's `origin/rolling`.
+    fn advance_rolling(work: &Path, files: &[(&str, &str)]) {
+        let mut script = String::from("git checkout -q -B advance origin/rolling");
+        for (path, content) in files {
+            script.push_str(&format!(
+                " && mkdir -p $(dirname {path}) && printf '{content}\\n' > {path} && git add {path}"
+            ));
+        }
+        script.push_str(
+            " && git commit -qm advance && git push -q origin HEAD:rolling \
+             && git fetch -q origin rolling",
+        );
+        sh(work, &script);
+    }
+
+    async fn sweep_queue(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> Vec<Uuid> {
+        tip_conflict::sweep(store, Duration::ZERO).await.unwrap()
+    }
+
+    fn refusal_of(entry: &RollingQueueEntryV1) -> (Option<&str>, Option<&str>) {
+        let outcome = entry.outcome.as_ref();
+        (
+            outcome.and_then(|outcome| outcome.refusal.as_deref()),
+            outcome.and_then(|outcome| outcome.detail.as_deref()),
+        )
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_queued_source_conflicting_with_the_rolling_tip_is_refused_at_once_3293() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let stale = commit_file(&work, "stale", "shared", "stale");
+        let clean = commit_file(&work, "clean", "elsewhere", "clean");
+        let ids = queue_all(&store, &work, &[stale, clean], None).await;
+        assert!(
+            sweep_queue(&store).await.is_empty(),
+            "nothing conflicts with the tip it was cut from"
+        );
+
+        // Rolling advances onto the stale source's lines.
+        advance_rolling(&work, &[("shared", "tip")]);
+        assert_eq!(sweep_queue(&store).await, [ids[0]]);
+        let refused = entry_of(&store, ids[0]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let (code, detail) = refusal_of(&refused);
+        assert_eq!(
+            code,
+            Some(rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ROLLING)
+        );
+        assert!(
+            detail.unwrap().starts_with("conflict_paths=shared;"),
+            "{detail:?}"
+        );
+        assert_eq!(
+            entry_of(&store, ids[1]).await.state,
+            RollingQueueEntryState::Queued,
+            "a source that merges cleanly stays queued"
+        );
+        let wakes = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name == format!("merge-queue-{}", ids[0]))
+            .count();
+        assert_eq!(wakes, 1, "its enqueuer is woken once");
+        assert!(sweep_queue(&store).await.is_empty(), "refused once");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_claimed_source_is_not_refused_by_the_rolling_conflict_sweep_3293() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let stale = commit_file(&work, "stale", "shared", "stale");
+        let ids = queue_all(&store, &work, &[stale], None).await;
+        advance_rolling(&work, &[("shared", "tip")]);
+        let claimed = claim_batch_in_lanes(&store, 1).await.unwrap().unwrap();
+        assert_eq!(claimed.entries[0].id, ids[0]);
+        assert!(sweep_queue(&store).await.is_empty());
+        assert_eq!(
+            entry_of(&store, ids[0]).await.state,
+            RollingQueueEntryState::Gating,
+            "the lander decides a gating entry"
+        );
+    }
+
+    /// A rolling tip that defines `old_api`, for the compile-probe tests (the
+    /// stand-in checker treats a `CALL name` without a `fn name` as a break).
+    fn compile_probe_workspace() -> (tempfile::TempDir, PathBuf) {
+        let (dir, _origin, work) = repos();
+        sh(
+            &work,
+            "printf 'fn old_api\\n' > lib.rs && git add lib.rs && git commit -qm api \
+             && git push -q origin rolling && git fetch -q origin rolling",
+        );
+        (dir, work)
+    }
+
+    /// A wide source cut from the tip: `files` plus forty-five Rust files.
+    fn wide_source(work: &Path, branch: &str, files: &[(&str, &str)]) -> String {
+        let mut script = format!(
+            "git checkout -q -B {branch} origin/rolling \
+             && for n in $(seq 1 45); do printf 'fn {branch}_noise%s\\n' $n > {branch}_wide$n.rs; done"
+        );
+        for (path, content) in files {
+            script.push_str(&format!(" && printf '{content}\\n' > {path}"));
+        }
+        script.push_str(&format!(" && git add -A && git commit -qm {branch}"));
+        sh(work, &script);
+        head(work)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_wide_entry_holds_the_claim_until_its_compile_probe_has_a_verdict_3394() {
+        use compile_probe::tests::FakeChecker;
+        let (dir, work) = compile_probe_workspace();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let wide = wide_source(&work, "wide", &[]);
+        let narrow = commit_file(&work, "narrow", "notes.txt", "n");
+        let ids = queue_all(&store, &work, &[wide.clone(), narrow], None).await;
+
+        let held = compile_probe::held_head_for_claim(&store, 32).await;
+        assert_eq!(held.as_deref(), Some(wide.as_str()));
+        assert!(
+            claim_batch_in_lanes_held(&store, 4, held)
+                .await
+                .unwrap()
+                .is_none(),
+            "neither the wide entry nor the one behind it is claimed"
+        );
+
+        let checker = Arc::new(FakeChecker::new());
+        let refused = compile_probe::sweep_with(&store, &dir.path().join("probe"), checker.clone())
+            .await
+            .unwrap();
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(
+            checker.runs(),
+            1,
+            "one bounded check, and only for the wide entry"
+        );
+        assert_eq!(compile_probe::held_head_for_claim(&store, 32).await, None);
+        let claimed = claim_batch_in_lanes_held(&store, 4, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed_ids: Vec<Uuid> = claimed.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(claimed_ids, ids, "a clear entry batches as before");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_wide_entry_that_breaks_the_entry_queued_ahead_is_refused_naming_it_3394() {
+        use compile_probe::tests::FakeChecker;
+        let (dir, work) = compile_probe_workspace();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // A calls the API B renames: every merge is textually clean.
+        let a = commit_file(&work, "caller", "caller.rs", "CALL old_api");
+        let b = wide_source(&work, "refactor", &[("lib.rs", "fn new_api")]);
+        let ids = queue_all(&store, &work, &[a, b.clone()], None).await;
+
+        let checker = Arc::new(FakeChecker::new());
+        let probe_root = dir.path().join("probe");
+        let refused = compile_probe::sweep_with(&store, &probe_root, checker.clone())
+            .await
+            .unwrap();
+        assert_eq!(refused, [ids[1]]);
+        let entry = entry_of(&store, ids[1]).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Refused);
+        let (code, detail) = refusal_of(&entry);
+        assert_eq!(
+            code,
+            Some(rsi_common::rolling_queue::QUEUE_COMPILE_CONFLICT)
+        );
+        let detail = detail.unwrap();
+        assert!(detail.contains(&ids[0].to_string()), "names A: {detail}");
+        assert!(detail.contains("E0425"), "the first error: {detail}");
+        assert_eq!(
+            entry_of(&store, ids[0]).await.state,
+            RollingQueueEntryState::Queued,
+            "the entry ahead is not blamed"
+        );
+        let wakes = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name == format!("merge-queue-{}", ids[1]))
+            .count();
+        assert_eq!(wakes, 1, "its enqueuer is woken once");
+        assert!(
+            compile_probe::sweep_with(&store, &probe_root, checker)
+                .await
+                .unwrap()
+                .is_empty(),
+            "refused once"
+        );
+        // Nothing the refusal left behind holds the queue.
+        assert_eq!(compile_probe::held_head_for_claim(&store, 32).await, None);
+    }
+
+    /// Write a provisional declaration naming `declared` as renumber sites and
+    /// commit it with `files` on a branch cut from the rolling tip.
+    fn commit_declaring(
+        work: &Path,
+        branch: &str,
+        files: &[(&str, &str)],
+        declared: &[&str],
+    ) -> String {
+        commit_declaring_with(work, branch, files, declared, &[])
+    }
+
+    /// [`commit_declaring`], plus `named` paths the declaration lists without
+    /// making them renumber sites (#3362).
+    fn commit_declaring_with(
+        work: &Path,
+        branch: &str,
+        files: &[(&str, &str)],
+        declared: &[&str],
+        named: &[&str],
+    ) -> String {
+        let entries = declared
+            .iter()
+            .map(|path| format!("{{\"path\":\"{path}\",\"site\":true}}"))
+            .chain(named.iter().map(|path| format!("{{\"path\":\"{path}\"}}")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut script = format!(
+            "git checkout -q -B {branch} origin/rolling && mkdir -p tools/provisional-migrations \
+             && printf '{{\"version\":901,\"files\":[{entries}]}}\\n' > tools/provisional-migrations/{branch}.json \
+             && git add tools/provisional-migrations/{branch}.json"
+        );
+        for (path, content) in files {
+            script.push_str(&format!(
+                " && mkdir -p $(dirname {path}) && printf '{content}\\n' > {path} && git add {path}"
+            ));
+        }
+        script.push_str(&format!(" && git commit -qm {branch}"));
+        sh(work, &script);
+        head(work)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_conflict_only_on_declared_renumber_sites_stays_queued_3293() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let renumberable = commit_declaring(
+            &work,
+            "renumberable",
+            &[("v901", "mine"), ("tests", "mine")],
+            &["v901", "tests"],
+        );
+        // The same declaration, but one conflict is not a declared site.
+        let mixed = commit_declaring(
+            &work,
+            "mixed",
+            &[("v901", "mine"), ("other", "mine")],
+            &["v901"],
+        );
+        // No declaration at all.
+        let undeclared = commit_file(&work, "undeclared", "v901", "mine");
+        let ids = queue_all(&store, &work, &[renumberable, mixed, undeclared], None).await;
+        advance_rolling_with_stub_tool(&work);
+        advance_rolling(
+            &work,
+            &[("v901", "theirs"), ("tests", "theirs"), ("other", "theirs")],
+        );
+        assert_eq!(sweep_queue(&store).await, [ids[1], ids[2]]);
+        assert_eq!(
+            entry_of(&store, ids[0]).await.state,
+            RollingQueueEntryState::Queued,
+            "the renumber tool proves the declared migration's version clash"
+        );
+        let mixed = entry_of(&store, ids[1]).await;
+        let (_, detail) = refusal_of(&mixed);
+        assert!(
+            detail.is_some_and(|d| d.starts_with("conflict_paths=other,v901;")
+                || d.starts_with("conflict_paths=v901,other;")),
+            "{detail:?}"
+        );
+        assert_eq!(
+            entry_of(&store, ids[2]).await.state,
+            RollingQueueEntryState::Refused
+        );
+    }
+
+    /// A renumber-guard stand-in the probe starts as its trusted executable
+    /// (`<exe> rolling-migration-renumber ...`). It reads the
+    /// source's declaration the way the real tool's validation does in
+    /// miniature: `--transform` refuses (exit 2) an unparsable declaration and
+    /// otherwise reports the versions; `--build` refuses a source whose
+    /// `marker` file says `bad` (like the real tool's `unproved migration
+    /// conflict`) and a merge with a conflict on any file the declaration does
+    /// not mark `"site": true` (the real tool's `nonmigration conflict`: a path
+    /// merely NAMED in the declaration is no renumber site), and crashes
+    /// (exit 1) on `crash`. `reject_unpublished` models the real tool's refusal
+    /// of a target whose provisional inventory is not published yet (#3406).
+    const STUB_GUARD_SCRIPT: &str = r#"
+shift 1
+repo=; mode=; base=; source=; target=; unit=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --repo) repo=$2; shift 2;;
+    --base) base=$2; shift 2;;
+    --source) source=$2; shift 2;;
+    --target) target=$2; shift 2;;
+    --unit-file) unit=$2; shift 2;;
+    --scratch) shift 2;;
+    --transform) mode=transform; shift;;
+    --build) mode=build; shift;;
+    *) shift;;
+  esac
+done
+g() { git -C "$repo" "$@"; }
+refuse() { echo "provisional migration refused: $1" >&2; exit 2; }
+declaration() {
+  first=$(g diff --name-only --diff-filter=A "$1" "$2" -- tools/provisional-migrations/ | head -n 1)
+  [ -n "$first" ] || refuse "invalid provisional site declaration"
+  text=$(g show "$2:$first")
+  case $text in
+    '{"version"'*'}') ;;
+    *) refuse "invalid provisional site declaration";;
+  esac
+  printf '%s\n' "$text"
+}
+if [ "$mode" = transform ]; then
+  if [ "$reject_unpublished" = 1 ] && [ -n "$(g diff --name-only --diff-filter=A "$base" "$target" -- tools/provisional-migrations/)" ]; then
+    refuse "invalid migration inventory at $target: provisional inventory does not match its source: migration blocks V901; LATEST_SCHEMA_VERSION"
+  fi
+  declaration "$base" "$source" >/dev/null
+  printf '{"base":"%s","source":"%s","target":"%s","old_version":901,"new_version":902,"renumber_noop":false}\n' "$base" "$source" "$target"
+  exit 0
+fi
+field() { sed -n "s/.*\"$1\":\"\([0-9a-f]*\)\".*/\1/p" "$unit"; }
+ubase=$(field base); usource=$(field source); utarget=$(field target)
+marker=$(g show "$usource:marker" 2>/dev/null)
+case $marker in
+  *crash*) echo "tool bug" >&2; exit 1;;
+  *bad*) refuse "unproved migration conflict: v901";;
+esac
+sites=$(declaration "$ubase" "$usource" | grep -o '"path":"[^"]*","site":true' | sed 's/"path":"\([^"]*\)".*/\1/')
+merged=$(g merge-tree --write-tree --name-only --no-messages "$utarget" "$usource"); rc=$?
+if [ "$rc" = 1 ]; then
+  outside=
+  for path in $(printf '%s\n' "$merged" | tail -n +2); do
+    case "
+$sites
+" in
+      *"
+$path
+"*) ;;
+      *) outside="${outside:+$outside, }$path";;
+    esac
+  done
+  [ -z "$outside" ] || refuse "nonmigration conflict: $outside"
+fi
+printf '{"candidate": "%s"}\n' 0000000000000000000000000000000000000000
+"#;
+
+    /// Make `work` answer the probe's trusted-executable lookup with the stub
+    /// and move the remote `rolling` tip once, as installing a tool did.
+    fn advance_rolling_with_stub_tool(work: &Path) {
+        install_stub_guard(work, false);
+    }
+
+    fn install_stub_guard(work: &Path, reject_unpublished: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rsi-stub-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rsi-rolling-land");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\nreject_unpublished={}\n{STUB_GUARD_SCRIPT}",
+                u8::from(reject_unpublished)
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::repo_guard_call::register_test_tool(work, exe);
+        sh(
+            work,
+            "git checkout -q -B advance origin/rolling && printf 'stub guard\\n' > stub-guard-marker \
+             && git add stub-guard-marker && git commit -qm stub-guard \
+             && git push -q origin HEAD:rolling && git fetch -q origin rolling",
+        );
+    }
+
+    /// #361: the probe's trusted executable is a killable child. A guard that
+    /// hangs, with a descendant, ends at the shared deadline with nothing
+    /// proved, and nothing it started outlives the kill.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_hanging_guard_is_killed_at_the_probe_deadline_and_proves_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _origin, work) = repos();
+        let source = commit_declaring(&work, "hangs", &[("marker", "ok")], &["marker"]);
+        let started_file = dir.path().join("guard-started");
+        let survivor = dir.path().join("guard-descendant-survived");
+        let exe = dir.path().join("hanging-guard");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\n: > '{}'\n(sleep 4; : > '{}') &\nsleep 300\n",
+                started_file.display(),
+                survivor.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::repo_guard_call::register_test_tool(&work, exe);
+        let started = std::time::Instant::now();
+        let proof = provisional_probe::prove_against_tip(
+            &work,
+            "origin/rolling",
+            &source,
+            started + std::time::Duration::from_millis(2500),
+        );
+        // #3545 replaced Proof::Unknown with a typed Inconclusive cause.
+        assert!(
+            matches!(proof, provisional_probe::Proof::Inconclusive { .. }),
+            "{proof:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(started_file.exists(), "the guard was never started");
+        std::thread::sleep(std::time::Duration::from_millis(4500));
+        assert!(!survivor.exists(), "a guard descendant outlived the kill");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn missing_provisional_guard_preserves_best_effort_conflict_classification_3545() {
+        use provisional_probe::{InconclusiveCause, Proof, Renumber};
+        let (_dir, _origin, work) = repos();
+        let source = commit_declaring(&work, "source", &[("marker", "ok")], &["marker"]);
+        let tip = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        let deadline = || std::time::Instant::now() + Duration::from_secs(30);
+        // #465: the guard is a trusted installed executable, not a file of the
+        // tip. With none resolvable (no guard is registered for this repo) the
+        // probe is Inconclusive, never Clear: an unproven source is not
+        // admitted (hub #3545). The best-effort sweep classifier keeps its
+        // separate unknown outcome rather than inventing a conflict.
+        assert_eq!(
+            provisional_probe::prove_against_tip(&work, tip.trim(), &source, deadline()),
+            Proof::Inconclusive {
+                cause: InconclusiveCause::Infrastructure(
+                    "no trusted rolling-migration-renumber guard executable".into()
+                )
+            }
+        );
+        assert_eq!(
+            provisional_probe::classify_conflict(&work, tip.trim(), &source, deadline()),
+            Renumber::Unknown
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_source_the_renumber_tool_refuses_is_refused_at_once_3346() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let provable = commit_declaring(&work, "provable", &[("marker", "ok")], &["marker"]);
+        let unprovable = commit_declaring(&work, "unprovable", &[("marker", "bad")], &["marker"]);
+        let crashes = commit_declaring(&work, "crashes", &[("marker", "crash")], &["marker"]);
+        // The same marker, but it declares no migration: not the tool's business.
+        let undeclared = commit_file(&work, "undeclared", "marker", "bad");
+        let ids = queue_all(
+            &store,
+            &work,
+            &[provable, unprovable.clone(), crashes, undeclared],
+            None,
+        )
+        .await;
+        advance_rolling_with_stub_tool(&work);
+
+        assert_eq!(sweep_queue(&store).await, [ids[1]]);
+        let refused = entry_of(&store, ids[1]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        assert_eq!(refused.source_commit, unprovable);
+        let (code, detail) = refusal_of(&refused);
+        assert_eq!(
+            code,
+            Some(rsi_common::rolling_queue::PROVISIONAL_UNPROVABLE)
+        );
+        let detail = detail.unwrap();
+        assert!(
+            detail.starts_with("unproved migration conflict: v901;"),
+            "the tool's own reason leads the detail: {detail}"
+        );
+        for kept in [ids[0], ids[2], ids[3]] {
+            assert_eq!(
+                entry_of(&store, kept).await.state,
+                RollingQueueEntryState::Queued,
+                "only a refusal by the tool refuses: a proved source, a crash and an undeclared source stay queued"
+            );
+        }
+        let wakes = store
+            .lock()
+            .await
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .filter(|job| job.name == format!("merge-queue-{}", ids[1]))
+            .count();
+        assert_eq!(wakes, 1, "its enqueuer is woken once");
+        assert!(sweep_queue(&store).await.is_empty(), "refused once");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_conflict_free_unprovable_source_is_refused_when_rolling_advances_3346() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        advance_rolling_with_stub_tool(&work);
+        let unprovable = commit_declaring(&work, "unprovable", &[("marker", "bad")], &["marker"]);
+        let ids = queue_all(&store, &work, &[unprovable.clone()], None).await;
+        // Nothing conflicts and the tool refuses: refused on the first pass.
+        assert_eq!(sweep_queue(&store).await, [ids[0]]);
+        assert_eq!(entry_of(&store, ids[0]).await.source_commit, unprovable);
+        assert_eq!(
+            refusal_of(&entry_of(&store, ids[0]).await).0,
+            Some(rsi_common::rolling_queue::PROVISIONAL_UNPROVABLE)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_path_named_in_a_declaration_but_not_a_renumber_site_exempts_nothing_3362() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // `unrelated` is named in the declaration but is no renumber site.
+        let named = commit_declaring_with(
+            &work,
+            "named",
+            &[("v901", "mine"), ("unrelated", "mine")],
+            &["v901"],
+            &["unrelated"],
+        );
+        // An invalid declaration: the tool refuses it, so it exempts nothing.
+        sh(
+            &work,
+            "git checkout -q -B broken origin/rolling && mkdir -p tools/provisional-migrations \
+             && printf '{' > tools/provisional-migrations/broken.json \
+             && printf 'mine\\n' > v901 && git add tools v901 && git commit -qm broken",
+        );
+        let broken = head(&work);
+        let ids = queue_all(&store, &work, &[named, broken], None).await;
+        advance_rolling_with_stub_tool(&work);
+        advance_rolling(&work, &[("v901", "theirs"), ("unrelated", "theirs")]);
+
+        assert_eq!(sweep_queue(&store).await, [ids[0], ids[1]]);
+        let refused = entry_of(&store, ids[0]).await;
+        let (code, detail) = refusal_of(&refused);
+        assert_eq!(
+            code,
+            Some(rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ROLLING)
+        );
+        let detail = detail.unwrap();
+        assert!(
+            detail.starts_with("conflict_paths=unrelated,v901;"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("does not cover them: nonmigration conflict: unrelated"),
+            "the tool's reason is named: {detail}"
+        );
+        let invalid = entry_of(&store, ids[1]).await;
+        let (code, detail) = refusal_of(&invalid);
+        assert_eq!(
+            code,
+            Some(rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ROLLING)
+        );
+        assert!(
+            detail.is_some_and(|detail| detail.starts_with("conflict_paths=v901;")
+                && detail.contains("invalid provisional site declaration")),
+            "an invalid declaration exempts nothing"
+        );
+    }
+
+    /// The paths of the Issue's case: the declared migration file and the store
+    /// test module's tail.
+    const MIGRATION_FILE: &str = "crates/rsid-store/src/store/migrations/v901.rs";
+    const MIGRATION_TESTS: &str = "crates/rsid-store/src/store/tests.rs";
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_declared_migration_version_clash_stays_queued_and_is_not_a_conflict_3336() {
+        use rsi_common::rolling_queue::{
+            ENTRY_CONFLICTS_WITH_ROLLING, ENTRY_RENUMBERABLE_WITH_ROLLING,
+            QUEUE_CONFLICTS_WITH_ENTRY, QUEUE_CONFLICTS_WITH_ROLLING,
+            QUEUE_RENUMBERABLE_WITH_ENTRY, QUEUE_RENUMBERABLE_WITH_ROLLING,
+        };
+
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        advance_rolling_with_stub_tool(&work);
+        let clash = [(MIGRATION_FILE, "mine"), (MIGRATION_TESTS, "mine")];
+        let entry_files = [(MIGRATION_FILE, "entry"), (MIGRATION_TESTS, "entry")];
+        let sites = [MIGRATION_FILE, MIGRATION_TESTS];
+        let entry = commit_declaring(&work, "entry", &entry_files, &sites);
+        let source = commit_declaring(&work, "source", &clash, &sites);
+        // The same clash from a declaration that does not mark the files sites.
+        let unsited = commit_declaring_with(
+            &work,
+            "unsited",
+            &clash,
+            &[],
+            &[MIGRATION_FILE, MIGRATION_TESTS],
+        );
+        // Not declared at all.
+        sh(
+            &work,
+            &format!(
+                "git checkout -q -B undeclared origin/rolling && mkdir -p $(dirname {MIGRATION_FILE}) \
+                 && printf 'mine\\n' > {MIGRATION_FILE} && git add {MIGRATION_FILE} \
+                 && git commit -qm undeclared"
+            ),
+        );
+        let undeclared = head(&work);
+        let ahead = [(Uuid::new_v4(), 7, entry.clone())];
+        let codes = |warnings: &[rsi_common::rolling_queue::QueueConflictWarningV1]| {
+            warnings
+                .iter()
+                .map(|warning| warning.code.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The source and the entry ahead both add the migration file.
+        let warnings = queue_conflict_warnings(&work, &source, &ahead);
+        assert_eq!(
+            codes(&warnings),
+            [QUEUE_RENUMBERABLE_WITH_ENTRY],
+            "{warnings:?}"
+        );
+        assert_eq!(warnings[0].entry_id, Some(ahead[0].0));
+        assert_eq!(warnings[0].files, [MIGRATION_FILE, MIGRATION_TESTS]);
+        assert!(
+            warnings[0]
+                .detail
+                .contains("declared migration v901 will be renumbered to v902 at landing"),
+            "{warnings:?}"
+        );
+        // Without a declaration the tool proves, it stays a conflict.
+        for stays in [&unsited, &undeclared] {
+            let warnings = queue_conflict_warnings(&work, stays, &ahead);
+            assert_eq!(
+                codes(&warnings),
+                [QUEUE_CONFLICTS_WITH_ENTRY],
+                "{warnings:?}"
+            );
+        }
+        let warnings = queue_conflict_warnings(&work, &unsited, &ahead);
+        assert!(
+            warnings[0]
+                .detail
+                .contains("does not cover them: nonmigration conflict"),
+            "{warnings:?}"
+        );
+
+        // Rolling advances onto the same files.
+        advance_rolling(
+            &work,
+            &[(MIGRATION_FILE, "theirs"), (MIGRATION_TESTS, "theirs")],
+        );
+        let warnings = queue_conflict_warnings(&work, &source, &ahead);
+        assert_eq!(
+            codes(&warnings),
+            [
+                QUEUE_RENUMBERABLE_WITH_ROLLING,
+                ENTRY_RENUMBERABLE_WITH_ROLLING
+            ],
+            "{warnings:?}"
+        );
+        assert_eq!(warnings[0].entry_id, None);
+        assert_eq!(warnings[1].entry_id, Some(ahead[0].0));
+        let warnings = queue_conflict_warnings(&work, &undeclared, &ahead);
+        assert_eq!(
+            codes(&warnings),
+            [
+                QUEUE_CONFLICTS_WITH_ROLLING,
+                ENTRY_RENUMBERABLE_WITH_ROLLING
+            ],
+            "{warnings:?}"
+        );
+        assert!(!codes(&warnings).contains(&ENTRY_CONFLICTS_WITH_ROLLING.to_owned()));
+
+        // The sweep keeps the declared source queued and refuses the others.
+        let ids = queue_all(&store, &work, &[source, unsited, undeclared], None).await;
+        assert_eq!(sweep_queue(&store).await, [ids[1], ids[2]]);
+        assert_eq!(
+            entry_of(&store, ids[0]).await.state,
+            RollingQueueEntryState::Queued,
+            "the lander renumbers a declared migration's version clash"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_probe_that_cannot_run_never_refuses_a_queued_source_3293() {
+        let (_dir, _origin, work) = repos();
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // A source commit the repository does not hold.
+        let ids = queue_all(&store, &work, &["1".repeat(40)], None).await;
+        advance_rolling(&work, &[("shared", "tip")]);
+        for _ in 0..4 {
+            assert!(sweep_queue(&store).await.is_empty());
+        }
+        assert_eq!(
+            entry_of(&store, ids[0]).await.state,
+            RollingQueueEntryState::Queued
+        );
+
+        // A repository that does not exist: no tip, nothing refused.
+        let gone = work.join("no-such-checkout");
+        let id = queued(&store, &gone, &"2".repeat(40), "k-gone").await;
+        assert!(sweep_queue(&store).await.is_empty());
+        assert_eq!(
+            entry_of(&store, id).await.state,
+            RollingQueueEntryState::Queued
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn enqueue_attributes_existing_rolling_conflicts_to_the_ahead_entry_3271() {
+        use rsi_common::rolling_queue::{ENTRY_CONFLICTS_WITH_ROLLING, QUEUE_CONFLICTS_WITH_ENTRY};
+
+        let (_dir, _origin, work) = repos();
+        commit_file(&work, "ahead", "shared", "ahead");
+        std::fs::write(work.join("genuine"), "ahead\n").unwrap();
+        git(&work, &["add", "genuine"]).unwrap();
+        git(&work, &["commit", "-qm", "ahead-genuine"]).unwrap();
+        let ahead = head(&work);
+
+        git(
+            &work,
+            &["checkout", "-q", "-b", "advance", "origin/rolling"],
+        )
+        .unwrap();
+        std::fs::write(work.join("shared"), "rolling\n").unwrap();
+        git(&work, &["add", "shared"]).unwrap();
+        git(&work, &["commit", "-qm", "advance"]).unwrap();
+        git(&work, &["push", "-q", "origin", "HEAD:rolling"]).unwrap();
+        git(&work, &["fetch", "-q", "origin", "rolling"]).unwrap();
+
+        // The source contains rolling and leaves its conflicting file alone.
+        let source = commit_file(&work, "source", "unrelated", "source");
+        git(
+            &work,
+            &["merge-base", "--is-ancestor", "origin/rolling", &source],
+        )
+        .unwrap();
+        assert_eq!(
+            git(&work, &["diff", "origin/rolling", &source, "--", "shared"]).unwrap(),
+            ""
+        );
+        let id = Uuid::new_v4();
+        let queue = [(id, 7, ahead)];
+        let warnings = queue_conflict_warnings(&work, &source, &queue);
+        // Exactly the entry's own warning: the source is attributed no conflict.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, ENTRY_CONFLICTS_WITH_ROLLING);
+        assert_eq!(warnings[0].entry_id, Some(id));
+        assert_eq!(warnings[0].entry_sequence, Some(7));
+        assert_eq!(warnings[0].files, ["shared"]);
+
+        // An independent source-vs-entry conflict still gets its own warning,
+        // even when the same entry also has a conflict with rolling.
+        std::fs::write(work.join("genuine"), "source\n").unwrap();
+        git(&work, &["add", "genuine"]).unwrap();
+        git(&work, &["commit", "-qm", "source-genuine"]).unwrap();
+        let warnings = queue_conflict_warnings(&work, &head(&work), &queue);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0].code, ENTRY_CONFLICTS_WITH_ROLLING);
+        assert_eq!(warnings[0].files, ["shared"]);
+        assert_eq!(warnings[1].code, QUEUE_CONFLICTS_WITH_ENTRY);
+        assert_eq!(warnings[1].entry_id, Some(id));
+        assert_eq!(warnings[1].entry_sequence, Some(7));
+        assert_eq!(warnings[1].files, ["genuine"]);
+    }
+
+    /// #3406: the pair probe cannot treat a queued target's provisional
+    /// inventory as released. Model the real tool's target-inventory refusal;
+    /// the real publication-order proof lives in the renumber tool's tests.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn two_provisional_units_with_the_same_version_have_unknown_pair_classification_3406() {
+        use provisional_probe::{Proof, Renumber};
+        use rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE;
+        let (_dir, _origin, work) = repos();
+        // The stand-in otherwise proves renumbers, but rejects an unpublished
+        // target exactly as the real tool does before publication pins it.
+        install_stub_guard(&work, true);
+        let entry = commit_declaring(
+            &work,
+            "entry",
+            &[(MIGRATION_FILE, "entry")],
+            &[MIGRATION_FILE],
+        );
+        let source = commit_declaring(
+            &work,
+            "source",
+            &[(MIGRATION_FILE, "source")],
+            &[MIGRATION_FILE],
+        );
+        let tip = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        let deadline = || std::time::Instant::now() + Duration::from_secs(30);
+        for commit in [&entry, &source] {
+            assert!(matches!(
+                provisional_probe::classify_conflict(&work, tip.trim(), commit, deadline()),
+                Renumber::Renumberable(_)
+            ));
+        }
+        assert!(matches!(
+            provisional_probe::prove_against_tip(&work, &entry, &source, deadline()),
+            Proof::Unprovable(reason)
+                if reason.starts_with(&format!("invalid migration inventory at {entry}:"))
+        ));
+        assert_eq!(
+            provisional_probe::classify_conflict(&work, &entry, &source, deadline()),
+            Renumber::Unknown
+        );
+        let id = Uuid::new_v4();
+        let warnings = queue_conflict_warnings(&work, &source, &[(id, 7, entry)]);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w.code == QUEUE_CONFLICT_SCAN_INCOMPLETE)
+        );
+        assert_eq!(warnings[0].entry_id, Some(id));
+        assert_eq!(warnings[0].entry_sequence, Some(7));
+        assert_eq!(warnings[0].files, [MIGRATION_FILE]);
+        assert!(warnings[0].detail.contains("classification is unknown"));
+    }
+
+    /// An exhausted renumber proof cannot advise repairing an entry. Inject
+    /// the outcome instead of spending the real four-second scan budget.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn entry_renumber_classification_preserves_unknown_and_the_shared_deadline_3406() {
+        use provisional_probe::Renumber;
+        use rsi_common::rolling_queue::{
+            ENTRY_CONFLICTS_WITH_ROLLING, ENTRY_RENUMBERABLE_WITH_ROLLING,
+            QUEUE_CONFLICT_SCAN_INCOMPLETE,
+        };
+        let (_dir, _origin, work) = repos();
+        let entry = commit_declaring(
+            &work,
+            "ahead",
+            &[(MIGRATION_FILE, "entry")],
+            &[MIGRATION_FILE],
+        );
+        let declared = commit_declaring(
+            &work,
+            "declared",
+            &[(MIGRATION_FILE, "source")],
+            &[MIGRATION_FILE],
+        );
+        let ordinary = commit_file(&work, "ordinary", "unrelated", "source");
+        let ahead = [(Uuid::new_v4(), 7, entry.clone())];
+        for source in [&declared, &ordinary] {
+            for (kind, expected) in [
+                (
+                    Renumber::Renumberable("v901 -> v902".into()),
+                    ENTRY_RENUMBERABLE_WITH_ROLLING,
+                ),
+                (Renumber::Unknown, QUEUE_CONFLICT_SCAN_INCOMPLETE),
+                (
+                    Renumber::Conflict(Some("nonmigration conflict".into())),
+                    ENTRY_CONFLICTS_WITH_ROLLING,
+                ),
+            ] {
+                let mut proofs = 0;
+                let warnings = queue_conflict_warnings_with_probe(
+                    &work,
+                    source,
+                    &ahead,
+                    ENQUEUE_CONFLICT_SCAN_BUDGET,
+                    |_, theirs, _| {
+                        if theirs == entry {
+                            MergeConflictProbe::Conflicts(vec![MIGRATION_FILE.into()])
+                        } else {
+                            MergeConflictProbe::Clean
+                        }
+                    },
+                    |_, theirs, deadline| {
+                        assert_eq!(theirs, entry);
+                        assert!(
+                            deadline.saturating_duration_since(std::time::Instant::now())
+                                <= ENQUEUE_CONFLICT_SCAN_BUDGET
+                        );
+                        proofs += 1;
+                        kind.clone()
+                    },
+                );
+                assert_eq!(proofs, 1);
+                assert_eq!(warnings[0].code, expected, "{warnings:?}");
+                assert_eq!(warnings[0].entry_id, Some(ahead[0].0));
+                assert_eq!(warnings[0].entry_sequence, Some(7));
+                assert_eq!(warnings[0].files, [MIGRATION_FILE]);
+                assert_eq!(
+                    warnings.len(),
+                    if kind == Renumber::Unknown { 2 } else { 1 }
+                );
+                if kind == Renumber::Unknown {
+                    assert!(
+                        warnings
+                            .iter()
+                            .all(|warning| warning.code == QUEUE_CONFLICT_SCAN_INCOMPLETE)
+                    );
+                    assert!(warnings[0].detail.contains("classification is unknown"));
+                }
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_unknown_entry_rolling_probe_reports_incomplete_without_attributing_conflicts_3311() {
+        use rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE;
+
+        let (_dir, _origin, work) = repos();
+        let entry = commit_file(&work, "ahead", "shared", "ahead");
+        let source = commit_file(&work, "source", "shared", "source");
+        let tip = git(&work, &["rev-parse", "origin/rolling"]).unwrap();
+        let tip = tip.trim();
+        let queue = [
+            (Uuid::new_v4(), 7, entry.clone()),
+            (Uuid::new_v4(), 8, entry.clone()),
+        ];
+        let mut baseline_probes = 0;
+        let mut successful_pairwise_probes = 0;
+        let warnings = queue_conflict_warnings_with_probe(
+            &work,
+            &source,
+            &queue,
+            Duration::from_secs(3600),
+            |ours, theirs, timeout| {
+                if ours == tip && theirs == entry {
+                    baseline_probes += 1;
+                    return MergeConflictProbe::Unknown {
+                        reason: "injected failure",
+                    };
+                }
+                let result = merge_conflict_paths_with(&work, ours, theirs, &["git"], timeout);
+                if ours == entry && theirs == source {
+                    assert_eq!(result, MergeConflictProbe::Conflicts(vec!["shared".into()]));
+                    successful_pairwise_probes += 1;
+                }
+                result
+            },
+            |_, _, _| provisional_probe::Renumber::Conflict(None),
+        );
+        assert_eq!(
+            baseline_probes, 1,
+            "unknown results are cached per entry commit"
+        );
+        assert_eq!(successful_pairwise_probes, 2);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, QUEUE_CONFLICT_SCAN_INCOMPLETE);
+        assert_eq!(warnings[0].entry_id, None);
+        assert_eq!(warnings[0].files, Vec::<String>::new());
+        assert!(
+            warnings[0].detail.contains("1 probe(s) not completed"),
+            "{warnings:?}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn unknown_source_probes_report_incomplete_before_the_deadline_3311() {
+        use rsi_common::rolling_queue::{
+            QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICTS_WITH_ENTRY,
+        };
+
+        let (_dir, _origin, work) = repos();
+        let entry = commit_file(&work, "ahead", "shared", "ahead");
+        let source = commit_file(&work, "source", "shared", "source");
+        let queue = [(Uuid::new_v4(), 7, entry.clone())];
+        for fail_pairwise in [false, true] {
+            let warnings = queue_conflict_warnings_with_probe(
+                &work,
+                &source,
+                &queue,
+                Duration::from_secs(3600),
+                |ours, theirs, timeout| {
+                    if theirs == source && (ours == entry) == fail_pairwise {
+                        MergeConflictProbe::Unknown {
+                            reason: "injected failure",
+                        }
+                    } else {
+                        merge_conflict_paths_with(&work, ours, theirs, &["git"], timeout)
+                    }
+                },
+                |_, _, _| provisional_probe::Renumber::Conflict(None),
+            );
+            let codes: Vec<_> = warnings
+                .iter()
+                .map(|warning| warning.code.as_str())
+                .collect();
+            let expected = if fail_pairwise {
+                vec![QUEUE_CONFLICT_SCAN_INCOMPLETE]
+            } else {
+                vec![QUEUE_CONFLICTS_WITH_ENTRY, QUEUE_CONFLICT_SCAN_INCOMPLETE]
+            };
+            assert_eq!(codes, expected);
+            assert!(
+                warnings
+                    .last()
+                    .unwrap()
+                    .detail
+                    .contains("1 probe(s) not completed")
+            );
+        }
+    }
+
     /// #3036 (the hub's #3022 case): a refused source that edits files a
     /// queued entry ahead deletes is held by exactly that entry. A disjoint
     /// entry, and an entry that only carries a rolling change the source
@@ -9200,6 +12775,175 @@ echo published_target_id=$(git rev-parse HEAD)
         assert!(conflicting_entries_ahead(&work, &source, &queue, Duration::ZERO).is_empty());
     }
 
+    /// #3345: an entry past the probe cap was never inspected; the scan says so.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn entries_past_the_probe_cap_make_the_scan_incomplete_3345() {
+        use rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE;
+        let (_dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "mine", "mine");
+        let queue = |len: usize| -> Vec<(Uuid, i64, String)> {
+            (0..len)
+                .map(|index| {
+                    (
+                        Uuid::new_v4(),
+                        i64::try_from(index).unwrap(),
+                        format!("{index:040x}"),
+                    )
+                })
+                .collect()
+        };
+        let scan = |ahead: &[(Uuid, i64, String)]| {
+            queue_conflict_warnings_with_probe(
+                &work,
+                &source,
+                ahead,
+                Duration::from_secs(30),
+                |_, _, _| MergeConflictProbe::Clean,
+                |_, _, _| provisional_probe::Renumber::Conflict(None),
+            )
+        };
+        // At the cap every entry is probed: no gap is reported.
+        assert!(scan(&queue(CONFLICT_PROBE_MAX_ENTRIES)).is_empty());
+        // One entry past it was never inspected, and the scan says so.
+        let warnings = scan(&queue(CONFLICT_PROBE_MAX_ENTRIES + 1));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, QUEUE_CONFLICT_SCAN_INCOMPLETE);
+        assert!(
+            warnings[0].detail.contains("1 probe(s)"),
+            "{}",
+            warnings[0].detail
+        );
+        // #3741: the farthest entry (sequence 0) is the one skipped, and named.
+        assert!(
+            warnings[0]
+                .detail
+                .contains("queue sequences not fully checked: 0)"),
+            "{}",
+            warnings[0].detail
+        );
+    }
+
+    /// #3741: a queue deeper than the old 32-entry cap whose conflicting entry
+    /// is directly ahead of the new position (the highest sequence) is found,
+    /// both for a 35-deep queue and for one past the current cap.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_conflict_with_the_entry_directly_ahead_is_found_in_a_deep_queue_3741() {
+        use rsi_common::rolling_queue::{
+            QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICTS_WITH_ENTRY,
+        };
+        let (_dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "mine", "mine");
+        for depth in [35_usize, CONFLICT_PROBE_MAX_ENTRIES + 3] {
+            let queue: Vec<(Uuid, i64, String)> = (0..depth)
+                .map(|index| {
+                    (
+                        Uuid::new_v4(),
+                        i64::try_from(index).unwrap() + 100,
+                        format!("{index:040x}"),
+                    )
+                })
+                .collect();
+            let directly_ahead = queue.last().unwrap().clone();
+            let entry_commit = directly_ahead.2.clone();
+            let warnings = queue_conflict_warnings_with_probe(
+                &work,
+                &source,
+                &queue,
+                Duration::from_secs(30),
+                |ours, theirs, _| {
+                    if ours == entry_commit && theirs == source {
+                        MergeConflictProbe::Conflicts(vec!["shared".into()])
+                    } else {
+                        MergeConflictProbe::Clean
+                    }
+                },
+                |_, _, _| provisional_probe::Renumber::Conflict(None),
+            );
+            let found: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.code == QUEUE_CONFLICTS_WITH_ENTRY)
+                .collect();
+            assert_eq!(found.len(), 1, "depth {depth}: {warnings:?}");
+            assert_eq!(found[0].entry_id, Some(directly_ahead.0));
+            assert_eq!(found[0].entry_sequence, Some(directly_ahead.1));
+            // Past the cap the farthest entries are skipped, and named.
+            let skipped = depth.saturating_sub(CONFLICT_PROBE_MAX_ENTRIES);
+            let incomplete = warnings
+                .iter()
+                .find(|w| w.code == QUEUE_CONFLICT_SCAN_INCOMPLETE);
+            assert_eq!(incomplete.is_some(), skipped > 0, "depth {depth}");
+            let Some(incomplete) = incomplete else {
+                continue;
+            };
+            assert!(
+                incomplete.detail.contains(&format!("{skipped} probe(s)"))
+                    && incomplete
+                        .detail
+                        .contains("queue sequences not fully checked: 102, 101, 100)"),
+                "{}",
+                incomplete.detail
+            );
+        }
+    }
+
+    /// #3741: when the wall budget runs out mid-scan, the entries nearest the
+    /// new position were already probed and the incomplete warning names the
+    /// farther sequences it never reached.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_spent_budget_skips_the_far_entries_and_names_their_sequences_3741() {
+        use rsi_common::rolling_queue::{
+            QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICTS_WITH_ENTRY,
+        };
+        let (_dir, _origin, work) = repos();
+        let source = commit_file(&work, "source", "mine", "mine");
+        let queue: Vec<(Uuid, i64, String)> = (1..=6)
+            .map(|index| (Uuid::new_v4(), index, format!("{index:040x}")))
+            .collect();
+        let nearest = queue[5].2.clone();
+        let mut pair_probes = 0_usize;
+        let warnings = queue_conflict_warnings_with_probe(
+            &work,
+            &source,
+            &queue,
+            Duration::from_millis(300),
+            |ours, _, _| {
+                if ours == nearest {
+                    return MergeConflictProbe::Conflicts(vec!["shared".into()]);
+                }
+                // Only the pairwise probe of another entry burns the budget;
+                // the tip-baseline probes stay fast.
+                if !queue.iter().any(|entry| entry.2 == ours) {
+                    return MergeConflictProbe::Clean;
+                }
+                pair_probes += 1;
+                std::thread::sleep(Duration::from_millis(400));
+                MergeConflictProbe::Clean
+            },
+            |_, _, _| provisional_probe::Renumber::Conflict(None),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == QUEUE_CONFLICTS_WITH_ENTRY && w.entry_sequence == Some(6)),
+            "{warnings:?}"
+        );
+        let incomplete = warnings
+            .iter()
+            .find(|w| w.code == QUEUE_CONFLICT_SCAN_INCOMPLETE)
+            .expect("an incomplete warning");
+        assert_eq!(pair_probes, 1, "one probe spends the budget");
+        assert!(
+            incomplete
+                .detail
+                .contains("queue sequences not fully checked: 4, 3, 2, 1)"),
+            "{}",
+            incomplete.detail
+        );
+    }
+
     /// #2907: a synthetic queue of 32 entries that all conflict with the new
     /// source. An unbounded scan runs 32 probes (each several git processes);
     /// the bounded one stops at its budget and says so.
@@ -9210,7 +12954,7 @@ echo published_target_id=$(git rev-parse HEAD)
             QUEUE_CONFLICT_SCAN_INCOMPLETE, QUEUE_CONFLICTS_WITH_ENTRY,
         };
         let (_dir, _origin, work) = repos();
-        let queue: Vec<(Uuid, i64, String)> = (0..CONFLICT_PROBE_MAX_ENTRIES)
+        let queue: Vec<(Uuid, i64, String)> = (0..32)
             .map(|index| {
                 let sha = commit_file(
                     &work,
@@ -9412,11 +13156,19 @@ echo published_target_id=$(git rev-parse HEAD)
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn a_source_git_cannot_probe_yields_no_conflict_warning_2118() {
+    fn a_missing_entry_commit_reports_an_incomplete_conflict_scan_2118() {
         let (_dir, _origin, work) = repos();
         let sha = commit_file(&work, "solo", "solo", "s");
         let missing = "0".repeat(40);
-        assert!(queue_conflict_warnings(&work, &sha, &[(Uuid::new_v4(), 1, missing)]).is_empty());
+        let warnings = queue_conflict_warnings(&work, &sha, &[(Uuid::new_v4(), 1, missing)]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].code,
+            rsi_common::rolling_queue::QUEUE_CONFLICT_SCAN_INCOMPLETE
+        );
+        assert_eq!(warnings[0].entry_id, None);
+        assert_eq!(warnings[0].files, Vec::<String>::new());
+        assert!(warnings[0].detail.contains("2 probe(s) not completed"));
     }
 
     /// A source repository with a merge driver configured (config and
@@ -9478,6 +13230,7 @@ echo published_target_id=$(git rev-parse HEAD)
         assert_eq!(status_of(&work), before, "the probe changed the source");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_merge_probe_uses_builtin_semantics_for_a_clean_merge_under_a_driver_2706() {
@@ -9528,7 +13281,10 @@ echo published_target_id=$(git rev-parse HEAD)
             &["sh", "-c", &script, "hung-git"],
             Duration::from_millis(500),
         );
-        assert_eq!(paths, None, "a timed-out probe is never a verdict");
+        assert!(
+            matches!(paths, MergeConflictProbe::Unknown { .. }),
+            "{paths:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "{:?}",
@@ -9576,7 +13332,10 @@ echo published_target_id=$(git rev-parse HEAD)
         // reads are the only thing that could reach the helper.
         let paths =
             merge_conflict_paths_with(&work, &present, &missing, &["git"], Duration::from_secs(5));
-        assert_eq!(paths, None, "a missing commit is an unrunnable probe");
+        assert!(
+            matches!(paths, MergeConflictProbe::Unknown { .. }),
+            "{paths:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5) + Duration::from_secs(3),
             "{:?}",
@@ -9598,7 +13357,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let owner = Uuid::new_v4();
         let mut ids = Vec::new();
         for (index, sha) in shas.iter().enumerate() {
@@ -9637,7 +13398,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let log = dir.path().join("lander.log");
         let guard = format!("export SKIP={}", shas[1]);
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(
@@ -9666,7 +13429,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let shas = vec![a.clone(), b.clone(), c.clone()];
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         // The conflicting middle entry is refused; the batch retries without it
@@ -9726,7 +13491,7 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect()
     }
 
-    async fn wake_count(store: &Arc<tokio::sync::Mutex<Store>>) -> usize {
+    async fn wake_count(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> usize {
         store
             .lock()
             .await
@@ -9743,7 +13508,7 @@ echo published_target_id=$(git rev-parse HEAD)
         count: usize,
         bad: &[(usize, &str)],
     ) -> (
-        Arc<tokio::sync::Mutex<Store>>,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
         Vec<String>,
         Vec<Uuid>,
         Vec<String>,
@@ -9762,7 +13527,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .map(|(index, test)| (shas[*index].as_str(), *test))
             .collect();
         let launcher = merging_lander(dir.path(), &work, &log, &red_when_any(&bad_shas));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, count).await.unwrap();
         assert_eq!(results.len(), count, "every member settles exactly once");
@@ -9770,7 +13537,11 @@ echo published_target_id=$(git rev-parse HEAD)
         (store, shas, ids, runs, work, dir)
     }
 
-    async fn assert_isolated_red(store: &Arc<tokio::sync::Mutex<Store>>, id: Uuid, test: &str) {
+    async fn assert_isolated_red(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        id: Uuid,
+        test: &str,
+    ) {
         let entry = entry_of(store, id).await;
         assert_eq!(entry.state, RollingQueueEntryState::Refused);
         let outcome = entry.outcome.unwrap();
@@ -9780,7 +13551,7 @@ echo published_target_id=$(git rev-parse HEAD)
     }
 
     async fn assert_landed(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         work: &Path,
         id: Uuid,
         sha: &str,
@@ -9823,7 +13594,7 @@ echo published_target_id=$(git rev-parse HEAD)
     }
 
     async fn queue_sandboxes(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         sandboxes: &[(PathBuf, String)],
         project: Option<Uuid>,
     ) -> Vec<Uuid> {
@@ -9859,7 +13630,9 @@ echo published_target_id=$(git rev-parse HEAD)
             &log,
             "echo 'gate_timing=shards=1 wall_secs=3'",
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_sandboxes(&store, &sandboxes, Some(Uuid::from_u128(0x1945))).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         // One gate for three sandboxes, settled in queue order.
@@ -9910,7 +13683,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let foreign = commit_file(&other_work, "x", "x", "x");
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let (project, other_project) = (Some(Uuid::from_u128(0x1945)), Some(Uuid::from_u128(0x2)));
         let first = queue_sandboxes(&store, &[a.clone()], project).await[0];
         let foreign_id =
@@ -9947,7 +13722,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let log = dir.path().join("lander.log");
         let guard = red_when_any(&[(sandboxes[1].1.as_str(), "q::red_b")]);
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_sandboxes(&store, &sandboxes, Some(Uuid::from_u128(0x1945))).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 3, "every member settles exactly once");
@@ -9967,7 +13744,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let pruned = "1".repeat(40);
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let project = Some(Uuid::from_u128(0x1945));
         let kept = queued_in_project(&store, &live.0, &live.1, "k0", Uuid::new_v4(), project).await;
         let gone =
@@ -9999,7 +13778,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let sha = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &sha, "k").await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -10078,6 +13859,7 @@ echo published_target_id=$(git rev-parse HEAD)
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_red_gate_event_names_the_failing_tests_and_a_log_that_exists() {
@@ -10094,7 +13876,9 @@ echo published_target_id=$(git rev-parse HEAD)
             &red_when_any(&[(shas[1].as_str(), "q::red_b")]),
         )
         .with_workspace(dir.path().join("queue"));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 3).await.unwrap();
         let guard = store.lock().await;
@@ -10125,6 +13909,7 @@ echo published_target_id=$(git rev-parse HEAD)
         assert!(red_entry.contains("lander_log="), "{red_entry}");
     }
 
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_conflict_refusal_event_names_the_conflicting_path() {
@@ -10138,7 +13923,9 @@ echo published_target_id=$(git rev-parse HEAD)
             shas[0], shas[0]
         );
         let launcher = fake_lander(dir.path(), &body).with_workspace(dir.path().join("queue"));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 2).await.unwrap();
         let guard = store.lock().await;
@@ -10184,7 +13971,9 @@ echo published_target_id=$(git rev-parse HEAD)
             "printf 'candidate-0\\trsid\\ta::test\\t1.234\\tPASS\\n' >> \"$RSI_LANDER_TEST_TIMINGS\"",
         )
         .with_workspace(dir.path().join("queue"));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let run = run_group(
             &store,
             &launcher,
@@ -10284,7 +14073,7 @@ echo published_target_id=$(git rev-parse HEAD)
     async fn red_naming(
         named: &[&str],
     ) -> (
-        Arc<tokio::sync::Mutex<Store>>,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
         Vec<String>,
         Vec<Uuid>,
         Vec<usize>,
@@ -10299,7 +14088,7 @@ echo published_target_id=$(git rev-parse HEAD)
         red: usize,
         named: &[&str],
     ) -> (
-        Arc<tokio::sync::Mutex<Store>>,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
         Vec<String>,
         Vec<Uuid>,
         Vec<usize>,
@@ -10322,7 +14111,9 @@ echo published_target_id=$(git rev-parse HEAD)
             shas[red]
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 4, "every member settles exactly once");
@@ -10475,7 +14266,9 @@ echo published_target_id=$(git rev-parse HEAD)
         let sha = commit_file(&work, "a", "a", "a");
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, &format!("export SKIP={sha}"));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &sha, "k").await;
         run_next(&store, &launcher).await.unwrap().unwrap();
         let entry = entry_of(&store, id).await;
@@ -10503,7 +14296,9 @@ echo published_target_id=$(git rev-parse HEAD)
             red_when_any(&[(shas[3].as_str(), "q::red_d")])
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         let lost = entry_of(&store, ids[1]).await;
@@ -10535,7 +14330,9 @@ echo published_target_id=$(git rev-parse HEAD)
             red = red_when_any(&[(shas[0].as_str(), "q::red_a")])
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_isolated_red(&store, ids[0], "q::red_a").await;
@@ -10546,7 +14343,7 @@ echo published_target_id=$(git rev-parse HEAD)
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn every_run_of_a_bisect_gets_the_batch_wall_time_not_a_regate_count() {
+    async fn every_run_of_a_bisect_gets_its_own_wall_time_not_a_regate_count() {
         let (dir, _origin, work) = repos();
         let shas: Vec<String> = ["a", "b", "c", "d"]
             .iter()
@@ -10559,21 +14356,239 @@ echo published_target_id=$(git rev-parse HEAD)
             red_when_any(&[(shas[3].as_str(), "q::red_d")])
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
-        // #1940: the tip keeps moving, yet no run is refused for a spent
-        // count: each is given the wall time the one batch deadline has left.
+        // #1940, #3267: the tip keeps moving, yet no run is refused for a spent
+        // count, and a run is not shortened by the runs before it: each is given
+        // the full per-run wall time.
         let budgets = budgets(&log);
         assert!(budgets.len() >= 3, "{budgets:?}");
         assert!(
-            budgets.iter().all(|secs| (3000..=3600).contains(secs)),
+            budgets.iter().all(|secs| (3500..=3600).contains(secs)),
             "{budgets:?}"
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_batch_ceiling_scales_with_the_bisect_depth() {
+        let per_run = Duration::from_secs(60 * 60);
+        let ceiling = |members: usize| {
+            let budget = GateBudget::new(per_run, members);
+            budget.ceiling - tokio::time::Instant::now()
+        };
+        let runs = |members: usize| (ceiling(members).as_secs_f64() / 3600.0).round() as u32;
+        // A full gate, ceil(log2 n) halvings and the extra runs a non-attributable
+        // red needs: a batch of four can isolate its culprit.
+        assert_eq!(runs(1), BATCH_EXTRA_RUNS);
+        assert_eq!(runs(2), BATCH_EXTRA_RUNS + 1);
+        assert_eq!(runs(4), BATCH_EXTRA_RUNS + 2);
+        assert_eq!(runs(8), BATCH_EXTRA_RUNS + 3);
+        assert!(runs(4) >= 1 + 2 + 1, "full run + bisect depth + tail");
+    }
+
+    /// A merging fake lander that also takes `pause` seconds per run, and hangs
+    /// (stuck gate) on a run whose sources include `hang_with` but not
+    /// `hang_without`.
+    fn slow_lander(
+        dir: &Path,
+        work: &Path,
+        log: &Path,
+        red: &[(&str, &str)],
+        pause: &str,
+        hang: Option<(&str, &str)>,
+    ) -> LanderLauncher {
+        let mut guard = format!("sleep {pause}\n");
+        if let Some((with, without)) = hang {
+            guard.push_str(&format!(
+                "case \" $* \" in *\" {with} \"*) case \" $* \" in *\" {without} \"*) ;; \
+                 *) sleep 120;; esac;; esac\n"
+            ));
+        }
+        guard.push_str(&red_when_any(red));
+        merging_lander(dir, work, log, &guard)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_non_attributable_red_in_a_batch_of_four_is_isolated_though_the_runs_outlast_one_budget()
+     {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        // Four runs of about 1.3 s each: past the 3 s a single shared budget
+        // would give the batch, inside the 3 s each run gets (#3267).
+        let launcher = slow_lander(
+            dir.path(),
+            &work,
+            &log,
+            &[(shas[1].as_str(), "q::red_b")],
+            "1.3",
+            None,
+        )
+        .with_gate_timeout(Duration::from_secs(3))
+        .with_workspace(dir.path().join("queue"));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let started = std::time::Instant::now();
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 4);
         assert!(
-            budgets.windows(2).all(|pair| pair[1] <= pair[0]),
-            "the batch's one deadline only shrinks: {budgets:?}"
+            started.elapsed() > Duration::from_secs(3),
+            "the batch's runs together outlast one budget: {:?}",
+            started.elapsed()
         );
+        // batch (red), [a,b] (red), [a] (green), b isolated with NO run of its
+        // own, tail [c,d] (green).
+        let counts: Vec<usize> = lander_runs(&log)
+            .iter()
+            .map(|r| r.matches("--accepted").count())
+            .collect();
+        assert_eq!(counts, vec![4, 2, 1, 2]);
+        for index in [0, 2, 3] {
+            assert_landed(&store, &work, ids[index], &shas[index]).await;
+        }
+        // The suspect window narrowed to one member: it is refused with the
+        // failing test named, and the outcome points at the bisect's run logs.
+        let refused = entry_of(&store, ids[1]).await;
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let outcome = refused.outcome.unwrap();
+        assert_eq!(outcome.refusal.as_deref(), Some("gate_failed"));
+        assert_eq!(outcome.failing_tests, vec!["q::red_b".to_string()]);
+        let detail = outcome.detail.unwrap();
+        assert!(
+            detail.contains("outcome_reason=bisect_isolated"),
+            "{detail}"
+        );
+        let logs = detail
+            .lines()
+            .find_map(|line| line.strip_prefix("bisect_logs="))
+            .unwrap_or_else(|| panic!("the outcome names the bisect evidence: {detail}"));
+        assert_eq!(logs.split(',').count(), 3, "{logs}");
+        for path in logs.split(',') {
+            assert!(Path::new(path).is_file(), "{path}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_timeout_mid_bisect_requeues_members_a_red_run_left_out_and_refuses_only_the_suspects()
+     {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        // b is red. The batch (red) and [a,b] (red, which leaves c and d out
+        // while the red persists) are fast; the gate of [a] alone then hangs.
+        let launcher = slow_lander(
+            dir.path(),
+            &work,
+            &log,
+            &[(shas[1].as_str(), "q::red_b")],
+            "0",
+            Some((shas[0].as_str(), shas[1].as_str())),
+        )
+        .with_gate_timeout(Duration::from_secs(4));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let started = std::time::Instant::now();
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(60));
+        // Only the members still in the suspect window are settled.
+        assert_eq!(results.len(), 2);
+        for index in [0, 1] {
+            let entry = entry_of(&store, ids[index]).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Refused);
+            assert_eq!(
+                entry.outcome.unwrap().refusal.as_deref(),
+                Some(QUEUE_GATE_TIMEOUT)
+            );
+        }
+        // c and d are not refused: they are back in the queue, in order.
+        let mut sequences = Vec::new();
+        for index in [2, 3] {
+            let entry = entry_of(&store, ids[index]).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Queued);
+            assert!(entry.outcome.is_none());
+            sequences.push(entry.sequence);
+        }
+        assert!(sequences[0] < sequences[1], "{sequences:?}");
+        for sha in &shas {
+            assert!(!is_ancestor_of_origin(&work, sha));
+        }
+        assert_eq!(wake_count(&store).await, 2, "only the refused are woken");
+        let guard = store.lock().await;
+        let timeout = events_of(&guard, "gate_timeout");
+        assert_eq!(timeout.len(), 1);
+        assert_eq!(timeout[0]["refused"], 2);
+        assert_eq!(timeout[0]["requeued"], 2);
+        assert_eq!(events_of(&guard, "requeued_after_bisect").len(), 2);
+        let state: String = guard
+            .conn
+            .query_row("SELECT state FROM rolling_queue_batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            state, "refused",
+            "the batch closes with its last open member"
+        );
+        drop(guard);
+        // They are claimed again at their original position, ahead of anything
+        // enqueued later.
+        let later = commit_file(&work, "e", "e", "e");
+        let later_id = queued(&store, &work, &later, "k-late").await;
+        let again = claim_batch(&store, 4).await.unwrap().unwrap();
+        let claimed: Vec<Uuid> = again.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(claimed, vec![ids[2], ids[3], later_id]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_timeout_with_nothing_proved_still_refuses_every_member() {
+        let (dir, _origin, work) = repos();
+        let shas: Vec<String> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|name| commit_file(&work, name, name, name))
+            .collect();
+        let log = dir.path().join("lander.log");
+        // The very first gate hangs: no run proved anything about anyone.
+        let launcher = slow_lander(
+            dir.path(),
+            &work,
+            &log,
+            &[],
+            "0",
+            Some((shas[0].as_str(), "none")),
+        )
+        .with_gate_timeout(Duration::from_secs(2));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let ids = queue_all(&store, &work, &shas, None).await;
+        let results = run_next_batch(&store, &launcher, 4).await.unwrap();
+        assert_eq!(results.len(), 4);
+        for id in ids {
+            let entry = entry_of(&store, id).await;
+            assert_eq!(entry.state, RollingQueueEntryState::Refused);
+            assert_eq!(
+                entry.outcome.unwrap().refusal.as_deref(),
+                Some(QUEUE_GATE_TIMEOUT)
+            );
+        }
+        let guard = store.lock().await;
+        assert!(events_of(&guard, "requeued_after_bisect").is_empty());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -10584,7 +14599,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .iter()
             .map(|name| commit_file(&work, name, name, name))
             .collect();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let claimed = store
             .lock()
@@ -10659,7 +14676,9 @@ echo published_target_id=$(git rev-parse HEAD)
             &log,
             "echo policy_fence=migration_number; echo 'migration must be tip + 1' >&2; exit 8",
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         for id in ids {
@@ -10686,7 +14705,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let first = run_next_batch(&store, &launcher, 2).await.unwrap();
         assert_eq!(first.iter().map(|r| r.0).collect::<Vec<_>>(), ids[..2]);
@@ -10716,7 +14737,9 @@ echo published_target_id=$(git rev-parse HEAD)
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, Some(901)).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         let first = entry_of(&store, ids[0]).await;
@@ -10752,7 +14775,9 @@ echo published_target_id=$(git rev-parse HEAD)
                 shas[0], shas[1]
             ),
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         // The daemon claimed the batch, the lander published, then the daemon died.
         store
@@ -10830,7 +14855,9 @@ echo published_target_id=$(git rev-parse HEAD)
             b = shas[1]
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_landed(&store, &work, ids[0], &shas[0]).await;
@@ -10866,7 +14893,9 @@ echo published_target_id=$(git rev-parse HEAD)
             ),
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_landed(&store, &work, ids[0], &shas[0]).await;
@@ -10901,7 +14930,9 @@ echo published_target_id=$(git rev-parse HEAD)
             ),
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 2, "every member settles exactly once");
@@ -10942,7 +14973,9 @@ echo published_target_id=$(git rev-parse HEAD)
             ),
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 2, "every member settles exactly once");
@@ -10977,7 +15010,9 @@ echo published_target_id=$(git rev-parse HEAD)
              ext e$n; echo publication_status=not_published; exit 1; fi",
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 4);
@@ -11011,7 +15046,9 @@ echo published_target_id=$(git rev-parse HEAD)
             b = shas[1]
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 2);
@@ -11038,7 +15075,9 @@ echo published_target_id=$(git rev-parse HEAD)
         );
         let b = head(&work);
         let _ = dir;
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &[a.clone(), b.clone()], None).await;
         store
             .lock()
@@ -11186,7 +15225,9 @@ exit 0
              echo fetched_target_id=$fetched; echo candidate_id=$cand; \
              echo published_target_id=$cand; exit 1; fi",
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_landed(&store, &work, ids[0], &shas[0]).await;
@@ -11223,7 +15264,9 @@ exit 0
             &shas[0],
             "",
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         run_next_batch(&store, &launcher, 4).await.unwrap();
         let runs = lander_runs(&log);
@@ -11243,7 +15286,7 @@ exit 0
     /// 901, the published provisional commit carries 902.
     async fn crashed_provisional_run(
         work: &Path,
-    ) -> (Arc<tokio::sync::Mutex<Store>>, Uuid, Uuid, String) {
+    ) -> (Arc<rsid_core::store_lock::Mutex<Store>>, Uuid, Uuid, String) {
         let a = commit_file(work, "a", "a", "a");
         sh(
             work,
@@ -11252,7 +15295,9 @@ exit 0
              && git add -A && git commit -qm b",
         );
         let b = head(work);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, work, &[a, b.clone()], None).await;
         store
             .lock()
@@ -11339,7 +15384,10 @@ exit 0
         assert_eq!(entry_of(&store, id).await.migration_version, Some(903));
     }
 
-    async fn planned_number(store: &Arc<tokio::sync::Mutex<Store>>, id: Uuid) -> Option<u32> {
+    async fn planned_number(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        id: Uuid,
+    ) -> Option<u32> {
         store
             .lock()
             .await
@@ -11350,7 +15398,7 @@ exit 0
     // #1208: a source already on rolling is published, never gated.
 
     async fn assert_published_out_of_band(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         work: &Path,
         id: Uuid,
         sha: &str,
@@ -11393,7 +15441,9 @@ exit 0
                 "echo publication_status=published\necho landing_outcome=already_on_rolling\necho fetched_target_id={tip}\necho candidate_id={tip}\necho published_target_id={tip}\n"
             ),
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &source, "already-contained").await;
         let (settled, result) = run_next(&store, &launcher).await.unwrap().unwrap();
         assert_eq!(settled, id);
@@ -11418,7 +15468,9 @@ exit 0
                 "echo publication_status=published\necho landing_outcome=already_on_rolling\necho published_target_id={source}\n"
             ),
         );
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &source, "unconfirmed-tip").await;
         run_next(&store, &launcher).await.unwrap().unwrap();
         let entry = entry_of(&store, id).await;
@@ -11440,7 +15492,9 @@ exit 0
         // The operator lands b directly, after it was enqueued.
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         sh(
             &work,
@@ -11462,6 +15516,228 @@ exit 0
         assert_eq!(events_of(&guard, "already_landed").len(), 1);
     }
 
+    /// Land `source` on the shared `rolling` as `email` would, with `subject`
+    /// (a `--no-ff` merge, or a `commit-tree` commit when `renumber`).
+    fn publish_as(work: &Path, source: &str, email: &str, subject: &str, renumber: bool) -> String {
+        let script = if renumber {
+            format!(
+                "tree=$(git rev-parse {source}^{{tree}}) && c=$(git commit-tree $tree \
+                 -p origin/rolling -p {source} -m '{subject}') \
+                 && git push -q origin $c:refs/heads/rolling && git update-ref refs/heads/landed $c"
+            )
+        } else {
+            format!(
+                "git checkout -q -B landed origin/rolling && git merge -q --no-ff {source} \
+                 -m '{subject}' && git push -q origin HEAD:rolling"
+            )
+        };
+        sh(
+            work,
+            &format!("export GIT_COMMITTER_EMAIL={email} GIT_AUTHOR_EMAIL={email}; {script}"),
+        );
+        git(work, &["rev-parse", "landed"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// A daemon restart that found the entry `gating`: claim a batch, then
+    /// requeue its entry the way startup reconciliation does.
+    async fn restart_while_gating(store: &Arc<rsid_core::store_lock::Mutex<Store>>, id: Uuid) {
+        let guard = store.lock().await;
+        guard
+            .claim_rolling_queue_batch(Utc::now(), 4)
+            .unwrap()
+            .unwrap();
+        assert!(
+            guard
+                .requeue_gating_rolling_queue_entry(id, Utc::now())
+                .unwrap()
+        );
+    }
+
+    async fn published_detail(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        id: Uuid,
+    ) -> (String, String) {
+        let entry = entry_of(store, id).await;
+        assert_eq!(entry.state, RollingQueueEntryState::Published, "{entry:?}");
+        let outcome = entry.outcome.unwrap();
+        (
+            outcome.landed_sha.unwrap(),
+            outcome.detail.unwrap_or_default(),
+        )
+    }
+
+    const LANDER_EMAIL: &str = "rsi-rolling-land@rsi.invalid";
+
+    /// #4009/#4040: the lander published the entry but the daemon restarted
+    /// before the settle, so the re-driven entry finds its source on rolling.
+    /// The lander's own commit (its committer identity names the source) is
+    /// reported as the queue's publication, naming the restart the entry's
+    /// events show, never as an outside landing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_lander_published_entry_found_after_a_restart_is_not_called_an_outside_landing() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = queued(&store, &work, &source, "lander-published").await;
+        restart_while_gating(&store, id).await;
+        let integration = publish_as(
+            &work,
+            &source,
+            LANDER_EMAIL,
+            &format!("rsi integration: merge {source} into rolling"),
+            false,
+        );
+        assert_eq!(
+            lander_publication_commit(&work, &source).as_deref(),
+            Some(integration.as_str())
+        );
+        assert_eq!(lander_publication_commit(&work, "0000"), None);
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        assert!(lander_runs(&log).is_empty(), "nothing is gated");
+        let (landed, detail) = published_detail(&store, id).await;
+        assert_eq!(landed, integration);
+        assert!(
+            detail.contains("published to origin/rolling by the queue's lander")
+                && detail.contains(&integration)
+                && detail.contains("requeued_after_restart"),
+            "{detail}"
+        );
+        assert!(!detail.contains("landed outside the queue"), "{detail}");
+    }
+
+    /// #4040 item 1: a commit with the lander's subject but another writer's
+    /// identity (the manager `Integrate` executor, a hand push) is not the
+    /// queue's landing, even after a restart found nothing else to say.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn an_integration_subject_from_another_writer_is_still_an_outside_landing() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = queued(&store, &work, &source, "manager-integrated").await;
+        let integration = publish_as(
+            &work,
+            &source,
+            "integration@rsi.local",
+            &format!("rsi integration: merge {source} into rolling"),
+            false,
+        );
+        assert_eq!(lander_publication_commit(&work, &source), None);
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        let (landed, detail) = published_detail(&store, id).await;
+        assert!(
+            detail.contains("(landed outside the queue); settled without a gate"),
+            "{detail}"
+        );
+        assert!(
+            git(
+                &work,
+                &["merge-base", "--is-ancestor", &integration, &landed]
+            )
+            .is_some(),
+            "the tip {landed} contains the manager's commit {integration}"
+        );
+    }
+
+    /// #4040 item 2: a renumbered provisional-migration publication (the
+    /// lander's commit, parents target and source, another subject) is found
+    /// by the same identity evidence, with no restart claimed when none ran.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_renumbered_lander_publication_is_attributed_to_the_lander_without_a_restart() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = queued(&store, &work, &source, "renumbered").await;
+        let renumbered = publish_as(
+            &work,
+            &source,
+            LANDER_EMAIL,
+            "rsi landing: renumber provisional migration",
+            true,
+        );
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        let (landed, detail) = published_detail(&store, id).await;
+        assert_eq!(landed, renumbered);
+        assert!(
+            detail.contains("by the queue's lander")
+                && detail.contains("gate receipt")
+                && !detail.contains("restart"),
+            "{detail}"
+        );
+        assert!(!detail.contains("landed outside the queue"), "{detail}");
+    }
+
+    /// #4040 item 2: a fast-forward publication writes no commit; an entry the
+    /// queue was gating when the daemon restarted, found on rolling afterwards,
+    /// is attributed to the queue's earlier run, not to an outside landing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_fast_forwarded_entry_found_after_a_restart_is_not_called_an_outside_landing() {
+        let (dir, _origin, work) = repos();
+        let source = commit_file(&work, "a", "a", "a");
+        let log = dir.path().join("lander.log");
+        let launcher = merging_lander(dir.path(), &work, &log, "");
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = queued(&store, &work, &source, "fast-forwarded").await;
+        restart_while_gating(&store, id).await;
+        sh(
+            &work,
+            &format!("git push -q origin {source}:refs/heads/rolling"),
+        );
+        run_next(&store, &launcher).await.unwrap().unwrap();
+        assert!(lander_runs(&log).is_empty(), "nothing is gated");
+        let (landed, detail) = published_detail(&store, id).await;
+        assert_eq!(landed, source);
+        assert!(
+            detail.contains("re-driven after a daemon restart")
+                && detail.contains("requeued_after_restart")
+                && detail.contains("gate_timing"),
+            "{detail}"
+        );
+        assert!(!detail.contains("landed outside the queue"), "{detail}");
+    }
+
+    /// #4040 item 3: the restart is named only when the entry's events show
+    /// one; a lander commit found on a path that is not a restart says only
+    /// that the receipt is not on the entry.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_missing_receipt_text_names_a_restart_only_when_one_happened() {
+        let none = already_landed_outcome("s", "tip".into(), Some("lander".into()), 0).1;
+        assert!(
+            none.contains("gate receipt") && !none.contains("restart"),
+            "{none}"
+        );
+        let some = already_landed_outcome("s", "tip".into(), Some("lander".into()), 2).1;
+        assert!(some.contains("requeued_after_restart x2"), "{some}");
+        let outside = already_landed_outcome("s", "tip".into(), None, 0);
+        assert_eq!(outside.0, "tip");
+        assert!(
+            outside.1.contains("landed outside the queue"),
+            "{}",
+            outside.1
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_batch_whose_sources_all_landed_runs_no_lander_and_settles_published() {
@@ -11472,7 +15748,9 @@ exit 0
             .collect();
         let log = dir.path().join("lander.log");
         let launcher = merging_lander(dir.path(), &work, &log, "");
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         sh(
             &work,
@@ -11526,7 +15804,9 @@ exit 0
         let log = dir.path().join("lander.log");
         let guard = lands_then_refuses(&work, &dir.path().join("landed"), &shas[1]);
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -11550,7 +15830,9 @@ exit 0
         let log = dir.path().join("lander.log");
         let guard = lands_then_refuses(&work, &dir.path().join("landed"), &sha);
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let id = queued(&store, &work, &sha, "k").await;
         let (settled, result) = run_next(&store, &launcher).await.unwrap().unwrap();
         assert_eq!(settled, id);
@@ -11600,7 +15882,9 @@ exit 0
             red = red_when_any(&[(shas[1].as_str(), "q::b_breaks")]),
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();
         assert_eq!(results.len(), 3, "every member settles exactly once");
@@ -11636,7 +15920,9 @@ exit 0
         );
         let launcher = merging_lander(dir.path(), &work, &log, &guard)
             .with_gate_timeout(Duration::from_secs(2));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let ids = queue_all(&store, &work, &shas, None).await;
         let started = std::time::Instant::now();
         let results = run_next_batch(&store, &launcher, 4).await.unwrap();

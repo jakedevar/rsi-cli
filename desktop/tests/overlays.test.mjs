@@ -7,7 +7,8 @@ import { formKey, stepChoice } from '../dist/entity-form-keys.js';
 import { hexEditKey, normalizeHex, pickerLeader } from '../dist/overlay-keys.js';
 import { parseTextBg, textBgCss } from '../dist/textbg.js';
 import {
-  effortBars, launchSummary, launchedId, promptKey, scopeChoices, settingRows, settingsKey, stepEffort, stepPreset, stepScope,
+  appointArgs, effortBars, freshPlan, grantStatus, launchBlock, launchSummary, launchedId, policyLabel, promptKey, regrantsSaved,
+  scopeChoices, settingRows, settingsKey, stepEffort, stepPlanPreset, stepPreset, stepScope,
 } from '../dist/prompt-model.js';
 import { SLICE as VIEWS } from '../dist/actions/views.js';
 import { sliceProblems } from '../dist/registry.js';
@@ -119,6 +120,8 @@ test('prompt chords: the launch prompt, the continue prompt and the input modal'
   assert.equal(promptKey(pc('modal'), { key: 'Enter' }), 'send');
   assert.equal(promptKey(pc('modal', { submitOnEnter: false }), { key: 'Enter' }), 'pass');
   assert.equal(promptKey(pc('modal'), { key: 'Enter', shiftKey: true }), 'pass');
+  assert.equal(promptKey(pc('modal', { normal: true }), { key: 'Enter' }), 'pass', 'Vim normal mode: Enter sends nothing (insert mode sends, as the TUI)');
+  assert.equal(promptKey(pc('modal', { normal: true }), { key: 'Enter', ctrlKey: true }), 'pass', 'Ctrl-Enter is the field\'s own send chord');
   assert.equal(promptKey(pc('launch'), { key: 'k', metaKey: true }), 'pass', 'Cmd chords stay the platform’s');
 });
 
@@ -141,7 +144,7 @@ test('the settings side: rows, keys, effort ladder, scope and policy cycles', ()
   assert.equal(stepEffort('claude-opus-5', '', 1), 'low');
   assert.equal(stepEffort('claude-opus-5', 'max', 1), '', 'wraps to the model default');
   assert.equal(stepEffort('claude-opus-4-5', 'high', 1), '', 'Opus 4.5 stops at high');
-  assert.equal(effortBars('claude-opus-4-5', 'medium'), '▮▮▯');
+  assert.equal(effortBars('claude-opus-4-5', 'medium'), '●●○');
   assert.equal(stepPreset('full', 1), 'observe');
   const sessions = [
     { id: 'g2', session_kind: 'Group', project_id: 'P', status: 'Running', title: 'beta' },
@@ -157,10 +160,76 @@ test('the settings side: rows, keys, effort ladder, scope and policy cycles', ()
 
 test('the launch header summarizes the launch, and the launched id is read from the answer', () => {
   const s = launchSummary(settings({ effort: 'high', sandbox: true, manager: { scope: { kind: 'project' }, preset: 'full' } }), '/repo');
-  assert.equal(s, '/repo  Claude · claude-opus-5  ▮▮▮▯▯ high  ⊡ sandbox  ★ manager · Full project control');
+  assert.equal(s, 'Starts Claude Code (Anthropic CLI) with model claude-opus-5, ●●●○○ high effort. Project: none. Folder: /repo. Own git worktree: yes. Manager: Full project control.');
   assert.equal(launchedId({ id: 'E2CAE1D4-1833-48EB-A7E8-6F1DD480FDAE' }), 'e2cae1d4-1833-48eb-a7e8-6f1dd480fdae');
   assert.equal(launchedId({ session: { id: 'e2cae1d4-1833-48eb-a7e8-6f1dd480fdae' } }), 'e2cae1d4-1833-48eb-a7e8-6f1dd480fdae');
   assert.equal(launchedId(null), null);
+});
+
+// desktop #204, mirroring the TUI's GrantContextState / block_unloaded_grant /
+// appoint_launched_manager (crates/rsi/src/overlay/launch_settings.rs, #3270).
+const PID = '11111111-1111-4111-8111-111111111111';
+const SID = '22222222-2222-4222-8222-222222222222';
+const SAVED = { project_id: PID, row_version: 4, policy: { capabilities: ['observe'] }, revoked: false };
+
+test('#204: an unchanged Policy re-grants the saved grant (presetChosen false, as the TUI)', () => {
+  const plan = freshPlan();
+  assert.deepEqual(plan, { scope: { kind: 'project' }, preset: 'execute', presetChosen: false });
+  const loaded = { state: 'loaded', projectId: PID, saved: SAVED };
+  assert.equal(regrantsSaved(plan, loaded), true);
+  assert.equal(policyLabel(plan, loaded), 'Saved grant');
+  assert.deepEqual(appointArgs(plan, PID, SID), {
+    projectId: PID, sessionId: SID, scopeKind: 'project', scopeId: null, preset: 'execute', presetChosen: false,
+  });
+  assert.ok(launchSummary(settings({ manager: plan }), '/repo', loaded).endsWith('Manager: saved grant.'));
+  // A project without a saved grant gets the preset, still unchosen.
+  const none = { state: 'loaded', projectId: PID, saved: null };
+  assert.equal(regrantsSaved(plan, none), false);
+  assert.equal(policyLabel(plan, none), 'Execute');
+});
+
+test('#204: a changed Policy sends the chosen preset', () => {
+  const loaded = { state: 'loaded', projectId: PID, saved: SAVED };
+  const stepped = stepPlanPreset(freshPlan(), 1);
+  assert.deepEqual(stepped, { scope: { kind: 'project' }, preset: 'full', presetChosen: true });
+  assert.equal(regrantsSaved(stepped, loaded), false);
+  assert.equal(policyLabel(stepped, loaded), 'Full project control');
+  // Stepping back to the default preset is still a choice (the TUI's step_preset).
+  const back = stepPlanPreset(stepped, -1);
+  assert.equal(back.preset, 'execute');
+  assert.equal(back.presetChosen, true);
+  const group = { ...stepped, scope: { kind: 'group', id: SID, label: 'g' } };
+  assert.deepEqual(appointArgs(group, PID, SID), {
+    projectId: PID, sessionId: SID, scopeKind: 'group', scopeId: SID, preset: 'full', presetChosen: true,
+  });
+});
+
+test('#204: the launch is blocked until the saved grant loads', () => {
+  const plan = freshPlan();
+  assert.equal(launchBlock(null, null, PID), null, 'no planned manager, no block');
+  assert.equal(launchBlock(plan, null, PID), 'Loading saved grant…');
+  assert.equal(launchBlock(plan, { state: 'loading', projectId: PID }, PID), 'Loading saved grant…');
+  assert.equal(
+    launchBlock(plan, { state: 'failed', projectId: PID, reason: 'grant read timed out' }, PID),
+    'Saved grant unavailable: grant read timed out. Press p on the Grant row to retry.',
+  );
+  assert.equal(launchBlock(plan, { state: 'loaded', projectId: 'other', saved: SAVED }, PID), 'Loading saved grant…', 'a read for another project does not count');
+  assert.match(launchBlock(plan, { state: 'loaded', projectId: PID, saved: SAVED }, ''), /^Choose a project first/);
+  assert.equal(launchBlock(plan, { state: 'loaded', projectId: PID, saved: SAVED }, PID), null);
+  assert.equal(launchBlock(plan, { state: 'loaded', projectId: PID, saved: null }, PID), null, 'no saved grant is a successful read');
+  assert.equal(grantStatus({ state: 'loaded', projectId: PID, saved: null }), null);
+});
+
+test('#204: the dialog reads the saved grant, gates the Launch button and passes the plan to the appointment', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const prompts = await readFile(new URL('../src/prompts.ts', import.meta.url), 'utf8');
+  assert.match(prompts, /invoke<unknown>\('harness_manager_policy_get', \{ projectId: pid \}\)/);
+  assert.match(prompts, /button\.disabled = why !== null/);
+  assert.match(prompts, /invoke<\{ message\?: string \}>\('appoint_launched_manager', appointArgs\(plan, launchProject, id\)\)/);
+  const launch = await readFile(new URL('../src/launch.ts', import.meta.url), 'utf8');
+  assert.ok(launch.indexOf('launchBlocked()') < launch.indexOf("invoke<unknown>('launch_prompt'"), 'submitLaunch checks the block before any launch');
+  const rust = await readFile(new URL('../src-tauri/src/prompts.rs', import.meta.url), 'utf8');
+  assert.match(rust, /preset_chosen: Option<bool>/);
 });
 
 test('the G4 slice registers cleanly', () => {
@@ -236,4 +305,14 @@ test('the DAG inspector readbacks: ids from rows, the preview head and body, buc
   assert.equal(previewBody(p), 'hello');
   assert.equal(previewBody({ binary_unavailable_reason: 'binary' }), 'binary or unavailable: binary');
   assert.deepEqual(bucketLines({ live_attempt_id: G, prompt: { a: 1 }, diff: null, tests: [1, 2] }), ['prompt: 1 field', 'diff: none', 'tests: 2 items']);
+});
+
+test('the New session summary uses only glyphs every UI font has (local #283: ▯ and ⊡ drew as boxes)', () => {
+  const settings = { provider: 'Claude', model: 'claude-opus-5', effort: 'high', sandbox: true, manager: { preset: 'full' } };
+  const text = [launchSummary(settings, '/repo'), launchSummary({ ...settings, sandbox: false, effort: '' }, '')].join(' ')
+    + effortBars('claude-opus-5', 'low') + effortBars('claude-opus-5', '');
+  const odd = [...new Set([...text].filter((c) => c.charCodeAt(0) > 127))].filter((c) => !'·●○★’'.includes(c)); // ’ is the apostrophe in "the daemon’s default" (#289)
+  assert.deepEqual(odd, []);
+  assert.match(text, /●/);
+  assert.match(text, /○/);
 });

@@ -31,6 +31,73 @@ pub(super) fn allows(name: &str) -> bool {
         || name.ends_with("-target")
 }
 
+/// The worktree a registered build target was allocated for and what is known
+/// of its use (#646).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TargetOwner {
+    pub worktree: String,
+    /// An open job whose working directory is inside the worktree.
+    pub job: Option<String>,
+    /// The worktree is gone, the open-job list is known and names no job in it.
+    pub orphaned: bool,
+}
+
+/// The owner a build target's registry entry records. `None` for a legacy
+/// allocation that recorded no source worktree. A worktree is gone only when
+/// the filesystem says it does not exist; any other error keeps it present.
+pub(super) fn owner_of(
+    entry: &super::Entry,
+    open_jobs: Option<&[super::OpenJob]>,
+) -> Option<TargetOwner> {
+    let worktree = entry
+        .source
+        .as_deref()
+        .filter(|source| !source.is_empty())?;
+    let source = Path::new(worktree);
+    let job = open_jobs
+        .into_iter()
+        .flatten()
+        .find(|job| job.cwd.starts_with(source))
+        .map(|job| job.id.clone());
+    let gone = matches!(
+        fs::symlink_metadata(source),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    );
+    Some(TargetOwner {
+        worktree: worktree.to_string(),
+        orphaned: gone && open_jobs.is_some() && job.is_none(),
+        job,
+    })
+}
+
+/// Directory under the data dir that holds the manager build allocations.
+const BUILD_TARGETS_DIR: &str = "build-targets";
+
+/// Whether `root` is the manager build-targets root (#3261).
+pub(super) fn is_build_targets_root(root: &Path) -> bool {
+    root.file_name()
+        .is_some_and(|name| name == BUILD_TARGETS_DIR)
+}
+
+/// The manager build-targets root of the running daemon.
+pub(super) fn build_targets_root() -> PathBuf {
+    rsi_common::identity::data_dir().join(BUILD_TARGETS_DIR)
+}
+
+/// A repository a test created under a registered Cargo target's fixture
+/// directory (`rsid-test-fixtures`, `slice8-*-fixtures`, ...): throwaway
+/// scratch of the test run, never operator work, so it cannot pin the whole
+/// allocation as unpublished (#3261). Only a top-level `*-fixtures` child
+/// qualifies; a repository anywhere else in a target still has to be clean
+/// and published.
+pub(super) fn is_fixture_repo(git: &fsys::GitRoot) -> bool {
+    git.rel
+        .components()
+        .next()
+        .and_then(|first| first.as_os_str().to_str())
+        .is_some_and(|first| first.ends_with("-fixtures"))
+}
+
 pub(super) fn roots() -> Vec<(PathBuf, RootKind)> {
     known_roots(
         &rsi_common::identity::data_dir(),
@@ -40,7 +107,7 @@ pub(super) fn roots() -> Vec<(PathBuf, RootKind)> {
 
 fn known_roots(data: &Path, home: Option<&Path>) -> Vec<(PathBuf, RootKind)> {
     let mut roots = vec![
-        data.join("build-targets"),
+        data.join(BUILD_TARGETS_DIR),
         data.to_path_buf(),
         data.join("staging"),
         data.join("cloud"),
@@ -211,11 +278,48 @@ pub(super) fn manager_target_in(
     registry_path: &Path,
     cwd: &Path,
 ) -> io::Result<PathBuf> {
+    registered_target_in(parent, registry_path, "rsi-build-", cwd)
+}
+
+/// Name prefix of a seat QA target (still `rsi-build-`, which [`allows`] lists).
+const SEAT_QA_PREFIX: &str = "rsi-build-qa-seat-";
+
+/// The one warm build target of a manager seat's QA worktrees (hub #3870 b).
+/// `seat_root` is the seat's own sandbox root, the same for every QA worktree
+/// the seat builds in, so a cold build is paid once per seat and not once per
+/// head. Reclaim sees the seat root as the registered source: while the seat
+/// lives the age floor keeps the target, and once the root is gone the target
+/// is orphaned and reclaimable at once (#646). The prefix differs from the
+/// per-worktree one, so the two kinds never collide.
+pub(crate) fn seat_qa_target(seat_root: &Path) -> io::Result<PathBuf> {
+    seat_qa_target_in(
+        &rsi_common::identity::data_dir().join("build-targets"),
+        &registry::default_registry_path(),
+        seat_root,
+    )
+}
+
+pub(super) fn seat_qa_target_in(
+    parent: &Path,
+    registry_path: &Path,
+    seat_root: &Path,
+) -> io::Result<PathBuf> {
+    registered_target_in(parent, registry_path, SEAT_QA_PREFIX, seat_root)
+}
+
+/// A registered Cargo target named for the canonical `source` path, which the
+/// allocation registry records as its owner.
+fn registered_target_in(
+    parent: &Path,
+    registry_path: &Path,
+    prefix: &str,
+    source: &Path,
+) -> io::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::DirBuilderExt;
-    let cwd = cwd.canonicalize()?;
+    let cwd = source.canonicalize()?;
     let digest = Sha256::digest(cwd.as_os_str().as_encoded_bytes());
-    let name = format!("rsi-build-{digest:x}");
+    let name = format!("{prefix}{digest:x}");
     match fs::DirBuilder::new().mode(0o700).create(parent) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -238,7 +342,14 @@ pub(super) fn manager_target_in(
         }
     }
     let path = parent.join(&name);
-    match record::create_scratch_dir_in(registry_path, parent, &name, RootKind::CargoTarget) {
+    // The registered source worktree lets reclaim tell that it is gone (#646).
+    match record::create_scratch_dir_for_in(
+        registry_path,
+        parent,
+        &name,
+        RootKind::CargoTarget,
+        Some(&cwd),
+    ) {
         Ok(_) => {
             let fresh = fsys::pin_child(&root, &name)?;
             fsys::create_file(&fresh, "CACHEDIR.TAG", CACHE_SIGNATURE.as_bytes())?;

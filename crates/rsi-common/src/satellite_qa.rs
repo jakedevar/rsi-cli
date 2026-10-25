@@ -11,6 +11,7 @@
 use crate::agent_jobs::JobState;
 use crate::satellite::SatelliteUuidV1;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// Wire method the satellite accepts for a hub full-library QA run.
@@ -27,6 +28,10 @@ pub const SATELLITE_QA_MAX_FAILING_TESTS: usize = 200;
 pub const SATELLITE_QA_MAX_TEST_NAME_BYTES: usize = 512;
 /// Longest log path or refusal text a receipt carries.
 pub const SATELLITE_QA_MAX_TEXT_BYTES: usize = 1_024;
+/// Maximum UTF-8 panic payload bytes per test (after redaction).
+pub const SATELLITE_QA_MAX_PANIC_BYTES: usize = 2_048;
+/// Maximum panic evidence bytes per receipt, including test identity keys.
+pub const SATELLITE_QA_MAX_PANIC_TOTAL_BYTES: usize = 32_768;
 
 /// The request is malformed.
 pub const SATELLITE_QA_INVALID: &str = "satellite_qa_invalid";
@@ -213,6 +218,11 @@ pub struct SatelliteQaRunReceiptV1 {
     /// Failing tests beyond [`SATELLITE_QA_MAX_FAILING_TESTS`].
     #[serde(default)]
     pub failing_tests_omitted: u32,
+    /// Optional redacted panic payloads, keyed by the exact failing test path.
+    /// Older hubs ignore this field; older satellites omit it. Never contains
+    /// a satellite-local log path for the hub to open.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub panic_excerpts: BTreeMap<String, String>,
     /// The job log on the satellite.
     pub log_path: String,
     /// `true` when this reply reports an earlier start.
@@ -229,6 +239,83 @@ fn bounded(text: &str, max: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Mask the whole evidence line containing an Authorization header. Generic
+/// secret redaction can otherwise consume its label and only part of a quoted
+/// Digest value, leaving later fields without a recognizable secret label.
+fn redact_authorization_lines(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            // Detection decodes escapes so escaped header keys and quotes in
+            // JSON/debug output cannot hide the label. Retain original bytes
+            // on every other line; decoding must never invent panic needles.
+            if crate::daemon_handoff::authorization_header_in_line(line) {
+                if line.ends_with('\n') {
+                    "[REDACTED]\n"
+                } else {
+                    crate::daemon_handoff::REDACTED
+                }
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
+/// Redact and cap one payload before transport. Redact before truncation so
+/// a cut cannot hide a secret's identifying shape.
+/// Rechecked by the hub before evidence is used in a signature block.
+#[must_use]
+pub fn sanitize_panic_excerpt(text: &str) -> String {
+    static PRIVATE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(concat!(
+            r#"(?i)(?:[a-z]:[\\/]+users[\\/]+|/(?:home|users)/|~/)[^\s\"'<>]+"#,
+            r#"|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"#,
+            r#"|\b(?:\+?\d[ ()-]*){7,}\d\b"#,
+            // Include Digest fields and schemes already masked by redact_secrets.
+            r#"|\bauthorization[\"']?[ \t]*[:=][ \t]*(?:[!#$%&'*+.^_`|~0-9a-z-]+|\[REDACTED\])[ \t]+[^\r\n]+"#,
+            r#"|\b(?:[A-Z0-9_.-]*(?:secret|token|password|api[_-]?key|authorization)[A-Z0-9_.-]*[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|bearer\s+[^\s,;]+|[^\s,;]+)"#,
+            r#"|\bbearer\s+[^\s,;]+"#,
+        )).expect("panic privacy pattern compiles")
+    });
+    // Consume multiline secret spans whole before any line mask can remove
+    // their opener or opening quote and strand the continuation.
+    let text = crate::daemon_handoff::redact_multiline_secret_spans(text);
+    let text = redact_authorization_lines(&text);
+    let text = crate::daemon_handoff::redact_secrets(&text);
+    let sanitized: String = PRIVATE
+        .replace_all(&text, crate::daemon_handoff::REDACTED)
+        .split_inclusive('\n')
+        .map(|line| {
+            // A changed line cannot be a literal contains needle on the hub.
+            // Keep a marker instead of silently joining tab/CR-separated text.
+            if line.chars().any(|c| c.is_control() && c != '\n') {
+                if line.ends_with('\n') {
+                    "[REDACTED]\n"
+                } else {
+                    crate::daemon_handoff::REDACTED
+                }
+            } else {
+                line
+            }
+        })
+        .collect();
+    clip_panic(&sanitized, SATELLITE_QA_MAX_PANIC_BYTES)
+}
+
+fn clip_panic(text: &str, max: usize) -> String {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len()
+        && let Some(start) = text[..end].rfind('[')
+        && crate::daemon_handoff::REDACTED.starts_with(&text[start..end])
+    {
+        end = start;
+    }
+    text[..end].to_owned()
 }
 
 impl SatelliteQaRunReceiptV1 {
@@ -248,6 +335,28 @@ impl SatelliteQaRunReceiptV1 {
         self.refusal = self
             .refusal
             .map(|text| bounded(&text, SATELLITE_QA_MAX_TEXT_BYTES));
+        let mut remaining = SATELLITE_QA_MAX_PANIC_TOTAL_BYTES;
+        self.panic_excerpts =
+            std::mem::take(&mut self.panic_excerpts)
+                .into_iter()
+                .filter_map(|(test, text)| {
+                    if !self.failing_tests.iter().any(|outcome| {
+                        outcome.split_whitespace().next_back() == Some(test.as_str())
+                    }) || test.len() >= remaining
+                    {
+                        return None;
+                    }
+                    let text = clip_panic(
+                        &sanitize_panic_excerpt(&text),
+                        SATELLITE_QA_MAX_PANIC_BYTES.min(remaining - test.len()),
+                    );
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    remaining -= test.len() + text.len();
+                    Some((test, text))
+                })
+                .collect();
         self
     }
 
@@ -264,6 +373,20 @@ impl SatelliteQaRunReceiptV1 {
                 .iter()
                 .any(|name| name.len() > SATELLITE_QA_MAX_TEST_NAME_BYTES)
             || self.log_path.len() > SATELLITE_QA_MAX_TEXT_BYTES
+            || self.panic_excerpts.len() > SATELLITE_QA_MAX_FAILING_TESTS
+            || self.panic_excerpts.iter().any(|(test, text)| {
+                test.len() > SATELLITE_QA_MAX_TEST_NAME_BYTES
+                    || text.len() > SATELLITE_QA_MAX_PANIC_BYTES
+                    || !self.failing_tests.iter().any(|outcome| {
+                        outcome.split_whitespace().next_back() == Some(test.as_str())
+                    })
+            })
+            || self
+                .panic_excerpts
+                .iter()
+                .map(|(test, text)| test.len() + text.len())
+                .sum::<usize>()
+                > SATELLITE_QA_MAX_PANIC_TOTAL_BYTES
             || self
                 .refusal
                 .as_ref()
@@ -280,6 +403,14 @@ impl SatelliteQaRunReceiptV1 {
     /// `_`); a refusal must be a stable code or it is replaced.
     #[must_use]
     pub fn sanitized(mut self) -> Self {
+        self.panic_excerpts = std::mem::take(&mut self.panic_excerpts)
+            .into_iter()
+            .filter(|(test, _)| {
+                test.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_:./-".contains(c))
+            })
+            .map(|(test, text)| (test, sanitize_panic_excerpt(&text)))
+            .collect();
         for name in &mut self.failing_tests {
             *name = restrict(name, |c| c.is_ascii_alphanumeric() || "_:./- ".contains(c));
         }
@@ -298,7 +429,7 @@ impl SatelliteQaRunReceiptV1 {
                 SATELLITE_QA_REFUSAL_UNRECOGNIZED.to_owned()
             }
         });
-        self
+        self.bounded()
     }
 }
 
@@ -330,6 +461,348 @@ pub fn classify_refusal(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Frozen pre-evidence wire shape: serde ignores additional receipt fields.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct OldReceipt {
+        run_id: Uuid,
+        sha: String,
+        job_id: Uuid,
+        state: JobState,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        refusal: Option<String>,
+        #[serde(default)]
+        failing_tests: Vec<String>,
+        #[serde(default)]
+        failing_tests_omitted: u32,
+        log_path: String,
+        #[serde(default)]
+        replayed: bool,
+    }
+
+    fn old_receipt() -> OldReceipt {
+        OldReceipt {
+            run_id: Uuid::new_v4(),
+            sha: "b".repeat(40),
+            job_id: Uuid::new_v4(),
+            state: JobState::Failed,
+            exit_code: Some(1),
+            refusal: None,
+            failing_tests: vec!["FAIL rsid a::red".into()],
+            failing_tests_omitted: 0,
+            log_path: "/jobs/red.log".into(),
+            replayed: false,
+        }
+    }
+
+    #[test]
+    fn panic_evidence_round_trips_between_old_and_new_peers() {
+        let old = old_receipt();
+        let old_wire = serde_json::to_value(&old).unwrap();
+        let mut new: SatelliteQaRunReceiptV1 = serde_json::from_value(old_wire.clone()).unwrap();
+        assert!(new.panic_excerpts.is_empty());
+        assert_eq!(serde_json::to_value(&new).unwrap(), old_wire);
+        new.panic_excerpts
+            .insert("a::red".into(), "assertion failed: inbox ready".into());
+        let new_wire = serde_json::to_value(&new).unwrap();
+        assert_eq!(
+            serde_json::from_value::<OldReceipt>(new_wire.clone()).unwrap(),
+            old
+        );
+        assert_eq!(
+            serde_json::from_value::<SatelliteQaRunReceiptV1>(new_wire).unwrap(),
+            new
+        );
+        assert_eq!(new.validate(old.run_id), Ok(()));
+    }
+
+    #[test]
+    fn panic_evidence_has_per_test_and_total_utf8_byte_caps() {
+        let mut receipt: SatelliteQaRunReceiptV1 =
+            serde_json::from_value(serde_json::to_value(old_receipt()).unwrap()).unwrap();
+        receipt.failing_tests = (0..200).map(|i| format!("test_{i:03}")).collect();
+        receipt.panic_excerpts = receipt
+            .failing_tests
+            .iter()
+            .map(|test| (test.clone(), "é".repeat(4096)))
+            .collect();
+        assert_eq!(receipt.validate(receipt.run_id), Err(SATELLITE_QA_INVALID));
+        let receipt = receipt.bounded();
+        assert_eq!(
+            receipt.panic_excerpts["test_000"].len(),
+            SATELLITE_QA_MAX_PANIC_BYTES
+        );
+        assert_eq!(
+            receipt
+                .panic_excerpts
+                .iter()
+                .map(|(test, text)| test.len() + text.len())
+                .sum::<usize>(),
+            SATELLITE_QA_MAX_PANIC_TOTAL_BYTES
+        );
+        assert_eq!(receipt.validate(receipt.run_id), Ok(()));
+        assert_eq!(
+            receipt.clone().sanitized().sanitized(),
+            receipt.clone().sanitized()
+        );
+        let mut total_only = receipt.clone();
+        total_only.panic_excerpts = total_only
+            .failing_tests
+            .iter()
+            .map(|test| (test.clone(), "x".repeat(SATELLITE_QA_MAX_PANIC_BYTES)))
+            .collect();
+        assert_eq!(
+            total_only.validate(total_only.run_id),
+            Err(SATELLITE_QA_INVALID)
+        );
+        let mut unrelated = receipt;
+        unrelated.panic_excerpts = [("other::test".into(), "other panic".into())].into();
+        assert_eq!(
+            unrelated.validate(unrelated.run_id),
+            Err(SATELLITE_QA_INVALID)
+        );
+        assert!(unrelated.bounded().panic_excerpts.is_empty());
+    }
+
+    #[test]
+    fn panic_evidence_redacts_private_shapes_before_truncation() {
+        let text = concat!(
+            "assertion failed: inbox ready\n",
+            "/home/fixture/private /Users/fixture/private C:\\Users\\fixture\\private ~/private\n",
+            "fixture@example.invalid +1 (555) 010-1234\n",
+            "RSI_SESSION_TOKEN=tiny bearer short sk-test0123456789abcdef0123456789\n",
+            "api_key=small\n",
+            r#"debug path: "C:\\Users\\fixture\\private""#,
+            "\nAuthorization: Bearer tiny\n",
+        );
+        assert_eq!(
+            sanitize_panic_excerpt(text),
+            concat!(
+                "assertion failed: inbox ready\n",
+                "[REDACTED] [REDACTED] [REDACTED] [REDACTED]\n",
+                "[REDACTED] +[REDACTED]\n",
+                "[REDACTED] [REDACTED] [REDACTED]\n",
+                "[REDACTED]\n",
+                "debug path: \"[REDACTED]\"\n",
+                "[REDACTED]\n",
+            )
+        );
+        let mut receipt: SatelliteQaRunReceiptV1 =
+            serde_json::from_value(serde_json::to_value(old_receipt()).unwrap()).unwrap();
+        let prefix = "a".repeat(SATELLITE_QA_MAX_PANIC_BYTES - 10);
+        receipt.panic_excerpts.insert(
+            "a::red".into(),
+            format!("{prefix} sk-test0123456789abcdef0123456789"),
+        );
+        assert_eq!(
+            receipt.bounded().panic_excerpts["a::red"],
+            format!("{prefix} ")
+        );
+    }
+
+    #[test]
+    fn panic_evidence_redacts_authorization_values_for_any_scheme() {
+        for scheme in ["Basic", "Digest", "Bearer", "Custom+Scheme"] {
+            for value in ["tiny".to_owned(), "a".repeat(256)] {
+                let text = format!("before\nAuthorization: {scheme} {value}\nafter");
+                let sanitized = sanitize_panic_excerpt(&text);
+                assert_eq!(sanitized, "before\n[REDACTED]\nafter");
+                assert_eq!(sanitize_panic_excerpt(&sanitized), sanitized);
+            }
+        }
+        assert_eq!(
+            sanitize_panic_excerpt(
+                "authorization: Digest username=\"fixture\", realm=\"test\", response=\"tiny\"\nnext"
+            ),
+            "[REDACTED]\nnext"
+        );
+    }
+
+    #[test]
+    fn panic_evidence_redacts_serialized_digest_headers_before_generic_secrets() {
+        for response in ["tiny".to_owned(), "a".repeat(256)] {
+            let digest = format!(
+                r#"Digest username="fixture", realm="test", nonce="nonce", uri="/test", response="{response}", opaque="opaque""#
+            );
+            let headers = serde_json::json!({"Authorization": digest, "other": "context"});
+            let raw = format!("Authorization: {digest}");
+            let json = serde_json::to_string(&headers).unwrap();
+            let debug = format!("{headers:?}");
+            let quoted_value = format!("Authorization: {digest:?}");
+            for header in [
+                raw.clone(),
+                json.clone(),
+                debug,
+                quoted_value,
+                format!("{raw:?}"),
+                serde_json::to_string(&json).unwrap(),
+                format!("{json:?}"),
+            ] {
+                let input = format!("before\n{header}\nafter");
+                let sanitized = sanitize_panic_excerpt(&input);
+                assert_eq!(sanitized, "before\n[REDACTED]\nafter");
+                assert_eq!(sanitize_panic_excerpt(&sanitized), sanitized);
+            }
+        }
+    }
+
+    #[test]
+    fn panic_evidence_consumes_multiline_secrets_beside_authorization() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nc3ludGhldGlj\n-----END PRIVATE KEY-----";
+        let cases = [
+            (
+                format!("before\nAuthorization: Digest tiny; {pem}\nafter"),
+                "before\n[REDACTED]\nafter",
+            ),
+            (
+                format!("before\nAuthorization: Digest tiny; {pem}"),
+                "before\n[REDACTED]",
+            ),
+            (
+                format!("before\n{pem}\nAuthorization: Digest tiny\nafter"),
+                "before\n[REDACTED]\n[REDACTED]\nafter",
+            ),
+            (
+                "before\npassword=\"fixture Authorization: Digest tiny\nfixture-tail\"\nafter"
+                    .to_owned(),
+                "before\n[REDACTED]\nafter",
+            ),
+            (
+                "before\nAuthorization: Digest tiny\npassword=\"fixture\nfixture-tail\"\nafter"
+                    .to_owned(),
+                "before\n[REDACTED]\n[REDACTED]\nafter",
+            ),
+            (
+                "before\nsecret='fixture\nAuthorization: Digest tiny\nfixture-tail'\nafter"
+                    .to_owned(),
+                "before\n[REDACTED]\nafter",
+            ),
+        ];
+        for (input, expected) in cases {
+            let sanitized = sanitize_panic_excerpt(&input);
+            assert_eq!(sanitized, expected, "input: {input:?}");
+            assert_eq!(sanitize_panic_excerpt(&sanitized), expected);
+        }
+    }
+
+    #[test]
+    fn panic_evidence_masks_quoted_digest_after_unterminated_multiline_secret_606() {
+        let cases = [
+            // The Issue's repro: the first closing quote is inside the header.
+            (
+                "before\npassword=\"x\nAuthorization: Digest username=\"alice\", response=\"abc123\"\nafter",
+                "before\n[REDACTED]\nafter",
+            ),
+            (
+                "before\nsecret='x\nAuthorization: Digest username='alice', response='abc123'\nafter",
+                "before\n[REDACTED]\nafter",
+            ),
+            (
+                "before\npassword=\"x\nAuthorization: Digest username=\"alice\", response=\"abc123\"",
+                "before\n[REDACTED]",
+            ),
+            (
+                "before\npassword=\"fixture\n\\\"Authorization\\\": Digest username=\"alice\", response=\"abc123\"\nafter",
+                "before\n[REDACTED]\nafter",
+            ),
+            // A second multiline span opened in the consumed remainder.
+            (
+                "before\npassword=\"fixture\nAuthorization: Digest x=\", token=\"fixture2\nfixture-tail\"\nafter",
+                "before\n[REDACTED]\nafter",
+            ),
+        ];
+        for (input, expected) in cases {
+            let sanitized = sanitize_panic_excerpt(input);
+            assert_eq!(sanitized, expected, "input: {input:?}");
+            assert_eq!(sanitize_panic_excerpt(&sanitized), expected);
+        }
+    }
+
+    #[test]
+    fn panic_evidence_redacts_quoted_and_escaped_authorization_keys() {
+        for key in [
+            "Authorization",
+            "\"aUtHoRiZaTiOn\"",
+            "'Authorization'",
+            r#"\"Authorization\""#,
+            r#"\\\"Authorization\\\""#,
+            r#""\u0041uthorization""#,
+            r#""Authorizatio\u006e""#,
+            r#"\u0022Authorization\u0022"#,
+            r#"\x22\x41uthorization\x22"#,
+        ] {
+            for separator in [":", "=", r"\u003a", r"\x3d"] {
+                let input = format!(
+                    "before\n{{{key}{separator} \"Digest username=\\\"fixture\\\", realm=\\\"test\\\", response=\\\"tiny\\\"\", \"other\": \"context\"}}\nafter"
+                );
+                let sanitized = sanitize_panic_excerpt(&input);
+                assert_eq!(sanitized, "before\n[REDACTED]\nafter");
+                assert_eq!(sanitize_panic_excerpt(&sanitized), sanitized);
+            }
+        }
+        assert_eq!(
+            sanitize_panic_excerpt(
+                "headers: {\"Authorization\": \"\"}\nAuthorization: [REDACTED]\nAuthorization: Digest tiny\r\nAuthorization:\tBasic tiny\nnext"
+            ),
+            "[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED]\nnext"
+        );
+        assert_eq!(
+            sanitize_panic_excerpt(r#"ordinary: \"text\" \u0041 \x42; authorization check ready"#),
+            r#"ordinary: \"text\" \u0041 \x42; authorization check ready"#
+        );
+    }
+
+    #[test]
+    fn panic_evidence_redacts_serialized_headers_before_utf8_clipping() {
+        let header = serde_json::json!({
+            "Authorization": format!(r#"Digest username="fixture", realm="test", response="{}""#, "é".repeat(4096))
+        });
+        // A long value must be consumed before the cap, preserving the safe
+        // line after it rather than clipping inside a credential field.
+        assert_eq!(
+            sanitize_panic_excerpt(&format!("{header}\nnext é")),
+            "[REDACTED]\nnext é"
+        );
+        for prefix_bytes in [
+            SATELLITE_QA_MAX_PANIC_BYTES - 12,
+            SATELLITE_QA_MAX_PANIC_BYTES - 4,
+            SATELLITE_QA_MAX_PANIC_BYTES - 1,
+        ] {
+            let prefix = "é".repeat(prefix_bytes / 2);
+            let sanitized = sanitize_panic_excerpt(&format!("{prefix}\n{header}"));
+            let expected = if prefix.len() + 1 + "[REDACTED]".len() <= SATELLITE_QA_MAX_PANIC_BYTES
+            {
+                format!("{prefix}\n[REDACTED]")
+            } else {
+                format!("{prefix}\n")
+            };
+            assert_eq!(sanitized, expected);
+            assert_eq!(sanitize_panic_excerpt(&sanitized), expected);
+        }
+        assert_eq!(
+            sanitize_panic_excerpt(&format!(
+                "{}é\n{header}",
+                "a".repeat(SATELLITE_QA_MAX_PANIC_BYTES - 1)
+            )),
+            "a".repeat(SATELLITE_QA_MAX_PANIC_BYTES - 1)
+        );
+    }
+
+    #[test]
+    fn panic_control_lines_keep_a_marker_instead_of_inventing_needles() {
+        let original = "clean panic\na\tb\nx\ry\nlast line";
+        let sanitized = sanitize_panic_excerpt(original);
+        assert_eq!(sanitized, "clean panic\n[REDACTED]\n[REDACTED]\nlast line");
+        assert_eq!(sanitize_panic_excerpt(&sanitized), sanitized);
+        for needle in sanitized
+            .lines()
+            .filter(|line| !line.contains(crate::daemon_handoff::REDACTED))
+        {
+            assert!(original.contains(needle));
+        }
+    }
 
     fn request() -> SatelliteQaRunRequestV1 {
         SatelliteQaRunRequestV1 {
@@ -373,6 +846,7 @@ mod tests {
                 .map(|i| format!("store::tests::red_{i}"))
                 .collect(),
             failing_tests_omitted: 0,
+            panic_excerpts: Default::default(),
             log_path: "/data/jobs/x.log".into(),
             replayed: false,
         }
@@ -397,6 +871,7 @@ mod tests {
                 "x`\n# heading".into(),
             ],
             failing_tests_omitted: 0,
+            panic_excerpts: Default::default(),
             log_path: "/home/op/.rsi/jobs/a b`.log".into(),
             replayed: false,
         }

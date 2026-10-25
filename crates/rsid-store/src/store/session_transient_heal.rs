@@ -7,7 +7,6 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::bus::{DaemonEvent, EventBus};
@@ -16,7 +15,7 @@ use crate::store::transient_heal::{HealSchedule, TransientHealOutcome};
 
 /// Best effort: a heal failure never affects the finalizer.
 pub async fn heal_failed_session(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
 ) {

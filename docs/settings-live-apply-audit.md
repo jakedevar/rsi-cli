@@ -1,5 +1,29 @@
 # Settings live-apply audit — Issue #1200
 
+## New-setting checklist
+
+1. Add the registry row in `crates/rsi/src/settings_registry.rs`, with its owner,
+   apply class and consumer wired. Ship the operator RPC and TUI surface together
+   (AGENTS.md rule 10); keep operator-only methods out of agent catalogs.
+2. Add a row below containing the literal `` (`SettingIdVariant`) `` and its
+   owner key, consumer and live-apply outcome. The Rust audit test remains the
+   authority for coverage and converted controls' live-apply class.
+3. Run `node desktop/scripts/settings.mjs` from the repository root and commit
+   `desktop/src/settings.generated.ts`. Map the row in `widgetFor` /
+   `OVERLAY_ROW_IDS` in `desktop/src/settings-model.ts`; intentional TUI-only
+   rows also need `TUI_ONLY` in `desktop/tests/settings-state.test.mjs` and
+   `tuiOnlyRows` in `desktop/parity-audit.json`.
+4. Run `make manual` (the daemon's `manual` test recipe), and commit regenerated
+   `docs/manual/rsi-manual.md`, `docs/manual/rsi-manual.html` and any changed
+   generated regions of `docs/keybindings.md`. Then run
+   `node desktop/scripts/keymap.mjs` and `node desktop/scripts/overlay-help.mjs`
+   and commit changed generated catalogs. A new overlay also needs owned parity
+   entries and the corresponding parity fixture count. Update explanatory docs as needed.
+5. Run `scripts/repo-guard settings-preflight origin/rolling HEAD` after
+   committing. `scripts/scoped-test` runs this omission check before Cargo for
+   settings diffs, reusing `node desktop/scripts/settings.mjs --check`. Full Rust
+   audit and manual drift tests remain authoritative.
+
 Drafted by Codex worker 3b46ff8f on `46eb8ce00`; recovered, reviewed, compiled and
 tested by worker 9891ed4c on `origin/rolling` `5706e01ab` (merged into its sandbox).
 
@@ -98,8 +122,9 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Stop-all and cancel (`UsageActions`) | Usage | DaemonState | `rsid model_control` cancel/stop verbs | kept |
 | Provider credential slots (`ProviderCredentialSlots`) | Provider Keys | DaemonState | `rsid-store vault/mod.rs` key vault | kept |
 | Cloud spend (`CloudSpendStatus`) | Cloud Spend | DaemonState | `rsid cloud_spend.rs` report | kept |
-| Cloud spend stop line (USD) (`CloudSpendStopLine`) | Cloud Spend | `cloud_spend_stop_line_usd` | caps file (`rsid rpc/settings.rs`, `main.rs:485`) → `scripts/cloud-spend.py` | kept |
-| Cloud spend daily cap (USD) (`CloudSpendDailyCap`) | Cloud Spend | `cloud_spend_daily_cap_usd` | caps file (`rsid rpc/settings.rs`, `main.rs:485`) → `scripts/cloud-spend.py` | kept |
+| OpenRouter spend ceiling (`OpenRouterSpendStatus`) | Cloud Spend | DaemonState | `rsid openrouter_spend.rs` state (`GetDaemonConfig` `openrouter_spend_status`) | kept |
+| Cloud spend stop line (USD) (`CloudSpendStopLine`) | Cloud Spend | `cloud_spend_stop_line_usd` | caps file (`rsid rpc/settings.rs`, `main.rs:485`) → `rsi-cloud spend` | kept |
+| Cloud spend daily cap (USD) (`CloudSpendDailyCap`) | Cloud Spend | `cloud_spend_daily_cap_usd` | caps file (`rsid rpc/settings.rs`, `main.rs:485`) → `rsi-cloud spend` | kept |
 | Retry on failure (`RetryOnFailure`) | Retries & Recovery | `retry_enabled` | `rsid session/retry_policy.rs:20`, `session/lifecycle.rs:3019` | kept |
 | Retry max backoff (`RetryMaxBackoff`) | Retries & Recovery | `retry_max_backoff_ms` | `rsid session/lifecycle.rs:6127`, `monitor.rs:5013` | kept |
 | Retry on stall (`RetryOnStall`) | Retries & Recovery | `retry_on_stall` | `rsid stall_detector.rs:51` | kept |
@@ -109,6 +134,7 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Context rotation threshold (Claude Code) (`ContextRotationClaudePct`) | Context Rotation | `context_rotation_claude_pct` | `rsid session/monitor.rs:1338` via `context_rotation_threshold_pct` | kept |
 | Context rotation threshold (Codex) (`ContextRotationCodexPct`) | Context Rotation | `context_rotation_codex_pct` | `rsid session/monitor.rs:1338` via `context_rotation_threshold_pct` | kept |
 | Coordinator context cap (0 off, 1-100 = % of window) (`CoordinatorContextCap`) | Context Rotation | `coordinator_context_cap_tokens` | `rsid session/context_cap.rs` | kept |
+| Manager wake-turn cap (per hour, 0 off) (`ManagerMaxTurnsPerHour`) | Context Rotation | `manager_max_turns_per_hour` | `rsid scheduler/turn_budget.rs` | kept |
 | Worker context cap (0 off, 1-100 = % of window) (`WorkerContextCap`) | Context Rotation | `worker_context_cap_tokens` | `rsid session/context_cap.rs` | kept |
 | Stall detection (`StallDetection`) | Stall Detection | `stall_detection_enabled` | `rsid stall_detector.rs:225` | kept |
 | Stall classifier (`StallClassifier`) | Stall Detection | `stall_classifier_enabled` | `rsid stall_detector.rs:267`, `stall_classifier/scheduler.rs:323` | kept |
@@ -157,6 +183,8 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Codex max concurrent subagents (`CodexMaxConcurrentSubagents`) | Subagent Governance | `codex_max_concurrent_subagents` | `rsid codex.rs` `codex_subagent_overrides` | kept |
 | Claude fallback models (`ClaudeFallbackModels`) | Provider Isolation | `claude_fallback_models` | `rsid claude.rs` `claude_fallback_chain_for` | kept |
 | Claude spend cap per session (USD) (`ClaudeMaxBudgetUsd`) | Provider Isolation | `claude_max_budget_usd` | `rsid claude.rs` `ClaudeClient::launch_inner` | kept |
+| OpenRouter spend cap (USD) (`OpenRouterSpendCap`) | Cloud Spend | `openrouter_spend_cap_usd` | `rsid openrouter_spend.rs` (`freeze_launch_identity`, `spawn_provider_process`, `SpendGuardedControl`) | kept |
+| OpenRouter spend warn line (%) (`OpenRouterSpendWarnPct`) | Cloud Spend | `openrouter_spend_warn_pct` | `rsid session/manager_coordinator.rs` `reconcile_openrouter_spend_notices` | kept |
 | Vault: legacy env fallback (`VaultEnvCompat`) | Provider Isolation | `vault.env_compat` | `rsid-store vault/mod.rs:447` | kept |
 | Vault: check TTL (`VaultCheckTtl`) | Provider Isolation | `vault.check_ttl_secs` | `rsid-store vault/mod.rs:882` | kept |
 | Provider profile (`ProviderProfile`) | API Routes | `provider_profile` | `rsid-store config.rs` `launch_model_refusal` (every launch) | kept |
@@ -189,6 +217,7 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Hub build CPU budget (`HubBuildCpuPercent`) | Resource Limits | `hub_build_cpu_percent` | `rsid build_budget.rs:40` (rewrites `rsi-build.slice`) | kept |
 | Completed transcript cache (bytes) (`CompletedTranscriptCache`) | Resource Limits | `completed_transcript_cache_max_bytes` | `rsid session/queries.rs:754,919` | kept |
 | Host load limit for new launches (`HostLoadAdmissionThreshold`) | Build Governor | `host_load_admission_threshold` | `rsid host_load.rs:203` | kept |
+| Worker build reserve (GiB) (`WorkerBuildReserveGb`) | Build Governor | `worker_build_reserve_gb` | `rsid host_load.rs` → `host_pressure::launch_hold_now` at every admission | kept |
 | CPU andon: CPU-minutes per tree (`CpuAndonCpuMinutes`) | Build Governor | `cpu_andon_cpu_minutes` | `rsid cpu_andon.rs:385` | kept |
 | CPU andon: host load (`CpuAndonHostLoad`) | Build Governor | `cpu_andon_host_load` | `rsid cpu_andon.rs:386` | kept |
 | Build slots (`GovernorBuildSlots`) | Build Governor | `governor_build_slots` | `rsid governor.rs` via `governor_policy()` | kept |
@@ -206,6 +235,7 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Job thermal hold (C) (`JobThermalCeiling`) | Queue & Deploys | `job_thermal_ceiling_c` | `rsid agent_jobs.rs` `submit_with_hold` and `start_queued_jobs` via `rsid-core thermal_guard` | kept |
 | Health alert: hub disk used (%) (`HealthDiskUsedPct`) | Scheduling | `health_disk_used_pct` | `rsid scheduler/wake_when.rs` `gate` via `rsid-core health_thresholds` | kept |
 | Health alert: CPU hot (C) (`HealthThermal`) | Scheduling | `health_thermal_c` | `rsid scheduler/wake_when.rs` `gate` via `rsid-core health_thresholds` | kept |
+| Health alert: provider window used (%) (`HealthProviderWindowUsedPct`) | Scheduling | `health_provider_window_used_pct` | `rsid health_anomaly/provider_windows.rs` via `rsid-core health_thresholds` | Live at the next health evaluation; operator RPC and TUI/desktop cycle (0 off, 1-100, default 70) |
 | Health alert: work stuck (min) (`HealthStuckMinutes`) | Scheduling | `health_stuck_minutes` | `rsid scheduler/wake_when.rs` `gate` via `rsid-core health_thresholds` | kept |
 | Agent test job timeout (min) (`JobTestTimeout`) | Queue & Deploys | `job_test_timeout_mins` | `rsid session/agent_jobs_verb.rs:458` | kept |
 | Detach Claude turns (`TurnDetachEnabled`) | Queue & Deploys | `turn_detach_enabled` | `rsid claude/turn_spool.rs:33`, `claude.rs:1328` | kept |
@@ -220,6 +250,9 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Automatic source settlement (`SourceWorktreeAutoSettlement`) | Sandbox Storage | `source_worktree_auto_settlement_enabled` | `rsid session/cohort_settlement.rs:361` | kept |
 | Disk pressure free space (GB) (`DiskPressureMinFreeGb`) | Sandbox Storage | `disk_pressure_min_free_gb` | `rsid session/cohort_settlement.rs:371` | kept |
 | Purge archived sandboxes (`ArchivedSandboxPurge`) | Sandbox Storage | `archived_sandbox_purge_enabled` | `rsid session/sandbox_purge.rs:171` | kept |
+| Resolve errored sessions (`ErrorDispositionEnabled`) | Cold Storage | `error_disposition_enabled` | `rsid session/error_disposition.rs::run_error_disposition_loop` | kept |
+| Error grace (minutes) (`ErrorDispositionGraceMinutes`) | Cold Storage | `error_disposition_grace_minutes` | `rsid session/error_disposition.rs::error_disposition_pass` | kept |
+| Error continuations per day (`ErrorDispositionContinuationBudget`) | Cold Storage | `error_disposition_continuation_budget` | `rsid session/error_disposition.rs::error_disposition_pass` | kept |
 | Cold-storage archive (`ColdArchiveEnabled`) | Cold Storage | `cold_archive_enabled` | `rsid session/cold_archive.rs` | kept |
 | Cold-storage age (days) (`ColdArchiveAfterDays`) | Cold Storage | `cold_archive_after_days` | `rsid session/cold_archive.rs` | kept |
 | Cold-storage directory (`ColdArchiveDir`) | Cold Storage | `cold_archive_dir` | `rsid session/cold_archive.rs` (`cold_archive_settings`), `overlay/daemon_text_editor.rs` | kept |
@@ -227,6 +260,7 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Cold-storage last run (`ColdArchiveLastRun`) | Cold Storage | DaemonState | `GetColdArchiveStatus` read (`cold_storage.rs`) | kept |
 | Run cold-storage pass (`ColdArchiveRunNow`) | Cold Storage | DaemonState | `RunColdArchiveNow` (`rsid rpc/cold_archive.rs`) | kept |
 | Stored tool-result cap (KiB) (`ToolResultStorageCap`) | Sandbox Storage | `tool_result_storage_cap_kib` | `rsid-store store/events.rs` `stored_tool_result_body` via `rsid-core tool_result_cap` | kept |
+| Keep referenced pasted images (days) (`PasteRetentionReferencedDays`) | Sandbox Storage | `paste_retention_referenced_days` | `rsid paste_retention.rs` `run_policy_pass` via `rsid-core paste_retention_setting` | kept |
 | Sandbox storage (`SandboxStorageStatus`) | Build Cache | DaemonState | `rsid rpc/storage.rs:199` dry-run report | kept |
 | Sandbox cache reclaim (`CacheReclaim`) | Build Cache | `sandbox_build_cache_reclaim_enabled` | `rsid session/launch.rs:10577` (reclaim worker gate), `shared_target_reclaim.rs` | kept |
 | Cache reclaim TTL (`CacheReclaimTtl`) | Build Cache | `sandbox_build_cache_reclaim_ttl_secs` | `rsid session/launch.rs:780` (min idle), `:11150` | kept |
@@ -236,7 +270,7 @@ remains as the boot seed of the retry kill-switch, listed in the manual's no-edi
 | Cache reclaim pass limit (`CacheReclaimPassLimit`) | Build Cache | `sandbox_build_cache_reclaim_max_candidates` | `rsid session/launch.rs:10729` | kept |
 | Preview cache reclaim (`PreviewReclaim`) | Build Cache | DaemonState | `GetSandboxStorageStatus` / `RunSandboxBuildCacheReclaim` dry run | kept |
 | Reclaim sandbox caches now (`ReclaimNow`) | Build Cache | DaemonState | `RunSandboxBuildCacheReclaim` | kept |
-| Warm build pools kept (`TargetPoolKeep`) | Build Cache | `target_pool_keep` | `rsid-store sandbox/execution_scratch.rs:269`, `scripts/target-pool:111` | kept |
+| Warm build pools kept (`TargetPoolKeep`) | Build Cache | `target_pool_keep` | `rsid-store sandbox/execution_scratch.rs:269`, `crates/rsi-repo-guards/src/target_pool_ops.rs:59` | kept |
 | Warm build pools (`TargetPoolStatus`) | Build Cache | DaemonState | `GetTargetPoolStatus` report | kept |
 | Agent build jobs (`AgentBuildJobs`) | Agent Builds | `agent_build_jobs` | `rsid-store sandbox/execution_scratch.rs:258` | kept |
 | Agent line tables (`AgentBuildLineTables`) | Agent Builds | `agent_build_line_tables_only` | `rsid-store sandbox/execution_scratch.rs:259` | kept |
@@ -305,6 +339,7 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Context rotation threshold (Claude Code) (`ContextRotationClaudePct`) | Live | Live | Runtime values are read at the corresponding retry/context decision. Owner: `context_rotation_claude_pct`. |
 | Context rotation threshold (Codex) (`ContextRotationCodexPct`) | Live | Live | Runtime values are read at the corresponding retry/context decision. Owner: `context_rotation_codex_pct`. |
 | Coordinator context cap (0 off, 1-100 = % of window) (`CoordinatorContextCap`) | Live | Live | Runtime values are read at the corresponding retry/context decision. Owner: `coordinator_context_cap_tokens`. |
+| Manager wake-turn cap (per hour, 0 off) (`ManagerMaxTurnsPerHour`) | Live | Live | The scheduler reads the persisted cap at each manager-notice delivery (#4021); a seat over the cap has routine-only deliveries held and coalesced into the next free turn. Applies to the next delivery. Owner: `manager_max_turns_per_hour`. |
 | Worker context cap (0 off, 1-100 = % of window) (`WorkerContextCap`) | Live | Live | Read at each usage update of a non-seat session (#1254). Owner: `worker_context_cap_tokens`. |
 | Stall detection (`StallDetection`) | Daemon restart | Live | Always start idle detector; each tick gates on runtime enable. Disabled passes keep the duplicate-report set, so re-enabling never re-publishes (or re-remediates) a stall already reported; sessions that stalled while disabled are reported on the first enabled tick. Owner: `stall_detection_enabled`. |
 | Stall classifier (`StallClassifier`) | Live OFF; ON needs daemon restart if worker absent | Live | Always wire/start receiver; runtime flag gates both signal emission and receipt. Model admission remains unchanged. Owner: `stall_classifier_enabled`. |
@@ -349,7 +384,8 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Deploy restarts per hour (`DeployRestartsPerHour`) | Live | Live | The deploy runner copies the limit into the deploy service at every 5 s poll; each request and quiet-point restart checks it. Owner: `deploy_restarts_per_hour`. |
 | Shutdown grace (s) (`SupervisorShutdownGrace`) | Live | Live | `UpdateDaemonConfig` rewrites the supervisor snapshot (line 2) atomically; the supervisor re-reads it when a daemon shutdown begins. Owner: `supervisor_shutdown_grace_secs`. |
 | Host load limit for new launches (`HostLoadAdmissionThreshold`) | Live | Live | The manager-action claim loop (every pass, at most 10 s apart) and each topology node launch read the threshold at the moment they decide; raising or zeroing it releases held launches on the next pass, lowering it holds queued ones. Owner: `host_load_admission_threshold`. |
-| Worker CPU quota (`WorkerCpuQuotaPercent`) | Live | Live | `ScopedWorkerCommand` reads the value when it creates each worker scope and passes `CPUQuota=<n>%` (0 omits it). Running scopes keep their quota; new workers and tool scopes use the new value. Linux only. Owner: `worker_cpu_quota_percent`. |
+| Worker build reserve (GiB) (`WorkerBuildReserveGb`) | Live | Live | Each manager-create and topology admission reads the reserve above the governor floor; lowering it or setting 0 releases held launches on the next admission pass. Existing build/test jobs keep their governor floor. Owner: `worker_build_reserve_gb`. |
+| Worker CPU quota (`WorkerCpuQuotaPercent`) | Live | Next launch (no daemon/TUI restart) | `ScopedWorkerCommand` reads the value when it creates each worker scope and passes `CPUQuota=<n>%` (0 omits it). Running scopes keep their quota; new workers and tool scopes use the new value. Linux only. Owner: `worker_cpu_quota_percent`. |
 | Hub build CPU budget (`HubBuildCpuPercent`) | Live | Live | `UpdateDaemonConfig` rewrites the `rsi-build.slice` runtime properties (`CPUQuota=<threads x n>%`, `CPUWeight=20`) through `systemctl --user set-property --runtime`, so units already running in the slice are bounded at once; the daemon re-applies it at start and before each build unit or lander it launches, and job launchers read the value to cap their own per-job ceilings. Linux only: elsewhere the response reports `unavailable`. Owner: `hub_build_cpu_percent`. |
 | Merge queue batch size (`RollingQueueBatchSize`) | Live | Live | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Owner: `rolling_queue_batch_size`. |
 | Merge queue gate timeout (min) (`RollingQueueGateTimeout`) | Live | Live | Read when the queue claims its next batch (the batch gate deadline); a batch already gating keeps the deadline it was claimed with. Owner: `rolling_queue_gate_timeout_mins`. |
@@ -376,6 +412,10 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Harness network egress (`HarnessEgressMode`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_egress_mode`. |
 | Harness web search backend (`HarnessWebSearchBackend`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_web_search_backend`. |
 | Harness SearXNG URL (`HarnessSearxngUrl`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_searxng_url`. |
+| Benchmark docker hosts (`BenchDockerHosts`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `bench.docker_hosts`. |
+| Benchmark jobs enabled (`BenchEnabled`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `bench.enabled`. |
+| Benchmark concurrency (`BenchMaxConcurrency`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `bench.max_concurrency`. |
+| Benchmark laptop host (`BenchLaptopHost`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `bench.laptop_host`. |
 | Harness context editing (`HarnessContextEditing`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_context_editing`. |
 | Harness search call cap (`HarnessSearchCap`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_max_search_calls`. |
 | Harness fetch call cap (`HarnessFetchCap`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_max_fetch_calls`. |
@@ -384,6 +424,7 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Harness web cost cap (micro-USD) (`HarnessWebCostCap`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `harness_max_web_cost_usd_micros`. |
 | MCP deferred tool threshold (`McpDeferredToolThreshold`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Next-launch policy is deliberately stable for an already running session/build. Owner: `mcp.deferred_tool_threshold`. |
 | Cloud spend (`CloudSpendStatus`) | Live | Live | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Owner: `cloud spend`. |
+| OpenRouter spend ceiling (`OpenRouterSpendStatus`) | Live | Live | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Owner: `openrouter spend`. |
 | Cloud spend stop line (USD) (`CloudSpendStopLine`) | Live | Live | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Owner: `cloud_spend_stop_line_usd`. |
 | Cloud spend daily cap (USD) (`CloudSpendDailyCap`) | Live | Live | Scheduler/admission/request handlers read runtime controls at their next decision; does not retroactively cancel accepted work. Owner: `cloud_spend_daily_cap_usd`. |
 | Codegraph indexing (`CodegraphIndexing`) | Live | Live | Indexer uses shared runtime flag and publication gate; acknowledged OFF prevents subsequent publication. Owner: `codegraph_indexing_enabled`. |
@@ -403,6 +444,8 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Codex max concurrent subagents (`CodexMaxConcurrentSubagents`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Session launch reads the saved value; existing provider subprocesses keep launch-time settings. Owner: `codex_max_concurrent_subagents`. |
 | Claude fallback models (`ClaudeFallbackModels`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Session launch/credential resolution reads saved policy; existing provider subprocesses keep launch-time settings. Next-launch policy is deliberately stable for an already running session/build. Owner: `claude_fallback_models`. |
 | Claude spend cap per session (USD) (`ClaudeMaxBudgetUsd`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Session launch/credential resolution reads saved policy; existing provider subprocesses keep launch-time settings. Next-launch policy is deliberately stable for an already running session/build. Owner: `claude_max_budget_usd`. |
+| OpenRouter spend cap (USD) (`OpenRouterSpendCap`) | Live | Live | Read at each OpenRouter-billed launch and before every Harness model call; arming (off to on) takes a fresh probe of the account usage as the baseline. Owner: `openrouter_spend_cap_usd`. |
+| OpenRouter spend warn line (%) (`OpenRouterSpendWarnPct`) | Live | Live | Read by the manager pass that sends the one warn notice per arming. Owner: `openrouter_spend_warn_pct`. |
 | Vault: legacy env fallback (`VaultEnvCompat`) | Live | Live | Session launch/credential resolution reads saved policy; existing provider subprocesses keep launch-time settings. Owner: `vault.env_compat`. |
 | Vault: check TTL (`VaultCheckTtl`) | Live | Live | Session launch/credential resolution reads saved policy; existing provider subprocesses keep launch-time settings. Owner: `vault.check_ttl_secs`. |
 | OpenRouter engine (`OpenRouterRoute`) | Next launch (no daemon/TUI restart) | Next launch (no daemon/TUI restart) | Session launch/credential resolution reads saved policy; existing provider subprocesses keep launch-time settings. Next-launch policy is deliberately stable for an already running session/build. Owner: `api_route.openrouter`. |
@@ -435,10 +478,14 @@ report actual behavior; where existing UI metadata was inaccurate, both are stat
 | Warm build pools kept (`TargetPoolKeep`) | Live | Live | Read when a seed starts a pool build and on every reclaim pass; pools beyond it are removed, never one a seed is reading. Owner: `target_pool_keep`. |
 | Warm build pools (`TargetPoolStatus`) | Live | Live | Status is an immediate RPC read (`GetTargetPoolStatus`). Owner: `target pool`. |
 | Purge archived sandboxes (`ArchivedSandboxPurge`) | Live | Live | Storage maintenance/admission reads current runtime policy; status/actions are immediate RPC operations. Owner: `archived_sandbox_purge_enabled`. |
+| Resolve errored sessions (`ErrorDispositionEnabled`) | Live | Live | The disposition loop reads the switch every five minutes; a pass already running finishes. Owner: `error_disposition_enabled`. |
+| Error grace (minutes) (`ErrorDispositionGraceMinutes`) | Live | Live | Each bounded pass reads its grace cutoff, which is checked again before a disposition. Owner: `error_disposition_grace_minutes`. |
+| Error continuations per day (`ErrorDispositionContinuationBudget`) | Live | Live | Each bounded pass reads its continuation budget; durable attempts in the preceding 24 hours count against it. Owner: `error_disposition_continuation_budget`. |
 | Cold-storage archive (`ColdArchiveEnabled`) | Live | Live | The cold-archive loop reads the switch at every 10-minute tick; a pass already running finishes. Owner: `cold_archive_enabled`. |
 | Cold-storage age (days) (`ColdArchiveAfterDays`) | Live | Live | Read when a pass starts; a pass already running keeps its cutoff. Owner: `cold_archive_after_days`. |
 | Cold-storage directory (`ColdArchiveDir`) | Live | Live | Read when a pass starts (and checked against the sandbox roots then); a pass already running keeps its directory, and existing archive files keep their recorded path. Owner: `cold_archive_dir`. |
 | Stored tool-result cap (KiB) (`ToolResultStorageCap`) | Live | Live | `UpdateDaemonConfig` publishes the value into `rsid_core::tool_result_cap`; the event writer reads it for every `ToolResult` it stores (#2373), so it applies to results stored after the change and never rewrites a stored row. Owner: `tool_result_storage_cap_kib`. |
+| Keep referenced pasted images (days) (`PasteRetentionReferencedDays`) | Live | Live | `UpdateDaemonConfig` publishes the value into `rsid_core::paste_retention_setting`; the paste retention pass reads it at its next pass (daemon start, or after an upload at most hourly, #86). 0 (the default) keeps every referenced image. Owner: `paste_retention_referenced_days`. |
 | Claude hooks (`ClaudeHooks`) | Live | Live | File saved immediately; Claude owns consumption at its next supported load boundary. No TUI/daemon restart; cannot promise mutation of active provider hook state. Owner: `~/.claude/settings.json`. |
 | Claude skills (`ClaudeSkills`) | Live | Live | File enable/disable applies immediately to inventory; Claude owns its next skill load. No TUI/daemon restart. Owner: `~/.claude/skills/`. |
 | Signal bridge (`SignalBridge`) | Bridge restart (mislabelled live) | Bridge process restart | TUI writes signal.toml; flywheel-signal/src/main.rs loads once. Restart the independently launched bridge, not rsid; no reload control exists. Owner: `signal.toml`. |
@@ -467,3 +514,70 @@ stay boot-only; only the model name is refreshed per classification.
   generator parity tests (`/tmp/i1200/rsi-full.log`). No baseline reds hit.
 - New tests sit in shards `other-04` (stall detector, classifier, dream) and
   `other-05` (reconciliation).
+
+## Provider billing (#3533)
+
+| Claude billing (`ClaudeBillingMode`) | Provider Billing | `claude_billing_mode` | Store billing aggregates and admission gates | live on next read; historical estimates classified without rewriting rows |
+| Codex billing (`CodexBillingMode`) | Provider Billing | `codex_billing_mode` | Store billing aggregates and admission gates | live on next read; historical estimates classified without rewriting rows |
+| CodexAppServer billing (`CodexAppServerBillingMode`) | Provider Billing | `codexappserver_billing_mode` | Store billing aggregates and admission gates | live on next read; historical estimates classified without rewriting rows |
+| Pioneer billing (`PioneerBillingMode`) | Provider Billing | `pioneer_billing_mode` | Store billing aggregates and admission gates | live on next read; historical estimates classified without rewriting rows |
+| Antigravity billing (`AntigravityBillingMode`) | Provider Billing | `antigravity_billing_mode` | Store billing aggregates and admission gates | live on next read; historical estimates classified without rewriting rows |
+
+## Host tuning, Slice A (#3532)
+
+`:manager tune` opens the local host probe and profile/preset editor. The Resource
+Limits tab and command help point to it. The profile is an operator preference,
+not a RuntimeConfig field; it uses dedicated `GetHostTuning`,
+`ConfigureHostTuning` and `SwitchHostPreset` RPCs. It adds no general settings-page
+row or raw daemon setting. The versioned JSON record `host_tuning.v1` in
+`daemon_settings` holds the profile, explicit numeric per-key bounds, named
+presets and the prior values for undo; no schema migration is needed.
+
+The panel stages reserve/dedicated intent, session-cap guidance, preset values
+and their bounds. `n` captures current settings into a new named draft; initial
+bounds are exactly those captured values, so widening them is an explicit
+operator choice. Tab and j/k select a preset or resource key, Enter edits its
+value, m/M edit its minimum/maximum, b edits reserve %, d selects dedicated,
+g edits session guidance. w saves the complete draft with a revision fence;
+a applies a saved preset; u restores the last switch's prior values; r discards
+the draft and refreshes evidence. Profile/reserve never silently change settings.
+
+| Resource key | Consumer / outcome |
+|---|---|
+| `worker_cpu_quota_percent` | Next worker/tool scope launch; existing scopes retain quota. Linux systemd only. The prior Live label is corrected to NextSpawn. |
+| `hub_build_cpu_percent` | Live shared build and parent CPU slice update; report carries actual systemd apply state. Unsupported or failed enforcement is reported as incomplete, even if values were saved. |
+| `host_load_admission_threshold` | Live host-load admission for new sessions/topology launches. |
+| `governor_build_slots`, `governor_check_slots`, `governor_lander_slots` | Live governor admission; already admitted jobs finish. |
+| `governor_min_avail_mem_gb`, `governor_min_free_disk_gb` | Live governor memory/disk floors; macOS daemon admission reads the published build slot/memory policy. |
+| `agent_build_jobs`, `agent_build_slots` | Next agent/build launch; existing launch environments stay fixed. |
+| `agent_build_sccache_cache_gib` | Next launch's sccache environment. |
+| `sandbox_min_free_gib`, `disk_pressure_min_free_gb` | Live sandbox/admission and reclamation floors. |
+| `target_pool_keep` | Live pool publication/reclaim pass; active seed readers stay protected. |
+| `sandbox_build_cache_reclaim_ttl_secs` | Live cache reclamation pass. |
+| Live-session cap | Profile guidance only. Manager-policy `max_active_sessions` remains its own authority grant and is never changed by tuning. |
+| scoped_test/test threads | Per-job option and load-adaptive runner policy; no existing persisted daemon setting. Not accepted in presets. |
+
+No supported preset key requires a daemon restart. Apply and undo use the same
+validated batch persistence/publication and side-effect path as
+`UpdateDaemonConfig`, serialized against ordinary setting updates. The prior
+values are stored before effects. Re-applying an already matching active preset
+keeps both the revision and undo record. Failed/partial effects retain a pending
+undo record; retry re-runs effects even when saved values already match. Receipts
+always include actual runtime read-back and apply classes. Operator and agent
+undo both honor the currently saved per-key bounds; an operator tightening a
+bound may need to widen it to recover an older value.
+
+`AgentSwitchHostPreset` is RPC-only and requires a current Execute, unpaused
+project, area or portfolio manager seat. It accepts only a saved name or undo;
+it cannot edit profiles, reserves, bounds or presets. Explicit manager-policy
+bounds further narrow the tuning bounds. The three operator RPCs remain absent
+from AGENT_VERBS, READ_VERBS, native tools and the agent CLI catalog.
+
+The probe uses portable available_parallelism and Unix filesystem free space.
+Linux reads memory/load, CPU sensors, and v1/v2 cgroup membership, mount roots and
+ancestor quotas; the tightest quota caps effective CPUs. RAM is explicitly host
+MemTotal/MemAvailable, not a cgroup allowance. Missing readings carry unknown
+reasons; non-Linux memory/cgroup/load/temperature readings are unsupported.
+Windows disk probes are unknown (unavailable), with portable CPU parallelism.
+Guided value derivation, schedules, accelerator discovery and satellites remain
+outside Slice A. No running host settings are changed by this implementation task.

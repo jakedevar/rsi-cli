@@ -741,7 +741,10 @@ impl PinnedSandboxRoot {
             let stat =
                 fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|_| unreadable())?;
             let kind = SFlag::from_bits_truncate(stat.st_mode);
-            if !is_reclaimable_target_entry(name.to_bytes(), kind)
+            let unsafe_nextest_store =
+                name.to_bytes() == b"nextest" && !dir_is_nextest_store(fd, name, 0);
+            if unsafe_nextest_store
+                || !is_reclaimable_target_entry(name.to_bytes(), kind)
                 && !(kind == SFlag::S_IFDIR
                     && is_cargo_target_triple_name(name.to_bytes())
                     && target_triple_dir_has_cargo_layout(fd, name))
@@ -1341,6 +1344,54 @@ fn dir_is_empty(parent_fd: RawFd, name: &CStr) -> bool {
         .all(|entry| entry.is_ok_and(|e| matches!(e.file_name().to_bytes(), b"." | b"..")))
 }
 
+/// Nextest stores arbitrary reports and archives under `target/nextest` (#528).
+/// Accept only real directories and regular files, with the same no-follow,
+/// depth and pass-budget bounds as nested Cargo trees.
+fn dir_is_nextest_store(parent_fd: RawFd, name: &CStr, depth: usize) -> bool {
+    if depth >= NESTED_TARGET_MAX_DEPTH {
+        return false;
+    }
+    let Ok(raw) = nix::fcntl::openat(
+        Some(parent_fd),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(mut dir) = Dir::from_fd(raw) else {
+        return false;
+    };
+    for entry in dir.iter() {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let child = entry.file_name();
+        if matches!(child.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if current_pass_state().charge_filesystem_entry(0).is_err() {
+            return false;
+        }
+        let Ok(stat) = fstatat(Some(raw), child, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return false;
+        };
+        match SFlag::from_bits_truncate(stat.st_mode) {
+            SFlag::S_IFREG => {}
+            SFlag::S_IFDIR if dir_is_nextest_store(raw, child, depth + 1) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Top-level names the desktop lane writes into a Cargo target (#3260). Each is
+/// pinned against the script that writes it by
+/// `desktop_lane_target_entries_are_all_reclaimable`.
+const DESKTOP_LANE_TARGET_DIR: &[u8] = b"desktop-tauri";
+const RELEASE_GUARD_LOCK: &[u8] = b".rsi-release.lock";
+const DESKTOP_RELEASE_GUARD_LOCK: &[u8] = b".rsi-desktop.lock";
+
 fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
     const FIXTURE_SUFFIX: &[u8] = b"-fixtures";
     if kind == SFlag::S_IFDIR {
@@ -1354,8 +1405,13 @@ fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
                 | b"cargo-timings"
                 | b"criterion"
                 | b"dhat"
+                | b"nextest"
                 | b".rsi-tmp"
                 | b"rsid-test-shards"
+                // The desktop lane's own Cargo output: `desktop-test-gate.py`
+                // builds the standalone `desktop/src-tauri` workspace into
+                // `$CARGO_TARGET_DIR/desktop-tauri` (#3260).
+                | DESKTOP_LANE_TARGET_DIR
         ) || name == E2E_ARTIFACTS_DIR_NAME.as_bytes()
             || (name.len() > FIXTURE_SUFFIX.len() && name.ends_with(FIXTURE_SUFFIX))
     } else if kind == SFlag::S_IFREG {
@@ -1369,6 +1425,12 @@ fn is_reclaimable_target_entry(name: &[u8], kind: SFlag) -> bool {
                 | b".future-incompat-report.json"
                 | b".rsid-test-shards.lock"
                 | b".rsi-job-admission.lock"
+                // The release-target guard's flock files (`release-target-guard.sh`,
+                // `.rsi-release.lock`; `install-desktop.sh` sets `.rsi-desktop.lock`),
+                // one per target. A live holder is a process with the file open and
+                // is refused by the process scan, not by this name check (#3260).
+                | RELEASE_GUARD_LOCK
+                | DESKTOP_RELEASE_GUARD_LOCK
                 // The daemon's build-settings record and the warm target
                 // pool's seed marker (#1741), both rewritten on demand.
                 | b".rsi-build-env.json"
@@ -1403,14 +1465,20 @@ fn is_idle_cost_scratch(name: &[u8]) -> bool {
 }
 
 /// How often a `/proc/<pid>` entry that cannot be read is re-read before the
-/// scan fails closed on it (#2163).
-const PROCESS_SCAN_RETRIES: u32 = 3;
+/// scan fails closed on it (#2163, #3368).
+const PROCESS_SCAN_RETRIES: u32 = 8;
 /// Pause between those re-reads. A transient state (a process between
 /// `unshare(2)` and `execve(2)` is briefly non-dumpable, one being torn down
 /// answers `EACCES`/`EIO` rather than `ENOENT`) clears within microseconds to
-/// milliseconds. A process that stays unreadable costs a candidate at most
-/// `PROCESS_SCAN_RETRIES * PROCESS_SCAN_RETRY_DELAY` before it refuses.
-const PROCESS_SCAN_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// milliseconds on an idle host, but a full-library run stretches it: its job
+/// unit is CPU-capped, thousands of test processes exec and exit under the
+/// same `rsi-` cgroup the scan fails closed on, and a throttled process can
+/// stay mid-`exec` for a scheduling period or more (#3368: the 30 ms of the
+/// first fix, three 10 ms re-reads, still refused a reclaim that no consumer
+/// blocked). A process that stays unreadable costs a candidate at most
+/// `PROCESS_SCAN_RETRIES * PROCESS_SCAN_RETRY_DELAY` (400 ms, inside the
+/// pass budget the pause checkpoints) before it refuses.
+const PROCESS_SCAN_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// What one `/proc/<pid>` examination concluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1466,8 +1534,13 @@ fn ensure_no_target_process(
     target: &Path,
 ) -> Result<(), (SkipReason, SandboxReclaimCheck)> {
     let by_reason = |reason: SkipReason| (reason, check(reason.as_str()));
-    let processes = std::fs::read_dir("/proc").map_err(|_| unreadable_process(0))?;
+    let proc_dir = proc_dir();
+    let processes = std::fs::read_dir(&proc_dir).map_err(|_| unreadable_process(0))?;
     let uid = nix::unistd::getuid().as_raw();
+    // The reclaimer's own cgroup, read once: a process sharing it is not a
+    // detached consumer (see `probe_process`).
+    let own_cgroup = std::fs::read_to_string(proc_dir.join("self/cgroup")).ok();
+    let own_cgroup = own_cgroup.as_deref().and_then(cgroup_v2_path);
     for process in processes {
         current_pass_state().checkpoint(0).map_err(by_reason)?;
         let process = process.map_err(|_| unreadable_process(0))?;
@@ -1480,7 +1553,7 @@ fn ensure_no_target_process(
         }
         let path = process.path();
         let probed = settle_process_probe(
-            || probe_process(&path, uid, root, target),
+            || probe_process(&path, uid, own_cgroup, root, target),
             || {
                 std::thread::sleep(PROCESS_SCAN_RETRY_DELAY);
                 current_pass_state().checkpoint(0)
@@ -1508,12 +1581,172 @@ fn unreadable_process(pid: u32) -> (SkipReason, SandboxReclaimCheck) {
     )
 }
 
+/// The unified-hierarchy (`0::<path>`) line of a `/proc/<pid>/cgroup` file.
+/// A v1 or hybrid host has no such line, so no process is judged by cgroup.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_path(cgroup_file: &str) -> Option<&str> {
+    cgroup_file
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(str::trim)
+}
+
+/// Whether `theirs` is the reclaimer's own cgroup or a child of it. The
+/// root cgroup never counts: it would exempt every process.
+#[cfg(target_os = "linux")]
+fn shares_cgroup(own: Option<&str>, theirs: &str) -> bool {
+    let Some(own) = own.map(|own| own.trim_end_matches('/')) else {
+        return false;
+    };
+    !own.is_empty()
+        && (theirs == own
+            || theirs
+                .strip_prefix(own)
+                .is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// The procfs directory the scan reads. Production reads `/proc`; a test that
+/// must not depend on the host's process table installs another directory
+/// (`install_proc_root_for_test`).
+#[cfg(target_os = "linux")]
+fn proc_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-seam"))]
+    if let Some(dir) = proc_root_override()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return dir;
+    }
+    PathBuf::from("/proc")
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+fn proc_root_override() -> &'static Mutex<Option<PathBuf>> {
+    static OVERRIDE: std::sync::OnceLock<Mutex<Option<PathBuf>>> = std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// Points the reclaim process scan at a private procfs-shaped directory until
+/// dropped. Hold it under `reclaim_test_isolation_for_test`: the override is
+/// process-wide, like the other reclaim test hooks.
+#[cfg(any(test, feature = "test-seam"))]
+pub struct ProcRootForTest {
+    dir: tempfile::TempDir,
+    locked: Mutex<Vec<PathBuf>>,
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl ProcRootForTest {
+    /// The directory the scan reads; add `<pid>/{cgroup,cwd,...}` entries to it.
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Whether directory permissions are enforced for this user. A superuser
+    /// reads a mode-000 directory, so it cannot stage an unreadable process.
+    pub fn can_stage_unreadable_process() -> bool {
+        !nix::unistd::geteuid().is_root()
+    }
+
+    /// The cgroup the reclaimer itself runs in (`/proc/self/cgroup`).
+    pub fn set_own_cgroup(&self, cgroup: &str) {
+        let own = self.dir.path().join("self");
+        std::fs::create_dir_all(&own).expect("self entry");
+        std::fs::write(own.join("cgroup"), format!("0::{cgroup}\n")).expect("self cgroup");
+    }
+
+    /// A same-user process in `cgroup` with a readable cwd and executable that
+    /// name nothing of the sandbox, and a descriptor directory the kernel
+    /// refuses to list: what a non-dumpable process looks like to its owner.
+    pub fn add_unreadable_process(&self, pid: u32, cgroup: &str) {
+        let process = self.add_process(pid, cgroup, Path::new("/"));
+        let fd = process.join("fd");
+        std::fs::create_dir_all(&fd).expect("fd dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fd, std::fs::Permissions::from_mode(0o000))
+                .expect("lock fd dir");
+        }
+        self.locked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(fd);
+    }
+
+    /// A same-user process in `cgroup` whose working directory is `cwd`.
+    pub fn add_process(&self, pid: u32, cgroup: &str, cwd: &Path) -> PathBuf {
+        let process = self.dir.path().join(pid.to_string());
+        std::fs::create_dir_all(&process).expect("process entry");
+        std::fs::write(process.join("cgroup"), format!("0::{cgroup}\n")).expect("cgroup");
+        std::fs::write(process.join("environ"), b"").expect("environ");
+        for link in ["cwd", "exe"] {
+            std::os::unix::fs::symlink(
+                if link == "cwd" { cwd } else { Path::new("/") },
+                process.join(link),
+            )
+            .expect("proc link");
+        }
+        process
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+impl Drop for ProcRootForTest {
+    fn drop(&mut self) {
+        *proc_root_override()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // `TempDir` cannot list a directory it may not read.
+        #[cfg(unix)]
+        for fd in self
+            .locked
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(fd, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+}
+
+/// Replace the host's `/proc` with an empty directory for the scan, so a
+/// fixture's verdict cannot depend on which processes the host is running
+/// (cloud-QA #4014: an unreadable same-user process in an `rsi-` unit refused
+/// every candidate on the sweep host only).
+#[cfg(any(test, feature = "test-seam"))]
+pub fn install_proc_root_for_test() -> ProcRootForTest {
+    let dir = tempfile::Builder::new()
+        .prefix("rsi-reclaim-proc-")
+        .tempdir()
+        .expect("private proc root");
+    *proc_root_override()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.path().to_path_buf());
+    ProcRootForTest {
+        dir,
+        locked: Mutex::new(Vec::new()),
+    }
+}
+
 /// One pass over a single `/proc/<pid>`: does this process use the sandbox
 /// root or the target, by cwd, executable, `CARGO_TARGET_DIR` or descriptor?
+///
+/// A same-user process in an `rsi-` unit whose entry stays unreadable refuses
+/// the pass (it may be a detached consumer started with `systemd-run`, which
+/// lives in its own unit). A process in the reclaimer's own cgroup is not such
+/// a consumer: its unit is the one this reclaimer runs in, so it is judged like
+/// the daemon's own service cgroup, where an unreadable (non-dumpable) entry
+/// is tolerated. Without that, a daemon run inside an `rsi-` unit (the cloud
+/// sweep's `rsi-cloud-sweep-<sha>`) was refused by any non-dumpable sibling,
+/// such as a rootless-container helper, on every candidate (#4014).
 #[cfg(target_os = "linux")]
 fn probe_process(
     path: &Path,
     uid: u32,
+    own_cgroup: Option<&str>,
     root: &Path,
     target: &Path,
 ) -> Result<ProcessProbe, ProcessProbeFailure> {
@@ -1534,7 +1767,8 @@ fn probe_process(
     };
     let owned_unit = cgroup
         .split('/')
-        .any(|component| component.starts_with("rsi-"));
+        .any(|component| component.starts_with("rsi-"))
+        && !cgroup_v2_path(&cgroup).is_some_and(|theirs| shares_cgroup(own_cgroup, theirs));
     for link in ["cwd", "exe"] {
         match std::fs::read_link(path.join(link)) {
             Ok(value) if value.starts_with(root) => return Ok(ProcessProbe::InUse),
@@ -5997,6 +6231,65 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
+    fn cargo_target_guard_accepts_nextest_junit_and_reclaims_whole_target() {
+        let (_temp, base, root, id) = fixture();
+        std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+        let report = root.join("target/nextest/test-timings/junit.xml");
+        std::fs::create_dir_all(report.parent().unwrap()).unwrap();
+        std::fs::write(&report, b"<testsuites/>").unwrap();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+        let outcome = pinned.reclaim_target(id, 1);
+        assert_eq!(
+            outcome.kind,
+            TargetReclaimKind::StagedRemoved,
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            pinned.inspect_target().reason,
+            Some(SkipReason::TargetAbsent)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn cargo_target_guard_refuses_nextest_symlinks_and_special_files() {
+        for case in ["store-symlink", "directory-symlink", "file-symlink", "fifo"] {
+            let (temp, base, root, id) = fixture();
+            std::fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+            let store = root.join("target/nextest");
+            let outside = temp.path().join("sentinel");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("junit.xml"), b"preserved").unwrap();
+            if case == "store-symlink" {
+                symlink(&outside, &store).unwrap();
+            } else {
+                // Even names recognized as Cargo output must be inspected.
+                let nested = store.join("test-timings/debug/deps");
+                std::fs::create_dir_all(&nested).unwrap();
+                let entry = nested.join("junit.xml");
+                match case {
+                    "directory-symlink" => symlink(&outside, &entry).unwrap(),
+                    "file-symlink" => symlink(outside.join("junit.xml"), &entry).unwrap(),
+                    "fifo" => nix::unistd::mkfifo(&entry, Mode::from_bits_truncate(0o600)).unwrap(),
+                    _ => unreachable!(),
+                }
+            }
+            let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+            let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+            assert_eq!(reason, SkipReason::TargetUnrecognizedContent, "{case}");
+            assert_eq!(check.token(), "target_entry_unrecognized:nextest", "{case}");
+            assert!(root.join("target/debug/deps").is_dir());
+            assert_eq!(
+                std::fs::read(outside.join("junit.xml")).unwrap(),
+                b"preserved"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
     fn cargo_target_guard_preserves_unknown_files_and_non_cargo_entry_types() {
         use std::os::unix::fs::FileTypeExt;
         let (temp, base, root, id) = fixture();
@@ -6056,6 +6349,7 @@ mod tests {
             b"tmp",
             b".rsi-tmp",
             b"rsid-test-shards",
+            b"nextest",
             E2E_ARTIFACTS_DIR_NAME.as_bytes(),
             b"rsid-test-fixtures",
             b"rsid-d00-fixtures",
@@ -6098,8 +6392,34 @@ mod tests {
         for kind in [SFlag::S_IFLNK, SFlag::S_IFIFO, SFlag::S_IFSOCK] {
             assert!(!is_reclaimable_target_entry(b".rsi-tmp", kind));
             assert!(!is_reclaimable_target_entry(b"debug", kind));
+            assert!(!is_reclaimable_target_entry(b"nextest", kind));
             assert!(!is_reclaimable_target_entry(b".rustc_info.json", kind));
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn finished_target_with_scoped_failure_snapshot_is_reclaimed() {
+        let (_temp, base, root, id) = fixture();
+        let snapshot = root.join("target/.rsi-tmp/scoped-test/known-failures.v1.json");
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::fs::write(&snapshot, b"{}").unwrap();
+        std::fs::create_dir(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/artifact"), b"finished build").unwrap();
+
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+        let outcome = pinned.reclaim_target(id, 1);
+        assert_eq!(
+            outcome.kind,
+            TargetReclaimKind::StagedRemoved,
+            "{outcome:?}"
+        );
+        assert_eq!(outcome.reason, None);
+        assert_eq!(
+            pinned.inspect_target().reason,
+            Some(SkipReason::TargetAbsent)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -6262,6 +6582,90 @@ mod tests {
         assert_eq!(probes, 1);
     }
 
+    const SWEEP_UNIT: &str = "/system.slice/rsi-cloud-sweep-4001b92.service";
+
+    /// A same-user process whose entry the kernel will not list, in the unit the
+    /// reclaimer itself runs in (the cloud sweep's `rsi-cloud-sweep-<sha>`): the
+    /// sweep host refused every candidate on it (#4014).
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn an_unreadable_process_in_the_reclaimers_own_unit_does_not_refuse_the_scan() {
+        if !ProcRootForTest::can_stage_unreadable_process() {
+            return;
+        }
+        let _isolation = reclaim_test_isolation_for_test();
+        let proc_root = install_proc_root_for_test();
+        proc_root.set_own_cgroup(SWEEP_UNIT);
+        proc_root.add_unreadable_process(4242, SWEEP_UNIT);
+        proc_root.add_unreadable_process(4243, &format!("{SWEEP_UNIT}/child.scope"));
+        let sandbox = tempfile::tempdir().unwrap();
+        let target = sandbox.path().join("target");
+        assert!(ensure_no_target_process(sandbox.path(), &target).is_ok());
+    }
+
+    /// The other half of the contract: an unreadable process in a different
+    /// `rsi-` unit may be a detached consumer, so it still refuses, and so does
+    /// one whose unit merely shares a name prefix with the reclaimer's.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn an_unreadable_process_in_another_rsi_unit_still_refuses_the_scan() {
+        if !ProcRootForTest::can_stage_unreadable_process() {
+            return;
+        }
+        let _isolation = reclaim_test_isolation_for_test();
+        let sandbox = tempfile::tempdir().unwrap();
+        let target = sandbox.path().join("target");
+        for (pid, other) in [
+            (4300, "/system.slice/rsi-job-7.service"),
+            (4301, "/system.slice/rsi-cloud-sweep-4001b92.service-other"),
+            (4302, "/system.slice/rsi-cloud-sweep-4001b9"),
+        ] {
+            let proc_root = install_proc_root_for_test();
+            proc_root.set_own_cgroup(SWEEP_UNIT);
+            proc_root.add_unreadable_process(pid, other);
+            let (reason, check) = ensure_no_target_process(sandbox.path(), &target).unwrap_err();
+            assert_eq!(reason, SkipReason::UnreadableEntry, "{other}");
+            assert_eq!(check.token(), format!("process_scan_unreadable:{pid}"));
+        }
+        // Without the reclaimer's own cgroup nothing is exempt.
+        let proc_root = install_proc_root_for_test();
+        proc_root.add_unreadable_process(4310, SWEEP_UNIT);
+        let (reason, _) = ensure_no_target_process(sandbox.path(), &target).unwrap_err();
+        assert_eq!(reason, SkipReason::UnreadableEntry);
+    }
+
+    /// Sharing the reclaimer's unit exempts only an unreadable entry: a readable
+    /// process there that uses the sandbox still blocks the reclaim.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn a_readable_consumer_in_the_reclaimers_own_unit_still_blocks_the_scan() {
+        let _isolation = reclaim_test_isolation_for_test();
+        let proc_root = install_proc_root_for_test();
+        proc_root.set_own_cgroup(SWEEP_UNIT);
+        let sandbox = tempfile::tempdir().unwrap();
+        let target = sandbox.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        proc_root.add_process(4400, SWEEP_UNIT, &target);
+        let (reason, check) = ensure_no_target_process(sandbox.path(), &target).unwrap_err();
+        assert_eq!(reason, SkipReason::ActiveOwner);
+        assert_eq!(check.token(), "process_uses_sandbox:4400");
+    }
+
+    /// A fixture that installs a private procfs sees none of the host's
+    /// processes, whatever their state.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn an_empty_private_proc_root_scans_clean_regardless_of_the_host() {
+        let _isolation = reclaim_test_isolation_for_test();
+        let _proc_root = install_proc_root_for_test();
+        let sandbox = tempfile::tempdir().unwrap();
+        assert!(ensure_no_target_process(sandbox.path(), &sandbox.path().join("target")).is_ok());
+    }
+
     #[cfg(target_os = "linux")]
     struct ReapedChild(std::process::Child);
 
@@ -6271,26 +6675,88 @@ mod tests {
             PathBuf::from(format!("/proc/{}", self.0.id()))
         }
 
-        /// `spawn` returns once the kernel has switched the child to its new
-        /// program, but `execve` publishes the child's environment area a
-        /// little later: a `/proc/<pid>/environ` read in between is empty, and a
-        /// `CARGO_TARGET_DIR` consumer probed that early reads as unrelated.
-        /// Wait until the environment is visible so the probe judges the
-        /// settled process.
-        fn wait_until_exec_settled(&self) {
+        /// `spawn` can return before the child runs its new program, and
+        /// `execve` publishes the child's command line and environment area a
+        /// little after it switches address spaces. Until then
+        /// `/proc/<pid>/environ` is either empty or, for a child that has not
+        /// yet exec'd, the PARENT's environment (non-empty, without the
+        /// variable the test set), so a `CARGO_TARGET_DIR` consumer probed that
+        /// early reads as unrelated (#3639). Wait until the child is observably
+        /// the program the test started (its `cmdline` names it), in its
+        /// requested working directory, with every environment variable the
+        /// test set, so the probe judges the settled process.
+        fn wait_until_exec_settled(&self, expected: &ExpectedChild) {
             let deadline = Instant::now() + Duration::from_secs(30);
+            let pid = self.0.id();
             loop {
-                match std::fs::read(self.proc_path().join("environ")) {
-                    Ok(environment) if !environment.is_empty() => return,
-                    Ok(_) => {}
-                    Err(error) => panic!("child {} environ unreadable: {error}", self.0.id()),
+                match self.settled_state(expected) {
+                    Ok(None) => return,
+                    Ok(Some(_)) => {}
+                    Err(error) => panic!("child {pid} unreadable while settling: {error}"),
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "child {} never published its environment",
-                    self.0.id()
-                );
+                if Instant::now() >= deadline {
+                    let waiting_for = self.settled_state(expected).ok().flatten();
+                    panic!("child {pid} never settled after exec: {waiting_for:?}");
+                }
                 std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// `None` when the child shows everything `expected` names, else what
+        /// is still missing.
+        fn settled_state(&self, expected: &ExpectedChild) -> std::io::Result<Option<&'static str>> {
+            let proc = self.proc_path();
+            let cmdline = std::fs::read(proc.join("cmdline"))?;
+            let program = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+            if program != expected.program.as_bytes() {
+                return Ok(Some("cmdline"));
+            }
+            if std::fs::read_link(proc.join("cwd"))? != expected.cwd {
+                return Ok(Some("cwd"));
+            }
+            let environment = std::fs::read(proc.join("environ"))?;
+            let variables: HashSet<&[u8]> = environment.split(|byte| *byte == 0).collect();
+            if !expected
+                .variables
+                .iter()
+                .all(|variable| variables.contains(variable.as_slice()))
+            {
+                return Ok(Some("environ"));
+            }
+            Ok(environment.is_empty().then_some("environ"))
+        }
+    }
+
+    /// What `idle_child` configured, so the settle wait can compare it with
+    /// what the kernel shows for the running process.
+    #[cfg(target_os = "linux")]
+    struct ExpectedChild {
+        program: &'static str,
+        cwd: PathBuf,
+        /// `NAME=value` entries the test set explicitly.
+        variables: Vec<Vec<u8>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ExpectedChild {
+        fn of(program: &'static str, command: &std::process::Command) -> Self {
+            let cwd = command
+                .get_current_dir()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            let variables = command
+                .get_envs()
+                .filter_map(|(name, value)| {
+                    let mut entry = name.as_bytes().to_vec();
+                    entry.push(b'=');
+                    entry.extend_from_slice(value?.as_bytes());
+                    Some(entry)
+                })
+                .collect();
+            Self {
+                program,
+                cwd: std::fs::canonicalize(cwd).unwrap(),
+                variables,
             }
         }
     }
@@ -6308,8 +6774,9 @@ mod tests {
         let mut command = std::process::Command::new("sleep");
         command.arg("120").current_dir("/");
         configure(&mut command);
+        let expected = ExpectedChild::of("sleep", &command);
         let child = ReapedChild(command.spawn().unwrap());
-        child.wait_until_exec_settled();
+        child.wait_until_exec_settled(&expected);
         child
     }
 
@@ -6323,7 +6790,8 @@ mod tests {
         let held = target.join("held");
         std::fs::write(&held, b"cache").unwrap();
         let uid = nix::unistd::getuid().as_raw();
-        let probe = |child: &ReapedChild| probe_process(&child.proc_path(), uid, &root, &target);
+        let probe =
+            |child: &ReapedChild| probe_process(&child.proc_path(), uid, None, &root, &target);
 
         let unrelated = idle_child(|_| {});
         assert_eq!(probe(&unrelated), Ok(ProcessProbe::Unrelated));
@@ -6345,9 +6813,159 @@ mod tests {
         let gone_path = PathBuf::from(format!("/proc/{}", gone.id()));
         gone.wait().unwrap();
         assert_eq!(
-            probe_process(&gone_path, uid, &root, &target),
+            probe_process(&gone_path, uid, None, &root, &target),
             Ok(ProcessProbe::Unrelated)
         );
+    }
+
+    /// Every top-level name the desktop lane (and the release-target guard it
+    /// sources) writes into a Cargo target, read from the scripts that write it
+    /// (#3260). A new lock or output directory in those scripts that the reclaim
+    /// allowlist does not know would silently re-pin finished worker targets.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    fn desktop_lane_target_entries() -> (Vec<String>, Vec<String>) {
+        let scripts = Path::new(rsi_common::manifest_dir!()).join("../../scripts");
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(&scripts).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|ext| ext != "sh") {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                // `RELEASE_GUARD_LOCK=".rsi-desktop.lock"`: one lock file per
+                // target, created by `release_guard_lock` at the target root.
+                if let Some(name) = line
+                    .strip_prefix("RELEASE_GUARD_LOCK=\"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+                {
+                    files.push(name.to_string());
+                }
+            }
+        }
+        // `$CARGO_TARGET_DIR/desktop-tauri`: the standalone workspace's target.
+        let gate = std::fs::read_to_string(scripts.join("desktop-test-gate.py")).unwrap();
+        for line in gate.lines() {
+            if let Some((_, rest)) = line.split_once("Path(env[\"CARGO_TARGET_DIR\"]) / \"") {
+                dirs.push(rest.split('"').next().unwrap().to_string());
+            }
+        }
+        (files, dirs)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn desktop_lane_target_entries_are_all_reclaimable() {
+        let (files, dirs) = desktop_lane_target_entries();
+        // The derivation itself must find the lane's names, or the guard is
+        // vacuous after a script rewrite.
+        for expected in [".rsi-release.lock", ".rsi-desktop.lock"] {
+            assert!(files.iter().any(|name| name == expected), "{files:?}");
+        }
+        assert_eq!(dirs, ["desktop-tauri"]);
+        for name in &files {
+            assert!(
+                is_reclaimable_target_entry(name.as_bytes(), SFlag::S_IFREG),
+                "{name} is written into the target by the desktop lane but is not in the reclaim allowlist"
+            );
+        }
+        for name in &dirs {
+            assert!(
+                is_reclaimable_target_entry(name.as_bytes(), SFlag::S_IFDIR),
+                "{name} is written into the target by the desktop lane but is not in the reclaim allowlist"
+            );
+        }
+        // Exact kinds only: a lock is a regular file, the lane target a real
+        // directory, never a link or the other kind.
+        assert!(!is_reclaimable_target_entry(
+            b".rsi-desktop.lock",
+            SFlag::S_IFDIR
+        ));
+        assert!(!is_reclaimable_target_entry(
+            b"desktop-tauri",
+            SFlag::S_IFREG
+        ));
+        assert!(!is_reclaimable_target_entry(
+            b".rsi-desktop.lock",
+            SFlag::S_IFLNK
+        ));
+        assert!(!is_reclaimable_target_entry(
+            b"desktop-tauri",
+            SFlag::S_IFLNK
+        ));
+        assert!(!is_reclaimable_target_entry(
+            b".rsi-desktop.lock.bak",
+            SFlag::S_IFREG
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn idle_cargo_target_accepts_the_desktop_lane_outputs() {
+        let (_temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let (files, dirs) = desktop_lane_target_entries();
+        for file in &files {
+            std::fs::write(target.join(file), b"").unwrap();
+        }
+        for dir in &dirs {
+            std::fs::create_dir_all(target.join(dir).join("release/bundle")).unwrap();
+            std::fs::write(target.join(dir).join("release/bundle/blob"), b"x").unwrap();
+        }
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // `install-desktop.sh` with `CARGO_TARGET_DIR` at the lane target puts
+        // its lock inside the nested Cargo tree; that tree stays recognized.
+        let lane = target.join("desktop-tauri");
+        std::fs::remove_dir_all(&lane).unwrap();
+        std::fs::create_dir_all(lane.join("release/deps")).unwrap();
+        std::fs::write(lane.join("CACHEDIR.TAG"), b"Signature: x\n").unwrap();
+        std::fs::write(lane.join(".rsi-desktop.lock"), b"").unwrap();
+        std::fs::write(lane.join(".rustc_info.json"), b"{}").unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        // A foreign file beside them still retains the whole target.
+        std::fs::write(target.join("lander"), b"manager state").unwrap();
+        assert_eq!(
+            pinned.ensure_idle_cargo_target(),
+            Err(SkipReason::TargetUnrecognizedContent)
+        );
+    }
+
+    /// A live holder of the desktop lock (an `install-desktop.sh` mid-build)
+    /// still retains the target, with a typed reason naming the process, even
+    /// though the lock's name is now recognized (#3260).
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn a_held_desktop_lock_retains_the_target_with_a_typed_reason() {
+        use std::os::fd::AsRawFd;
+        let (_temp, base, root, id) = fixture();
+        let pinned = PinnedSandboxRoot::open(&base, &root, id).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock_path = target.join(".rsi-desktop.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
+
+        let lock = std::fs::File::open(&lock_path).unwrap();
+        assert_eq!(
+            unsafe { nix::libc::flock(lock.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) },
+            0
+        );
+        let holder = idle_child(|command| {
+            command.stdin(lock);
+        });
+        let (reason, check) = pinned.ensure_idle_cargo_target_checked().unwrap_err();
+        assert_eq!(reason, SkipReason::ActiveOwner);
+        assert_eq!(
+            check.token(),
+            format!("process_uses_sandbox:{}", holder.0.id())
+        );
+        drop(holder);
+        assert_eq!(pinned.ensure_idle_cargo_target(), Ok(()));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
@@ -7136,6 +7754,16 @@ mod tests {
         for _ in 0..BUCKET_COUNT.saturating_mul(2) {
             if flat_names().is_empty() {
                 break;
+            }
+            // The migration scan takes the first quantum of flat names in
+            // directory order, so the conflict stage may miss the first
+            // pass. Bucket recovery meanwhile rejects the planted collision
+            // as a malformed entry, and the stage would then migrate
+            // cleanly and be reclaimed instead of rejected. Re-plant the
+            // collision before every pass while the stage is still flat so
+            // the conflict exists whenever that stage is migrated.
+            if queue.join(&conflict).exists() {
+                std::fs::write(conflict_bucket.join(&conflict), b"collision").unwrap();
             }
             recover_staged_targets_with_state(&base, false, &ReclaimPassState::new());
         }

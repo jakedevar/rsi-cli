@@ -19,6 +19,7 @@ mod agent_landing_candidate_verb;
 pub(crate) mod agent_message_arbiter;
 pub(crate) mod agent_message_delivery;
 mod agent_projects; // #1626
+pub(crate) mod bench_route; // #3177
 mod effect_fence;
 mod operator_todos; // #1747
 pub(crate) mod standing_directives; // #2649
@@ -37,11 +38,14 @@ mod completion_gates_launch;
 mod context_cap;
 mod context_pipeline;
 mod context_succession;
+pub(crate) mod custom_provider_launch;
 mod daemon_info_verb;
 pub(crate) mod daemon_wait; // #2353
 mod delegated_operator;
 pub(crate) mod deploy_verb;
+mod error_disposition;
 mod esp_games;
+mod exec_target_launch;
 mod failure_signature_verb;
 mod global_manager_verbs; // #872 Slice B
 pub(crate) mod graph_executions;
@@ -87,6 +91,7 @@ pub(crate) mod question;
 mod reaper;
 mod remote_answers;
 pub mod retention;
+mod role_playbook;
 mod rolling_queue_verb;
 mod satellite_message_verb;
 mod satellite_report_verb;
@@ -117,6 +122,7 @@ pub(crate) mod topology_bridge;
 pub(crate) mod topology_ops;
 pub(crate) use rsid_store::store::session_transient_heal as transient_heal;
 mod list_wakes_verb; // #2389: AgentListWakes
+pub(crate) mod manager_idle; // #3765
 pub(crate) mod manager_question_stall;
 pub mod types;
 pub(crate) mod until_evaluator;
@@ -543,7 +549,7 @@ pub struct SessionManager {
         Arc<harness::tools::process_registry::HarnessProcessRegistryManager>,
     /// Shared S3 index registration used by construction-bound native reads.
     pub(super) codegraph_handle: Option<crate::codegraph::IndexHandle>,
-    pub(super) store: Arc<tokio::sync::Mutex<Store>>,
+    pub(super) store: Arc<rsid_core::store_lock::Mutex<Store>>,
     /// Bounded, same-boot settlement for custody effect permits.  It shares
     /// this manager's Store handle so custody never creates a parallel mutex
     /// regime around SQLite.
@@ -871,7 +877,7 @@ impl SessionManager {
         // crashed attempt produced no external effect.
         store.set_delivery_boot_id(Uuid::new_v4())?;
         let database_path = store.database_path().map(std::path::PathBuf::from);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let (custody_settlements, custody_settlement_worker) =
             crate::sandbox::custody::CustodySettlementService::new(Arc::clone(&store))?;
         let persistence = PersistenceHandle::new(Arc::clone(&store));
@@ -900,7 +906,7 @@ impl SessionManager {
         // Construct sandbox allocator and ensure its base dir exists. A
         // failure here is logged but non-fatal: sandboxed launches will
         // surface the error at allocation time.
-        let sandbox_allocator = Arc::new(SandboxAllocator::new(sandbox_base.clone()));
+        let sandbox_allocator = SandboxAllocator::new(sandbox_base.clone());
         if let Err(e) = sandbox_allocator.ensure_base() {
             tracing::warn!(
                 sandbox_base = %sandbox_base.display(),
@@ -908,6 +914,9 @@ impl SessionManager {
                 "Failed to ensure sandbox base dir at startup; sandboxed launches may fail"
             );
         }
+        // #143: allocation needs the exact canonical base; a configured base
+        // under a symlinked ancestor (macOS /tmp) is resolved here, once.
+        let sandbox_allocator = Arc::new(sandbox_allocator.with_canonical_base());
 
         // Build the global tool registry. The memory_search tool is
         // intentionally registered *without* a project scope here — this
@@ -972,7 +981,7 @@ impl SessionManager {
             active: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
             completed_transcript_cache: completed_transcript_cache::CompletedTranscriptCache::new(),
-            event_bus,
+            event_bus: Arc::clone(&event_bus),
             claude_client,
             codex_client,
             local_client,
@@ -980,7 +989,7 @@ impl SessionManager {
             harness_client,
             harness_process_manager: Arc::clone(&harness_process_manager),
             codegraph_handle: None,
-            store,
+            store: Arc::clone(&store),
             custody_settlements,
             custody_settlement_worker,
             persistence,
@@ -1006,7 +1015,10 @@ impl SessionManager {
             workspace_roots,
             tool_registry,
             runtime_config,
-            provider_login: crate::provider_login::ProviderLoginService::for_manager(),
+            provider_login:
+                crate::provider_login::ProviderLoginService::for_manager_with_rate_limits(
+                    &store, &event_bus,
+                ),
             provider_contract: crate::provider_contract::ProviderContractService::for_manager(),
             daemon_config_update: tokio::sync::Mutex::new(()),
             cold_archive_running: std::sync::atomic::AtomicBool::new(false),
@@ -1070,6 +1082,7 @@ impl SessionManager {
     /// The provider CLI login probes (#2753).
     #[must_use]
     pub fn provider_login(&self) -> &Arc<crate::provider_login::ProviderLoginService> {
+        self.provider_login.set_billing_store(&self.store);
         &self.provider_login
     }
 
@@ -1102,7 +1115,7 @@ impl SessionManager {
     }
 
     /// Access the backing store (for direct queries like model segments).
-    pub fn store(&self) -> &Arc<tokio::sync::Mutex<Store>> {
+    pub fn store(&self) -> &Arc<rsid_core::store_lock::Mutex<Store>> {
         &self.store
     }
 
@@ -1659,7 +1672,7 @@ impl SessionManager {
     /// Active -> Store -> A6 read.
     pub(super) async fn reconstruct_live_same_id_controller_grant(
         active: &RwLock<HashMap<Uuid, TrackedSession>>,
-        store: &tokio::sync::Mutex<Store>,
+        store: &rsid_core::store_lock::Mutex<Store>,
         agent_tokens: &RwLock<AgentTokenRegistry>,
         session_id: Uuid,
         project_id: Option<Uuid>,
@@ -1859,7 +1872,7 @@ impl SessionManager {
     /// next same-ID continuation), and subscribers see the committed event.
     pub(super) async fn settle_rotation_controller_moves(
         active: &RwLock<HashMap<Uuid, TrackedSession>>,
-        store: &tokio::sync::Mutex<Store>,
+        store: &rsid_core::store_lock::Mutex<Store>,
         agent_tokens: &RwLock<AgentTokenRegistry>,
         event_bus: &EventBus,
         moves: &[crate::store::rotation_abandon::RotationControllerMove],
@@ -2724,7 +2737,7 @@ impl SessionManager {
             }
             lines.insert(
                 0,
-                format!("{pending} durable manager notices pending; read AgentManagerInbox"),
+                format!("{pending} durable manager notices pending; read AgentManagerInbox {{\"fields\":\"full\"}}. Lead mail bodies are in notices[].state.message and messages[].message. Follow next_after_sequence as after_sequence for message pages; expand a summary with read_notice_ids:[<notice_id>], fields:\"full\"."),
             );
         }
 
@@ -2946,18 +2959,15 @@ impl SessionManager {
         query: String,
         job_ids: Option<Vec<Uuid>>,
     ) -> Result<Uuid> {
-        // A8 §9 Q1 (Jake: INCLUDE): chase rotation lineage so a wake armed
-        // against a since-rotated session resumes the live tip, never a
-        // superseded row (the duplicate-master incident class). K2: the chase
-        // is the published tip (RPC-1 C2) captured with the lead generation;
-        // the tip's guard re-checks both, publication and busy, so the
-        // busy pre-check moved under the guard.
+        // Capture fresh delivery state. Child/manager deliveries retain the
+        // K2 lineage chase; an owner's resume/when wake requires that exact
+        // owner to remain the tip and tolerates daemon-authored cursor growth.
         let fence = self
-            .capture_continuation_fence(
-                target,
-                crate::store::manager_actions::fence::ContinuationAuthorityV1::Automated,
-            )
-            .await?;
+            .store
+            .lock()
+            .await
+            .capture_scheduled_continuation_fence(target, job_ids.as_deref().unwrap_or_default())?
+            .ok_or(DaemonError::SessionNotFound(target))?;
         let target = fence.tip;
 
         // Scheduled resume/watch delivery wakes an existing session; it must

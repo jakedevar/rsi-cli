@@ -235,6 +235,7 @@ mod tests {
 
     fn entry(state: RollingQueueEntryState, landed: Option<&str>) -> RollingQueueEntryV1 {
         RollingQueueEntryV1 {
+            issue: None,
             id: Uuid::new_v4(),
             sequence: 7,
             source_commit: "a".repeat(40),
@@ -244,9 +245,11 @@ mod tests {
             work_key: None,
             migration_version: None,
             hot_files: Vec::new(),
+            derived_test_filters: Vec::new(),
             test_filters: Vec::new(),
             fixes_tests: Vec::new(),
             filters_state: None,
+            expedite_reason: None,
             state,
             outcome: landed.map(|sha| RollingQueueOutcome {
                 landed_sha: Some(sha.into()),
@@ -349,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_press_shows_the_commit_and_the_second_enqueues_exactly_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::socket_tempdir().unwrap();
         let socket = dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let mut app = crate::app::app_test_helpers::with_session_list(1);

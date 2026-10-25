@@ -35,16 +35,52 @@ note is `idempotency_conflict`), and is returned as `status_note` by
 operator audit access and remains default-denied to tokened callers.
 
 A live Issue-bound worker may also use `AgentListIssues` to dedupe before filing:
-`title_contains` is required and `project_id` must be omitted. Its live launch
+it must narrow with at least one of `title_contains`, `labels` or `status` (#184:
+a `labels`- or `status`-only search is a read-only summary search over its bound
+project; `{}` is refused naming `title_contains`) and `project_id` must be omitted
+(refused `authority_denied`). Its live launch
 binding determines project scope within the list transaction. It receives only
-`display_number`, `id`, `title`, `labels`, `status`, `priority`, `created_at`
+`display_number`, `id`, `row_version`, `title`, `labels`, `status`, `priority`, `created_at`
 and `updated_at` in each row, with the same page envelope and cursor. All list
 filters, including `labels` (all exact matches), work on both projections. RPC
 and native tools serialize the same typed result. Leads and managers choose
 with `fields: "summary" | "full"` (#2052): omitted, a `title_contains` search
 returns the summary rows (no bodies; read one with `AgentGetIssue`) and every
 other list keeps full records; `fields:"full"` restores bodies on a search. A
-bound worker always gets summary rows.
+bound worker always gets summary rows. The summary's `row_version` is the same
+integer accepted as `expected_row_version` by Issue mutations, so a manager can
+close a listed Issue without fetching its full record first (#539).
+
+Every `AgentListIssues` `invalid_request` names its field and the fix (kaizen #184):
+the envelope's `validation` carries the class and field and `next_action` the static
+wording (`rsi_common::rpc::agent_issue_invalid_request_next_action`), for example
+`params: an unknown field; AgentListIssues accepts only status, archive, cursor, limit,
+ready, order, title_contains, labels, fields ... (there is no `query` field)`,
+`params.limit: invalid value; limit must be an integer in 1..=256` (a bad `limit`,
+`cursor`, `fields`, `status` or other value is classified at decode, never a bare
+`invalid_request`) and, for a worker's search with no filter,
+`params.title_contains: an Issue-bound worker ... searches its own project with
+title_contains, labels or status (at least one) ...`. The refusal never echoes a
+caller-supplied key or value. The other guarded Issue verbs get the generic
+`params.<field>: required|invalid value` wording, with the catalog verb to consult.
+
+**Issue-worker launch field conflicts (#527).** `AgentManagerLaunchIssueWorker`
+accepts `review_of` or `continue_from`, never both non-null. The refusal names both
+fields and the fix: omit `continue_from` to launch a fresh review with the latest
+implementer handoff. Catalog parameter validation returns `invalid_input` with
+`path: "params.continue_from"` and that explanation in `constraint`; direct request
+validation returns `manager_issue_worker_invalid_request` with the same explanation.
+`continue_from` is also exclusive with `sandbox_source`.
+
+**Project repository for worker sources (#617).** A container's working directory
+is hierarchy metadata, not repository authority. Manager creates (including
+project-bound Issue workers and inferred review sources) resolve the target
+project's registered path at admission and recheck it before launch. Default
+containers use that path too. An absent, non-repository or unusable registered
+path refuses `manager_sandbox_source_invalid` naming the attempted path; it never
+falls back to the manager seat's repository. Explicit commit/worktree refusals
+name the checked repository and source. Existing leaf-source custody checks,
+freshly fetched default `origin/rolling` and admission-time exact pins still apply.
 
 **Bound-worker reads of referenced Issues (#218; hub #2505, #2391, #2408).** A worker
 launched by `AgentManagerLaunchIssueWorker` reads, with `AgentGetIssue` and read-only,
@@ -52,7 +88,8 @@ launched by `AgentManagerLaunchIssueWorker` reads, with `AgentGetIssue` and read
 same-project Issues it references. Referenced means a `#N`, `#A-#B`, `#A-B`, `#A..#B`
 (or en-dash) selector in: the bound Issue's body (read now), its newest 64 handoff records
 (read now, worker-authored ones included: a worker can extend its own reads inside its
-project but gains no write and never crosses projects), the manager's launch brief (the
+project but gains no write and never crosses projects), the manager's admitted launch
+request's `brief` field (not the whole daemon-compiled visible query; the
 selectors are snapshotted into the launch binding as `brief_refs`, at most 64 distinct;
 more refuses the launch `manager_issue_worker_references_overflow`), or the launch's
 `related` list (at most 16 numbers, the same-project Issues whose COMPLETE text and latest
@@ -70,7 +107,14 @@ or `/` is not a selector, and a range selects `A..=B` only when it spans at most
 numbers (a reversed or wider range selects just its two endpoints, so no middle number
 is granted silently). References never chain: the text of a read or attached Issue
 selects nothing. The attachment is a snapshot at launch (whole or named with its size
-and left to be read, never cut); the read is live at call time. A foreign-project or
+and left to be read, never cut); the read is live at call time. Selectors only in
+daemon-copied reviews, implementer text, latest/preceding handoffs, related text or
+evidence blocks grant no additional live Issue reads, including a copied handoff
+authored by a manager. Required same-project dependencies must be selected explicitly
+in the admitted request's `brief` field (a valid `#N`) or `related` list. The copied
+review/revision/related sections state this distinction. `review_of` alone grants no
+reverse live read from reviewer to implementer; explicit selection can independently
+grant that same-project read. A foreign-project or
 unknown UUID, a missing number, an unreferenced Issue and a binding whose launch is no
 longer `running`/`succeeded` (revoked, failed) keep `agent_issue_authority_denied`.
 Writes, status changes and handoffs stay on the bound Issue: the compiled brief ends
@@ -79,10 +123,30 @@ with a section naming it as the only publication Issue whatever the freeform bri
 `AgentManagerOverview {fleet?}` (#2052) takes `fleet: "none" | "summary" |
 "full"`. The default `summary` replaces the fleet rollup with `{view:"summary",
 as_of, active, totals:{1h,24h}, models:[{model, active, 1h, 24h}], ...}` where
-each window is `{invocations, errors, cost}`; `none` returns `fleet: null`;
+each usage window is `{invocations, errors, cost}`. Both `summary` and `full`
+include `fleet.provider_windows`: account-level provider snapshots with utilization,
+reset epoch and observation time, as in the resources view (#3567); `none` returns `fleet: null`;
 `full` is the whole rollup (every project, provider and model group over
 5m/1h/24h). The operator `GetManagerNodeWorkspace` always returns the full
 shape. `AgentGlobalOverview` carries no fleet.
+
+`AgentManagerOverview {detail?, directives?}` (#3531) is compact by default
+(`detail: "compact"`; `"full"` is the whole serialized workspace, the shape the
+operator `GetManagerNodeWorkspace` returns). Compact removes the repeats one
+call carried: (1) a project child's `children[].seat` keeps only `session_id`,
+`project_id`, `launch_turn` and the predecessor summary when that session is
+the `projects[].overview.manager` row, which holds the seat; (2) a seat's
+`predecessors` becomes `predecessor_count` plus `newest_predecessor`
+(`predecessors_truncated` stays); (3) standing directives (the node's and each
+project's) become `{id, scope, title, updated_at, text_bytes}` (title = first
+line, 80 chars); `directives: true` returns the verbatim records; (4) every
+seat's `coordinator_budget` is a key into the top-level `coordinator_budgets`
+map, one entry per distinct budget (`<provider>/<model>`, `#2`.. when one
+model's budgets differ); (5) `launches_display` is dropped, the structured
+`grant.allowed_launches` stays. The typed `agent_manager_overview` and the
+operator workspace are unchanged. Not done: "full directive text only when
+changed since the seat's last read" needs per-seat read state; use
+`directives: true` instead.
 
 ProgramRun kernel (operator-only; V78, custody-hardened by V79; divergent legacy
 V78 baselines are normalized forward by `repair_legacy_d05_v78_baseline` before
@@ -101,7 +165,16 @@ held and why" is one read. The rows are immutable (a BEFORE INSERT guard refuses
 collisions, #2689); a run recorded before V179 has none. `AgentAuditSourceWorktreeCohort` returns
 with `fields:"full"` the latest run's snapshot as `last_run_retained_roots` beside the fresh `items` (#2690): it is what
 that run recorded, not today's classification, and lists only the roots whose owner the caller
-covers now. A retained item explains itself in its `diagnostic` (#2731): `custody_unverified` and
+covers now. Unproven survivors (#149, V188 `source_worktree_settlement_unproven_survivors`):
+the orphan reap after durable intent never signals a process it cannot prove by its exact stamps,
+and on macOS the kernel withholds the environment of platform and hardened binaries (an errno, or a
+`KERN_PROCARGS2` record with no environment). Such a live same-uid process is recorded on the run as
+`unproven_survivors` (pid, start time, executable, reason `environment_withheld_by_macos`) only with
+path evidence: its cwd lies in a run root (the row names that root's session, custody and sandbox root)
+or in the cohort's canonical repository (no root); every other withheld process is left out. Insert-only,
+at most 64 per run, a replayed reap appends only processes not yet named; Linux records none. The TUI
+receipt and the desktop settlement view list them so the operator can stop them by hand; kill authority
+is unchanged. A retained item explains itself in its `diagnostic` (#2731): `custody_unverified` and
 `custody_generation_drift` carry `check=<field> stored=<..> observed=<..>` for the first stored custody,
 session-identity or runtime-completed-entry check that failed, and `nonancestor` carries
 `compared_ref=<ref>@<oid12> ref_updated_secs_ago=.. tip_committed_secs_ago=.. fetched_this_pass=..`, plus
@@ -121,6 +194,27 @@ owner, regardless of status, and unknown ownership are retained with
 `retained_foreign_owner` or `retained_unknown_owner`. The plan digest binds only
 the eligible set and its safety evidence; retained metadata and unrelated ref
 activity do not invalidate an unchanged plan. Eligibility changes still refuse apply.
+Audit traversal (#581): both operator and agent audit accept optional
+`after_custody_id`, an exclusive custody-key selection hint. Omit it to restart;
+follow `traversal.last_custody_id` only when `traversal.has_more` is true. V120's
+existing complete identity scan is capped at 16,384 Live roots and uses 256-row
+SQL pages. Each request proves dependencies and Git state for at most 256 roots.
+Larger cohorts (and explicit continuations) return `traversal` with the hint,
+last key, `has_more`, `snapshot_root_count` and `snapshot_digest`. Traversing from
+the start through `has_more:false` with the same snapshot digest proves complete
+coverage; a changed digest starts a new snapshot and requires restarting to claim
+complete coverage. Applying a page changes that snapshot; re-audit before applying
+another page. All roots outside the returned page remain unexamined and protected;
+`counts`, `items` and persisted retained roots describe only that page. The TUI's
+`Enter` restarts and `n` audits the next page, including after a retained-only page.
+Apply repeats the audited `after_custody_id`; the plan digest binds the snapshot,
+page boundaries and exact eligible evidence, and the retry fingerprint binds the
+hint. Detached audits join only the same caller/repository/page; journal retries
+re-prove their exact custody rather than searching page one. No client hint grants
+custody or removal authority. Above the existing identity-scan cap the read refuses
+without effects. The automatic pass currently starts at page one; explicit audit
+traversal is needed to advance past a retained-only first page.
+
 `AgentAuditSourceWorktreeCohort {repository_identity, fields?}` accepts
 `fields: "summary" | "full"`, following the `AgentManagerInbox` naming. Omitted
 `fields` selects summary when `applyable` is false, full otherwise. Full preserves
@@ -134,6 +228,15 @@ including `applyable`, `plan_digest`, `authorization_phrase`, refusal and run id
 is preserved. Apply accepts the summary's exact digest and phrase: projection
 happens after the complete audit and never changes the safety proof. Request
 `fields:"full"` to inspect retained-root evidence. The operator audit remains full.
+
+The agent audit is itself a detached daemon task (#3760): the per-root proof of a
+large cohort (hundreds of roots) can outlast the 30 s RPC limit, so the call waits at
+most 15 s and, past it, answers the typed `source_settlement_audit_pending` (`audit_id`,
+`retry_after_secs`, `writes: 0`, no plan, digest or phrase) while the audit keeps running.
+The next audit request for the same caller and cohort joins that task and receives the
+finished audit once (the entry is removed on delivery, so a later request audits afresh);
+an unclaimed outcome expires after 10 minutes. Arm one `AgentScheduleWake` `resume` with
+`in_seconds` and re-send the audit; never poll. The operator audit is unchanged.
 
 A covered terminal owner (including Deleted) may be settled by the repository
 manager only through the full custody, runtime and dependency proof. Operator
@@ -212,6 +315,47 @@ Agent Sessions (P0 lead/child dispatch) — the entire agent-facing surface:
 `AgentManagerCommitPreparedControl`, `AgentManagerGetAction`,
 `AgentManagerWorkView`
 
+Busy self-wakes (`continuation_turn_changed` on a live target, or
+`continuation_target_busy`) keep their 30-second unspent deferral and deliver
+at the next idle point. Their hold ends one hour after the wake first became
+due, captured before the first deferral in daemon-owned
+`schedule_json.busy_target_hold`; restarting the daemon never renews it.
+`AgentListWakes.deadline` includes this deadline (the earlier of it and a
+predicate deadline when both exist). If the target is still busy at expiry,
+the existing undelivered-wake escalation retains the original result for the
+project's manager or, without one, an operator to-do. Only after that notice
+is durable does the wake retire with `disabled_reason: "wake_recoverable"`
+(visible with `include_disabled:true`); the notice names
+`wake_recoverable: busy_target_deadline`. Failed notice writes keep the wake
+armed for recovery. An explicit edit/rearm starts a new epoch; successful
+delivery clears the hold.
+
+`AgentHalt` of another session and operator `InterruptSession` share the same
+halt transition: under the target's continuation spawn guard, one Store
+transaction records durable halt intent (`session_halt_requested:<session>`)
+and disables the target's own enabled, unprotected `resume`/`when` wakes.
+`AgentListWakes {include_disabled:true}` exposes `disabled_reason:
+"disabled_by_halt"` for these rows. A scheduler snapshot taken before the halt
+is rechecked under the same guard, so job completion cannot restart the halted
+worker. Self-targeted `AgentHalt` preserves its wakes. Terminal watches (including
+those owned by other sessions) and protected daemon wakes remain armed.
+Detached jobs continue running; use `AgentCancelJob` separately within its
+existing scope. A later explicit `AgentContinueChild` still delivers without
+re-enabling the disabled wake. The halt record is audit history, not a permanent
+continuation fence. Operator pause ownership and continuation rules still apply.
+
+When that transaction newly disables any wakes, the shared boundary also records
+a non-waking `System` conversation event with their count, exact job IDs,
+`disabled_by_halt`, and the `AgentListWakes {include_disabled:true}` hint. It is
+inspectable through the existing conversation/event reads on a later authorized
+continuation. The active monitor numbers and persists the event through its
+existing lifecycle inbox (also drained on exit); an idle session writes directly
+under the spawn guard. Persistence confirmation waits at most 250 ms for a live
+monitor, then the stop proceeds and the queued event remains for its final drain.
+A failed or unconfirmed notification is logged and cannot fail or undo the
+committed halt. No new model turn, mail dispatch, pause clearing or wake rearming
+is involved. A retry with zero newly disabled wakes writes no additional notice.
+
 Harness manager v1 (V102/V103; see `docs/harness-manager.md`): operator-only
 `GetHarnessManager` / `ConfigureHarnessManager` appoint one ordinary session
 per project. New appointments default to the whole current project; explicit
@@ -242,8 +386,23 @@ with optional `notice_kind` (`session_state`, `message`, `action_result`,
 `operator_answer`, `ledger_change`). A kind other than `message` suppresses
 the message page, including on audit reads. Routine manager reads return only
 incoming replies and lead notices, excluding the seat's own sends across
-rotation. `include_sent:true`, `request_id`, or `fields:"full"` also returns
-outbound sends for audits; lead inbox delivery is unchanged. Satellite reports are `ledger_change`
+rotation. A routine manager read returns each informational lead notice once
+(#3363): the read is recorded per manager principal, so it carries across seat
+succession; replies (`request_id` set) are unaffected. `include_sent:true`,
+`request_id`, or `fields:"full"` also returns outbound sends and replays
+already-read lead notices for audits; lead inbox delivery is unchanged. Each unanswered
+request in a lead inbox adds `reply_instruction:"reply with AgentManagerReply request_id=<message_id>"`
+using that request's actual ID. Informational mail (`informational:true`) creates
+no reply obligation and omits this field, as do settled requests and manager reads.
+Lead-facing `message` notices in compact/full reads also project the full body
+as `state.message` and its `state.informational` flag (#3914), including exact
+re-reads of retained ID-only notices. The projection rechecks the message's live
+scope and sender/recipient bindings; it changes no stored snapshot or reply state.
+The independent message page may be empty when historical mail for former leads
+fills its limit: continue with `next_after_sequence` as `after_sequence`, or read
+the delivered notice body directly. A summary drain can be expanded with
+`read_notice_ids:[<notice_id>], fields:"full"`.
+Satellite reports are `ledger_change`
 notices whose `subject_id` is `satellite_report`. Returned notices are marked
 retrieved and settled atomically. `fields:"summary"` (#285, default `"compact"`) trims the returned notices to a `state_summary` string in place of `state` (projection only; the same notices settle). `settle_notice_ids` explicitly settles up to
 32 exact IDs owned by the caller's current seat lineage, within current scope;
@@ -268,7 +427,12 @@ source outside a clean live worktree, activity inside the last 24h (the refusal 
 an unreadable status. Untracked files do not block logical archive; archive
 never runs cleanup or moves the worktree or branch. `UnarchiveSession` is the same
 logical restore as the housekeeping/operator path (Archived to Completed, no
-worktree recreated). The `archive_container` cascade uses the same live
+worktree recreated). A predecessor with a current manager rotation receipt
+stays Archived: late terminal writes preserve its status and cause, and
+operator restore refuses `session_rotation_successor_current` (manager
+housekeeping/delegated restore refuses `manager_v2_historical_restore_refused`).
+Use the successor, or explicitly change the appointment; restoring an old
+session cannot take the successor's seat. The `archive_container` cascade uses the same live
 worktree check for each leaf and can archive a fully terminal manager-paused
 Epic without resuming its lead. Every call is journaled with the manager as actor and
 read back through `AgentManagerGetAction`. A catalog test
@@ -294,6 +458,77 @@ continue and mail path, or expose ProgramRun. Reported progress,
 queued/retrieved/accepted requests, effected actions, accepted source and
 integrated delivery are distinct. Operator pauses and exact approvals remain
 operator-owned; missing evidence stays unknown.
+
+`AgentManagerUpdate` also offers the manager-only `request_withdraw` variant
+(#668, hub #3950): `{update:"request_withdraw", request_id,
+expected_row_version, reason}`. Read the request's lifecycle `row_version` with
+`AgentManagerInspect {section:"requests"}` (zero before its first lifecycle
+update). The current manager in the sending slot lineage, including a successor,
+may retire its pending request; a covering manager in another slot and the lead
+are refused. The existing settlement ledger records `disposition:"withdrawn"`,
+the actor and reason, and the request lifecycle becomes `declined` with manager
+disposition evidence. Pending capacity and overdue attention are released
+atomically; Progress reports `settled`. This asserts no lead execution evidence.
+An exact retry replays its receipt; a changed lifecycle version refuses the
+update, and a settled request refuses `manager_v2_request_settled`. Lead replies
+to other requests retain their ordinary lifecycle. Sending a new request does
+not implicitly retire independent requests to that Epic: withdraw the superseded
+request explicitly with a reason. Withdrawing mail does not retire unfinished
+declared Work or reset the Epic's recovery budget.
+
+`AgentManagerControl` also accepts `withdraw_queued_create` (#481), under
+`SessionCreate`, for a `create_session` that admission has not claimed. Read its
+`operation_id` and `row_version` with `AgentManagerGetAction`, then send:
+
+```json
+{"fence":{"scope_version":1,"policy_version":1},"idempotency_key":"withdraw-held-worker-1","operation":{"action":"withdraw_queued_create","operation_id":"00000000-0000-4000-8000-000000000001","expected_row_version":1}}
+```
+
+The current project, original create capability and parent scope are rechecked.
+A queued withdrawal receipt is pending until its action succeeds. Withdrawal
+CASes the original `queued` state and version to `revoked`, with outcome
+`manager_v2_queued_create_withdrawn`, releases its reservation and pending
+terminal watch, and corrects the Issue launch note. A stale version refuses
+`manager_v2_action_changed`; a non-create or terminal action refuses
+`manager_v2_action_not_queued_create`. A claimed or started create refuses
+`manager_v2_action_started_use_agent_halt`: use `AgentHalt` on the original
+receipt's `target_session_id`. Claim and withdrawal race on the same durable
+row; a withdrawal never stops a started provider.
+
+`AgentManagerLaunchIssueWorker {review_of:N}` defaults its sandbox to the
+commit declared in the implementer Issue's latest handoff (`commit`,
+`commit_sha`, `source_commit`, `pushed_sha`, or `RESULT <40-hex>`). The launch
+journals that default separately from the caller's request so an idempotent
+replay retains its original source after a newer handoff. An explicit
+`sandbox_source` takes precedence; an explicit unknown commit is refused. With
+no declared source, or a declared commit unavailable in the local repository,
+it keeps `origin/rolling`, and the compiled brief disallows test jobs for source
+tests that may be missing from that tree and names any unresolved commit.
+Reviewers make no changes or commits.
+Bundled `issue-pipeline-reviewed` and `issue-pipeline-post-review` nodes already
+use DB-native historical-source allocation at the accepted source commit;
+their exact-name test jobs therefore run the reviewed tree.
+
+Every Issue-bound create rechecks its Issue before allocating its sandbox or
+starting its provider, including after `host_load`, `thermal`, `disk_pressure`,
+`sandbox_free_space` and `deploy_draining` holds. A Closed, Cancelled, archived
+or missing Issue blocks the action with
+`manager_issue_worker_issue_unavailable` and releases its reservation/watch.
+For an unstarted launch, its own latest Open-to-InProgress status write rolls
+back to Open with the ended-launch note; later Issue edits and terminal statuses
+are preserved. No schema migration is needed.
+
+Lead fence (#4011): `resume_lead`, `pause_lead`, `retry_lead` and `replace_lead` take
+`expected {lead_session_id, lead_generation, event_sequence, custody_generation}`, the live
+`Store::manager_action_lead_fence`. A manager reads it, with no database access, from
+`AgentManagerInspect {section:"overview", epic_id}`: the `lead_control` row's `expected`
+(`fence_state:"current"`; `unavailable` with `expected:null` when it cannot be read), the
+Epic `topology` row's `expected`, and `lead_fence` on each `work` row. Copy it unchanged into
+the action. `event_sequence` is the lead's newest event, so it moves whenever the lead
+speaks: re-read just before the action. A stale fence is refused
+`manager_v2_lead_changed: <field> expected X, current Y[; ...]`, naming each differing field
+with both values (the values are not secret to the authorized manager); the code stays the
+leading token.
 
 `AgentManagerInspect {section:"overview"}` bounds each intent row's
 `work_versions` to the newest 16 unfinished items (updated time descending,
@@ -389,7 +624,7 @@ seat only in `Execute` mode, unpaused):
   ledger. The record becomes `status:"answered"` with `answered_by` and a
   `delivery` of `available_in_scoped_inbox` (`actor:"manager"`), so the lead
   retrieves it exactly like an operator answer, and the
-  `manager_v2_pending_operator_decision` launch block clears. A gate refuses with
+  `manager_v2_pending_manager_decision` launch block clears. A gate refuses with
   `manager_v2_decision_operator_gate`; a moved version, digest, work or request
   refuses `manager_v2_decision_changed` / `manager_v2_decision_target_changed`;
   a ledger the caller does not outrank refuses `manager_v2_decision_owner_denied`
@@ -403,8 +638,11 @@ seat only in `Execute` mode, unpaused):
 `AgentManagerInspect {section:"rulings"}` (managers only, one page, no cursor)
 lists the pending non-gate records the caller may rule on: its own ledger's and,
 for a portfolio seat, every ledger below it (the project manager's). Each row is
-a decision row plus `owner_manager_session_id`, `scope_version` and
-`owner_role` (`self`, `project_manager`, `portfolio_manager`).
+a decision row plus `owner_manager_session_id`, `current_manager_session_id`,
+`scope_version` and `owner_role` (`self`, `project_manager`, `portfolio_manager`).
+The owner is the ledger's lineage anchor (it survives seat rotation and is what a
+ruling names); the current id is the live seat resolved at read time, `null` when
+the ledger has none (#3330).
 
 *Read fields.* `GetHarnessManagerState {section:"decisions"}` (the operator
 board's read) and the agent `decisions` section return, per `decision` row, the
@@ -418,7 +656,7 @@ asker's recommendation), `status` (`pending`, `answer_queued`, `answered`,
 | `answerable_by` | `"operator"` (a gate) or `"manager"` (a non-gate), `null` once not pending |
 | `gate`, `gate_source` | the class and why (above), `null` for a non-gate |
 | `answered_by` | `{kind: operator \| project_manager \| portfolio_manager, session_id, node_label, at}`; show "ruled by <node_label or kind>" when `kind != "operator"` |
-| `blocks` | `{launches: bool, epic_ids: [Epic], execution_ids: [execution], work_key, request_id, reason}`; `launches` is true while the record is `pending` or `answer_queued` and not archived. Daemon-filed `topology:` decisions name only the asking execution in `execution_ids`: that executor pauses new launches until the ruling, while other executions and manager launches in the Epic remain available. Other records name `epic_ids` (create_session under those Epics refuses `manager_v2_pending_operator_decision`). |
+| `blocks` | `{launches: bool, epic_ids: [Epic], execution_ids: [execution], work_key, request_id, reason}` (`reason` is named by who can answer, #3240: `manager_v2_pending_manager_decision` when `answerable_by` is `manager`, `manager_v2_pending_operator_decision` otherwise); `launches` is true while the record is `pending` or `answer_queued` and not archived. Daemon-filed `topology:` decisions name only the asking execution in `execution_ids`: that executor pauses new launches until the ruling, while other executions and manager launches in the Epic remain available. Other records name `epic_ids` (create_session under those Epics refuses `manager_v2_pending_manager_decision` when every blocking record is manager-answerable, else `manager_v2_pending_operator_decision`). |
 | `history` | bounded audit trail `[{event: asked \| reasked \| answered \| declined \| ruled \| withdrawn \| archived, at, actor, note?}]` |
 | `created_at`, `age_seconds` | age of the question |
 | `stale`, `stale_reason`, `stale_after_days` | pending and (`manager_gone` or older than 7 days) |
@@ -540,6 +778,49 @@ boundary: their send receipt carries `delivery_boundary: "turn_end_only"`
 `AgentContinueChild` only when deliberate interruption and replacement of a
 running child is intended; it is not a mail delivery acknowledgment.
 
+`RecordProviderLifecycleEvent` remains hook-only. A `SessionStart` request may
+carry `provider_session_id` and `transcript_path` from the provider hook input,
+plus the installed handler's `session_start_part`. Its `served` response carries
+`additional_context` without recording delivery. The daemon watches from the
+pre-reply transcript offset for the exact served text, using the same verified
+conversation locator and bounded JSONL tail reader as `ConfirmBoundaryMail`.
+Claude evidence must be a `hook_additional_context` attachment with
+`hookEvent: SessionStart`; Codex evidence must be a developer message tagged
+`hooks.additional_context`. Every part of the current batch must have evidence
+before one `session_start_context` row is queued/written. The watcher waits for
+the monitor's provider conversation ID (startup hooks can precede init), expires
+after `BOUNDARY_MAIL_CONFIRM_DEADLINE`, and never confirms from a foreign
+conversation, a prior batch's transcript prefix or partial JSONL lines. Missing
+or partial evidence leaves the preamble owed. With SessionStart enabled, each
+provider also installs a UserPromptSubmit recovery handler (one per Claude
+chunk). Its trusted `--session-start-fallback` argument sets
+`session_start_fallback: true` on the same hook-only request; the user's prompt
+is never forwarded. Before serving only unconfirmed chunks, the daemon
+synchronously reconciles earlier evidence from the saved locators and offsets.
+Recovery output uses `hookEventName: UserPromptSubmit`; Claude acceptance must
+name that event, while Codex retains its developer-message evidence shape.
+This runs before the first model response without requiring tools or another
+launch. Failure of both hook channels retains the next-launch prompt fallback.
+
+The launch text, multipart plan, batch ID, claims, confirmed bits and pre-reply
+evidence locators/offsets are JSON in the session-owned `session_start_preambles`
+table (migration V189). Store accessors own all SQL; the registry holds a weak
+reference to the daemon's existing shared Store, initialized before recovery or
+launch admission. Lazy reads recover debt after restart or cache eviction.
+Hook operations await the Store lock. Synchronous launch construction tries
+that same lock without blocking a seat fence: if persistence cannot commit
+(including a session not yet inserted), the preamble stays in the prompt.
+Every mutation commits before acknowledging it. Prompt fallback/forget clears
+the payload to SQL NULL without deleting a row or creating an empty one; the
+session foreign key cascades on owner deletion. No operator setting or agent
+verb is added, and the preamble flow never writes `daemon_settings`.
+
+Existing lifecycle records cannot reconstruct an unfinished clear batch:
+SessionStart records delivery only after every part has transcript evidence,
+so a partial clear has no durable lifecycle boundary. The session-owned state
+preserves its batch fence and pre-reply watermark without adding unconfirmed
+rows to the visible conversation. Delivery rows still require every part.
+
 ## Agent authority catalog
 
 `AgentGetAuthorityCatalog` (native `rsi_control_authority_catalog`) is open to
@@ -555,6 +836,30 @@ envelope plus one `control` detail (`permitted`, `parameters`, `example`,
 from `rsi_common::agent_control_examples`, exhaustive over the verb enum, so a
 new verb cannot ship without an example the tests validate. It is an
 advertisement, never a grant.
+
+Role playbook references (#656): whole catalogs resolve committed coordinating
+roles through the daemon's existing selected `harness_root`, independently of
+the caller's project. Pending catalogs keep the worker baseline; single-verb
+responses remain compact. One resolver also supplies context-cap handoffs.
+It canonicalizes the harness and role file, requires a readable regular file
+inside that tree, and bounds the read to 256 KiB and emitted path text to 2048
+bytes. Unsafe/non-Unicode path text, missing/reclaimed files and read errors
+produce an unavailable reference. Follow the binary-shipped catalog role
+guidance in that case; the full playbook and adjacent resources have not been
+delivered. No ambient provider roots, recursive searches or asset installation
+are implied. Resolved paths preserve the actual file's directory for adjacent
+resources; readability is checked at emission and can change afterward.
+
+`rsi.daemon_handoff.v1` keeps `playbook` as the exact harness-relative role
+identifier. Its optional, serde-defaulted `playbook_location` is either
+`{"status":"resolved","path":"<canonical absolute path>"}` or
+`{"status":"unavailable","reason":"<typed reason>"}`. The rendered reference
+comes from that same value. Legacy documents without the field remain readable
+and direct the successor through the current catalog. This is backward
+readability for new readers only: old `deny_unknown_fields` readers reject new
+documents containing the field. Structural parsing checks bounded safe absolute
+path text for both Unix and Windows syntax without consulting the reader's
+filesystem or OS. This changes neither authority nor rotation admission.
 
 Coordinator budget visibility (#3079): a whole catalog for a coordinating
 seat carries optional `coordinator_budget` and the same explanation in its
@@ -601,17 +906,72 @@ or default changes are introduced here.
 
 ## Rolling merge queue (#1007)
 
+Provisional declaration validation (#3397): the shared `probe_source` used by
+agent, operator and topology enqueues dry-runs a newly declared provisional
+migration before inserting its queue entry. If `--transform` reports that the
+declared version is still free (`latest + 1`), `provisional_probe` also invokes
+`scripts/repo-guard rolling-migration-renumber` in inspection mode (without `--transform`)
+to run its full site inventory at that version. A tool refusal returns
+`provisional_unprovable` with the tool's file/site reason; clean declarations
+enqueue normally. All base/source/target arguments are full commit SHAs.
+Already-landed identical migration units keep their no-op behavior. At enqueue,
+incomplete proofs return retryable `provisional_probe_inconclusive` (#3545),
+naming the infrastructure cause (missing Python/tool/rolling ref, failed git
+read, tool crash, malformed output or timeout). No entry is inserted; restore
+the prerequisite or retry after the timeout with the same `idempotency_key`.
+This is distinct from the source-defect verdict `provisional_unprovable`.
+Sources without declarations remain unaffected. The queue sweep retains its
+best-effort policy: incomplete proofs stay unknown and do not refuse entries.
+The probe uses the enqueue's existing wall deadline. Derived `scripts/scoped-test` runs
+use the same inspection hook for a still-free declaration and stop on a tool
+refusal before deriving filters, building or testing.
+
+Expedite lane (#3487). An incident fix or a red-QA fix must not wait behind
+the whole queue, and a manager must never rewrite queue order with hand-built
+merge commits or a `supersedes` bundle of unrelated changes. An entry is
+*expedited* when (1) the current appointed manager passes `expedite: {reason}`
+on `AgentEnqueueLandingSource` (reason 1-256 bytes, no control character,
+`queue_expedite_reason_invalid`; an Epic lead or any caller that is not the
+appointed manager is refused `queue_expedite_not_authorized`, and the lead's
+ordinary enqueue still works), or (2) the request's `fixes_issue` names an
+Issue that is open (`Open` or `InProgress`) and labelled `qa`, with no flag; the
+automatic reason names the Issue. The reason is stored on the entry as the
+reserved item `expedited=<reason>` in `test_filters_json` (no schema change,
+like the fix claims; `finish_rolling_queue_filter_derivation` and
+`mark_rolling_queue_filters_lander_selects` keep it) and read back as
+`RollingQueueEntryV1.expedite_reason`. At most `ROLLING_QUEUE_MAX_EXPEDITED` (2)
+expedited entries are live (`queued`, `admitted` or `gating`) per project,
+counted in the insert's own transaction: a manual expedite over the cap is
+refused `queue_expedite_cap_reached`, whose text lists each live expedited entry
+(id, queue number, state, source, reason); an automatic one counts toward the
+cap but is never refused, it is queued as an ordinary entry and the receipt
+carries `expedite_warning` (the same listing). A superseded expedited entry
+does not count against its replacement, but the replacement is expedited only if
+its own request says so. Admission order is `expedited first, then sequence`
+(`QUEUED_ADMISSION_ORDER` in `rsid-store`, shared by `claim_rolling_queue_batch_lanes`,
+`queued_rolling_queue_repo_paths` and `rolling_queue_lane_candidates`): the next
+batch claims expedited entries first, in enqueue order among themselves, and
+fills the rest of the batch FIFO from the same project and repository. A
+`gating` batch is never preempted or cancelled, a second lane still needs
+disjoint packages (#1224), and the batch follows every existing policy (one
+change per gate, filters, migrations, rebase on advance); batch size and gate
+content are unchanged. `AgentListRollingQueue` rows (summary and full) carry
+`expedited: true` and `expedite_reason` for an expedited entry, and
+`rsi land`'s queue line shows `[expedited: <reason>]`. A manager expedites only
+what cannot wait (an incident, a landing a red QA Issue is waiting on); routine
+work stays in order.
+
 `AgentEnqueueLandingSource` admits a source (in `AGENT_VERBS`, the closed
 catalog and `rsi-rpc`; no native tool); `AgentListRollingQueue` and
 `AgentCancelRollingQueueEntry` (#1964, below) read and withdraw entries. The daemon
 binds the caller from the token; only the current appointed manager and the
 current lead of the caller's Epic may enqueue (`queue_not_authorized`
-otherwise). Request `{source_commit, test_filters? | derive_filters?, fixes_issue?, fixes_tests?, idempotency_key, supersedes?}` (claimed fixes: below); `derive_filters` runs `scripts/check-touched-shards --filters-only --json` on the source (`crates/rsid/src/rolling_queue.rs` `derive_test_filters`), normalizes (dedupe focused rsid/rsid-store filters across shards, split filters over 256 bytes, no count cap) and a topology `land` node with no `test_filters` derives the same way (#1807, #1781, #1786); explicit filters stay capped at 32 of 256 bytes. Refusals:
+otherwise). Supersession is narrower than `AgentCancelRollingQueueEntry`: the caller must be the entry’s enqueuer, the session its outcome wakes (`wake_session_id`, which a manager seat transfer moves to the successor), or the project’s current manager seat when the enqueuer is an earlier seat of that same manager lineage. A manager’s project-wide cancel scope does not let it replace an Epic lead’s or another worker’s entry. The authority is rechecked in the admission transaction. `issue` must be a display number of an Issue in the source’s own project, else `queue_invalid_request`. The descendant source inherits the replaced entry’s FIFO position and wake target. Request `{source_commit, test_filters?, derive_filters?, fixes_issue?, fixes_tests?, issue?, idempotency_key, supersedes?, expedite?}` (claimed fixes and the expedite lane: below); `derive_filters` runs `scripts/check-touched-shards --filters-only --json` on the source (`crates/rsid/src/rolling_queue.rs` `derive_test_filters`), normalizes (dedupe focused rsid/rsid-store filters across shards, split filters over 256 bytes, no count cap) and a topology `land` node with no `test_filters` derives the same way (#1807, #1781, #1786); explicit filters stay capped at 32 of 256 bytes. `derive_filters` combines with `test_filters` (#3264): the gate runs the derived set plus those extras, and an entry recorded with its derivation pending keeps the extras until the derived set joins them. Refusals:
 `queue_disabled`, `queue_source_invalid`, `queue_source_session_out_of_scope`,
 `queue_filter_invalid`, `queue_tip_read_timeout`, `queue_probe_timeout`,
 `queue_duplicate_source` (a live entry for the commit exists),
-`queue_idempotency_conflict`. Conflict warnings (#2118): the receipt of `AgentEnqueueLandingSource` may carry `conflict_warnings`, a typed list from an in-memory `git merge-tree --write-tree` of the new source against the rolling tip (`queue_conflicts_with_rolling`) and against each live (`queued`/`admitted`/`gating`) entry of the same project ahead of it (`queue_conflicts_with_entry`, naming `entry_id`, `entry_sequence` and up to 8 conflicting `files`). It is a warning, never a refusal: the entry is queued either way, since an entry ahead may still be withdrawn or refused; the enqueuer can have the worker merge `origin/rolling` first or cancel the entry, instead of finding the conflict after a gate (`queue_batch_merge_conflict`). A probe git cannot run (object missing, old git) yields no warning (`rolling_queue::queue_conflict_warnings`). Enqueue latency bound (#2907): `AgentEnqueueLandingSource` is an admission step and returns in seconds under load. The filter derivation and the conflict scan run side by side, so the call takes the longer of the two, and each has a hard wall bound. The conflict scan stops at `ENQUEUE_CONFLICT_SCAN_BUDGET` (4 s for the whole scan, each probe under the time left); a scan cut short ends its warnings with one `queue_conflict_scan_incomplete` warning naming how many probes it skipped, so a missing warning never reads as "no conflict". `derive_filters:true` waits at most `ENQUEUE_DERIVE_WAIT` (4 s) and one call is enough (#2993): a derivation still running then does not refuse the call. The source is probed without filters, the entry is recorded `queued` with `filters_state: deriving` (the reserved stored item `filters_state=deriving` in `test_filters_json`, no schema change; `test_filters` is empty until it lands) and returned, and a background task (`rolling_queue::finish_filter_derivation_in_background`, at most one per entry, re-attached to every pending entry by the queue loop's per-tick sweep so a restart loses none) finishes it. The lander (`claim_rolling_queue_batch_lanes`, `queued_rolling_queue_repo_paths`, `rolling_queue_lane_candidates`) never admits an entry carrying that state, and a pending entry does not hold up later ones. When the derivation ends the filters replace the marker (`finish_rolling_queue_filter_derivation`, a CAS on the entry still being pending, so a cancelled entry is left alone); a derivation that fails (the checker did not start, timed out after 180 s or printed no usable receipt: `queue_filter_derivation_failed`; a derived filter that provably selects no test: `filter_matches_no_tests`; a rolling-tip read that never completes: `queue_tip_read_timeout`) settles the entry `refused` with that code (`refuse_rolling_queue_filter_derivation`, lander friction like any refusal) and writes the enqueuer's single outcome wake in the same transaction; a second settle writes nothing. A replay under the same `idempotency_key` returns the same entry (never a second one) whether its filters are pending, final or refused, without asking the derivation again. A derivation that fails while the call is still waiting (inside the 4 s) keeps the unfiltered-gate fallback it always had. The derivation is keyed by repository, source and rolling tip, so a retry joins it or reads its finished result for 10 minutes; it never falls back to an unfiltered gate once an entry waits on it. Callers never sleep, poll or call again for the filters. Every git read of the call runs under a deadline (#2912): the rolling-tip read behind the derivation wait shares the 4 s `ENQUEUE_DERIVE_WAIT` (a read that does not finish is refused `queue_tip_read_timeout`, retryable, nothing recorded, and stays andon friction, #2992: it is git trouble, not a derivation in progress), the source probe (existence, merge base, diffs, filter greps) shares `ENQUEUE_WALL_BOUND` (5 s from the start of the call, so it gets what the derivation left) and the conflict scan's rolling-ref resolve shares the scan budget. A stalled git is killed with its process group at the deadline; a probe it cut short is refused `queue_probe_timeout` (retryable, nothing recorded, same `idempotency_key`), never `queue_source_invalid`, and a cut-short ref resolve counts as a skipped probe in `queue_conflict_scan_incomplete`. The call therefore returns within `ENQUEUE_WALL_BOUND` plus a small margin whatever git does (the derivation itself runs in the background and is not killed). The operator path (`EnqueueRollingQueueSource`) still waits for the derivation and its source probe. Each call logs `enqueue phase:` lines (`derive_filters`, `derive_and_probe`, `conflict_scan`, `total`) with per-phase `*_ms`. Entries live in `rolling_queue_entries`
-(provisional migration) in FIFO `sequence` order; a run is one `gating` entry plus a
+`queue_idempotency_conflict`. Conflict warnings (#2118): the receipt of `AgentEnqueueLandingSource` may carry `conflict_warnings`, a typed list from an in-memory `git merge-tree --write-tree` of the new source against the rolling tip (`queue_conflicts_with_rolling`) and against each live (`queued`/`admitted`/`gating`) entry of the same project ahead of it (`queue_conflicts_with_entry`, naming `entry_id`, `entry_sequence` and up to 8 conflicting `files`). Renumberable classification (#3336, #3362): a conflict between the source and a target (the tip, or the entry ahead) is `renumberable`, NOT a conflict, only when the source adds a provisional-migration declaration and `scripts/repo-guard rolling-migration-renumber` (`--transform` then `--build`, against that target; `provisional_probe::classify_conflict`, the same proof the sweep and the lander run) proves the renumber: its own schema and site validation decides the renumber sites and its resolve step refuses a conflict on any other path (`nonmigration conflict`), so a path merely named in the declaration (`files[].path`), an invalid declaration, no declaration, and a tip with no tool exempt nothing and stay conflicts. An unfinished proof is unknown: `queue_conflict_scan_incomplete` names the affected entry (id, sequence, files and detail) without repair advice (#3406). This also applies when a pair proof rejects the entry-ahead target’s unpublished migration inventory: publication must pin and renumber that target first, so rejecting it as a released target proves no conflict between the two provisional units. The three conflict warnings then become the non-conflict notices `queue_renumberable_with_rolling`, `queue_renumberable_with_entry` and `entry_renumberable_with_rolling`, with the same `entry_id`, `entry_sequence` and `files` and a detail naming the migration (`declared migration v185 will be renumbered to v186 at landing`): no merge, repair or cancellation is needed. A conflict warning whose source carries a declaration the tool refused appends the tool's reason to the detail. Merge probes and renumber proofs share the same 4 s total scan deadline, including the proof’s git reads. Every conflicting entry ahead uses the same renumber classification regardless of what the new candidate declares; only a proved version clash emits `entry_renumberable_with_rolling`, and only a completed conflict verdict emits `entry_conflicts_with_rolling` with repair advice. It is a warning, never a refusal at enqueue: the entry is queued either way, since an entry ahead may still be withdrawn or refused, but a source whose own conflict is with the rolling TIP is refused by the queue loop's per-tick sweep (#3293, `rolling_queue/tip_conflict.rs`): a `queued` (never `gating`) entry that trial-merges with conflicts onto `origin/rolling` settles `refused` with `queue_conflicts_with_rolling`, `conflict_paths=` in the detail and the enqueuer's one wake, so a topology land goes to its repair node at once instead of after the queue drains. One merge per entry per tip, at most 16 per pass, one fetch per repository per 30 s; a probe that cannot finish, an unreadable tip, and a source whose conflicts the renumber tool proves resolved (below) stay `queued`; a source that adds a provisional-migration declaration and merges cleanly, or whose conflicts are proved renumberable, is also dry-run through `scripts/repo-guard rolling-migration-renumber` `--transform` and `--build` (merge, resolve, prove) against the tip in a private `git clone --shared` scratch, using the tip's committed tool (#3346, `rolling_queue/provisional_probe.rs`): a tool refusal (exit 2, e.g. `unproved migration conflict`) settles the entry `refused` with `provisional_unprovable` and the tool's reason leading the detail, so it never joins and splits a batch; a crash, timeout, missing tool or git failure refuses nothing; the enqueuer can have the worker merge `origin/rolling` first or cancel the entry, instead of finding the conflict after a gate (`queue_batch_merge_conflict`). A probe git cannot run (object missing, old git) yields no warning (`rolling_queue::queue_conflict_warnings`). Enqueue latency bound (#2907): `AgentEnqueueLandingSource` is an admission step and returns in seconds under load. The filter derivation and the conflict scan run side by side, so the call takes the longer of the two, and each has a hard wall bound. The conflict scan stops at `ENQUEUE_CONFLICT_SCAN_BUDGET` (4 s for the whole scan, each probe under the time left); a scan cut short ends its warnings with one `queue_conflict_scan_incomplete` warning naming how many probes it skipped, so a missing warning never reads as "no conflict". `derive_filters:true` waits at most `ENQUEUE_DERIVE_WAIT` (4 s) and one call is enough (#2993): a derivation still running then does not refuse the call. The source is probed without filters, the entry is recorded `queued` with `filters_state: deriving` (the reserved stored item `filters_state=deriving` in `test_filters_json`, no schema change; `test_filters` is empty until it lands) and returned, and a background task (`rolling_queue::finish_filter_derivation_in_background`, at most one per entry, re-attached to every pending entry by the queue loop's per-tick sweep so a restart loses none) finishes it. The lander (`claim_rolling_queue_batch_lanes`, `queued_rolling_queue_repo_paths`, `rolling_queue_lane_candidates`) never admits an entry carrying that state, and a pending entry does not hold up later ones. When the derivation ends the filters replace the marker (`finish_rolling_queue_filter_derivation`, a CAS on the entry still being pending, so a cancelled entry is left alone); a derivation that fails (the checker did not start, timed out after 180 s or printed no usable receipt: `queue_filter_derivation_failed`; a derived filter that provably selects no test: `filter_matches_no_tests`; a rolling-tip read that never completes: `queue_tip_read_timeout`) settles the entry `refused` with that code (`refuse_rolling_queue_filter_derivation`, lander friction like any refusal) and writes the enqueuer's single outcome wake in the same transaction; a second settle writes nothing. A replay under the same `idempotency_key` returns the same entry (never a second one) whether its filters are pending, final or refused, without asking the derivation again. A derivation that fails while the call is still waiting (inside the 4 s) keeps the unfiltered-gate fallback it always had. The derivation is keyed by repository, source and rolling tip, so a retry joins it or reads its finished result for 10 minutes; it never falls back to an unfiltered gate once an entry waits on it. Callers never sleep, poll or call again for the filters. Every git read of the call runs under a deadline (#2912): the rolling-tip read behind the derivation wait shares the 4 s `ENQUEUE_DERIVE_WAIT` (a read that does not finish is refused `queue_tip_read_timeout`, retryable, nothing recorded, and stays andon friction, #2992: it is git trouble, not a derivation in progress), the source probe (existence, merge base, diffs, filter greps) shares `ENQUEUE_WALL_BOUND` (5 s from the start of the call, so it gets what the derivation left) and the conflict scan's rolling-ref resolve shares the scan budget. A stalled git is killed with its process group at the deadline; a probe it cut short is refused `queue_probe_timeout` (retryable, nothing recorded, same `idempotency_key`), never `queue_source_invalid`, and a cut-short ref resolve counts as a skipped probe in `queue_conflict_scan_incomplete`. The call therefore returns within `ENQUEUE_WALL_BOUND` plus a small margin whatever git does (the derivation itself runs in the background and is not killed). The operator path (`EnqueueRollingQueueSource`) still waits for the derivation and its source probe. Each call logs `enqueue phase:` lines (`derive_filters`, `derive_and_probe`, `conflict_scan`, `total`) with per-phase `*_ms`. Optional `issue` is a positive display number in the source project, stored in the nullable `rolling_queue_entries.issue` and returned on the enqueue entry and by `AgentListRollingQueue`. It is tracking metadata, independent of `fixes_issue` and its required-green test claims; omitting it preserves existing callers. Reusing an enqueue key with a different Issue returns `queue_idempotency_conflict`. `AgentTopologyExecute` with `inputs.issue` returns up to 32 FIFO `warnings` with code `topology_issue_landing_queued`, `issue`, `entry_id`, `entry_sequence` and `state` for matching live (`queued`/`admitted`/`gating`) entries in the Epic's project. This is advisory: it accepts the execution; settled entries and other projects do not warn. Replays report the current live matches. Entries live in `rolling_queue_entries`
+(provisional migration) in admission order (expedited entries first, then FIFO `sequence`); a run is one `gating` entry plus a
 `rolling_queue_batches` row. The runner (`rsid::rolling_queue`) claims the head
 plus up to `rolling_queue_batch_size - 1` later entries of the same project and
 repository while `rolling_queue_enabled` is on (#1945). The repository is the git
@@ -790,6 +1150,12 @@ latest full-library-green `rolling` SHA: `AgentListRollingQueue` returns the new
 `qa_green` (`sha`, `passed_at`, `job_id`), scoped like the entries it lists (and to
 `project_id` when given), `null` before any pass. The old `qa-green.sha` pointer file is
 retired; nothing advances it.
+#3885: while a staged hub deploy holds queue admission (#2190: the whole life of the deploy,
+not the worker-start cap) the batch already gating finishes and nothing new is admitted;
+queued entries keep order and expedite flags. `AgentListRollingQueue` carries the reason as
+`held_for_deploy` (`deploy_id`, `release_by` = the deploy deadline), absent when admitting.
+Settling, cancelling or timing out the deploy releases it. A satellite deploy holds only
+that satellite daemon's own queue.
 #2743: rolling red must reach the seat. (1) When the daemon files a `qa` Issue (a red or
 incomplete full-library run in `finish_bounded_qa`, or a base red a gate reports) the current
 project manager gets one project-wide `ledger_change` notice (`record_kind: qa_issue`, subject
@@ -846,6 +1212,13 @@ polled platform (process-local, unknown after a hub restart until polled),
 `AgentGetDaemonInfo.satellites[].platform` shows the live platform, and each
 peer rejection reason appends `(platform: <os>/<arch>)` or `(platform: unknown)`.
 Manager satellite inspection rows also carry `health.platform`.
+Satellite health also separates `sessions_running` (live provider turns),
+`workers_parked` (Completed leaves classified `parked_on_job`/`parked_on_wake`
+by the shared worker-roster derivation), and `open_jobs` (queued/running daemon
+jobs). The last two fields are optional: an older satellite reports unknown,
+not zero. `AgentGetDaemonInfo.satellites[]` carries the live counts; the TUI
+satellite peer rows and manager inspection show the last reported counts.
+A worker with several open jobs counts once as parked; jobs count separately.
 Existing run polling and uncertain-start reconciliation skip fresh platform
 admission, preserving the binding to the original run. Every
 `bounded_qa_finished` receipt carries the placement, `exit_code`,
@@ -886,8 +1259,29 @@ with `governor_min_free_disk_gb`.
 that every member commit exists in the queue checkout; a member whose commit is
 gone (its sandbox was reclaimed and the commit pruned: same common directory means
 same object database, so there is nothing to fetch) settles `refused` with
-`queue_source_unreachable` and a `source_unreachable` event, and the rest gate. Restart reconcile settles a `gating` entry whose
-source is an ancestor of `origin/rolling` and re-queues the rest. An out-of-band
+`queue_source_unreachable` and a `source_unreachable` event, and the rest gate.
+An interrupted lander (`publication_unknown`, "landing interrupted") is
+infrastructure loss, not a refusal of the source: after a fresh fetch, proven
+source ancestry settles the entry `published`; otherwise the same entry returns
+to `queued` with its original FIFO `sequence`, source, replay key and custody.
+No replacement entry or terminal outcome wake is created for that re-admission.
+Restart reconciliation does the same for entries left `gating`, except the
+crash-loop breaker (#3480): an entry that was `gating` at a second daemon stop
+(`requeued_after_restart` events for it) is not gated again but settled
+`refused` `queue_suspect_daemon_crash_loop` (the enqueuer is woken once;
+re-enqueue it alone, a new entry starts with a clean count). A gate whose test
+signals the hub no longer stops it on every start; the health wake
+`daemon_restart_loop` names the stops. This recovery
+is forward-only: legacy terminal rows (including `failed/publication_unknown`)
+remain immutable; the entry and batch terminal-immutability triggers are unchanged.
+A failed fetch or unreadable
+ancestry never proves publication: the entry is re-queued for a fresh gate.
+A topology land node keeps waiting on a live interrupted entry and does not
+run repair or enqueue again. A legacy terminal interruption follows the existing
+refusal path: resolve landed only if a successful fetch proves source ancestry
+on rolling; otherwise route to repair.
+Tests, conflicts and policy refusals still take the existing repair path.
+An out-of-band
 push (a direct `rsi-rolling-land`, an operator merge) moves rolling under a gate
 without stopping it (#1940): the lander (`RSI_LANDER_EXACT_GATE=1`) classifies the
 advance (`rsi-rolling-land/stale_delta.rs`), runs again only the test targets, compile
@@ -897,9 +1291,9 @@ the rest. An advance reuses the whole gate when `scripts/check-touched-shards
 candidate's diff and no crate the candidate's tests depend on. A shared file, a
 manifest or toolchain change, an unplaceable path or an unavailable selector run
 everything again. The re-runs are bounded by the wall time the batch has left
-(`RSI_LANDER_REGATE_BUDGET_SECS`, the batch deadline), not a count: a re-gate that
+(`RSI_LANDER_REGATE_BUDGET_SECS`, the run's deadline), not a count: a re-gate that
 cannot finish inside it is refused `queue_out_of_band_regate_exhausted` before it
-starts, and a batch that runs out is refused `queue_gate_timeout`. The lander's
+starts, and a run that runs out is refused `queue_gate_timeout`. The lander's
 `gate_timing=` line and its `stale_reason_N=` / `stale_retry_N=` lines name the reason
 and how many commands were reused or re-run. There are no
 hot-file waits, claims or seals; migration numbers are renumbered at landing.
@@ -907,14 +1301,54 @@ A source already on `origin/rolling` (landed outside the queue) is never gated
 (#1208): ancestry is re-checked right before a batch is gated, before each bisect
 step and after a lander "already integrated" refusal, and such a member settles
 `published` with the containing tip (an `already_landed` batch event). One
-batch's gating is bounded by `rolling_queue_gate_timeout_mins` (30-1440, default
-60, #1940); past it the lander's process group is stopped and unsettled members are
-refused `queue_gate_timeout`.
+batch's gating is bounded per lander run by `rolling_queue_gate_timeout_mins`
+(30-1440, default 60, #1940): the full gate and each bisect step get the whole
+budget, under a batch ceiling of `ceil(log2 n) + 4` runs (#3267). Past a run's
+budget the lander's process group is stopped; members an earlier red run left
+out while the red persisted (they are not its cause) return to `queued` at their
+original position (`requeued_after_bisect` event, no wake), and only the members
+still in the suspect window are refused `queue_gate_timeout`, with the bisect's
+run logs named (`bisect_logs=`). A suspect window that narrows to one member
+settles that member with the failing test named and no confirming gate run
+(`bisect_isolated`).
 The operator settings `rolling_queue_enabled`, `rolling_queue_batch_size` (1-8), `rolling_queue_speculation_depth` (0-2) and
 `rolling_queue_gate_timeout_mins`, `rolling_queue_full_qa_interval_mins` (0-240, #2112)
 and the unfiltered read `GetRollingQueue` are
 operator-only: absent from `AGENT_VERBS`, `READ_VERBS`, native tools and the
 agent CLI catalog.
+
+### Compile probe of wide entries (#3394)
+
+The tip sweep (#3293) and the enqueue warnings see only textual conflicts. A wide
+entry (at least 40 changed `.rs`/`Cargo.*` files, or one that removes or changes a
+`pub` line under `rsid-core`, `rsid-store` or `rsi-common`; an additions-only diff is
+narrow) can merge cleanly and still break the entry queued ahead of it, or code that
+landed after it was cut. The release build of the batch gate then fails and the batch
+bisects. The queue now finds that before the gate (`rolling_queue/compile_probe.rs`),
+for a launcher with a queue workspace and `with_compile_probe()` (the daemon sets it):
+
+- **Hold.** The claim skips the first queued wide entry that has no verdict yet, and
+  everything behind it (`claim_rolling_queue_batch_lanes_held`); entries ahead of it
+  claim as before. The hold is at most 40 minutes and a probe that cannot run (no
+  cargo, a timeout, a failed merge, an unreadable tip) is a verdict that releases it.
+  Classification is cached per source and read within 5 s at claim time; what it did
+  not reach is not held.
+- **Probe.** The queue loop's background pass (one in flight, 90 minute budget) merges
+  the rolling tip, the live entries ahead (gating included; one that does not merge is
+  left out) and the entry in a persistent private clone under
+  `<queue workspace>/compile-probe/` and runs `cargo check --workspace --all-targets
+  --keep-going` there in `rsi-build.slice`, 30 minutes at most, with its own cargo target
+  (emptied above 40 GiB). Only a run with a compiler diagnostic is red; cargo's other
+  failures are unknown. A verdict is recomputed at most every 10 minutes when the tip or
+  the entries ahead move.
+- **Attribute.** Red: the entry alone on the tip red means it breaks the tip; entry alone
+  green and the entries ahead alone green means an interaction; the entries ahead red on
+  their own do not blame the entry. A blamed entry settles `refused`
+  `queue_compile_conflict` with the first diagnostics and the entries ahead whose changed
+  files appear in them (all of them when none does), waking its enqueuer once like any
+  refusal. Re-enqueue after those entries land.
+
+A clear wide entry costs one bounded check; a narrow entry costs two cached git reads.
 
 ### Operator landing (#2055)
 
@@ -952,7 +1386,17 @@ reads that Issue (in the source's project) and adds every name its body lists on
 `Failing tests:` lines (the qa Issue format, `a, b (and N more)`). Refusals:
 `queue_fixes_invalid`, `queue_fixes_issue_not_found`,
 `queue_fixes_issue_lists_no_failing_tests` (pass `fixes_tests` instead). Claims
-combine with `derive_filters` or `test_filters`. No migration: the entry keeps
+combine with `derive_filters` or `test_filters`. #3264: the verb also reads the
+Issue's `Shard command:` lines (the qa and gate base-red Issue format) and adds
+the filter each `cargo test -p PKG --test|--bin NAME` names (`PKG=test:NAME`,
+`PKG=bin:NAME`; `rsi_common::rolling_queue::shard_command_filters`) to the
+landing's filters, so a claim the gate would not otherwise select is run, not
+refused `claimed_fix_still_red`. #3905: a `cargo test -p PKG --lib [FILTER]` command (the base-red filer's own format) adds the exact lib filter `PKG=test(=PATH)` of each test the Issue names on its `Failing tests:`/`Test:` lines (when the Issue holds one lib package), whatever the diff touched; a test in `gate_base_red.rs` feeds the filer's output through the parser. #3748: the full-library QA Issue has no `Shard command:`
+line, so the verb also reads its `Failing outcomes:` entries and adds the exact
+lib filter of each `FAIL|TIMEOUT <pkg> <path>` whose binary is a bare package
+(`PKG=test(=PATH)`; `rsi_common::rolling_queue::failing_outcome_lib_filters`;
+a `<pkg>::bin/NAME` binary selects nothing). A claim with neither (`fixes_tests`
+alone, a shard script or nextest command) still needs its own `test_filters`. No migration: the entry keeps
 them in its `test_filters_json` as reserved `fixes_test=NAME` items, which the
 store splits back out into `RollingQueueEntryV1.fixes_tests` (`test_filters` is
 unchanged, and the claims are part of the replay identity); a lander that
@@ -972,15 +1416,22 @@ without claims behave as before.
 
 `AgentEnqueueLandingSource` accepts optional `supersedes: <entry UUID>` from
 `AgentListRollingQueue` or an enqueue receipt. Use a new `idempotency_key` and a
-`source_commit` that descends from that entry's commit. Only the original
-enqueuer (`source_session_id`, including when landing another session's sandbox)
-may replace it, and both entries must have the same project. Unknown or
-foreign-enqueuer/project entries are refused `queue_entry_not_found`; missing
-ancestry in the new source checkout is `queue_supersedes_not_descendant`.
+`source_commit` that descends from that entry's commit. The original enqueuer
+(`source_session_id`, including when landing another session's sandbox), or a
+caller with the same authority to cancel the entry, may replace it. This includes
+the current manager seat replacing a predecessor seat's entry after rotation or
+reappointment. Both entries must have the same project. Unknown or out-of-scope
+entries are refused `queue_entry_not_found`; missing ancestry in the new source
+checkout is `queue_supersedes_not_descendant`.
 
 An immediate transaction rechecks ownership, project, the probed source and
 `queued` state, then settles the old entry `superseded` with outcome refusal
-`queue_entry_superseded` and inserts the replacement at its FIFO `sequence`.
+`queue_entry_superseded` (and, #3358, `superseded_by: <replacement entry id>`)
+and inserts the replacement at its FIFO `sequence`. A topology land node
+waiting on the old entry follows `superseded_by` (`land_entry_followed` event),
+keeps waiting and settles on the successor's outcome, so a repaired descendant
+costs no repair round; a cancelled entry has no successor and still fails the
+node `land_refused`.
 The old row moves to a fresh sequence before its terminal state freezes it;
 its id, source and replay key remain available. No migration or deletion is
 needed. Listing is ordered by current sequence, so start a new page traversal
@@ -1027,6 +1478,66 @@ count; the parent comes from the launch journal. Action Items tell the successor
 to pass `parent_epic_id` after confirming the Epic is still in scope. This list
 is a recovery hint, not authority, and defaults to empty for older documents.
 
+### First Issue-worker launch of a project-wide manager (#3688)
+
+`AgentManagerLaunchIssueWorker` without `parent_epic_id` from a manager whose
+scope is the whole project (no listed Groups or Epics), with a live grant and no
+live Epic in scope, provisions the parent itself before admission
+(`Store::issue_worker_default_container_plan`, daemon half
+`provision_default_issue_worker_containers`): a default Epic "Issue workers"
+under the project's oldest live top-level Group, or under a new default Group
+"Managed work" when there is none. It needs no operator or global-manager action
+and no `allow_create_groups`; the project-wide scope covers both rows, so no
+scope or policy version changes. A scope that lists Groups or Epics is the
+operator's deliberate limit and is never widened: it keeps the
+`manager_issue_worker_parent_required` refusal that names the remedy (#3540).
+The containers are not charged against `max_created_containers`. A retry after a
+later refusal reuses the Epic (one live Epic is the unambiguous parent).
+
+### Issue-bound worker reads its reporter (#173)
+
+`AgentReadSessionEvents` (and no other verb) also admits a live Issue-bound
+worker reading the session that created its bound Issue
+(`Store::issue_worker_reads_reporter`): the caller's binding is live as the
+write authority defines it (`live_issue_binding_for_worker_on`: its latest
+Issue-bound launch is running or succeeded, the worker session is
+`Starting`/`Running`/`WaitingApproval`, and no later launch of the same Issue
+was admitted), the target is that Issue's `issues.created_by_session_id`, and
+the target session's `project_id` is the binding's project. Project and portfolio
+(including global) manager seats never qualify (#471 / hub #3342), including
+former appointments and any continuation of a seat. Seat identity comes from
+durable project appointments and portfolio grants, never a title. Exactly that one
+session: not another hop of its rotation lineage, not the creator of a
+referenced, related or review Issue, not a session in another project, never
+the caller itself. It is read-only, with the same paging, byte bound and
+per-field clipping as any read; the final message and terminal reason come
+from the target's lineage tip as for every target. The admission ends with the
+binding (the worker ends, or a later launch of the Issue supersedes it). Any
+other caller or target keeps the one `agent_verb_scope_denied` refusal, and
+`AgentGetStatus`, `AgentGetProgress`, halts, mail and watches are unchanged.
+Pass the full id: a short prefix resolves only inside the
+`authorize_agent_target` scope.
+
+### Issue-bound worker reads cited evidence sessions (#466)
+
+The same live binding also admits `AgentReadSessionEvents` for a same-project
+non-manager session whose full lowercase UUID appears as a complete token in
+the bound Issue's body, the journalled launch brief
+(`request.operation.query`, including attached evidence), or its newest 64
+handoff records authored by a session outside the reading worker's continuation
+lineage. Handoffs by the worker itself, its predecessors in the `continued_from`
+chain, or its successors do not grant access (#466 r2). The 64-record bound is
+applied before filtering authors. The body and handoffs
+are read at call time; the brief is the durable launch snapshot. Alphanumeric,
+hyphen or underscore extensions, uppercase UUIDs and prefixes do not select.
+Citation text is data, never instructions. No other verb, mutation, mail or
+control authority changes. Paging, byte bounds, clipping and lineage-tip
+final-message behavior are unchanged. An uncited or unknown session, a cited
+foreign-project session, any project/portfolio/global manager seat (including
+former seats and their continuations), a citation only in the reading worker's
+continuation-lineage handoffs, and a worker whose binding ended keep the identical
+`agent_verb_scope_denied` refusal. Short IDs gain no new resolution scope.
+
 ### Short ids on read verbs (#2312)
 
 `AgentGetJob` (`job_id`), `AgentGetStatus` and `AgentReadSessionEvents`
@@ -1050,6 +1561,30 @@ UUID-only.
 `agent_jobs` before `AgentEnqueueLandingSource`. It is read-only, has the native
 tool `rsi_control_check_landing_candidate` and is in the closed catalog.
 
+Profile-backed non-Rust verification (#413) is also accepted. The daemon stores
+`result.profile_verification` independently of project output, binding the
+canonical clean source/HEAD, raw and resolved profile digest, exact argv and
+daemon/shell/runner byte digests. All resolved verification commands must finish
+successfully; empty/unsupported roles fail closed. The generic warning verdict
+is `generic_command_exit`, with completed command counts and no invented Rust
+test count. A candidate read rechecks source/profile/tools and reports
+`candidate_profile_stale` on drift/unreadability. A manager-owned job counts for
+a named worker only in the owner's live scope, in the same stored project and
+the worker's exact registered sandbox, with caller reach to both identities.
+Without job_id the lookup also checks the caller's newest 100 jobs under those
+same fences. Full contract and limitations: [project profile](../project-profile.md#verification-evidence-413).
+The Rust receipt, baseline and warning behavior below remains unchanged.
+
+A portfolio owner can use this path in a granted project without appointing a
+project manager: launch that project's Issue worker with
+`sandbox_source:{commit:"<exact candidate SHA>"}` (the object must already exist
+in the project's repository), then have the worker submit its declared
+verification recipe from its own allocated sandbox. The job belongs to that
+worker and project. The portfolio checks `source_session_id` and `source_commit`
+against the resulting job. This needs no external `worktree` selector or
+sibling grant; another project's PM gains no authority over the source or job.
+This verifies a candidate; publication still needs a supported landing backend.
+
 - **Verb gate.** Manager, Epic lead or a Status-mode portfolio seat
   (`portfolio_reader`, the list rule); anyone else, a worker included, is refused
   `candidate_not_authorized`. The request is validated first
@@ -1062,10 +1597,13 @@ tool `rsi_control_check_landing_candidate` and is in the closed catalog.
   job. A session's jobs are the ones it owns: a rotated worker's finished jobs stay
   with the predecessor, so pass `job_id` for those.
 - **Verdict.** `ok` only for a finished `scoped_test` job whose receipt head is
-  `source_commit` and whose `new_failures` is empty or `null` with a green run.
+  `source_commit`, whose daemon-owned `scoped_tool.source` is `rolling`, and
+  whose `new_failures` is empty or `null` with a green run.
   Otherwise `ok:false` with one `refusal`, most blocking first:
   `candidate_job_not_terminal`, `candidate_admission_timeout` (the job's own
   `job_admission_timed_out`/`job_start_timed_out`), `candidate_receipt_missing`,
+  `candidate_tool_untrusted` (candidate/sandbox tool or missing daemon provenance:
+  rerun scoped_test with the rolling tool copy, `params.scoped_test.rolling_tool:true`),
   `candidate_job_not_green` (the run failed before the baseline comparison named
   its reds, `new_failures: null`), `candidate_new_failures`,
   `candidate_head_mismatch`, `candidate_conflicts_with_rolling` (#348: the
@@ -1076,6 +1614,14 @@ tool `rsi_control_check_landing_candidate` and is in the closed catalog.
   paths, and a clean fresh probe lifts a stale receipt's conflict). A session with no `scoped_test` job is
   `candidate_no_verification_job`. A run that exits non-zero only on baseline
   reds is `ok`: the gate is no new failures relative to `rolling`.
+- **Tool provenance.** `scoped_tool` exposes the daemon's pre-launch stamp,
+  never the receipt's `tool`. For an untrusted run the handler searches the
+  owner's newest 100 jobs for acceptable rolling-tool verification at the same
+  head. If found, the verdict's verification fields and `job_id` identify that
+  rolling job; `tool_under_test` retains the original job id and provenance.
+  Candidate-copy runs remain diagnostic evidence. Legacy jobs without a stamp
+  require a rolling-tool rerun. The merge queue's independent Rust lander gate
+  remains mandatory and does not reuse a worker receipt as proof.
 - **Docs-only delta.** On a head mismatch the daemon reads
   `git diff --name-only <receipt head> <source_commit>` in the owner's checkout (then
   the caller's) and reports `docs_only_delta`, `delta_files` and up to 10
@@ -1088,7 +1634,7 @@ tool `rsi_control_check_landing_candidate` and is in the closed catalog.
 
 ### Listing and cancelling your entries (#1964)
 
-`AgentListRollingQueue {state?, project_id?, limit?, before_sequence?}` and
+`AgentListRollingQueue {fields?, state?, project_id?, limit?, before_sequence?}` and
 `AgentCancelRollingQueueEntry {entry_id, reason?}` (`crates/rsid/src/session/rolling_queue_verb.rs`,
 `Store::list_rolling_queue_for_agent` / `cancel_rolling_queue_entry_for_agent`) have native tools
 (`rsi_control_list_rolling_queue`, `rsi_control_cancel_rolling_queue_entry`) and are
@@ -1114,7 +1660,21 @@ terminal state and nothing wrote it before.
 - **List** is newest-first (`sequence` descending), bounded to 100 rows (default 50),
   paged by `before_sequence` (`next_before_sequence`). Rows are the bounded
   `AgentRollingQueueEntryV1` (no hot-file or filter lists; `test_filter_count`
-  and a truncated `outcome` summary instead).
+  and a truncated `outcome` summary instead). With neither `fields:"full"`
+  nor an explicit `state`, filter before paging to `queued`/`admitted`/`gating`
+  plus `refused`/`failed` entries whose `finished_at` is within the last hour
+  (inclusive). Compact outcomes retain `landed_sha`, `refusal` and the first
+  nonempty refusal-detail line (160 UTF-8 bytes); omit test counts and other
+  detail. `fields:"summary"` is the default. `fields:"full"` or an explicit
+  `state` restores all matching history and the existing 240-byte outcome
+  detail and failing-test count. The request field is additive; authority,
+  cursor ordering and the operator-wide view are unchanged.
+- **Seat handoff.** The context-cap document's Open Work section renders each
+  live queue entry as one line: entry UUID, state, 12-character source SHA,
+  Issue number and quoted title (Issue title, falling back to the source
+  session's title). Missing Issue/title uses `-`. Additive optional `issue`
+  and `title` fields in `HandoffQueueEntryV1` preserve old typed documents;
+  the Typed State block retains complete recovery identity.
 - **Cancel** is one CAS `queued -> superseded` under an immediate transaction, the
   same one a claim takes, so an entry is either claimed or cancelled. The entry
   settles with outcome refusal `queue_entry_cancelled` and detail
@@ -1195,6 +1755,18 @@ settings `governor_build_slots` (4), `governor_lander_slots` (5),
 `governor_min_avail_mem_gb` (16), `governor_max_workers_slice_gb` (30) are live
 daemon settings with Settings > Orchestration rows. If rsid is unreachable the
 script falls back to its local flock gates.
+
+Memory projection (hub #3629): the `governor_min_avail_mem_gb` floor is also a
+projected floor. A granted heavy build (a cargo `test`/`nextest`/`--no-run`
+command naming `-p rsid` or `--workspace`, never the `check` lane) reserves
+8 GiB at grant, decaying linearly to zero over 10 minutes. While any reserve
+exists, or the request is itself heavy, `MemAvailable` plus free swap
+(`ResourceSample.swap_free_gb`) less those reserves must still meet the floor,
+otherwise the ticket queues with the typed reason `memory_projected`
+(`headroom_gb`, `projected_gb`, `min_gb`, `reserved_gb`, `requested_gb`). With
+nothing reserved and a light request only the physical `MemAvailable` floor
+applies, as before. The estimate is a constant; the operator tunes only the
+floor. macOS keeps the daemon-side `held_for_capacity` gate.
 ## Provider profile and AWS setup (#1407)
 
 - `provider_profile` (`all` | `aws_only`) is an ordinary persisted daemon
@@ -1339,7 +1911,9 @@ is refused at launch.
   (the closed Claude `authMethod` set `none|claude.ai|oauth_token|api_key|
   api_key_helper|third_party`, `chatgpt` for Codex, else `unknown`) and
   `checked_at`; the CLI's other output (e-mail, organisation, directory) is dropped
-  before anything is stored, served or logged. Claude: `loggedIn` decides;
+  before anything is served or logged. An opaque digest of stable Claude
+  account identity is persisted for plan-window invalidation (#3568); raw
+  identity is never persisted. Claude: `loggedIn` decides;
   Codex: exit 0 is logged in, exit 1 with empty output or "Not logged in" is
   logged out; a missing CLI, a timeout or anything unreadable is `unknown`.
 - Cache and triggers: 60 s TTL, one probe in flight per provider (concurrent callers
@@ -1393,6 +1967,33 @@ is refused at launch.
 - Notice: the manager coordinator records one deduped `ledger_change` notice per
   provider and login loss (`provider_login_required:<provider>`, version the
   `logged_in` -> `logged_out` transition time) naming the host-side fix.
+
+## Provider account switches and plan-window holds (#3568)
+
+The Claude login probe compares an opaque digest of its account identifier (or
+email) and organisation ID with the last identifiable account. The Codex
+`account/read` poll does the same before storing its fresh windows. A changed
+account invalidates older windows using an internal durable cutoff in
+`daemon_settings`; rows are retained, with no migration or deletion. The first
+identifiable account establishes a baseline, and a missing, failed or unchanged
+identity never clears a hold. Fresh windows after the cutoff enforce admission
+normally. Existing Claude probe triggers and TTL apply even while launches are
+held, so detection needs no model turn.
+
+`ClearProviderUsageHold {provider: SessionProvider}` is the operator fallback
+when account detection is unavailable (including a switch before the daemon's
+first identifiable probe). It invalidates that provider's existing windows and
+runs wake release immediately. It is deliberately absent from `AGENT_VERBS`,
+`READ_VERBS`, native agent tools and the agent CLI catalog. The TUI key
+`<Space>hu` / `:provider-clear-hold` applies it to the selected session's provider.
+This clears old telemetry, not future enforcement.
+
+The scheduler releases held wakes on its next pass after an account change or
+fresh capacity reading, preserving the existing four-wake / 30-second backlog
+stagger. Wakes without a manager notice carry `schedule_json.provider_window_hold`
+and are re-armed when the same admission predicate clears. Topology launches
+remain Reserved and retry on their next normal executor tick, without waiting
+for the previous account's reset.
 
 ## Provider CLI contract canary (`provider_contract`, #2755)
 
@@ -1456,6 +2057,56 @@ canary per CLI makes the drift visible.
 - Notice: the manager coordinator records one deduped `ledger_change` notice per
   provider and degradation (`provider_contract_degraded:<provider>`, version the
   time the provider entered that reason).
+
+## OpenRouter spend ceiling (`openrouter_spend`, #3154)
+
+The daemon, not an agent, keeps OpenRouter spend inside the operator's budget.
+
+- **Operator surface.** `UpdateDaemonConfig {field:"openrouter_spend_cap_usd", value}`
+  (TUI Settings > Cloud Spend; `0` = off; alone, never in a batch). Turning the
+  cap on from off takes a FRESH probe of the account `total_usage` and records
+  it with its time as `openrouter_spend_baseline_usd` / `openrouter_spend_armed_at`
+  (derived rows, refused as operator writes, durable); a cap that cannot get a
+  baseline is refused `openrouter_spend_cap_probe_failed`. The stop line is
+  baseline + cap. Changing an armed cap keeps the baseline; `0` forgets it.
+  `openrouter_spend_warn_pct` (default 80) is the warn line. `GetDaemonConfig`
+  carries `openrouter_spend` (the state below) and `openrouter_spend_status`
+  (the Settings row: cap, spent since arming, remainder, state).
+- **State** (`rsi_common::openrouter_spend::evaluate`): spent = last probed usage
+  + the cost of `OpenRouter`/`Harness` invocations settled since that probe
+  (increment SQL) - baseline; `off | ok | warn | reached | probe_stale`. The
+  probe is refreshed at most once a minute (a failing provider is retried every
+  15 s); one older than 5 minutes, or none, is `probe_stale`.
+- **Enforcement.** Launch admission (`freeze_launch_identity`; the sync backstop
+  in `spawn_provider_process` covers continuations and rotations) refuses an
+  OpenRouter-billed launch (the OpenRouter provider on any route; a Harness
+  session whose `openai_base_url` is on `openrouter.ai`) with
+  `openrouter_spend_cap_reached` once spend plus the per-launch reserve (2% of
+  the cap, `$0.05..$0.50`) reaches the line, and with
+  `openrouter_spend_cap_probe_stale` while an armed cap cannot be judged (fail
+  closed, never open). `SpendGuardedControl` checks before every Harness model
+  call; a session past the line ends with stop reason `openrouter_spend_cap_reached`
+  (never healed). One manager notice per line per arming
+  (`openrouter_spend:warn|reached`).
+- **Agent reads.** `AgentGetProviderStatus` `openrouter` entry: `spend_cap`
+  {cap_usd, baseline_usage, spent_usd, remaining_usd, warn_pct, state,
+  stop_line_usd, ...}; `launch_admission: refused` with the typed code once
+  reached or stale. `{provider:"openrouter", models:[...]}` adds `model_prices`
+  (per-million-token prompt, completion and cache-read prices with `fetched_at`)
+  and `model_prices_unknown`, from the daemon's own `/api/v1/models` fetch;
+  `price_for_model` prefers a discovered price over the hand-typed `PRICES`.
+- **Per-run budget.** `AgentGetProviderStatus {provider:"openrouter",
+  run_budget_usd, run_sessions:[...]}` (positive finite budget, at most 256
+  sessions; `provider_status_run_budget_*` refusals otherwise) adds `run_budget`
+  to the `openrouter` entry: `admitted`, `refusal_code` and `status`
+  {run_budget_usd, spent_usd, remaining_usd, exhausted}, from
+  `SpendEnforcer::run_budget_report`. The run's spend is the increment-SQL sum
+  of its `run_sessions`. Refused `openrouter_run_budget_exhausted` once the run
+  spent its budget (stop launching tasks), `openrouter_run_budget_exceeds_remainder`
+  when what is left of the budget is larger than the cap's remainder, or the
+  launch refusals while the cap is reached/stale.
+- Not covered: OpenRouter calls that are not launches (background helper models);
+  they only show up in the next probe.
 
 ## Harness tool policy (#792)
 
@@ -1576,6 +2227,14 @@ and `AgentSpawnChild` (`deny_unknown_fields`) has no field for it.
   (hosted searches at 0.01 USD, fetches token-only).
 ## Durable agent jobs (#1002)
 
+Scoped-test receipt recovery (#561): the daemon reads the last complete JSON
+`SCOPED_TEST_RECEIPT` line from a separate, bounded 16 MiB log suffix, independent
+of its 256 KiB diagnostic tail. An unfinished or malformed final receipt falls
+back to the previous complete receipt within that suffix; without one the
+normal scoped-test settlement reports `scoped_test_receipt_missing`. Failed
+runs retain typed evidence, and hard timeouts retain the last receipt marked
+`ok:false, partial:true` alongside `job_timed_out`.
+
 Deploy drain (#1566): while a deploy drain holds worker starts, a `test` or
 `build` `AgentSubmitJob` from a worker or manager is accepted, not refused. The
 job is recorded `queued` (`held: "held_for_deploy"`, no `started_at`, no unit),
@@ -1588,9 +2247,14 @@ from `started_at`. `landing`, `cloud_gate` and `cloud_sweep` submits keep the
 typed retryable `deploy_draining` refusal. Schema: V159 (`queued` state,
 `started_at`).
 
-Held for a staged deploy (#2190): a staged `interrupt_workers` deploy stops
+Held for a staged deploy (#2190, #3373): a staged `interrupt_workers` deploy stops
 running `test` jobs after their grace (below), so a `test`/`build` job started
-meanwhile would only be killed. For the whole life of such a deploy (to its own
+meanwhile would only be killed; a staged deploy without it stops no job and
+reaches its quiet point only if running jobs drain, so a job started after the
+worker-start hold would keep `job_running` set to the deadline while the merge
+queue sits held. Both hold new jobs the same way, except that only the
+`interrupt_workers` deploy has the retry window below (and none applies with
+`deploy_drain_enabled` off for the plain one). For the whole life of such a deploy (to its own
 deadline, past the `deploy_drain_hold_secs` worker-start cap, and for its caller
 and parentless sessions too) every new `test`/`build` submit is held exactly as
 above: `held: "held_for_deploy"`, no unit, no timeout clock, and the receipt's
@@ -1598,17 +2262,17 @@ above: `held: "held_for_deploy"`, no unit, no timeout clock, and the receipt's
 submission order through normal governor admission when the deploy settles
 (success, rollback or timeout), is abandoned (`cancel`) or reaches its deadline,
 and each owner's one wake fires at the job's real terminal state. Jobs already
-running when the deploy is staged keep the grace below. A satellite runs its own
+running when the deploy is staged keep running (#3554, "Running jobs" below). A satellite runs its own
 deploy flow on its own daemon, so the same rule holds jobs on that satellite.
 
 `AgentSubmitJob`, `AgentGetJob`, `AgentListJobs` and `AgentCancelJob` (#1106; the owner's stop, the job settles `failed` with refusal `job_cancelled`; #2213: the current appointed manager, or a portfolio seat inside its grant, may also stop an ordinary worker `test` or `build` job owned by a session in its live scope under the `manager_session_control_scope` mutation checks, the result's `cancelled_by_manager` and the job detail name the manager and the owner; #2232: a daemon-owned job is never cancelled by a manager (`landing`, `cloud_gate`, `cloud_sweep`, a `release` build, the `rolling-library-qa` recipe and any job a `bounded_qa_requested` binding names: `agent_jobs::manager_may_cancel`), which is `job_not_found` to every non-owner; #2233: every non-owner refusal is `job_not_found` (including `manager_target_owned_by_ancestor`, a container owner and a custody change), and only the owner's current in-scope manager sees the typed `manager_v2_capability_denied`, `manager_v2_paused` and `manager_v2_human_or_recovery_owner`) are agent verbs (in #2470: `AgentGetJob`/`AgentListJobs` also serve the live manager seat (project, area or portfolio) the jobs, settled or not, that its published rotation predecessors owned (project jobs must name the seat's project), and `AgentGetJob` a job owned by a session in its manager scope (a worker's receipt); owner and cancel authority are unchanged, a stale predecessor or foreign manager gets `job_not_found`.
 `AGENT_VERBS`, the closed catalog and `rsi-rpc`; no native tool, none in
 `READ_VERBS`). The daemon binds the caller from the token; the job is owned by
 that session. `params` are typed per `kind` (`test`, `build`, `landing`,
-`cloud_gate`, `cloud_sweep`; `rsi_common::agent_jobs`) and become a fixed argv in
+`cloud_gate`, `cloud_sweep`, `bench`; `rsi_common::agent_jobs`) and become a fixed argv in
 `rsid::agent_jobs::job_command`: an agent never supplies a command line, and every
 free-text field is a validated bare token. The working directory is the caller's
-own `sandbox_root`; `landing`, `cloud_gate` and `cloud_sweep` are refused `job_kind_not_authorized`
+own `sandbox_root`; `landing`, `cloud_gate`, `cloud_sweep` and `bench` are refused `job_kind_not_authorized`
 unless the caller is the current appointed manager or current Epic lead; the cloud
 gate and the sweep run the scripts and Terraform embedded in the daemon binary
 (written to `~/.rsi/jobs/trusted-gate`), never the caller's tree (the sweep gets
@@ -1629,12 +2293,56 @@ rebuilds `agent_jobs` (a provisional migration); each Linux unit has
 log gets a marker and the recorded status is 153); only an appointed manager may pass `worktree`, and it must be a
 worktree of the caller's own repository (same `git rev-parse --git-common-dir`).
 
+Issue-worker continuation (#584): a successfully published `continue_from`
+launch may read/list and arm `jobs_terminal` for its predecessor chain's
+`test`/`build` jobs, queued, running or settled. Each edge must have the same
+Issue and project, the recorded Session link, a frozen Path selection of the
+predecessor's sandbox and verified successor custody allocated at that frozen
+commit. A bare Session link, another Issue/project/root, unverified custody,
+unpublished launch or superseded binding grants nothing. The walk is bounded
+at 64 participants and fails closed on cycles or overflow. Publication carries
+enabled job-result and wholly scoped batch wakes in its transaction, preserving
+their ids and predicates and resetting the delivery fence to the successor's
+bootstrap. Future default-owner completion wakes use the same proven recipient.
+Generic backstops and protected wakes stay put. Jobs, original owners, replay
+keys and receipts are unchanged: inherited reads do not make an old-head receipt
+acceptance evidence for a new head. Cancellation and manager succession rules
+are unchanged. This is prospective publication behavior, not a migration of
+existing job/watch rows.
+
+#### Job read scope
+
+`AgentGetJob` includes the owner, published manager-seat predecessors, the
+caller's live manager scope and the proven Issue-worker predecessor chain above.
+The review-only exception (#604) uses the reader's latest running/succeeded
+Issue launch, which must carry `review_of`, resolved in that launch's project. It selects
+the reviewed Issue's newest four distinct implementer sessions from
+running/succeeded launches without `review_of`. For each eligible owner, Get
+admits only `kind: test` jobs whose stored `params.scoped_test` is an object:
+the owner's newest such job (any state), or an older one whose full UUID appears
+in the reviewed Issue's body or newest 64 handoff records (case-insensitive).
+The check uses current records at read time, not a frozen list from the copied
+review brief. Recipe, package, shard, build and other jobs do not qualify for
+this exception merely because their IDs or claimed source SHA were copied.
+
+`job_not_found` means absent or inaccessible within the caller's read scope;
+the same code does not disclose which. Full and compact views and authorized
+unique prefixes use the same read predicate. Reading a receipt does not prove
+it verifies the reviewed SHA: review access does not compare its source/head
+to the admitted review source. Check the receipt's provenance and head
+separately. This review exception grants no List, `jobs_terminal` watch,
+cancel or ownership authority; the manager and continuation rules above remain
+unchanged.
+
 Lost job id (#269): the `AgentSubmitJob` receipt repeats the id as a top-level `job_id`
 (beside `job.id`; replies serialize with sorted keys, so it lands after the large `job`
 object and survives a `tail`). `AgentListJobs {limit?}` (1-100, default 20) returns the
-caller's own jobs newest first for every session, worker included; only a live manager seat
-also sees its published rotation predecessors' jobs (#2470), and another session's job is
-never listed or readable (`job_not_found`).
+caller's own jobs newest first for every session, worker included. A live manager
+seat also lists its published rotation predecessors' jobs (#2470), and a proven
+Issue-worker continuation lists its scoped predecessor test/build jobs (#584).
+Review-only Get access does not add jobs to this list; use the eligible newest
+job ID from the copied evidence or an eligible full UUID cited in the reviewed
+Issue records. A copied ID alone grants no access.
 
 Package test jobs accept `params.exact: true` (#1600) to pass libtest `--exact`
 after Cargo's `--` separator, matching whole names in `filters`. Omitted or
@@ -1648,7 +2356,31 @@ For one integration-test harness, set `test_target:"<name>"` instead of
 and nonempty filters, and is exclusive with all other test job forms. The
 target is a plain ASCII letter/digit/underscore/hyphen name (no leading hyphen,
 path or shell syntax; 200 bytes max); invalid names and combinations are
-`job_invalid_params`. Existing requests without the selector are unchanged.
+`job_invalid_params` (kaizen #168: every `job_invalid_params` text, here and on
+`--validate`, is `job_invalid_params: <field>: <one-line fix>`, built by
+`rsi_common::agent_jobs::JobRefusal`; none is bare, and the code is unchanged,
+including `source_session_id` on a kind other than landing/cloud_gate). Existing requests without the selector are unchanged.
+
+Package jobs selecting `rsi`'s `e2e_tui` target run through the shared
+`scripts/e2e.sh` setup: build its required binaries, set `RSI_E2E=1`, and run
+the requested filters serially (#3370). This also applies to `rsi` package
+runs without `lib_only` or a different `test_target`: filter strings alone
+cannot prove that no gated test matches. A failed prebuild fails the job
+before tests start. Library-only jobs and other integration targets retain
+their ordinary Cargo command.
+
+A package test job may also pass `features` (#171): the same per-package
+allowlist as a `check`/`build` job (`JOB_BUILD_FEATURE_ALLOWLIST`, today `rsid`
+`e2e-seed`), sent as one `--features` list, so a feature-gated integration
+target runs as a job, for example
+`{"kind":"test","params":{"package":"rsid","test_target":"e2e_seed","exact":true,"filters":["<full test name>"],"features":["e2e-seed"]}}`.
+Any other feature is refused `job_invalid_params` with the build text
+(`job_invalid_params: params.features: entry ... is not allowed for ... (test job);
+... allowed features for ...: ...`, on submit and on `--validate`), as is `features` on a shard,
+recipe, `scoped_test` or candidate-receipt run. The job stays under
+`rsi-build.slice`, the sandbox target and the job timeout, and a filtered run
+that executes no test still fails `job_filter_matched_no_tests`. `scoped_test`
+takes no features: the queue derives its own filters.
 
 A package test job runs plain `cargo test` under the job's private, deliberately
 disk-backed TMPDIR (the job refuses a tmpfs/ramfs TMPDIR and caps its scratch);
@@ -1684,7 +2416,7 @@ test-profile build.
 Project gates (#1477) use `AgentSubmitJob` with
 `{"kind":"test","params":{"recipe":"check-cpu"}}`. This is a test-job
 workflow, so no new database kind or migration is needed. Declare the gate in
-the submitting worktree's `.rsi/jobs.toml` and review it with the project code:
+the submitting worktree's `.rsi/project.toml` or legacy `.rsi/jobs.toml` and review it with the project code:
 
 ```toml
 version = 1
@@ -1715,20 +2447,45 @@ aliases whose target is either gate, even in stale manifests. They return
 `job_recipe_use_scoped_test` before recording or launching a job; submit
 `{"kind":"test","params":{"scoped_test":{"base":"origin/rolling"}}}` instead,
 without `recipe` or `filters`. Local Makefile targets remain available.
-The typed `test {scoped_test:{base, head?}}` form (#1638, any
-leaf; `base`/`head` are bare branch, `origin/<branch>` or 40-hex refs, no other
-field) runs `scripts/scoped-test --base B [--head H] --runtime-max-sec T-120
+The typed `test {scoped_test:{base, head?, rolling_tool?}}` form (#1638, any
+leaf; `base`/`head` are bare branch, `origin/<branch>` or 40-hex refs;
+`rolling_tool` is a boolean, default false) runs `scripts/scoped-test --base B [--head H] --runtime-max-sec T-120
 --total-max-sec T-60 --cpu-quota 200` in the caller's sandbox under the ordinary
 test unit and `timeout_minutes` rules (T = the timeout in seconds), needing no
-manifest entry. Its default timeout is 60 minutes, or `job_test_timeout_mins` when
+manifest entry. Submission resolves both refs to commits in the job worktree
+before toolchain probes, static guards or cargo work (#476); omitted `head`
+defaults to `HEAD`. An unresolved ref refuses `job_scoped_test_ref_unresolved`,
+naming the field and ref and asking for a full 40-hex SHA or a fetched ref.
+Its default timeout is 60 minutes, or `job_test_timeout_mins` when
 larger, capped at 180 (#1979): the tool budgets each package separately, so the
 20-minute test default killed a plan of two 25-minute packages; the other test
 forms keep `job_test_timeout_mins`. Only a larger explicit `timeout_minutes`
 needs the manager/Epic-lead authority. The stamped `params.timeout_minutes`
 (`AgentGetJob`) and the receipt's `job_timeout_minutes` show the effective timeout. It uses the current `origin/rolling` tip's tool, materialized
 read-only, unless the candidate changes that tool or a helper; then it runs
-the candidate's copy (#1938). Resolution failure falls back to the worktree.
-The receipt's `tool` object names its `path`, `blob`, `source` and `rev`.
+the candidate's copy (#1938, `source: candidate`). When `base...head` leaves the tool
+alone but the head changed it on its own side of rolling (`origin/rolling...head`) and its
+bytes still differ from rolling's (an unlanded tool change in the base), the candidate's copy
+runs with `source: candidate_differs_from_rolling` (#279). Resolution failure falls back to the worktree.
+The receipt's `tool` object is self-reported diagnostic output. The daemon
+records `result.scoped_tool` in `agent_jobs.result_json` before launch: `source`
+(`rolling`, `candidate`, `sandbox`), absolute script `path`, Git `rev`, and
+`files[{path,blob}]` hashing every selected tool file's actual bytes. It survives
+settlement and daemon restart independently of omitted/forged receipt fields.
+No migration is needed. `rolling_tool:true` forces the rolling copy even for a
+tool edit, while Python tests still come from the candidate tree; it refuses
+`scoped_test_rolling_tool_unavailable` instead of falling back if rolling cannot
+be materialized or its files differ from their Git blobs.
+Signal-only compile/test failures (#516) carry `failure_class: "infrastructure_interrupted"`
+and `ok: false` in the scoped receipt. Compiler diagnostics or failing tests veto
+that classification, including when a signal occurred in the same run. The daemon
+preserves it in `AgentGetJob.result.receipt`; `AgentWorkerRoster.latest_job` and
+`AgentCheckLandingCandidate` copy `failure_class` into their summaries. The job
+stays failed and cannot qualify for landing; this is evidence for one same-head
+worker rerun outside the two-run limit, never an automatic retry.
+
+An admission timeout (`job_admission_timed_out`, #618) is classed the same way: `failure_class: "infrastructure_admission_timeout"` in the result (`AgentGetJob.result.failure_class`) and the receipt, with `admission.blocked_by` and the result detail naming the slot holders (governor `Slots` reason: lease, pid, unit, seconds held) or the disk, memory or load floor that held the job. It is not charged to the two-run limit. #625: while the host disk floor alone holds a running test or build job (the governor reports its waiter with no lease at all, so no holder can free space) for `DISK_FLOOR_FAIL_FAST_SECS` (10 minutes, after cargo-slot's one idle-pool reclaim), the job poll stops its unit and settles it the same way instead of waiting out the full admission allowance; a wait with any slot holder keeps the long allowance. The detail names the free space and the fix (`scripts/clean-target` on a finished sandbox, or the build-cache reclaim), then resubmit once.
+
 The script's last line is `SCOPED_TEST_RECEIPT <json>`; the job
 settles `succeeded` only on exit 0 with `ok: true` and carries it as
 `result.receipt` next to `result.exit_code` and the job `log_path`
@@ -1739,6 +2496,26 @@ The manifest is version 1, at most 64 KiB and 64 recipes, with no unknown
 fields; its resolved path must stay inside the worktree. Missing manifests or
 undeclared recipes return `job_recipe_not_allowed`; malformed manifests return
 `job_recipe_invalid`, before inserting or launching a job.
+
+No-sandbox recipe jobs (hub #33): a session whose `sandbox_root` is null (a
+manager seat on a registered non-Rust project, `working_dir` = its project
+root) runs a declared recipe job (`params.recipe` only: no `scoped_test`,
+`qa_lane` or `candidate_receipt`, and no `worktree`) from its `working_dir`
+when that directory canonicalizes (symlinks and `..` resolved) to exactly the
+canonical `Project.path` of the session's own `project_id`
+(`agent_jobs::resolve_unsandboxed_recipe_cwd`; a registered path that is a
+filesystem root, a missing directory or any other path is
+`job_directory_not_allowed`). Admission reads the registered path under the
+store lock and the effect-time recheck refuses if it changed. Only a project
+whose root admits no sandbox qualifies: when the root passes the predicate every
+sandbox allocation passes (`sandbox::git_worktree::origin_admits_sandbox`, a git
+work tree), the project's agent sessions get sandboxes and the root is a shared
+worktree agents never run in (hard rule 2), so the job is refused
+`job_project_root_sandboxed` (run it from a sandboxed session of the project).
+Nothing else widens: a session that owns a sandbox keeps the sandbox-only rule, a foreign
+or symlinked-away directory is refused, a requested `worktree` keeps the
+manager same-repository rule, and the job runner's build-slice CPU bounds,
+timeout fit and manifest limits apply unchanged.
 
 Declared timeout caps are 5-180 minutes and CPU caps are 1-1600 percent.
 The request's test timeout must fit the declaration (`job_invalid_params`
@@ -1759,6 +2536,25 @@ the same authority as Cargo tests; declarations grant no cloud, publishing or
 credential authority. Package/shard/candidate-receipt fields are exclusive
 with `recipe`.
 
+Commit-pinned exact test (#3410, #3229): a `test` job with `params.at_commit` (a full
+lowercase 40-hex commit id of the project repository) runs one exact package test at that
+commit instead of at the sandbox HEAD. It is open to every session with a sandbox, not a
+manager or Epic-lead job: a QA-red or gate-red fixer confirms the culprit by running the
+failing test at `<sha>^` and `<sha>`, and a post-land or pre-merge reviewer (sandbox at
+`rolling`) runs the reviewed source's new tests. The params name exactly what runs: `package`,
+`exact: true`, nonempty `filters` and exactly one of `lib_only` or `test_target`
+(`rsi` `e2e_tui` is refused: it needs the `scripts/e2e.sh` setup); `shard`, `filterset`,
+`recipe`, `scoped_test`, `candidate_receipt` and `qa_lane` are refused with it
+(`job_invalid_params` naming the field). `job_command` runs
+`<cargo-slot> env -u <ns> scripts/at-commit-test.sh <sha> test -p ...`, so the run is bounded
+like any package test. The script checks the commit out into a detached `git worktree` under
+the job's private `TMPDIR` (repository hooks off), runs cargo there with the sandbox's own
+`CARGO_TARGET_DIR` and removes the worktree on every exit, so the sandbox's HEAD, branch, index
+and files are never touched (hard rule 2). A commit the repository lacks (one best-effort
+`git fetch origin <sha>` first) exits 2 with `not in this repository`. The usual
+`job_filter_matched_no_tests` settlement and `timeout_minutes`/`cpu_quota_percent` apply. The
+result is diagnostic: acceptance stays the `scoped_test` receipt at the final HEAD.
+
 Per-job CPU budget (#161): a package, shard, `scoped_test` or `build` job may carry
 `params.cpu_quota_percent` (100-1600, percent of one CPU; out of range or on a
 `recipe`/`candidate_receipt` is `job_invalid_params`). `agent_jobs::job_command` takes
@@ -1775,7 +2571,11 @@ cap needs the installed `cargo-slot` from the same deploy (an older copy keeps f
 jobs; the quota and test threads still apply). macOS jobs run `env` as the slot wrapper and
 keep launchd's two build jobs and four test threads (#2937); the daemon itself holds a macOS cargo job
 `held_for_capacity` while the platform build slots (2) are full or less than 4 GiB of memory is available
-(`host_memory.rs`); Windows has no job runtime.
+(`host_memory.rs`). A capacity wait is no deploy drain (#177): a capacity-held job is bounded by
+its one pre-launch admission allowance (`admission_allowance_secs`, counted from its queue start, the
+wait a scoped receipt reports as `queue_wait_sec`), never by the drain cap below, and its
+`job_admission_timed_out` detail names the hold, the observed slot or memory reading and that bound.
+Windows has no job runtime.
 
 Test-job timeout (#1337): a `test` job carries `params.timeout_minutes`
 (5-180). When omitted the daemon stamps the operator's `job_test_timeout_mins`
@@ -1794,14 +2594,15 @@ durable `job-start` marker, excluding governor and sandbox/artifact lock waits
 spends none of it. The pre-launch wait has its own cap, the drain's
 `deploy_drain_hold_secs` (default 600 s when uncapped) plus 5 minutes, counted
 from the later of the submission and the deploy hold's last engagement (#2190:
-a long hold, and a daemon restart through it, never count); a job
+a long hold, and a daemon restart through it, never count; scoped and macOS
+capacity-held jobs use the finite pre-launch allowance instead); a job
 still unlaunched past it settles `failed` with the distinct refusal
 `job_admission_timed_out` (wakes the owner once; resubmit it) and never reports
 `job_timed_out` (#1611). A unit that never writes `job-start` (its command never
 ran: a systemd start delay, not a test) gets one `start-wait` line with the
 unit's state in its log after 2 minutes and, past its independent ten-minute
 start admission limit, settles `failed` with `job_start_timed_out`, never `job_timed_out` (#1832). The job log
-is written unbuffered (`stdbuf -o0 head -c`), so `job-start`, slot/lock waits
+is written unbuffered (`stdbuf -o0 head -c` on Linux, an unbuffered `cat` under `ulimit -f` elsewhere, #464), so `job-start`, slot/lock waits
 and test output are visible while the job runs (#1830).
 
 Same-owner test/build peers in one sandbox queue before unit launch, oldest
@@ -1814,23 +2615,34 @@ holder without an exit status (after the launch grace) fails with
 progress yields `job_sandbox_holder_stalled`. Both results name the holder job,
 unit and log, and leave its service alone. Completed holders are reconciled
 normally before the next peer launches. Deploy-drain holds take precedence
-and keep their own admission cap.
+and keep their own admission cap. Scoped jobs retain the finite pre-launch
+allowance below while waiting behind a peer or a deploy.
 
 Linux test/build jobs sharing a Cargo target serialize under an exclusive
 `sandbox-lock` before governor admission, so Cargo's silent build-lock wait
 does not consume execution time or a governor slot. macOS retains Cargo's own
 serialization. Build admission is separate from execution. #2211: an ordinary test job waits
-for its governor slot up to its own timeout (at least ten minutes) and a `build`
-job (a manager's release build) up to one hour (`BUILD_ADMISSION_WAIT_SECS`), so
+for its governor slot up to its own timeout or one hour (`BUILD_ADMISSION_WAIT_SECS`),
+whichever is longer (#3575: a worker cannot raise a 20-minute timeout, so a
+timeout-sized wait failed jobs on a busy hub without a compile), and a `build`
+job (a manager's release build) up to one hour, so
 neither loses a fixed ten-minute race against the jobs holding the one slot
 (cargo-slot gets `RSI_CARGO_ADMISSION_MAX_SEC` from the unit's environment,
 `JobCommand::admission_max_secs`); exceeding it settles `job_admission_timed_out` with the last phase and full wait
-duration. Scoped-test jobs (#2025) count slot/lock waits in their own wall budget
-from `job-start`; admission may use the remaining budget minus a 120-second
-runtime reserve. A granted slot leaves only the remaining wall budget to run.
+duration. Scoped-test jobs (#431) also exclude slot/lock waits from execution.
+Admission gets the job's timeout (at least one hour, #3575) separately; a granted
+slot leaves the full execution budget, including later packages and baseline
+triage. Pre-launch holds have the same finite allowance measured from the current
+attempt's queue marker (creation for legacy logs), even during a deploy or thermal
+hold. Deploy reruns start a new queue allowance. The receipt reports `queue_wait_sec` before
+unit launch, and `admission.startup_wait_sec` and `admission.waited_sec` for wrapper
+and governor waits, with `excluded_from_execution: true`.
 The script derives the diff before acquiring a slot: a selection with no Rust
 package runs its Python suites without a governor slot. Scoped-test units carry
-only the job timeout plus 5 minutes of grace, without a separate slot allowance.
+the execution timeout plus the admission allowance, 5 minutes for teardown, and
+one minute for the script to publish its own admission-timeout receipt before
+the daemon backstop (#3284). A wait past the allowance settles
+`job_admission_timed_out`, which candidate checks read as starved capacity.
 The Linux launcher uses `--no-block` so service start cannot stall submission
 of the rest of a batch; a unit that ends before `job-start` reports
 `job_launch_failed` with its unit state and launch phase.
@@ -1927,6 +2739,26 @@ those jobs on Mac, and all jobs on other unsupported operating systems, return
 `job_platform_unsupported` before inserting a job. Linux keeps its existing
 systemd backend and resource limits.
 
+Mac test lifecycle containment (#637): every `test` payload, including native
+Cargo targets, at-commit execution, scoped candidate/baseline worktrees and
+declared/profile recipes, enters `/usr/bin/sandbox-exec` with a profile compiled
+into the daemon. It denies the system `launchctl` executable, launchd job
+creation, privileged task ports and signals to processes other than self or
+children. Fake lifecycle executables remain usable. This is a bounded lifecycle
+fence, not a filesystem/network sandbox or proof that an installer fixture is
+hermetic. Neither source age, `rolling_tool`, HOME, PATH nor an environment switch
+can disable it. The service wrapper, watchdog and daemon custody sweep remain
+outside the fence. Build jobs and operator install/deploy flows keep their
+existing policy; Linux keeps its current isolation.
+
+A missing system sandbox executable is refused before job insertion as
+`job_test_source_uncontained`. Queued jobs recheck availability and receive the
+same payload fence at actual launch, including jobs admitted by an older daemon.
+Profile initialization failure never falls back to executing the payload; it
+fails the job, with sandbox-exec setup diagnostics reported as
+`job_test_source_uncontained`. Already running jobs require separate incident
+coordination: a new daemon cannot retrofit a kernel sandbox into their processes.
+
 Toolchain custody (#2823): a Linux or Mac `test`/`build`/`landing`/`cloud_gate`
 submit whose daemon `PATH` resolves a `rustc` other than the exact version the
 job directory's `rust-toolchain.toml` pins (probed with `rustc --version` in that
@@ -1967,6 +2799,151 @@ grace settles `lost`. `settle_agent_job` CASes `running -> terminal` and inserts
 the owner's single `scheduled_jobs` resume wake in the same transaction, so
 overlapping polls and restarts never wake twice.
 
+## Bench jobs (#3181, program #3135 M3 S5)
+
+`AgentSubmitJob {kind:"bench", params:{config, budget_usd}}` runs one pinned
+Terminal-Bench configuration on the operator's laptop with RSI's native harness (or
+the oracle agent (the official solution script) for a $0 smoke) and returns one typed result
+(`result.bench`) and one run record. Only the current appointed manager or a current
+Epic lead may submit it (`job_kind_not_authorized`, the landing rule). `config` is a
+repository path `eval/bench/tb2/runs/<name>.toml` (a plain file name, no `..`) or
+`eval/bench/tb2/candidates/<id>/run.toml` (#3191),
+`budget_usd` a finite number in `(0, 1000]`: the run's M4 budget. No other field
+exists: an agent supplies no command, host, model or path of its own. The job is
+owned by the caller, gets `jobs_terminal` wakes and the deploy rules below, and
+needs no schema beyond the V187 widening of the `agent_jobs.kind` CHECK.
+
+**The run config** (`eval/bench/tb2/runs/*.toml`, `schema_version = 1`, unknown fields
+refused) names `host` (`ssh://<bench.laptop_host>`), exactly one of `split`
+(`smoke`, `calibration`, `search`, `held_out`) and `tasks`, `k` (1..=10, Harbor `-k`),
+`concurrency` (1..=8; the operator's `bench.max_concurrency` lowers it),
+`timeout_multiplier` (only `1.0` is accepted: leaderboard-shaped) and `[agent]`
+`kind = "oracle"` (no model, $0) or `kind = "rsi"` with `model`, `effort` and
+`per_task_cap_usd`. An optional `[loop]` table sets the per-launch loop knobs
+(#3177). An optional `overlay = "eval/bench/tb2/candidates/<id>/overlay.toml"` names a
+run overlay (#3191): the editable bench prompt body, a narrowed tool allowlist, the compaction
+budget and the iteration cap of a Meta-Harness candidate. `config` may then also be
+`eval/bench/tb2/candidates/<id>/run.toml`. The job reads the overlay and its instructions file
+from its committed, clean HEAD, refuses a schema or limit breach `bench_overlay_invalid` and a
+leak audit hit `bench_overlay_leak_audit_failed` (fail closed), writes the validated overlay to
+`~/.rsi/bench/<run>/overlay.json` before opening the run, and each trial start re-verifies it
+(`bench_overlay_unavailable`) and applies it per launch (`BenchLaunchProfile.overlay`, the
+overlay's knobs over `[loop]`); nothing writes a daemon setting. Its canonical digest, file
+hashes and rendered prompt digest are in `harness_build_digest` and the `overlay` effective
+input. Schema and dry run (`rsi-bench-resolve`): `eval/bench/README.md`. The committed `smoke-oracle.toml` and `calibration-flash.toml` are the S10
+runs. The shard plan is the dataset's (`eval/bench/tb2/dataset.toml`) cut to the
+selected tasks, in dataset order.
+
+**Gates**, run in this order at submit (before any row exists) and again when the
+queued job starts; a failure at submit is the typed refusal, at start the job
+settles `failed` with the code in `result.refusal`:
+
+| Gate | Refusal |
+| --- | --- |
+| operator setting `bench.enabled` (default off) | `bench_disabled` |
+| the config exists, parses and resolves against the pinned dataset | `bench_config_invalid` |
+| the config and every file the run reads (the config, the dataset and the split; the Rust runner reads nothing else) are tracked and unmodified at the worktree HEAD, which is a git checkout | `bench_config_uncommitted` |
+| the config's host is `ssh://` plus `bench.laptop_host` | `bench_laptop_host_mismatch` |
+| the config's host is in `bench.docker_hosts` | `bench_docker_host_not_allowed` |
+| *model-driven runs only:* (OpenRouter, model, effort) is in the project's `allowed_launches` | `bench_launch_not_allowed` |
+| *model-driven runs only:* the OpenRouter spend cap is armed (`spend_cap.state` is not `off`) | `bench_spend_cap_off` |
+| *model-driven runs only:* `admit_run_budget(cap, budget_usd)`: the budget fits what is left under the cap, the cap is not reached and the probe is fresh; `per_task_cap_usd` does not exceed `budget_usd` | `openrouter_run_budget_exceeds_remainder`, `openrouter_spend_cap_reached`, `openrouter_spend_cap_probe_stale`, `openrouter_run_budget_invalid` |
+| the installed Rust runner (`rsi-eval`, the sibling of the running `rsid`, never a `PATH` copy) prints a build stamp that names this runner version, lists no missing source and agrees with its own source manifest | `bench_preflight_failed: runner_unavailable` |
+| the runner's preflight (`rsi-eval bench tb2 preflight --plan`): the plan's host is the allowlisted `ssh://<bench.laptop_host>`, the hub's pinned checkout and the plan match the pinned dataset (#3620 pin check), Docker and Compose v2 answer on the laptop, which is linux/amd64 with measured free disk at least the largest planned shard plus 10 GiB and measured available memory at least concurrency x 4 GiB + 4 GiB (a capacity that cannot be measured fails closed) | `bench_pin_check_failed` (pin drift), else `bench_preflight_failed: <kind>: <detail>` (`host_refused`, `ssh_failed`, `docker_unreachable`, `compose_unavailable`, `unsupported_platform`, `disk_insufficient`, `memory_insufficient`, `capacity_unmeasured`, `unsupported`, ...) |
+
+A config that launches no model (`kind = "oracle"`) skips the three model-driven
+gates and may run with the spend cap off; a paid run never does. At start the job
+must also still be on the commit it was admitted on (`job_source_moved`, the build
+source custody of hub #2954) and its config digest must equal the one recorded at
+submit (`bench_config_changed`). A staged deploy keeps a queued bench job queued.
+
+**Lifecycle.** Submit stores the job `queued` (`held: held_for_bench_admission`) with
+its HEAD and config digest in `<jobs>/<id>.source` and `<id>.bench`. The jobs loop
+(`agent_jobs::bench::start_queued`) runs the gates, then creates
+`~/.rsi/bench/<job id>/` (0700) and, for a model-driven run, opens the S4 run
+(`BenchService::open_run`: the run id **is** the job id, so a restart rebinds the same
+run; the adapter socket is `~/.rsi/bench/<run>/adapter.sock`). It writes `inputs/`
+(the exact config, `dataset.toml` and `split.json` the run used) and `plan.json`, then
+launches the unit: `<install dir>/rsi-eval bench tb2 run --plan <run>/plan.json` (#3681, program #3135
+option B; design `thoughts/shared/plans/2026-10-22-issue-3135-rust-tb2-runner.md`). The binary is
+the `rsi-eval` that `make release-install` builds and installs beside `rsid` (a deploy carries it:
+`DEPLOY_BINARIES`); `rsid` finds it as its own sibling, runs `rsi-eval bench tb2 stamp` and trusts it
+only when the stamp is self-consistent (`RunnerBinary::from_stamp`), so a missing, foreign-version
+or half-built runner is `bench_preflight_failed: runner_unavailable`, and nothing is compiled at
+trial time. The unit holds no agent token, one CPU (`CPUQuota=100%`, never the build slice, so the
+4-CPU hub's merge-queue CPUs are never loaded) and runs at most five days. A run whose job ended
+has its adapter socket closed (`Finished` after a succeeded job, `Cancelled` otherwise, which also
+stops live trials).
+
+**The runner** (`crates/rsi-eval/src/tb2_runner`, plain Rust, tested against fake Docker and ssh
+executors) reads the daemon-written `RunnerPlanV1` (`plan.json`; no credentials) and drives the
+laptop's Docker over `docker -H ssh://<laptop>` and `ssh -o BatchMode=yes`: it validates the plan and
+the hub checkout (`<bench root>/tb2/<pinned commit>`, the same checkout the overlay leak audit
+uses; provision it with a clone at the pinned commit) against `dataset.toml` with #3620's pin check,
+pulls each shard's images by pinned linux/amd64 digest, runs bounded trials with the task's own
+agent and verifier deadlines and exact CPU and memory limits, and always removes the containers,
+networks and log directories it created. An oracle trial runs the official `solution/solve.sh`, then
+`tests/test.sh`, in the task container and reads the verifier's reward; no model session is created.
+It leaves `<run>/trials/<task>-s<slot>-r<retry>/outcome.json` per attempt and `<run>/summary.json`.
+Exit codes: 0 every trial passed with a clean teardown, 2 the run finished but a trial did not pass
+or was not cleaned up (the job still settles `succeeded`; the record carries each verdict and the
+result detail names an uncleaned trial), 20 preflight, 21 pin drift, 22 a trial operation failed, 23
+ssh failed (each settles the job `failed` with `bench_preflight_failed`, `bench_pin_check_failed`
+or `bench_transport_failed`). A model-driven (`kind = "rsi"`) config plans the Harness mode, which the
+runner refuses (`unsupported`) until its Harness client lands (R4/R6), so such a run is turned away
+at preflight before a run is opened or any money is reserved.
+
+**Budget.** The run cannot spend beyond `budget_usd`: S4's `BenchTaskStart` re-reads the
+run's spend (daemon increments, never cumulative rows) through M4's
+`run_budget_report` before every trial and refuses one that cannot be afforded; the
+jobs loop also re-reads it every tick (`run_budget_status`, `bench::watch_budget`) and,
+once the run's budget is spent, writes `<run>/stop.json` so the transport starts no
+further shard. The stop is in the receipt (`result.bench.stopped:
+"budget_exhausted"`, the detail line) and in the run record: every trial that never ran
+is a row with `failure_cause` and `stop_reason` `budget_exhausted`, `reward_valid`
+false (so it is counted as an invalid trial, never as a pass or a fail). A run stopped
+early is a bounded stop, not a failure: the job is `succeeded` with `bench.stopped` set.
+
+**Deploys.** A deploy never waits on a bench job (a running `bench` job is not a quiet-point
+blocker and is never preempted) and a daemon restart does not stop its unit. Trials in
+flight at the restart become `infra_interrupted` (S4) and the record keeps the interrupted attempt
+as an invalid trial (`infra_interrupted`) that does not fill its slot; the runner's journaled
+replacement (R5) is not wired yet, so such a run reads `incomplete`.
+
+**Result and record.** The job settles when the unit ends. `result.bench`
+(`BenchJobResultV1`) carries `run_id`, `config`, `config_digest`, `record_path`,
+`observation_fingerprint`, per-shard `{shard, status, trials}`, the counts
+`expected_trials`, `trials`, `valid_trials`, `passed_trials`, `invalid_trials`,
+`infra_interrupted_trials`, `not_run_trials`, `spent_micro_usd`, `budget_micro_usd` and
+`stopped` (`budget_exhausted`, `transport_failed`, `incomplete`;
+absent for a complete run). The record `~/.rsi/bench/<run>/record.json` (0600) is
+the `BenchRunRecord` v1 (#3179), assembled (`record::assemble_runner`) by joining each runner
+`TrialOutcomeV1` (verifier reward, typed exception, phase times) with the trial's `bench_tasks`
+row (the join key is `rsi_common::bench_runner::trial_key`): cost, tokens, wall time and the stop
+reason come from the daemon's increment SQL, the route verdict from the post-run audit (an
+`invalid_route` trial never counts), the trace hash and the solution-lookup scan from the trace
+file. An oracle trial has no daemon row, so its usage is zero and it has no session or trace hash.
+The record names the Rust evaluator: `run.harbor_version` is `rsi-tb2/1;parity=harbor-0.24.0`,
+`run.adapter_tree_hash` is the runner's stamped evaluator digest (taken from the runner admitted at
+start and kept in `<id>.bench`, so a runner reinstalled mid-run cannot change it) and
+`sampling.runner` carries its version, source digest, reference archive digest and retry policy,
+so a Harbor record and a Rust record are never compared. A trial the runner never started is a
+`not_run` row as above. The record is written even when the runner failed (a partial record,
+with `stopped`). The legacy Harbor reader (`record::assemble`) stays for historical trees only.
+
+**Operator settings** (rule 10: TUI Settings > Benchmarks, `GetDaemonConfig` /
+`UpdateDaemonConfig`, the desktop pane and the daemon-config catalog; all next-launch):
+`bench.enabled` (bool, default off), `bench.max_concurrency` (1..=8, default 4),
+`bench.laptop_host` (a plain ssh host or `user@host`, default `arch-laptop`) beside
+`bench.docker_hosts` (#3176). None is an agent verb.
+
+**Trust boundary.** The oracle unit uses no adapter socket and no model credential. (A Harness
+run's per-run adapter socket, S4, stays local to the hub: the Rust client of R4 connects to it
+directly, with no forwarding to the laptop.) The gates are the daemon's own code; the runner is the
+binary installed beside the daemon, identified by its build stamp, whose evaluator digest is
+recorded as `adapter_tree_hash`; the config, dataset and split are the worktree's committed, clean
+ones.
+
 ## Topology names and bundled starters (hub #3157)
 
 Topology names are unique within `(owner_kind, project_id, epic_id)`, with
@@ -1991,8 +2968,12 @@ visible row, including one shadowed by name. Existing visibility and execute
 policy checks still apply; name ordering grants no additional authority.
 
 The daemon seeds bundled starters as shared operator rows at their fixed IDs.
-Private manager/Epic rows are never adopted or refreshed by seeding, even when
-their text is an older bundled definition. Managers and Epic leads use the
+Private manager/Epic rows are never adopted, refreshed or rewritten by seeding.
+The one exception (hub #3257): a private row named like a starter whose canonical
+text is exactly an older shipped digest (`SHIPPED_BEFORE`) is an unedited stale
+seed that would shadow the current shared starter by name, so seeding archives it
+(never deletes it) once the shared row exists. Edited private rows and private
+copies of the current text stay. Managers and Epic leads use the
 same fixed starter ID and its returned digest to execute the same starter
 revision. A manager's private same-name row remains its default name lookup;
 use the fixed ID to select the shared starter. Operator edits and archives
@@ -2036,8 +3017,9 @@ evaluates it every `HEALTH_POLL_SECS` (60 s) with no model call and resumes the
 owner ONCE when any condition holds, with one `condition=<kind> subject=<id> ignore_key=<kind>:<subject> detail="..."`
 line per condition (at most 24) after the wake's own text. With nothing abnormal
 the owner takes no turn at all. Only a project manager (`is_manager`, scope = its
-project) or a portfolio seat (`is_global_manager`, scope = the projects its grant
-covers, which for a child node is a strict subset, #2788) may arm it
+project), a live area seat (scope = its current direct Epics and its own seat),
+or a portfolio seat (`is_global_manager`, scope = the projects its grant covers,
+which for a child node is a strict subset, #2788) may arm it
 (`wake_when_health_anomaly_manager_only`); the daemon pins `project`/`projects` into
 the stored spec at arm time and overwrites any client-supplied value. The stored
 scope is only an upper bound: every evaluation re-derives the observable projects
@@ -2045,10 +3027,22 @@ scope is only an upper bound: every evaluation re-derives the observable project
 (a PM keeps its project only while it is still its session's project), so a narrowed or
 revoked grant stops reporting the removed project at once, and every project-bound
 fact (seats, blocked executions, overrun attempts, red QA, PM context) is limited to
-that set in the query itself. Host readings are not project-bound. It is a
+that set in the query itself. Area wakes filter blocked executions and overrun
+attempts by the execution's Epic before applying row limits, observe their own
+seat, creation caps and decision ledger, and leave project-wide rolling QA to
+the PM. Revocation empties the area wake's scope on the next evaluation. Host
+readings are not project-bound. It is a
 predicate wait, so it follows the seat on a succession or rotation
 (`manager_obligations.rs`). `timeout_seconds` is honoured (a `timed_out` check-in
 at most that rarely) but is not needed.
+
+Satellite health carries optional `governor_disk` facts (free bytes on the
+job governor's filesystem, its effective floor, and the longest continuous disk
+wait in seconds). Old peers may omit them; the hub then uses `qa_admission` disk
+facts. A reported disk waiter makes a new full-library QA placement fall back to
+the hub with `satellite_qa_disk_low`, using the existing floor-plus-target check
+for space. `rolling_health.qa_hub_fallback_reason` and its rendered block expose
+the latest placement's hub reason; a later satellite placement clears it.
 
 Conditions (`rsi_common::health_anomaly`, evaluated by the pure
 `rsid::health_anomaly::evaluate` over `StoreFacts` (`collect_store_facts`),
@@ -2061,12 +3055,45 @@ Conditions (`rsi_common::health_anomaly`, evaluated by the pure
 | `topology_execution_blocked` | execution id | `blocked` for `health_stuck_minutes` |
 | `node_attempt_past_wall_limit` | attempt id | `running` more than `health_stuck_minutes` past its real wall limit (#2786): the earlier of its execution's `deadline_at` and its node wall time (`SESSION_WALL_TIME`, 4 h from the attempt's start plus the time it waited on an answer), as the executor enforces it; an execution with no deadline still bounds it |
 | `hub_disk_high` | `/` | root filesystem use >= `health_disk_used_pct` |
-| `satellite_disk_low` | peer id | the satellite's reported free build disk is below its reported floor |
+| `hub_memory_high` | `hub` | `MemAvailable` below half of `governor_min_avail_mem_gb` (0 turns this arm off), or swap use >= 80% (hub #3629); no new setting, so the manager is woken before the OOM killer acts |
+| `hub_disk_critical` | `/` | root filesystem use >= 97% or free space < 20 GiB while the disk check is on (hub #3634). Own kind and ignore key, so an accepted warm `hub_disk_high:/` never hides it; it replaces the warm line while it holds, and its detail prints `severity=critical` |
+| `satellite_disk_low` | peer id | the satellite's reported free build disk is below its governor floor, or a continuous disk-governor wait exceeds `health_stuck_minutes` (0 disables the wait condition) |
+| `satellite_manager_no_launches` | `<peer id>:<project id>` | a declared satellite project's manager seat reports an empty saved `allowed_launches` list; old peers without manager policy facts remain unknown |
 | `cpu_hot` | `hub` | the hottest CPU sensor >= `health_thermal_c` for 3 minutes |
+| `cpu_critical` | `hub` | the hottest CPU sensor >= 92 C for 3 minutes while the thermal check is on (hub #3634); own ignore key, replaces the warm `cpu_hot` line, detail prints `severity=critical` |
 | `provider_model_unavailable` | `<hub or peer id>:<provider>:<model>` | a launch was refused `model_unavailable` (same data as `AgentGetProviderStatus`; a satellite reports its own on `SatelliteHealthV1.provider_faults`) |
 | `provider_auth_failure` | `<hub or peer id>:<provider>` | an open 401-class auth episode |
+| `provider_window_projected_exhaustion` | `<provider>:<window>:<reset epoch>` | utilization >= `health_provider_window_used_pct` (default 70%, 0 off), and the faster of average burn since the window opened or recent observed burn (up to 24 hours) projects exhaustion before reset. Known five-hour, seven-day and numeric-minute windows are supported, including Codex buckets. Invalid, future, expired or explicitly stale readings stay quiet. Detail names provider, window, utilization, projected exhaustion, reset and observation time (#3567) |
 | `rolling_qa_red_untracked` | tested SHA | the newest full-library QA receipt is red, older than `health_stuck_minutes`, and its Issue is closed, cancelled or was never filed |
 | `reclaim_unsupported` | `hub` | this build cannot reclaim sandbox build caches (the fail-closed `target_reclaim_unsupported.rs` shim: not Linux, not macOS); persistent, and `AgentGetDaemonInfo` `hub.build_cache_reclaim` reads `unsupported` (hub #3055) |
+| `manager_decision_pending` | decision key | a decision a manager may rule on (`answerable_by: manager`) has been pending on a project manager's ledger for `health_stuck_minutes` (#3240); the line names the project and the asking execution. Rule with `AgentManagerUpdate decision_ruling`. The same decision also sends the current seat one `ledger_change` notice (`decision:<key>`, event wake, re-homes to a successor seat) when it is asked and rides the context-cap handoff Typed State (`pending_decisions`) |
+| `manager_creation_cap_near` | `<project id>:<cap field>` | a project manager seat has used at least 80% of one of its own creation caps (`max_created_sessions`, `max_created_containers`), counted by `Store::manager_own_creation_caps` with the counter and limit its `manager_v2_creation_limit` refusal uses (#206); the detail names the cap, `used`, `limit` and the refusal's exact `raise_in` path. A zero limit never warns. `AgentManagerOverview` shows the same counts read-only on each project row as `policy.creation_caps` |
+| `daemon_restart_loop` | `hub:<time of the newest counted stop>` | the daemon stopped 3 or more times within 2 h without announcing it (#3480; a stop is announced only by an operator deploy drain). `daemon-lifecycle.jsonl` beside the socket journals each boot and each shutdown start (`daemon_lifecycle.rs`); a boot with no stop record before the next boot is an `unrecorded` stop. The line lists the newest 6 stops: time, uptime, reason, and the lander entries (`lander:entry=<id>:source=<sha>`) and job units (`job:<kind>:<unit>`) active at the stop. The subject changes with each new stop, so an `ignore`d loop is heard again when it continues |
+| `supervisor_restart_budget` | `hub:<unix time of the newest recorded restart>` | the supervisor's ONE restart budget (`deploy_restarts_per_hour + 1` restarts per hour, spent by deploys, watchdog exits and unannounced signal stops alike, #3492) is full, or it is backing off now. `supervisor-restarts` beside the socket's `deploy-restart-budget` snapshot is the supervisor's published history (`rsi_common::supervisor_restarts`); the line gives `restarts_in_window`, `limit`, `frees_at_unix`. Effect: `AgentRequestDeploy` is refused `deploy_restart_budget retry_after=` (deploy admission reads the same file and keeps the one slot the supervisor reserves for rollback), and the next crash restart WAITS the budget out (capped, default 900 s) instead of the supervisor exiting and leaving no rsid. Clears when the oldest restart leaves the window |
+| `hub_not_pulling` | trusted hub installation id | satellite-side inbound hub pairing exists and `last_hub_pull_at` is more than 15 minutes old, even with an empty backlog. Before the first pull, an oldest pending report older than 15 minutes establishes the condition; a newly paired idle satellite stays quiet. Detail names `last_hub_pull_at`, pending backlog depth and oldest age. Local project managers and portfolio seats with project coverage observe it; hubs without inbound pairing stay quiet. Successful `FetchHubReports` clears it on the next evaluation, even while reports remain pending (#518) |
+
+Provider-window samples are bounded daemon-local state, retained across the
+same manager re-arming its wake. Successful deliveries also store episode subjects
+in the wake receipt, preserving deduplication across daemon restarts. A held
+or refused delivery never acknowledges the episode. Each manager receives at
+most one successful warning per provider/window/reset;
+a new reset has a new key. After restart the window
+average remains available; recent samples start accumulating again. A successor
+manager may receive its own warning. The printed episode key also works in `ignore`. Recent burn uses the
+oldest retained observation within 24 hours, requires at least a minute between
+observations, and never extrapolates a negative delta. Unknown window lengths
+are left unprojected rather than guessing their start. This is advisory telemetry;
+launch admission continues to use its existing exhaustion rules.
+
+The inbound hub link uses the fixed `HUB_PULL_STALE_SECS` deadline (900 seconds),
+independent of `health_stuck_minutes`; it adds no operator setting. The existing
+satellite registry tick checks the same condition even when outbound satellite
+polling is disabled. It logs one WARN when a paired hub stops pulling and one
+INFO when pulls resume, each with hub installation id, `last_hub_pull_at`, backlog
+depth and oldest age. Ordinary pulls and repeated outage ticks are silent. These
+link observations are process-local, as is the report outbox. The satellite's
+inbound policy identifies hubs by trusted installation id rather than registry
+peer id; the existing outbox shares its pull clock across allowlisted hubs.
 
 The thresholds are daemon settings with an operator surface (RPC
 `GetDaemonConfig`/`UpdateDaemonConfig` and TUI Settings > Merge queue): `health_disk_used_pct`
@@ -2095,7 +3122,7 @@ when no other execution or worker holds it (`topology/issue_hold.rs`).
 
 ## Worker roster (#2311)
 
-`AgentWorkerRoster {project_id?, states?, limit?}` is a read-only agent verb with a
+`AgentWorkerRoster {project_id?, states?, fields?: "summary" | "full", limit?}` is a read-only agent verb with a
 native tool (`rsi_control_worker_roster`) and no database schema change. A session's
 `Completed` status is shown both for a worker parked on its own running job and
 for one that wrote its final handoff; the roster derives the state a manager acts
@@ -2107,10 +3134,10 @@ check (#2212):
 | --- | --- |
 | `running` | `Starting`, `Running` or `WaitingApproval` |
 | `failed` | `Failed` or `Interrupted` |
-| `final_handoff` | `Completed` and `latest_turn_final_result` (#3090: a final `RESULT`/`PIPELINE HANDOFF`/`REVIEW` line in the latest turn AND no `when.jobs_terminal` result wake still owed: a marker written while that predicate is pending, or before the last named job finished, is provisional (#2054) and the worker stays parked, because the daemon retires the wake only for a handoff written at or after the predicate settled, `wake_superseded_by_handoff`); or, with nothing parked, the worker published an Issue handoff (`issue_handoffs.author_session_id`, #2362): a reviewer whose verdict is on the review Issue but whose turn lacks the marker is done |
-| `parked_on_job` | `Completed`, no final result (a provisional marker counts as none), and `owner_running_job_has_completion_wake` (an enabled `when.jobs_terminal` wake of the worker's names a `queued`/`running` job it owns) |
+| `final_handoff` | `Completed` and `latest_turn_final_result` (#3090: a final `RESULT`/`PIPELINE HANDOFF`/`REVIEW` line in the latest turn AND no `when.jobs_terminal` result wake still owed: a marker written while that predicate is pending, or before the last named job finished, is provisional (#2054) and the worker stays parked, because the daemon retires the wake only for a handoff written at or after the predicate settled, `wake_superseded_by_handoff`); or, with nothing parked, the worker published an Issue handoff (`issue_handoffs.author_session_id`, #2362): a reviewer whose verdict is on the review Issue but whose turn lacks the marker is done; a submitted DB review receipt (`manager_review_receipts.reviewer_session_id`) or membership in a settled topology execution (`succeeded`/`failed`/`cancelled`/`blocked`) is also completion evidence |
+| `parked_on_job` | `Completed`, no final result (a provisional marker counts as none), and `owner_running_job_has_completion_wake` (a `queued`/`running` job it owns has `wake: owner`, including the default when omitted, or an enabled `when.jobs_terminal` wake of the worker's names it). An owner-wake job parks the worker before settlement creates the wake row (#364); once the job settles it no longer parks the worker by itself |
 | `parked_on_wake` | `Completed`, no final result, and `owner_armed_result_wake` (an enabled `resume`, `when` or `on_terminal` wake the worker owns; the one liveness predicate shared with `parked_session_pending`) |
-| `stranded` | `Completed`, no report, no published Issue handoff and none of the above; a job it still owns (`open_jobs`) cannot resume it |
+| `stranded` | `Completed`, no report, no published Issue handoff and none of the above; an open `wake: none` job without a completion wake cannot resume it |
 
 Scope is resolved from the transport token. Without `project_id`, a project's
 current appointed manager (the committed lineage tip) lists its own project, and
@@ -2125,12 +3152,29 @@ beyond the seat), lists the project: sessions a manager created
 binding) and children its Epic leads spawned. Any other caller is refused
 `worker_roster_not_authorized`; a seat outside its grant is
 `manager_project_not_in_scope`. Archived and deleted sessions are not listed.
-In the default view (no `states`), a `stranded` worker idle for over
+The default `fields: "summary"` view (no nonempty `states` filter) includes
+`running`, `parked_on_job`, `parked_on_wake` and `stranded` workers, plus
+`final_handoff`/`failed` workers whose `last_activity_at` is within the last
+hour (inclusive). Older finished workers are omitted and counted in
+`hidden_finished` (#477). A `stranded` worker idle for over
 `WORKER_ROSTER_STALE_STRANDED_DAYS` (7) days is omitted and counted in
-`stale_stranded_hidden` (#2362); `states: ["stranded"]` lists every one.
+`stale_stranded_hidden` (#2362). Nonempty `states` or `fields: "full"` restores
+all matching history, including stale strands; an explicit filter takes
+precedence over `fields: "summary"`. The same view selection applies inside
+each authorized scope; it changes no scope or authority rule.
 Workers come newest `updated_at` first; at most 512 are examined (deriving a
 completed worker reads its latest turn) and `truncated` says when more matched or
-were left unexamined.
+were left unexamined. History filtering precedes the page limit (default 64,
+maximum 256). `count` and per-state `counts` describe returned workers only,
+as before, never the whole scope. Hidden counts describe omitted candidates
+examined before the first extra matching worker or the scan cap stops the
+read; when `truncated` is true they may undercount omitted history. Hiding
+history alone does not set `truncated`.
+
+Examples: `{}` (or `{"fields":"summary"}`) reads the compact recovery view;
+`{"states":["final_handoff"]}` reads finished handoff history, including old
+workers; `{"fields":"full"}` reads all states and history within the normal
+page and scan bounds. Worker rows keep their existing detail in either view.
 
 `latest_job` is the shared minimal job summary `AgentJobSummaryV1` (`job_id`,
 `kind`, `state`, `exit_code`, `refusal`, `receipt_head`); `receipt_head` is
@@ -2149,6 +3193,13 @@ Disk and sandbox free-space holds request a non-dry-run reclaim pass through
 the usual serialized worker, with trigger `launch_hold`, at most once every
 three minutes per daemon. A reclaim submission failure observes the same
 debounce and is logged; launch admission remains queued and retryable.
+Manager `operator_call RunSandboxBuildCacheReclaim` (#434) may claim alongside
+running `create_session` actions, with one extra executor slot reserved for
+reclaim when ordinary slots or the pass's completion budget are exhausted.
+Reclaim still serializes with other actions (including other reclaim calls)
+in its project, and new creates cannot pass a running reclaim. All existing
+authority and cache-custody gates apply. Source-worktree settlement uses its
+own control path; those methods are not delegable through `operator_call`.
 
 ## Gone-target wakes (#2451)
 
@@ -2167,6 +3218,21 @@ original message. With no resolvable manager, one operator-scope to-do
 the wake due, so the next tick retries.
 
 ## Own wakes (#2389)
+
+Epic lead rotation (including a coordinator context-cap handover) carries the
+lead's enabled ordinary resume wakes and predicate waits in the same transaction
+as publication of its successor and the Epic lead pointer. It uses the shared
+manager-seat obligation transfer, including live job ownership. Terminal watches
+keep their existing lineage routing; program guards keep their owners.
+
+Carried predicate wakes (#482, hub #3223) record the successor's transcript
+sequence at the seat transfer in daemon-owned `schedule_json.self_wake_transfer`.
+The successor's existing bootstrap prompt does not supersede the inherited
+wait; later operator input still fences delivery, including input racing the
+continuation claim. Transfer clears the predecessor's continuation retry state
+and makes the predicate due for the next fast-lane pass. Job IDs remain
+authorized at scheduling time; evaluation uses their stored terminal states
+regardless of which seat in the lineage owns them.
 
 `AgentListWakes {include_disabled?, limit?, session_id?}` (native tool `rsi_control_list_wakes`)
 lists the caller's own wakes by default, `wake_session_id == caller`, so a
@@ -2217,6 +3283,66 @@ visible in the workspace. Active sessions have no lower age cutoff, so a
 long-running agent remains visible. Project names do not act as aggregation keys.
 The workspace refreshes every five seconds while open and retains the last
 snapshot, explicitly marked stale, when a refresh fails.
+
+## Global dashboard (#3316, slice B of #3314)
+
+`GetGlobalDashboard {window}` is an operator-only read (`window` is `"1h"`,
+`"24h"` (default) or `"7d"`; anything else is `Invalid params`). It stays out of
+`AGENT_VERBS`, `READ_VERBS`, the native tools and the agent CLI catalog, and
+`fleet_rpc_is_operator_only`-style tests pin that (`global_dashboard_rpc_is_operator_only`,
+and the attributed-caller refusal list in `rpc/tests.rs`). Types are
+`rsi_common::global_dashboard`; the read is `Store::global_dashboard`
+(`store/global_dashboard.rs`). It feeds the TUI `gd` view (#3314 C) and the
+desktop app (#3314 D).
+
+One bounded snapshot: `as_of`, `window`, `window_seconds`, `projects[]` (every
+project in the store, the home project first when one is passed and exists,
+then by name), a `totals` row, `projects_incomplete` and `incomplete_reasons`.
+The home project (#3314 A) is not recorded in the store yet, so the handler
+passes none and `is_home` is false everywhere until A wires it.
+
+Per project:
+
+- identity: `id`, `name`, `path`, `is_home`.
+- `agents`: live sessions (`Starting`, `Running`, `WaitingApproval`), leaves
+  only (Group and Epic containers never count), split by role and by
+  provider/model/effort. Role mapping, first match wins: `manager` (the active
+  global-manager seat, or a project's `harness_manager_scopes` seat), `lead`
+  (the lead of its parent Epic), `reviewer` (`agent_role` contains "review",
+  case-insensitive), `worker` (any other session with a parent), `other`
+  (parentless sessions). `by_provider` and `by_model` carry `{provider, model,
+  effort|null, count}`.
+- `pm_seat`: the project manager seat's session id and status, if any.
+- `usage` and `usage_by_model`: sums over `model_invocations` with `created_at`
+  in `[as_of - window, as_of]` (inclusive): input, output, cache read, cache
+  creation and reasoning tokens, `estimated_cost_usd`, `invocations` and
+  `errors` (status `failed`). A null token or cost field counts as 0.
+- `issues`: `open` and `in_progress` now (not archived), `created_in_window`,
+  `closed_in_window` (status `Closed`, `closed_at` in the window) and
+  `open_operator_requests` (open or in progress, not archived, label
+  `operator-request`).
+- `landings`: merge-queue entries with `published` or `refused` state whose
+  `finished_at` is in the window.
+- `rolling`: only when the project has a full-library green or an open `qa`
+  Issue: `qa_green_sha`, `qa_green_age_secs`, `open_qa_issues` (the #2743
+  `rolling_health_for_project` read).
+
+`totals.agents`, `totals.usage` and `totals.landings` cover every live session,
+invocation and queue entry, including those of no project; `totals.issues` sums
+the listed projects.
+
+Bounds (hard): every statement is capped and index-driven, and a hit cap sets
+`totals.incomplete: true` and names the read in `incomplete_reasons`
+(`projects`, `sessions`, `invocations`, `issues:<project id>`, `landings`); a
+snapshot is never silently partial. Caps: 256 projects (`projects_incomplete`),
+4,096 live sessions, invocations 50,000 / 100,000 / 200,000 for 1h / 24h / 7d
+(one extra row is fetched to detect the cap, then dropped), 50,000 Issues per
+project (a project at exactly the cap is reported incomplete) and 50,000
+merge-queue entries per outcome. Plans (pinned by
+`dashboard_queries_use_their_indexes`): live sessions
+`idx_fleet_active_sessions` (v153 partial index), invocations
+`idx_fleet_invocations_created`, Issues `idx_issues_project_display`, queue
+entries `rolling_queue_by_state`, projects the unique name index. No migration.
 
 ## Portfolio nodes (#1236, hierarchy S2)
 
@@ -2357,7 +3483,31 @@ Agent verbs, granted to any active portfolio seat (catalog role
 
 - `AgentManagerAppointChild {target, launch, query, idempotency_key,
   sandbox?}` launches a Standard root session and seats it in one idempotent
-  operation. `target` is `{kind:"project", project_id}` (appoint or replace
+  operation. The seat of a git-backed project root always gets its own
+  git-worktree sandbox, like a worker, so it runs `AgentSubmitJob` from its own
+  tree and never writes the shared root (#169; `sandbox: false` does not opt it
+  out); a non-git root gives none unless `sandbox: true` is asked, which the
+  allocation refuses. That rule is for project PM seats. A portfolio seat (new
+  child, replacement or self-handoff) is launched in the built-in "RSI home"
+  project (`Project::HOME_ID`, path = the daemon's `$HOME`, registered
+  idempotently at every daemon start by `Store::ensure_home_project`) with no
+  sandbox whatever `sandbox` says (hub #3315: `$HOME` is itself a git
+  repository). `launch_project_id` stays the appointment's admission and charge
+  project, and the launch-origin check accepts the home project for a portfolio
+  appointment only. An existing seat moves at its next replacement. A session
+  of the home project never gets a sandbox (`home_project_sandbox_refused`).
+  The home project holds no Issues (`home_project_issue_refused` on every
+  create path): a home seat's `AgentCreateIssue` without `project_id` files
+  into the admission project of the appointment that launched its lineage
+  (`Store::appointment_admission_project_for_lineage`), and naming the home
+  project is refused. `succeed_manager` from a home seat is refused
+  `home_project_succession_refused` before any git runs.
+  The home project cannot be deleted (`home_project_delete_refused`) or
+  re-pathed (`home_project_repath_refused`) through `DeleteProject`,
+  `UpdateProject` or `AgentUpdateProject`. Projects have no archive state, so
+  there is no archive path to refuse. It is never matched by path, so a launch
+  in an unregistered directory under `$HOME` stays unscoped, and codegraph
+  never indexes it. `target` is `{kind:"project", project_id}` (appoint or replace
   that covered project's PM, whole-project scope, then save the node's
   `child_policy`, or its own policy when unset), `{kind:"portfolio",
   node_id:null, tier_label, project_ids, policy, child_policy?,
@@ -2438,6 +3588,26 @@ reaches a sibling's or an ancestor's seat. The operator keeps
 `GetManagerTree` rows carry `grantor` (`operator` or `node:<id>`, also for a
 PM a node appointed) and the TUI tree shows it on each row (`by <tier>
 <short id>`) and in the detail (`granted by ...`).
+
+## Area-node delegation (#3438)
+
+`AgentManagerDelegateNode` creates or updates a direct child of the caller's
+current area/project node. The caller must hold its live parent seat in Execute
+mode, unpaused; the transaction checks the parent grant, policy and authority
+epoch, the narrower selector and grant, sibling overlap and direct-report cap.
+`seat_root_session_id` may name a parentless Standard session or a Task directly
+under a live Epic covered by the new node's selector. Both must belong to the
+node's project, have no predecessor and have no other active seat. Managers can
+therefore use `AgentManagerControl create_session` to create a Task under a
+selected Epic, then delegate the node to it. The operator's
+`ConfigureManagerNode` accepts the same seat shapes.
+
+A Task area seat resolves its own manager grant even when it already leads its
+Epic. Its catalog advertises the grant's manager controls, and subsequent
+checks re-resolve the selected Epics and seat lineage. A Task whose parent Epic
+leaves the selector loses that authority. An invalid `grant.max_direct_reports`
+(outside 1..=64) reports `params.grant.max_direct_reports` and the violated bound
+in the agent client's `invalid_input` diagnostic.
 
 ## N-level routing (#1238, hierarchy S4)
 
@@ -2661,8 +3831,8 @@ the verified quiet-point install and restart.
   after the `lib` entry so `lib` is published first; a rollback restores the old
   `bin` file and removes a first-time `lib`. `installed_tools` reports
   `cargo-slot` installed only behind the wrapper. They are hash-verified,
-  `cargo-slot` is checked with `bash -n` and `target-pool` with a Python parse
-  before staging succeeds, and the swap is the manifest's atomic rename, so a
+  `cargo-slot` and `target-pool` (a shim over the Rust `rsi-repo-guard target-pool`, #453) are
+  checked with `bash -n` before staging succeeds, and the swap is the manifest's atomic rename, so a
   running copy keeps its inode (`<name>.prev` until the deploy verifies). A
   `binaries_dir` without them is not refused: the receipt's `skipped` list
   names each (never a silent skip). `AgentGetDaemonInfo` `hub.installed_tools`
@@ -2737,7 +3907,9 @@ the verified quiet-point install and restart.
   `session_state` manager notice carrying `daemon_forced_shutdown`, so the
   forced end is never silent. The process-group kill is Unix-only; on
   Windows (no supervisor) the script says the backstop is unsupported.
-- **`interrupt_workers: true`** (optional, default false; V158 columns
+- **`interrupt_workers`** (optional boolean: omitted defaults to true for
+  `peer_id`, false for a local hub deploy; explicit false waits for a lull on
+  either target; V158 columns
   `agent_deploys.interrupt_workers` and `interrupted_sessions`). Once the hold
   is over (`created_at + deploy_drain_hold_secs`; with the drain setting off
   there is no hold, so it is over at once) `worker_mid_turn` stops blocking
@@ -2751,39 +3923,46 @@ the verified quiet-point install and restart.
   satellite deploy request; the satellite runs its own flow, so its hold and its
   workers are the ones that count, and the worker resumes on the new satellite
   build. Compatibility: the satellite advertises `capabilities.deploy_interrupt`
-  in its identity; the field is sent only when asked (`true`), and an older
+  in its identity; the resolved true is sent explicitly (including an omitted
+  peer option). Explicit false is sent without the field for compatibility, and an older
   satellite (no capability, it would refuse the unknown field) is refused
   `satellite_deploy_interrupt_unsupported` before anything is sent, never
-  silently run without it. The flag is part of the replay fingerprint (a request without it
-  keeps the old fingerprint), so a replay cannot flip it.
-- **Job grace (#2048; supersedes the AWS-era #1177 idea of leaving jobs alone).**
-  A fixed policy constant, not an operator setting (`DEPLOY_JOB_GRACE_SECS` =
-  300, counted from the request; it only bounds re-runnable verification and
-  the receipt reports it). Past it, each agent-jobs tick
-  (`agent_jobs::cancel_test_jobs_for_deploy`) stops every running `test` job of
-  a staged `interrupt_workers` deploy: the unit is stopped and (#2278) the job
-  goes back to `queued` under the same id, owner, params and wake policy
-  (`Store::requeue_agent_job_for_deploy`; `held_for_deploy`, the deploy recorded
-  as `requeued_by_deploy` in the params JSON, no schema change). It reruns on
-  the new daemon once the hold ends, and the owner's wake (per-job wake or a
-  `when.jobs_terminal` wait on that id) fires once, when the rerun ends, so
-  nothing is resubmitted by hand. `build`,
-  `landing` and cloud jobs and the queue's lander are never stopped and keep
-  blocking. #2176: a hub's full-library QA run on a satellite is stopped the
-  same way by any staged deploy at once (no `interrupt_workers`, no grace, and
-  even while a landing blocks the deploy: QA is preemptible, the #2190 order below
-  spares only ordinary test jobs); it is not requeued: it settles `failed` with refusal
-  `interrupted_by_deploy` and `deploy_id` in its result, and the hub defers it as
-  `deploy_preempted`. The receipt carries `job_grace_secs` and `cancelled_jobs`
-  (`Store::deploy_cancelled_jobs`: requeued jobs through `requeued_by_deploy`, settled ones
-  through the result's `deploy_id`), and the settle wake lists both kinds. Order (#2190):
-  stopping test jobs gains nothing while the deploy is blocked by something it
-  cannot preempt (`Store::deploy_unpreemptible_blockers`: an admitted or gating
-  queue landing, a running `build` or `landing` job), so none is stopped
-  meanwhile (ordinary test jobs only) and the grace runs from the latest tick that saw such a blocker
-  (the request when none was seen). New `test`/`build` jobs are held for the
-  deploy throughout (see "Held for a staged deploy" under "Durable agent
-  jobs"), so only a job already running when the deploy was staged is stopped.
+  silently run without it. A cancellation never acquires the peer default.
+  The resolved flag is part of the replay fingerprint, so a replay cannot flip it.
+  Existing peer requests made before this default change should specify false
+  when replaying a non-interrupting deploy.
+- **Running jobs (#3554; supersedes the #2048/#2278 grace-then-requeue and the
+  AWS-era #1177 idea of leaving jobs alone).** A staged `interrupt_workers`
+  deploy stops and requeues no ordinary `test` job (`scoped_test` included). The
+  job is a `systemd-run --user` unit outside rsid's process tree whose wrapper
+  writes the status file itself, so it runs across the restart; the new daemon's
+  startup poll (`agent_jobs::poll_once`) finds the `running` row, sees the unit
+  active (re-adopted by unit name and job id) and settles it once when it ends,
+  with the one owner wake (per-job wake or a `when.jobs_terminal` wait). Such a
+  job is a survivor (`agent_jobs::deploy_surviving_jobs`: a running `test` job a
+  manager may cancel, never the hub QA guest): it is excluded from the
+  `job_running` blocker (`Store::deploy_quiet_blockers_surviving`), so the
+  deploy no longer idles behind verification. Local builds, `landing` and cloud
+  jobs, the queue's lander and protected tests (full-library QA and bounded-QA
+  obligations) keep blocking the quiet point and are never stopped. A deploy
+  without `interrupt_workers` has no survivors and waits for running jobs to
+  drain. At the restart (`mark_agent_deploy_restarting` succeeded, same store
+  lock) the runner records the survivors still running under `survived_deploy` in
+  their params (`Store::record_agent_deploy_surviving_jobs`, no schema change;
+  `Store::deploy_surviving_jobs` reads them), so a job that ended before the
+  restart is not listed. A survivor's cargo-slot lease is not known to the new
+  daemon's in-memory governor, as after any unplanned restart. #2176: a hub's
+  full-library QA run on a satellite is still stopped by any staged deploy at
+  once (`agent_jobs::stop_hub_qa_for_deploy`; no `interrupt_workers`, and even
+  while a landing blocks the deploy: QA is preemptible); it is not requeued: it
+  settles `failed` with refusal `interrupted_by_deploy` and `deploy_id` in its
+  result, and the hub defers it as `deploy_preempted`. `cancelled_jobs`
+  (`Store::deploy_cancelled_jobs`) lists such settled jobs, plus, for a deploy
+  of an older daemon, the jobs it requeued through `requeued_by_deploy` (#2278).
+  `job_grace_secs`, `expected_requeued_jobs` and `requeued_jobs` are legacy
+  receipt fields a current daemon leaves empty. New `test`/`build` jobs are held
+  for the deploy throughout (see "Held for a staged deploy" under "Durable agent
+  jobs"), so only a job already running when the deploy was staged survives.
   **Retry window (#2278, #2551-#2553).** The job hold ends at the deploy's deadline, so a
   deploy that times out (a landing or build it cannot preempt held it to its deadline) would
   start every held job at once and meet its retry with a fresh crop of running jobs. A staged
@@ -2805,7 +3984,13 @@ the verified quiet-point install and restart.
   and files one `deploy_interrupt:worker_mid_turn` friction event per worker
   (session = the worker, evidence `deploy:<id>`). The next process settles the
   row and its single wake names those session ids; the receipt
-  (`interrupt_workers`, `interrupted_workers`) carries them on a replay. The list
+  (`interrupt_workers`, `interrupted_workers`) carries them on a replay.
+  While staged the receipt names `expected_interrupted_workers` and
+  `expected_surviving_jobs` from live state; these are predictions, since work
+  may finish before the swap. `surviving_jobs` names the jobs actually still
+  running at the restart, apart from the compatibility field `cancelled_jobs`
+  (stopped satellite QA guests). The outcome wake names interrupted sessions and
+  the jobs that kept running (their own wake fires when each ends). The list
   is the workers mid-turn at the swap: the graceful drain gives each up to 30 s to
   finish before interrupting, so one whose turn ends inside that window is
   listed but resumes nothing.
@@ -2875,7 +4060,9 @@ agent callers cannot supply them.
 The satellite derives the project from that appointment and checks
 `expected_scope_version` and `expected_policy_version` (0 means no saved
 policy). Scope/policy mismatch returns `satellite_policy_stale`. It changes
-only `allowed_launches`, `max_created_sessions`, `max_active_sessions` and
+only `allowed_launches`, `max_created_sessions` (per
+`created_sessions_window_hours`, optional, default 24; a push may not exceed the
+hub grant's sessions per hour, #3416), `max_active_sessions` and
 `provider_limits`, preserving mode, pause, capabilities and every other
 operator field. The existing policy-save transaction bumps row_version and
 records a `satellite_policy` event and operation receipt with hub installation
@@ -2966,6 +4153,31 @@ reaches whoever is appointed now. Re-appointing a manager revokes the old
 policy grant (#1145), so the resolver reports the entry `revoked` and the push
 is refused `target_not_authorized` until the operator saves the new manager's
 policy on the satellite; after that, pushes follow the seat with no scope edit.
+`satellite_policy_stale` returns `data.code` and the satellite's
+`actual_scope_version`, `actual_policy_version`, saved `allowed_launches` count
+and `manager_session_id`, also named in the refusal text. The paired link
+forwards only these typed facts. Older satellites' bare stale refusals still
+work. Satellite health optionally includes `manager_policies[]` for every
+declared project, with optional `manager_session_id`, `scope_version`,
+`policy_version` and saved `allowed_launches` count; `launches` is the effective
+count after ancestor grants. Policy version zero means no saved policy, and
+absent fields mean unknown. Manager inspection section `satellites` exposes the
+same rows under `health.manager_policies`; `AgentGetDaemonInfo.satellites[]`
+forwards them too. The legacy eight-row `manager_launches` summary keeps its
+original bound for compatibility with older hubs.
+
+**Per-host provider usage rollup (#4008).** Satellite health optionally includes
+`usage[]`: per provider and window (`1h`, `24h`) the admitted
+`model_invocations` count and the input, output, cache-creation, cache-read and
+reasoning token totals of that host's own database. It is counts only (no
+account, key, prompt or path), at most 32 rows, and absent from older
+satellites. `AgentGetDaemonInfo.satellites[].usage` forwards each satellite's
+rows and `AgentGetDaemonInfo.hub_usage` carries the hub's, so the appointed
+manager reads one table of per-host burn against a shared plan window. The rows
+group by provider, not by account fingerprint: no non-secret account identity is
+recorded in `model_invocations` yet. Plan windows stay in `AgentGetProviderStatus`;
+a throttle still reaches a satellite seat only through the hub manager's
+satellite message path (#3903).
 
 **Reseat after a provider outage (#2750).** A session's provider is fixed at
 creation and `succeed_manager` must be called by the seat itself, so a manager
@@ -2975,7 +4187,8 @@ provider_unavailable?}` (operator-only, never delegable; TUI
 `:manager-reseat <provider>[/<model>] <reason>`, run twice to confirm) replaces
 it in one step: `SessionManager::reseat_harness_manager` launches a root successor
 on the new provider with `continued_from` the failed seat (same working dir,
-tags, role, sandbox kind), then `Store::commit_manager_reseat` re-appoints it
+tags, role, sandbox kind; a sandbox-less seat whose root is now a git work tree
+gets its own sandbox, #169), then `Store::commit_manager_reseat` re-appoints it
 through the ordinary scope save (so the displaced seat's wakes, queued tier mail
 and open requests follow, #1553/#2468/#2469) and, in the same transaction,
 re-grants the project's saved policy to the new tuple instead of leaving a
@@ -3003,10 +4216,119 @@ effective launch grant (`satellite_reseat_bounds_exceeded`), and the satellite
 answers with the same result. A retry after success finds the healthy successor
 and is refused `manager_seat_live`.
 
+Hub #3859: a fleet-wide portfolio manager's `health_anomaly` wake raises
+`satellite_manager_seat_failed`, subject the paired peer id, when the existing
+hub poll cache shows an appointed satellite manager with status `Failed`.
+The detail names each failed project and seat, and uses the received seat report
+for `reason`, `terminal_reason` and `reset_at` when available; otherwise it says
+`reason=failed_status terminal_reason=unknown`. No additional network probe is
+made. Disabled, unpaired, mismatched or stale peers do not qualify. A recovered
+or replaced manager clears the condition on the next successful poll even when
+its old report is retained. Ignore key: `satellite_manager_seat_failed:<peer>`.
+A project-manager wake also receives failures for peers whose existing hub
+report route matches its live wake scope (`Scope::allows`). The route uses the
+recent dispatcher and existing manager fallback; remote appointment project ids
+need not match the hub project. Ambiguous or missing routes do not qualify.
+Area wakes remain limited to their own seats. This does not add project satellite
+disk/provider reads, which are currently fleet-wide only.
+
+Reseat policy refusals keep their authority boundary. For
+`satellite_reseat_bounds_exceeded`, specify an explicit model and an allowed
+provider/model/effort tuple; parent portfolio ceilings also apply. If no healthy
+tuple fits, the operator authorizes it on the hub through
+`ConfigureHarnessManagerPolicy` or `ConfigurePortfolioNodeLaunches`, as
+applicable, or invokes operator-only `ReseatHarnessManager` on the satellite.
+For `target_not_authorized`, the operator corrects the missing Deploy/Execute
+grant, pairing, declared scope or satellite inbound allowlist on the relevant
+host, or uses that same satellite operator reseat path.
+
+The hub waits up to 60 s for the satellite's reply (the satellite launches a
+session first). `satellite_reseat_unreachable` means the request never reached
+the satellite; once it was written, a timeout, lost connection or malformed
+reply is `satellite_reseat_uncertain reason=reply_timed_out|reply_lost|
+reply_empty|reply_malformed` (#3291), because the satellite may have completed
+the reseat: read its live seat (`continued_from` the failed seat) before any
+retry.
+
+**Handoff anchor of a seat without a sandbox (#172, hub #3328).**
+`succeed_manager` reads the committed handoff (`source_commit`,
+`relative_path`, `blob_oid`) in the seat's sandbox, anchored at its HEAD.
+A seat with no custody (a reseated seat in the shared project root, where no
+agent commits) is read in its working directory, and its anchor is the
+private ref `refs/rsi/manager-handoff/<seat session id>`
+(`git_worktree::manager_handoff_ref`) when that ref names `source_commit`;
+otherwise HEAD. HEAD may equal `source_commit` or descend from it while
+`relative_path` still holds the same regular-file `blob_oid` (#640). This
+also accepts an existing ancestor of shared HEAD without a private ref;
+the successor still forks from `source_commit` and receives its exact blob.
+For a new handoff, the sandboxless seat writes that commit with plumbing only,
+which leaves the tree, index, HEAD and branches as they were:
+`git hash-object -w <file>`, `printf '100644 blob <blob>\t<name>\n' | git
+mktree`, `git commit-tree -m handoff <tree>`, `git update-ref
+refs/rsi/manager-handoff/<id> <commit>`. The ref is outside `refs/heads`, so
+no branch listing, settlement or sandbox cleanup sees it, and it keeps the
+objects from garbage collection. Seats with a sandbox are unchanged.
+Once a successor is published (#185), the daemon prunes that lineage's aged
+handoff refs off the publication path (`manager_succession::
+prune_manager_handoff_refs`): it walks the committed successions behind the
+live seat (`Store::manager_handoff_lineage_page`) to the oldest seat in
+batches of at most 256 hops. An in-memory cursor carries the oldest visited
+seat, project and cycle guard between batches; the store lock is released
+before each batch's Git work and reacquired for the next batch. Catch-up
+therefore covers the whole existing lineage without a migration or a total
+256-hop cutoff (#505). It keeps the two newest predecessors
+(`MANAGER_HANDOFF_REFS_KEPT`: the handoff just read and one hop of audit) and, for each older sandboxless hop, runs `git update-ref -d
+refs/rsi/manager-handoff/<id> <recorded source_commit>` in that hop's recorded
+working directory, only while the ref still names that commit. The live seat
+and any predecessor or candidate of a pending succession are protected. It
+never runs in `$HOME` or the home project, never touches another ref, branch or the tree, and
+a reappointed (parentless) seat starts a new lineage, so the refs of an earlier
+lineage are left alone.
+`prepare_manager_handoff` refuses `home_project_succession_refused` before any
+git for a seat of the home project, or one whose working directory is the home
+project's path: the daemon never runs git in `$HOME`. A home seat is a
+portfolio seat with no project manager configuration, so it hands on with
+`AgentManagerAppointChild` on its own node (no commit).
+
 **Deploy and reports.** The satellite deploy owner is the live seat of the
 first declared entry that resolves (replay identity stays the declared id);
 `AgentReportToHub` is accepted only from a live seat. Schema V166 adds three
 tables and no column to a released one.
+
+**Deploy-ready paths (#472 / hub #3333).** `AgentReportToHub` requires the
+optional typed `binaries_dir` field when `kind` is `deploy_ready`; enqueue and
+result retain their free-text shape. On the satellite, leading `~/` expands
+against the daemon's home, then canonicalization requires an existing directory
+under `identity::data_dir()/staging` (including symlink/parent traversal checks).
+The queued wire report and the hub's inbox notice expose the resolved absolute
+`binaries_dir`; the hub never resolves it against its own filesystem or guesses
+a satellite home. Missing, relative, unresolvable and outside-root sources use
+`satellite_report_binaries_dir_required`, `_not_absolute`, `_unresolvable` and
+`_not_allowed`, respectively. Hub report ingestion refuses missing or relative
+deploy-ready paths with those same typed codes. `AgentRequestDeploy {peer_id}`
+refuses relative and tilde paths as `deploy_binaries_dir_not_absolute` before a
+link request; cancel still ignores source fields. No new database schema is
+needed: the outbox carries the typed field and the notice stores it in state JSON.
+Upgrade the hub before sending typed deploy-ready reports: older hubs reject
+unknown wire-report fields.
+
+**ENQUEUE claims (#3958, #3984).** Auto-intake accepts hub claim fields in the report
+text as `issue=#N`, `fixes_issue=#N` (alias `fixes=#N`) and
+`fixes_tests=a::b,c::d`; claim fields also accept a whitespace separator, such
+as `fixes_issue 3953`. `hub #N`, including the satellite notation
+`laptop #659 = hub #3931`, also names the hub implementation Issue. Matching
+hub and explicit `issue` references may coexist; different implementation
+Issue numbers refuse the report as `satellite_enqueue_issue_ambiguous` before
+an intake or queue entry is created. These reach normal queue validation, including
+`queue_fixes_issue_not_found` for a missing hub Issue and automatic priority
+for an open `qa` repair. `expedite=<reason-token>` or a bare `expedite`
+(including `Please expedite.`) requests explicit priority with normal queue
+admission and named refusals, including `queue_expedite_cap_reached`.
+The request survives a hub restart in the received intake's `outcome_json`;
+the intake's decision replaces that with its outcome. Automatic priority's
+cap warning is retained in the digest outcome and asks for manager attention.
+Malformed or repeated fields leave the report as a plain manager notice,
+without auto-enqueueing a partial claim. No wire-format or schema change.
 
 **Report routing and state (#2242).** A satellite report carries no hub session
 id. The hub records it as a `satellite_report` notice for the CURRENT manager of
@@ -3019,8 +4341,9 @@ acknowledged. The satellite keeps a process-local ledger per report
 reporting seat (`queued`, `fetched`, `held`, `delivered`, `refused`,
 `undelivered`) plus a `backlog` summary (`depth`, `max`, `oldest_queued_at`,
 `oldest_age_secs`, `by_kind` counts of `result`/`enqueue`/`deploy_ready`, #135),
-`AgentReportToHub` refuses `satellite_report_hub_unreachable`
-while the hub has not pulled for 180 s, refuses `satellite_report_queue_full` at 32
+`AgentReportToHub` accepts a report while the hub has not pulled for 180 s into the
+same backlog in arrival order (receipt `state: queued`, `reason: hub_not_pulling`, #530),
+refuses `satellite_report_queue_full` at 32
 unacknowledged reports with the same summary in the message (`depth=N/32`,
 `oldest_queued_at`, `oldest_age_secs`, `pending_by_kind=result:N,enqueue:N,deploy_ready:N`,
 `last_hub_pull_at`, `hub_pulling`, and a `next:` step; nothing pending is dropped and
@@ -3028,6 +4351,47 @@ reports are never coalesced), and the hub's `held`/`refused` verdicts
 ride the `outcomes` field of the next `FetchHubReports` request, sent only to a
 satellite whose identity has `capabilities.report_outcomes` (an older build
 refuses unknown request fields).
+
+**Manager report wakes (#3976).** Informational RESULT/ENQUEUE reports and
+`issue_result_landed` echoes remain quiet in `AgentManagerInbox` for a fixed
+30-minute digest window. The hub stamps `digest_until_unix` from the notice's
+write time; later arrivals and replays do not extend an older deadline.
+The shared transport stays armed, and the first expired notice permits one
+wake carrying the whole pending batch, including newer notices. Delivery marks
+the batch delivered so it does not wake again while awaiting inbox retrieval.
+Another actionable wake may carry the batch sooner. Legacy notices without
+the stamp use their original `recorded_at` plus 30 minutes. This interval is
+fixed policy, with no operator setting or schema migration. Satellite intake
+records with `needs_attention:false` remain routine. DEPLOY-READY, intake records needing attention,
+failures, refused action results, decisions, questions and mail still justify
+an immediate wake.
+
+**Seat-failed report and terminal reason on bounces (hub #3859).** When a
+satellite's appointed manager seat enters a non-live condition (`down`,
+`recovering`, `exhausted`, or a provider usage-limit hold), the daemon's seat
+pass (`reconcile_manager_seat`, `ManagerSeatPassV1.seat_report`) queues ONE
+`RESULT` report per condition change through the same outbox as
+`AgentReportToHub` (`Store::queue_manager_seat_report`): attempt counters and
+retry timestamps do not re-send it, a seat that recovered and fails again does.
+A daemon with no allowlisted hub, or a tip that is not the declared seat, queues
+nothing. The text is one line of at most 1024 bytes:
+
+```
+satellite_manager_seat_failed project=<uuid> peer=<uuid|none> seat=<uuid>
+  state=<down|recovering|exhausted> terminal_reason=<token|none> reason=<token>
+  reset_at=<rfc3339|none> limit="<provider sentence, <=160 bytes>"
+```
+
+(one physical line; `limit=` is omitted when absent.) `peer` is the satellite's
+installation id, `terminal_reason` the tip's persisted reason (for example
+`api_error`), `reset_at` the provider window reset when the seat is held on a
+usage limit, and `limit` the latest `Process Error` text only when it mentions a
+limit, quota, reset or usage (never other error text). Tokens are reduced to
+`[A-Za-z0-9_.:-]`. The hub consumer is a follow-up: a hub that does not parse the
+line records it as an ordinary untrusted `RESULT` notice, which already wakes the
+project manager. A `satellite_message_failure` `remote_terminal|<status>|<reason>`
+bounce now appends `;terminal_reason=<token>` to the reason slot when the target
+recorded one (`split_terminal_reason` splits it); the three-part wire is unchanged.
 
 **Pending mail across a seat or scope change (#2469).** A replacement bumps the
 `(manager_session_id, scope_version)` tuple every manager message and notice is
@@ -3109,6 +4473,17 @@ build pool with full builds and test runs and queued behind them.
   A worker iterating on a change that spans crates submits one
   `{"command":"check","workspace":true,"all_targets":true}` job; it does not count
   against the one `scoped_test` job. `cargo build` jobs are unchanged.
+- **Dev features and named binaries (kaizen #160).** A `check` or `build` job
+  with `package` may pass `features` (only the dev features of
+  `JOB_BUILD_FEATURE_ALLOWLIST` for that package, today `rsid` `e2e-seed`; never
+  with `release`, `workspace` or `test_no_run`) and `bins` (up to 8 `--bin NAME`
+  entries), so the desktop e2e rsid is the job
+  `{"command":"build","package":"rsid","features":["e2e-seed"],"bins":["rsid","rsi-e2e-seed"]}`
+  under `rsi-build.slice` and the sandbox target, not a foreground cargo run.
+  Any other feature is refused `job_invalid_params` naming the allowed ones,
+  on `AgentSubmitJob` and on `--validate` (`constraint`). `test_no_run` keeps
+  `test-shard-*` features only. An exact package `test` job takes the same
+  allowlist (#171, "Package test jobs" above).
 - **Gates.** The disk and memory floors apply to the check class. The load gate
   does not: the lane exists to give feedback while full builds saturate the host,
   and the `rsi-build.slice` CPU cap (below) still bounds it. Build and lander
@@ -3119,6 +4494,27 @@ build pool with full builds and test runs and queued behind them.
   Cargo target), so a check submitted while the sandbox's own test job runs
   waits for it. `GetResourceGovernor` reports `check_in_use` and the queue/lease
   views carry `class: "check"`.
+
+## Feature-isolated release members (#612)
+
+`build` accepts `release_members:[{package,bins}, ...]` with `command:"build"`,
+`release:true` and a full lowercase `sha`. Each distinct package has nonempty,
+globally distinct binary names (up to 16 packages and 64 binaries). All names
+are bare tokens. Single-build selectors (`package`, `workspace`, `bins`,
+`all_targets`, `features`, `no_default_features`, `shards`) are excluded. A dirty
+or unreadable source, or a mismatched SHA, is refused before launch.
+
+The job holds one build slot and uses the existing daemon-selected target,
+source record and finish checks for the whole sequential build. Each member
+has a separate Cargo invocation, preserving dependency feature isolation;
+the first nonzero exit stops the job. Successful settlement adds
+`result.release_members` to the existing `exit_code`, `source_head`,
+`source_dirty` and `target_dir` proof. Staging checks that aggregate coverage
+includes the installer's Cargo inventory and every binary exists and is
+executable in the selected target. Existing per-package receipts remain
+compatible; their caller must check every member's receipt for identical
+source/target and successful clean completion. The canonical deploy request
+is in `rsi-project-manager/procedures.md`, “Deploys”.
 
 ## Shard-feature test builds (#2692)
 
@@ -3182,11 +4578,37 @@ hub-wide budget now covers every cargo build and test unit RSI starts.
   (`RSI_BUILD_SLICE` overrides the name, empty opts out) and of
   `scripts/systemd-test-fallback`; the merge-queue lander, which the daemon starts
   as `systemd-run --user --scope --slice=rsi-build.slice --property=PartOf=rsid.service`
-  (`rsi-lander-<uuid>.scope`, exec'd in place so its pid, process group and pipes
-  are unchanged; a timed-out or failed run also gets `systemctl kill` on its
-  scope; an unconfigurable slice runs the lander unscoped); the
+  (`rsi-lander-<uuid>.scope`; a timed-out or failed run also gets `systemctl kill`
+  on its scope; an unconfigurable slice runs the lander unscoped). The scope of
+  a queue-workspace lander has no `PartOf=rsid.service` and is not the daemon's
+  child (#3435, see "Detached lander runs" below); the
   `rolling-library-qa` recipe is an ordinary job unit. Provider worker scopes
   (`rsi-workers.slice`) are not builds and are untouched.
+- **Detached lander runs (#3435).** A gate takes tens of minutes and a daemon
+  restart used to kill the lander, so the next daemon gated the batch again from
+  the start. With the build slice on and a queue workspace
+  (`LanderLauncher::with_build_slice`, `rolling_queue/detached_run.rs`) a lander
+  run lives in files under `<queue>/lander-runs/<key>/`: `stdout`, `stderr`, the
+  `exit` status (written by the `/bin/sh` wrapper that runs the lander,
+  `build_budget::exit_recording_command`) and `record.json` (scope unit, pid,
+  the watching daemon's `epoch`). `key` hashes the lander's directory, arguments
+  and derived filters, not the wall budget or log paths. The scope has no
+  `PartOf=rsid.service` and the run is never killed on drop, so a daemon stop or
+  crash leaves it running; restart reconcile returns the interrupted batch's
+  entries to `queued` and the batch claimed next, asking for the same gate
+  (same sources and expected tip), adopts the run (`rolling queue adopted the
+  lander run ...`), rewrites the record with its own epoch and waits for the
+  files, so a gate that finished while the daemon was down is consumed at once
+  and nothing is tested twice. A run is adoptable for 4 hours; a different gate
+  stops every inherited run before it starts (one lander per queue worktree); a
+  run no batch claims within 20 minutes of the restart is stopped (its entries
+  were cancelled or settled elsewhere and it must not publish them). A deadline
+  stops the run (SIGTERM, 2 s, SIGKILL on the scope) as before; a run whose
+  scope vanished without an `exit` file reads as killed by SIGKILL. With the slice
+  unavailable the run is still file-backed but unscoped (tracked by pid), so it
+  survives only what the daemon's own cgroup does; a launcher with no queue
+  workspace keeps the lander the daemon's attached child. The adopted run's gate log
+  timings go to the sidecar of the batch that started it.
 - **Per-job threads.** A job's CPU ceiling is `min(its own ceiling, budget cores)`
   (`rsid_core::build_slice::per_job_ceiling_percent`): the `scoped_test` ceiling
   (`clamp(host threads / 2, 2, 12)` cores, #2087), the default 1600% of other
@@ -3276,6 +4698,16 @@ quota and usage-limit stop reasons keep failing fast.
   default 40; 0 disables; live; TUI settings row "Host load limit for new
   launches", `GetDaemonConfig`/`UpdateDaemonConfig`). Read at every admission
   decision (`host_load.rs`).
+- **Worker build reserve (#467 / hub #3312).** Operator-only curated setting
+  `worker_build_reserve_gb` (0..=64 GiB, default 8; 0 disables the reserve;
+  live; `GetDaemonConfig`/`UpdateDaemonConfig`, TUI Settings > Build governor >
+  "Worker build reserve (GiB)"). A new manager worker or topology launch waits
+  while free disk is below `governor_min_free_disk_gb + worker_build_reserve_gb`.
+  This reserves one launch's target estimate, avoiding sandbox scans and build
+  lifecycle bookkeeping; it does not accumulate reservations for other workers
+  that have not built yet. The existing job disk floor is unchanged. A zero
+  governor floor still disables disk admission. Lead recovery, continuations
+  and worker-owned children keep their exemptions.
 - **Governor and QA knobs (#2123).** `governor_build_slots` (default bounds 1-4),
   `governor_lander_slots` (1-5), `rolling_queue_full_qa_interval_mins`
   (30-240) and `hub_build_cpu_percent` (#2119, 10-50) are lower-only by default
@@ -3316,12 +4748,14 @@ quota and usage-limit stop reasons keep failing fast.
   (`host_pressure::hold_now`) answers "too hot or too full": the hottest CPU
   sensor at or above the operator's `job_thermal_ceiling_c` (#2524), or free
   disk on `/` below the governor's `min_free_disk_gb` floor. Build/test jobs
-  (`agent_jobs`, `held_for_thermal`), the governor's disk gate, a manager's new
-  `create_session` and a topology node's first launch all use it, so no manager
+  (`agent_jobs`, `held_for_thermal`) and the governor's disk gate use that floor;
+  a manager's new `create_session` and a topology node's first launch use
+  `launch_hold_now`, adding `worker_build_reserve_gb` to it, so no manager
   polls `sensors` or `df`. The create or node is held, never refused, and shares
   the host-load held queue, so it starts oldest-first once the condition clears.
   `AgentManagerGetAction.held` is `{reason: thermal, temperature_c, ceiling_c}`
-  or `{reason: disk_pressure, free_disk_gb, min_free_disk_gb}`; a topology
+  or `{reason: disk_pressure, free_disk_gb, min_free_disk_gb, reserve_gb,
+  needed_free_gb}` (needed = floor + reserve); a topology
   node stays `Reserved` with one `admission_hold{kind: thermal|disk_pressure}`
   event per transition; `AgentGetDaemonInfo.host_load.held[].reason` carries the
   same names. Pressure holds an operator-requested execution's first launch too
@@ -3341,6 +4775,25 @@ quota and usage-limit stop reasons keep failing fast.
   `sandbox_max_source_roots` (`code: source_root_limit`) is not held: it ends
   `blocked` with `manager_v2_sandbox_source_root_limit` (a free-space refusal
   after the effect began ends `manager_v2_sandbox_free_space_limit`).
+- **Sandbox Git timeout (#495).** A `git worktree add` execution timeout during
+  allocation rolls back only the new, unpublished allocation under the repository
+  lock (matching source/branch, no foreign files; interrupted missing tracked
+  files are allowed). Only successful cleanup returns `sandbox_git_timeout`.
+  A pre-effect new `create_session` is requeued for 30 seconds through the same
+  claim/admission loop; `AgentManagerGetAction.held` reports
+  `{reason: sandbox_git_timeout, release_by: <retry timestamp>}` during cooldown.
+  The cooldown and charged attempt count survive daemon restart. At most three
+  attempts run; other deploy/disk holds do not consume the budget. Once due,
+  ordinary thermal, disk and load admission still applies. Exhaustion ends
+  `blocked` / `sandbox_git_timeout`, with `AgentManagerGetAction.next_step`
+  directing a relaunch under a new idempotency key. A cleanup failure or foreign
+  residue ends `sandbox_git_timeout_cleanup_required` without retry: inspect and
+  clean the retained allocation first. The allocation `git worktree add` and the
+  rollback inspect run under a load-scaled deadline (120 s floor, stretched by
+  one-minute load over CPU count, at most 480 s; #626); the inspect streams the
+  status so a large half-made checkout never fails on output size, and the
+  rollback releases only Git's own `initializing` lock (any other lock is
+  preserved). The global Git timeout is unchanged.
 - **Oldest first.** The claim query orders queued creates by `(not_before, id)`
   across all projects; waiting topology nodes queue by execution age
   (`HostLoadAdmission::admit_waiter`, stale entries dropped after 90 s). The two
@@ -3371,8 +4824,8 @@ quota and usage-limit stop reasons keep failing fast.
   admission floor, apart from any launch policy: the live
   `governor_min_free_disk_gb` and free GiB on `/` (where `scripts/cargo-slot`
   measures). A manager reads it before promising verification: below it a build
-  or test unit still launches, but waits in the governor and spends its ten
-  minute admission (a scoped test's wall budget), so a lower launch override
+  or test unit still launches, but waits in the governor and spends its separate
+  admission allowance, so a lower launch override
   does not make a build runnable. Same-owner jobs on one sandbox target already
   queue before launch (above), nested worktrees included.
 
@@ -3594,9 +5047,21 @@ refusal `job_source_moved` and a detail naming both SHAs (at finish the build's 
 exit code and log tail stay on the result); a tree that was already dirty at
 submit is built as is and only a HEAD move fails it. `result.source_head` and
 `result.source_dirty` carry what the daemon observed when the job ended, so a deploy
-can compare `source_head` with the SHA it is asked to install. A manager building
+can compare `source_head` with the SHA it is asked to install. A `build` result also
+carries `target_dir` (#282): the cargo target directory the unit really built in, read
+from the daemon's own `rsi-build-target` log line when the job settles (the log is the
+one record of the target the unit was launched with, so it cannot drift from it).
+`scripts/install-release.sh --link-only --build-receipt` looks for `release/` there,
+not in the caller's `CARGO_TARGET_DIR`; the script treats it as untrusted and uses it only when it resolves to an allowed deploy target (#3513), otherwise it needs an explicit `--target-dir`. A manager building
 for a deploy passes `params.sha` and leaves the integration worktree alone until
-the job is terminal.
+the job is terminal. `AgentSubmitJob.worktree` is appointed-manager-only:
+a deploy brief does not authorize a worker to build from another worktree
+(`job_directory_not_allowed`, #661). The manager on the build host submits both
+pinned release jobs and verifies their successful, clean, same-SHA receipts
+with the same `target_dir`. A worker may prepare, then stage and verify using
+the completed build results supplied in its brief; it need not read or watch
+manager-owned jobs. The canonical build/stage sequence is in
+[the project-manager procedures](../../.claude/skills/rsi-project-manager/procedures.md#deploys-build-then-restart-at-a-quiet-point).
 
 ## Cold-storage archive (#2384, V176, slices S1-S5)
 
@@ -4018,8 +5483,74 @@ pins all of them (`INPUT_ASSET_METHODS`).
   `*.png` files the TUI removes when it exits), directory `0700`, file `0600`,
   written to a `create_new` temporary file and renamed over the name, so a link
   planted at the name is replaced, never followed. An identical regular file
-  already there is `reused: true` and nothing is written. The request chooses
-  no part of the path. `path` is what a message references (`@<path>`).
+  already there is `reused: true` and nothing is written except a fresh mtime.
+  The request chooses no part of the path. `path` is what a message references
+  (`@<path>`).
+- Paste image retention (local #86, `rsid::paste_retention`; hub PM ruling:
+  a referenced image is conversation history). By default a bounded pass
+  removes only ABANDONED uploads: a regular, single-link file named
+  `<sha256>.<png|jpg|gif|webp>` whose mtime (refreshed by a re-upload) is more
+  than 7 days old (the TUI's trash rule) and that no operator message of any
+  session in any state (its edited or original text), no conversation event
+  of any type (`Message`, `ToolUse`, `ToolResult`, `System`, ...: its content,
+  tool input or metadata) and no enabled scheduled job ever named
+  (`Store::paste_reference_scan_chunk`, read 1,000 rows per store lock; the
+  rows of a session in, or moving to or from, cold storage are read from its
+  archive, one session per lock, and a move or restore during the scan
+  (`Store::paste_reference_cold_fingerprint` changed) or an unreadable
+  archive removes nothing; a `ToolResult` body stored cut, #2373, is read as
+  stored). An archived session whose index row (raw or compressed size) is
+  over 64 MiB (`PASTE_REFERENCE_ARCHIVE_MAX_RAW_BYTES`, the transcript cache
+  budget) is streamed (#178), and the stream runs on a blocking task with the store
+  lock released (`Store::paste_reference_scan_step` returns it as a
+  `PasteReferenceStream`; the cold fingerprint fence before and after the walk
+  and again under the lock before any removal rejects a scan a move or
+  restore raced): its payload is read through SQLite incremental
+  blob I/O 64 KiB at a time into a zstd stream decoder (window at most 64 MiB)
+  and decoded one row at a time, each row visited and then dropped, with the
+  length, digest and row count checked when the stream ends (any mismatch
+  removes nothing). A single row holding more than 64 MiB of values, or an
+  archive record (raw size, or the stored payload's SQLite `length()`, read in
+  the same query before the blob is selected) over 64 MiB under an index row
+  within it, is refused `cold_archive_over_bound` before the value or payload
+  is read: the pass removes nothing and its warning names the session (hub
+  #3322 finding 3, hub #3332). Late
+  references (hub #3322 finding 2): the pass records a high-water mark of every
+  source before it reads anything (`Store::paste_reference_marks`: newest
+  operator message rowid and `updated_at`, newest event id, the cold
+  fingerprint); for the removal it takes the store lock, reads only what was
+  written since (`Store::paste_reference_late_texts`: operator messages added
+  or edited, events of any type added, every enabled scheduled job), keeps
+  every image those name and unlinks the rest before it releases the lock, so
+  no reference can be committed between the check and the unlink. A move or
+  restore since the marks, more than 100,000 late rows or a check past 10 s
+  removes nothing. A referenced image
+  is removed only under the opt-in operator setting
+  `paste_retention_referenced_days` (default 0 = keep forever, else 7-3650;
+  `GetDaemonConfig`/`UpdateDaemonConfig`, TUI Settings > Sandbox Storage, the
+  desktop settings pane; live), once its mtime is older than that and no text
+  a provider may still read names it (`Store::paste_image_reference_texts`:
+  operator messages `queued`, `dispatching`, `effect_possible` or `uncertain`,
+  delivered ones of a `Starting`/`Running`/`WaitingApproval` session, enabled
+  scheduled-job messages). A pass lists the expired images first (no
+  database read when there are none), then reads their references, then
+  removes under the upload lock, re-checking each file; an image that expired
+  after the listing is kept for the next pass. A stale `.upload-<uuid>.tmp`
+  goes after 7 days. A read failure, more than 10,000 live reference texts or
+  a reference scan past 300 s removes nothing. The directory is opened
+  `O_NOFOLLOW` below the data root (a symlinked `paste` or `rsid` is
+  refused), entries are `lstat`ed and unlinked through that handle (symlinks,
+  directories, hard links and other names are kept), at most 10,000 names and
+  1,000 removals per pass. One pass at daemon start, then after an upload when
+  the directory's last pass is an hour old; uploads and removals are
+  serialized. No byte cap. Log line: "Paste image retention pass finished"
+  with `trigger=daemon_start|upload`, `referenced_days` and
+  `removed_referenced`. Unix only. The TUI deletes nothing at exit (local
+  #155, `rsi::clipboard::leave_paste_dir_to_daemon`): the same pass also
+  covers the TUI's own top-level `<lowercase uuid>.png` pastes in
+  `~/.rsi/paste` (`prune_tui_paste_dir`, the same abandoned/opt-in rule,
+  single-link and no-follow checks; a message names one as
+  `@<path>/<uuid>.png`), so a queued message never loses its image.
 - `ListSlashCommands {project_id | session_id, max_entries?}` -> `{root,
   commands: [{name, description, source: command|skill}], truncated,
   skipped_outside_root}`. The root resolves as for the project-file methods
@@ -4109,3 +5640,136 @@ off the rsi-remote gateway (fence test
   prompt is `prompt_file_not_found`; bad params are
   `prompt_file_invalid_request`. All refusals are `INVALID_PARAMS` with the code
   as the message prefix.
+
+# One-shot operator main-push consent (#3566)
+
+`AuthorizeMainPush {idempotency_key, remote_url, ref, target_sha, expires_at, operator_note}` is
+operator-only: absent from agent, read and hook verb catalogs, and refused for
+session-attributed callers both before dispatch and in the handler. This RPC is
+the operator surface; it creates no agent control and performs no push.
+
+The operator supplies a fresh UUID `idempotency_key`, the exact **push URL** (`git remote get-url --push <name>`,
+not the remote alias), `ref: "refs/heads/main"`, a nonzero lowercase 40-hex commit
+SHA, an RFC3339 expiry within the next 24 hours, and the operator's consent words
+(1–4096 bytes). The response returns the full grant, including its UUID and
+nanosecond RFC3339 creation/expiry timestamps. For example, the operator's RPC
+client can call `AuthorizeMainPush` with:
+
+```json
+{"idempotency_key":"00000000-0000-4000-8000-000000000001","remote_url":"git@example.invalid:team/project.git","ref":"refs/heads/main","target_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at":"2026-10-23T04:00:00.000000000Z","operator_note":"Approve this exact main push once"}
+```
+
+Exact retries with the same key return the original grant without restoring
+spent consent. Reusing a key with different fields is refused.
+Use a fresh key and future expiry for the actual call. Grants live on the pushing host at
+`~/.rsi/git-push-consents/<uuid>.json`; call the operator RPC on that host. Install
+the updated `tools/git-hooks/pre-push` in the destination repository too (the
+hook is self-contained and needs Python 3). No schema migration or SQLite write
+is involved. These local files follow the same cooperative guard-rail model as
+the existing hook; agents must never manufacture grants or alter use receipts.
+
+An agent push to `main` requires an exact URL/ref/SHA match and a future expiry.
+Before claiming consent the hook refuses deletion and non-fast-forward updates;
+an unknown remote tip requires fetching first. The command guard continues to
+refuse force flags and `+refspec`. The hook cannot distinguish a force flag on
+an otherwise fast-forward update, because Git does not provide flags to hooks.
+The lander marker does not grant a main exception.
+
+The hook atomically creates `<uuid>.used` with exclusive create, so racing hooks
+cannot spend the same grant twice. It retains the grant and use receipt (remote,
+ref, target SHA, previous SHA and timestamp). Consumption occurs **before**
+transport, including dry runs: a failed or aborted push needs a fresh operator
+grant. A receipt records permission spent, not proof of remote publication.
+Never remove receipts to retry. Other protected-ref and rolling-queue rules
+are unchanged.
+
+## Operator intake agent (#3787)
+
+`LaunchIntakeSession {project_id, request, model?}` is operator-only (TUI `:intake <request>`; absent from `AGENT_VERBS`, `READ_VERBS`, native tools and the agent CLI catalog). It launches a short-lived Claude session on `intake_agent::INTAKE_DEFAULT_MODEL` (haiku unless the operator overrides `model`; the normal launch checks still apply), tag `intake`, `agent_role` `intake`, query `/intake <request>`. `LaunchSession` accepts `agent_role` only as `intake`.
+
+- **Grant** (`rsi_common::intake_agent`): a session with that role may call only `INTAKE_SEAT_AGENT_VERBS` (`AgentGetAuthorityCatalog`, `AgentGetStatus`, `AgentListIssues`, `AgentGetIssue`, `AgentCreateIssue`). Any other `Agent*` verb is refused `intake_seat_verb_denied` in `handle_request_inner`. It has no send, spawn, job or landing verb.
+- **Filing** (`agent_create_issue`): priority 1-4 is required; the daemon forces the `operator-request` label, validates `held:<reason>` (`[a-z0-9-]`, at most 48 bytes), caps labels at 8, refuses `harness`/`source_issue`/another project, and appends a filing footer naming the seat.
+- **Mail-only-on-P1**: priority 1, or the `notify-manager` label, records exactly one `operator_intake:<n>` manager notice (`Store::record_operator_intake_notice`, actionable so it wakes); P2-P4 and a deduplicated replay record none.
+
+## External harness-report intake (#3789)
+
+Installs with no pairing to this hub report harness defects as GitHub Issues on the public RSI CLI repository
+(`github.com/jakedevar/rsi-cli`); the hub imports them. The hub opens no
+listener: it only makes outbound `gh` calls with its own `gh` login.
+
+- **Reporter**: `rsi report-issue --title T --failure F [--steps S] [--evidence T|--evidence-file P|-]
+  [--repo OWNER/REPO] [--dry-run]` (`crates/rsi/src/report_issue.rs`; no daemon needed). It renders the fixed
+  template (rsi version, build SHA, platform, failure signature, steps, redacted evidence), scrubs every
+  field (`rsi_common::external_report::scrub`: tokens, credentials, e-mail addresses, home-directory user
+  names, this process's secret environment values, PEM keys, opaque 32+ character secrets) and runs
+  `gh issue create` with the reporter's own `gh` auth, without labels or repository write access.
+  Reports carry the fixed title prefix `[rsi-report] ` and first-line versioned body marker
+  `<!-- rsi-agent-report:v1 -->`, followed by the template headings in order. Labels are informational:
+  reporter submissions never request them, so a missing label or dropped label cannot block intake.
+  Missing or unauthenticated `gh`
+  prints fixed guidance through typed `GhError` refusals (missing, unauthenticated, expired/rejected auth,
+  network, timeout, output limit, other); raw stderr is never surfaced and no other credential is tried.
+  `--dry-run` shows the redacted report only.
+- **Hub sync** (`rsid::external_report_sync`, fixed public RSI CLI repository and 15 minute cadence, first pass 90 s
+  after boot; honors the existing `RSI_OFFLINE` gate): lists up to 100 open Issues per pass, checks the exact
+  versioned marker, title prefix and template sections locally, and ignores everything else regardless of labels.
+  At most 25 new mappings (imports or duplicate links) are handled per pass, at most five per GitHub author.
+  Author logins are case-folded and used only in an in-memory per-pass counter; missing/deleted authors share
+  one bucket, already-handled reports consume no quota, and author identity is never persisted or logged.
+  For each
+  new one files an `external-report` Issue at P4 with no assignee, or links it to the Issue that already covers
+  its failure signature (recomputed on the hub from the "Failure signature" section, never read from the
+  reporter) or an open Issue with an equivalent title. Using the hub's write access, it idempotently ensures
+  `agent-report` exists (`gh label create --force`) once per pending batch, adds it without replacing other labels,
+  then comments the hub Issue number on the GitHub Issue. Label and comment failures remain pending and
+  up to 25 pending receipts are retried per pass, including
+  reports since closed on GitHub, without creating another hub Issue. Imported text is untrusted data:
+  bounded to 64 KiB before parsing/hashing/scrubbing, re-scrubbed, every line quoted behind `> `, `<` escaped, and
+  priority, labels and assignee are constants set by `hub_issue_from_report`; nothing in the GitHub body or
+  labels reaches them. Reporter identity is omitted. Subprocess stdout/stderr reads are capped at 8 MiB/64 KiB.
+  Imports stay P4/no assignee for PM triage: automatic intake routing remains blocked because the #3787
+  short-lived intake seat has only read/create authority, no existing-Issue promotion verb or durable inbox.
+  Adding that workflow requires a separate intake contract change; this sync does not expand its grant.
+- **State** (no migration; `daemon_settings` keys): `external_report:gh:<repo>#<n>` (handled; a re-run imports
+  nothing; includes `issue_id`, `linked`, `pending_write_back`), `external_report:sig:<signature>` (first
+  Issue of a signature), `external_report:status:v1` (last run, counts, errors). The mapping, pending flag
+  and the Issue are written in one transaction; the flag clears only after label application and the comment succeed.
+  Legacy mappings lacking the flag receive one write-back attempt to heal previously lost receipts.
+  Delivery is at least once: a crash after GitHub accepts a comment but before recording it can repeat it.
+- **Operator surface** (rule 10; operator-only, not in `AGENT_VERBS`): `GetExternalReportSyncStatus {}` and
+  `SyncExternalReportsNow {}`; the TUI `:external-reports [status|sync|filter]` (`filter` sets the focused
+  Issues pane to the `external-report` label).
+- **Repository access**: `rsi-cli` is public with Issues enabled; outside reporters need their own GitHub
+  login, with no collaborator or label permissions. The hub needs write access to create/apply its informational
+  GitHub label and post receipts. `external-report` is a hub tracker label, not a required GitHub label.
+
+## Host tuning and saved presets (#3532, Slice A)
+
+Operator-only `GetHostTuning {}` returns probe, local configuration, revision,
+active/pending/undo state, supported keys with apply classes, and actual resource
+settings. `ConfigureHostTuning {expected_revision, configuration}` saves the whole
+profile/bounds/preset document using compare-and-swap; configuration is
+`{profile:{role:"unconfigured"|"dedicated"|"shared", reserve_percent?:0..100},
+bounds:{key:{min,max}}, presets:{name:{key:integer}},
+live_session_cap_guidance:integer|null}` (reserve is only legal for shared).
+Saving never applies settings. Every preset value requires a resource allowlist
+entry and explicit operator bounds within the runtime validator's range.
+
+`SwitchHostPreset` (operator) and `AgentSwitchHostPreset` (current Execute,
+unpaused project/area/portfolio manager) accept `{action:"apply",name}` or
+`{action:"undo"}`. Unknown fields, raw values and preset edits are rejected.
+The operator controls both tuning bounds and preset definitions. Explicit manager
+policy bounds additionally restrict agent effects. Operator RPCs are absent from
+all attributed catalogs; the one agent verb is CLI/RPC-only.
+
+The daemon serializes switching and document saves with ordinary config updates.
+It stores prior values before using the shared validated config batch path.
+Apply/undo receipts include `changed`, `complete`, `error`, `settings_result`
+(including build slice enforcement report), and a full view with actual values.
+A matching active preset is a no-op, preserving the undo record. Failed effects
+retain the original undo and `pending:true`; retry replays effects, while undo
+is bounded by current operator/manager constraints. A crash after settings apply
+but before finalization leaves the persisted pending record recoverable. Only
+one switch history is retained; a successful undo consumes it, repeated undo is
+a no-op. The profile reserve is an intent for a later guided tune flow, never
+an automatic resource calculation or an implied enforcement claim.

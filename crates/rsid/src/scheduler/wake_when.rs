@@ -12,11 +12,11 @@ use rsi_common::operator_todos::{OperatorTodoStatusV1, OperatorTodoV1};
 use rsi_common::topology_agent::AgentTopologyExecutionSummaryV1;
 use rsi_common::types::{IssueStatus, ScheduledJob};
 use rsi_common::wake_predicate::{
-    REASON_EXECUTION_MISSING, REASON_ISSUE_CANCELLED, REASON_ISSUE_MISSING, REASON_JOB_MISSING,
-    REASON_REPO_UNAVAILABLE, REASON_SETTLEMENT_RUN_MISSING, REASON_TODO_MISSING,
-    WAKE_WHEN_MESSAGE_BYTES, WAKE_WHEN_REFUSAL_BYTES, WakeWhenState,
+    QUIET_SETTLE_MAX_HOLD_SECS, REASON_EXECUTION_MISSING, REASON_ISSUE_CANCELLED,
+    REASON_ISSUE_MISSING, REASON_JOB_MISSING, REASON_REPO_UNAVAILABLE,
+    REASON_SETTLEMENT_RUN_MISSING, REASON_TODO_MISSING, WAKE_WHEN_MESSAGE_BYTES,
+    WAKE_WHEN_REFUSAL_BYTES, WakeWhenState,
 };
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::store::Store;
@@ -107,7 +107,8 @@ fn authorize_settlement_run_wake(
 
 /// #2747: authorize a `health_anomaly` wake and pin its scope. A portfolio
 /// seat watches the projects its grant covers (#2788); a project manager
-/// watches its own project; any other caller is refused. A client-supplied
+/// watches its own project; an area seat watches its live grant. Any other
+/// caller is refused. A client-supplied
 /// `project` or `projects` is overwritten.
 fn scope_health_predicate(
     store: &Store,
@@ -159,8 +160,21 @@ pub(super) enum Gate {
     NotPredicate,
     /// Still pending; the row was deferred and nothing is delivered.
     Pending,
-    /// Deliver this message as the (only) resume wake.
-    Deliver(String),
+    /// Deliver this message as the (only) resume wake, with its logging outcome.
+    Deliver(
+        String,
+        &'static str,
+        Vec<rsi_common::health_anomaly::HealthCondition>,
+    ),
+    /// #217: deliver this message and keep the wake armed. A `fire: "each"`
+    /// rolling wake found commits newly on rolling while others are still
+    /// pending; once the delivery succeeds the scheduler records `delivered`
+    /// (the whole reported set) and re-arms the row at `next_fire_at`.
+    DeliverAndRearm {
+        message: String,
+        delivered: Vec<String>,
+        next_fire_at: DateTime<Utc>,
+    },
     /// #1935: the owner already wrote its `PIPELINE HANDOFF` after arming this
     /// wake; the settled wake is retired without opening a new turn.
     Retire,
@@ -175,6 +189,9 @@ pub(crate) enum Verdict {
     Unsatisfiable(&'static str),
     /// An operator forced the trigger while the predicate was pending.
     ManualPending,
+    /// #217: a `fire: "each"` rolling wake has commits newly on rolling and
+    /// others still pending: this firing is delivered and the wake re-armed.
+    Landed,
     Pending,
 }
 
@@ -264,6 +281,7 @@ pub(crate) fn compose_message(
 ) -> String {
     let (status, timed_out, reason) = match verdict {
         Verdict::Satisfied => ("satisfied", false, None),
+        Verdict::Landed => ("landed", false, None),
         Verdict::TimedOut => ("timed_out", true, None),
         Verdict::Unsatisfiable(reason) => ("unsatisfiable", false, Some(*reason)),
         Verdict::ManualPending | Verdict::Pending => ("pending_manual_trigger", false, None),
@@ -272,6 +290,12 @@ pub(crate) fn compose_message(
         "health_anomaly".to_owned()
     } else if state.predicate.sha_on_rolling.is_some() {
         format!("sha_on_rolling {}", sha.unwrap_or("-"))
+    } else if let Some(shas) = &state.predicate.shas_on_rolling {
+        if state.predicate.fires_each() {
+            format!("shas_on_rolling ({} commits, fire=each)", shas.len())
+        } else {
+            format!("shas_on_rolling ({} commits)", shas.len())
+        }
     } else if let Some(number) = state.predicate.issue_closed {
         format!("issue_closed #{number}")
     } else if let Some(id) = state.predicate.todo_closed {
@@ -336,7 +360,7 @@ fn snapshots(store: &Store, ids: &[Uuid]) -> Vec<JobSnapshot> {
 }
 
 /// Upper bound on one `git fetch` of `origin rolling` made for a pending
-/// `sha_on_rolling` probe (#1463).
+/// rolling commit probe (#1463).
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn is_ancestor_of_origin_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
@@ -397,18 +421,99 @@ fn fetch_origin_rolling(repo_dir: &str, timeout: std::time::Duration) {
     }
 }
 
-/// True when `sha` is an ancestor of `origin/rolling` in `repo_dir`, checking
-/// the local tracking ref first and then a freshly fetched one. A missing
+/// Check each commit against the local tracking ref, fetching once per batch
+/// if any are pending, then rechecking every commit. A missing
 /// repository is `Err`; a missing commit or ref is simply "not yet".
-fn sha_on_rolling(repo_dir: &str, sha: &str) -> Result<bool, ()> {
+fn shas_on_rolling(repo_dir: &str, shas: &[String]) -> Result<Vec<bool>, ()> {
     if !std::path::Path::new(repo_dir).is_dir() {
         return Err(());
     }
-    if is_ancestor_of_origin_rolling(repo_dir, sha)? {
-        return Ok(true);
+    let check = || {
+        shas.iter()
+            .map(|sha| is_ancestor_of_origin_rolling(repo_dir, sha))
+            .collect::<Result<Vec<_>, ()>>()
+    };
+    let states = check()?;
+    if states.iter().all(|on_rolling| *on_rolling) {
+        return Ok(states);
     }
     fetch_origin_rolling(repo_dir, FETCH_TIMEOUT);
-    is_ancestor_of_origin_rolling(repo_dir, sha)
+    check()
+}
+
+/// Decide a rolling commit predicate (`sha_on_rolling`, `shas_on_rolling`)
+/// from the probe (`None` = git could not answer), and render its report: one
+/// `sha=<id> state=on_rolling|pending|unknown` line per listed commit.
+///
+/// #217: with `fire: "each"`, commits on rolling that no earlier firing
+/// reported (`state.delivered_shas`) make a pending predicate [`Verdict::Landed`]:
+/// the report then opens with `landed_since_last_firing:` and marks those
+/// lines `new=true`. The third value is the delivered set after this firing
+/// (earlier ones first); it is empty for the default mode.
+pub(crate) fn decide_rolling(
+    shas: &[String],
+    states: Option<&[bool]>,
+    state: &WakeWhenState,
+    now: DateTime<Utc>,
+    manual: bool,
+) -> (Verdict, String, Vec<String>) {
+    let on_rolling = |index: usize| states.is_some_and(|states| states[index]);
+    let each = state.predicate.fires_each();
+    let newly: Vec<&String> = if each {
+        shas.iter()
+            .enumerate()
+            .filter(|(index, sha)| on_rolling(*index) && !state.delivered_shas.contains(sha))
+            .map(|(_, sha)| sha)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut lines = Vec::with_capacity(shas.len() + 2);
+    if each {
+        let landed = if newly.is_empty() {
+            "none".to_owned()
+        } else {
+            newly
+                .iter()
+                .map(|sha| sha.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        lines.push(format!("landed_since_last_firing: {landed}"));
+    }
+    for (index, sha) in shas.iter().enumerate() {
+        let status = match states {
+            Some(states) if states[index] => "on_rolling",
+            Some(_) => "pending",
+            None => "unknown",
+        };
+        let mut line = format!("sha={sha} state={status}");
+        if newly.contains(&sha) {
+            line.push_str(" new=true");
+        }
+        lines.push(line);
+    }
+    let verdict = if states.is_some_and(|states| states.iter().all(|on| *on)) {
+        Verdict::Satisfied
+    } else {
+        match decide_pending(state, now, manual) {
+            Verdict::Pending if !newly.is_empty() => Verdict::Landed,
+            verdict => verdict,
+        }
+    };
+    if verdict == Verdict::Landed {
+        let pending = shas.len() - states.map_or(0, |s| s.iter().filter(|on| **on).count());
+        lines.push(format!(
+            "remaining: {pending} pending; this wake stays armed and fires again as each lands"
+        ));
+    }
+    let mut delivered = state.delivered_shas.clone();
+    delivered.extend(newly.into_iter().cloned());
+    (
+        verdict,
+        lines.join("\n"),
+        if each { delivered } else { Vec::new() },
+    )
 }
 
 /// Decide an `issue_closed` predicate from the Issue's current status
@@ -579,7 +684,7 @@ const TODO_EVIDENCE_BYTES: usize = 2_048;
 /// provisional marker on a parked turn; the worker has not seen the result, so
 /// the wake delivers.
 async fn wake_superseded(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     job: &ScheduledJob,
     settled_at: Option<DateTime<Utc>>,
 ) -> bool {
@@ -601,7 +706,7 @@ async fn wake_superseded(
 
 /// #2054: when a satisfied predicate became true, if the daemon recorded it.
 /// `jobs_terminal` settles when its last job finished; `todo_closed` when the
-/// item closed. `sha_on_rolling` and `issue_closed` record no such time, so
+/// item closed. Rolling commit predicates and `issue_closed` record no such time, so
 /// they are `None` and a wake on them is never treated as superseded: a late
 /// short notice is cheaper than a lost result.
 fn settled_at(
@@ -625,13 +730,108 @@ fn settled_at(
     todo_closed_at
 }
 
+/// #3387: a quiet-capable settle wake (the daemon's default arm; see
+/// [`rsi_common::wake_predicate::QuietSettle`]) that observed a clean success
+/// opens no owner turn. The success is recorded on the row and the row's next
+/// check moves to the batch deadline: the owner's next wake carries the digest
+/// ([`append_quiet_digest`]), and once the oldest held line is
+/// `QUIET_SETTLE_MAX_HOLD_SECS` old the wake is delivered alone as one batch.
+/// `None` delivers the wake as usual: the owner armed it itself, the record is
+/// unreadable, or the batch deadline passed.
+async fn quiet_hold(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    job: &ScheduledJob,
+    line: String,
+    now: DateTime<Utc>,
+) -> Option<Gate> {
+    let guard = store.lock().await;
+    let record = match guard.quiet_settle_state(job.id) {
+        Ok(Some(record)) => record,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(job_id = %job.id, %error, "quiet settle record unreadable; delivering");
+            return None;
+        }
+    };
+    let held = match record.held {
+        Some(held) => held,
+        None => {
+            let held = rsi_common::wake_predicate::QuietHeld { at: now, line };
+            let due = now + chrono::Duration::seconds(QUIET_SETTLE_MAX_HOLD_SECS);
+            if let Err(error) = guard.hold_quiet_settle(job.id, &held, due) {
+                tracing::warn!(job_id = %job.id, %error, "clean success not held; delivering");
+                return None;
+            }
+            held
+        }
+    };
+    let due = held.at + chrono::Duration::seconds(QUIET_SETTLE_MAX_HOLD_SECS);
+    if now >= due {
+        return None;
+    }
+    if let Err(error) = guard.defer_wake_when(job.id, due) {
+        tracing::warn!(job_id = %job.id, %error, "failed to defer held clean success");
+    }
+    Some(Gate::Pending)
+}
+
+/// Most held successes listed in one digest; the rest are counted.
+const QUIET_DIGEST_LINES: usize = 20;
+
+/// #3387: the owner's held clean successes as digest lines to append to a wake
+/// delivered to it now, with the rows that carry them (retired by the caller
+/// once the owner took the turn). Empty when nothing is held or the read fails.
+pub(super) async fn quiet_digest(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    job: &ScheduledJob,
+) -> (Vec<Uuid>, String) {
+    let Some(owner) = job.wake_session_id else {
+        return (Vec::new(), String::new());
+    };
+    let held = match store.lock().await.held_quiet_settles(owner, job.id) {
+        Ok(held) => held,
+        Err(error) => {
+            tracing::warn!(job_id = %job.id, %error, "held clean successes unreadable; none appended");
+            return (Vec::new(), String::new());
+        }
+    };
+    if held.is_empty() {
+        return (Vec::new(), String::new());
+    }
+    let mut text = format!(
+        "\nClean topology successes since your last wake ({}; no action needed):",
+        held.len()
+    );
+    for (_, entry) in held.iter().take(QUIET_DIGEST_LINES) {
+        text.push_str(&format!(
+            "\n- {} (settled {})",
+            entry.line,
+            entry.at.to_rfc3339()
+        ));
+    }
+    if held.len() > QUIET_DIGEST_LINES {
+        text.push_str(&format!("\n(+{} more)", held.len() - QUIET_DIGEST_LINES));
+    }
+    (held.into_iter().map(|(id, _)| id).collect(), text)
+}
+
 /// Evaluate one predicate wake. `manual` (an operator trigger) delivers a
 /// current-state report instead of deferring.
 pub(super) async fn gate(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &Arc<dyn SessionLauncher>,
     job: &ScheduledJob,
     manual: bool,
+) -> Gate {
+    gate_at(store, launcher, job, manual, Utc::now()).await
+}
+
+pub(super) async fn gate_at(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    launcher: &Arc<dyn SessionLauncher>,
+    job: &ScheduledJob,
+    manual: bool,
+    now: DateTime<Utc>,
 ) -> Gate {
     let state = {
         let guard = store.lock().await;
@@ -644,10 +844,13 @@ pub(super) async fn gate(
             }
         }
     };
-    let now = Utc::now();
     let mut todo_report: Option<String> = None;
+    let mut health_conditions = Vec::new();
     let mut todo_closed_at: Option<DateTime<Utc>> = None;
+    // #3387: set when the awaited execution succeeded and asks nothing of its owner.
+    let mut quiet_line: Option<String> = None;
     let mut requeued: Vec<RequeuedJob> = Vec::new();
+    let mut each_delivered: Vec<String> = Vec::new();
     let (verdict, snaps) = if let Some(ids) = &state.predicate.jobs_terminal {
         let snaps = {
             let guard = store.lock().await;
@@ -655,13 +858,25 @@ pub(super) async fn gate(
             snapshots(&guard, ids)
         };
         (decide_jobs(&snaps, &state, now, manual), snaps)
-    } else if let Some(sha) = state.predicate.sha_on_rolling.clone() {
+    } else if let Some(shas) = state
+        .predicate
+        .shas_on_rolling
+        .clone()
+        .or_else(|| state.predicate.sha_on_rolling.clone().map(|sha| vec![sha]))
+    {
         let repo = state.repo_dir.clone().unwrap_or_default();
-        let probe = tokio::task::spawn_blocking(move || sha_on_rolling(&repo, &sha)).await;
+        let probe_shas = shas.clone();
+        let probe = tokio::task::spawn_blocking(move || shas_on_rolling(&repo, &probe_shas)).await;
+        let states = match &probe {
+            Ok(Ok(states)) => Some(states.as_slice()),
+            _ => None,
+        };
+        let (verdict, report, delivered) = decide_rolling(&shas, states, &state, now, manual);
+        todo_report = Some(report);
+        each_delivered = delivered;
         let verdict = match probe {
-            Ok(Ok(true)) => Verdict::Satisfied,
             Ok(Err(())) => Verdict::Unsatisfiable(REASON_REPO_UNAVAILABLE),
-            _ => decide_pending(&state, now, manual),
+            _ => verdict,
         };
         (verdict, Vec::new())
     } else if let Some(number) = state.predicate.issue_closed {
@@ -714,6 +929,12 @@ pub(super) async fn gate(
                     let guard = store.lock().await;
                     match crate::topology::outcome::settled_outcome(&guard, id) {
                         Ok(Some(outcome)) => {
+                            if execution.as_ref().is_some_and(|e| e.status == "succeeded")
+                                && crate::topology::outcome::is_clean_success(&outcome)
+                            {
+                                quiet_line =
+                                    Some(crate::topology::outcome::digest_line(id, &outcome));
+                            }
                             report.push('\n');
                             report.push_str(&crate::topology::outcome::render(
                                 &outcome,
@@ -766,29 +987,73 @@ pub(super) async fn gate(
             let guard = store.lock().await;
             crate::health_anomaly::Scope::live(&guard, job.wake_session_id, &spec).and_then(
                 |scope| {
-                    crate::health_anomaly::collect_store_facts(&guard, &scope, now)
-                        .map(|facts| (scope, facts))
+                    crate::health_anomaly::collect_store_facts(&guard, &scope, now).and_then(
+                        |facts| {
+                            let reported = job
+                                .wake_session_id
+                                .map(|owner| guard.provider_window_warning_subjects(owner, now))
+                                .transpose()?
+                                .unwrap_or_default();
+                            Ok((scope, facts, reported))
+                        },
+                    )
                 },
             )
         };
         match facts {
-            Ok((scope, facts)) => {
+            Ok((scope, facts, reported)) => {
                 let inputs = crate::health_anomaly::Inputs {
                     store: facts,
                     host: crate::health_anomaly::read_host(),
                     live: launcher.health_live_inputs(&scope).await,
+                    helper_outages: crate::memory::helper_breaker::HelperEndpointBreaker::global()
+                        .outages(std::time::Instant::now()),
+                    daemon_stops: crate::daemon_lifecycle::journal_stops(),
+                    supervisor_restarts: rsi_common::supervisor_restarts::SupervisorRestarts::read(
+                        &rsi_common::supervisor_restarts::default_path(),
+                    ),
                 };
                 let conditions = {
                     let mut trackers = crate::health_anomaly::sustain()
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let found = crate::health_anomaly::evaluate(
-                        &inputs,
-                        &rsid_core::health_thresholds::current(),
-                        &spec,
-                        trackers.entry(job.id).or_default(),
-                        now,
-                    );
+                    let mut window_trackers = crate::health_anomaly::provider_windows::trackers()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Session identity scopes episode notifications; a re-armed
+                    // wake retains samples and acknowledgments from its owner.
+                    window_trackers.retain(|_, tracker| tracker.retain_live(now));
+                    let owner = job.wake_session_id.unwrap_or(job.id);
+                    let tracker = trackers.entry(job.id).or_default();
+                    tracker.windows = window_trackers.remove(&owner).unwrap_or_default();
+                    for subject in reported {
+                        tracker.windows.reported_subject(subject);
+                    }
+                    let mut found = crate::health_anomaly::hub_pull_outages()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .evaluate(
+                            (owner, job.id),
+                            &inputs,
+                            &rsid_core::health_thresholds::current(),
+                            &spec,
+                            tracker,
+                            now,
+                        );
+                    window_trackers.insert(owner, std::mem::take(&mut tracker.windows));
+                    // #4020: the daemon-armed manager idle backstop (#3765) is
+                    // re-armed by every turn end, so it reports an anomaly set
+                    // once per seat, not once per re-arm.
+                    if job
+                        .name
+                        .starts_with(crate::session::manager_idle::IDLE_BACKSTOP_NAME_PREFIX)
+                        && let Some(seat) = job.wake_session_id
+                    {
+                        found = crate::health_anomaly::idle_backstop_latch()
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .filter(seat, job.id, found);
+                    }
                     if !found.is_empty() {
                         trackers.remove(&job.id);
                     }
@@ -800,6 +1065,7 @@ pub(super) async fn gate(
                     Verdict::Satisfied
                 };
                 if !conditions.is_empty() {
+                    health_conditions = conditions.clone();
                     let mut report = conditions
                         .iter()
                         .map(rsi_common::health_anomaly::HealthCondition::line)
@@ -809,6 +1075,14 @@ pub(super) async fn gate(
                         "\nHandle each condition, then re-arm health_anomaly; add its \
                          key (the ignore_key= field, verbatim) to ignore to accept one that will persist.",
                     );
+                    if conditions.iter().any(|condition| {
+                        condition.kind == rsi_common::health_anomaly::KIND_HUB_NOT_PULLING
+                    }) {
+                        report.push_str(
+                            " hub_not_pulling is latched for this outage: re-arm with your usual spec; \
+                             do not add its key to ignore, a later outage after a successful pull fires again.",
+                        );
+                    }
                     todo_report = Some(report);
                 }
                 (verdict, Vec::new())
@@ -840,6 +1114,11 @@ pub(super) async fn gate(
             Gate::Retire
         }
         verdict => {
+            if let (Verdict::Satisfied, false, Some(line)) = (&verdict, manual, quiet_line)
+                && let Some(gate) = quiet_hold(store, job, line, now).await
+            {
+                return gate;
+            }
             let mut message = compose_message(
                 &job.message,
                 &state,
@@ -852,7 +1131,24 @@ pub(super) async fn gate(
                 message.push('\n');
                 message.push_str(&line);
             }
-            Gate::Deliver(message)
+            if verdict == Verdict::Landed {
+                let next = now + chrono::Duration::seconds(state.predicate.poll_seconds());
+                Gate::DeliverAndRearm {
+                    message,
+                    delivered: each_delivered,
+                    next_fire_at: state.deadline.map_or(next, |deadline| next.min(deadline)),
+                }
+            } else {
+                let outcome = match verdict {
+                    Verdict::Satisfied => "satisfied",
+                    Verdict::TimedOut => "timed_out",
+                    Verdict::Unsatisfiable(_) => "unsatisfiable",
+                    Verdict::ManualPending => "manual_pending",
+                    Verdict::Landed => "landed",
+                    Verdict::Pending => "pending",
+                };
+                Gate::Deliver(message, outcome, health_conditions)
+            }
         }
     }
 }

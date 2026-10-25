@@ -790,6 +790,7 @@ impl Store {
             return Ok(false);
         }
         Ok(self.owner_has_enabled_own_wake(session.id)?
+            || self.owner_running_job_has_completion_wake(session.id)?
             || (self.owner_has_running_agent_job(session.id)?
                 && self.worker_stranded_note(session)?.is_none()))
     }
@@ -797,8 +798,9 @@ impl Store {
     /// #1555: stranded-worker notice for the launching manager. `Some` when an
     /// Issue-bound worker's turn ended (`Completed`) with no final
     /// `RESULT`/`PIPELINE HANDOFF`/BATON line while nothing of its own will
-    /// resume it: no enabled `resume`/`when` wake (a refused or retired wake is
-    /// not enabled). The text names every daemon job and unit it still owns,
+    /// resume it: no enabled `resume`/`when` wake or queued/running job with a
+    /// completion wake (a refused or retired wake is not enabled). The text
+    /// names every running daemon job and unit it still owns,
     /// so the manager can stop or adopt them. A worker with a pending wake, a
     /// final report, or no Issue binding yields `None`. A worker that published
     /// a handoff to its bound Issue but left the marker out of its final turn
@@ -812,7 +814,10 @@ impl Store {
         let Some((_, issue)) = Self::bound_issue_for_worker_on(&self.conn, session.id)? else {
             return Ok(None);
         };
-        if self.latest_turn_reported(session.id)? || self.owner_has_enabled_own_wake(session.id)? {
+        if self.latest_turn_reported(session.id)?
+            || self.owner_has_enabled_own_wake(session.id)?
+            || self.owner_running_job_has_completion_wake(session.id)?
+        {
             return Ok(None);
         }
         let mut stmt = self.conn.prepare(
@@ -918,21 +923,32 @@ impl Store {
             .find_map(|content| review_verdict(content)))
     }
 
-    /// #1734: a daemon job the session owns is still running AND the session
-    /// has an enabled `when.jobs_terminal` wake naming it. The worker ended its
-    /// turn on purpose to be resumed with the job's result, so a foreground-wait
-    /// nudge would contradict the published completion-wake workflow.
+    /// A queued/running daemon job the session owns will resume it: either
+    /// its `wake: owner` policy (#364), or an enabled `when.jobs_terminal`
+    /// wake naming it (#1734). Owner-wake rows are only created at settlement;
+    /// the open job itself is enough to park the worker until then.
     pub fn owner_running_job_has_completion_wake(&self, owner: Uuid) -> crate::error::Result<bool> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM scheduled_jobs w
+        if self.session_has_live_owner_wake_job(owner)? {
+            return Ok(true);
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT j.id FROM scheduled_jobs w
                  JOIN json_each(w.schedule_json,'$.wake_when.predicate.jobs_terminal') ids
                  JOIN agent_jobs j ON j.id=ids.value
                WHERE w.wake_session_id=?1 AND w.enabled=1 AND json_valid(w.schedule_json)
-                 AND j.owner_session_id=?1 AND j.state IN ('queued','running'))",
-            params![owner.to_string()],
-            |row| row.get(0),
-        )?)
+                 AND j.state IN ('queued','running')",
+        )?;
+        let ids = statement
+            .query_map(params![owner.to_string()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for id in ids {
+            if let Ok(id) = uuid::Uuid::parse_str(&id)
+                && self.job_watchable_by(owner, id)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// #3090: the worker owns an enabled `when.jobs_terminal` wake whose result
@@ -943,7 +959,7 @@ impl Store {
     /// running the predicate is pending, and once every job finished the wake is
     /// still owed when the worker's latest handoff after arming it predates the
     /// last finish or an unknown finish time (`None` never supersedes, as the
-    /// scheduler reads it). A wake naming a job the worker does not own never
+    /// scheduler reads it). A wake naming a job the worker cannot watch never
     /// counts, as in [`Self::owner_running_job_has_completion_wake`].
     pub fn owner_job_result_wake_pending(&self, owner: Uuid) -> crate::error::Result<bool> {
         let mut wakes = self.conn.prepare(
@@ -971,12 +987,18 @@ impl Store {
             let mut settled: Option<Option<chrono::DateTime<chrono::Utc>>> = Some(None);
             let mut named = 0usize;
             for id in &ids {
+                let Ok(job_id) = uuid::Uuid::parse_str(id) else {
+                    continue;
+                };
+                if !self.job_watchable_by(owner, job_id)? {
+                    continue;
+                }
                 let job: Option<(String, Option<String>)> = self
                     .conn
                     .query_row(
                         "SELECT state, finished_at FROM agent_jobs
-                          WHERE id=?1 AND owner_session_id=?2",
-                        params![id, owner.to_string()],
+                          WHERE id=?1",
+                        params![id],
                         |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()?;

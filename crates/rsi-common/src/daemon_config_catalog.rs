@@ -189,7 +189,29 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("provider_launch_overrides", NextSpawn),
     // #2762 (rsid claude.rs, read per Claude CLI spawn).
     page("claude_fallback_models", NextSpawn),
+    // #3176: the operator allowlist of docker hosts for Harness container exec
+    // targets (read at every container-bound launch, continuation and rotation).
+    page("bench.docker_hosts", NextSpawn),
+    // #3181: the benchmark job (read at every submit and start of a `bench` job).
+    page("bench.enabled", NextSpawn),
+    page("bench.max_concurrency", NextSpawn),
+    page("bench.laptop_host", NextSpawn),
     page("claude_max_budget_usd", NextSpawn),
+    // #3154 (rsid openrouter_spend.rs, read at each launch and model call).
+    page("openrouter_spend_cap_usd", LIVE),
+    page("openrouter_spend_warn_pct", LIVE),
+    no_tui_editor(
+        "openrouter_spend_baseline_usd",
+        LIVE,
+        "written by arming openrouter_spend_cap_usd (a fresh probe of the account usage)",
+        "#3154",
+    ),
+    no_tui_editor(
+        "openrouter_spend_armed_at",
+        LIVE,
+        "written by arming openrouter_spend_cap_usd (the time of that probe)",
+        "#3154",
+    ),
     // The TUI updates its cache after save and includes the preset in launches.
     page("system_prompt_preset", NextSpawn),
     // #1626: the TUI reads it from GetDaemonConfig when a `project_created`
@@ -256,6 +278,11 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("sandbox_build_cache_reclaim_max_candidates", LIVE),
     page("sandbox_max_source_roots", LIVE),
     page("sandbox_min_free_gib", LIVE),
+    // Issue #3427: the disposition loop reads its switch every five minutes,
+    // and grace/budget at the start of each bounded pass (rsid session/error_disposition.rs).
+    page("error_disposition_enabled", LIVE),
+    page("error_disposition_grace_minutes", LIVE),
+    page("error_disposition_continuation_budget", LIVE),
     // Issue #2384: the cold-archive loop reads the toggle at every 10-minute tick,
     // and the age and directory at the start of each pass (rsid
     // session/cold_archive.rs).
@@ -282,10 +309,18 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // Issue #2509: the job launcher reads the QA target size cap at each
     // full-library QA start.
     page("qa_target_max_gib", LIVE),
+    // Issue #86: the paste retention pass reads it at each pass (daemon start
+    // and after an upload, at most hourly).
+    page("paste_retention_referenced_days", LIVE),
     // Issue #2752: the Codex live-catalog cache reads its TTL at each lookup.
     page("codex_live_catalog_ttl_secs", LIVE),
     // Issue #2757: the Codex plan-window poll loop reads its interval each cycle.
     page("codex_rate_limit_poll_secs", LIVE),
+    page("claude_billing_mode", LIVE),
+    page("codex_billing_mode", LIVE),
+    page("codexappserver_billing_mode", LIVE),
+    page("pioneer_billing_mode", LIVE),
+    page("antigravity_billing_mode", LIVE),
     // Issue #2763: each Claude/Codex spawn reads the subagent model and cap.
     page("claude_subagent_model", NextSpawn),
     page("claude_max_concurrent_subagents", NextSpawn),
@@ -309,6 +344,7 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("health_disk_used_pct", LIVE),
     page("health_thermal_c", LIVE),
     page("health_stuck_minutes", LIVE),
+    page("health_provider_window_used_pct", LIVE),
     // Issue #1337: AgentSubmitJob reads the test-job timeout default at each
     // submit; the CPU-time andon reads its two thresholds at every sample.
     page("job_test_timeout_mins", LIVE),
@@ -327,8 +363,9 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("supervisor_shutdown_grace_secs", LIVE),
     // Issue #1417: every manager create_session admission reads the threshold.
     page("host_load_admission_threshold", LIVE),
+    page("worker_build_reserve_gb", LIVE),
     // Issue #1992: each worker scope reads the quota when it is created.
-    page("worker_cpu_quota_percent", LIVE),
+    page("worker_cpu_quota_percent", NextSpawn),
     // Issue #2119: the daemon rewrites rsi-build.slice's CPUQuota on every
     // accepted change; job launchers read the share for their own ceilings.
     page("hub_build_cpu_percent", LIVE),
@@ -365,7 +402,7 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     page("completion_gates_enabled", NextSpawn),
     // #788 slice 4: fixed for the session when its MCP bridge is built.
     page("mcp.deferred_tool_threshold", NextSpawn),
-    // #1036: scripts/cloud-spend.py reads the mirrored caps file at every
+    // #1036: rsi-cloud spend reads the mirrored caps file at every
     // remote run start, so a change reaches the next run.
     page("cloud_spend_stop_line_usd", LIVE),
     page("cloud_spend_daily_cap_usd", LIVE),
@@ -408,6 +445,9 @@ pub static DAEMON_CONFIG_FIELDS: &[DaemonFieldSpec] = &[
     // of a coordinating seat. Overrides are `coordinator_context_cap.<key>`
     // fields written by the TUI command `:context-cap`.
     page("coordinator_context_cap_tokens", LIVE),
+    // Issue #4021: the scheduler reads the cap from the persisted row at each
+    // manager-notice delivery.
+    page("manager_max_turns_per_hour", LIVE),
     // #1254: rsid session/context_cap.rs reads the worker baton cap at each
     // usage update of a non-seat session. Overrides are
     // `worker_context_cap.<key>` fields written by `:worker-context-cap`.

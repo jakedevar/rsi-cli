@@ -86,6 +86,11 @@ pub fn default_socket() -> PathBuf {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home_socket(&home)
+}
+
+/// The socket the installed rsid service holds for `home` (no environment override).
+pub fn home_socket(home: &Path) -> PathBuf {
     home.join(".rsi").join("daemon.sock")
 }
 
@@ -173,8 +178,18 @@ pub fn parse_response(line: &[u8]) -> Result<Value, DaemonError> {
             .and_then(Value::as_str)
             .unwrap_or("unknown error")
             .to_string();
+        // A refusal's own next step (`data.next_action`) travels with the message;
+        // the webview's errors-model.ts shows it as the next step (local #207).
+        if let Some(next) = err
+            .pointer("/data/next_action")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            message = format!("{message} | next_action: {next}");
+        }
         // A typed Issue-workspace error carries its code in `data` (stale_version,
-        // dependency_cycle, ...); keep it so the UI can tell a stale write apart.
+        // dependency_cycle, ...); keep it last so the UI can tell a stale write apart.
         if let Some(code) = err.pointer("/data/code").and_then(Value::as_str) {
             message = format!("{message} [{code}]");
         }
@@ -235,6 +250,19 @@ mod tests {
             DaemonError::Rpc {
                 code: -32000,
                 message: "row changed [stale_version]".into()
+            }
+        );
+    }
+
+    #[test]
+    fn refusal_next_action_travels_before_the_code() {
+        let line = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"deploy draining","data":{"code":"deploy_draining","next_action":"retry after the deploy settles"}}}"#;
+        assert_eq!(
+            parse_response(line).unwrap_err(),
+            DaemonError::Rpc {
+                code: -32000,
+                message: "deploy draining | next_action: retry after the deploy settles [deploy_draining]"
+                    .into()
             }
         );
     }

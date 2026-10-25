@@ -75,66 +75,97 @@ rsid_launchd_path() {
     printf '%s\n' "$result"
 }
 
+# rsid_launchd_render <template> <label> <install-dir> <socket> <log> <home> <path> <lang>
+# Fill each @NAME@ placeholder of the template with its XML-escaped value in
+# one pass (a value that itself contains @NAME@ is never re-expanded) and print
+# the result. An unknown placeholder is refused. Values travel through the
+# environment so awk never interprets backslashes or `&` in them (#465).
+rsid_launchd_render() {
+    RSID_R_LABEL="$2" RSID_R_INSTALL_DIR="$3" RSID_R_SOCKET="$4" RSID_R_LOG="$5" \
+        RSID_R_HOME="$6" RSID_R_PATH="$7" RSID_R_LANG="$8" \
+        awk -v template="$1" '
+        function escape(v) {
+            gsub(/&/, "\\&amp;", v)
+            gsub(/</, "\\&lt;", v)
+            gsub(/>/, "\\&gt;", v)
+            return v
+        }
+        BEGIN {
+            split("LABEL INSTALL_DIR SOCKET LOG HOME PATH LANG", names, " ")
+            for (i in names) values[names[i]] = escape(ENVIRON["RSID_R_" names[i]])
+        }
+        {
+            line = $0
+            out = ""
+            while (match(line, /@[A-Z_]+@/)) {
+                name = substr(line, RSTART + 1, RLENGTH - 2)
+                if (!(name in values)) {
+                    unknown[name] = 1
+                    out = out substr(line, 1, RSTART + RLENGTH - 1)
+                } else {
+                    out = out substr(line, 1, RSTART - 1) values[name]
+                }
+                line = substr(line, RSTART + RLENGTH)
+            }
+            print out line
+        }
+        END {
+            n = 0
+            for (name in unknown) list[++n] = name
+            if (n == 0) exit 0
+            for (i = 2; i <= n; i++) {
+                key = list[i]
+                for (j = i - 1; j >= 1 && list[j] > key; j--) list[j + 1] = list[j]
+                list[j + 1] = key
+            }
+            msg = ""
+            for (i = 1; i <= n; i++) msg = msg (i > 1 ? ", " : "") list[i]
+            print template " names unknown placeholders: " msg > "/dev/stderr"
+            exit 3
+        }' "$1"
+}
+
 # rsid_launchd_write_plist <template> <install-dir> <socket> <log>
 # Render the agent (atomic rename, mode 0644). Prints `changed` or `unchanged`.
 rsid_launchd_write_plist() {
-    local template="$1" install_dir="$2" socket="$3" log="$4" plist
+    local template="$1" install_dir="$2" socket="$3" log="$4" plist temp
     plist="$(rsid_launchd_plist)"
     mkdir -p "$(dirname -- "$plist")"
     case "$socket" in
         /*) ;;
         *) socket="$PWD/$socket" ;;
     esac
-    python3 - "$template" "$plist" "$RSID_LAUNCHD_LABEL" "$install_dir" "$socket" "$log" \
-        "$HOME" "$(rsid_launchd_path)" "${LANG:-en_US.UTF-8}" <<'PY'
-import os
-import plistlib
-import re
-import sys
-import tempfile
-
-
-def escape(value):
-    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-template, plist, label, install_dir, socket, log, home, path, lang = sys.argv[1:]
-values = {
-    "LABEL": label,
-    "INSTALL_DIR": install_dir,
-    "SOCKET": socket,
-    "LOG": log,
-    "HOME": home,
-    "PATH": path,
-    "LANG": lang,
-}
-with open(template, encoding="utf-8") as handle:
-    text = handle.read()
-unknown = sorted(set(re.findall(r"@([A-Z_]+)@", text)) - set(values))
-if unknown:
-    sys.exit(f"{template} names unknown placeholders: {', '.join(unknown)}")
-for name, value in values.items():
-    text = text.replace(f"@{name}@", escape(value))
-data = text.encode("utf-8")
-plistlib.loads(data)  # refuse to install a plist launchd cannot parse
-try:
-    with open(plist, "rb") as handle:
-        if handle.read() == data:
-            print("unchanged")
-            sys.exit(0)
-except FileNotFoundError:
-    pass
-fd, temp = tempfile.mkstemp(prefix=f".{label}.", dir=os.path.dirname(plist))
-try:
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-    os.chmod(temp, 0o644)
-    os.replace(temp, plist)
-except BaseException:
-    os.unlink(temp)
-    raise
-print("changed")
-PY
+    temp="$(mktemp "$(dirname -- "$plist")/.$RSID_LAUNCHD_LABEL.XXXXXX")" || return 1
+    if ! rsid_launchd_render "$template" "$RSID_LAUNCHD_LABEL" "$install_dir" "$socket" "$log" \
+        "$HOME" "$(rsid_launchd_path)" "${LANG:-en_US.UTF-8}" >"$temp"; then
+        rm -f "$temp"
+        return 1
+    fi
+    # Refuse to install a plist launchd cannot parse (plutil on macOS, xmllint
+    # where present; a host with neither has no launchd to parse it anyway).
+    if command -v plutil >/dev/null 2>&1; then
+        if ! plutil -lint "$temp" >/dev/null 2>&1; then
+            echo "$template rendered a plist launchd cannot parse" >&2
+            rm -f "$temp"
+            return 1
+        fi
+    elif command -v xmllint >/dev/null 2>&1; then
+        if ! xmllint --noout "$temp" >/dev/null 2>&1; then
+            echo "$template rendered a plist launchd cannot parse" >&2
+            rm -f "$temp"
+            return 1
+        fi
+    fi
+    if [[ -f "$plist" ]] && cmp -s "$temp" "$plist"; then
+        rm -f "$temp"
+        echo unchanged
+        return 0
+    fi
+    chmod 0644 "$temp" && mv -f "$temp" "$plist" || {
+        rm -f "$temp"
+        return 1
+    }
+    echo changed
 }
 
 rsid_launchd_loaded() {

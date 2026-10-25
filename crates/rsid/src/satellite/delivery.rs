@@ -22,7 +22,7 @@ use rsi_common::satellite_dispatch::{
     SATELLITE_LAUNCH_FAILED_SANDBOX_CUSTODY, SATELLITE_MESSAGE_KEY_CONFLICT,
     SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeliverOutcomeV1, SatelliteDeliverRedirectV1,
     SatelliteDeliverRequestV1, SatelliteDeliverResultV1, SatelliteDeployRequestV1,
-    remote_terminal_refusal,
+    remote_terminal_refusal_with_terminal,
 };
 use uuid::Uuid;
 
@@ -242,10 +242,12 @@ where
                     _ => "deleted",
                 };
                 let stop_reason = session.as_ref().and_then(|s| s.stop_reason.as_deref());
-                return Err(DaemonError::PolicyDenied(remote_terminal_refusal(
-                    name,
-                    stop_reason,
-                )));
+                // hub #3859: also the persisted terminal_reason (for example
+                // `api_error` for a provider weekly limit).
+                let terminal_reason = session.as_ref().and_then(|s| s.terminal_reason.as_deref());
+                return Err(DaemonError::PolicyDenied(
+                    remote_terminal_refusal_with_terminal(name, stop_reason, terminal_reason),
+                ));
             }
             // Interrupted (by the operator or a restart) is not idle: the
             // operator stopped it, so hub mail must not resume it.
@@ -679,6 +681,7 @@ mod tests {
                 session.parent_id = Some(rig.root);
                 session.status = status;
                 session.stop_reason = Some("provider_error: codex 401 /home/x".into());
+                session.terminal_reason = Some("api_error".into());
                 store.insert_session(&session).unwrap();
                 session.id
             };
@@ -688,7 +691,7 @@ mod tests {
             );
             assert!(
                 text.contains(&format!(
-                    "remote_terminal|{name}|provider_error:_codex_401__home_x"
+                    "remote_terminal|{name}|provider_error:_codex_401__home_x;terminal_reason=api_error"
                 )),
                 "{text}"
             );

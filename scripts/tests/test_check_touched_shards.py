@@ -1528,12 +1528,13 @@ mod tests;
         # #2338: a `#[test]` named in a doc comment or a fixture string is not a test, and a
         # source whose every test is `#[ignore]`d runs nothing; a filter naming either selects
         # no test and the lander refuses the whole derived gate (#2244: extract::rust, s1_corpus).
-        mods = ("docs_only", "string_only", "ignored_only", "mixed", "real")
+        mods = ("docs_only", "string_only", "ignored_only", "compiled_out", "mixed", "real")
         self.write("crates/codegraph/src/lib.rs", "".join(f"pub mod {m};\n" for m in mods))
         sources = {
             "docs_only": "/// Attribute tails that mark a test (`#[test]`,\n/// `#[tokio::test]`).\npub fn f() {}\n",
             "string_only": 'pub const SRC: &str = "#[test]\\nfn x() {}";\npub fn f() {}\n',
             "ignored_only": "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore = \"slow\"]\n    fn slow() {}\n}\n",
+            "compiled_out": "pub fn f() {}\n#[cfg(any())]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
             "mixed": "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    #[ignore = \"slow\"]\n    fn slow() {}\n\n    #[test]\n    fn fast() {}\n}\n",
             "real": "pub fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn a() {}\n}\n",
         }
@@ -1557,6 +1558,28 @@ mod tests;
         self.assertEqual(code, 0, summary)
         self.assertEqual(sorted(receipt["suggested_filters"]),
                          ["codegraph=mixed", "codegraph=real", "codegraph=test:live"])
+
+    def test_public_item_selection_names_only_compiled_tests_in_the_dependent_file(self):
+        # Hub #3408 selects the entire dependent module; #551 must exclude empty-any tests.
+        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/rsi-common", "crates/rsid"]\n')
+        self.write("crates/rsi-common/Cargo.toml", '[package]\nname = "rsi-common"\nversion = "0.1.0"\n')
+        self.write("crates/rsid/Cargo.toml", '[package]\nname = "rsid"\nversion = "0.1.0"\n'
+                   '[dependencies]\nrsi-common = { path = "../rsi-common" }\n')
+        self.write("crates/rsi-common/src/lib.rs", "pub fn selected_item() -> u8 { 1 }\n")
+        self.write("crates/rsid/src/lib.rs", "mod foo;\n")
+        enabled = GATE.format(shard="store-02", name="enabled")
+        disabled = GATE.format(shard="store-02", name="t")
+        self.write("crates/rsid/src/foo.rs", "use rsi_common::selected_item;\n" + enabled
+                   + "#[cfg(any())]\nmod disabled {\n" + "".join("    " + row + "\n" for row in disabled.splitlines())
+                   + "}\nmod outer {\n    #[cfg(any( ))]\n    mod nested {\n"
+                   + "".join("        " + row + "\n" for row in disabled.splitlines()) + "    }\n}\n")
+        self.commit("dependent module fixture")
+        self.git("branch", "-f", "base")
+        self.write("crates/rsi-common/src/lib.rs", "pub fn selected_item() -> u16 { 1 }\n")
+        self.commit()
+        code, summary, receipt = self.check("--filters-only")
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(receipt["suggested_filters"], ["rsid=shard:store-02:test(=foo::enabled)"])
 
     def test_a_crate_root_diff_selects_the_roots_own_inline_test_module(self):
         # #2331: lib.rs has no module path, so its own `mod tests` was never selected.
@@ -1966,10 +1989,7 @@ pub fn manager_review_reclaimed_source() -> Option<ReclaimedReviewSource> {
         # static guards (which have their own fixture suites). Supply the
         # guard entry points that a scoped-test dry run always invokes.
         for guard in ("scripts/check-rsid-test-shards.py",
-                      "tools/check-released-migrations.py",
-                      "tools/check_identity_assertions.py",
-                      "tools/check_starter_pins.py",
-                      "tools/check_portable_shell.py"):
+                      "tools/check-released-migrations.py"):
             self.write(guard, "raise SystemExit(0)\n")
         self.write("scripts/check-rsid-test-shards.py", "import sys\n"
                    "if '--list-shard-packages' in sys.argv:\n"
@@ -2044,10 +2064,7 @@ fn observe_journal() {
         self.write("crates/rsid/src/lib.rs", "pub mod session;\n")
         self.write("crates/rsid/src/session/mod.rs", "mod rotation;\n")
         for guard in ("scripts/check-rsid-test-shards.py",
-                      "tools/check-released-migrations.py",
-                      "tools/check_identity_assertions.py",
-                      "tools/check_starter_pins.py",
-                      "tools/check_portable_shell.py"):
+                      "tools/check-released-migrations.py"):
             self.write(guard, "raise SystemExit(0)\n")
         self.write("scripts/check-rsid-test-shards.py", "import sys\n"
                    "if '--list-shard-packages' in sys.argv:\n"
@@ -2328,15 +2345,19 @@ fn assert_rotation(failure: PrePublicationFailure) {
         self.write("crates/rsid-store/Cargo.toml", STORE_MANIFEST)
         self.write(src + "lib.rs", "pub mod model_control;\npub mod store;\n")
         self.write(src + "model_control/mod.rs", "mod cost;\n")
-        self.write(src + "store/mod.rs", "mod manager_resources;\nmod portfolio_nodes;\n")
+        self.write(src + "store/mod.rs", "mod manager_resources;\nmod manager_intent;\nmod unrelated;\nmod portfolio_nodes;\n")
         self.write(src + "store/portfolio_nodes.rs",
                    '#[cfg(test)]\n#[path = "portfolio_delegation_tests.rs"]\nmod delegation_tests;\n')
         name = "a_manager_pass_costs_a_bounded_number_of_instructions_per_member_2494"
         self.write(src + "store/portfolio_delegation_tests.rs",
                    self.gated_tests("store-01", [name if with_test else "other_delegation_test"]))
-        for path in ("model_control/cost.rs", "store/manager_resources.rs"):
+        for path in ("model_control/cost.rs", "store/manager_resources.rs", "store/manager_intent.rs", "store/unrelated.rs"):
             self.write(src + path, "pub fn spend() -> u8 { 1 }\n" +
                        self.gated_tests("store-01", ["own_spend_test"]))
+        intent = src + "store/manager_intent.rs"
+        self.write(intent, (self.root / intent).read_text() + "mod detail;\n")
+        self.write(src + "store/manager_intent/detail.rs", "pub fn detail() { 1; }\n")
+        self.write("tools/test-guards.json", (SCRIPT.parent.parent / "tools/test-guards.json").read_text())
         self.commit("split store spend observer fixture")
         self.git("branch", "-f", "base")
         return src, name
@@ -2345,6 +2366,7 @@ fn assert_rotation(failure: PrePublicationFailure) {
         src, name = self.manager_spend_observer_fixture()
         # Small module filters alone omitted this claimed regression in the #3043 gate.
         for paths in (("model_control/cost.rs",), ("store/manager_resources.rs",),
+                      ("store/manager_intent.rs",),
                       ("model_control/cost.rs", "store/manager_resources.rs")):
             with self.subTest(paths=paths):
                 self.git("reset", "-q", "--hard", "base")
@@ -2354,34 +2376,118 @@ fn assert_rotation(failure: PrePublicationFailure) {
                 self.commit()
                 code, summary, receipt = self.check("--filters-only")
                 self.assertEqual(code, 0, summary)
-                pin = ("rsid=shard:store-01:test(/^store::portfolio_nodes::delegation_tests::"
-                       "(?:\\w+::)*" + name + "$/)")
+                full = "store::portfolio_nodes::delegation_tests::" + name
+                pin = "rsid=shard:store-01:test(=" + full + ")"
                 self.assertEqual(receipt["suggested_filters"].count(pin), 1)
-                self.assertEqual(receipt["source_observer_pins"],
-                                 ["store::portfolio_nodes::delegation_tests::" + name])
-                self.assertEqual(receipt["source_observer_missing"], [])
+                self.assertEqual(receipt["declared_guards"], [{
+                    "package": "rsid-store", "test": full,
+                    "paths": sorted(src + p for p in paths), "filters": [pin],
+                }])
                 checker = runpy.run_path(str(SCRIPT))
                 mapping = checker["shard_packages"](self.root)
                 planner = runpy.run_path(str(SCRIPT.with_name("scoped-test")))["selection_plan"]
                 plan = planner([pin], mapping)
                 self.assertEqual(set(plan), {"rsid-store"})
-                self.assertIsNotNone(re.fullmatch(plan["rsid-store"][0]["regex"],
-                                                 "store::portfolio_nodes::delegation_tests::" + name))
+                self.assertEqual(plan["rsid-store"][0]["exact"], full)
                 for path in paths:
                     module = path[:-3].replace("/", "::")
                     self.assertIn("rsid=shard:store-01:test(" + module + ")",
                                   receipt["suggested_filters"])
 
-    def test_a_missing_delegation_cost_observer_is_reported_for_the_spend_input(self):
-        src, name = self.manager_spend_observer_fixture(with_test=False)
-        self.write(src + "store/manager_resources.rs", "pub fn spend() -> u8 { 2 }\n" +
+    def test_an_unrelated_module_keeps_its_own_coverage_without_a_declared_guard(self):
+        src, _ = self.manager_spend_observer_fixture()
+        self.write(src + "store/unrelated.rs", "pub fn spend() -> u8 { 2 }\n" +
                    self.gated_tests("store-01", ["own_spend_test"]))
         self.commit()
         code, summary, receipt = self.check("--filters-only")
         self.assertEqual(code, 0, summary)
-        self.assertEqual(receipt["source_observer_missing"],
-                         ["store::portfolio_nodes::delegation_tests::" + name])
-        self.assertIn("rsid=shard:store-01:test(store::manager_resources)", receipt["suggested_filters"])
+        self.assertEqual(receipt["declared_guards"], [])
+        self.assertEqual(receipt["suggested_filters"], ["rsid=shard:store-01:test(store::unrelated)"])
+
+    def test_guard_declarations_fail_loudly_instead_of_publishing_partial_filters(self):
+        src, _ = self.manager_spend_observer_fixture()
+        table = "tools/test-guards.json"
+        original = json.loads((self.root / table).read_text())
+        cases = [
+            ("{", "Expecting property name"),
+            ({"version": 2, "guards": []}, "expected version: 1"),
+            ({"version": 1, "guards": [None]}, "expected package, test and modules"),
+        ]
+        for key, value, error in (
+            ("package", "missing-crate", "package must be"),
+            ("modules", ["store::missing"], "unknown file-backed module"),
+            ("modules", [], "nonempty modules array"),
+            ("modules", [123], "module names"),
+            ("test", "store::portfolio_nodes::delegation_tests::missing", "unknown or non-runnable"),
+            ("test", "bad test!", "full test name"),
+            ("typo", "value", "expected package, test and modules"),
+        ):
+            config = json.loads(json.dumps(original))
+            config["guards"][0][key] = value
+            cases.append((config, error))
+        for config, error in cases:
+            with self.subTest(error=error, config=config):
+                self.git("reset", "-q", "--hard", "base")
+                self.write(table, config if isinstance(config, str) else json.dumps(config))
+                self.commit()
+                result = subprocess.run(
+                    [str(SCRIPT), "--repo", str(self.root), "--base", "base", "--filters-only", "--json"],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(table + ":", result.stderr)
+                self.assertIn(error, result.stderr)
+
+    def test_guard_validation_checks_the_test_even_on_an_unrelated_diff(self):
+        src, name = self.manager_spend_observer_fixture(with_test=False)
+        self.write(src + "store/unrelated.rs", "pub fn spend() -> u8 { 2 }\n")
+        self.commit()
+        result = subprocess.run(
+            [str(SCRIPT), "--repo", str(self.root), "--base", "base", "--filters-only", "--json"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("unknown or non-runnable sharded test rsid-store::store::portfolio_nodes::delegation_tests::" + name,
+                      result.stderr)
+
+    def test_guard_observers_are_selected_for_comments_descendants_and_table_edits(self):
+        src, name = self.manager_spend_observer_fixture()
+        table = "tools/test-guards.json"
+        for change in ("comment", "descendant", "table"):
+            with self.subTest(change=change):
+                self.git("reset", "-q", "--hard", "base")
+                if change == "comment":
+                    path = src + "store/manager_intent.rs"
+                    self.write(path, "// updated explanation\n" + (self.root / path).read_text())
+                elif change == "descendant":
+                    self.write(src + "store/manager_intent/detail.rs", "pub fn detail() { 2; }\n")
+                else:
+                    self.write(table, json.dumps(json.loads((self.root / table).read_text()), indent=4) + "\n")
+                self.commit()
+                code, summary, receipt = self.check("--filters-only")
+                self.assertEqual(code, 0, summary)
+                self.assertIn("rsid=shard:store-01:test(=store::portfolio_nodes::delegation_tests::" + name + ")",
+                              receipt["suggested_filters"])
+                self.assertEqual(len(receipt["declared_guards"]), 1)
+
+    def test_an_arbitrary_guard_resolves_an_inline_test_module_in_the_daemon(self):
+        self.manager_spend_observer_fixture()
+        self.write("crates/rsid/src/lib.rs", "mod input;\nmod observer;\n")
+        self.write("crates/rsid/src/input.rs", "pub fn input() -> u8 { 1 }\n")
+        self.write("crates/rsid/src/observer.rs", "#[cfg(test)]\nmod tests {\n" +
+                   "\n".join("    " + line for line in GATE.format(shard="other-03", name="invariant").splitlines()) + "\n}\n")
+        self.write("tools/test-guards.json", json.dumps({"version": 1, "guards": [{
+            "package": "rsid", "test": "observer::tests::invariant", "modules": ["input"],
+        }]}) + "\n")
+        self.commit("arbitrary daemon guard fixture")
+        self.git("branch", "-f", "base")
+        self.write("crates/rsid/src/input.rs", "pub fn input() -> u8 { 2 }\n")
+        self.commit()
+        code, summary, receipt = self.check("--filters-only")
+        self.assertEqual(code, 0, summary)
+        self.assertIn("rsid=shard:other-03:test(=observer::tests::invariant)", receipt["suggested_filters"])
+        self.assertEqual(receipt["declared_guards"][0]["test"], "observer::tests::invariant")
 
     def manifest_dir_guard_fixture(self):
         name = "workspace_code_never_bakes_the_manifest_path_at_compile_time"
@@ -2927,6 +3033,34 @@ class ExportedHelperIdentityTest(unittest.TestCase):
         observed = self.observers(receipt)
         self.assertIn("builder_observes_the_helper", observed)
         self.assertNotIn("other_kind_is_unrelated", observed)
+
+    def test_repo_wide_scans_are_computed_once_per_tree_not_once_per_changed_file(self):
+        # #3372: `narrow_tests` runs once per changed source; a repo-wide scan inside it made a
+        # 181-file mechanical diff take over 400 s. The scans are shared per SourceTree.
+        self.write("crates/rsid/src/builder.rs",
+                   "pub struct Builder;\n\nimpl Builder {\n    pub fn new() -> Self {\n        Self\n    }\n}\n")
+        self.commit("builder")
+        self.git("branch", "-f", "base")
+        planner = runpy.run_path(str(SCRIPT))
+        sources = planner["SourceTree"](self.root, "HEAD", planner["git"](
+            self.root, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines())
+        counts = sources.type_declaration_counts()
+        self.assertEqual(counts["Builder"], 1)
+        self.assertIs(sources.type_declaration_counts(), counts)
+        index = sources.typed_function_index({"Builder"})
+        self.assertIs(sources.typed_function_index(["Builder"]), index)
+        self.assertIsNot(sources.typed_function_index({"Other"}), index)
+        leaf = sources.exported_leaf_functions()
+        self.assertIs(sources.exported_leaf_functions(), leaf)
+        # Callers may edit what they are handed: the shared memo is never aliased.
+        text = sources.texts["crates/rsid/src/builder.rs"]
+        owners = planner["type_owners"](text, {"Builder"})
+        self.assertEqual(owners[2], "Builder")
+        owners[2] = "scribbled"
+        self.assertEqual(planner["type_owners"](text, {"Builder"})[2], "Builder")
+        regions = planner["test_module_regions"](text)
+        regions.append((0, 0))
+        self.assertEqual(planner["test_module_regions"](text), [])
 
 
 class HubBoundedTraceTest(unittest.TestCase):
@@ -3622,6 +3756,49 @@ class HoldsRunnableTestFailsSafeTest(unittest.TestCase):
         self.assertTrue(self.holds("#[test]\n#[ignore]\nfn a() {}\n#[test]\nfn b() {}\n"))
 
 
+class AlwaysFalseCfgTestsAreNotSelectedTest(unittest.TestCase):
+    """#551: empty any() gates cannot produce runnable tests on any host."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.planner = runpy.run_path(str(SCRIPT), run_name="check_touched_shards")
+
+    def names(self, text):
+        return [name for name, *_ in self.planner["rust_functions"](text)]
+
+    def test_empty_any_spelling_on_an_item_excludes_only_that_item(self):
+        for gate in ("#[cfg(any())]", "#[cfg(any( ))]", "#[ cfg ( any (\t) ) ]"):
+            with self.subTest(gate=gate):
+                disabled = gate + "\n#[test]\nfn disabled() {}\n"
+                self.assertEqual(self.names(disabled + "#[test]\nfn enabled() {}\n"), ["enabled"])
+                self.assertFalse(self.planner["holds_runnable_test"](disabled))
+
+    def test_disabled_inline_module_excludes_nested_tests_and_keeps_its_neighbour(self):
+        disabled = (
+            "#[cfg(any())]\nmod disabled {\n    #[test]\n    fn t() {}\n"
+            "    mod nested {\n        #[test]\n        fn nested_test() {}\n    }\n}\n"
+        )
+        self.assertEqual(self.names(disabled + "#[test]\nfn enabled() {}\n"), ["enabled"])
+        self.assertFalse(self.planner["holds_runnable_test"](disabled))
+
+    def test_a_file_or_external_module_with_an_empty_any_gate_is_compiled_out(self):
+        test = "#[test]\nfn t() {}\n"
+        self.assertEqual(self.names("#![cfg(any( ))]\n" + test), [])
+        files = {
+            "crates/x/src/lib.rs": "#[cfg(any())]\nmod disabled;\nmod enabled;\n",
+            "crates/x/src/disabled.rs": test,
+            "crates/x/src/enabled.rs": test,
+        }
+        gated = set()
+        self.planner["module_map"](files, gated)
+        self.assertEqual(gated, {"crates/x/src/disabled.rs"})
+
+    def test_other_cfg_predicates_keep_their_tests(self):
+        for gate in ("#[cfg(any(test))]", "#[cfg(all())]", "#[cfg(not(any()))]", "#[cfg(feature = \"x\")]"):
+            with self.subTest(gate=gate):
+                self.assertEqual(self.names(gate + "\n#[test]\nfn enabled() {}\n"), ["enabled"])
+
+
 class OtherOsTestsAreNotSelectedTest(unittest.TestCase):
     """#2291: a test gated to another OS is not compiled here, so no filter may name it."""
 
@@ -3640,8 +3817,7 @@ class OtherOsTestsAreNotSelectedTest(unittest.TestCase):
         return [name for name, *_ in mod["rust_functions"](self.SOURCE)]
 
     def test_a_linux_host_keeps_only_the_tests_it_compiles(self):
-        # `compound` stays: only a plain target_os gate is read.
-        self.assertEqual(self.names("linux"), ["linux_only", "compound", "everywhere"])
+        self.assertEqual(self.names("linux"), ["linux_only", "everywhere"])
 
     def test_a_macos_host_keeps_the_macos_tests(self):
         self.assertEqual(self.names("macos"), ["mac_only", "not_linux", "compound", "everywhere"])
@@ -3649,8 +3825,8 @@ class OtherOsTestsAreNotSelectedTest(unittest.TestCase):
 
 class OtherOsGatesReachEveryOwnerTest(unittest.TestCase):
     """#2291: a gate on an enclosing inline `mod`, on an external `mod x;` or `#![cfg]` in the file
-    itself leaves a test out of this host exactly as a gate on the test does. A condition the
-    scan does not read (`any`, a feature, an `all` with another predicate) keeps the test."""
+    itself leaves a test out of this host exactly as a gate on the test does. Unknown
+    predicates keep the test unless the complete condition is provably false."""
 
     INLINE = (
         '#[test]\nfn everywhere() {}\n\n'
@@ -3689,7 +3865,7 @@ class OtherOsGatesReachEveryOwnerTest(unittest.TestCase):
         # `never_closed` has no closing brace at its indentation: nothing is proven, so its test stays.
         common = ["everywhere", "feature_gated", "any_nested", "unclosed", "after_modules"]
         expected = {
-            "linux": ["everywhere", "not_win_nested", "feature_gated", "any_nested", "unclosed", "after_modules"],
+            "linux": ["everywhere", "not_win_nested", "feature_gated", "unclosed", "after_modules"],
             "macos": ["everywhere", "mac_nested", "mac_deeper", "not_win_nested", *common[1:]],
             "windows": ["everywhere", "win_nested", *common[1:]],
         }
@@ -3754,7 +3930,7 @@ class OtherOsGatesReachEveryOwnerTest(unittest.TestCase):
                 with self.subTest(host=host, text=text):
                     self.assertEqual(holds(text), expected)
 
-    def test_the_gate_grammar_answers_as_check_rsid_test_shards_does(self):
+    def test_the_shared_gate_grammar_answers_as_check_rsid_test_shards_does(self):
         spec = importlib.util.spec_from_file_location("check_rsid_test_shards", SCRIPT.parent / "check-rsid-test-shards.py")
         shards = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(shards)
@@ -3762,7 +3938,6 @@ class OtherOsGatesReachEveryOwnerTest(unittest.TestCase):
             '#[cfg(target_os = "macos")]', '#[cfg(target_os = "linux")]', '#[cfg(target_os = "windows")]',
             '#[cfg(not(target_os = "macos"))]', '#[cfg(not(target_os = "linux"))]',
             '#[cfg(all(test, target_os = "macos"))]', '#[cfg(all(test, not(target_os = "linux")))]',
-            '#[cfg(all(target_os = "macos", unix))]', '#[cfg(any(target_os = "macos", unix))]',
             '#[cfg(feature = "x")]', '#[cfg(target_os = "macos"]', '#[cfg(test)]', '#[test]',
         ]
         for host in ("linux", "macos", "windows"):
@@ -3771,6 +3946,28 @@ class OtherOsGatesReachEveryOwnerTest(unittest.TestCase):
                 for row in rows:
                     with self.subTest(host=host, row=row):
                         self.assertEqual(mod["other_os_gate"](row), shards.host_excluded(row))
+
+    def test_compound_platform_gates_match_the_runtime_inventory(self):
+        spec = importlib.util.spec_from_file_location("check_rsid_test_shards", SCRIPT.parent / "check-rsid-test-shards.py")
+        shards = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shards)
+        # #574: the planner and runtime inventory agree on compound platform cfgs.
+        cases = {
+            '#[cfg(all(target_os = "macos", unix))]': (True, False, True),
+            '#[cfg(any(target_os = "macos", unix))]': (False, False, True),
+            '#[cfg(not(unix))]': (True, True, False),
+            '#[cfg(all(test, not(unix)))]': (True, True, False),
+            '#[cfg(any(not(unix), feature = "x"))]': (False, False, False),
+        }
+        for index, host in enumerate(("linux", "macos", "windows")):
+            mod = self.module(host)
+            with mock.patch.object(shards, "HOST_TARGET_OS", host), mock.patch.object(
+                shards, "HOST_TARGET_FAMILY", "windows" if host == "windows" else "unix"
+            ):
+                for row, expected in cases.items():
+                    with self.subTest(host=host, row=row):
+                        self.assertEqual(mod["other_os_gate"](row), expected[index])
+                        self.assertEqual(shards.host_excluded(row), expected[index])
 
 
 class OtherOsFilterDerivationTest(unittest.TestCase):

@@ -1,6 +1,22 @@
 {
   "version": 1,
   "rows": {
+    "overlay:host-tuning": {
+      "status": "missing",
+      "location": "",
+      "note": "Host tuning is available in the TUI via :manager tune and operator RPCs; desktop probe/profile/preset editing is tracked separately.",
+      "owner": [
+        "#3932"
+      ]
+    },
+    "module:ui/overlay/host_tuning.rs": {
+      "status": "missing",
+      "location": "",
+      "note": "Host tuning is available in the TUI via :manager tune and operator RPCs; desktop probe/profile/preset editing is tracked separately.",
+      "owner": [
+        "#3932"
+      ]
+    },
     "cmd:diagnostics": {
       "status": "substitute",
       "location": "src/actions/admin.ts, src/admin-model.ts, src/actions/admin-spec.ts",
@@ -69,7 +85,7 @@
     "overlay-ref:source-worktree-settlement": {
       "status": "done",
       "location": "src/admin-ops.ts, src/admin-model.ts, src/actions/admin-spec.ts, src/actions/admin.ts, src-tauri/src/admin_ops.rs",
-      "note": "View \u203a Source-worktree settlement\u2026: j/k J/K select (a selection change drops the audit), Enter audits, A begins authorization, r refreshes the receipt, Esc/q, Space N / Space ; (ListSourceWorktreeCohorts, AuditSourceWorktreeCohort, ListSourceWorktreeSettlementRuns, ApplySourceWorktreeCohort)"
+      "note": "View \u203a Source-worktree settlement\u2026: j/k J/K select (a selection change drops the audit), Enter audits, A begins authorization, r refreshes the receipt, Esc/q, Space N / Space ; the latest run's receipt shows who started it, the outcome, each settled, refused or recovery-required root with its reason and after-observation, the last error and the #149 unproven survivors (pid, executable, root or cohort repository, reason, what it means, stop by hand), in plain words (#276); the audit lists each root with what would happen to it and why (ListSourceWorktreeCohorts, AuditSourceWorktreeCohort, ListSourceWorktreeSettlementRuns, GetSourceWorktreeSettlementRun, ApplySourceWorktreeCohort)"
     },
     "overlay:legacy-scratch-adoption": {
       "status": "done",

@@ -1,0 +1,103 @@
+---
+source: crates/rsi/src/overlay/manager_v2/tests/layout.rs
+expression: "screen_at(&mut app, 72, 100)"
+---
+
+┌ Manager · operator ──────────────────────────────────────────────────┐
+│ 1 Board  2 Decisions  3 Inbox  4 Inspect  [5 Policy]                 │
+│ Coordination desk · governs this PM's own launches only; caps above  │
+│ Mode Execute · Preset Full project control                           │
+│ Usage: sessions 183/1024 created (lifetime) · 841 left · active 3/4  │
+│ Spend uncapped · Allowed models: 17 (Claude 5 · Codex 5 · Pioneer 2  │
+│ · OpenRouter 2 · Local 1 · Antigravity 1 · Harness 1)                │
+│ Saved: Full project control · scope 93 / policy 107 · draft          │
+│ unchanged                                                            │
+│ ──────────────────────────────────────────────────────────────────── │
+│   ── Presets · each replaces mode and grants ──                      │
+│ ›  Observe                                                           │
+│        Monitor mode · no write grants · watches and reports only     │
+│    Execute                                                           │
+│        Execute mode · 8 of 15 grants · withholds Topology,           │
+│        GitEffect +5 more                                             │
+│    Full project control                                              │
+│        Execute mode · all 15 grants, including Git, Topology,        │
+│        Automation and Deploy                                         │
+│    Custom                                                            │
+│        Keep the draft exactly as edited · opens the raw launch rows  │
+│   ── Budgets and limits ──                                           │
+│    Created session quota             1024                            │
+│    Created session window (hours)    24                              │
+│    Created container quota           64                              │
+│    Active session limit              4                               │
+│    Tier-2 minimum reviewer           Standard                        │
+│    Spend cap (USD)                   uncapped                        │
+│    Provider limits                   none set · Enter to set one     │
+│   ── Allowed models ──                                               │
+│    Allowed models                                                    │
+│        Restricted to 17 exact choices · Enter adds · x removes the   │
+│        focused one                                                   │
+│     Claude · 5                                                       │
+│      claude-opus-5                   xhigh                           │
+│      claude-sonnet-5-5               high                            │
+│      claude-haiku-5                  any effort                      │
+│      claude-opus-5                   high                            │
+│      claude-sonnet-5-5               medium                          │
+│     Codex · 5                                                        │
+│      gpt-6-astra                     high                            │
+│      gpt-6-astra                     low                             │
+│      gpt-6-astra                     xhigh                           │
+│      gpt-6-mini                      high                            │
+│      gpt-6-mini                      low                             │
+│     Pioneer · 2                                                      │
+│      pioneer-large                   high                            │
+│      pioneer-small                   any effort                      │
+│     OpenRouter · 2                                                   │
+│      vendor/model-a                  any effort                      │
+│      vendor/model-b                  high                            │
+│     Local · 1                                                        │
+│      local-coder                     any effort                      │
+│     Antigravity · 1                                                  │
+│      ag-pro                          any effort                      │
+│     Harness · 1                                                      │
+│      harness-direct                  high                            │
+│    Launch allowlist entries                                          │
+│        Enter expand raw provider/model/effort rows                   │
+│   ── Provider grants · operator spend ──                             │
+│    Provider grants                   none set · Enter to set one     │
+│   ── Mode and grants ──                                              │
+│    Operating mode                    Execute                         │
+│    [ ] Operator pause                                                │
+│    [x] WorkPlan                                                      │
+│    [x] LeadControl                                                   │
+│    [x] Topology                                                      │
+│    [x] SessionCreate                                                 │
+│    [x] LeadAssign                                                    │
+│    [x] Integration                                                   │
+│    [x] SelfSuccession                                                │
+│    [x] GitEffect                                                     │
+│    [x] SessionControl                                                │
+│    [x] IssueCoordinate                                               │
+│    [x] Operator delegation                                           │
+│    [x] Automation                                                    │
+│    [x] Storage control                                               │
+│    [x] Daemon settings                                               │
+│    [x] Deploy                                                        │
+│   ── Scope ──                                                        │
+│    Pause scoped Epic by ID           Enter UUID                      │
+│    Grant Group by ID                 Enter UUID                      │
+│    [x] Allow root Group creation                                     │
+│   ── Recovery ──                                                     │
+│    Recovery attempt limit            3                               │
+│    Retry delay (seconds)             60                              │
+│    Request timeout (seconds)         900                             │
+│   ── Daemon settings · manager bounds ──                             │
+│    Manager may set Maximum sandbox roots  not adjustable             │
+│    Manager may set Minimum free space (GiB)  not adjustable          │
+│    Manager may set Cache pressure high  not adjustable               │
+│    Manager may set Cache pressure low  not adjustable                │
+│    Manager may set Worker context cap (0 off, 1-100 = % of window)   │
+│ Enter runs · Replace mode and grants with this preset; explicit limi │
+│ Explicit operator grant · Enter/Space edit · s save                  │
+│                                                                      │
+│ j/k Tab move · Enter/Space edit · s save · r discard/reload · * unsa │
+└──────────────────────────────────────────────────────────────────────┘

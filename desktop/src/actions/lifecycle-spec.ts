@@ -33,7 +33,7 @@ export const LIFECYCLE_RULES: Readonly<Record<LifecycleActionId | 'answer-questi
   'delete-session': (s) => (s.lifecycle?.target ? deleteBlock(s.lifecycle.target.status) : NEED_TARGET),
   'unarchive-session': (s) => (s.lifecycle?.target ? unarchiveBlock(s.lifecycle.target.status) : NEED_TARGET),
   'downgrade-pause': (s) => {
-    if (!s.open) return 'Open a session first (j/k, then Enter)';
+    if (!s.open) return 'Open a session first: click one in the list (j/k, then Enter)';
     return downgradeBlock(s.open.pauseLevel);
   },
   'open-trash': () => null,
@@ -42,7 +42,7 @@ export const LIFECYCLE_RULES: Readonly<Record<LifecycleActionId | 'answer-questi
   // `<Space>gq` opens the question panel for the open session, else the first session with a question.
   'answer-question': (s) => {
     if (s.open?.hasQuestion || (s.lifecycle?.questions ?? 0) > 0) return null;
-    return s.open ? 'The open session has no question waiting' : 'Open a session first (j/k, then Enter)';
+    return s.open ? 'The open session has no question waiting' : 'Open a session first: click one in the list (j/k, then Enter)';
   },
 };
 

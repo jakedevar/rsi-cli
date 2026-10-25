@@ -1,9 +1,11 @@
 //! RSI Remote API v2 (#2962): the exposed projects' manager seats, a manager
 //! seat's conversation and one second closed write, a message to a seat.
 //!
-//! The two GETs are read-only: they need a bound session (cookie plus the
-//! Origin check the V1 reads use) and project scope, and they dispatch only
-//! the closed `OperatorCall` variants below.
+//! The GETs are read-only: they need a bound session (cookie plus the Origin
+//! check the V1 reads use) and project scope, and they dispatch only the
+//! closed `OperatorCall` variants below. The dashboard (hub #3287) names no
+//! project: it carries fleet-wide satellite labels and agent counts only, so
+//! the bound session is its whole scope.
 //!
 //! `MessageGate::serve` is a closed pipeline modelled on `AnswerGate`. Every
 //! step before the final daemon call is a denial that dispatches nothing to
@@ -38,8 +40,8 @@ use crate::{
     session::{self, Binding, SessionDenial, Sessions},
 };
 use rsi_common::remote_manager_v2::{
-    CONVERSATION_PAGE_LIMIT, ConversationAnchorV2, ConversationRequestV2,
-    ListManagerSeatsRequestV2, ListManagerSeatsResponseV2, ProjectSeatsV2,
+    CONVERSATION_PAGE_LIMIT, ConversationAnchorV2, ConversationRequestV2, DashboardRequestV2,
+    ListManagerSeatsRequestV2, ListManagerSeatsResponseV2, ProjectSeatsV2, ProvidersRequestV2,
     REFUSAL_IDEMPOTENCY_CONFLICT, REFUSAL_INVALID_MESSAGE, REFUSAL_SEAT_NOT_LIVE,
     REFUSAL_SEAT_OUT_OF_SCOPE, SendMessageReceiptV2, SendMessageRequestV2, valid_message_text,
 };
@@ -81,6 +83,22 @@ fn read_call(req: &Request, policy: &Config) -> Result<OperatorCall, AnswerReply
     };
     if method == "RemoteListManagerSeatsV2" {
         return list_call(policy).ok_or_else(|| AnswerReply::bare(403));
+    }
+    if method == "RemoteGetDashboardV2" {
+        // Fleet-wide labels and counts; no project is named, so no project
+        // scope applies beyond the bound session. Any query is refused.
+        if req.query != ingress::Query::default() {
+            return Err(AnswerReply::coded(400, "invalid_request"));
+        }
+        return Ok(OperatorCall::Dashboard(DashboardRequestV2 {}));
+    }
+    if method == "RemoteGetProvidersV2" {
+        // Fleet-wide labels and numbers (hub #3796); no project is named and
+        // no query is accepted.
+        if req.query != ingress::Query::default() {
+            return Err(AnswerReply::coded(400, "invalid_request"));
+        }
+        return Ok(OperatorCall::Providers(ProvidersRequestV2 {}));
     }
     let segments: Vec<&str> = req.path.split('/').collect();
     let (Some(project), Some(seat)) = (segments.get(4), segments.get(6)) else {
@@ -477,8 +495,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::answers::{AuditSink, MIN_ANSWER_GAP, MemoryAudit};
     use rsi_common::remote_manager_v2::{
-        ConversationItemV2, ConversationResponseV2, ManagerSeatV2, OperatorMessageStateV2,
-        ProjectSeatsV2, SeatRoleV2, SpeakerV2,
+        ConversationItemV2, ConversationResponseV2, DashboardAgentGroupV2, DashboardResponseV2,
+        DashboardSatelliteV2, ItemKindV2, ManagerSeatV2, OperatorMessageStateV2, ProjectSeatsV2,
+        ProviderModelSpendV2, ProviderRowV2, ProviderSpendV2, ProviderWindowV2,
+        ProvidersResponseV2, SeatRoleV2, SpeakerV2,
     };
     use std::time::Duration;
 
@@ -561,6 +581,10 @@ pub(crate) mod tests {
             truncated: false,
             created_at: format!("2026-10-17T09:2{sequence}:00.000000000Z"),
             operator_message_id: (speaker == SpeakerV2::Operator).then(|| uuid(MESSAGE_ID)),
+            kind: ItemKindV2::Message,
+            tool_name: None,
+            tool_use_id: None,
+            idempotency_key: None,
         };
         let response = if first_page {
             ConversationResponseV2 {
@@ -588,6 +612,7 @@ pub(crate) mod tests {
                     updated_at: "2026-10-17T09:23:05.000000000Z".into(),
                     delivered_at: Some("2026-10-17T09:23:05.000000000Z".into()),
                     text_len: 32,
+                    idempotency_key: None,
                 }],
             }
         } else {
@@ -602,9 +627,189 @@ pub(crate) mod tests {
         serde_json::to_vec(&response).unwrap()
     }
 
+    pub(crate) fn dashboard_body(populated: bool) -> Vec<u8> {
+        let response = if populated {
+            DashboardResponseV2 {
+                observed_at: "2026-10-19T19:30:00.000000000Z".into(),
+                satellites: vec![
+                    DashboardSatelliteV2 {
+                        label: "laptop".into(),
+                        reachable: false,
+                        build_sha: None,
+                        last_seen_at: Some("2026-10-19T18:02:11.000000000Z".into()),
+                        running_agents: None,
+                    },
+                    DashboardSatelliteV2 {
+                        label: "mac-mini".into(),
+                        reachable: true,
+                        build_sha: Some("a077ca3b02ae7d9de512c24d56a5803d88f703e5".into()),
+                        last_seen_at: Some("2026-10-19T19:29:40.000000000Z".into()),
+                        running_agents: Some(3),
+                    },
+                ],
+                satellites_truncated: false,
+                agents: vec![
+                    DashboardAgentGroupV2 {
+                        provider: "Claude".into(),
+                        effort: Some("high".into()),
+                        running: 4,
+                    },
+                    DashboardAgentGroupV2 {
+                        provider: "Codex".into(),
+                        effort: Some("xhigh".into()),
+                        running: 2,
+                    },
+                    DashboardAgentGroupV2 {
+                        provider: "Claude".into(),
+                        effort: None,
+                        running: 1,
+                    },
+                ],
+                agents_total: 7,
+                agents_truncated: false,
+                agents_incomplete: false,
+            }
+        } else {
+            DashboardResponseV2 {
+                observed_at: "2026-10-19T19:30:00.000000000Z".into(),
+                satellites: Vec::new(),
+                satellites_truncated: false,
+                agents: Vec::new(),
+                agents_total: 0,
+                agents_truncated: false,
+                agents_incomplete: false,
+            }
+        };
+        serde_json::to_vec(&response).unwrap()
+    }
+
+    fn provider_row(provider: &str) -> ProviderRowV2 {
+        ProviderRowV2 {
+            provider: provider.into(),
+            status: None,
+            binding_window: None,
+            overage_status: None,
+            is_using_overage: false,
+            observed_at: None,
+            stale_reason: None,
+            windows: Vec::new(),
+            windows_reason: Some("no_observation".into()),
+            windows_truncated: false,
+            spend: None,
+            spend_reason: Some("warming".into()),
+            models: Vec::new(),
+            models_truncated: false,
+        }
+    }
+
+    /// The providers body: a populated Claude (two windows, spend, two models),
+    /// a stale Codex, and a provider with no data (`null` blocks with reasons);
+    /// or only no-data providers.
+    pub(crate) fn providers_body(populated: bool) -> Vec<u8> {
+        let mut providers = vec![provider_row("Claude"), provider_row("Codex")];
+        if populated {
+            providers[0] = ProviderRowV2 {
+                status: Some("allowed".into()),
+                binding_window: Some("five_hour".into()),
+                overage_status: Some("rejected".into()),
+                observed_at: Some("2026-10-22T12:00:00.000000000Z".into()),
+                windows: vec![
+                    ProviderWindowV2 {
+                        key: "five_hour".into(),
+                        utilization: 0.42,
+                        resets_at: Some("2026-10-22T15:00:00.000000000Z".into()),
+                        resets_at_epoch: Some(1_792_681_200),
+                    },
+                    ProviderWindowV2 {
+                        key: "seven_day".into(),
+                        utilization: 0.1,
+                        resets_at: None,
+                        resets_at_epoch: None,
+                    },
+                ],
+                windows_reason: None,
+                spend: Some(ProviderSpendV2 {
+                    cost_1h_usd: 1.25,
+                    cost_24h_usd: 9.5,
+                }),
+                spend_reason: None,
+                models: vec![
+                    ProviderModelSpendV2 {
+                        model: "claude-opus".into(),
+                        cost_1h_usd: 1.0,
+                        cost_24h_usd: 8.0,
+                    },
+                    ProviderModelSpendV2 {
+                        model: "claude-haiku".into(),
+                        cost_1h_usd: 0.25,
+                        cost_24h_usd: 1.5,
+                    },
+                ],
+                ..provider_row("Claude")
+            };
+            providers[1] = ProviderRowV2 {
+                status: Some("allowed_warning".into()),
+                binding_window: Some("weekly".into()),
+                overage_status: None,
+                observed_at: Some("2026-10-22T11:58:00.000000000Z".into()),
+                stale_reason: Some("probe_timeout".into()),
+                windows: vec![ProviderWindowV2 {
+                    key: "weekly".into(),
+                    utilization: 0.97,
+                    resets_at: Some("2026-10-25T00:00:00.000000000Z".into()),
+                    resets_at_epoch: Some(1_792_886_400),
+                }],
+                windows_reason: None,
+                spend: Some(ProviderSpendV2 {
+                    cost_1h_usd: 0.0,
+                    cost_24h_usd: 0.0,
+                }),
+                spend_reason: None,
+                ..provider_row("Codex")
+            };
+        }
+        serde_json::to_vec(&ProvidersResponseV2 {
+            observed_at: "2026-10-22T12:00:00.000000000Z".into(),
+            providers,
+            providers_truncated: false,
+            windows_incomplete: false,
+        })
+        .unwrap()
+    }
+
+    /// A hub running more agents than the dashboard counts: the read stopped
+    /// at the cap, so the total is the cap and the reply says incomplete.
+    pub(crate) fn dashboard_incomplete_body() -> Vec<u8> {
+        let cap =
+            u32::try_from(rsi_common::remote_manager_v2::DASHBOARD_MAX_RUNNING_AGENTS).unwrap();
+        let response = DashboardResponseV2 {
+            observed_at: "2026-10-19T19:30:00.000000000Z".into(),
+            satellites: Vec::new(),
+            satellites_truncated: false,
+            agents: vec![
+                DashboardAgentGroupV2 {
+                    provider: "Claude".into(),
+                    effort: Some("high".into()),
+                    running: cap - 24,
+                },
+                DashboardAgentGroupV2 {
+                    provider: "Codex".into(),
+                    effort: Some("xhigh".into()),
+                    running: 24,
+                },
+            ],
+            agents_total: cap,
+            agents_truncated: false,
+            agents_incomplete: true,
+        };
+        serde_json::to_vec(&response).unwrap()
+    }
+
     /// Scripted daemon: answers each v2 method from a slot and records calls.
     pub(crate) struct Fake {
         pub(crate) seats: Mutex<Result<Vec<u8>, OperatorError>>,
+        pub(crate) dashboard: Mutex<Result<Vec<u8>, OperatorError>>,
+        pub(crate) providers: Mutex<Result<Vec<u8>, OperatorError>>,
         pub(crate) conversation: Mutex<Result<Vec<u8>, OperatorError>>,
         pub(crate) send: Mutex<Result<Vec<u8>, OperatorError>>,
         pub(crate) calls: Mutex<Vec<(String, Value)>>,
@@ -614,6 +819,8 @@ pub(crate) mod tests {
         pub(crate) fn new() -> Self {
             Self {
                 seats: Mutex::new(Ok(seats_body(true))),
+                dashboard: Mutex::new(Ok(dashboard_body(true))),
+                providers: Mutex::new(Ok(providers_body(true))),
                 conversation: Mutex::new(Ok(conversation_body(true))),
                 send: Mutex::new(Ok(receipt_body(false))),
                 calls: Mutex::new(Vec::new()),
@@ -648,6 +855,8 @@ pub(crate) mod tests {
                 OperatorCall::ManagerSeats(_) => lock(&self.seats).clone(),
                 OperatorCall::ManagerConversation(_) => lock(&self.conversation).clone(),
                 OperatorCall::SendManagerMessage(_) => lock(&self.send).clone(),
+                OperatorCall::Dashboard(_) => lock(&self.dashboard).clone(),
+                OperatorCall::Providers(_) => lock(&self.providers).clone(),
                 _ => Err(OperatorError::Refused("not a v2 call".into())),
             }
         }
@@ -813,6 +1022,208 @@ pub(crate) mod tests {
         let reply = rig.read(&list, &policy(false)).await;
         assert_eq!(reply.status, 200);
         assert_eq!(rig.fake.count("RemoteListManagerSeatsV2"), 3);
+    }
+
+    #[tokio::test]
+    async fn dashboard_needs_a_session_takes_no_query_and_sends_empty_params() {
+        let rig = Rig::new();
+        let dashboard = rig.get("/api/v2/dashboard", ingress::Query::default());
+        let mut anonymous = dashboard.clone();
+        anonymous.cookie = None;
+        let reply = rig.read(&anonymous, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 401);
+        let mut foreign = dashboard.clone();
+        foreign.origin = Some("https://evil.example".into());
+        let reply = rig.read(&foreign, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 401);
+        let queried = rig.get(
+            "/api/v2/dashboard",
+            ingress::Query {
+                cursor: Some("x".into()),
+                ..ingress::Query::default()
+            },
+        );
+        let reply = rig.read(&queried, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 400);
+
+        // Not project-scoped: a policy exposing no project still reads it.
+        let mut no_projects = policy(false);
+        no_projects.project_ids.clear();
+        let reply = rig.read(&dashboard, &no_projects).await;
+        assert_eq!(reply.status, 200);
+        let typed: DashboardResponseV2 = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(typed.satellites[1].label, "mac-mini");
+        assert_eq!(typed.agents_total, 7);
+        assert_eq!(
+            lock(&rig.fake.calls)[0],
+            ("RemoteGetDashboardV2".to_string(), json!({})),
+            "the daemon is asked with no parameters"
+        );
+    }
+
+    #[tokio::test]
+    async fn providers_need_a_session_take_no_query_and_send_empty_params() {
+        let rig = Rig::new();
+        let providers = rig.get("/api/v2/providers", ingress::Query::default());
+        let mut anonymous = providers.clone();
+        anonymous.cookie = None;
+        let reply = rig.read(&anonymous, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 401);
+        let mut foreign = providers.clone();
+        foreign.origin = Some("https://evil.example".into());
+        let reply = rig.read(&foreign, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 401);
+        let queried = rig.get(
+            "/api/v2/providers",
+            ingress::Query {
+                cursor: Some("x".into()),
+                ..ingress::Query::default()
+            },
+        );
+        let reply = rig.read(&queried, &policy(false)).await;
+        assert_denied_without_dispatch(&rig, &reply, 400);
+
+        // Not project-scoped: a policy exposing no project still reads it.
+        let mut no_projects = policy(false);
+        no_projects.project_ids.clear();
+        let reply = rig.read(&providers, &no_projects).await;
+        assert_eq!(reply.status, 200);
+        let typed: ProvidersResponseV2 = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(typed.providers[0].windows[0].key, "five_hour");
+        assert_eq!(
+            lock(&rig.fake.calls)[0],
+            ("RemoteGetProvidersV2".to_string(), json!({})),
+            "the daemon is asked with no parameters"
+        );
+    }
+
+    /// Positive allowlist (AGENTS.md rule 7): the providers body carries exactly
+    /// the named label and number fields, and the wire type refuses any other
+    /// field (an account, key, URL or path), so the gateway's typed check
+    /// never forwards one.
+    #[test]
+    fn providers_carry_only_the_allowed_fields_and_refuse_extra_ones() {
+        let body: Value = serde_json::from_slice(&providers_body(true)).unwrap();
+        let keys = |value: &Value| {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&body),
+            [
+                "observed_at",
+                "providers",
+                "providers_truncated",
+                "windows_incomplete"
+            ]
+        );
+        assert_eq!(
+            keys(&body["providers"][0]),
+            [
+                "binding_window",
+                "is_using_overage",
+                "models",
+                "models_truncated",
+                "observed_at",
+                "overage_status",
+                "provider",
+                "spend",
+                "spend_reason",
+                "stale_reason",
+                "status",
+                "windows",
+                "windows_reason",
+                "windows_truncated"
+            ]
+        );
+        assert_eq!(
+            keys(&body["providers"][0]["windows"][0]),
+            ["key", "resets_at", "resets_at_epoch", "utilization"]
+        );
+        assert_eq!(
+            keys(&body["providers"][0]["spend"]),
+            ["cost_1h_usd", "cost_24h_usd"]
+        );
+        assert_eq!(
+            keys(&body["providers"][0]["models"][0]),
+            ["cost_1h_usd", "cost_24h_usd", "model"]
+        );
+        for place in [
+            "",
+            "/providers/0",
+            "/providers/0/windows/0",
+            "/providers/0/spend",
+        ] {
+            for extra in ["token", "account_id", "email", "api_url", "working_dir"] {
+                let mut copy = body.clone();
+                let target = if place.is_empty() {
+                    &mut copy
+                } else {
+                    copy.pointer_mut(place).unwrap()
+                };
+                target[extra] = json!("secret");
+                assert!(
+                    serde_json::from_value::<ProvidersResponseV2>(copy).is_err(),
+                    "{extra} at {place:?} must not be accepted"
+                );
+            }
+        }
+    }
+
+    /// The dashboard body carries exactly the named label and count fields,
+    /// and the wire type refuses any other field (a link, address, token or
+    /// path), so the gateway's typed check never forwards one
+    /// (`reads::tests::dashboard_reply_with_an_extra_field_is_malformed`).
+    #[test]
+    fn dashboard_carries_no_secret_fields_and_refuses_extra_ones() {
+        let body: Value = serde_json::from_slice(&dashboard_body(true)).unwrap();
+        let keys = |value: &Value| {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&body),
+            [
+                "agents",
+                "agents_incomplete",
+                "agents_total",
+                "agents_truncated",
+                "observed_at",
+                "satellites",
+                "satellites_truncated"
+            ]
+        );
+        assert_eq!(
+            keys(&body["satellites"][0]),
+            [
+                "build_sha",
+                "label",
+                "last_seen_at",
+                "reachable",
+                "running_agents"
+            ]
+        );
+        assert_eq!(keys(&body["agents"][0]), ["effort", "provider", "running"]);
+
+        for leaked in [
+            json!({"token": "secret"}),
+            json!({"ssh_target": "operator@192.0.2.44"}),
+            json!({"working_dir": "/home/operator"}),
+        ] {
+            let mut copy = body.clone();
+            let (key, value) = leaked.as_object().unwrap().iter().next().unwrap();
+            match key.as_str() {
+                "token" => copy[key] = value.clone(),
+                "ssh_target" => copy["satellites"][0][key] = value.clone(),
+                _ => copy["agents"][0][key] = value.clone(),
+            }
+            assert!(
+                serde_json::from_value::<DashboardResponseV2>(copy).is_err(),
+                "{key} must not be accepted"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1476,6 +1887,75 @@ pub(crate) mod tests {
             reply,
         });
 
+        let dashboard_path = "/api/v2/dashboard";
+        for (name, body) in [
+            ("dashboard_200", dashboard_body(true)),
+            ("dashboard_empty_200", dashboard_body(false)),
+            ("dashboard_incomplete_200", dashboard_incomplete_body()),
+        ] {
+            let rig = Rig::new();
+            *lock(&rig.fake.dashboard) = Ok(body);
+            let reply = rig
+                .read(
+                    &rig.get(dashboard_path, ingress::Query::default()),
+                    &policy(false),
+                )
+                .await;
+            out.push(Exchange {
+                name,
+                request: get_record(dashboard_path),
+                reply,
+            });
+        }
+
+        let rig = Rig::new();
+        *lock(&rig.fake.dashboard) = Err(OperatorError::Transport(ReadError::Busy));
+        let reply = rig
+            .read(
+                &rig.get(dashboard_path, ingress::Query::default()),
+                &policy(false),
+            )
+            .await;
+        out.push(Exchange {
+            name: "dashboard_busy_503",
+            request: get_record(dashboard_path),
+            reply,
+        });
+
+        let providers_path = "/api/v2/providers";
+        for (name, body) in [
+            ("providers_200", providers_body(true)),
+            ("providers_empty_200", providers_body(false)),
+        ] {
+            let rig = Rig::new();
+            *lock(&rig.fake.providers) = Ok(body);
+            let reply = rig
+                .read(
+                    &rig.get(providers_path, ingress::Query::default()),
+                    &policy(false),
+                )
+                .await;
+            out.push(Exchange {
+                name,
+                request: get_record(providers_path),
+                reply,
+            });
+        }
+
+        let rig = Rig::new();
+        *lock(&rig.fake.providers) = Err(OperatorError::Transport(ReadError::Busy));
+        let reply = rig
+            .read(
+                &rig.get(providers_path, ingress::Query::default()),
+                &policy(false),
+            )
+            .await;
+        out.push(Exchange {
+            name: "providers_busy_503",
+            request: get_record(providers_path),
+            reply,
+        });
+
         let rig = Rig::new();
         let reply = rig.send().await;
         out.push(Exchange {
@@ -1656,6 +2136,14 @@ pub(crate) mod tests {
             let again = if exchange.name.starts_with("projects_") {
                 serde_json::to_value(
                     serde_json::from_value::<ProjectsResponseV2>(body.clone()).unwrap(),
+                )
+            } else if exchange.name.starts_with("dashboard_") {
+                serde_json::to_value(
+                    serde_json::from_value::<DashboardResponseV2>(body.clone()).unwrap(),
+                )
+            } else if exchange.name.starts_with("providers_") {
+                serde_json::to_value(
+                    serde_json::from_value::<ProvidersResponseV2>(body.clone()).unwrap(),
                 )
             } else if exchange.name.starts_with("conversation_") {
                 serde_json::to_value(

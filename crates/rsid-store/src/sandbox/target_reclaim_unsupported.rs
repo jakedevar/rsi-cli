@@ -294,6 +294,23 @@ pub fn reclaim_test_isolation_for_test() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// This platform has no reclaim process scan to isolate: a no-op stand-in so
+/// fixtures compile unchanged.
+#[cfg(any(test, feature = "test-seam"))]
+pub struct ProcRootForTest;
+
+#[cfg(any(test, feature = "test-seam"))]
+impl ProcRootForTest {
+    pub fn can_stage_unreadable_process() -> bool {
+        false
+    }
+}
+
+#[cfg(any(test, feature = "test-seam"))]
+pub fn install_proc_root_for_test() -> ProcRootForTest {
+    ProcRootForTest
+}
+
 #[cfg(any(test, feature = "test-seam"))]
 pub fn set_post_authentication_signal_for_test(
     _custody_id: Uuid,

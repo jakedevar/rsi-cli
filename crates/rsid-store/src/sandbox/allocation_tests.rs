@@ -83,3 +83,40 @@ fn launch_floor_is_capped_at_a_quarter_of_a_small_disk() {
     );
     assert_eq!(effective_min_free_bytes(u64::MAX, u64::MAX), u64::MAX / 4);
 }
+
+#[cfg(unix)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+#[tokio::test]
+async fn canonical_base_resolves_ancestor_symlinks_but_keeps_a_symlinked_base_refused() {
+    use super::SandboxAllocator;
+
+    let fixture = tempdir().unwrap();
+    let real_parent = std::fs::canonicalize(fixture.path()).unwrap().join("real");
+    std::fs::create_dir(&real_parent).unwrap();
+    let real_base = real_parent.join("sandboxes");
+    std::fs::create_dir(&real_base).unwrap();
+
+    // A symlinked ancestor is resolved and the result is accepted.
+    let linked_parent = fixture.path().join("linked");
+    std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+    let allocator = SandboxAllocator::new(linked_parent.join("sandboxes")).with_canonical_base();
+    assert_eq!(allocator.base_dir(), real_base);
+    AllocationPermit::acquire(allocator.base_dir())
+        .await
+        .expect("a base under a symlinked ancestor resolves to an accepted base");
+
+    // A base that is itself a symlink to a foreign directory is not adopted.
+    let foreign = std::fs::canonicalize(fixture.path())
+        .unwrap()
+        .join("foreign");
+    std::fs::create_dir(&foreign).unwrap();
+    let symlinked_base = fixture.path().join("base-link");
+    std::os::unix::fs::symlink(&foreign, &symlinked_base).unwrap();
+    let allocator = SandboxAllocator::new(symlinked_base.clone()).with_canonical_base();
+    assert_eq!(allocator.base_dir(), symlinked_base);
+    let error = AllocationPermit::acquire(allocator.base_dir())
+        .await
+        .err()
+        .expect("a symlinked base must remain refused");
+    assert!(error.to_string().contains("exact canonical directory"));
+}

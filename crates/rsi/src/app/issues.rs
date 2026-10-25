@@ -591,6 +591,22 @@ impl App {
         }
     }
 
+    /// #3789 `:external-reports filter`: show only Issues labelled
+    /// `external-report` in the focused Issues pane. Returns false when the
+    /// focused pane is not an Issues workspace.
+    pub(crate) fn filter_focused_issues_to_external_reports(&mut self) -> bool {
+        let pane_id = self.active_tab().focused_pane;
+        let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) else {
+            return false;
+        };
+        state.local.filters.labels_all.clear();
+        state.local.filters.labels_any = vec![rsi_common::external_report::HUB_LABEL.to_string()];
+        state.local.saved_view = None;
+        reset_local_pagination(state);
+        self.request_issue_workspace_active(pane_id, false);
+        true
+    }
+
     pub fn request_issue_workspace_active(&mut self, pane_id: PaneId, _manual: bool) {
         let data_kind = match self.active_tab().layout.find_pane(pane_id) {
             Some(Pane::Issues(state)) => active_data_kind(state.active_tab),
@@ -2306,24 +2322,15 @@ impl App {
         true
     }
 
-    /// Standard editing (#1628): a real cursor and selection in the issue
-    /// editor's active text field. Returns whether the key was taken; Tab,
-    /// Esc, Up/Down, a frozen retry and non-text fields keep the old handling.
-    fn standard_issue_editor_key(
-        &mut self,
-        pane_id: PaneId,
-        key: crossterm::event::KeyEvent,
-    ) -> bool {
-        use crate::field_edit::FieldKey;
-        use crossterm::event::KeyCode;
+    /// Edit the focused text field of the Issue editor through its vim (or
+    /// Standard) text surface (#3421). Returns whether the key was taken; Tab,
+    /// Up/Down in the choice forms, Enter in a one-line field, a frozen retry,
+    /// Esc at rest in normal mode and non-text fields keep the form's handling.
+    fn issue_editor_text_key(&mut self, pane_id: PaneId, key: crossterm::event::KeyEvent) -> bool {
+        use crate::form_text::TextKey;
+        use crossterm::event::{KeyCode, KeyModifiers};
 
-        if matches!(
-            key.code,
-            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
-        ) {
-            return false;
-        }
-        let mut field_edit = std::mem::take(&mut self.field_edit);
+        let standard = self.standard_editing();
         let mut refresh = None;
         let taken = 'edit: {
             let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id)
@@ -2336,14 +2343,92 @@ impl App {
             let Some(editor) = state.transient.editor.as_mut() else {
                 break 'edit false;
             };
-            if !editor_accepts_text(editor) {
+            let Some(spec) = editor.text_field_spec() else {
+                break 'edit false;
+            };
+            let free_form = matches!(
+                editor.mode,
+                IssueEditorMode::Create | IssueEditorMode::Edit { .. }
+            );
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab => break 'edit false,
+                KeyCode::Up | KeyCode::Down if !free_form => break 'edit false,
+                // Enter keeps its meaning (apply a filter, pick a candidate)
+                // in a one-line field; the body takes it as a new line.
+                KeyCode::Enter if key.modifiers == KeyModifiers::NONE && !spec.multiline => {
+                    break 'edit false;
+                }
+                KeyCode::Char('r')
+                    if key.modifiers == KeyModifiers::CONTROL && editor.stale_conflict =>
+                {
+                    break 'edit false;
+                }
+                _ => {}
+            }
+            editor.sync_text(standard);
+            if key.code == KeyCode::Esc && !editor.text.consumes_esc(standard) {
                 break 'edit false;
             }
-            let result = field_edit.handle_key(editor_field_mut(editor), key);
-            if result == FieldKey::Ignored {
-                break 'edit false;
+            match editor.text.handle_key(key, spec, standard) {
+                TextKey::Ignored => break 'edit false,
+                TextKey::Moved => {}
+                TextKey::Refused => {
+                    editor.error = Some(crate::form_text::title_limit_hint());
+                }
+                TextKey::Edited => {
+                    if let Some(text) = editor.text.content() {
+                        *editor_field_mut(editor) = text;
+                    }
+                    sync_editor_derived(editor);
+                    editor.dirty = true;
+                    editor.discard_armed = false;
+                    editor.error = None;
+                    if matches!(editor.mode, IssueEditorMode::Dependency { .. })
+                        && editor.active_field == 1
+                    {
+                        refresh = editor_target_issue_id(editor)
+                            .map(|issue_id| (issue_id, editor.dependency_text.clone()));
+                    }
+                }
             }
-            if result == FieldKey::Edited {
+            true
+        };
+        if let Some((issue_id, query)) = refresh {
+            self.request_issue_dependency_candidates(pane_id, issue_id, query);
+        }
+        taken
+    }
+
+    /// Paste into the focused Issue editor text field (#3421). A one-line field
+    /// takes newlines as spaces; the title takes only what fits under its limit
+    /// and says so. Returns whether the editor took the paste.
+    pub fn paste_into_issue_editor(&mut self, text: &str) -> bool {
+        use crate::form_text::TextKey;
+
+        let pane_id = self.active_tab().focused_pane;
+        let standard = self.standard_editing();
+        let mut refresh = None;
+        let taken = 'paste: {
+            let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id)
+            else {
+                break 'paste false;
+            };
+            let frozen = state.transient.pending_mutation.is_some();
+            let Some(editor) = state.transient.editor.as_mut() else {
+                break 'paste false;
+            };
+            let Some(spec) = editor.text_field_spec() else {
+                break 'paste false;
+            };
+            if frozen {
+                break 'paste true;
+            }
+            editor.sync_text(standard);
+            let (result, cut) = editor.text.paste(text, spec);
+            if result == TextKey::Edited {
+                if let Some(content) = editor.text.content() {
+                    *editor_field_mut(editor) = content;
+                }
                 sync_editor_derived(editor);
                 editor.dirty = true;
                 editor.discard_armed = false;
@@ -2355,13 +2440,28 @@ impl App {
                         .map(|issue_id| (issue_id, editor.dependency_text.clone()));
                 }
             }
+            if cut {
+                editor.error = Some(crate::form_text::title_limit_hint());
+            }
             true
         };
-        self.field_edit = field_edit;
+        if taken {
+            self.mark_dirty();
+        }
         if let Some((issue_id, query)) = refresh {
             self.request_issue_dependency_candidates(pane_id, issue_id, query);
         }
         taken
+    }
+
+    /// Whether the Issue editor's focused text field holds a Standard selection.
+    #[must_use]
+    pub fn issue_editor_has_selection(&self) -> bool {
+        matches!(
+            self.focused_pane(),
+            Some(Pane::Issues(state))
+                if state.transient.editor.as_ref().is_some_and(|editor| editor.text.has_selection())
+        )
     }
 
     /// Whether the focused Issues pane has its editor open (a text field the
@@ -2396,8 +2496,14 @@ impl App {
             }
             return false;
         }
+        // Ctrl-R is redo in the text field; it rebases a stale draft only then.
+        let stale_draft = matches!(
+            self.active_tab().layout.find_pane(pane_id),
+            Some(Pane::Issues(state))
+                if state.transient.editor.as_ref().is_some_and(|editor| editor.stale_conflict)
+        );
         if key.modifiers == KeyModifiers::CONTROL
-            && matches!(key.code, KeyCode::Char('l') | KeyCode::Char('r'))
+            && (key.code == KeyCode::Char('l') || (key.code == KeyCode::Char('r') && stale_draft))
         {
             return false;
         }
@@ -2439,12 +2545,12 @@ impl App {
             }
             return true;
         }
-        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
-            return false;
-        }
-        if self.standard_editing() && self.standard_issue_editor_key(pane_id, key) {
+        if self.issue_editor_text_key(pane_id, key) {
             self.mark_dirty();
             return true;
+        }
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+            return false;
         }
         let Some(Pane::Issues(state)) = self.active_tab_mut().layout.find_pane_mut(pane_id) else {
             return false;
@@ -2960,6 +3066,7 @@ impl App {
             retry_key: Uuid::new_v4().to_string(),
             error: None,
             submitted: false,
+            text: Default::default(),
         };
         self.set_issue_editor(pane_id, editor);
     }
@@ -3009,6 +3116,7 @@ impl App {
             retry_key: Uuid::new_v4().to_string(),
             error: None,
             submitted: false,
+            text: Default::default(),
         };
         self.set_issue_editor(pane_id, editor);
     }
@@ -3072,6 +3180,7 @@ impl App {
                 "Use ↑/↓ to choose Open, In progress, Closed, or Cancelled".to_string()
             }),
             submitted: false,
+            text: Default::default(),
         };
         self.set_issue_editor(pane_id, editor);
     }
@@ -3110,6 +3219,7 @@ impl App {
                     .to_string(),
             ),
             submitted: false,
+            text: Default::default(),
         };
         self.set_issue_editor(pane_id, editor);
         self.request_issue_dependency_candidates(pane_id, issue_id, String::new());
@@ -3150,6 +3260,7 @@ impl App {
             retry_key: String::new(),
             error: Some("Bounded filters · ↑/↓ choices · Ctrl-Enter applies".to_string()),
             submitted: false,
+            text: Default::default(),
         };
         let mut editor = editor;
         load_editor_scratch(&mut editor);
@@ -4503,6 +4614,11 @@ mod tests {
             KeyModifiers::SHIFT,
         ))
         .await;
+        // The first Esc leaves insert mode (#3421); only Esc from normal mode
+        // asks to discard.
+        app.handle_issue_workspace_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        assert!(issue_editor_of(&app, pane_id).error.is_none());
         app.handle_issue_workspace_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
         let editor = match app.active_tab().layout.find_pane(pane_id) {
@@ -8290,6 +8406,251 @@ mod tests {
                 .transient
                 .detail_history
                 .is_empty()
+        );
+    }
+
+    fn issue_editor_of(app: &App, pane_id: PaneId) -> &IssueEditorState {
+        match app.active_tab().layout.find_pane(pane_id) {
+            Some(Pane::Issues(state)) => state.transient.editor.as_ref(),
+            _ => None,
+        }
+        .expect("the editor is open")
+    }
+
+    /// Send `input` through the editor key path; `<Esc>`, `<Tab>`, `<CR>` and
+    /// `<C-Enter>` name the keys that are not characters.
+    async fn editor_keys(app: &mut App, input: &str) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut rest = input;
+        while !rest.is_empty() {
+            let (code, modifiers, used) = if let Some(tail) = rest.strip_prefix("<Esc>") {
+                (KeyCode::Esc, KeyModifiers::NONE, rest.len() - tail.len())
+            } else if let Some(tail) = rest.strip_prefix("<Tab>") {
+                (KeyCode::Tab, KeyModifiers::NONE, rest.len() - tail.len())
+            } else if let Some(tail) = rest.strip_prefix("<CR>") {
+                (KeyCode::Enter, KeyModifiers::NONE, rest.len() - tail.len())
+            } else if let Some(tail) = rest.strip_prefix("<C-Enter>") {
+                (
+                    KeyCode::Enter,
+                    KeyModifiers::CONTROL,
+                    rest.len() - tail.len(),
+                )
+            } else if let Some(tail) = rest.strip_prefix("<C-r>") {
+                (
+                    KeyCode::Char('r'),
+                    KeyModifiers::CONTROL,
+                    rest.len() - tail.len(),
+                )
+            } else {
+                let c = rest.chars().next().expect("a character");
+                let modifiers = if c.is_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                (KeyCode::Char(c), modifiers, c.len_utf8())
+            };
+            app.handle_issue_workspace_editor_key(KeyEvent::new(code, modifiers))
+                .await;
+            rest = &rest[used..];
+        }
+    }
+
+    #[tokio::test]
+    async fn create_editor_edits_in_the_middle_of_a_word_undoes_and_saves_the_exact_text() {
+        let mut app = with_session_list(0);
+        let project_id = Uuid::new_v4();
+        app.tabs[app.active_tab].project_id = Some(project_id);
+        let pane_id = app.open_or_focus_issues();
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id) {
+            state.transient.in_flight.clear();
+        }
+        app.open_issue_create_editor(pane_id);
+
+        // Title: insert mode at the end, then normal-mode edits in the middle.
+        editor_keys(&mut app, "fix the bug<Esc>0wciwa<Esc>").await;
+        assert_eq!(issue_editor_of(&app, pane_id).title, "fix a bug");
+        editor_keys(&mut app, "u").await;
+        assert_eq!(issue_editor_of(&app, pane_id).title, "fix the bug");
+        editor_keys(&mut app, "0ciwmend<Esc>").await;
+        assert_eq!(issue_editor_of(&app, pane_id).title, "mend the bug");
+        // Re-enter insert mode at the end and keep typing.
+        editor_keys(&mut app, "A!").await;
+        assert_eq!(issue_editor_of(&app, pane_id).title, "mend the bug!");
+
+        // Body: Enter is a new line in insert mode; edit the first line later.
+        editor_keys(&mut app, "<Esc><Tab>first<CR>second<Esc>k0ciwone<Esc>").await;
+        assert_eq!(issue_editor_of(&app, pane_id).body, "one\nsecond");
+        assert!(issue_editor_of(&app, pane_id).dirty);
+
+        // A one-line field never keeps a newline: Enter does nothing there.
+        editor_keys(&mut app, "<Tab>2<CR>").await;
+        assert_eq!(issue_editor_of(&app, pane_id).priority, Some(2));
+
+        editor_keys(&mut app, "<C-Enter>").await;
+        assert!(matches!(
+            app.active_tab().layout.find_pane(pane_id),
+            Some(Pane::Issues(state))
+                if matches!(
+                    state.transient.pending_mutation,
+                    Some(IssuePendingMutation::Create(ref request))
+                        if request.title == "mend the bug!"
+                            && request.body == "one\nsecond"
+                            && request.priority == Some(2)
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_editor_changes_the_stored_text_in_place_and_saves_only_the_edit() {
+        let mut app = with_session_list(0);
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        app.tabs[app.active_tab].project_id = Some(project_id);
+        let pane_id = app.open_or_focus_issues();
+        if let Some(Pane::Issues(state)) = app.active_tab_mut().layout.find_pane_mut(pane_id) {
+            state.transient.in_flight.clear();
+        }
+        install_issue_page(
+            &mut app,
+            pane_id,
+            fixture_issue(project_id, issue_id, 802, "Original edit identity"),
+        );
+        app.open_issue_edit_editor(pane_id, 0);
+        assert_eq!(
+            issue_editor_of(&app, pane_id).title,
+            "Original edit identity"
+        );
+        editor_keys(&mut app, "<Esc>0wciwFixed<Esc>").await;
+        assert_eq!(
+            issue_editor_of(&app, pane_id).title,
+            "Original Fixed identity"
+        );
+        editor_keys(&mut app, "<C-Enter>").await;
+        assert!(matches!(
+            app.active_tab().layout.find_pane(pane_id),
+            Some(Pane::Issues(state))
+                if matches!(
+                    state.transient.pending_mutation,
+                    Some(IssuePendingMutation::Update(ref request))
+                        if request.issue_id == issue_id
+                            && request.patch.title.as_deref() == Some("Original Fixed identity")
+                )
+        ));
+    }
+
+    /// The unsaved-changes guard after the textarea change (#3421): an edit in
+    /// any Create field marks the editor dirty, the first Esc only leaves
+    /// insert mode, Esc from normal mode warns and a third Esc discards.
+    #[tokio::test]
+    async fn every_create_textarea_edit_marks_the_editor_dirty_and_arms_the_discard_guard() {
+        for field in 0..5 {
+            let mut app = with_session_list(0);
+            let project_id = Uuid::new_v4();
+            app.tabs[app.active_tab].project_id = Some(project_id);
+            let pane_id = app.open_or_focus_issues();
+            app.open_issue_create_editor(pane_id);
+            editor_keys(&mut app, &"<Tab>".repeat(field)).await;
+            assert!(
+                !issue_editor_of(&app, pane_id).dirty,
+                "field {field}: moving between fields is not an edit"
+            );
+            editor_keys(&mut app, "1").await;
+            assert!(
+                issue_editor_of(&app, pane_id).dirty,
+                "field {field}: a typed character marks the editor dirty"
+            );
+            editor_keys(&mut app, "<Esc>").await;
+            assert_eq!(
+                issue_editor_of(&app, pane_id).text.mode_label(),
+                "NORMAL",
+                "field {field}: the first Esc leaves insert mode"
+            );
+            assert!(issue_editor_of(&app, pane_id).error.is_none());
+            editor_keys(&mut app, "<Esc>").await;
+            assert_eq!(
+                issue_editor_of(&app, pane_id).error.as_deref(),
+                Some("UNSAVED CHANGES — Esc again to discard"),
+                "field {field}: Esc from normal mode warns before discarding"
+            );
+            editor_keys(&mut app, "<Esc>").await;
+            assert!(matches!(
+                app.active_tab().layout.find_pane(pane_id),
+                Some(Pane::Issues(state)) if state.transient.editor.is_none()
+            ));
+        }
+    }
+
+    /// A normal-mode operator (`x`) is an edit too: it marks an Edit form
+    /// dirty, so leaving it warns first (#3421).
+    #[tokio::test]
+    async fn a_normal_mode_operator_marks_the_edit_editor_dirty() {
+        let mut app = with_session_list(0);
+        let project_id = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        app.tabs[app.active_tab].project_id = Some(project_id);
+        let pane_id = app.open_or_focus_issues();
+        install_issue_page(
+            &mut app,
+            pane_id,
+            fixture_issue(project_id, issue_id, 803, "Dirty edit identity"),
+        );
+        app.open_issue_edit_editor(pane_id, 0);
+        editor_keys(&mut app, "<Esc>").await;
+        assert!(!issue_editor_of(&app, pane_id).dirty);
+        editor_keys(&mut app, "0x").await;
+        let editor = issue_editor_of(&app, pane_id);
+        assert_eq!(editor.title, "irty edit identity");
+        assert!(editor.dirty, "a normal-mode delete marks the editor dirty");
+        editor_keys(&mut app, "<Esc>").await;
+        assert_eq!(
+            issue_editor_of(&app, pane_id).error.as_deref(),
+            Some("UNSAVED CHANGES — Esc again to discard")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_issue_title_stops_at_the_limit_with_a_hint_and_a_paste_is_cut() {
+        let mut app = with_session_list(0);
+        let project_id = Uuid::new_v4();
+        app.tabs[app.active_tab].project_id = Some(project_id);
+        let pane_id = app.open_or_focus_issues();
+        app.open_issue_create_editor(pane_id);
+
+        let limit = crate::form_text::ISSUE_TITLE_LIMIT;
+        editor_keys(&mut app, &"a".repeat(limit - 1)).await;
+        assert_eq!(
+            issue_editor_of(&app, pane_id).title.chars().count(),
+            limit - 1
+        );
+        assert!(issue_editor_of(&app, pane_id).error.is_none());
+        editor_keys(&mut app, "bc").await;
+        let editor = issue_editor_of(&app, pane_id);
+        assert_eq!(editor.title.chars().count(), limit);
+        assert!(editor.title.ends_with('b'));
+        assert_eq!(
+            editor.error.as_deref(),
+            Some(crate::form_text::title_limit_hint().as_str())
+        );
+
+        // A paste into an emptied title is cut at the limit, with the hint.
+        editor_keys(&mut app, "<Esc>dd").await;
+        assert_eq!(issue_editor_of(&app, pane_id).title, "");
+        editor_keys(&mut app, "i").await;
+        assert!(app.paste_into_issue_editor(&"z".repeat(limit + 50)));
+        let editor = issue_editor_of(&app, pane_id);
+        assert_eq!(editor.title.chars().count(), limit);
+        assert_eq!(
+            editor.error.as_deref(),
+            Some(crate::form_text::title_limit_hint().as_str())
+        );
+
+        // The body has no limit: it takes the same paste whole.
+        editor_keys(&mut app, "<Esc><Tab>").await;
+        assert!(app.paste_into_issue_editor(&"y".repeat(limit + 50)));
+        assert_eq!(
+            issue_editor_of(&app, pane_id).body.chars().count(),
+            limit + 50
         );
     }
 }

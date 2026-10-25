@@ -103,6 +103,53 @@ fn sse_data_payload(line: &str) -> Option<&str> {
     line.strip_prefix("data:").map(str::trim)
 }
 
+/// What a Chat Completions stream accumulated.
+#[derive(Debug, Default)]
+pub struct OpenAiStreamResult {
+    pub content: String,
+    pub tool_calls: Vec<AccumulatedToolCall>,
+    pub usage: TokenUsage,
+    pub finish_reason: Option<String>,
+    /// The thinking text streamed beside the answer (`reasoning_content` or
+    /// `reasoning` deltas, #3170).
+    pub reasoning: Option<String>,
+    /// The streamed `reasoning_details` blocks, merged by index (#3170).
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
+}
+
+/// Merge one streamed `reasoning_details` block into the accumulated list.
+///
+/// OpenRouter streams each block under an `index`; a later delta with the same
+/// index continues it (its text-like fields append, any other field replaces).
+/// A block with no index is appended as its own block.
+pub fn merge_reasoning_detail(details: &mut Vec<serde_json::Value>, delta: &serde_json::Value) {
+    let index = delta.get("index").and_then(serde_json::Value::as_u64);
+    let existing = index.and_then(|index| {
+        details
+            .iter_mut()
+            .find(|d| d.get("index").and_then(serde_json::Value::as_u64) == Some(index))
+    });
+    let (Some(existing), Some(fields)) = (existing, delta.as_object()) else {
+        details.push(delta.clone());
+        return;
+    };
+    let Some(target) = existing.as_object_mut() else {
+        return;
+    };
+    for (key, value) in fields {
+        match (target.get_mut(key), value.as_str()) {
+            (Some(serde_json::Value::String(old)), Some(new))
+                if matches!(key.as_str(), "text" | "summary" | "data") =>
+            {
+                old.push_str(new);
+            }
+            _ => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Read an OpenAI-format SSE stream, emitting chunks and accumulating the response.
 ///
 /// Extracted from `openai.rs::read_sse_stream()` with generalized types.
@@ -110,7 +157,7 @@ pub async fn read_openai_sse_stream<S, B, E>(
     byte_stream: S,
     chunk_tx: &mpsc::Sender<StreamChunk>,
     cancel: &CancellationToken,
-) -> Result<(String, Vec<AccumulatedToolCall>, TokenUsage, Option<String>), ProviderError>
+) -> Result<OpenAiStreamResult, ProviderError>
 where
     S: Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -122,13 +169,36 @@ where
     let mut line_buf = String::new();
     let mut complete = false;
     let mut last_warning: Option<String> = None;
+    let mut reasoning = String::new();
+    let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
+    let finished =
+        |content: String,
+         tool_calls: Vec<AccumulatedToolCall>,
+         usage: TokenUsage,
+         finish_reason: Option<String>,
+         reasoning: String,
+         reasoning_details: Vec<serde_json::Value>| OpenAiStreamResult {
+            content,
+            tool_calls,
+            usage,
+            finish_reason,
+            reasoning: (!reasoning.trim().is_empty()).then_some(reasoning),
+            reasoning_details: (!reasoning_details.is_empty()).then_some(reasoning_details),
+        };
 
     let mut byte_stream = std::pin::pin!(byte_stream);
 
     loop {
         let chunk = tokio::select! {
             _ = cancel.cancelled() => {
-                return Ok((content, tool_calls, usage, Some("cancelled".into())));
+                return Ok(finished(
+                    content,
+                    tool_calls,
+                    usage,
+                    Some("cancelled".into()),
+                    reasoning,
+                    reasoning_details,
+                ));
             }
             chunk = byte_stream.next() => chunk,
         };
@@ -210,6 +280,20 @@ where
                 continue;
             };
 
+            // Thinking text and structured reasoning blocks (#3170). Kept for
+            // replay; never shown as answer text.
+            if let Some(text) = ["reasoning_content", "reasoning"]
+                .iter()
+                .find_map(|key| delta.get(*key).and_then(|v| v.as_str()))
+            {
+                reasoning.push_str(text);
+            }
+            if let Some(blocks) = delta.get("reasoning_details").and_then(|v| v.as_array()) {
+                for block in blocks {
+                    merge_reasoning_detail(&mut reasoning_details, block);
+                }
+            }
+
             // Text content
             if let Some(text) = delta.get("content").and_then(|v| v.as_str())
                 && !text.is_empty()
@@ -276,7 +360,14 @@ where
     if !complete && finish_reason.is_none() {
         return Err(stream_disconnect());
     }
-    Ok((content, tool_calls, usage, finish_reason))
+    Ok(finished(
+        content,
+        tool_calls,
+        usage,
+        finish_reason,
+        reasoning,
+        reasoning_details,
+    ))
 }
 
 /// Anthropic Messages streaming state shared by the SSE reader (direct API)
@@ -785,6 +876,45 @@ mod tests {
                 .map(|piece| Ok(piece.as_bytes().to_vec()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_text_and_details_are_accumulated_for_replay() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = byte_stream(&[
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"let me \",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"index\":0,\"text\":\"let me \"}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"index\":0,\"text\":\"think\",\"signature\":\"sig\"}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        let result = read_openai_sse_stream(stream, &tx, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.content, "answer");
+        assert_eq!(result.reasoning.as_deref(), Some("let me think"));
+        assert_eq!(
+            result.reasoning_details,
+            Some(vec![serde_json::json!({
+                "type": "reasoning.text",
+                "index": 0,
+                "text": "let me think",
+                "signature": "sig",
+            })])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_reasoning_reports_none() {
+        let (tx, _rx) = mpsc::channel(32);
+        let stream = byte_stream(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        let result = read_openai_sse_stream(stream, &tx, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.reasoning, None);
+        assert_eq!(result.reasoning_details, None);
     }
 
     #[tokio::test]

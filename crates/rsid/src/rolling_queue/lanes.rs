@@ -362,7 +362,7 @@ mod tests {
             "Cargo.toml",
             "crates/rsi/Cargo.toml",
             "scripts/scoped-test",
-            "tools/check-released-migrations.py",
+            "tools/released-migrations.json",
             "Makefile",
         ] {
             assert_eq!(

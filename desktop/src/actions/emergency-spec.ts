@@ -17,7 +17,7 @@ export const EMERGENCY_ACTIONS: readonly ActionSpec[] = [
     title: 'Emergency stop all…',
     group: 'session',
     menuBreak: true,
-    detail: 'Deny new model work, cancel active invocations and interrupt running sessions (<Space>X, :stopall)',
+    detail: 'Stop running sessions and start nothing new until you choose Resume AI work (<Space>X, :stopall)',
   },
 ];
 

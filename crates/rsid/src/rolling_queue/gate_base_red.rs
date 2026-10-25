@@ -68,7 +68,7 @@ pub(super) fn unowned_base_reds(stdout: &str, claimed: &BTreeSet<String>) -> Vec
 /// the outcome-detail lines that name them. Best effort: the gate's verdict
 /// stands whatever happens here, so a store failure only logs and names nothing.
 pub(super) async fn file_base_reds(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     batch_id: Uuid,
     group: &[RollingQueueEntryV1],
     stdout: &str,

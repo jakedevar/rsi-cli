@@ -466,6 +466,20 @@ mod tests {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
     }
 
+    /// The process `pid` still runs. An unreaped zombie does not count: under a
+    /// PID namespace whose init never waits, a killed group member stays a
+    /// zombie and `kill(pid, 0)` keeps answering for it (#3700, #3662).
+    #[cfg(target_os = "linux")]
+    fn member_is_running(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        !matches!(
+            crate::process_control::parse_stat_state_and_group(&stat),
+            Some(('Z' | 'X' | 'x', _)) | None
+        )
+    }
+
     /// #2812: the non-reaping exit wait macOS uses reports a running child as
     /// running, an exited one as exited, and leaves it unreaped (still
     /// waitable, so its group id stays pinned) for the later reap.
@@ -641,7 +655,7 @@ mod tests {
             .unwrap();
         let mut alive = true;
         for _ in 0..50 {
-            alive = exists(member);
+            alive = member_is_running(member);
             if !alive {
                 break;
             }

@@ -84,6 +84,16 @@ fn capacity_shaped(reason: &str) -> bool {
         || reason.contains("capacity")
 }
 
+/// Whether an unsettled reason is the reviewer's allocation launch failing
+/// (#3640): the launch action ended with the catch-all
+/// `manager_v2_lifecycle_unconfirmed` (its original error text follows the code),
+/// or settled with no reviewer session. The node reports `review_launch_refused`
+/// with that reason, not a bare `review_unsettled`.
+fn is_launch_refusal(reason: &str) -> bool {
+    reason.starts_with("manager_v2_lifecycle_unconfirmed")
+        || reason.starts_with("manager_review_reviewer_unavailable_launch_")
+}
+
 /// One review request: everything the review service needs to open an
 /// assignment for the commit under review.
 #[derive(Clone, Debug)]
@@ -254,13 +264,26 @@ impl<E: NodeEffects> Executor<E> {
 
     /// The round policy for a new review after one that gave no usable verdict
     /// (#2280). An execution with no project has no review ledger to ask (its
-    /// review request is refused outright), so nothing is pre-checked.
+    /// review request is refused outright), so nothing is pre-checked. A node
+    /// refused before its first assignment has not opened a round either
+    /// (#3784); its first reservation checks the live ledger and policy.
     pub(crate) async fn review_retry_round(
         &self,
         execution: &ExecutionRow,
         attempt: &AttemptRow,
     ) -> Result<ExtraRound> {
         if execution.project_id.is_none() {
+            return Ok(ExtraRound::Same);
+        }
+        let has_assignment = {
+            let store = self.store.lock().await;
+            rows::load_attempts(&store, execution.id)?
+                .iter()
+                .any(|other| {
+                    other.node_id == attempt.node_id && other.review_assignment_id.is_some()
+                })
+        };
+        if !has_assignment {
             return Ok(ExtraRound::Same);
         }
         self.review_extra_round(execution, attempt).await
@@ -345,7 +368,7 @@ impl<E: NodeEffects> Executor<E> {
                     execution,
                     attempt,
                     AttemptStatus::Blocked,
-                    failed(failure::POLICY_REFUSED, code),
+                    failed(failure::POLICY_REFUSED, &code.error_text()),
                 )
                 .await?;
                 return Ok(true);
@@ -355,6 +378,37 @@ impl<E: NodeEffects> Executor<E> {
             let store = self.store.lock().await;
             rows::load_attempts(&store, execution.id)?
         };
+        if let Some(scope) = super::repair_review::scope(execution, attempt, &attempts) {
+            let (repo, base, head) = (
+                execution.repo_root.clone(),
+                scope.reviewed.to_owned(),
+                attempt.base_commit.clone(),
+            );
+            let only_merges = tokio::task::spawn_blocking(move || {
+                super::custody::only_rolling_merges(&repo, &base, &head)
+            })
+            .await
+            .unwrap_or(false);
+            if only_merges
+                && matches!(self.effects.review_status(scope.assignment).await,
+                ReviewStatus::Accepted { reviewed_commit, .. } if reviewed_commit == scope.reviewed)
+            {
+                // Reuse the durable acceptance, never invent a review receipt.
+                // observe_review and queue admission independently re-prove it.
+                let update = {
+                    let store = self.store.lock().await;
+                    rows::mark_waiting(
+                        &store,
+                        execution.id,
+                        attempt,
+                        scope.assignment,
+                        self.boot_id,
+                    )?
+                };
+                self.publish([update]);
+                return Ok(true);
+            }
+        }
         let context = match review_context(execution, attempt, &attempts) {
             Ok(context) => context,
             Err(reason) => {
@@ -382,9 +436,10 @@ impl<E: NodeEffects> Executor<E> {
         let reopened = attempts
             .iter()
             .any(|other| same_instance(&other, failure::REVIEW_REOPENED));
-        let retried = attempts
-            .iter()
-            .any(|other| same_instance(&other, failure::REVIEW_UNSETTLED));
+        let retried = attempts.iter().any(|other| {
+            same_instance(&other, failure::REVIEW_UNSETTLED)
+                || same_instance(&other, failure::REVIEW_LAUNCH_REFUSED)
+        });
         let round = if reopened {
             Some(self.review_extra_round(execution, attempt).await?)
         } else if retried {
@@ -498,11 +553,18 @@ impl<E: NodeEffects> Executor<E> {
         // shares the infrastructure budget and spends no review round.
         let infrastructure =
             reason == REVIEW_INFRASTRUCTURE_REASON || reason == REVIEW_INTERRUPTED_REASON;
+        // #3640: a reviewer whose launch never produced a session is a launch
+        // problem; it keeps the same budget but names the cause.
+        let unsettled_class = if is_launch_refusal(reason) {
+            failure::REVIEW_LAUNCH_REFUSED
+        } else {
+            failure::REVIEW_UNSETTLED
+        };
         let prior = {
             let class = if infrastructure {
                 failure::REVIEW_INFRASTRUCTURE
             } else {
-                failure::REVIEW_UNSETTLED
+                unsettled_class
             };
             let store = self.store.lock().await;
             rows::load_attempts(&store, execution.id)?
@@ -511,7 +573,11 @@ impl<E: NodeEffects> Executor<E> {
                     other.node_id == attempt.node_id
                         && other.iteration == attempt.iteration
                         && other.id != attempt.id
-                        && other.failure_class.as_deref() == Some(class)
+                        && if infrastructure {
+                            other.failure_class.as_deref() == Some(class)
+                        } else {
+                            failure::is_review_unsettled(other.failure_class.as_deref())
+                        }
                 })
                 .count()
         };
@@ -521,9 +587,9 @@ impl<E: NodeEffects> Executor<E> {
         let (status, class) = if infrastructure && prior < REVIEW_INFRASTRUCTURE_RETRIES {
             (AttemptStatus::Failed, failure::REVIEW_INFRASTRUCTURE)
         } else if !infrastructure && prior == 0 {
-            (AttemptStatus::Failed, failure::REVIEW_UNSETTLED)
+            (AttemptStatus::Failed, unsettled_class)
         } else {
-            (AttemptStatus::Blocked, failure::REVIEW_UNSETTLED)
+            (AttemptStatus::Blocked, unsettled_class)
         };
         // #2423: a reviewer can outlive its verdict (an immutable `blocked`
         // receipt does not end the session). The topology has given up on this
@@ -558,7 +624,11 @@ impl<E: NodeEffects> Executor<E> {
         };
         if !matches!(
             previous.failure_class.as_deref(),
-            Some(failure::REVIEW_UNSETTLED | failure::REVIEW_INFRASTRUCTURE)
+            Some(
+                failure::REVIEW_UNSETTLED
+                    | failure::REVIEW_LAUNCH_REFUSED
+                    | failure::REVIEW_INFRASTRUCTURE
+            )
         ) || previous.resolution.is_some()
             || !capacity_shaped(previous.error.as_deref().unwrap_or_default())
         {
@@ -592,7 +662,32 @@ impl<E: NodeEffects> Executor<E> {
                 findings,
                 reviewed_commit,
             } => {
+                let mut rolling_merge_base = None;
                 if reviewed_commit != attempt.base_commit {
+                    let attempts = {
+                        let store = self.store.lock().await;
+                        rows::load_attempts(&store, execution.id)?
+                    };
+                    if let Some(scope) = super::repair_review::scope(execution, attempt, &attempts)
+                        && scope.assignment == assignment
+                        && scope.reviewed == reviewed_commit
+                    {
+                        let (repo, base, head) = (
+                            execution.repo_root.clone(),
+                            reviewed_commit.clone(),
+                            attempt.base_commit.clone(),
+                        );
+                        if tokio::task::spawn_blocking(move || {
+                            super::custody::only_rolling_merges(&repo, &base, &head)
+                        })
+                        .await
+                        .unwrap_or(false)
+                        {
+                            rolling_merge_base = Some(reviewed_commit.clone());
+                        }
+                    }
+                }
+                if reviewed_commit != attempt.base_commit && rolling_merge_base.is_none() {
                     self.settle_unsettled(
                         execution,
                         attempt,
@@ -601,20 +696,25 @@ impl<E: NodeEffects> Executor<E> {
                     .await?;
                     return Ok(true);
                 }
+                let mut output = review_output(
+                    round,
+                    assignment,
+                    "accepted",
+                    &attempt.base_commit,
+                    &reviewer.model,
+                    &findings,
+                );
+                if let Some(base) = rolling_merge_base {
+                    output["fields"]["rolling_merge_base"] = base.into();
+                    output["fields"]["review_skipped"] = "only_rolling_merges".into();
+                }
                 self.settle(
                     execution,
                     attempt,
                     AttemptStatus::Succeeded,
                     Settlement {
-                        result_commit: Some(reviewed_commit.clone()),
-                        output: Some(review_output(
-                            round,
-                            assignment,
-                            "accepted",
-                            &reviewed_commit,
-                            &reviewer.model,
-                            &findings,
-                        )),
+                        result_commit: Some(attempt.base_commit.clone()),
+                        output: Some(output),
                         ..Settlement::default()
                     },
                 )
@@ -716,11 +816,16 @@ const REVIEW_TEST_EVIDENCE_RULES: &str = "\n\nTest evidence: the author's verifi
     receipt snapshot attached below (and, for a published commit, the merge-queue gate receipt) is the test evidence for \
     this change. Do not re-run those tests and do not run `scripts/scoped-test`: a run waits for a \
     build slot and proves nothing the receipt does not. Read the snapshot directly; AgentGetJob \
-    and AgentListJobs remain own-job only. For a pre-merge review, only trust `trust: verified` for this exact source; \
+    and AgentListJobs remain own-job only. For a pre-merge review, only trust `trust: verified` or \
+    `trust: trusted_with_baseline_reds` for this exact source. `trusted_with_baseline_reds` is a \
+    red run whose every failure is a tracked baseline red (the snapshot's `baseline_reds` lists each \
+    test with its open Issue) and the daemon found no new failure: it is accepted verification, \
+    never a finding, so do not block on those reds or on the job's non-zero exit. \
     `untrusted` or `absent` does not meet the test minimum and must remain blocked with an \
     `infra_` finding. For a published source, the merge-queue gate receipt remains test evidence. \
     Do not substitute an author's self-reported receipt. You may submit at most one exact-name test \
-    job to prove one specific finding. If a check you need cannot run (no build slot, a missing \
+    job to prove one specific finding. Your reviewer sandbox is pinned to the exact reviewed source \
+    commit, so that job runs the source's tests. Make no changes or commits. If a check you need cannot run (no build slot, a missing \
     runner), do not file it as a code finding: submit verdict `blocked` with a blocking finding \
     whose key starts with `infra_` (for example `infra_tests_unavailable`). The topology treats \
     that as an infrastructure retry, not as a verdict on the code, and it spends no review round.";
@@ -901,6 +1006,9 @@ fn review_context(
     }
     query.push_str(REVIEW_TEST_EVIDENCE_RULES);
     query.push_str(REVIEW_FINDINGS_RULE);
+    if let Some(scope) = super::repair_review::scope(execution, attempt, attempts) {
+        query.push_str(&scope.prompt(&attempt.base_commit));
+    }
     Ok(ReviewContext {
         author: author.session_id,
         extra_contributors,

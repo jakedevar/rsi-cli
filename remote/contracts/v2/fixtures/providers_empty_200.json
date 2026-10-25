@@ -1,0 +1,55 @@
+{
+  "name": "providers_empty_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/providers"
+  },
+  "response": {
+    "body": {
+      "observed_at": "2026-10-22T12:00:00.000000000Z",
+      "providers": [
+        {
+          "binding_window": null,
+          "is_using_overage": false,
+          "models": [],
+          "models_truncated": false,
+          "observed_at": null,
+          "overage_status": null,
+          "provider": "Claude",
+          "spend": null,
+          "spend_reason": "warming",
+          "stale_reason": null,
+          "status": null,
+          "windows": [],
+          "windows_reason": "no_observation",
+          "windows_truncated": false
+        },
+        {
+          "binding_window": null,
+          "is_using_overage": false,
+          "models": [],
+          "models_truncated": false,
+          "observed_at": null,
+          "overage_status": null,
+          "provider": "Codex",
+          "spend": null,
+          "spend_reason": "warming",
+          "stale_reason": null,
+          "status": null,
+          "windows": [],
+          "windows_reason": "no_observation",
+          "windows_truncated": false
+        }
+      ],
+      "providers_truncated": false,
+      "windows_incomplete": false
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

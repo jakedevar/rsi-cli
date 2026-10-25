@@ -210,11 +210,14 @@ fn routine_inbox_reads_only_incoming_mail_across_manager_succession_3140() {
         .store
         .manager_lead_notice(lead, "status", "lead-status")
         .unwrap();
-    for _ in 0..2 {
-        let page = inbox(&f.store, tip, 0);
-        let ids: Vec<_> = page.messages.iter().map(|m| m.message_id).collect();
-        assert_eq!(ids, vec![reply.message_id, notice.message_id]);
-    }
+    // The reply stays on every read; the informational lead notice is
+    // returned once (#3363).
+    let page = inbox(&f.store, tip, 0);
+    let ids: Vec<_> = page.messages.iter().map(|m| m.message_id).collect();
+    assert_eq!(ids, vec![reply.message_id, notice.message_id]);
+    let page = inbox(&f.store, tip, 0);
+    let ids: Vec<_> = page.messages.iter().map(|m| m.message_id).collect();
+    assert_eq!(ids, vec![reply.message_id]);
     // Audit forms retain the exchange, including the predecessor's sends.
     let full = f
         .store
@@ -271,7 +274,7 @@ fn routine_inbox_reads_only_incoming_mail_across_manager_succession_3140() {
             .iter()
             .map(|m| m.message_id)
             .collect::<Vec<_>>(),
-        vec![reply.message_id, notice.message_id]
+        vec![reply.message_id]
     );
     let exchange = f
         .store
@@ -318,7 +321,8 @@ fn routine_inbox_reads_only_incoming_mail_across_manager_succession_3140() {
         .unwrap();
     assert_eq!(messages.messages.len(), 1);
     assert_eq!(messages.messages[0].message_id, reply.message_id);
-    assert_eq!(messages.next_after_sequence, Some(reply.sequence));
+    // The lead notice was already read, so no further page remains.
+    assert_eq!(messages.next_after_sequence, None);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

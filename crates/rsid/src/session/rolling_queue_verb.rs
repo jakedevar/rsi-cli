@@ -18,7 +18,7 @@ use super::agent_verbs::AgentControlHandle;
 use crate::error::{DaemonError, Result};
 use crate::rolling_queue::DeltaRead;
 use crate::store::Store;
-use crate::store::rolling_queue::NewQueueEntry;
+use crate::store::rolling_queue::{ExpediteAdmission, NewQueueEntry, expedite_cap_detail};
 use crate::topology::land::{LandAcceptance, LandEnqueue, LandRequest, LandStatus};
 use crate::topology::review_policy::{self, Candidate, ReviewPolicy};
 use rsi_common::agent_control_schema::AgentControlVerbV1;
@@ -27,12 +27,13 @@ use rsi_common::rolling_queue::{
     AgentEnqueueLandingSourceReceiptV1, AgentEnqueueLandingSourceRequestV1,
     AgentListRollingQueueReceiptV1, AgentListRollingQueueRequestV1,
     EnqueueRollingQueueSourceParams, EnqueueRollingQueueSourceResponse, LandSourceStatusV1,
-    QUEUE_DISABLED, QUEUE_ENTRY_IN_FLIGHT, QUEUE_ENTRY_NOT_FOUND, QUEUE_ENTRY_SETTLED,
+    PROVISIONAL_PROBE_INCONCLUSIVE, PROVISIONAL_UNPROVABLE, QUEUE_DISABLED, QUEUE_ENTRY_IN_FLIGHT,
+    QUEUE_ENTRY_SETTLED, QUEUE_EXPEDITE_NOT_AUTHORIZED, QUEUE_EXPEDITE_QA_LABEL,
     QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_FIXES_ISSUE_LISTS_NO_TESTS, QUEUE_FIXES_ISSUE_NOT_FOUND,
     QUEUE_KEY_INVALID, QUEUE_MULTIPLE_PROVISIONAL_MIGRATIONS, QUEUE_NOT_AUTHORIZED,
     QUEUE_PROBE_TIMEOUT, QUEUE_SOURCE_ALREADY_ON_ROLLING, QUEUE_SOURCE_INVALID,
     QUEUE_SOURCE_SESSION_OUT_OF_SCOPE, QUEUE_SUPERSEDES_NOT_DESCENDANT, QUEUE_TIP_READ_TIMEOUT,
-    RollingQueueBinding, RollingQueueEntryState, check_fix_claims_cap,
+    QueueFiltersState, RollingQueueBinding, RollingQueueEntryState, check_fix_claims_cap,
 };
 use rsi_common::types::Session;
 use std::path::PathBuf;
@@ -106,6 +107,7 @@ fn admit(
 
 /// One source to admit onto the queue, resolved by the caller's admission.
 pub(crate) struct QueueSource {
+    pub(crate) issue: Option<i64>,
     pub(crate) supersedes: Option<(Uuid, String)>,
     pub(crate) project_id: Option<Uuid>,
     /// The checkout the lander fetches the source from.
@@ -119,6 +121,7 @@ pub(crate) struct QueueSource {
     /// than letting the queue derive them. Only such filters are exempt from
     /// the async full-library QA obligation a derived-filter publish owes.
     pub(crate) explicit_filters: bool,
+    pub(crate) handwritten_filters: Vec<String>,
     /// #2167: the tests the landing claims to fix; its gate must run each one
     /// green on the candidate.
     pub(crate) fixes_tests: Vec<String>,
@@ -129,6 +132,8 @@ pub(crate) struct QueueSource {
     pub(crate) idempotency_key: String,
     /// Where the settlement wake goes when it is not the source session.
     pub(crate) wake_session_id: Option<Uuid>,
+    /// #3487: admit the entry ahead of ordinary queued entries.
+    pub(crate) expedite: Option<ExpediteAdmission>,
 }
 
 /// The git probe shared by every enqueue path: the source must exist in
@@ -142,6 +147,7 @@ pub(crate) struct QueueSource {
 ///
 /// # Errors
 /// `queue_source_invalid`, `queue_multiple_provisional_migrations`,
+/// `provisional_unprovable`, `provisional_probe_inconclusive` (retryable),
 /// `queue_probe_timeout`, or `filter_matches_no_tests: <filter>`.
 pub(crate) async fn probe_source(
     repo: &std::path::Path,
@@ -152,16 +158,58 @@ pub(crate) async fn probe_source(
     let (probe_repo, source, filters) = (repo.to_path_buf(), commit.to_owned(), filters.to_vec());
     let (outcome, timed_out) = tokio::task::spawn_blocking(move || {
         let read = || {
-            crate::rolling_queue::source_commit_exists(&probe_repo, &source).then(|| {
-                (
-                    crate::rolling_queue::derive_source_facts(&probe_repo, &source),
-                    crate::rolling_queue::source_provisional_declaration_count(
-                        &probe_repo,
-                        &source,
-                    ),
-                    crate::rolling_queue::filter_selecting_no_tests(&probe_repo, &source, &filters),
-                )
-            })
+            if !crate::rolling_queue::source_commit_exists(&probe_repo, &source) {
+                return Err(DaemonError::InvalidParam(QUEUE_SOURCE_INVALID.into()));
+            }
+            let declarations =
+                crate::rolling_queue::source_provisional_declaration_count(&probe_repo, &source);
+            if declarations.is_some_and(|count| count > 1) {
+                return Err(DaemonError::InvalidParam(format!(
+                    "{QUEUE_MULTIPLE_PROVISIONAL_MIGRATIONS}: drop the extra provisional declarations or split the migrations across separate landings"
+                )));
+            }
+            // #3658: every cheap git read comes BEFORE the renumber proof.
+            // The proof clones and runs the guard (seconds under load); it
+            // used to run first, spend the call's whole wall bound, and
+            // leave the reads below to be killed at an expired deadline
+            // (`queue_probe_timeout` for every source with a provisional
+            // declaration, on every retry).
+            let facts = crate::rolling_queue::derive_source_facts(&probe_repo, &source);
+            if let Some(filter) =
+                crate::rolling_queue::filter_selecting_no_tests(&probe_repo, &source, &filters)
+            {
+                return Err(DaemonError::InvalidParam(format!(
+                    "{QUEUE_FILTER_MATCHES_NO_TESTS}: {filter}"
+                )));
+            }
+            // A failed count is not proof that the source has no declaration.
+            if declarations == Some(0) {
+                return Ok(facts);
+            }
+            // #3545: a proof that could not run (no guard, bad exit,
+            // timeout, malformed output) is not a pass: it refuses retryably and
+            // no entry is recorded. No trusted guard is Inconclusive too (#465).
+            let refusal = crate::rolling_queue::provisional_source_refusal(
+                &probe_repo,
+                &source,
+                deadline.unwrap_or_else(|| {
+                    std::time::Instant::now() + std::time::Duration::from_secs(60)
+                }),
+            );
+            use crate::rolling_queue::ProvisionalSourceRefusal;
+            match refusal {
+                None => Ok(facts),
+                Some(ProvisionalSourceRefusal::Unprovable(reason)) => {
+                    Err(DaemonError::InvalidParam(format!(
+                        "{PROVISIONAL_UNPROVABLE}: {reason}; correct the provisional declaration or its undeclared sites and enqueue the corrected commit"
+                    )))
+                }
+                Some(ProvisionalSourceRefusal::Inconclusive(cause)) => {
+                    Err(DaemonError::InvalidParam(format!(
+                        "{PROVISIONAL_PROBE_INCONCLUSIVE}: {cause}; infrastructure prevented validation; no entry was recorded; restore the named tool/ref or retry after the timeout with the same idempotency_key"
+                    )))
+                }
+            }
         };
         match deadline {
             Some(deadline) => crate::rolling_queue::with_git_deadline(deadline, read),
@@ -172,22 +220,10 @@ pub(crate) async fn probe_source(
     .map_err(|error| DaemonError::Process(format!("enqueue source probe: {error}")))?;
     if timed_out {
         return Err(DaemonError::InvalidParam(format!(
-            "{QUEUE_PROBE_TIMEOUT}: a git read of the source probe did not finish within the call's wall bound and was killed; no entry was recorded, so call again with the same idempotency_key"
+            "{QUEUE_PROBE_TIMEOUT}: a git read of the source probe did not finish within the call's wall bound and was killed; no entry was recorded. Call again with the same idempotency_key; if it recurs, check host load and git health (a stalled repository read), since a slow provisional-migration proof alone no longer causes this"
         )));
     }
-    let (facts, declarations, empty_filter) =
-        outcome.ok_or_else(|| DaemonError::InvalidParam(QUEUE_SOURCE_INVALID.into()))?;
-    if declarations.is_some_and(|count| count > 1) {
-        return Err(DaemonError::InvalidParam(format!(
-            "{QUEUE_MULTIPLE_PROVISIONAL_MIGRATIONS}: drop the extra provisional declarations or split the migrations across separate landings"
-        )));
-    }
-    if let Some(filter) = empty_filter {
-        return Err(DaemonError::InvalidParam(format!(
-            "{QUEUE_FILTER_MATCHES_NO_TESTS}: {filter}"
-        )));
-    }
-    Ok(facts)
+    outcome
 }
 
 /// What [`derive_and_probe`] resolved (#2993).
@@ -195,14 +231,25 @@ enum Derived {
     /// The filters (derived or explicit) and the source probe made with them.
     Ready(Vec<String>, crate::rolling_queue::SourceFacts),
     /// The derivation was still running at `derive_wait`. The source was
-    /// probed without filters; the entry is recorded with its filters pending
-    /// and the derivation finishes it in the background.
-    Deferred(crate::rolling_queue::SourceFacts),
+    /// probed with the extra filters alone (#3264); the entry is recorded with
+    /// them and its derived filters pending, and the derivation finishes it in
+    /// the background.
+    Deferred(Vec<String>, crate::rolling_queue::SourceFacts),
+    /// #3372: the derivation exceeded its budget (it timed out, or the diff is
+    /// too wide to trace in time). The source was probed with the extra filters
+    /// alone and the entry is recorded with them and `filters_state:
+    /// lander_selects`: the lander selects the tests itself (its bounded
+    /// closure selection plus the automatic full-library QA). Not a refusal.
+    LanderSelects(Vec<String>, crate::rolling_queue::SourceFacts),
 }
 
 /// The filters and probe shared by the agent and operator enqueue paths:
 /// derive the landing filters from the source's diff (or take the explicit
 /// ones), then probe the source with them. Runs without the store lock.
+///
+/// #3264: with `derive_filters`, `explicit` are extra filters: the landing gates
+/// the derived set plus them. A derivation that FAILED falls back to the
+/// unfiltered gate plus them.
 ///
 /// #2907: `derive_wait` bounds the derivation (`None` waits for it, the
 /// operator path). #2993: a derivation still running at the bound is not a
@@ -224,16 +271,24 @@ async fn derive_and_probe(
     use crate::rolling_queue::SharedDerivation;
     let started = std::time::Instant::now();
     let mut deferred = false;
+    let mut over_budget = false;
     let test_filters = if derive_filters {
         match crate::rolling_queue::derive_test_filters_shared(repo, commit, derive_wait).await {
-            SharedDerivation::Ready(filters) => filters,
+            SharedDerivation::Ready(filters) => {
+                rsi_common::rolling_queue::merge_filters(filters, &explicit)
+            }
             SharedDerivation::Failed(reason) => {
                 tracing::warn!(%reason, "enqueue: filter derivation failed; gating unfiltered");
-                Vec::new()
+                explicit
+            }
+            SharedDerivation::OverBudget(reason) => {
+                tracing::warn!(%reason, "enqueue: filter derivation over budget; the lander selects the tests");
+                over_budget = true;
+                explicit
             }
             SharedDerivation::Running => {
                 deferred = true;
-                Vec::new()
+                explicit
             }
             SharedDerivation::TipUnreadable => {
                 return Err(DaemonError::InvalidParam(format!(
@@ -254,7 +309,9 @@ async fn derive_and_probe(
         "enqueue phase: derive_and_probe"
     );
     Ok(if deferred {
-        Derived::Deferred(facts)
+        Derived::Deferred(test_filters, facts)
+    } else if over_budget {
+        Derived::LanderSelects(test_filters, facts)
     } else {
         Derived::Ready(test_filters, facts)
     })
@@ -270,7 +327,10 @@ async fn derive_and_probe_to_end(
 ) -> Result<(Vec<String>, crate::rolling_queue::SourceFacts)> {
     match derive_and_probe(repo, commit, derive_filters, explicit, None, None).await? {
         Derived::Ready(filters, facts) => Ok((filters, facts)),
-        Derived::Deferred(_) => Err(DaemonError::Process(
+        // The operator path has no pending state: an over-budget derivation is
+        // the unfiltered gate it always fell back to.
+        Derived::LanderSelects(filters, facts) => Ok((filters, facts)),
+        Derived::Deferred(..) => Err(DaemonError::Process(
             "filter derivation deferred without a wait bound".into(),
         )),
     }
@@ -301,21 +361,22 @@ pub(crate) fn insert_source(
         .supersedes
         .as_ref()
         .map(|(id, commit)| (*id, commit.as_str()));
-    let (entry, replayed) = if source.filters_pending {
-        store.enqueue_rolling_queue_source_deriving(
-            &new,
-            source.wake_session_id,
-            supersedes,
-            chrono::Utc::now(),
-        )?
-    } else {
-        store.enqueue_rolling_queue_source_superseding(
-            &new,
-            source.wake_session_id,
-            supersedes,
-            chrono::Utc::now(),
-        )?
-    };
+    let derived: Vec<String> = source
+        .test_filters
+        .iter()
+        .filter(|filter| !source.explicit_filters && !source.handwritten_filters.contains(filter))
+        .cloned()
+        .collect();
+    let (entry, replayed) = store.enqueue_rolling_queue_source_expediting(
+        &new,
+        source.wake_session_id,
+        supersedes,
+        source.filters_pending,
+        source.issue,
+        &derived,
+        source.expedite.as_ref(),
+        chrono::Utc::now(),
+    )?;
     // A replay re-marks a live entry (after a restart too); a settled one
     // has already been judged.
     if source.explicit_filters && !entry.state.is_terminal() {
@@ -324,9 +385,48 @@ pub(crate) fn insert_source(
     Ok((entry, replayed))
 }
 
+/// What [`resolve_fix_claims`] resolved (#2167, #3264).
+struct FixClaims {
+    /// The tests the landing claims to fix.
+    tests: Vec<String>,
+    /// The filters that select the `fixes_issue` Issue's tests (from its
+    /// `Shard command:` lines): added to the landing's filters so the gate runs
+    /// the claim instead of refusing it `claimed_fix_still_red`.
+    selecting: Vec<String>,
+    /// #3487: the `fixes_issue` Issue is open and labelled `qa`: the landing is
+    /// expedited automatically. The reason names the Issue.
+    qa_expedite_reason: Option<String>,
+}
+
+/// #3487: the recorded reason of the automatic expedite for `issue`, when it is
+/// open and labelled `qa`: the Issue number and a bounded copy of its title.
+fn qa_expedite_reason(issue: &rsi_common::types::Issue) -> Option<String> {
+    use rsi_common::types::IssueStatus;
+    let open = matches!(issue.status, IssueStatus::Open | IssueStatus::InProgress);
+    let qa = issue
+        .labels
+        .iter()
+        .any(|label| label.eq_ignore_ascii_case(QUEUE_EXPEDITE_QA_LABEL));
+    if !(open && qa) {
+        return None;
+    }
+    let title: String = issue
+        .title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    Some(format!(
+        "automatic: fixes open qa Issue #{}: {}",
+        issue.display_number,
+        title.trim()
+    ))
+}
+
 /// #2167: the tests a landing claims to fix: the explicit `fixes_tests`, then
 /// each test the `fixes_issue` Issue (of the source's project) lists on its
-/// `Failing tests:` lines (the qa Issue format).
+/// `Failing tests:` lines (the qa Issue format). #3264: with the claims, the
+/// filters its `Shard command:` lines name, which select those tests.
 ///
 /// # Errors
 /// `queue_fixes_issue_not_found`, `queue_fixes_issue_lists_no_failing_tests` or
@@ -335,11 +435,15 @@ fn resolve_fix_claims(
     store: &Store,
     project_id: Option<Uuid>,
     request: &AgentEnqueueLandingSourceRequestV1,
-) -> Result<Vec<String>> {
+) -> Result<FixClaims> {
     let Some(number) = request.fixes_issue else {
         // Already capped by `validate`; checked here too so both paths share it.
         check_fix_claims_cap(&request.fixes_tests).map_err(DaemonError::InvalidParam)?;
-        return Ok(request.fixes_tests.clone());
+        return Ok(FixClaims {
+            tests: request.fixes_tests.clone(),
+            selecting: Vec::new(),
+            qa_expedite_reason: None,
+        });
     };
     let issue = match project_id {
         Some(project) => store.get_issue_by_display_number(project, number)?,
@@ -359,7 +463,11 @@ fn resolve_fix_claims(
     let claims = rsi_common::rolling_queue::union_fix_claims(&request.fixes_tests, &listed);
     // #2175: the Issue body is operator-sized text; cap the combined claims.
     check_fix_claims_cap(&claims).map_err(DaemonError::InvalidParam)?;
-    Ok(claims)
+    Ok(FixClaims {
+        tests: claims,
+        selecting: rsi_common::rolling_queue::issue_selecting_filters(&issue.body),
+        qa_expedite_reason: qa_expedite_reason(&issue),
+    })
 }
 
 /// #2118: the conflict warnings for `source` against the rolling tip and the
@@ -367,7 +475,7 @@ fn resolve_fix_claims(
 /// failure yields none. The store lock is released before git runs, and the
 /// scan is bounded by `budget` (#2907).
 async fn conflict_warnings_for(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     repo: &std::path::Path,
     project_id: Option<Uuid>,
     source: &str,
@@ -438,18 +546,17 @@ impl AgentControlHandle {
             .map_err(|code| DaemonError::InvalidParam(code.into()))?;
         let store = self.store.lock().await;
         queue_verb_gate(&store, caller, AgentControlVerbV1::ListRollingQueue)?;
-        let (entries, next_before_sequence) = store.list_rolling_queue_for_agent(
-            caller,
-            request.state,
-            request.project_id,
-            request.before_sequence,
-            request.page_size(),
-        )?;
+        let (entries, next_before_sequence) =
+            store.list_rolling_queue_for_agent(caller, &request)?;
         let qa_green = store.rolling_qa_green_for_agent(caller, request.project_id)?;
         Ok(AgentListRollingQueueReceiptV1 {
             entries,
             next_before_sequence,
             qa_green,
+            held_for_deploy: self
+                .deploy_drain
+                .as_ref()
+                .and_then(|drain| drain.queue_deploy_hold()),
         })
     }
 
@@ -518,17 +625,40 @@ impl AgentControlHandle {
             .map_err(|code| DaemonError::InvalidParam(request.refusal_detail(code)))?;
         let (session, is_lead, fence) = {
             let store = self.store.lock().await;
-            admit(&store, caller, &request)?
+            let admitted = admit(&store, caller, &request)?;
+            // #3487: only the current appointed manager expedites; an Epic
+            // lead enqueues in order and its manager expedites if it must.
+            if request.expedite.is_some() {
+                let projection = store
+                    .agent_authority_projection(caller)
+                    .map_err(|_| DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()))?;
+                if !(projection.is_manager || projection.is_global_manager) {
+                    return Err(DaemonError::PolicyDenied(format!(
+                        "{QUEUE_EXPEDITE_NOT_AUTHORIZED}: only the current appointed manager may expedite a landing; enqueue without expedite and ask your manager to expedite it if it cannot wait"
+                    )));
+                }
+            }
+            admitted
         };
         if !queue_enabled {
             return Err(DaemonError::InvalidParam(QUEUE_DISABLED.into()));
         }
         // #2167: a fix claim names its tests directly or through the red
         // Issue that lists them.
-        let fixes_tests = {
+        let FixClaims {
+            tests: fixes_tests,
+            selecting: selecting_filters,
+            qa_expedite_reason,
+        } = {
             let store = self.store.lock().await;
             resolve_fix_claims(&store, session.project_id, &request)?
         };
+        // #3264: the request's own filters, then the ones that select the
+        // claimed tests; with `derive_filters` they join the derived set.
+        let extra_filters = rsi_common::rolling_queue::merge_filters(
+            request.test_filters.clone(),
+            &selecting_filters,
+        );
         let repo: PathBuf = session
             .sandbox_root
             .clone()
@@ -547,10 +677,11 @@ impl AgentControlHandle {
                     .filter(|entry| {
                         entry.source_commit == request.source_commit
                             && entry.fixes_tests == fixes_tests
+                            && entry.issue == request.issue
                     })
             };
             if let Some(entry) = existing {
-                if entry.filters_state.is_some() {
+                if entry.filters_state == Some(QueueFiltersState::Deriving) {
                     // Idempotent: a no-op while a task already finishes it.
                     crate::rolling_queue::finish_filter_derivation_in_background(
                         &self.store,
@@ -563,6 +694,7 @@ impl AgentControlHandle {
                     entry,
                     replayed: true,
                     conflict_warnings: Vec::new(),
+                    expedite_warning: None,
                 });
             }
         }
@@ -577,9 +709,8 @@ impl AgentControlHandle {
                 None
             } else if let Some(id) = request.supersedes {
                 let old = store
-                    .get_rolling_queue_entry(id)?
-                    .filter(|entry| entry.source_session_id == caller)
-                    .ok_or_else(|| DaemonError::InvalidParam(QUEUE_ENTRY_NOT_FOUND.into()))?;
+                    .get_rolling_queue_entry_for_supersession(caller, id)?
+                    .ok_or_else(|| store.queue_entry_not_found_refusal(caller, id))?;
                 match old.state {
                     RollingQueueEntryState::Queued => {}
                     RollingQueueEntryState::Admitted | RollingQueueEntryState::Gating => {
@@ -587,6 +718,12 @@ impl AgentControlHandle {
                             "{QUEUE_ENTRY_IN_FLIGHT}: enqueue normally without supersedes; the lander owns this entry"
                         )));
                     }
+                    // #648: the one settled state a descendant may supersede; the
+                    // store re-checks the window and a prior takeover transactionally.
+                    _ if rsi_common::rolling_queue::resumable_conflict_refusal(
+                        &old,
+                        chrono::Utc::now(),
+                    ) => {}
                     _ => return Err(DaemonError::InvalidParam(QUEUE_ENTRY_SETTLED.into())),
                 }
                 Some((id, old.source_commit))
@@ -623,7 +760,7 @@ impl AgentControlHandle {
                 &repo,
                 &request.source_commit,
                 request.derive_filters,
-                request.test_filters.clone(),
+                extra_filters.clone(),
                 Some(derive_wait),
                 Some(phases + crate::rolling_queue::ENQUEUE_WALL_BOUND),
             ),
@@ -635,9 +772,10 @@ impl AgentControlHandle {
                 crate::rolling_queue::ENQUEUE_CONFLICT_SCAN_BUDGET,
             )
         );
-        let (test_filters, facts, filters_pending) = match derived? {
-            Derived::Ready(filters, facts) => (filters, facts, false),
-            Derived::Deferred(facts) => (Vec::new(), facts, true),
+        let (test_filters, facts, filters_pending, lander_selects) = match derived? {
+            Derived::Ready(filters, facts) => (filters, facts, false, false),
+            Derived::Deferred(extra, facts) => (extra, facts, true, false),
+            Derived::LanderSelects(extra, facts) => (extra, facts, false, true),
         };
         let probes_ms = u64::try_from(phases.elapsed().as_millis()).unwrap_or(u64::MAX);
         #[cfg(test)]
@@ -656,9 +794,24 @@ impl AgentControlHandle {
             return Err(DaemonError::PolicyDenied(QUEUE_NOT_AUTHORIZED.into()));
         }
         let commit = request.source_commit.clone();
-        let (entry, replayed) = insert_source(
+        // #3487: a manager's `expedite` wins; otherwise a fix for an open `qa`
+        // Issue expedites on its own, but is never refused for the cap.
+        let automatic_wanted = request.expedite.is_none() && qa_expedite_reason.is_some();
+        let expedite = match (&request.expedite, qa_expedite_reason) {
+            (Some(manual), _) => Some(ExpediteAdmission {
+                reason: manual.reason.trim().to_owned(),
+                automatic: false,
+            }),
+            (None, Some(reason)) => Some(ExpediteAdmission {
+                reason,
+                automatic: true,
+            }),
+            (None, None) => None,
+        };
+        let (mut entry, replayed) = insert_source(
             &store,
             &QueueSource {
+                issue: request.issue,
                 supersedes,
                 project_id: session.project_id,
                 repo: repo.clone(),
@@ -667,6 +820,7 @@ impl AgentControlHandle {
                 commit: request.source_commit,
                 test_filters,
                 explicit_filters: !request.derive_filters,
+                handwritten_filters: extra_filters,
                 fixes_tests,
                 filters_pending,
                 idempotency_key: request.idempotency_key,
@@ -676,13 +830,34 @@ impl AgentControlHandle {
                 // `source_session_id` only supplies the sandbox; it is never
                 // the target.
                 wake_session_id: Some(caller),
+                expedite,
             },
             &facts,
         )?;
+        // #3487: the automatic expedite met the cap and stayed ordinary.
+        let expedite_warning = if automatic_wanted && !replayed && entry.expedite_reason.is_none() {
+            let live = store.live_expedited_rolling_queue_entries(session.project_id)?;
+            Some(format!(
+                "{}; this qa fix was queued as an ordinary entry",
+                expedite_cap_detail(&live)
+            ))
+        } else {
+            None
+        };
+        // #3372: the derivation exceeded its budget. A fresh entry is kept with
+        // no derived filters and marked, so the lander selects its tests and
+        // the entry says why; a replay keeps the entry as it was recorded.
+        if lander_selects
+            && !replayed
+            && entry.filters_state.is_none()
+            && store.mark_rolling_queue_filters_lander_selects(entry.id, false)?
+        {
+            entry.filters_state = Some(QueueFiltersState::LanderSelects);
+        }
         // #2993: the entry is recorded with its filters pending. The
         // derivation finishes it (or settles it refused) in the background, so
         // the caller ends its turn; nobody polls for the filters.
-        if entry.filters_state.is_some() {
+        if entry.filters_state == Some(QueueFiltersState::Deriving) {
             crate::rolling_queue::finish_filter_derivation_in_background(
                 &self.store,
                 entry.id,
@@ -701,6 +876,7 @@ impl AgentControlHandle {
             entry,
             replayed,
             conflict_warnings,
+            expedite_warning,
         })
     }
 
@@ -836,6 +1012,7 @@ impl AgentControlHandle {
         let (entry, replayed) = insert_source(
             &store,
             &QueueSource {
+                issue: None,
                 supersedes: None,
                 project_id: current.project_id,
                 repo,
@@ -844,10 +1021,12 @@ impl AgentControlHandle {
                 commit,
                 test_filters,
                 explicit_filters: !request.derive_filters,
+                handwritten_filters: request.test_filters.clone(),
                 fixes_tests: Vec::new(),
                 filters_pending: false,
                 idempotency_key,
                 wake_session_id,
+                expedite: None,
             },
             &facts,
         )?;
@@ -924,6 +1103,26 @@ impl AgentControlHandle {
         if !queue_enabled {
             return Ok(LandEnqueue::QueueDisabled);
         }
+        if let LandAcceptance::RollingMerge {
+            reviewed_commit, ..
+        } = &request.acceptance
+        {
+            let (repo, base, head) = (
+                request.repo_root.clone(),
+                reviewed_commit.clone(),
+                request.source_commit.clone(),
+            );
+            let proved = tokio::task::spawn_blocking(move || {
+                crate::topology::custody::only_rolling_merges(&repo, &base, &head)
+            })
+            .await
+            .unwrap_or(false);
+            if !proved {
+                return Ok(LandEnqueue::AdmissionLost(
+                    "the reviewed source is not followed solely by clean rolling merges".into(),
+                ));
+            }
+        }
         // #1807: a land node without explicit filters derives them from the
         // accepted diff, like a hand landing.
         let test_filters = if request.test_filters.is_empty() {
@@ -991,6 +1190,7 @@ impl AgentControlHandle {
             return Ok(LandEnqueue::Cancelled);
         }
         let source = QueueSource {
+            issue: None,
             supersedes: None,
             project_id: request.project_id,
             repo: request.repo_root.clone(),
@@ -999,10 +1199,12 @@ impl AgentControlHandle {
             commit: request.source_commit.clone(),
             test_filters,
             explicit_filters: !request.test_filters.is_empty(),
+            handwritten_filters: request.test_filters.clone(),
             fixes_tests: Vec::new(),
             filters_pending: false,
             idempotency_key: request.dedup_key.clone(),
             wake_session_id: owner,
+            expedite: None,
         };
         match insert_source(&store, &source, &facts) {
             Ok((entry, _)) => Ok(LandEnqueue::Queued(entry.id)),
@@ -1030,7 +1232,7 @@ fn topology_admission(
         return Ok(Err(format!("land_not_authorized: {code}")));
     }
     match &request.acceptance {
-        LandAcceptance::Review { .. } => {
+        LandAcceptance::Review { .. } | LandAcceptance::RollingMerge { .. } => {
             if !review_admitted(store, request)? {
                 return Ok(Err(
                     "the review no longer admits this commit as accepted".into()
@@ -1118,10 +1320,19 @@ async fn inspect_candidate(
 type ReviewAdmitted = fn(&Store, &LandRequest) -> Result<bool>;
 
 fn review_admits(store: &Store, request: &LandRequest) -> Result<bool> {
-    let LandAcceptance::Review { assignment_id, .. } = &request.acceptance else {
-        return Ok(false);
-    };
-    store.topology_land_admitted(*assignment_id, &request.source_commit)
+    match &request.acceptance {
+        LandAcceptance::Review { assignment_id, .. } => {
+            store.topology_land_admitted(*assignment_id, &request.source_commit)
+        }
+        // The immutable commits' merge proof runs outside the Store lock.
+        // This live verdict is checked both before and after that Git work.
+        LandAcceptance::RollingMerge {
+            assignment_id,
+            reviewed_commit,
+            ..
+        } => store.topology_land_admitted(*assignment_id, reviewed_commit),
+        LandAcceptance::Verified { .. } => Ok(false),
+    }
 }
 
 /// #2249: whether the verifying job row still admits exactly the landing's
@@ -1198,6 +1409,293 @@ pub(crate) fn topology_land_status(store: &Store, entry_id: Uuid) -> Result<Land
 mod enqueue_bound_tests {
     use super::*;
 
+    /// Exercise the shared enqueue admission with the real renumber guard (the
+    /// `rsi-repo-guard` child process), while rolling is still V129 and the
+    /// declared V130 is free (#3397). #452: the repository is built in Rust.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_free_provisional_version_is_validated_before_enqueue_3397() {
+        use crate::provisional_fixture::{Provisional, git, real_guard};
+        let guard = real_guard();
+        let case = Provisional::new(&guard, &[]);
+        let repo = case.repo.clone();
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/rolling", &case.base],
+        );
+        crate::repo_guard_call::register_test_tool(&repo, guard);
+        let clean = case.source("clean", "");
+        case.source("dirty", "");
+        let dirty = case.commit_extra(
+            "dirty",
+            "crates/rsi-common/src/satellite_intake.rs",
+            "const FIXTURE: &str = \"migrations/v130.rs\";\n",
+        );
+        let refusal = probe_source(&repo, &dirty, &[], None).await.unwrap_err();
+        let DaemonError::InvalidParam(detail) = refusal else {
+            panic!("unexpected refusal: {refusal}");
+        };
+        assert!(detail.starts_with(PROVISIONAL_UNPROVABLE), "{detail}");
+        assert!(
+            detail.contains(
+                "undeclared version-bearing file or site: crates/rsi-common/src/satellite_intake.rs"
+            ),
+            "{detail}"
+        );
+
+        let facts = probe_source(&repo, &clean, &[], None).await.unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let (entry, replayed) = insert_source(
+            &store,
+            &QueueSource {
+                issue: None,
+                supersedes: None,
+                project_id: None,
+                repo,
+                source_session_id: Uuid::new_v4(),
+                owner_epic_id: None,
+                commit: clean.clone(),
+                test_filters: Vec::new(),
+                explicit_filters: true,
+                handwritten_filters: Vec::new(),
+                fixes_tests: Vec::new(),
+                filters_pending: false,
+                idempotency_key: "free-clean-provisional".into(),
+                wake_session_id: None,
+                expedite: None,
+            },
+            &facts,
+        )
+        .unwrap();
+        assert_eq!(entry.state, RollingQueueEntryState::Queued);
+        assert_eq!(entry.source_commit, clean);
+        assert!(!replayed);
+    }
+
+    /// The stub guard's still-free inspection when nothing is wrong.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    const HEALTHY_INSPECTION: &str =
+        r#"echo '{"old_version":130,"new_version":130,"renumber_noop":true}'"#;
+
+    /// Register a stub trusted guard (`<exe> rolling-migration-renumber ...`)
+    /// for the fixture repository: `--transform` answers a no-op unit and the
+    /// still-free inspection (no `--transform`) runs `inspection`, a shell
+    /// snippet that injects the infrastructure failure.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn register_stub_guard(case: &crate::provisional_fixture::Provisional, inspection: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = case.root.path().join("stub-guard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rsi-repo-guard");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" --transform \"*) echo '{{\"old_version\":130,\"new_version\":130,\"renumber_noop\":true}}'; exit 0;;\nesac\n{inspection}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::repo_guard_call::register_test_tool(&case.repo, exe);
+    }
+
+    /// The real fixture supplies declaration/git facts (built with the real
+    /// guard, #452); a tiny stub guard injects an inspection failure after a
+    /// successful still-free transform. `None` registers no guard at all.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn provisional_infrastructure_fixture(
+        inspection: Option<&str>,
+    ) -> (crate::provisional_fixture::Provisional, String) {
+        use crate::provisional_fixture::{Provisional, git, real_guard};
+        let case = Provisional::new(&real_guard(), &[]);
+        git(
+            &case.repo,
+            &["update-ref", "refs/remotes/origin/rolling", &case.base],
+        );
+        let source = case.source("declared", "");
+        if let Some(inspection) = inspection {
+            register_stub_guard(&case, inspection);
+        }
+        (case, source)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    async fn attempt_provisional_enqueue(
+        store: &Store,
+        repo: &std::path::Path,
+        commit: &str,
+        session: Uuid,
+    ) -> Result<rsi_common::rolling_queue::RollingQueueEntryV1> {
+        let facts = probe_source(repo, commit, &[], None).await?;
+        insert_source(
+            store,
+            &QueueSource {
+                issue: None,
+                supersedes: None,
+                project_id: None,
+                repo: repo.into(),
+                source_session_id: session,
+                owner_epic_id: None,
+                commit: commit.into(),
+                test_filters: Vec::new(),
+                explicit_filters: true,
+                handwritten_filters: Vec::new(),
+                fixes_tests: Vec::new(),
+                filters_pending: false,
+                idempotency_key: "infrastructure-retry".into(),
+                wake_session_id: None,
+                expedite: None,
+            },
+            &facts,
+        )
+        .map(|(entry, _)| entry)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    async fn assert_infrastructure_refuses_enqueue(
+        repo: &std::path::Path,
+        source: &str,
+        cause: &str,
+    ) -> (Store, Uuid) {
+        let store = Store::open_in_memory().unwrap();
+        let session = Uuid::new_v4();
+        let error = attempt_provisional_enqueue(&store, repo, source, session)
+            .await
+            .unwrap_err();
+        let DaemonError::InvalidParam(detail) = error else {
+            panic!("{error}");
+        };
+        assert!(
+            detail.starts_with(PROVISIONAL_PROBE_INCONCLUSIVE),
+            "{detail}"
+        );
+        assert!(detail.contains(cause), "{detail}");
+        assert!(detail.contains("no entry was recorded"), "{detail}");
+        assert!(detail.contains("same idempotency_key"), "{detail}");
+        assert!(
+            store
+                .get_rolling_queue_entry_by_key(session, "infrastructure-retry")
+                .unwrap()
+                .is_none()
+        );
+        (store, session)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_missing_guard_refuses_provisional_enqueue_retryably_3545() {
+        // #465 decision: the guard is a trusted installed executable, never a
+        // file of the source or of rolling. A declared source whose guard
+        // cannot be resolved has no proof, so it fails closed (a retryable
+        // refusal), exactly like #3545's missing-python3 case did.
+        let (case, source) = provisional_infrastructure_fixture(None);
+        let (store, session) = assert_infrastructure_refuses_enqueue(
+            &case.repo,
+            &source,
+            "no trusted rolling-migration-renumber guard executable",
+        )
+        .await;
+        let undeclared =
+            attempt_provisional_enqueue(&store, &case.repo, &case.base, Uuid::new_v4())
+                .await
+                .unwrap();
+        assert_eq!(undeclared.state, RollingQueueEntryState::Queued);
+        // Restoring the prerequisite admits exactly the same commit/key.
+        register_stub_guard(&case, HEALTHY_INSPECTION);
+        let entry = attempt_provisional_enqueue(&store, &case.repo, &source, session)
+            .await
+            .unwrap();
+        assert_eq!(entry.state, RollingQueueEntryState::Queued);
+        assert_eq!(entry.source_commit, source);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn inspection_exit_one_refuses_provisional_enqueue_retryably_3545() {
+        let (case, source) = provisional_infrastructure_fixture(Some("exit 1"));
+        assert_infrastructure_refuses_enqueue(
+            &case.repo,
+            &source,
+            "still-free inspection exited Some(1)",
+        )
+        .await;
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn malformed_inspection_output_refuses_provisional_enqueue_retryably_3545() {
+        for output in ["not json", "null", "{}"] {
+            let (case, source) =
+                provisional_infrastructure_fixture(Some(&format!("echo '{output}'")));
+            assert_infrastructure_refuses_enqueue(
+                &case.repo,
+                &source,
+                "still-free inspection: malformed output",
+            )
+            .await;
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn inspection_timeout_refuses_provisional_enqueue_retryably_3545() {
+        let (case, source) = provisional_infrastructure_fixture(Some("sleep 60"));
+        std::fs::write(case.repo.join(".rsi-provisional-step-timeout-ms"), "1000").unwrap();
+        let started = std::time::Instant::now();
+        assert_infrastructure_refuses_enqueue(
+            &case.repo,
+            &source,
+            "still-free inspection: timeout",
+        )
+        .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn missing_rolling_ref_refuses_only_declared_enqueue_retryably_3545() {
+        let (case, source) = provisional_infrastructure_fixture(Some(HEALTHY_INSPECTION));
+        for reference in ["refs/remotes/origin/rolling", "refs/heads/rolling"] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&case.repo)
+                .args(["update-ref", "-d", reference])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert_infrastructure_refuses_enqueue(&case.repo, &source, "could not resolve rolling ref")
+            .await;
+        let store = Store::open_in_memory().unwrap();
+        let entry = attempt_provisional_enqueue(&store, &case.repo, &case.base, Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(entry.state, RollingQueueEntryState::Queued);
+        assert_eq!(entry.source_commit, case.base);
+    }
+
+    /// #465: with no guard at all, a declared source that rolling already
+    /// contains still needs no proof (the lander merges nothing), so it is
+    /// admitted; only a source the guard would have to judge fails closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_declared_source_already_in_the_tip_needs_no_guard_3545() {
+        let (case, source) = provisional_infrastructure_fixture(None);
+        crate::provisional_fixture::git(
+            &case.repo,
+            &["update-ref", "refs/remotes/origin/rolling", &source],
+        );
+        let entry = attempt_provisional_enqueue(
+            &Store::open_in_memory().unwrap(),
+            &case.repo,
+            &source,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(entry.state, RollingQueueEntryState::Queued);
+        assert_eq!(entry.source_commit, source);
+    }
+
     /// #2907/#2993: a derivation that outruns the call's bound ends the wait at
     /// the bound, not when the derivation ends, and is deferred (the entry is
     /// recorded with its filters pending), never refused.
@@ -1258,7 +1756,7 @@ mod enqueue_bound_tests {
             started.elapsed()
         );
         assert!(
-            matches!(deferred, Derived::Deferred(_)),
+            matches!(deferred, Derived::Deferred(..)),
             "the entry is recorded with its filters pending"
         );
         // Explicit filters never wait on a derivation.
@@ -1277,33 +1775,131 @@ mod enqueue_bound_tests {
         assert!(filters.is_empty());
     }
 
-    /// #2912: a git read of the source probe that stalls is killed at the
-    /// call's deadline and the call is refused `queue_probe_timeout`
-    /// (retryable): never `queue_source_invalid`, never a hang.
+    /// #3264: with `derive_filters`, the explicit filters are extra: the derived
+    /// set comes first and the extras join it without a duplicate; a derivation
+    /// that outruns the bound defers with the extras kept for the entry.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_stalled_source_probe_is_killed_at_the_deadline_and_refused_retryably_2912() {
+    async fn derive_filters_gates_the_derived_set_plus_the_extra_filters_3264() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
-        let sh = |script: &str| {
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(script)
-                .current_dir(repo)
-                .status()
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
                 .unwrap();
-            assert!(status.success(), "{script}");
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
         };
-        sh(
-            "git init -q -b rolling . && git config user.email t@t && git config user.name t \
-            && git config commit.gpgsign false && echo a > a && git add a && git commit -qm base \
-            && git update-ref refs/remotes/origin/rolling HEAD \
-            && git checkout -q -b feature && echo b > b && git add b && git commit -qm feature",
+        git(&["init", "-q", "-b", "rolling"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), "x\n").unwrap();
+        git(&["add", "README"]);
+        git(&["commit", "-q", "-m", "base"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        let script = |sleep: u32| {
+            std::fs::write(
+                repo.join("scripts/check-touched-shards"),
+                format!(
+                    "import json, time\ntime.sleep({sleep})\nprint(json.dumps({{'suggested_filters': ['rsid=test:fast_shard']}}))\n"
+                ),
+            )
+            .unwrap();
+        };
+        let extra = vec![
+            "rsi-common=test:manifest_dir_guard".to_owned(),
+            "rsid=test:fast_shard".to_owned(),
+        ];
+
+        script(0);
+        let Derived::Ready(filters, _) = derive_and_probe(
+            repo,
+            &head,
+            true,
+            extra.clone(),
+            Some(std::time::Duration::from_secs(20)),
+            None,
+        )
+        .await
+        .unwrap() else {
+            panic!("a fast derivation is ready inline");
+        };
+        assert_eq!(
+            filters,
+            ["rsid=test:fast_shard", "rsi-common=test:manifest_dir_guard"],
+            "the derived set, then the extra filter it did not already hold"
         );
+
+        // A different commit is a different derivation (the shared one is cached
+        // per commit), and this one outruns the bound.
+        git(&["commit", "-q", "--allow-empty", "-m", "next"]);
+        let next = git(&["rev-parse", "HEAD"]);
+        script(3);
+        let Derived::Deferred(kept, _) = derive_and_probe(
+            repo,
+            &next,
+            true,
+            extra.clone(),
+            Some(std::time::Duration::from_millis(200)),
+            None,
+        )
+        .await
+        .unwrap() else {
+            panic!("a slow derivation is deferred");
+        };
+        assert_eq!(kept, extra, "the deferred entry keeps the extra filters");
+    }
+
+    /// #3658: a source with a provisional-migration declaration whose renumber
+    /// proof outlasts the call's wall bound is NOT refused `queue_probe_timeout`.
+    /// The proof ran first and spent the whole bound, so the cheap reads after
+    /// it were killed at an expired deadline. They now run first. #3545: a proof
+    /// the deadline cuts short is not a pass either: it is refused
+    /// `provisional_probe_inconclusive` (retryable, no entry recorded).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_slow_provisional_proof_does_not_time_out_the_probe_3658() {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let marker = dir.path().join("proof-started");
+        std::fs::write(repo.join("README"), "fixture\n").unwrap();
+        // The repo guard (the renumber proof) outlasts the deadline: a shell stand-in that records
+        // that it started and then sleeps.
+        let guard = dir.path().join("rsi-repo-guard");
+        std::fs::write(
+            &guard,
+            format!("#!/bin/sh\n: > '{}'\nexec sleep 120\n", marker.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = "git init -q -b rolling . && git config user.email t@t \
+            && git config user.name t && git config commit.gpgsign false \
+            && git add . && git commit -qm base \
+            && git update-ref refs/remotes/origin/rolling HEAD \
+            && git checkout -q -b feature && mkdir -p tools/provisional-migrations \
+            && echo '{}' > tools/provisional-migrations/x.json \
+            && git add tools && git commit -qm declare";
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{script}");
         let source = String::from_utf8(
             std::process::Command::new("git")
                 .arg("-C")
-                .arg(repo)
+                .arg(&repo)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -1312,9 +1908,85 @@ mod enqueue_bound_tests {
         .unwrap()
         .trim()
         .to_owned();
+        crate::repo_guard_call::register_test_tool(&repo, guard);
+        assert_eq!(
+            crate::rolling_queue::source_provisional_declaration_count(&repo, &source),
+            Some(1)
+        );
+        let started = std::time::Instant::now();
+        let refused = probe_source(&repo, &source, &[], Some(started + DEADLINE)).await;
+        let Err(DaemonError::InvalidParam(detail)) = refused else {
+            panic!("the slow proof must refuse retryably: {refused:?}");
+        };
+        assert!(
+            detail.starts_with(PROVISIONAL_PROBE_INCONCLUSIVE),
+            "{detail}"
+        );
+        assert!(
+            !detail.starts_with(QUEUE_PROBE_TIMEOUT),
+            "a slow proof is not a stalled git read: {detail}"
+        );
+        assert!(
+            marker.is_file(),
+            "the proof ran (and was cut short) rather than being skipped"
+        );
+        assert!(
+            started.elapsed() < DEADLINE + std::time::Duration::from_secs(3),
+            "the proof is killed at the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// #2912: a git read of the source probe that stalls is killed at the
+    /// call's deadline and the call is refused `queue_probe_timeout`
+    /// (retryable): never `queue_source_invalid`, never a hang.
+    ///
+    /// #187: the deadline also covers every git read the probe makes before the
+    /// stalled one. With a 600 ms deadline a loaded host spent it on those reads,
+    /// the stalled git never started (no pid file) and the kill check failed
+    /// although the probe behaved correctly. The deadline is now far above the
+    /// cost of those reads and the test asserts that the stalled git started.
+    /// The three phases run at once, each in its own repository (the stall
+    /// marker is per repository), so the test takes about one deadline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_stalled_source_probe_is_killed_at_the_deadline_and_refused_retryably_2912() {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        // The kill, reap and return after the deadline; the stall itself is 60 s.
+        const KILL_SLACK: std::time::Duration = std::time::Duration::from_secs(3);
+        fn source_repo() -> (tempfile::TempDir, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = dir.path();
+            let script = "git init -q -b rolling . && git config user.email t@t \
+                && git config user.name t && git config commit.gpgsign false \
+                && echo a > a && git add a && git commit -qm base \
+                && git update-ref refs/remotes/origin/rolling HEAD \
+                && git checkout -q -b feature && echo b > b && git add b && git commit -qm feature";
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{script}");
+            let source = String::from_utf8(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_owned();
+            (dir, source)
+        }
+        let (dir, source) = source_repo();
         // The probe passes when git is fast.
         probe_source(
-            repo,
+            dir.path(),
             &source,
             &[],
             Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
@@ -1323,21 +1995,28 @@ mod enqueue_bound_tests {
         .unwrap();
         // Each phase of the probe in turn: the source existence read, the merge
         // base, and the diffs.
-        for subcommand in ["cat-file", "merge-base", "diff"] {
-            crate::rolling_queue::stall_git(repo, subcommand);
-            let started = std::time::Instant::now();
-            let refusal = probe_source(
-                repo,
-                &source,
-                &[],
-                Some(started + std::time::Duration::from_millis(600)),
-            )
-            .await
-            .expect_err("the stalled read is cut short");
+        let phases = ["cat-file", "merge-base", "diff"].map(|subcommand| {
+            let (dir, source) = source_repo();
+            crate::rolling_queue::stall_git(dir.path(), subcommand);
+            async move {
+                let started = std::time::Instant::now();
+                let refusal = probe_source(dir.path(), &source, &[], Some(started + DEADLINE))
+                    .await
+                    .expect_err("the stalled read is cut short");
+                (subcommand, dir, started.elapsed(), refusal)
+            }
+        });
+        let [a, b, c] = phases;
+        let (a, b, c) = tokio::join!(a, b, c);
+        for (subcommand, dir, elapsed, refusal) in [a, b, c] {
+            let repo = dir.path();
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(3),
-                "{subcommand}: {:?}",
-                started.elapsed()
+                repo.join(".rsi-stall-pid").is_file(),
+                "{subcommand}: the deadline passed before the stalled git started ({elapsed:?})"
+            );
+            assert!(
+                elapsed >= DEADLINE && elapsed < DEADLINE + KILL_SLACK,
+                "{subcommand}: cut short at the deadline, not before and not after the stall: {elapsed:?}"
             );
             let text = refusal.to_string();
             assert!(text.contains(QUEUE_PROBE_TIMEOUT), "{subcommand}: {text}");
@@ -1346,7 +2025,6 @@ mod enqueue_bound_tests {
                 crate::rolling_queue::stalled_git_was_killed(repo),
                 "{subcommand}: the stalled git must be killed"
             );
-            std::fs::remove_file(repo.join(".rsi-stall")).unwrap();
         }
     }
 }

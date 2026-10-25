@@ -367,10 +367,18 @@ impl Store {
                     .filter(|id| q.epic_id.is_none_or(|e| e == **id))
                 {
                     let session = self.get_session(*epic)?;
-                    out.push(json!({"type":"lead_control", "key":format!("lead:{epic}"), "epic_id":epic,
+                    let fence = self.manager_action_lead_fence(*epic);
+                    let fence_state = if fence.is_ok() {
+                        "current"
+                    } else {
+                        "unavailable"
+                    };
+                    // #4011: `expected` is the exact `pause_lead`/`resume_lead` fence.
+                    out.push(
+                        json!({"type":"lead_control", "key":format!("lead:{epic}"), "epic_id":epic,
                         "title":session.as_ref().and_then(|s|s.title.as_ref()),
-                        "expected":self.manager_action_lead_fence(*epic).ok(),
-                        "fence_state":if self.manager_action_lead_fence(*epic).is_ok() {"current"} else {"unavailable"}}));
+                        "expected":fence.ok(), "fence_state":fence_state}),
+                    );
                 }
                 if q.epic_id.is_none() {
                     let scope = params![
@@ -714,6 +722,8 @@ impl Store {
                     "uptime_seconds":r.health.uptime_seconds,
                     "schema_version":r.health.schema_version,
                     "sessions_running":r.health.sessions_running,
+                    "workers_parked":r.health.workers_parked,
+                    "open_jobs":r.health.open_jobs,
                     "sessions_waiting_approval":r.health.sessions_waiting_approval,
                     "disk_free_bytes":r.health.disk_free_bytes,
                     "load_avg_1m":r.health.load_avg_1m_milli.map(|m| f64::from(m) / 1000.0),
@@ -724,6 +734,7 @@ impl Store {
                     "latest_watchdog_trip":r.health.latest_watchdog_trip,
                     "launches":rsi_common::satellite_manager_policy::launches_summary(&r.health.manager_launches),
                     "manager_launches":r.health.manager_launches,
+                    "manager_policies":r.health.manager_policies,
                 })),
             }));
         }
@@ -978,6 +989,9 @@ impl Store {
         let mut migrations = self.manager_v2_records(config, "migration")?;
         migrations.extend(self.manager_v2_facts_of_works(project, "migration", &history)?);
         let refusals = self.manager_v2_records(config, INTEGRATION_REFUSAL_KIND)?;
+        // #4011: one fence read per Epic, shared by its work rows.
+        let mut fences: std::collections::HashMap<Uuid, Option<ManagerLeadFenceV2>> =
+            std::collections::HashMap::new();
         for record in records {
             let w: WorkRecord = decode(&record)?;
             if epic.is_some_and(|e| e != w.epic_id) || !config.epic_ids.contains(&w.epic_id) {
@@ -1080,6 +1094,10 @@ impl Store {
             } else {
                 "unknown"
             });
+            let fence = fences
+                .entry(w.epic_id)
+                .or_insert_with(|| self.manager_action_lead_fence(w.epic_id).ok());
+            value["lead_fence"] = json!(fence);
             value["source_accepted"] = json!(accepted);
             value["integrated"] = json!(integrated);
             value["dependency_blockers"] = json!(blockers);

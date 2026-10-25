@@ -620,6 +620,7 @@ Review contract (it precedes the caller request below; the budget bounds optiona
    Review diff: the source's own change is its delta against the current rolling tip, `git diff origin/rolling $(git merge-tree --write-tree origin/rolling {source_sha})` (that is what the queue lands; when merge-tree reports a conflict, use `git show {source_sha}` instead). Never take a merge-base SHA from the caller request as the diff base: `git merge-base origin/rolling {source_sha}` can report several bases, and a base older than an already-landed parent source mixes that source's code into the diff (#2240). If the caller's diff lists files the Issue does not touch, compare it with this diff before charging them to the source.\n\
    Find the touched-module tests with `scripts/scoped-test --base <parent of {source_sha}> --dry-run` (it prints the derived plan; the merge queue derives the landing filters itself) and run them in the foreground with exact `cargo test` names or `scripts/scoped-test`. Exception: when the caller request below carries a `Test evidence:` policy (every topology review does), that policy replaces running the tests: the verified author and merge-queue gate receipts it names are the test evidence, so do not re-run those tests, do not run `scripts/scoped-test` (the `--dry-run` plan included), and treat the fixed minimum's test step as met by those receipts (read the receipt and the touched-module test list it records; the policy also says how to report a check that cannot run).\n\
    Build-slot wait (#2271): a foreground test run queues for a build slot first (`scripts/scoped-test` logs `slot-wait`; `cargo-slot` holds it). A wait over {REVIEW_SLOT_WAIT_MINUTES} minutes is an admission delay, not a test result and not a code finding. Start the run early, and when the wait passes {REVIEW_SLOT_WAIT_MINUTES} minutes stop only your own run and do not queue it again: do the other required checks, then submit verdict `blocked` with a blocking finding whose key starts with `infra_` (for example `infra_tests_unavailable`) stating the minutes waited and the tests that did not run, so the delay is reported apart from any code problem and the closeout deadline below is still met.\n\
+   Your sandbox is pinned to reviewed source {source_sha}; an exact-name test job runs that source tree. Make no changes or commits.\n\
    Copy the source SHA exactly from this prompt (all 40 characters). If `git cat-file -e {source_sha}` says the object is missing, compare the SHA you typed with this prompt character by character, and check the checkout's pinned review ref, before you submit `blocked`: the receipt is immutable and a misread digit settles a healthy review as unsettled.\n\
 2. Closeout budget: target {REVIEW_TARGET_MINUTES} minutes and at most {REVIEW_TOOL_CALL_BUDGET} tool calls; closeout deadline {REVIEW_CLOSEOUT_DEADLINE_MINUTES} minutes elapsed. This is a closeout rule, not a race: when you reach the target, stop optional work and submit; if required checks remain at the deadline, apply clause 5.\n\
 3. Receipt first: submit your receipt as soon as all required checks (fixed minimum and caller-required) are done. Optional exploration only after the receipt is submitted, and keep it brief.\n\
@@ -2551,6 +2552,99 @@ impl Store {
                 .with_timezone(&Utc),
             deduplicated: true,
         }))
+    }
+
+    /// Resolve the assignment a reviewer is submitting against (#3213).
+    ///
+    /// A reviewer session is bound to its own assignment rows
+    /// (`reviewer_session_id`), so `supplied` may be nil (omitted) and is then
+    /// taken from that binding. A supplied id the caller is not bound to is
+    /// refused with the caller's own live assignment id in the detail, and a
+    /// superseded assignment names its successor, so a model that mistyped the
+    /// id or lost its assignment mid-review can retry once instead of ending
+    /// the run. A supplied id with no better answer passes through unchanged:
+    /// the submission path then refuses it exactly as before.
+    pub fn resolve_manager_review_assignment_id(
+        &self,
+        caller: Uuid,
+        supplied: Uuid,
+    ) -> Result<Uuid> {
+        let mut statement = self.conn.prepare(
+            "SELECT assignment_id,state,superseded_by_assignment_id
+               FROM manager_review_assignments
+              WHERE reviewer_session_id=?1
+              ORDER BY CASE state WHEN 'active' THEN 0 WHEN 'allocating' THEN 1
+                                  WHEN 'submitted' THEN 2 ELSE 3 END,
+                       updated_at DESC
+              LIMIT 16",
+        )?;
+        let bound = statement
+            .query_map([caller.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let bound = bound
+            .into_iter()
+            .map(|(id, state, successor)| Ok((parse_uuid(id)?, state, optional_uuid(successor)?)))
+            .collect::<Result<Vec<_>>>()?;
+        // A scope or policy change outranks supersession (a rotated manager
+        // supersedes its reviews): that refusal keeps its own code.
+        let superseded = |id: Uuid, successor: Option<Uuid>| {
+            let assignment = match self.manager_review_assignment(id) {
+                Ok(assignment) => assignment,
+                Err(error) => return error,
+            };
+            if let Err(error) = self.require_current_manager_review_authority(&assignment) {
+                return error;
+            }
+            refused(&format!(
+                "manager_review_assignment_superseded: assignment_id={id} superseded_by={}",
+                successor.map_or_else(|| "unknown".to_string(), |next| next.to_string())
+            ))
+        };
+        let live = bound.iter().find(|row| row.1 == "active");
+        if supplied.is_nil() {
+            if let Some(row) = live {
+                return Ok(row.0);
+            }
+            return match bound.first() {
+                Some((id, state, successor)) if state == "superseded" => {
+                    Err(superseded(*id, *successor))
+                }
+                Some((id, _, _)) => Ok(*id),
+                None => Err(refused(
+                    "manager_review_assignment_missing: no assignment is bound to this session",
+                )),
+            };
+        }
+        if let Some((id, state, successor)) = bound.iter().find(|row| row.0 == supplied) {
+            return if state == "superseded" {
+                Err(superseded(*id, *successor))
+            } else {
+                Ok(supplied)
+            };
+        }
+        let Some(live) = live else {
+            return Ok(supplied);
+        };
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_review_assignments WHERE assignment_id=?1)",
+            [supplied.to_string()],
+            |row| row.get(0),
+        )?;
+        let code = if exists {
+            "manager_review_reviewer_required"
+        } else {
+            "manager_review_assignment_missing"
+        };
+        Err(refused(&format!(
+            "{code}: supplied_assignment_id={supplied} your_assignment_id={}",
+            live.0
+        )))
     }
 
     pub fn prepare_manager_review_submission(

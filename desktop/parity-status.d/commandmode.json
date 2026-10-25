@@ -31,6 +31,12 @@
       "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",
       "note": "GetColdArchiveStatus shown as the TUI's status and last-pass lines; run/stage, move, verify and compact send RunColdArchiveNow {mode}; move (deletes verified rows from the live database) asks first"
     },
+    "cmd:external-reports": {
+      "status": "missing",
+      "location": "",
+      "note": "TUI-only for now: GetExternalReportSyncStatus / SyncExternalReportsNow and the external-report Issue filter (#3789) are not yet on the desktop command line.",
+      "owner": ["#3789"]
+    },
     "cmd:blank": {
       "status": "done",
       "location": "src/actions/commandmode.ts, src/actions/commandmode-run.ts, src/commandmode-model.ts, src-tauri/src/commandmode.rs",

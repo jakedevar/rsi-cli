@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ACTIONS, appMenuModel, contextMenuModel, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, contextMenuModel, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
 import { COMMAND_BINDINGS, KEY_BINDINGS } from '../dist/keybindings.js';
 import { SESSIONLIST_ACTIONS, SESSIONLIST_COMMANDS, SESSIONLIST_KEYS } from '../dist/actions/sessionlist.js';
 import { desktopKeymap } from '../dist/keybindings.js';
@@ -128,14 +128,37 @@ test('the palette lists every slice-4 action with its keys', () => {
 
 test('the menu bar and the session-row menu carry the slice-4 actions', () => {
   const bar = appMenuModel('other', snap());
-  const ids = bar.flatMap((m) => m.items.filter((n) => n.kind === 'item').map((n) => n.id));
+  const ids = bar.flatMap((m) => menuItems(m.items).map((n) => n.id));
   for (const a of SESSIONLIST_ACTIONS) assert.ok(ids.includes(`act:${a.id}`), a.id);
   const view = bar.find((m) => m.id === 'view');
-  assert.ok(view.items.some((n) => n.id === 'act:choose-sort'));
+  assert.ok(menuItems(view.items).some((n) => n.id === 'act:choose-sort'));
   const file = bar.find((m) => m.id === 'file').items.filter((n) => n.kind === 'item');
   assert.equal(file[file.length - 1].id, 'act:quit', 'Quit stays last in File');
   const row = contextMenuModel('session-row', snap()).filter((n) => n.kind === 'item').map((n) => n.id);
   for (const id of ['session-info', 'choose-label', 'change-session-project', 'move-to-parent', 'move-to-root', 'unarchive-session']) {
     assert.ok(row.includes(`ctx:${id}`), id);
   }
+});
+
+test('desktop #210: the project actions sit in the File menu right after New session…, Quit stays last', () => {
+  const bar = appMenuModel('other', snap());
+  const file = bar.find((m) => m.id === 'file').items.filter((n) => n.kind === 'item').map((n) => n.id);
+  const view = menuItems(bar.find((m) => m.id === 'view').items).map((n) => n.id);
+  assert.deepEqual(file.slice(0, 4), ['act:launch', 'act:project-new', 'act:project-edit', 'act:project-delete']);
+  assert.equal(file[file.length - 1], 'act:quit');
+  for (const id of ['project-new', 'project-edit', 'project-delete']) assert.ok(!view.includes(`act:${id}`), `${id} left the View menu`);
+  const titles = bar.find((m) => m.id === 'file').items.filter((n) => n.kind === 'item').map((n) => n.text);
+  assert.ok(titles.includes('New project…'), 'the entry reads New project…');
+  const mac = appMenuModel('mac', snap()).find((m) => m.id === 'file').items.filter((n) => n.kind === 'item').map((n) => n.id);
+  assert.equal(mac[1], 'act:project-new', 'the same order on macOS');
+  assert.equal(unavailable('project-new', none()), null, 'New project… works with no projects and no session');
+});
+
+test('desktop #210: the keys and :project commands still reach the project actions', () => {
+  const e = new KeyEngine(desktopKeymap());
+  assert.equal(e.runCommand('project-new').action, 'project-new');
+  assert.equal(e.runCommand('project-edit').action, 'project-edit');
+  assert.equal(e.runCommand('project-delete web').action, 'project-delete');
+  assert.equal(e.runCommand('project').action, 'choose-project');
+  assert.equal(SESSIONLIST_KEYS['<Space>p'].action, 'choose-project');
 });

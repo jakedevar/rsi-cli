@@ -43,15 +43,10 @@ struct ManagerChatContent: View {
             .padding(.horizontal)
             .padding(.bottom, 8)
             if let seat = chat.seat {
-                List {
-                    Section {
-                        SeatHeaderView(seat: chat.thread?.seatInfo ?? seat)
-                        ComposerView(chat: chat)
-                    }
-                    TranscriptSection(chat: chat)
-                }
-                .listStyle(.insetGrouped)
-                .refreshable { await chat.refresh() }
+                SeatHeaderView(seat: chat.thread?.seatInfo ?? seat)
+                    .padding(.horizontal).padding(.bottom, 8)
+                Divider()
+                ManagerTranscript(chat: chat)
             } else if chat.seats == nil {
                 noSeats
             } else {
@@ -63,6 +58,11 @@ struct ManagerChatContent: View {
                             ? "This project has no appointed manager seat right now."
                             : "No global manager covers this project right now."))
             }
+        }
+        .themedList()
+        // The composer stays at the bottom, above the keyboard and the tab bar.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if chat.seat != nil { ComposerView(chat: chat) }
         }
         // Poll only while this pane is on screen and the app is active.
         .task(id: PollKey(role: chat.role, seat: chat.seat?.sessionId, active: scenePhase == .active)) {
@@ -85,6 +85,7 @@ struct ManagerChatContent: View {
 }
 
 struct SeatHeaderView: View {
+    @Environment(\.theme) private var theme
     let seat: ManagerSeat
 
     var body: some View {
@@ -97,80 +98,193 @@ struct SeatHeaderView: View {
                     PendingBadge(text: badge)
                 }
             }
-            Text(seat.summary).font(.caption).foregroundStyle(.secondary)
-            Text("Last activity \(shortTime(seat.lastActivityAt))")
-                .font(.caption2).foregroundStyle(.secondary)
+            Text(seat.summary).font(.caption).foregroundStyle(theme.model.color)
+            Text("Last activity \(localTime(seat.lastActivityAt))")
+                .font(.caption2).foregroundStyle(theme.time.color)
         }
     }
 }
 
 struct PendingBadge: View {
+    @Environment(\.theme) private var theme
     let text: String
 
     var body: some View {
         Text(text)
             .font(.caption.bold())
             .padding(.horizontal, 8).padding(.vertical, 2)
-            .background(.orange, in: Capsule())
-            .foregroundStyle(.white)
+            .background(theme.waiting.color, in: Capsule())
+            .foregroundStyle(theme.onAccent.color)
             .accessibilityLabel("\(text) pending decisions")
     }
 }
 
+/// The compose bar: a rounded field and a round send button, pinned to the
+/// bottom. A sent message leaves at once into the outbox (the chat shows it as
+/// a pending bubble) and the hub gets it however long that takes (#505).
 struct ComposerView: View {
+    @Environment(\.theme) private var theme
     @Bindable var chat: ManagerChat
 
     var body: some View {
         let draft = chat.draft
-        VStack(alignment: .leading, spacing: 8) {
+        let bytes = draft.text.utf8.count
+        let canSend = !chat.composeDisabled && messageProblem(draft.text) == nil
+        VStack(alignment: .leading, spacing: 6) {
             if chat.messagingOff {
                 MessagingOffNotice()
             }
-            TextField("Message the manager", text: $chat.draft.text, axis: .vertical)
-                .lineLimit(1...6)
-                .disabled(draft.locked || draft.sending || chat.composeDisabled)
-            HStack {
-                Text("\(draft.text.utf8.count)/\(maxMessageBytes) bytes")
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Message the manager", text: $chat.draft.text, axis: .vertical)
+                    .lineLimit(1...6)
+                    .disabled(chat.composeDisabled)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(theme.elevated.color, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                Button { chat.send() } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle((canSend ? theme.primary : theme.disabled).color)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+                .accessibilityLabel("Send")
+                .accessibilityHint("Saved on this phone and retried until the hub has it")
+            }
+            if bytes > maxMessageBytes * 4 / 5 {
+                Text("\(bytes)/\(maxMessageBytes) bytes")
                     .font(.caption2)
-                    .foregroundStyle(draft.text.utf8.count > maxMessageBytes ? .red : .secondary)
-                Spacer()
-                if draft.locked {
-                    Button("Discard", role: .destructive) { chat.discard() }
-                        .disabled(draft.sending)
-                    Button("Retry same message") { Task { await chat.send() } }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(draft.sending)
-                } else {
-                    Button("Send") { Task { await chat.send() } }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(draft.sending || chat.composeDisabled || messageProblem(draft.text) != nil)
+                    .foregroundStyle((bytes > maxMessageBytes ? theme.error : theme.mutedText).color)
+            }
+            if let problem = draft.problem {
+                Text(problem).font(.caption).foregroundStyle(theme.error.color)
+            }
+            if let problem = chat.outbox.storageProblem {
+                Text(problem).font(.caption).foregroundStyle(theme.error.color)
+            }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(theme.chrome.color.ignoresSafeArea(edges: .bottom))
+        .overlay(alignment: .top) { Divider() }
+    }
+}
+
+/// The manager conversation: turns by role, the messages still on their way as
+/// pending bubbles at the bottom.
+struct ManagerTranscript: View {
+    @Environment(\.theme) private var theme
+    @Bindable var chat: ManagerChat
+
+    var body: some View {
+        let thread = chat.thread
+        let items = thread?.items ?? []
+        let turns = ChatTranscript.build(items: items)
+        let pending = pendingOutgoing(
+            chat.outgoing, conversation: items, deliveries: thread?.operatorMessages ?? [])
+        ConversationScroll(
+            turns: turns, assistantName: "Manager",
+            delivery: { event in thread?.deliveryState(of: event) },
+            pendingCount: pending.count,
+            canLoadOlder: thread?.hasMore ?? false,
+            loadingOlder: thread?.loadingOlder ?? false,
+            loadOlder: { await chat.loadOlder() },
+            header: {
+                if let thread, let error = thread.error {
+                    Label(error.message, systemImage: error.isUnreachable ? "wifi.exclamationmark" : "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(theme.error.color)
+                }
+                if let error = thread?.olderError {
+                    Text(error.message).font(.caption).foregroundStyle(theme.error.color)
+                }
+                if let thread, thread.loaded {
+                    if items.isEmpty {
+                        Text("No messages yet. Say something below.")
+                            .foregroundStyle(.secondary).frame(maxWidth: .infinity)
+                    }
+                } else if thread?.error == nil {
+                    ProgressView("Loading conversation…").frame(maxWidth: .infinity)
+                }
+            },
+            footer: {
+                ForEach(pending) { message in
+                    OutboxBubble(chat: chat, message: message)
                 }
             }
-            .buttonStyle(.bordered)
-            status(draft)
-        }
-        .padding(.vertical, 4)
+        )
+        .refreshable { await chat.refresh() }
     }
+}
 
-    @ViewBuilder private func status(_ draft: MessageDraft) -> some View {
-        switch draft.phase {
-        case .idle:
-            EmptyView()
-        case .sending:
-            HStack(spacing: 6) {
-                ProgressView()
-                Text("Sending…").font(.caption).foregroundStyle(.secondary)
+/// A message written here that the conversation does not carry yet: queued,
+/// sending, failed or just delivered, with what to do about it.
+struct OutboxBubble: View {
+    @Environment(\.theme) private var theme
+    let chat: ManagerChat
+    let message: OutboxMessage
+
+    var body: some View {
+        OutboxRow(chat: chat, message: message)
+            .padding(12)
+            .background(theme.elevated.color, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .strokeBorder(
+                        theme.color(describeOutbox(message).tone).opacity(0.6),
+                        style: StrokeStyle(lineWidth: 1, dash: message.state == .delivered ? [] : [4, 3])))
+            .padding(.leading, 48)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+}
+
+struct OutboxRow: View {
+    @Environment(\.theme) private var theme
+    let chat: ManagerChat
+    let message: OutboxMessage
+
+    var body: some View {
+        let shown = describeOutbox(message)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                if message.state == .sending { ProgressView() }
+                Text(shown.state).font(.caption.bold()).foregroundStyle(theme.color(shown.tone))
+                Spacer()
+                Text(message.createdAt.formatted(date: .omitted, time: .shortened)).font(.caption2).foregroundStyle(theme.time.color)
             }
-        case .sent(let receipt):
-            let delivery = chat.delivery(of: receipt)
-            Text(delivery.text).font(.caption).foregroundStyle(delivery.tone.color)
-        case .failed(let error) where error.kind == .messagingOff:
-            // The notice above says it calmly; this is not an error.
-            EmptyView()
-        case .failed(let error):
-            Text(error.message).font(.caption)
-                .foregroundStyle(error.kind == .unknown ? .orange : .red)
+            Text(message.text).font(.callout).lineLimit(4)
+            if let reason = shown.reason {
+                Text(reason).font(.caption).foregroundStyle(theme.color(shown.tone))
+            }
+            if message.state == .queued, let next = message.nextAttemptAt, message.failures > 0 {
+                HStack(spacing: 4) {
+                    Text("Next try in").font(.caption2).foregroundStyle(.secondary)
+                    Text(next, style: .timer).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("· try \(message.failures + 1)").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if let note = shown.note {
+                Text(note).font(.caption2).foregroundStyle(.secondary)
+            }
+            if let delivery = chat.delivery(of: message) {
+                Text(delivery.text).font(.caption2).foregroundStyle(theme.color(delivery.tone))
+            }
+            if message.state == .queued || message.state == .failed {
+                HStack {
+                    Button("Discard", role: .destructive) { chat.outbox.discard(message.id) }
+                    Spacer()
+                    if message.state == .failed {
+                        Button("Send again") { chat.outbox.sendAgain(message.id) }
+                    } else if message.failures > 0 {
+                        Button("Try now") { chat.outbox.retryNow(message.id) }
+                    }
+                }
+                .buttonStyle(.bordered)
+                .font(.caption)
+            } else if message.state == .delivered {
+                Button("Dismiss") { chat.outbox.discard(message.id) }
+                    .buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary)
+            }
         }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -188,98 +302,4 @@ struct MessagingOffNotice: View {
         }
         .accessibilityElement(children: .combine)
     }
-}
-
-struct TranscriptSection: View {
-    @Bindable var chat: ManagerChat
-
-    var body: some View {
-        let thread = chat.thread
-        Section {
-            if let thread, let error = thread.error {
-                Label(error.message, systemImage: error.isUnreachable ? "wifi.exclamationmark" : "exclamationmark.triangle")
-                    .font(.caption).foregroundStyle(.red)
-            }
-            if let thread, thread.loaded {
-                if thread.items.isEmpty {
-                    Text("No messages yet.").foregroundStyle(.secondary)
-                }
-                ForEach(thread.items) { item in
-                    ConversationRow(
-                        item: item,
-                        delivery: item.operatorMessageId.flatMap { id in
-                            thread.operatorMessages.first { $0.messageId == id }?.state
-                        })
-                }
-                if thread.hasMore {
-                    Button {
-                        Task { await chat.loadOlder() }
-                    } label: {
-                        HStack {
-                            Text("Load older")
-                            if thread.loadingOlder { Spacer(); ProgressView() }
-                        }
-                    }
-                    .disabled(thread.loadingOlder)
-                }
-                if let error = thread.olderError {
-                    Text(error.message).font(.caption).foregroundStyle(.red)
-                }
-            } else if thread?.error == nil {
-                ProgressView("Loading conversation…")
-            }
-        } header: {
-            Text("Conversation, newest first")
-        }
-    }
-}
-
-struct ConversationRow: View {
-    let item: ConversationItem
-    let delivery: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(item.speakerLabel)
-                    .font(.caption.bold())
-                    .foregroundStyle(item.speaker == "operator" ? Color.accentColor : .primary)
-                Spacer()
-                Text(shortTime(item.createdAt)).font(.caption2).foregroundStyle(.secondary)
-            }
-            Text(item.text)
-                .font(item.speaker == "system" ? .callout.italic() : .callout)
-                .foregroundStyle(item.speaker == "system" ? .secondary : .primary)
-                .textSelection(.enabled)
-            if item.truncated {
-                Text("Cut at 4096 bytes; the full text is on the hub.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-            if let delivery {
-                let shown = describeDelivery(delivery)
-                Text(shown.text).font(.caption2).foregroundStyle(shown.tone.color)
-            }
-        }
-        .padding(.vertical, 2)
-    }
-}
-
-extension AnswerTone {
-    var color: Color {
-        switch self {
-        case .idle, .busy: .secondary
-        case .ok: .green
-        case .warn: .orange
-        case .error: .red
-        }
-    }
-}
-
-/// `2026-10-17T09:24:00.000000000Z` → `10-17 09:24 UTC`; other text unchanged.
-func shortTime(_ rfc3339: String) -> String {
-    let chars = Array(rfc3339)
-    guard chars.count >= 17, chars[4] == "-", chars[10] == "T", rfc3339.hasSuffix("Z") else {
-        return rfc3339
-    }
-    return String(chars[5..<10]) + " " + String(chars[11..<16]) + " UTC"
 }

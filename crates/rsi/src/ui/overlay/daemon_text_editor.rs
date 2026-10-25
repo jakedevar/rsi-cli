@@ -1,6 +1,7 @@
 //! Daemon text-setting editor overlay rendering (#2438, #2393).
 
-use crate::overlay::daemon_text_editor::daemon_text_field;
+use crate::overlay::editor_copy;
+use crate::settings::DaemonFeatureEntry;
 use crate::ui::theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -10,15 +11,16 @@ use ratatui::widgets::{Clear, Padding, Paragraph, Wrap};
 
 use super::fixed_centered_rect;
 
-/// Render the single-field editor of the daemon text setting `field`.
+/// Render the single-field editor of the daemon text or numeric setting `field`.
 pub(super) fn render_daemon_text_editor(
     frame: &mut Frame,
     area: Rect,
+    features: &[DaemonFeatureEntry],
     field: &str,
     input: &str,
     error: Option<&str>,
 ) {
-    let Some(spec) = daemon_text_field(field) else {
+    let Some(spec) = editor_copy(features, field) else {
         return;
     };
     let width = 76u16.min(area.width.saturating_sub(4)).max(20);
@@ -40,7 +42,7 @@ pub(super) fn render_daemon_text_editor(
     }
 
     let label = Line::from(vec![Span::styled(
-        format!("{} — empty = {}", spec.prompt, spec.default_label),
+        spec.prompt.clone(),
         Style::default()
             .fg(theme::overlay_title())
             .add_modifier(Modifier::BOLD),

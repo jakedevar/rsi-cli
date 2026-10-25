@@ -214,7 +214,7 @@ impl SessionManager {
             ArchiveContainer, ArchiveSession, AssignLead, CreateContainer, CreateSession,
             DeleteContainer, Integrate, OperatorCall, PauseLead, ReplaceLead, RestoreContainer,
             RestoreSession, ResumeLead, RetireLeadContinuations, RetryLead, SettleUncertainAction,
-            SucceedManager, UpdateContainer, UpdateSession,
+            SucceedManager, UpdateContainer, UpdateSession, WithdrawQueuedCreate,
         };
         let action = &op.context.request.operation;
         let mut guards = Guards::new();
@@ -256,6 +256,7 @@ impl SessionManager {
             | DeleteContainer { .. }
             | RestoreContainer { .. }
             | SettleUncertainAction { .. }
+            | WithdrawQueuedCreate { .. }
             | RetireLeadContinuations { .. }
             | ArchiveSession { .. }
             | RestoreSession { .. }
@@ -367,7 +368,7 @@ impl SessionManager {
             .apply_manager_retire_continuations(claim)
     }
 
-    async fn publish_manager_action_notice(&self, operation_id: Uuid) {
+    pub(super) async fn publish_manager_action_notice(&self, operation_id: Uuid) {
         let queued =
             crate::store_lock::lock(&self.store, "recovery::publish_manager_action_notice")
                 .await

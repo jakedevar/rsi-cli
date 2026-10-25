@@ -46,7 +46,8 @@ async fn quick_input_transport_drop_preserves_exact_draft_until_retry_accepts() 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary quick-launch socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary quick-launch socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("quick-launch listener");
     let returned_id = uuid::Uuid::new_v4();
@@ -123,7 +124,7 @@ async fn quick_input_transport_drop_preserves_exact_draft_until_retry_accepts() 
 async fn composing_to_busy_session_queues_without_changing_running_status() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let directory = tempfile::tempdir().expect("socket directory");
+    let directory = crate::test_support::socket_tempdir().expect("socket directory");
     let socket_path = directory.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
     let mut app = crate::app::app_test_helpers::with_session_list(1);
@@ -176,7 +177,7 @@ async fn clearing_a_manager_pause_asks_once_then_uses_set_operator_pause() {
     use crate::client::OperatorPauseLevel;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let directory = tempfile::tempdir().expect("socket directory");
+    let directory = crate::test_support::socket_tempdir().expect("socket directory");
     let socket_path = directory.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
     let mut app = crate::app::app_test_helpers::with_session_list(1);
@@ -246,7 +247,7 @@ async fn explicit_continuation_clears_cached_pause_only_on_acceptance() {
 
     for pause in [OperatorPauseLevel::Soft, OperatorPauseLevel::Hard] {
         for accepted in [false, true] {
-            let directory = tempfile::tempdir().expect("socket directory");
+            let directory = crate::test_support::socket_tempdir().expect("socket directory");
             let socket_path = directory.path().join("daemon.sock");
             let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
             let mut app = crate::app::app_test_helpers::with_session_list(1);
@@ -1583,6 +1584,7 @@ async fn repeated_empty_conversation_polls_do_not_retry_a_rejected_auto_resume()
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         });
 
         assert!(!progressed);
@@ -1623,6 +1625,7 @@ async fn conversation_event_progress_reopens_rejected_auto_resume_eligibility() 
         )]),
         batch_unsupported: false,
         connection_lost: false,
+        timed_out: false,
     });
 
     assert!(progressed);
@@ -1637,7 +1640,8 @@ async fn auto_resume_semantic_rejection_retries_only_on_relevant_progress_epochs
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary auto-resume socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary auto-resume socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("auto-resume listener");
     let requests = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1719,6 +1723,7 @@ async fn auto_resume_semantic_rejection_retries_only_on_relevant_progress_epochs
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         }));
     }
     tokio::task::yield_now().await;
@@ -1799,7 +1804,8 @@ async fn auto_resume_semantic_rejection_retries_only_on_relevant_progress_epochs
 async fn auto_resume_conversation_push_discovers_handoff_and_awaits_semantic_response() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary push-discovery socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary push-discovery socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("push-discovery listener");
     let returned_id = uuid::Uuid::new_v4();
@@ -1896,7 +1902,7 @@ async fn established_notification_eof_reconnects_once_and_restores_subscription(
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+    let temp_dir = crate::test_support::socket_tempdir().expect("temporary socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket listener");
     let subscriptions = Arc::new(AtomicUsize::new(0));
@@ -1927,6 +1933,10 @@ async fn established_notification_eof_reconnects_once_and_restores_subscription(
                             "persistence_queue_capacity": 1,
                             "last_command_duration_ms": 0,
                             "project_cache_size": 0
+                        }),
+                        "GetDaemonInfo" => serde_json::json!({
+                            "build_sha": env!("RSI_BUILD_SHA"), "started_at": "2026-10-23T00:00:00Z",
+                            "uptime_secs": 1, "schema_version": 1, "disk_free": {}
                         }),
                         "GetDaemonConfig" => serde_json::json!({}),
                         "UpdateDaemonConfig" => serde_json::Value::Null,

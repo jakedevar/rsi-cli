@@ -11,6 +11,7 @@
 //! method name when the receiver type is unknown) becomes `Inferred` edges
 //! whose evidence names the candidate count. Everything else stays unresolved.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -196,6 +197,7 @@ enum Entity {
     External,
 }
 
+#[derive(Clone)]
 pub(crate) struct Outcome {
     pub relations: Vec<RelationFact>,
     /// Indexes into the file's `unresolved_references` proven by this pass.
@@ -203,15 +205,36 @@ pub(crate) struct Outcome {
 }
 
 pub(crate) fn resolve(files: &[PerFileFacts], cargo: Option<&CargoWorkspace>) -> Vec<Outcome> {
+    let mut outcomes = Vec::with_capacity(files.len());
+    resolve_each(
+        files,
+        cargo,
+        |file| Cow::Borrowed(files[file].unresolved_references.as_slice()),
+        |_, outcome| outcomes.push(outcome),
+    );
+    outcomes
+}
+
+/// [`resolve`] for a caller that spills (#3491): `unresolved` supplies a file's
+/// unresolved references when its turn comes (the resolver reads no other file's),
+/// so they need not be resident, and `sink` takes each outcome as it is produced
+/// instead of the caller holding every outcome at once.
+pub(crate) fn resolve_each<'f>(
+    files: &[PerFileFacts],
+    cargo: Option<&CargoWorkspace>,
+    mut unresolved: impl FnMut(usize) -> Cow<'f, [UnresolvedReferenceFact]>,
+    mut sink: impl FnMut(usize, Outcome),
+) {
     let tree = Tree::build(files, cargo);
     let index = Index::build(&tree);
     let resolver = Resolver {
         tree: &tree,
         index: &index,
     };
-    (0..files.len())
-        .map(|file| resolver.file_outcome(file))
-        .collect()
+    for file in 0..files.len() {
+        let references = unresolved(file);
+        sink(file, resolver.file_outcome(file, &references));
+    }
 }
 
 // ------------------------------------------------------------------- tree
@@ -1036,7 +1059,7 @@ struct Resolver<'a, 'b> {
 }
 
 impl Resolver<'_, '_> {
-    fn file_outcome(&self, file: FileId) -> Outcome {
+    fn file_outcome(&self, file: FileId, unresolved: &[UnresolvedReferenceFact]) -> Outcome {
         let facts = &self.tree.files[file];
         let mut outcome = Outcome {
             relations: Vec::new(),
@@ -1057,7 +1080,7 @@ impl Resolver<'_, '_> {
         for (at, decl) in facts.scope.uses.iter().enumerate() {
             uses.entry(decl.reference as usize).or_default().push(at);
         }
-        for (at, reference) in facts.unresolved_references.iter().enumerate() {
+        for (at, reference) in unresolved.iter().enumerate() {
             match reference.kind {
                 UnresolvedReferenceKind::Import => {
                     if let Some(leaves) = uses.get(&at) {

@@ -192,6 +192,19 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // `--max-budget-usd` cap (0 = off) a Claude CLI launch passes.
     "claude_fallback_models",
     "claude_max_budget_usd",
+    // #3176: the docker hosts a benchmark container exec target may use.
+    "bench.docker_hosts",
+    // #3181: the benchmark job's master switch, trial concurrency and laptop host.
+    "bench.enabled",
+    "bench.max_concurrency",
+    "bench.laptop_host",
+    // Issue #3154: the OpenRouter spend ceiling. The cap is armed through the
+    // operator RPC (it takes a fresh probe of the account usage); the baseline
+    // and the arming time are written by that arming and survive a restart.
+    "openrouter_spend_cap_usd",
+    "openrouter_spend_warn_pct",
+    "openrouter_spend_baseline_usd",
+    "openrouter_spend_armed_at",
     "system_prompt_preset",
     "follow_agent_created_projects",
     "stall_classifier_enabled",
@@ -236,6 +249,9 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "sandbox_max_source_roots",
     "sandbox_min_free_gib",
     // Issue #2384: daemon-run cold-storage archive of old session data.
+    "error_disposition_enabled",
+    "error_disposition_grace_minutes",
+    "error_disposition_continuation_budget",
     "cold_archive_enabled",
     "cold_archive_after_days",
     "cold_archive_dir",
@@ -259,6 +275,7 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     // Issue #1417: hold manager launches while the host's 1-minute load is
     // above this threshold (0 disables).
     "host_load_admission_threshold",
+    "worker_build_reserve_gb",
     // Issue #1992: CPUQuota of each worker scope (percent of one CPU; 0 off).
     "worker_cpu_quota_percent",
     // Issue #2119: hub-wide CPU budget of every cargo build and test unit
@@ -266,6 +283,9 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "hub_build_cpu_percent",
     // Issue #2373: size cap (KiB; 0 off) of a stored ToolResult body.
     "tool_result_storage_cap_kib",
+    // Issue #4021: wake-driven turns a manager seat may use per rolling hour
+    // before routine notices are coalesced (0 off).
+    "manager_max_turns_per_hour",
     "rolling_queue_batch_size",
     // Issue #1208: bounded wall time of one merge-queue batch's gating.
     "rolling_queue_gate_timeout_mins",
@@ -273,11 +293,18 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "rolling_queue_full_qa_interval_mins",
     // Issue #2509: size (GiB; 0 off) above which the shared QA target is wiped.
     "qa_target_max_gib",
+    // Issue #86: days a referenced pasted image is kept (0 = forever).
+    "paste_retention_referenced_days",
     // Issue #2752: seconds the per-login Codex live model catalog is cached
     // (0 = bundled catalog only).
     "codex_live_catalog_ttl_secs",
     // Issue #2757: seconds between Codex plan-window reads (0 = off).
     "codex_rate_limit_poll_secs",
+    "claude_billing_mode",
+    "codex_billing_mode",
+    "codexappserver_billing_mode",
+    "pioneer_billing_mode",
+    "antigravity_billing_mode",
     // Issue #2763: subagent governance (model and concurrency cap per provider).
     "claude_subagent_model",
     "claude_max_concurrent_subagents",
@@ -289,6 +316,7 @@ pub const PERSISTED_RUNTIME_CONFIG_FIELDS: &[&str] = &[
     "health_disk_used_pct",
     "health_thermal_c",
     "health_stuck_minutes",
+    "health_provider_window_used_pct",
     // Issue #1337: runaway-test guard rails (job timeout, CPU-time andon).
     "job_test_timeout_mins",
     "cpu_andon_cpu_minutes",
@@ -535,6 +563,15 @@ fn optional_string(value: &serde_json::Value) -> Result<Option<String>, String> 
 pub const CLAUDE_FALLBACK_MODELS_MAX: usize = 3;
 /// Longest accepted model name in the fallback chain.
 const CLAUDE_FALLBACK_MODEL_MAX_LEN: usize = 128;
+/// The recorded OpenRouter spend ceiling (#3154), read as one consistent value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenRouterSpendConfig {
+    pub cap_usd: f64,
+    pub warn_pct: u8,
+    /// `(account total_usage at arming, arming time)`.
+    pub baseline: Option<(f64, chrono::DateTime<chrono::Utc>)>,
+}
+
 /// Largest accepted `claude_max_budget_usd` (a typo guard, not a policy).
 pub const CLAUDE_MAX_BUDGET_USD_LIMIT: f64 = 100_000.0;
 
@@ -614,6 +651,52 @@ pub fn parse_claude_max_budget_usd(value: &serde_json::Value) -> Result<f64, Str
         ));
     }
     Ok(number)
+}
+
+/// Validate `openrouter_spend_cap_usd` (#3154): a finite number of USD in
+/// `0..=`[`rsi_common::openrouter_spend::SPEND_CAP_USD_LIMIT`], as a JSON number
+/// or numeric text (the TUI text editor writes text; empty text is `0`, off).
+///
+/// # Errors
+/// The value is not an acceptable cap.
+pub fn parse_openrouter_spend_cap_usd(value: &serde_json::Value) -> Result<f64, String> {
+    let number = match value {
+        serde_json::Value::Null => 0.0,
+        serde_json::Value::Number(n) => n.as_f64().ok_or("expected a number of USD")?,
+        serde_json::Value::String(text) if text.trim().is_empty() => 0.0,
+        serde_json::Value::String(text) => text
+            .trim()
+            .trim_start_matches('$')
+            .parse::<f64>()
+            .map_err(|_| "expected a number of USD, such as 100 or 12.50".to_string())?,
+        _ => return Err("expected a number of USD".into()),
+    };
+    let limit = rsi_common::openrouter_spend::SPEND_CAP_USD_LIMIT;
+    if !number.is_finite() || !(0.0..=limit).contains(&number) {
+        return Err(format!("expected USD in 0..={limit} (0 turns the cap off)"));
+    }
+    Ok(number)
+}
+
+/// Validate `openrouter_spend_warn_pct` (#3154): a whole percent in `1..=100`,
+/// as a JSON number or text (`80`, `80%`).
+///
+/// # Errors
+/// The value is not an acceptable percent.
+pub fn parse_openrouter_spend_warn_pct(value: &serde_json::Value) -> Result<u8, String> {
+    let number = match value {
+        serde_json::Value::Number(n) => n.as_f64().ok_or("expected a percent")?,
+        serde_json::Value::String(text) => text
+            .trim()
+            .trim_end_matches('%')
+            .parse::<f64>()
+            .map_err(|_| "expected a percent, such as 80".to_string())?,
+        _ => return Err("expected a percent".into()),
+    };
+    if !number.is_finite() || number.fract() != 0.0 || !(1.0..=100.0).contains(&number) {
+        return Err("expected a whole percent in 1..=100".into());
+    }
+    Ok(number as u8)
 }
 
 /// A budget as JSON: an integer when whole (`5`, not `5.0`).
@@ -987,10 +1070,37 @@ pub struct RuntimeConfig {
     /// default) passes no flag. Normalized by [`normalize_claude_fallback_models`]
     /// and read on every Claude CLI spawn.
     pub claude_fallback_models: RwLock<Vec<String>>,
+    /// #3176: the operator's allowlist of docker hosts (`docker -H` values such
+    /// as `ssh://arch-laptop`) a Harness container exec target may name. Empty
+    /// (the default) refuses every container target. Normalized by
+    /// `rsi_common::exec_target::normalize_bench_docker_hosts`, checked at every
+    /// container-bound launch, continuation and rotation, and read live.
+    /// Operator-only: reachable only through `GetDaemonConfig`/`UpdateDaemonConfig`.
+    pub bench_docker_hosts: RwLock<Vec<String>>,
+    /// #3181: master switch of the `bench` job kind. Off by default: no benchmark
+    /// run is admitted (`bench_disabled`). Read at every submit and start.
+    pub bench_enabled: AtomicBool,
+    /// #3181: most concurrent Harbor trials a `bench` job runs (default 4, 1..=8).
+    pub bench_max_concurrency: AtomicU64,
+    /// #3181: the ssh host that runs Harbor (default `arch-laptop`). A run
+    /// config's docker host must be `ssh://` plus this.
+    pub bench_laptop_host: RwLock<String>,
     /// Issue #2762: per-session spend cap in USD passed as `--max-budget-usd`
     /// to a Claude CLI launch; `0.0` (the default) passes no flag. Read on
     /// every Claude CLI spawn.
     pub claude_max_budget_usd: RwLock<f64>,
+    /// Issue #3154: the operator's OpenRouter spend cap in USD above the
+    /// recorded baseline; `0.0` (the default) is off. Armed through the
+    /// operator RPC, which records `openrouter_spend_baseline_usd` from a fresh
+    /// probe of the account usage. Read live by launch admission and the
+    /// Harness loop.
+    pub openrouter_spend_cap_usd: RwLock<f64>,
+    /// Issue #3154: the percent of the cap at which one manager notice is sent.
+    pub openrouter_spend_warn_pct: AtomicU8,
+    /// Issue #3154: the account `total_usage` recorded when the cap was armed.
+    pub openrouter_spend_baseline_usd: RwLock<f64>,
+    /// Issue #3154: when the cap was armed (RFC3339, `""` = never armed).
+    pub openrouter_spend_armed_at: RwLock<String>,
     /// System-prompt preset value (RSI-026). Stored as the canonical
     /// kebab-case slug: `"default" | "concise" | "code-only" | "caveman"`.
     /// Authoritative source. Validated on write via
@@ -1091,6 +1201,9 @@ pub struct RuntimeConfig {
     /// while a fresh backup exists). Default on from slice S5
     /// (`COLD_ARCHIVE_ENABLED_DEFAULT`); an operator's `false` is persisted and
     /// survives a restart.
+    pub error_disposition_enabled: AtomicBool,
+    pub error_disposition_grace_minutes: AtomicU32,
+    pub error_disposition_continuation_budget: AtomicU32,
     pub cold_archive_enabled: AtomicBool,
     /// Issue #2384: a session is cold when its newest event is at least this
     /// many days old (3..=3650, default 14).
@@ -1137,6 +1250,10 @@ pub struct RuntimeConfig {
     /// disables the hold). Live: read at every admission decision.
     /// Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
     pub host_load_admission_threshold: AtomicU32,
+    /// Target estimate in GiB reserved above the governor floor for a new
+    /// manager worker or topology launch (0..=64, default 8; 0 disables reserve).
+    /// Live, operator-only via GetDaemonConfig/UpdateDaemonConfig; jobs use no reserve.
+    pub worker_build_reserve_gb: AtomicU64,
     /// Issue #1992: `CPUQuota` (percent of one CPU, default 400; 0 disables)
     /// of each worker scope. Live for scopes started afterwards; mirrored to
     /// `rsid_core::worker_cpu_quota` for the scope launchers.
@@ -1153,6 +1270,10 @@ pub struct RuntimeConfig {
     /// events stored afterwards; existing rows are never rewritten. Mirrored to
     /// `rsid_core::tool_result_cap`, which the event writer reads.
     pub tool_result_storage_cap_kib: AtomicU32,
+    /// Issue #4021: wake-driven turns per rolling hour a manager seat may use
+    /// before the scheduler coalesces its routine notices into the next free
+    /// slot (0 = off, else 1..=60). Read per delivery from the persisted row.
+    pub manager_max_turns_per_hour: AtomicU32,
     pub rolling_queue_batch_size: AtomicU32,
     /// Issue #1014: resource governor policy. `governor_max_load` 0 means 1.25 x cores.
     pub governor_build_slots: AtomicU32,
@@ -1163,9 +1284,11 @@ pub struct RuntimeConfig {
     pub governor_min_free_disk_gb: AtomicU64,
     pub governor_min_avail_mem_gb: AtomicU64,
     pub governor_max_workers_slice_gb: AtomicU64,
-    /// Issue #1208: wall-clock budget (minutes, 30..=1440, default 60) of one
-    /// merge-queue batch's gating, bisect included. A batch past it refuses its
-    /// unsettled members with `queue_gate_timeout`. Operator-only via
+    /// Issue #1208, #3267: wall-clock budget (minutes, 30..=1440, default 60)
+    /// of ONE lander run of a merge-queue batch (the full gate and each bisect
+    /// step each get it, under a ceiling scaled by the bisect depth). A run
+    /// past it refuses the still-suspect members with `queue_gate_timeout` and
+    /// returns the members a red run left out to the queue. Operator-only via
     /// `GetDaemonConfig`/`UpdateDaemonConfig`.
     pub rolling_queue_gate_timeout_mins: AtomicU32,
     /// Issue #2112: minimum minutes (0..=240, default 60) between two starts
@@ -1177,6 +1300,11 @@ pub struct RuntimeConfig {
     /// the shared full-library QA target is wiped before the next run. Live;
     /// mirrored to `rsid_core::qa_target_cap`, which the job launcher reads.
     pub qa_target_max_gib: AtomicU32,
+    /// Issue #86: days (0 = keep forever, the default, else 7..=3650) after
+    /// which a pasted image that a message or conversation once named may be
+    /// removed. Live; mirrored to `rsid_core::paste_retention_setting`, which
+    /// the paste retention pass reads.
+    pub paste_retention_referenced_days: AtomicU32,
     /// Issue #2752: cache lifetime (seconds) of the per-login Codex live model
     /// catalog; 0 reads only the bundled catalog.
     pub codex_live_catalog_ttl_secs: AtomicU32,
@@ -1184,6 +1312,8 @@ pub struct RuntimeConfig {
     /// (`account/rateLimits/read`); 0 = off, else 30..=86400. Live: the poll
     /// loop reads it every cycle.
     pub codex_rate_limit_poll_secs: AtomicU32,
+    /// Operator billing overrides, applied on the next accounting read.
+    pub provider_billing_modes: RwLock<std::collections::BTreeMap<String, String>>,
     /// Issue #2763: model every Claude subagent runs on
     /// (`CLAUDE_CODE_SUBAGENT_MODEL`); `""` = unset (subagents inherit the
     /// parent's model, today's behaviour). Validated by
@@ -1218,6 +1348,8 @@ pub struct RuntimeConfig {
     /// or a red rolling QA may go untracked before `when.health_anomaly`
     /// fires. Live.
     pub health_stuck_minutes: AtomicU32,
+    /// Minimum plan-window utilization for projected exhaustion warnings (0 off).
+    pub health_provider_window_used_pct: AtomicU32,
     /// Issue #1337: default wall-clock timeout (minutes, 5..=180, default 20)
     /// of an `AgentSubmitJob` `test` job; a manager may raise one job. Read at
     /// submit. Operator-only via `GetDaemonConfig`/`UpdateDaemonConfig`.
@@ -1265,7 +1397,7 @@ pub struct RuntimeConfig {
     /// Zero defers every tool; 256 is the current session tool cap.
     pub mcp_deferred_tool_threshold: AtomicUsize,
     /// #1036: remote-gate spend caps in whole USD. The daemon mirrors them
-    /// into `spend-caps.json` beside the ledger for `scripts/cloud-spend.py`.
+    /// into `spend-caps.json` beside the ledger for `rsi-cloud spend`.
     pub cloud_spend_stop_line_usd: AtomicU64,
     pub cloud_spend_daily_cap_usd: AtomicU64,
     /// Launch defaults for sandboxed agent builds. Read at each process spawn.
@@ -1447,7 +1579,21 @@ impl RuntimeConfig {
             claude_config_isolation: RwLock::new(config.claude_config_isolation.clone()),
             codex_config_isolation: RwLock::new(config.codex_config_isolation.clone()),
             claude_fallback_models: RwLock::new(Vec::new()),
+            bench_docker_hosts: RwLock::new(Vec::new()),
+            bench_enabled: AtomicBool::new(false),
+            bench_max_concurrency: AtomicU64::new(
+                rsi_common::bench_settings::DEFAULT_BENCH_MAX_CONCURRENCY,
+            ),
+            bench_laptop_host: RwLock::new(
+                rsi_common::bench_settings::DEFAULT_BENCH_LAPTOP_HOST.to_string(),
+            ),
             claude_max_budget_usd: RwLock::new(0.0),
+            openrouter_spend_cap_usd: RwLock::new(0.0),
+            openrouter_spend_warn_pct: AtomicU8::new(
+                rsi_common::openrouter_spend::DEFAULT_WARN_PCT,
+            ),
+            openrouter_spend_baseline_usd: RwLock::new(0.0),
+            openrouter_spend_armed_at: RwLock::new(String::new()),
             system_prompt_preset: RwLock::new(system_prompt_preset_seed),
             // Default to the sentinel, never to an effort name: an unset
             // ceiling is the pre-#34 behaviour (fall back to the tree root's
@@ -1490,6 +1636,9 @@ impl RuntimeConfig {
             // Match the interim cargo-slot host floor until the operator
             // chooses a different allocation threshold.
             sandbox_min_free_gib: AtomicU64::new(30),
+            error_disposition_enabled: AtomicBool::new(true),
+            error_disposition_grace_minutes: AtomicU32::new(15),
+            error_disposition_continuation_budget: AtomicU32::new(3),
             cold_archive_enabled: AtomicBool::new(
                 crate::store::cold_archive::COLD_ARCHIVE_ENABLED_DEFAULT,
             ),
@@ -1546,6 +1695,9 @@ impl RuntimeConfig {
             host_load_admission_threshold: AtomicU32::new(
                 rsi_common::agent_daemon_info::HOST_LOAD_THRESHOLD_DEFAULT,
             ),
+            worker_build_reserve_gb: AtomicU64::new(
+                rsi_common::agent_daemon_info::WORKER_BUILD_RESERVE_GB_DEFAULT,
+            ),
             worker_cpu_quota_percent: AtomicU32::new(
                 rsid_core::worker_cpu_quota::WORKER_CPU_QUOTA_PERCENT_DEFAULT,
             ),
@@ -1554,6 +1706,9 @@ impl RuntimeConfig {
             ),
             tool_result_storage_cap_kib: AtomicU32::new(
                 rsid_core::tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT,
+            ),
+            manager_max_turns_per_hour: AtomicU32::new(
+                rsi_common::coordinator_budget::MANAGER_TURNS_PER_HOUR_DEFAULT,
             ),
             rolling_queue_batch_size: AtomicU32::new(
                 rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_BATCH_SIZE,
@@ -1565,8 +1720,12 @@ impl RuntimeConfig {
                 rsi_common::rolling_queue::ROLLING_QUEUE_DEFAULT_FULL_QA_INTERVAL_MINS,
             ),
             qa_target_max_gib: AtomicU32::new(rsid_core::qa_target_cap::QA_TARGET_MAX_GIB_DEFAULT),
+            paste_retention_referenced_days: AtomicU32::new(
+                rsid_core::paste_retention_setting::PASTE_RETENTION_REFERENCED_DAYS_DEFAULT,
+            ),
             codex_live_catalog_ttl_secs: AtomicU32::new(CODEX_LIVE_CATALOG_TTL_SECS_DEFAULT),
             codex_rate_limit_poll_secs: AtomicU32::new(CODEX_RATE_LIMIT_POLL_SECS_DEFAULT),
+            provider_billing_modes: RwLock::new(std::collections::BTreeMap::new()),
             claude_subagent_model: RwLock::new(String::new()),
             claude_max_concurrent_subagents: AtomicU32::new(0),
             codex_subagent_model: RwLock::new(String::new()),
@@ -1578,6 +1737,9 @@ impl RuntimeConfig {
                 rsi_common::health_anomaly::HEALTH_DISK_USED_PCT_DEFAULT,
             ),
             health_thermal_c: AtomicU32::new(rsi_common::health_anomaly::HEALTH_THERMAL_C_DEFAULT),
+            health_provider_window_used_pct: AtomicU32::new(
+                rsi_common::health_anomaly::HEALTH_PROVIDER_WINDOW_USED_PCT_DEFAULT,
+            ),
             health_stuck_minutes: AtomicU32::new(
                 rsi_common::health_anomaly::HEALTH_STUCK_MINUTES_DEFAULT,
             ),
@@ -1864,6 +2026,24 @@ impl RuntimeConfig {
                 self.sandbox_min_free_gib.load(Ordering::Relaxed).into(),
             );
             map.insert(
+                "error_disposition_enabled".to_string(),
+                self.error_disposition_enabled
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "error_disposition_grace_minutes".to_string(),
+                self.error_disposition_grace_minutes
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "error_disposition_continuation_budget".to_string(),
+                self.error_disposition_continuation_budget
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
                 "cold_archive_enabled".to_string(),
                 self.cold_archive_enabled.load(Ordering::Relaxed).into(),
             );
@@ -1971,8 +2151,42 @@ impl RuntimeConfig {
                 self.claude_fallback_models.read().join(",").into(),
             );
             map.insert(
+                rsi_common::exec_target::BENCH_DOCKER_HOSTS_FIELD.to_string(),
+                self.bench_docker_hosts.read().join(",").into(),
+            );
+            map.insert(
+                rsi_common::bench_settings::BENCH_ENABLED_FIELD.to_string(),
+                self.bench_enabled.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                rsi_common::bench_settings::BENCH_MAX_CONCURRENCY_FIELD.to_string(),
+                self.bench_max_concurrency.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                rsi_common::bench_settings::BENCH_LAPTOP_HOST_FIELD.to_string(),
+                self.bench_laptop_host.read().clone().into(),
+            );
+            map.insert(
                 "claude_max_budget_usd".to_string(),
                 budget_usd_json(*self.claude_max_budget_usd.read()),
+            );
+            map.insert(
+                "openrouter_spend_cap_usd".to_string(),
+                budget_usd_json(*self.openrouter_spend_cap_usd.read()),
+            );
+            map.insert(
+                "openrouter_spend_warn_pct".to_string(),
+                self.openrouter_spend_warn_pct
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "openrouter_spend_baseline_usd".to_string(),
+                serde_json::json!(*self.openrouter_spend_baseline_usd.read()),
+            );
+            map.insert(
+                "openrouter_spend_armed_at".to_string(),
+                self.openrouter_spend_armed_at.read().clone().into(),
             );
             map.insert(
                 "harness_context_editing".to_string(),
@@ -2034,6 +2248,10 @@ impl RuntimeConfig {
                     .into(),
             );
             map.insert(
+                "worker_build_reserve_gb".to_string(),
+                self.worker_build_reserve_gb.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
                 "worker_cpu_quota_percent".to_string(),
                 self.worker_cpu_quota_percent.load(Ordering::Relaxed).into(),
             );
@@ -2044,6 +2262,12 @@ impl RuntimeConfig {
             map.insert(
                 "tool_result_storage_cap_kib".to_string(),
                 self.tool_result_storage_cap_kib
+                    .load(Ordering::Relaxed)
+                    .into(),
+            );
+            map.insert(
+                "manager_max_turns_per_hour".to_string(),
+                self.manager_max_turns_per_hour
                     .load(Ordering::Relaxed)
                     .into(),
             );
@@ -2066,6 +2290,12 @@ impl RuntimeConfig {
             map.insert(
                 "qa_target_max_gib".to_string(),
                 self.qa_target_max_gib.load(Ordering::Relaxed).into(),
+            );
+            map.insert(
+                "paste_retention_referenced_days".to_string(),
+                self.paste_retention_referenced_days
+                    .load(Ordering::Relaxed)
+                    .into(),
             );
             map.insert(
                 rsi_common::provider_lifecycle_hooks::SETTING_FIELD.to_string(),
@@ -2097,6 +2327,16 @@ impl RuntimeConfig {
                     .load(Ordering::Relaxed)
                     .into(),
             );
+            for provider in rsi_common::provider_billing::BILLING_OVERRIDE_PROVIDERS {
+                let field = format!("{provider}_billing_mode");
+                let mode = self
+                    .provider_billing_modes
+                    .read()
+                    .get(&field)
+                    .cloned()
+                    .unwrap_or_else(|| "auto".into());
+                map.insert(field, mode.into());
+            }
             map.insert(
                 "codex_rate_limit_poll_secs".to_string(),
                 self.codex_rate_limit_poll_secs
@@ -2131,6 +2371,10 @@ impl RuntimeConfig {
                 ("health_disk_used_pct", &self.health_disk_used_pct),
                 ("health_thermal_c", &self.health_thermal_c),
                 ("health_stuck_minutes", &self.health_stuck_minutes),
+                (
+                    "health_provider_window_used_pct",
+                    &self.health_provider_window_used_pct,
+                ),
                 ("job_test_timeout_mins", &self.job_test_timeout_mins),
                 ("cpu_andon_cpu_minutes", &self.cpu_andon_cpu_minutes),
                 ("cpu_andon_host_load", &self.cpu_andon_host_load),
@@ -2366,6 +2610,12 @@ impl RuntimeConfig {
             },
             // A CLI sandbox mode is per session only; there is no daemon default.
             cli_access: None,
+            // The file-tool reach is per session only; there is no daemon default.
+            file_paths: None,
+            // Extra environment names are per session only.
+            env_passthrough: Vec::new(),
+            // Spill thresholds are per session only.
+            output_spill: std::collections::BTreeMap::new(),
         }
     }
 
@@ -2465,11 +2715,61 @@ impl RuntimeConfig {
         self.claude_fallback_models.read().clone()
     }
 
+    /// #3176: the docker hosts a container exec target may use; empty refuses
+    /// every container target. Live.
+    pub fn bench_docker_hosts(&self) -> Vec<String> {
+        self.bench_docker_hosts.read().clone()
+    }
+
+    /// #3181: whether the `bench` job kind is switched on. Live.
+    pub fn bench_enabled(&self) -> bool {
+        self.bench_enabled.load(Ordering::Relaxed)
+    }
+
+    /// #3181: the most concurrent Harbor trials a `bench` job may run. Live.
+    pub fn bench_max_concurrency(&self) -> u32 {
+        u32::try_from(self.bench_max_concurrency.load(Ordering::Relaxed)).unwrap_or(1)
+    }
+
+    /// #3181: the ssh host that runs Harbor. Live.
+    pub fn bench_laptop_host(&self) -> String {
+        self.bench_laptop_host.read().clone()
+    }
+
     /// Issue #2762: the per-session `--max-budget-usd` cap, `None` when off
     /// (`0`). Live.
     pub fn claude_max_budget_usd(&self) -> Option<f64> {
         let usd = *self.claude_max_budget_usd.read();
         (usd > 0.0).then_some(usd)
+    }
+
+    /// Issue #3154: the OpenRouter spend ceiling as recorded: the cap, the warn
+    /// percent and the baseline taken when the cap was armed (`None` while the
+    /// cap was never armed or the recorded time does not parse). Live.
+    pub fn openrouter_spend_config(&self) -> OpenRouterSpendConfig {
+        let armed_at = chrono::DateTime::parse_from_rfc3339(&self.openrouter_spend_armed_at.read())
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc));
+        OpenRouterSpendConfig {
+            cap_usd: *self.openrouter_spend_cap_usd.read(),
+            warn_pct: self.openrouter_spend_warn_pct.load(Ordering::Relaxed),
+            baseline: armed_at.map(|at| (*self.openrouter_spend_baseline_usd.read(), at)),
+        }
+    }
+
+    /// Issue #3154: record an armed cap with the baseline a fresh probe read.
+    /// The caller persists the four fields (cap last) and holds the config
+    /// update lock.
+    pub fn arm_openrouter_spend_cap(
+        &self,
+        cap_usd: f64,
+        baseline_usage: f64,
+        armed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        *self.openrouter_spend_baseline_usd.write() = baseline_usage;
+        *self.openrouter_spend_armed_at.write() =
+            armed_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        *self.openrouter_spend_cap_usd.write() = cap_usd;
     }
 
     /// Issue #2755: whether the provider CLI contract canary runs. Live.
@@ -2668,6 +2968,7 @@ impl RuntimeConfig {
                 }
             }),
             window,
+            turn_budget: None,
         }
     }
 
@@ -2988,6 +3289,21 @@ impl RuntimeConfig {
                 self.sandbox_min_free_gib.store(value, Ordering::Relaxed);
                 Ok(true)
             }
+            "error_disposition_enabled" => {
+                self.error_disposition_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "error_disposition_grace_minutes" => {
+                self.error_disposition_grace_minutes
+                    .store(bounded_u64(value, 1, 1440)? as u32, Ordering::Relaxed);
+                Ok(true)
+            }
+            "error_disposition_continuation_budget" => {
+                self.error_disposition_continuation_budget
+                    .store(bounded_u64(value, 0, 10)? as u32, Ordering::Relaxed);
+                Ok(true)
+            }
             "cold_archive_enabled" => {
                 self.cold_archive_enabled
                     .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
@@ -3134,8 +3450,63 @@ impl RuntimeConfig {
                 *self.claude_fallback_models.write() = normalize_claude_fallback_models(value)?;
                 Ok(true)
             }
+            "bench.docker_hosts" => {
+                *self.bench_docker_hosts.write() =
+                    rsi_common::exec_target::normalize_bench_docker_hosts(value)?;
+                Ok(true)
+            }
+            "bench.enabled" => {
+                self.bench_enabled
+                    .store(value.as_bool().ok_or("expected bool")?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "bench.max_concurrency" => {
+                self.bench_max_concurrency.store(
+                    rsi_common::bench_settings::parse_bench_max_concurrency(value)?,
+                    Ordering::Relaxed,
+                );
+                Ok(true)
+            }
+            "bench.laptop_host" => {
+                *self.bench_laptop_host.write() =
+                    rsi_common::bench_settings::normalize_bench_laptop_host(value)?;
+                Ok(true)
+            }
             "claude_max_budget_usd" => {
                 *self.claude_max_budget_usd.write() = parse_claude_max_budget_usd(value)?;
+                Ok(true)
+            }
+            // Issue #3154. The operator RPC arms the cap (fresh probe, then the
+            // baseline); this arm is the replay of a persisted row and the
+            // disarm: turning the cap off forgets the baseline.
+            "openrouter_spend_cap_usd" => {
+                let cap = parse_openrouter_spend_cap_usd(value)?;
+                *self.openrouter_spend_cap_usd.write() = cap;
+                if cap == 0.0 {
+                    *self.openrouter_spend_baseline_usd.write() = 0.0;
+                    self.openrouter_spend_armed_at.write().clear();
+                }
+                Ok(true)
+            }
+            "openrouter_spend_warn_pct" => {
+                self.openrouter_spend_warn_pct
+                    .store(parse_openrouter_spend_warn_pct(value)?, Ordering::Relaxed);
+                Ok(true)
+            }
+            "openrouter_spend_baseline_usd" => {
+                let usd = value.as_f64().ok_or("expected a number of USD")?;
+                if !usd.is_finite() || usd < 0.0 {
+                    return Err("expected a non-negative number of USD".into());
+                }
+                *self.openrouter_spend_baseline_usd.write() = usd;
+                Ok(true)
+            }
+            "openrouter_spend_armed_at" => {
+                let text = value.as_str().ok_or("expected an RFC3339 time or \"\"")?;
+                if !text.is_empty() && chrono::DateTime::parse_from_rfc3339(text).is_err() {
+                    return Err("expected an RFC3339 time or \"\"".into());
+                }
+                *self.openrouter_spend_armed_at.write() = text.to_string();
                 Ok(true)
             }
             "harness_searxng_url" => {
@@ -3254,6 +3625,15 @@ impl RuntimeConfig {
                 );
                 Ok(true)
             }
+            "worker_build_reserve_gb" => {
+                let value = bounded_u64(
+                    value,
+                    0,
+                    rsi_common::agent_daemon_info::WORKER_BUILD_RESERVE_GB_MAX,
+                )?;
+                self.worker_build_reserve_gb.store(value, Ordering::Relaxed);
+                Ok(true)
+            }
             "worker_cpu_quota_percent" => {
                 let value = bounded_u64(
                     value,
@@ -3294,6 +3674,17 @@ impl RuntimeConfig {
                 self.tool_result_storage_cap_kib
                     .store(value, Ordering::Relaxed);
                 rsid_core::tool_result_cap::set_cap_kib(value);
+                Ok(true)
+            }
+            "manager_max_turns_per_hour" => {
+                let value = bounded_u64(
+                    value,
+                    0,
+                    u64::from(rsi_common::coordinator_budget::MANAGER_TURNS_PER_HOUR_MAX),
+                )?;
+                let value = u32::try_from(value).map_err(|_| "expected value within u32 range")?;
+                self.manager_max_turns_per_hour
+                    .store(value, Ordering::Relaxed);
                 Ok(true)
             }
             "rolling_queue_batch_size" => {
@@ -3338,6 +3729,20 @@ impl RuntimeConfig {
                     u32::try_from(value).map_err(|_| "expected value within u32 range")?,
                     Ordering::Relaxed,
                 );
+                Ok(true)
+            }
+            field
+                if field.strip_suffix("_billing_mode").is_some_and(|p| {
+                    rsi_common::provider_billing::BILLING_OVERRIDE_PROVIDERS.contains(&p)
+                }) =>
+            {
+                let mode = value.as_str().ok_or("expected billing mode string")?;
+                if !rsi_common::provider_billing::BILLING_OPTIONS.contains(&mode) {
+                    return Err("expected auto, subscription, metered_api or cloud".into());
+                }
+                self.provider_billing_modes
+                    .write()
+                    .insert(field.to_string(), mode.to_string());
                 Ok(true)
             }
             "codex_rate_limit_poll_secs" => {
@@ -3400,6 +3805,26 @@ impl RuntimeConfig {
                 rsid_core::qa_target_cap::set_gib(value);
                 Ok(true)
             }
+            "paste_retention_referenced_days" => {
+                use rsid_core::paste_retention_setting as setting;
+                let value = bounded_u64(
+                    value,
+                    0,
+                    u64::from(setting::PASTE_RETENTION_REFERENCED_DAYS_MAX),
+                )?;
+                if !setting::is_valid_days(value) {
+                    return Err(format!(
+                        "expected 0 (keep forever) or an integer in {}..={}",
+                        setting::PASTE_RETENTION_REFERENCED_DAYS_MIN,
+                        setting::PASTE_RETENTION_REFERENCED_DAYS_MAX
+                    ));
+                }
+                let value = u32::try_from(value).map_err(|_| "expected value within u32 range")?;
+                self.paste_retention_referenced_days
+                    .store(value, Ordering::Relaxed);
+                setting::set_days(value);
+                Ok(true)
+            }
             "job_thermal_ceiling_c" => {
                 let value = bounded_u64(
                     value,
@@ -3418,10 +3843,18 @@ impl RuntimeConfig {
                 rsid_core::thermal_guard::set_ceiling_c(value);
                 Ok(true)
             }
-            "health_disk_used_pct" | "health_thermal_c" | "health_stuck_minutes" => {
+            "health_disk_used_pct"
+            | "health_thermal_c"
+            | "health_stuck_minutes"
+            | "health_provider_window_used_pct" => {
                 use rsi_common::health_anomaly as health;
                 let value = bounded_u64(value, 0, u64::from(u32::MAX))?;
                 let (valid, expected, target): (bool, String, &AtomicU32) = match field {
+                    "health_provider_window_used_pct" => (
+                        value <= 100,
+                        "expected 0 (off) or an integer in 1..=100".to_string(),
+                        &self.health_provider_window_used_pct,
+                    ),
                     "health_disk_used_pct" => (
                         health::is_valid_disk_used_pct(value),
                         format!(
@@ -3456,6 +3889,9 @@ impl RuntimeConfig {
                 let value = u32::try_from(value).map_err(|_| "expected value within u32 range")?;
                 target.store(value, Ordering::Relaxed);
                 match field {
+                    "health_provider_window_used_pct" => {
+                        rsid_core::health_thresholds::set_provider_window_used_pct(value)
+                    }
                     "health_disk_used_pct" => {
                         rsid_core::health_thresholds::set_disk_used_pct(value)
                     }
@@ -5970,6 +6406,43 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
+    fn manager_max_turns_per_hour_defaults_off_persists_and_validates_4021() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"manager_max_turns_per_hour"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["manager_max_turns_per_hour"], 0);
+        for good in [0, 1, 3, 60] {
+            assert!(
+                config
+                    .update_field("manager_max_turns_per_hour", &serde_json::json!(good))
+                    .is_ok(),
+                "{good}"
+            );
+            assert_eq!(
+                config.persisted_field_value("manager_max_turns_per_hour"),
+                Some(serde_json::json!(good))
+            );
+        }
+        for bad in [
+            serde_json::json!(61),
+            serde_json::json!(-1),
+            serde_json::json!(2.5),
+            serde_json::json!("3"),
+        ] {
+            assert!(
+                config
+                    .update_field("manager_max_turns_per_hour", &bad)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            config.manager_max_turns_per_hour.load(Ordering::Relaxed),
+            60
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
     fn tool_result_storage_cap_kib_defaults_persists_validates_and_publishes() {
         let _guard = rsid_core::tool_result_cap::test_serial_guard();
         assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"tool_result_storage_cap_kib"));
@@ -6014,6 +6487,53 @@ mod tests {
         );
     }
 
+    /// #86: the referenced-paste retention defaults to 0 (keep forever),
+    /// accepts 0 or 7..=3650 days, persists, and is published to the pass.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn paste_retention_referenced_days_defaults_persists_validates_and_publishes() {
+        use rsid_core::paste_retention_setting as setting;
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"paste_retention_referenced_days"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["paste_retention_referenced_days"], 0);
+        for good in [7, 30, 3650, 0] {
+            assert!(
+                config
+                    .update_field("paste_retention_referenced_days", &serde_json::json!(good))
+                    .is_ok(),
+                "{good}"
+            );
+            assert_eq!(
+                config.persisted_field_value("paste_retention_referenced_days"),
+                Some(serde_json::json!(good))
+            );
+            assert_eq!(setting::current_days(), good);
+        }
+        for bad in [
+            serde_json::json!(1),
+            serde_json::json!(6),
+            serde_json::json!(3651),
+            serde_json::json!(-1),
+            serde_json::json!(7.5),
+            serde_json::json!("30"),
+        ] {
+            assert!(
+                config
+                    .update_field("paste_retention_referenced_days", &bad)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            config
+                .paste_retention_referenced_days
+                .load(Ordering::Relaxed),
+            0,
+            "a rejected value keeps the accepted one"
+        );
+        assert_eq!(setting::current_days(), 0);
+    }
+
     /// #2509: the QA target size cap defaults to 30 GiB, accepts 0 (off) or
     /// 10..=500, persists, and is published to the job launcher.
     /// #2524: the thermal job-hold ceiling defaults to 85 C, accepts 0 (off) or
@@ -6029,10 +6549,16 @@ mod tests {
         assert_eq!(json["health_disk_used_pct"], 90);
         assert_eq!(json["health_thermal_c"], 80);
         assert_eq!(json["health_stuck_minutes"], 30);
+        assert_eq!(json["health_provider_window_used_pct"], 70);
         for (field, good, bad) in [
             ("health_disk_used_pct", [0, 50, 99], [1, 49, 100]),
             ("health_thermal_c", [0, 60, 110], [1, 59, 111]),
             ("health_stuck_minutes", [0, 5, 720], [1, 4, 721]),
+            (
+                "health_provider_window_used_pct",
+                [0, 1, 100],
+                [101, 102, 1000],
+            ),
         ] {
             assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
             for value in good {
@@ -6069,6 +6595,8 @@ mod tests {
             (live.disk_used_pct, live.thermal_c, live.stuck_minutes),
             (99, 110, 720)
         );
+        assert_eq!(live.provider_window_used_pct, 100);
+        rsid_core::health_thresholds::set_provider_window_used_pct(70);
         rsid_core::health_thresholds::set_disk_used_pct(90);
         rsid_core::health_thresholds::set_thermal_c(80);
         rsid_core::health_thresholds::set_stuck_minutes(30);
@@ -6577,6 +7105,44 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
+    fn worker_build_reserve_defaults_to_eight_persists_and_validates() {
+        let field = "worker_build_reserve_gb";
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field));
+        assert!(
+            rsi_common::daemon_config_catalog::DAEMON_CONFIG_FIELDS
+                .iter()
+                .any(|spec| spec.field == field)
+        );
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()[field], 8);
+        for good in [0, 8, 64] {
+            config
+                .update_field(field, &serde_json::json!(good))
+                .unwrap();
+            assert_eq!(
+                config.persisted_field_value(field),
+                Some(serde_json::json!(good))
+            );
+            assert_eq!(config.worker_build_reserve_gb.load(Ordering::Relaxed), good);
+        }
+        for bad in [
+            serde_json::json!(65),
+            serde_json::json!(-1),
+            serde_json::json!(8.5),
+            serde_json::json!("8"),
+            serde_json::json!(true),
+        ] {
+            assert!(config.update_field(field, &bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            config.to_json()[field],
+            64,
+            "rejected writes preserve the accepted reserve"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
     fn host_load_admission_threshold_defaults_to_forty_persists_and_validates() {
         assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"host_load_admission_threshold"));
         let config = RuntimeConfig::from_config(&Config::default());
@@ -6884,6 +7450,120 @@ mod tests {
         assert_eq!(config.claude_fallback_models(), ["a", "b"]);
     }
 
+    /// #3176: `bench.docker_hosts` is durable, defaults to the empty allowlist
+    /// (every container target refused), normalizes the text the TUI writes and
+    /// refuses a value that is not a docker endpoint, so a bad edit keeps the
+    /// previous list.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn bench_docker_hosts_persist_normalize_and_validate() {
+        assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&"bench.docker_hosts"));
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert!(config.bench_docker_hosts().is_empty());
+        assert_eq!(config.to_json()["bench.docker_hosts"], "");
+        for (input, expected) in [
+            (
+                serde_json::json!("ssh://arch-laptop, tcp://10.0.0.2:2375"),
+                vec!["ssh://arch-laptop", "tcp://10.0.0.2:2375"],
+            ),
+            (serde_json::json!(["ssh://a"]), vec!["ssh://a"]),
+            (serde_json::json!(""), vec![]),
+            (serde_json::Value::Null, vec![]),
+        ] {
+            config
+                .update_field("bench.docker_hosts", &input)
+                .unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(config.bench_docker_hosts(), expected, "{input}");
+            assert_eq!(
+                config.persisted_field_value("bench.docker_hosts"),
+                Some(serde_json::json!(expected.join(","))),
+            );
+        }
+        config
+            .update_field("bench.docker_hosts", &serde_json::json!("ssh://a"))
+            .unwrap();
+        for bad in [
+            serde_json::json!("laptop"),
+            serde_json::json!("ssh://a,ssh://a"),
+            serde_json::json!("-H"),
+            serde_json::json!(["ssh://a", 1]),
+            serde_json::json!(7),
+        ] {
+            assert!(
+                config.update_field("bench.docker_hosts", &bad).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(config.bench_docker_hosts(), ["ssh://a"]);
+    }
+
+    /// #3181: the benchmark job settings are durable, default off / 4 / arch-laptop
+    /// and refuse a bad edit, keeping the previous value.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn bench_job_settings_persist_default_and_validate() {
+        for field in [
+            "bench.enabled",
+            "bench.max_concurrency",
+            "bench.laptop_host",
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+        }
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert!(!config.bench_enabled());
+        assert_eq!(config.bench_max_concurrency(), 4);
+        assert_eq!(config.bench_laptop_host(), "arch-laptop");
+        let json = config.to_json();
+        assert_eq!(json["bench.enabled"], false);
+        assert_eq!(json["bench.max_concurrency"], 4);
+        assert_eq!(json["bench.laptop_host"], "arch-laptop");
+
+        config
+            .update_field("bench.enabled", &serde_json::json!(true))
+            .unwrap();
+        assert!(config.bench_enabled());
+        assert_eq!(
+            config.persisted_field_value("bench.enabled"),
+            Some(serde_json::json!(true))
+        );
+        for (input, expected) in [
+            (serde_json::json!(8), 8),
+            (serde_json::json!("2"), 2),
+            (serde_json::json!(1), 1),
+        ] {
+            config
+                .update_field("bench.max_concurrency", &input)
+                .unwrap();
+            assert_eq!(config.bench_max_concurrency(), expected, "{input}");
+            assert_eq!(
+                config.persisted_field_value("bench.max_concurrency"),
+                Some(serde_json::json!(expected))
+            );
+        }
+        config
+            .update_field("bench.laptop_host", &serde_json::json!("me@box.lan"))
+            .unwrap();
+        assert_eq!(config.bench_laptop_host(), "me@box.lan");
+        for (field, bad) in [
+            ("bench.enabled", serde_json::json!("yes")),
+            ("bench.max_concurrency", serde_json::json!(0)),
+            ("bench.max_concurrency", serde_json::json!(9)),
+            ("bench.max_concurrency", serde_json::json!("many")),
+            ("bench.laptop_host", serde_json::json!("-oProxyCommand=x")),
+            ("bench.laptop_host", serde_json::json!("ssh://host")),
+            ("bench.laptop_host", serde_json::json!(5)),
+        ] {
+            assert!(config.update_field(field, &bad).is_err(), "{field} {bad}");
+        }
+        assert!(config.bench_enabled());
+        assert_eq!(config.bench_max_concurrency(), 1);
+        assert_eq!(config.bench_laptop_host(), "me@box.lan");
+        config
+            .update_field("bench.laptop_host", &serde_json::json!(""))
+            .unwrap();
+        assert_eq!(config.bench_laptop_host(), "arch-laptop");
+    }
+
     /// #2762: the Claude spend cap defaults off (`0`), takes a number or numeric
     /// text and refuses a negative, non-finite or absurd value.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -6929,6 +7609,93 @@ mod tests {
             );
         }
         assert_eq!(config.claude_max_budget_usd(), Some(2.5));
+    }
+
+    /// #3154: the OpenRouter spend ceiling defaults to off with an 80% warn
+    /// line, validates the cap and the percent, and the armed cap with its
+    /// baseline and arming time survives a restart; turning the cap off
+    /// forgets the baseline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn openrouter_spend_cap_validates_and_survives_a_restart() {
+        for field in [
+            "openrouter_spend_cap_usd",
+            "openrouter_spend_warn_pct",
+            "openrouter_spend_baseline_usd",
+            "openrouter_spend_armed_at",
+        ] {
+            assert!(PERSISTED_RUNTIME_CONFIG_FIELDS.contains(&field), "{field}");
+        }
+        let config = RuntimeConfig::from_config(&Config::default());
+        let off = config.openrouter_spend_config();
+        assert_eq!((off.cap_usd, off.warn_pct), (0.0, 80));
+        assert!(off.baseline.is_none());
+        assert_eq!(config.to_json()["openrouter_spend_cap_usd"], 0);
+        assert_eq!(config.to_json()["openrouter_spend_warn_pct"], 80);
+
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(1_000_000),
+            serde_json::json!("NaN"),
+            serde_json::json!("lots"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                config
+                    .update_field("openrouter_spend_cap_usd", &bad)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(101),
+            serde_json::json!(79.5),
+            serde_json::json!("most"),
+        ] {
+            assert!(
+                config
+                    .update_field("openrouter_spend_warn_pct", &bad)
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        config
+            .update_field("openrouter_spend_warn_pct", &serde_json::json!("90%"))
+            .unwrap();
+        assert_eq!(config.openrouter_spend_config().warn_pct, 90);
+
+        // Arm: the operator RPC records the fresh probe as the baseline.
+        let armed_at = chrono::Utc::now();
+        config.arm_openrouter_spend_cap(100.0, 514.968, armed_at);
+        let store = crate::store::Store::open_in_memory().unwrap();
+        for field in [
+            "openrouter_spend_baseline_usd",
+            "openrouter_spend_armed_at",
+            "openrouter_spend_cap_usd",
+            "openrouter_spend_warn_pct",
+        ] {
+            crate::store::daemon_settings::persist_runtime_config_field(&store, &config, field)
+                .unwrap();
+        }
+        let restarted = RuntimeConfig::from_config(&Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&store, &restarted).unwrap();
+        let back = restarted.openrouter_spend_config();
+        assert_eq!(back.cap_usd, 100.0);
+        assert_eq!(back.warn_pct, 90);
+        let (baseline, at) = back.baseline.expect("the baseline survives a restart");
+        assert!((baseline - 514.968).abs() < 1e-9);
+        assert_eq!(at, armed_at, "the arming time survives to the nanosecond");
+
+        // Off forgets the baseline, so the next arming re-baselines.
+        restarted
+            .update_field("openrouter_spend_cap_usd", &serde_json::json!(0))
+            .unwrap();
+        let disarmed = restarted.openrouter_spend_config();
+        assert_eq!(disarmed.cap_usd, 0.0);
+        assert!(disarmed.baseline.is_none());
+        assert_eq!(restarted.to_json()["openrouter_spend_baseline_usd"], 0.0);
+        assert_eq!(restarted.to_json()["openrouter_spend_armed_at"], "");
     }
 
     /// #2315: the SearXNG base URL is an operator setting that defaults to
@@ -10294,5 +11061,60 @@ mod tests {
             restarted.bedrock_route_for("global.openai.gpt-5.6-sol"),
             OpenRouterRoute::Harness
         );
+    }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn billing_overrides_validate_and_round_trip() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        for provider in rsi_common::provider_billing::BILLING_OVERRIDE_PROVIDERS {
+            let field = format!("{provider}_billing_mode");
+            assert_eq!(config.to_json()[&field], "auto");
+            for mode in rsi_common::provider_billing::BILLING_OPTIONS {
+                assert_eq!(
+                    config.update_field(&field, &serde_json::json!(mode)),
+                    Ok(true)
+                );
+                assert_eq!(
+                    config.persisted_field_value(&field),
+                    Some(serde_json::json!(mode))
+                );
+            }
+            assert!(
+                config
+                    .update_field(&field, &serde_json::json!("unlimited_dollars"))
+                    .is_err()
+            );
+        }
+    }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn error_disposition_settings_default_on_validate_and_round_trip() {
+        let config = RuntimeConfig::from_config(&Config::default());
+        assert_eq!(config.to_json()["error_disposition_enabled"], true);
+        assert_eq!(config.to_json()["error_disposition_grace_minutes"], 15);
+        assert_eq!(config.to_json()["error_disposition_continuation_budget"], 3);
+        for (key, value) in [
+            ("error_disposition_enabled", serde_json::json!(false)),
+            ("error_disposition_grace_minutes", serde_json::json!(30)),
+            (
+                "error_disposition_continuation_budget",
+                serde_json::json!(2),
+            ),
+        ] {
+            assert!(config.update_field(key, &value).unwrap());
+            assert_eq!(config.to_json()[key], value);
+            assert_eq!(config.persisted_field_value(key), Some(value));
+        }
+        for (key, value) in [
+            ("error_disposition_grace_minutes", serde_json::json!(0)),
+            ("error_disposition_grace_minutes", serde_json::json!(1441)),
+            (
+                "error_disposition_continuation_budget",
+                serde_json::json!(11),
+            ),
+            ("error_disposition_enabled", serde_json::json!("true")),
+        ] {
+            assert!(config.update_field(key, &value).is_err());
+        }
     }
 }

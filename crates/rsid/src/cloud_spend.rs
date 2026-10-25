@@ -2,7 +2,7 @@
 //!
 //! The caps live in daemon settings (`cloud_spend_stop_line_usd`,
 //! `cloud_spend_daily_cap_usd`). This module mirrors them into
-//! `<cloud dir>/spend-caps.json`, which `scripts/cloud-spend.py` reads on
+//! `<cloud dir>/spend-caps.json`, which `rsi-cloud spend` reads on
 //! every remote run, and builds the read-only report behind the operator-only
 //! `GetCloudSpend` RPC from the ledger `<cloud dir>/spend.md`.
 

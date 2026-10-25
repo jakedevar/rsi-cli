@@ -12,6 +12,12 @@ use super::SessionManager;
 
 /// A periodic pass that keeps the shared Store this long is logged (#3021).
 const SLOW_STORE_HOLD_MS: u64 = 100;
+/// #3486: a project whose last intent pass completed this recently skips a pass
+/// whose off-lock observation was rejected (an input changed while it ran)
+/// instead of re-reading everything under the shared Store lock; the next tick
+/// observes again. Past the window the pass reads under the lock, so a project
+/// on a store that never goes quiet is still reconciled.
+const INTENT_DEFER_WINDOW_SECS: i64 = 45;
 use crate::bus::DaemonEvent;
 use crate::error::Result;
 use crate::store::harness_manager_v2::refused;
@@ -127,6 +133,49 @@ impl SessionManager {
         changed
     }
 
+    /// #3154: one project-wide notice per OpenRouter spend line crossed (the
+    /// warn line, the stop line), deduped per arming across restarts by the
+    /// notice subject and the arming time. Reads the last probe the daemon's
+    /// spend loop keeps fresh; a cap that is off, or a state below the warn
+    /// line, notifies nothing.
+    async fn reconcile_openrouter_spend_notices(&self, projects: &[Uuid]) -> usize {
+        let enforcer = crate::openrouter_spend::SpendEnforcer::production(
+            std::sync::Arc::clone(&self.runtime_config),
+            std::sync::Arc::clone(&self.store),
+        );
+        let cap = enforcer.state(false).await;
+        let kinds: &[&str] = match cap.state {
+            rsi_common::openrouter_spend::SpendCapState::Warn => &["warn"],
+            // The stop line is its own, stronger notice; a jump straight past
+            // the warn line sends it alone.
+            rsi_common::openrouter_spend::SpendCapState::Reached => &["reached"],
+            _ => return 0,
+        };
+        let Some(armed_at) = cap.armed_at else {
+            return 0;
+        };
+        let detail = rsi_common::openrouter_spend::summary_line(&cap);
+        let mut changed = 0;
+        for kind in kinds {
+            for project in projects {
+                match crate::store_lock::lock(
+                    &self.store,
+                    "manager_coordinator::reconcile_openrouter_spend_notices",
+                )
+                .await
+                .record_openrouter_spend_notice(*project, kind, armed_at, &detail)
+                {
+                    Ok(Some(_)) => changed += 1,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(project_id=%project,error=%error,"OpenRouter spend notice deferred");
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// One cursor/guard serializes startup, event hints and periodic backstop.
     /// The cursor is only a bounded traversal hint; all ownership is durable.
     pub async fn reconcile_harness_managers_once(&self) -> Result<usize> {
@@ -217,6 +266,7 @@ impl SessionManager {
         // login loss (boxed: the coordinator future must not grow).
         changed += Box::pin(self.reconcile_provider_login_notices(&projects)).await;
         changed += Box::pin(self.reconcile_provider_contract_notices(&projects)).await;
+        changed += Box::pin(self.reconcile_openrouter_spend_notices(&projects)).await;
         for project in &projects {
             for episode in &unavailable_models {
                 match crate::store_lock::lock(
@@ -470,7 +520,14 @@ impl SessionManager {
         )
         .await;
         let held_since = std::time::Instant::now();
-        let result = guard.reconcile_manager_intent_observed(project, retry, observed);
+        let result = guard.reconcile_manager_intent_observed_with(
+            project,
+            retry,
+            observed,
+            crate::store::manager_intent::ObservationFallback::DeferWithin(
+                chrono::Duration::seconds(INTENT_DEFER_WINDOW_SECS),
+            ),
+        );
         let held_ms = held_since.elapsed().as_millis() as u64;
         drop(guard);
         // #3021: a periodic pass that holds the shared Store for a long time
@@ -481,8 +538,20 @@ impl SessionManager {
                 held_ms,
                 observation_offered,
                 read_under_lock = result.as_ref().is_ok_and(|r| r.read_under_lock),
+                deferred = result.as_ref().is_ok_and(|r| r.deferred),
+                observation_rejected = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.observation_rejected.as_deref())
+                    .unwrap_or(""),
                 "manager intent pass held the Store lock"
             );
+        } else if let Some(reason) = result
+            .as_ref()
+            .ok()
+            .and_then(|r| r.observation_rejected.as_deref())
+        {
+            tracing::debug!(project_id = %project, observation_rejected = reason, "manager intent observation rejected");
         }
         result
     }
@@ -530,6 +599,19 @@ impl SessionManager {
         if let Some((level, message)) = pass.notice {
             self.event_bus
                 .publish(DaemonEvent::SystemMessage { level, message });
+        }
+        if let Some(seat) = pass.seat_report.as_ref() {
+            // hub #3859: tell the hub once that this satellite's seat is down.
+            // Informational and at most once, so a refusal is only logged.
+            let queued = crate::store_lock::lock(
+                &self.store,
+                "manager_coordinator::queue_manager_seat_report",
+            )
+            .await
+            .queue_manager_seat_report(seat, chrono::Utc::now());
+            if let Err(error) = queued {
+                tracing::warn!(project_id=%project,error=%error,"manager seat report to the hub not queued");
+            }
         }
         let Some(claim) = pass.claim else {
             return Ok(changed);

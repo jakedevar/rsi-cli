@@ -42,7 +42,6 @@ use rsi_common::types::{
 use rsi_graph::format::{NodeDef, WorkflowDefinition};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::{DaemonError, Result};
@@ -146,11 +145,47 @@ fn clip(message: String) -> String {
     }
 }
 
+/// `execution_base_refused` carrying the underlying cause (git's stderr for a
+/// failed fetch or ref read, the dirty-path or custody reason) as a clipped
+/// diagnostic, so the caller can tell a transient ref lock from a bad base (#616).
+fn execution_base_refusal(error: DaemonError) -> DaemonError {
+    diagnostics_refusal(
+        "execution_base_refused",
+        "check base_commit and that the Epic's project repository is a clean checkout, then retry",
+        // Redact the whole text before clipping, so a cut cannot leave a
+        // half credential with no `@` to strip.
+        &[clip(strip_url_userinfo(&error_text(error)))],
+    )
+}
+
+/// Drop `user:token@` from every `scheme://` URL in a git error so a remote
+/// URL's credentials never reach the RPC caller.
+fn strip_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '\'' || c == '"')
+            .unwrap_or(tail.len());
+        let authority = &tail[..end];
+        out.push_str(authority.rsplit('@').next().unwrap_or(authority));
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn message(error: DaemonError) -> String {
-    clip(match error {
+    clip(error_text(error))
+}
+
+fn error_text(error: DaemonError) -> String {
+    match error {
         DaemonError::InvalidParam(text) | DaemonError::PolicyDenied(text) => text,
         other => other.to_string(),
-    })
+    }
 }
 
 // ─── request ledger (V133 `topology_agent_requests`) ───────────────────────
@@ -1067,7 +1102,7 @@ fn fanout_diagnostics(
 // ─── launch-time gate (plan §5.3) ──────────────────────────────────────────
 
 /// Re-check live policy before one agent-requested session launch. Returns
-/// the refusal code, or `None` to launch. Epic parenting applies the
+/// the refusal, or `None` to launch. Epic parenting applies the
 /// active, provider and spend caps inside the launch itself.
 fn global_launch_gate(
     store: &Store,
@@ -1076,52 +1111,60 @@ fn global_launch_gate(
     project: Uuid,
     requester: Uuid,
     launch: &ManagerLaunchChoiceV2,
-) -> Result<Option<&'static str>> {
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<LaunchRefusal>> {
     // #2472: `requester` is immutable provenance; the live owner is whoever
     // holds that portfolio node's seat now, re-proved against its grant here.
     let requester = live_owner(store, requester)?;
     let Ok(crate::store::harness_manager_v2::ManagerCallerV1::Global(authority)) =
         store.resolve_manager_caller(requester, Some(project))
     else {
-        return Ok(Some("manager_scope_changed"));
+        return Ok(Some("manager_scope_changed".into()));
     };
     let policy = &authority.grant.policy;
     let allowed = store.manager_effective_launches(&authority.config, &policy.allowed_launches)?;
     if !launch_granted(&allowed, launch) {
-        return Ok(Some("launch_not_granted"));
+        return Ok(Some("launch_not_granted".into()));
     }
     if execution.scope_version != Some(authority.config.row_version) {
-        return Ok(Some("manager_scope_changed"));
+        return Ok(Some("manager_scope_changed".into()));
     }
     if !policy
         .capabilities
         .contains(&ManagerCapabilityV2::Automation)
     {
-        return Ok(Some("capability_denied"));
+        return Ok(Some("capability_denied".into()));
     }
     let epic = execution.epic_id.or(execution.parent_session_id);
     if epic.is_none_or(|epic| !authority.config.epic_ids.contains(&epic)) {
-        return Ok(Some("epic_out_of_scope"));
+        return Ok(Some("epic_out_of_scope".into()));
     }
     if policy.mode != ManagerOperatingModeV2::Execute
         || policy.paused
         || epic.is_some_and(|epic| policy.paused_epic_ids.contains(&epic))
     {
-        return Ok(Some("manager_paused"));
+        return Ok(Some("manager_paused".into()));
     }
-    let usage = store.manager_v2_created_usage(&authority.config, false)?;
+    // A relaunch of this very attempt is already counted.
     let own = i64::from(attempt.boot_id.is_some());
-    if usage - own >= i64::from(policy.max_created_sessions) {
-        return Ok(Some("creation_limit"));
-    }
-    ancestor_allowance(store, &authority.config, 1, own)
+    creation_allowance(
+        store,
+        &authority.config,
+        policy.max_created_sessions,
+        policy.created_sessions_window_hours,
+        1,
+        own,
+        now,
+    )
 }
 
 /// #2472/#2532: the session that acts for an execution's recorded requester now. A
 /// portfolio seat that rotated (a context-cap transfer or a replacement
 /// within the same authority epoch) is represented by its node's current
 /// seat, and a rotated project manager seat by the appointment's current
-/// seat, and a rotated Epic lead by the Epic's current lead (#3241); any
+/// seat, a project manager seat an explicit re-appointment displaced by the
+/// appointment's current seat (#3274), and a rotated Epic lead by the Epic's
+/// current lead (#3241); any
 /// other requester is itself. `requested_by_session_id` stays the
 /// immutable provenance, and callers re-prove the returned session's live
 /// authority (grant, scope version, project, mode), so a revoked, re-granted
@@ -1135,37 +1178,114 @@ pub(crate) fn live_owner(store: &Store, requester: Uuid) -> Result<Uuid> {
     if let Some(seat) = store.project_manager_seat_now(requester)? {
         return Ok(seat);
     }
+    // #3274: a seat an explicit re-appointment displaced (the operator seated a
+    // fresh session) is represented by the appointment's current seat, which
+    // re-proves its own scope, so an Epic the new scope dropped still refuses.
+    if let Some(seat) = store.displaced_manager_seat_now(requester)? {
+        return Ok(seat);
+    }
     // #3241: an Epic lead that rotated at the context cap is represented by the
     // Epic's current lead, so the executions the predecessor started still land.
     Ok(store.epic_lead_seat_now(requester)?.unwrap_or(requester))
 }
 
-/// #1275: a topology session launch is charged against every ancestor's
-/// allowance too, exactly as a lifecycle `create_session` is. `counted` is
-/// the launches already charged (a relaunch of this attempt).
-fn ancestor_allowance(
+/// A launch gate refusal: the stable code and, for a creation allowance, the
+/// actionable detail (#3497).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LaunchRefusal {
+    pub(crate) code: &'static str,
+    detail: Option<String>,
+}
+
+impl From<&'static str> for LaunchRefusal {
+    fn from(code: &'static str) -> Self {
+        Self { code, detail: None }
+    }
+}
+
+impl LaunchRefusal {
+    /// What an attempt records as its error: the code alone, or the code
+    /// followed by the window, count and refill time.
+    pub(crate) fn error_text(&self) -> String {
+        match &self.detail {
+            Some(detail) => format!("{}: {detail}", self.code),
+            None => self.code.to_owned(),
+        }
+    }
+}
+
+/// #3497: the actionable text for a creation refusal the store produced.
+/// An ordinary exhausted window refills by itself, so it names the window,
+/// used/limit, the slots this launch needs and when enough have expired;
+/// raising the cap is the fallback, not the instruction.
+pub(crate) fn creation_refusal_detail(message: &str, own: bool) -> String {
+    let Some(detail) = rsi_common::manager_budget::CreationCapRefusalV1::parse(message) else {
+        return message.to_owned();
+    };
+    let whose = if own {
+        "your".to_owned()
+    } else {
+        format!("manager {}'s", detail.node_id)
+    };
+    let mut text = match detail.window_summary() {
+        Some(summary) => format!(
+            "{whose} {} allowance is spent ({summary}); this launch needs {} slot(s)",
+            detail.cap_field, detail.needed
+        ),
+        None => format!(
+            "{whose} {} allowance is spent ({} of {}); this launch needs {} slot(s)",
+            detail.cap_field, detail.used, detail.limit, detail.needed
+        ),
+    };
+    match (detail.window_hours, detail.next_free_at.as_deref()) {
+        (Some(_), Some(at)) => text.push_str(&format!(
+            "; the window refills on its own: retry after {at} and it is admitted with no operator change"
+        )),
+        (Some(_), None) => text.push_str(
+            "; nothing in the window will expire, so this launch needs more slots than the allowance holds",
+        ),
+        _ => {}
+    }
+    text.push_str(&format!("; to raise it instead: {}", detail.raise_in));
+    text
+}
+
+/// #1275, #3497: a topology session launch of `needed` creations (`counted`
+/// already charged) is judged against the caller's own rolling window and
+/// every ancestor's exactly as a lifecycle `create_session` is, at `now`.
+fn creation_allowance(
     store: &Store,
     config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    cap: u16,
+    window_hours: u16,
     needed: i64,
     counted: i64,
-) -> Result<Option<&'static str>> {
-    match store.manager_ancestor_creation_allowance(config, false, needed, counted) {
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<LaunchRefusal>> {
+    match store.manager_topology_creation_allowance_at(
+        config,
+        cap,
+        window_hours,
+        needed,
+        counted,
+        now,
+    ) {
         Ok(()) => Ok(None),
-        Err(DaemonError::InvalidParam(code))
-            if code.split(':').next()
-                == Some(rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT) =>
-        {
-            Ok(Some("creation_limit"))
-        }
-        Err(DaemonError::InvalidParam(code))
-            if code.starts_with(&format!(
-                "{}:",
-                rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED
-            )) =>
-        {
-            Ok(Some(
-                rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
-            ))
+        Err(DaemonError::InvalidParam(message)) => {
+            let code = message.split(':').next().unwrap_or_default();
+            if code == rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT {
+                Ok(Some(LaunchRefusal {
+                    code: "creation_limit",
+                    detail: Some(creation_refusal_detail(&message, true)),
+                }))
+            } else if code == rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED {
+                Ok(Some(LaunchRefusal {
+                    code: rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED,
+                    detail: Some(creation_refusal_detail(&message, false)),
+                }))
+            } else {
+                Err(DaemonError::InvalidParam(message))
+            }
         }
         Err(error) => Err(error),
     }
@@ -1173,7 +1293,7 @@ fn ancestor_allowance(
 
 /// #1641 S2: whether the manager or Epic lead that requested `execution`
 /// may still land on its behalf. Re-resolved from rows at every enqueue, so a
-/// revoked grant, a replaced lead, a paused manager or a moved scope stops
+/// revoked grant, an unavailable lead, a paused manager or a moved scope stops
 /// the landing (`Some(code)`). An execution no agent owns has nobody to land
 /// for.
 pub(crate) fn landing_gate(
@@ -1190,7 +1310,19 @@ pub(crate) fn landing_gate(
     ) else {
         return Ok(Some("owner_required"));
     };
-    let requester = live_owner(store, requester)?;
+    // #3784: an accepted lead execution belongs to its Epic through explicit
+    // replacements as well as rotations. The execution proves the original
+    // requester's role; resolve only this Epic's current lead, then re-prove
+    // its live authority below. Do not broaden live_owner for arbitrary workers.
+    let requester = if execution.requested_by_kind == "epic_lead" {
+        store
+            .get_session(epic)?
+            .filter(|row| row.project_id == execution.project_id)
+            .and_then(|row| row.lead_session_id)
+            .unwrap_or(requester)
+    } else {
+        live_owner(store, requester)?
+    };
     let Ok(caller) = TopologyCaller::resolve_in(store, requester, execution.project_id) else {
         return Ok(Some("requester_unauthorized"));
     };
@@ -1277,9 +1409,20 @@ pub(crate) fn launch_gate(
     store: &Store,
     execution: &ExecutionRow,
     attempt: &AttemptRow,
-) -> Result<Option<&'static str>> {
+) -> Result<Option<LaunchRefusal>> {
+    launch_gate_at(store, execution, attempt, chrono::Utc::now())
+}
+
+/// [`launch_gate`] judged at `now` (#3497: the creation window reads an
+/// injectable clock).
+pub(crate) fn launch_gate_at(
+    store: &Store,
+    execution: &ExecutionRow,
+    attempt: &AttemptRow,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<LaunchRefusal>> {
     let Some(project) = execution.project_id else {
-        return Ok(Some("project_required"));
+        return Ok(Some("project_required".into()));
     };
     let Some(node) = execution
         .definition
@@ -1287,10 +1430,10 @@ pub(crate) fn launch_gate(
         .iter()
         .find(|node| node.id == attempt.node_id)
     else {
-        return Ok(Some("node_missing"));
+        return Ok(Some("node_missing".into()));
     };
     let Some(launch) = attempt_launch(execution, node) else {
-        return Ok(Some("launch_not_explicit"));
+        return Ok(Some("launch_not_explicit".into()));
     };
     // #1235: an execution the global seat requested is governed only by its
     // grant, re-resolved here; a rotated, revoked or replaced seat's
@@ -1299,13 +1442,13 @@ pub(crate) fn launch_gate(
         && let Some(requester) = execution.requested_by_session_id
         && store.is_global_seat_ever(requester)?
     {
-        return global_launch_gate(store, execution, attempt, project, requester, &launch);
+        return global_launch_gate(store, execution, attempt, project, requester, &launch, now);
     }
     let grant = store
         .get_harness_manager_policy(project)?
         .filter(|grant| !grant.revoked);
     let Some(grant) = grant else {
-        return Ok(Some("launch_not_granted"));
+        return Ok(Some("launch_not_granted".into()));
     };
     let config = store.get_harness_manager(project)?;
     let allowed = match &config {
@@ -1313,41 +1456,45 @@ pub(crate) fn launch_gate(
         None => grant.policy.allowed_launches.clone(),
     };
     if !launch_granted(&allowed, &launch) {
-        return Ok(Some("launch_not_granted"));
+        return Ok(Some("launch_not_granted".into()));
     }
     if execution.requested_by_kind != "manager" {
         return Ok(None);
     }
     let Some(config) = config else {
-        return Ok(Some("manager_scope_changed"));
+        return Ok(Some("manager_scope_changed".into()));
     };
     let policy = &grant.policy;
     let epic = execution.epic_id.or(execution.parent_session_id);
     if execution.scope_version != Some(config.row_version) {
-        return Ok(Some("manager_scope_changed"));
+        return Ok(Some("manager_scope_changed".into()));
     }
     if !policy
         .capabilities
         .contains(&ManagerCapabilityV2::Automation)
     {
-        return Ok(Some("capability_denied"));
+        return Ok(Some("capability_denied".into()));
     }
     if epic.is_none_or(|epic| !config.epic_ids.contains(&epic)) {
-        return Ok(Some("epic_out_of_scope"));
+        return Ok(Some("epic_out_of_scope".into()));
     }
     if policy.mode != ManagerOperatingModeV2::Execute
         || policy.paused
         || epic.is_some_and(|epic| policy.paused_epic_ids.contains(&epic))
     {
-        return Ok(Some("manager_paused"));
+        return Ok(Some("manager_paused".into()));
     }
-    let usage = store.manager_v2_created_usage(&config, false)?;
     // A relaunch of this very attempt is already counted.
     let own = i64::from(attempt.boot_id.is_some());
-    if usage - own >= i64::from(policy.max_created_sessions) {
-        return Ok(Some("creation_limit"));
-    }
-    ancestor_allowance(store, &config, 1, own)
+    creation_allowance(
+        store,
+        &config,
+        policy.max_created_sessions,
+        policy.created_sessions_window_hours,
+        1,
+        own,
+        now,
+    )
 }
 
 // ─── verbs ─────────────────────────────────────────────────────────────────
@@ -1430,7 +1577,7 @@ struct UpsertDone {
 
 /// The launches the project's live grant allows, for a caller that holds no
 /// topology authority of its own (#2267). Empty when no live grant exists.
-fn project_allowed_launches(
+pub(crate) fn project_allowed_launches(
     store: &Store,
     project_id: Option<Uuid>,
 ) -> Result<Vec<ManagerLaunchChoiceV2>> {
@@ -2111,7 +2258,48 @@ fn execute_fingerprint(request: &AgentTopologyExecuteRequestV1) -> String {
     rows::digest(&fingerprint.to_string())
 }
 
+/// Read warnings under the same authority/acceptance lock as execution.
+/// Use the Epic's project, never a caller-supplied snapshot project.
+fn queued_landing_warnings(
+    store: &Store,
+    request: &AgentTopologyExecuteRequestV1,
+) -> Result<Vec<rsi_common::topology_agent::TopologyQueuedLandingWarningV1>> {
+    let Some(project) = store
+        .get_session(request.epic_id)?
+        .and_then(|epic| epic.project_id)
+    else {
+        return Ok(Vec::new());
+    };
+    let number = request
+        .inputs
+        .get("issue")
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            crate::topology::starters::issue_snapshot(Some(&request.inputs))
+                .filter(|(snapshot_project, _)| *snapshot_project == project)
+                .map(|(_, number)| number)
+        });
+    let Some(number) = number else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .live_rolling_queue_entries_for_issue(project, number)?
+        .into_iter()
+        .map(
+            |entry| rsi_common::topology_agent::TopologyQueuedLandingWarningV1 {
+                code: "topology_issue_landing_queued".into(),
+                issue: number,
+                entry_id: entry.id,
+                entry_sequence: entry.sequence,
+                state: entry.state,
+            },
+        )
+        .collect())
+}
+
 fn replayed(
+    store: &Store,
+    request: &AgentTopologyExecuteRequestV1,
     prior: &rows::PriorAcceptance,
     fingerprint: &str,
 ) -> Result<AgentTopologyExecuteResultV1> {
@@ -2122,6 +2310,7 @@ fn replayed(
         ));
     }
     Ok(AgentTopologyExecuteResultV1 {
+        warnings: queued_landing_warnings(store, request)?,
         execution_id: prior.execution_id,
         accepted_at: prior.accepted_at,
         base_commit: prior.base_commit.clone(),
@@ -2150,6 +2339,18 @@ fn admission_policy(
     caller: &TopologyCaller,
     record: &TopologyRecord,
     epic_id: Uuid,
+) -> Result<(Checked, Option<ManagerPolicyV2>, Option<i64>)> {
+    admission_policy_at(store, knobs, caller, record, epic_id, chrono::Utc::now())
+}
+
+/// [`admission_policy`] judged at `now` (#3497).
+pub(crate) fn admission_policy_at(
+    store: &Store,
+    knobs: AgentKnobs,
+    caller: &TopologyCaller,
+    record: &TopologyRecord,
+    epic_id: Uuid,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(Checked, Option<ManagerPolicyV2>, Option<i64>)> {
     caller.require_epic(store, epic_id, Reach::Effect)?;
     if !knobs.executor_enabled {
@@ -2180,34 +2381,36 @@ fn admission_policy(
         ));
     }
     let scope_version = if let TopologyCaller::Manager { authority, .. } = caller {
-        let usage = store.manager_v2_created_usage(&authority.config, false)?;
         let needed = i64::try_from(checked.session_nodes).unwrap_or(i64::MAX);
-        if usage.saturating_add(needed) > i64::from(authority.grant.policy.max_created_sessions) {
-            return Err(refusal(
-                "creation_limit",
-                "ask the operator to raise max_created_sessions for this manager",
-            ));
-        }
-        match ancestor_allowance(store, &authority.config, needed, 0)? {
-            None => {}
-            Some("creation_limit") => {
-                return Err(refusal(
-                    "creation_limit",
-                    "ask the operator to raise max_created_sessions for this manager",
-                ));
-            }
-            Some(code) => {
-                return Err(refusal(
-                    code,
-                    "a manager above you has no session allowance left in this project; report up",
-                ));
-            }
+        if let Some(refused) = creation_allowance(
+            store,
+            &authority.config,
+            authority.grant.policy.max_created_sessions,
+            authority.grant.policy.created_sessions_window_hours,
+            needed,
+            0,
+            now,
+        )? {
+            return Err(admission_creation_refusal(&refused));
         }
         Some(authority.config.row_version)
     } else {
         None
     };
     Ok((checked, policy, scope_version))
+}
+
+/// #3497: the typed admission refusal for a spent creation allowance. The
+/// code stays `creation_limit` (or the ancestor code); `next_action` names the
+/// window, the count, the slots this execution needs and the refill time.
+fn admission_creation_refusal(refused: &LaunchRefusal) -> DaemonError {
+    let detail = refused.detail.as_deref().unwrap_or_default();
+    let next_action = if refused.code == "creation_limit" {
+        detail.to_owned()
+    } else {
+        format!("a manager above you is out of session allowance: {detail}")
+    };
+    refusal(refused.code, &next_action)
 }
 
 fn admit(
@@ -2255,11 +2458,27 @@ fn admit(
     })
 }
 
+/// #3390: the current definition digest of `topology_id` when `caller` may
+/// execute it under `epic_id` (live, visible, not Epic-foreign), else `None`.
+/// The daemon's Issue dispatcher builds its `expected_digest` from it.
+pub(crate) fn executable_digest(
+    store: &Store,
+    caller: &TopologyCaller,
+    topology_id: Uuid,
+    epic_id: Uuid,
+) -> Option<String> {
+    TopologyRecord::load(&store.conn, topology_id)
+        .ok()
+        .flatten()
+        .filter(|record| !record.archived && caller.may_execute(record, epic_id))
+        .map(|record| record.digest())
+}
+
 /// `AgentTopologyExecute` (plan §5.1): accept one durable execution of a
 /// visible topology under an in-scope Epic. The caller publishes the
 /// `accepted` update and wakes the driver.
 pub(crate) async fn execute(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     knobs: impl Fn() -> AgentKnobs,
     caller_id: Uuid,
     request: &AgentTopologyExecuteRequestV1,
@@ -2319,7 +2538,7 @@ pub(crate) struct PreparedExecution {
 /// Admission under one lock, then the unlocked Git work (`origin/rolling`
 /// base resolution). Nothing is persisted; [`accept_prepared`] rechecks.
 pub(crate) async fn prepare_execute(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     knobs: AgentKnobs,
     caller_id: Uuid,
     request: &AgentTopologyExecuteRequestV1,
@@ -2336,7 +2555,7 @@ pub(crate) async fn prepare_execute(
         if let Some(prior) =
             rows::prior_acceptance(&store.conn, caller_id, &request.idempotency_key)?
         {
-            let replay = replayed(&prior, &fingerprint)?;
+            let replay = replayed(&store, request, &prior, &fingerprint)?;
             authorize_execution(&store, caller_id, replay.execution_id, Reach::Effect)?;
             return Ok(Prepared::Replay(Box::new(Executed {
                 result: replay,
@@ -2359,10 +2578,7 @@ pub(crate) async fn prepare_execute(
     .await
     .map_err(|error| {
         tracing::warn!(%error, "agent topology execution base refused");
-        refusal(
-            "execution_base_refused",
-            "check base_commit and that the Epic's project repository is a clean checkout, then retry",
-        )
+        execution_base_refusal(error)
     })?;
     let custody_plan = crate::session::graph_runner::plan_workflow_custody(&admitted.workflow)?;
     Ok(Prepared::Ready(Box::new(PreparedExecution {
@@ -2497,11 +2713,13 @@ pub(crate) fn accept_prepared(
         owner: None,
     };
     let base_commit = new.base_commit.clone();
+    let warnings = queued_landing_warnings(store, request)?;
     match rows::accept_agent_execution(store, &new)? {
         Acceptance::Fresh(update) => {
             crate::topology::issue_hold::mark_in_progress(store, caller_id, &inputs, id);
             Ok(Executed {
                 result: AgentTopologyExecuteResultV1 {
+                    warnings,
                     execution_id: id,
                     accepted_at: update.updated_at,
                     base_commit,
@@ -2521,6 +2739,7 @@ pub(crate) fn accept_prepared(
             base_commit,
         } => Ok(Executed {
             result: AgentTopologyExecuteResultV1 {
+                warnings,
                 execution_id,
                 accepted_at,
                 base_commit,
@@ -2765,7 +2984,9 @@ pub(crate) struct SettleWakeSeat {
 
 /// Hub #2967: arm the requester's one `topology_execution_settled` resume
 /// wake for an `AgentTopologyExecute`, the way `AgentEnqueueLandingSource`
-/// always wakes its enqueuer (#2405). Only a fresh acceptance arms it, and
+/// always wakes its enqueuer (#2405). #3387: that default wake is
+/// quiet-capable: a clean success is held in the requester's digest instead of
+/// opening a turn (`scheduler::wake_when`). Only a fresh acceptance arms it, and
 /// not under `wake:"none"`: the execution id is the key, and a replay
 /// (`executed.accepted` is `None`) reuses the first acceptance's wake, so an
 /// execution that settled in between never wakes its requester twice. The
@@ -2806,13 +3027,21 @@ pub(crate) fn arm_settle_wake(
     })
     .map_err(DaemonError::InvalidParam)
     .and_then(|(job, state)| {
-        crate::scheduler::arm_authorized_deduped(
+        let outcome = crate::scheduler::arm_authorized_deduped(
             store,
             &job,
             &state,
             true,
             crate::store::scheduled_jobs::SettleWakeDedupe::SkipIfCovered,
-        )
+        )?;
+        if outcome.armed {
+            // #3387: the daemon's own default wake is quiet-capable. A failed
+            // mark leaves an ordinary wake, which only ever wakes sooner.
+            if let Err(error) = store.mark_quiet_settle(job.id) {
+                tracing::warn!(%error, %execution_id, "topology settle wake not marked quiet");
+            }
+        }
+        Ok(outcome)
     });
     match armed {
         Ok(outcome) => SettleWakeArm {
@@ -2914,5 +3143,45 @@ mod launch_allowlist_tests {
         };
         assert!(!launch_granted(&[any], &other));
         assert!(!launch_granted(&[], &low));
+    }
+}
+
+#[cfg(test)]
+mod execution_base_refusal_tests {
+    use super::*;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn execution_base_refusal_names_the_underlying_cause() {
+        let error = execution_base_refusal(DaemonError::InvalidParam(
+            "cannot fetch origin/rolling: cannot lock ref 'refs/remotes/origin/rolling'".into(),
+        ));
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("expected a structured refusal");
+        };
+        assert_eq!(data["code"], "execution_base_refused");
+        let diagnostics = data["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .as_str()
+                .unwrap()
+                .contains("cannot lock ref 'refs/remotes/origin/rolling'")
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn execution_base_refusal_strips_remote_url_credentials() {
+        let error = execution_base_refusal(DaemonError::InvalidParam(
+            "cannot fetch origin/rolling: unable to access 'https://bot:s3cret@example.test/r.git/'"
+                .into(),
+        ));
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("expected a structured refusal");
+        };
+        let text = data["diagnostics"][0].as_str().unwrap();
+        assert!(text.contains("https://example.test/r.git/"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

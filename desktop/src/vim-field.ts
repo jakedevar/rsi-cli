@@ -33,9 +33,12 @@ export function isVimField(el: Element | null | undefined): el is VimField {
   return tag === 'INPUT' && (el as HTMLElement).dataset.vim === 'on' && (input.type === 'text' || input.type === 'search');
 }
 
-/** Does this field hold one line (an `<input>`)? `o` / `O` / `J` / `p` then never add a line. */
+/**
+ * Does this field hold one line (an `<input>`, or a wrapping one-line `<textarea data-line="single">`, form-field.ts)?
+ * `o` / `O` / `J` / `p` then never add a line.
+ */
 export function isSingleLine(el: VimField): boolean {
-  return el.tagName === 'INPUT';
+  return el.tagName === 'INPUT' || el.dataset.line === 'single';
 }
 
 /** Called whenever a field's mode changes (the mode badge). */

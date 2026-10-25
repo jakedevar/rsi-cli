@@ -213,13 +213,10 @@ fn refuse_candidate(
     check: Option<rsi_common::sandbox_storage::SandboxReclaimCheck>,
 ) {
     increment_reclaim_skip(report, reason);
-    let for_reason = refusals
-        .iter()
-        .filter(|sample| sample.reason == reason)
-        .count();
-    if refusals.len() >= rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_MAX
-        || for_reason >= rsi_common::sandbox_storage::SANDBOX_BUILD_CACHE_REFUSAL_SAMPLES_PER_REASON
-    {
+    // A live consumer is named for every fenced candidate (#3364), under its
+    // own bound; every other reason keeps the small shared sample.
+    let full = rsi_common::sandbox_storage::sandbox_refusal_samples_full(refusals, reason);
+    if full {
         return;
     }
     refusals.push(SandboxBuildCacheReclaimRefusalV2 {
@@ -511,6 +508,8 @@ struct SandboxReclaimEvidence {
     shared_target: Option<rsi_common::sandbox_storage::SandboxSharedTargetReclaimV1>,
     /// Sandbox directories no live session owns whose `target/` is on disk (#2682).
     stray_targets: Option<rsi_common::sandbox_storage::SandboxStrayTargetsV1>,
+    /// Registered manager build targets under `build-targets` (#3261).
+    build_targets: Option<rsi_common::sandbox_storage::SandboxBuildTargetsV1>,
 }
 
 /// How long a computed storage-status preview is served before the next read
@@ -518,8 +517,8 @@ struct SandboxReclaimEvidence {
 /// invalidates it sooner.
 pub(crate) const SANDBOX_STORAGE_PREVIEW_TTL: Duration = Duration::from_secs(60);
 
-/// Launch admission retries frequently; disk holds request at most one full
-/// reclaim pass every three minutes across all managers on this daemon.
+/// Launch and governor admission retry frequently; share one full reclaim pass
+/// every three minutes across both paths on this daemon.
 const LAUNCH_HOLD_RECLAIM_DEBOUNCE: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Default)]
@@ -590,6 +589,7 @@ impl SandboxReclaimRun {
             refusals: self.evidence.refusals,
             shared_target: self.evidence.shared_target,
             stray_targets: self.evidence.stray_targets,
+            build_targets: self.evidence.build_targets,
             computed_at: None,
             age_ms: None,
         })
@@ -850,6 +850,24 @@ fn run_sandbox_reclaim_job(
                     None
                 }
             });
+            // #3261: the registered manager build targets (`~/.rsi/build-targets`)
+            // belong to no sandbox row either. A preview reports what is live,
+            // reclaimable and kept; the hourly scratch pass owns the deletion.
+            if dry_run {
+                // #646: the open jobs tell a target whose worktree is gone from
+                // one a job is about to use; an unreadable store says unknown.
+                let open_jobs = stray_inputs.as_ref().and_then(|(store, _)| {
+                    runtime.block_on(async {
+                        let store = tokio::time::timeout(Duration::from_secs(5), store.lock())
+                            .await
+                            .ok()?;
+                        crate::agent_scratch_reclaim::open_jobs(&store)
+                    })
+                });
+                run.evidence.build_targets = tracing::dispatcher::with_default(&dispatch, || {
+                    crate::agent_scratch_reclaim::build_targets_status(open_jobs)
+                });
+            }
             if let Some(shared) = &run.evidence.shared_target {
                 run.report.reclaimed_bytes = run
                     .report
@@ -1087,12 +1105,12 @@ fn maybe_panic_reclaim_job_for_test(_manager_key: usize) {}
 #[derive(Clone)]
 struct SandboxReclaimContext {
     active: Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime_config: Arc<RuntimeConfig>,
     sandbox_allocator: Arc<SandboxAllocator>,
 }
 
-fn sandbox_reclaim_manager_key(store: &Arc<tokio::sync::Mutex<Store>>) -> usize {
+fn sandbox_reclaim_manager_key(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> usize {
     Arc::as_ptr(store).addr()
 }
 
@@ -2436,7 +2454,7 @@ pub(super) fn take_capacity_provider_spawn_failure(session_id: Uuid) -> bool {
 /// armed, dropping the guard removes exactly this incarnation from `active`
 /// and reaps its process cohort. The caller settles the durable rows.
 struct UnmonitoredLaunchGuard {
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     active: Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
     session_id: Uuid,
     generation: u64,
@@ -3248,7 +3266,7 @@ fn failed_agent_spawn_child_session(
 /// a caller with an already-spawned provider must stop that backend before
 /// terminally settling its admission.
 async fn persist_scheduled_fresh_disabled_row_before_active(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session: &Session,
     admission_permit: &crate::model_control::AdmissionPermit,
 ) -> Result<()> {
@@ -3301,7 +3319,7 @@ async fn persist_scheduled_fresh_disabled_row_before_active(
 /// another backend while this one still consumes resources. App-server launch
 /// is deferred and reaches this seam with no process, so it can settle directly.
 async fn cleanup_failed_scheduled_fresh_before_active(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     session_id: Uuid,
     admission_permit: &crate::model_control::AdmissionPermit,
@@ -3381,7 +3399,7 @@ fn launch_owner_from_config(
 }
 
 async fn load_session_invocation_id(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Result<Option<Uuid>> {
     let store_ref = Arc::clone(store);
@@ -3394,7 +3412,7 @@ async fn load_session_invocation_id(
 }
 
 async fn resolve_parent_invocation_id_for_launch(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     config: &LaunchConfig,
 ) -> Result<Option<Uuid>> {
     let Some(parent_id) = config.parent_id else {
@@ -3437,7 +3455,7 @@ enum DurableSessionRowCheck {
 
 async fn signal_controller_candidate_confirmation(
     context: &mut ControllerTransferLaunchContext,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     provider: SessionProvider,
     admission_invocation_id: Uuid,
@@ -3508,7 +3526,7 @@ async fn signal_controller_candidate_confirmation(
 
 async fn signal_agent_successor_confirmation(
     context: &mut AgentSuccessorLaunchContext,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     provider: SessionProvider,
     admission_invocation_id: Uuid,
@@ -3645,7 +3663,7 @@ async fn acquire_deferred_successor_start_permit(
 async fn settle_failed_deferred_manager_action(
     context: &super::types::ManagerActionLaunchContext,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     permit: &crate::model_control::AdmissionPermit,
@@ -3727,7 +3745,7 @@ async fn settle_failed_deferred_manager_action(
 async fn settle_failed_deferred_agent_successor(
     context: &mut AgentSuccessorLaunchContext,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     permit: &crate::model_control::AdmissionPermit,
@@ -3821,7 +3839,7 @@ async fn settle_failed_deferred_agent_successor(
 
 async fn settle_rejected_agent_successor_provider_effect(
     context: &AgentSuccessorLaunchContext,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     permit: &crate::model_control::AdmissionPermit,
@@ -3876,7 +3894,7 @@ async fn settle_rejected_agent_successor_provider_effect(
 
 async fn settle_failed_pre_provider_agent_successor(
     context: &mut AgentSuccessorLaunchContext,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     permit: &crate::model_control::AdmissionPermit,
@@ -3923,13 +3941,41 @@ async fn settle_failed_pre_provider_agent_successor(
 /// generic direct launches use the common bound-launch failure transaction.
 async fn settle_failed_bound_fresh_pre_provider(
     launch_purpose: &mut LaunchPurpose,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     session_id: Uuid,
     permit: &crate::model_control::AdmissionPermit,
     reason: &str,
     safe_error_class: &str,
+) -> Result<()> {
+    settle_failed_bound_fresh_pre_provider_detailed(
+        launch_purpose,
+        store,
+        event_bus,
+        agent_tokens,
+        session_id,
+        permit,
+        reason,
+        safe_error_class,
+        None,
+    )
+    .await
+}
+
+/// `settle_failed_bound_fresh_pre_provider` plus the bounded, redacted text of
+/// the underlying error (#3640), kept on the session's failure System event so a
+/// custody `ContextRead` refusal is no longer a bare class.
+async fn settle_failed_bound_fresh_pre_provider_detailed(
+    launch_purpose: &mut LaunchPurpose,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    event_bus: &Arc<crate::bus::EventBus>,
+    agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
+    session_id: Uuid,
+    permit: &crate::model_control::AdmissionPermit,
+    reason: &str,
+    safe_error_class: &str,
+    detail: Option<&str>,
 ) -> Result<()> {
     #[cfg(test)]
     if take_pre_provider_settlement_failure_for_test(session_id) {
@@ -3967,10 +4013,11 @@ async fn settle_failed_bound_fresh_pre_provider(
         | LaunchPurpose::TopologyNode(_)
         | LaunchPurpose::ControllerCandidate(_)
         | LaunchPurpose::ClosureSource(_) => {
-            store
-                .lock()
-                .await
-                .fail_bound_direct_launch(session_id, safe_error_class)?;
+            store.lock().await.fail_bound_direct_launch_detailed(
+                session_id,
+                safe_error_class,
+                detail,
+            )?;
         }
     }
     complete_invocation(
@@ -4047,7 +4094,7 @@ fn provider_spawn_failure_classifies_missing_route_credential() {
 /// from touching a replacement incarnation of the same logical Session.
 pub(super) async fn settle_failed_deferred_execution_scratch(
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     agent_tokens: &Arc<tokio::sync::RwLock<super::AgentTokenRegistry>>,
     custody_runtime: &crate::sandbox::custody::CustodyExecutionRuntime,
@@ -4065,7 +4112,7 @@ pub(super) async fn settle_failed_deferred_execution_scratch(
     // bound to this launch's invocation. Read under the active-registry guard.
     async fn is_exact_incarnation(
         active: &HashMap<Uuid, TrackedSession>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         permit: &crate::model_control::AdmissionPermit,
         spawn_generation: u64,
@@ -4490,7 +4537,7 @@ impl SessionManager {
     /// factory build a driver that shares the same store as `SessionManager`.
     pub(crate) fn recursive_dag_live_store_handle(
         &self,
-    ) -> Arc<tokio::sync::Mutex<crate::store::Store>> {
+    ) -> Arc<rsid_core::store_lock::Mutex<crate::store::Store>> {
         Arc::clone(&self.store)
     }
 
@@ -4592,6 +4639,23 @@ impl SessionManager {
             LaunchPurpose::Interactive,
             None,
         )
+        .await
+    }
+
+    /// Provider Setup launches carry a durable reference, never a copied key.
+    pub(crate) async fn launch_session_with_custom_provider(
+        &self,
+        config: LaunchConfig,
+        custom_provider_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        Box::pin(self.launch_session_with_retry_admission(
+            config,
+            None,
+            false,
+            LaunchPurpose::Interactive,
+            None,
+            custom_provider_id,
+        ))
         .await
     }
 
@@ -4922,6 +4986,9 @@ impl SessionManager {
             topology_iteration: reservation.request.iteration.unwrap_or(0),
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         })
     }
 
@@ -5845,6 +5912,7 @@ impl SessionManager {
             initial_rotation_disabled,
             launch_purpose,
             preheld_cwd_admission,
+            None,
         ))
     }
 
@@ -5952,6 +6020,23 @@ impl SessionManager {
             self.enforce_launch_provider_logged_in(identity.provider, identity.model.as_deref()),
         )
         .await?;
+        // #3154: an OpenRouter-billed launch is refused at the operator's spend
+        // ceiling (less the per-launch reserve), and while an armed cap's probe
+        // is stale. Before any side effect, like the checks above.
+        if crate::openrouter_spend::launch_bills_openrouter(
+            identity.provider,
+            config.openai_base_url.as_deref(),
+            identity.model.as_deref(),
+        ) {
+            Box::pin(
+                crate::openrouter_spend::SpendEnforcer::production(
+                    Arc::clone(&self.runtime_config),
+                    Arc::clone(&self.store),
+                )
+                .admit_launch(),
+            )
+            .await?;
+        }
         // #2768: an `ultracode` launch is checked against the CLI's own
         // ladder, so read it once if this daemon has not yet. Unit tests never
         // probe the ambient CLI; `ensure_effort_ladders_for` has its own test.
@@ -6298,12 +6383,35 @@ impl SessionManager {
         Box::pin(async move {
             let mut allocation_source_commit = None;
             let allocation = match config.sandbox.as_ref() {
+                // Hub #3315: `$HOME` is itself a git repository; no session of
+                // the home project (a global or portfolio seat, or a child it
+                // spawns) ever gets a worktree of it.
+                Some(_) if config.project_id == Some(rsi_common::types::Project::HOME_ID) => {
+                    return Err(DaemonError::InvalidParam(
+                        rsi_common::types::Project::HOME_SANDBOX_REFUSED.into(),
+                    ));
+                }
                 Some(spec) => {
                     let kind = spec.kind.unwrap_or(SandboxKind::GitWorktree);
                     if kind != SandboxKind::GitWorktree {
                         return Err(DaemonError::InvalidParam(format!(
                             "unsupported sandbox kind: {kind:?}"
                         )));
+                    }
+                    // #578: a known provider/cohort hold must not leave a new
+                    // allocation on every retry. Keep the later resource and
+                    // model-admission checks: policy can change during Git.
+                    if let Some(parent) = config.parent_id
+                        && (launch_purpose.topology_node().is_some()
+                            || launch_purpose.manager_action().is_some())
+                    {
+                        self.store
+                            .lock()
+                            .await
+                            .manager_v2_resource_gate_for_parent(
+                                parent,
+                                config.provider.unwrap_or_default(),
+                            )?;
                     }
                     crate::launch_breadcrumbs::note_phase(
                         session_id,
@@ -6483,6 +6591,29 @@ impl SessionManager {
                                 commit,
                                 spec.branch.as_deref(),
                             )
+                        } else if (launch_purpose.topology_node().is_some()
+                            || launch_purpose.manager_action().is_some())
+                            && std::fs::symlink_metadata(
+                                self.sandbox_allocator
+                                    .base_dir()
+                                    .join(session_id.to_string()),
+                            )
+                            .is_ok()
+                        {
+                            // The reserved session/dedup identity still owns the
+                            // retry under the spawn guard. A pathname proves no
+                            // custody: retain the old root and reserve a fresh
+                            // allocation UUID/branch, then bind it in the usual
+                            // session/custody transaction. Explicit branch policy
+                            // still applies and may refuse an occupied branch.
+                            self.sandbox_allocator.allocate_replacement_with_permit(
+                                allocation_permit,
+                                session_id,
+                                &source_origin,
+                                kind,
+                                commit,
+                                spec.branch.as_deref(),
+                            )
                         } else {
                             self.sandbox_allocator.allocate_with_permit(
                                 allocation_permit,
@@ -6542,6 +6673,7 @@ impl SessionManager {
         initial_rotation_disabled: bool,
         mut launch_purpose: LaunchPurpose,
         preheld_cwd_admission: Option<super::spawn_single_flight::ProviderCwdAdmissionGuard>,
+        custom_provider_id: Option<Uuid>,
     ) -> Result<Uuid> {
         if self
             .restart_draining
@@ -6589,6 +6721,20 @@ impl SessionManager {
         // effect (sandbox allocation, custody, session row, admission). The
         // check runs on the EFFECTIVE model: project and provider defaults are
         // resolved first, exactly as the launch does below.
+        let custom_provider_binding = {
+            let store = self.store.lock().await;
+            super::custom_provider_launch::resolve(
+                &store,
+                &crate::vault::global(),
+                &mut config,
+                None,
+                custom_provider_id,
+            )?
+        };
+        config.provider = super::harness::provider::provider_for_explicit_endpoint(
+            config.provider,
+            config.openai_base_url.as_deref(),
+        )?;
         self.freeze_launch_identity(&mut config, authenticated_retry)
             .await?;
         // #694 K1: refresh a missing/expired credential check (single-flight,
@@ -6600,7 +6746,10 @@ impl SessionManager {
         let context_rotation_enabled = self
             .runtime_config
             .context_rotation_enabled
-            .load(Ordering::Relaxed);
+            .load(Ordering::Relaxed)
+            // #3177: a per-launch knob turns rotation off for this session only;
+            // the stored `rotation_disabled_at` keeps it off across continues.
+            && !config.loop_knobs.rotation_off;
 
         // Acquire settlement-producer ownership before sandbox allocation,
         // persistence, admission, or provider spawn. Once shutdown seals new
@@ -6624,6 +6773,33 @@ impl SessionManager {
 
         // #1166: name the await this launch is parked at for the watchdog.
         let _launch_phase = crate::launch_breadcrumbs::PhaseGuard::new(session_id, "start");
+        // #3176: a container exec target runs only on the Harness loop and is
+        // validated against the live docker host before any side effect (sandbox,
+        // session row, admission), so a refusal leaves nothing to clean up. A
+        // session with a stored binding (a retry) resolves that one instead.
+        if config.exec_target.is_container()
+            && !matches!(
+                config.provider,
+                Some(
+                    SessionProvider::Harness
+                        | SessionProvider::OpenRouter
+                        | SessionProvider::Bedrock
+                )
+            )
+        {
+            return Err(DaemonError::PolicyDenied(format!(
+                "{}:provider_not_harness",
+                rsi_common::exec_target::EXEC_TARGET_INVALID
+            )));
+        }
+        config.exec_target = super::exec_target_launch::resolve_launch_exec_target(
+            &self.store,
+            &self.runtime_config,
+            session_id,
+            config.continued_from,
+            &config.exec_target,
+        )
+        .await?;
         // Workers always disable incremental builds. Leads and managers do
         // so when the configured sccache is available; otherwise they retain
         // their incremental builds.
@@ -6962,6 +7138,16 @@ impl SessionManager {
         } else {
             provider
         };
+
+        // Write the nonsecret route before ANY session-row admission. A
+        // rejected write leaves no resumable row; a crash after this write
+        // leaves either a bound row or an unused binding for this fresh UUID.
+        // Persisting at spawn was too late: direct launches already committed
+        // their session and could later resume without the lost route (#625).
+        if let Some(binding) = custom_provider_binding {
+            let store = self.store.lock().await;
+            super::custom_provider_launch::persist(&store, session_id, binding, provider)?;
+        }
 
         if config.configured_context_window.is_none() {
             config.configured_context_window = retry_admission.as_ref().and_then(|admission| {
@@ -7675,6 +7861,21 @@ impl SessionManager {
             self.check_manager_action_runtime(&context.claim, false)
                 .await?;
         }
+        if let Some(context) = launch_purpose.manager_action() {
+            // #3907: the lost lead's replacement must already be the durable
+            // Epic lead when its first provider turn reads its authority.
+            let published = self
+                .store
+                .lock()
+                .await
+                .publish_manager_lost_lead_replacement(&context.claim)?;
+            if published {
+                let target = context.claim.operation.context.target_session_id;
+                let epic = config.parent_id.expect("replacement epic");
+                self.set_lead_in_memory(epic, target).await;
+                self.publish_lead_delta(epic, target);
+            }
+        }
         // A delegated portfolio seat must hold its carried grant before any
         // provider context, token or first turn can observe its authority.
         // Model admission above still charges the launch to the grantor.
@@ -7740,18 +7941,24 @@ impl SessionManager {
             match context_effect {
                 Ok(permit) => Some(permit),
                 Err(error) => {
+                    // #3640: keep the custody error (bounded, redacted) on the
+                    // failed session instead of a bare class.
+                    let detail = super::manager_actions::bounded_error_detail(&error);
+                    tracing::warn!(session_id=%session_id, %detail, "fresh launch ContextRead authorization failed");
                     if let Some(admission_permit) = direct_admission.as_ref()
-                        && let Err(settlement_error) = settle_failed_bound_fresh_pre_provider(
-                            &mut launch_purpose,
-                            &self.store,
-                            self.event_bus(),
-                            &self.agent_tokens,
-                            session_id,
-                            admission_permit,
-                            "fresh launch ContextRead authorization failed",
-                            "session_context_authorization_failed",
-                        )
-                        .await
+                        && let Err(settlement_error) =
+                            settle_failed_bound_fresh_pre_provider_detailed(
+                                &mut launch_purpose,
+                                &self.store,
+                                self.event_bus(),
+                                &self.agent_tokens,
+                                session_id,
+                                admission_permit,
+                                "fresh launch ContextRead authorization failed",
+                                "session_context_authorization_failed",
+                                Some(&detail),
+                            )
+                            .await
                     {
                         tracing::warn!(session_id=%session_id, error=%settlement_error, "failed to settle ContextRead authorization failure; original refusal preserved");
                     }
@@ -8358,6 +8565,20 @@ impl SessionManager {
                 )
                 .await?;
             config.completion_gates = launch_completion_gates;
+            // #3176: a container exec target rides the same durable-launch rule
+            // as a tool policy: a later continue must find the binding.
+            if config.exec_target.is_container()
+                && !(direct_interactive
+                    || config.continued_from.is_some()
+                    || initial_rotation_disabled
+                    || launch_purpose.is_controller_candidate()
+                    || launch_purpose.is_agent_successor()
+                    || launch_purpose.agent_child().is_some())
+            {
+                return Err(DaemonError::InvalidParam(
+                    "exec_target_requires_durable_launch".into(),
+                ));
+            }
             let launch_tool_policy = super::tool_policy_launch::resolve_launch_tool_policy(
                 &self.store,
                 session_id,
@@ -8664,6 +8885,21 @@ impl SessionManager {
                 }
                 (other, _, _) => other,
             };
+            // #3176: record a daemon-built container target now that the session
+            // row exists, so a continue, a restart resume and a rotation rebuild
+            // the same target. A failure stops the launch like any admission
+            // failure; the stored first row wins on a retry.
+            let admission_result = match admission_result {
+                Ok(()) if config.exec_target.is_container() => {
+                    super::exec_target_launch::persist_launch_exec_target(
+                        &self.store,
+                        session_id,
+                        &config.exec_target,
+                    )
+                    .await
+                }
+                other => other,
+            };
             if let Err(error) = admission_result {
                 if initial_rotation_disabled {
                     return Err(cleanup_failed_scheduled_fresh_before_active(
@@ -8821,6 +9057,10 @@ impl SessionManager {
             };
 
         let manager_action_context = launch_purpose.manager_action().cloned();
+        // #3222: a topology node session carries its deterministic title from
+        // the executor; its query opens with the untrusted-data envelope, which
+        // a title model summarised instead of the task.
+        let is_topology_node_launch = launch_purpose.is_topology_node();
         let suppress_generic_lead_promotion = launch_purpose.is_agent_successor()
             || launch_purpose.is_topology_node()
             || manager_action_context.is_some()
@@ -8971,12 +9211,15 @@ impl SessionManager {
         let completed_for_title = Arc::clone(&completed);
         let store_for_title = self.store.clone();
         let config_session_kind = config.session_kind.unwrap_or_default();
-        let should_generate_title = super::title::should_enqueue_initial_title_generation(
-            config_session_kind,
-            config.parent_id,
-            config.agent_role.as_deref(),
-            config.epic_spawn_ordinal,
-        );
+        let should_generate_title = !is_topology_node_launch
+            // #3935: a bench trial gets no title; the call is a second model route.
+            && config.bench().is_none()
+            && super::title::should_enqueue_initial_title_generation(
+                config_session_kind,
+                config.parent_id,
+                config.agent_role.as_deref(),
+                config.epic_spawn_ordinal,
+            );
         // Lead authority is resolved here, after the auto-promotion above, so a
         // session that leads a container is titled for that authority rather
         // than for the craft named in its prompt.
@@ -11014,6 +11257,45 @@ impl SessionManager {
         if !matches!(hold.reason(), "disk_pressure" | "sandbox_free_space") {
             return;
         }
+        self.request_disk_hold_reclaim("launch_hold", hold.reason());
+    }
+
+    /// Cargo-slot clients (including daemon jobs) poll this same admission
+    /// path. A disk wait requests maintenance without waiting for the reclaim
+    /// worker or holding the governor lock; the next poll observes freed space.
+    pub(crate) fn acquire_resource_admission(
+        &self,
+        governor: &crate::governor::Governor,
+        params: &crate::governor::AcquireParams,
+    ) -> std::result::Result<crate::governor::AcquireOutcome, String> {
+        self.acquire_resource_admission_with_credit(governor, params, 0.0)
+    }
+
+    pub(crate) fn acquire_resource_admission_with_credit(
+        &self,
+        governor: &crate::governor::Governor,
+        params: &crate::governor::AcquireParams,
+        disk_credit_gb: f64,
+    ) -> std::result::Result<crate::governor::AcquireOutcome, String> {
+        let outcome = governor.acquire_with_disk_credit(
+            &self.runtime_config.governor_policy(),
+            params,
+            disk_credit_gb,
+        )?;
+        if matches!(
+            &outcome,
+            crate::governor::AcquireOutcome::Queued {
+                reason: crate::governor::BlockReason::Disk { .. }
+                    | crate::governor::BlockReason::DiskGrowth { .. },
+                ..
+            }
+        ) {
+            self.request_disk_hold_reclaim("governor_disk", "disk_pressure");
+        }
+        Ok(outcome)
+    }
+
+    fn request_disk_hold_reclaim(&self, trigger: &'static str, reason: &'static str) {
         let mut last = self
             .launch_hold_reclaim
             .last_request
@@ -11027,13 +11309,13 @@ impl SessionManager {
         // and retry on every admission tick. Its submission path logs errors.
         *last = Some(now);
         if self
-            .submit_sandbox_build_cache_reclaim(false, false, "launch_hold")
+            .submit_sandbox_build_cache_reclaim(false, false, trigger)
             .is_ok()
         {
             tracing::info!(
-                trigger = "launch_hold",
-                reason = hold.reason(),
-                "Sandbox build-cache reclaim pass accepted for held launch"
+                trigger,
+                reason,
+                "Sandbox build-cache reclaim pass accepted for disk-held admission"
             );
             #[cfg(test)]
             self.launch_hold_reclaim
@@ -11783,7 +12065,11 @@ impl SessionManager {
                         candidate.custody_id,
                         candidate.generation,
                         outcome.bytes,
-                        outcome.kind == TargetReclaimKind::StagedPending,
+                        (outcome.kind == TargetReclaimKind::StagedPending).then(|| {
+                            outcome
+                                .reason
+                                .unwrap_or(ReclaimSkipReason::StagedDeletionIncomplete)
+                        }),
                     )
                 {
                     tracing::warn!(%error, session_id = %candidate.session_id,
@@ -12077,6 +12363,79 @@ mod tests {
 
     fn manager() -> (SessionManager, TempDir, TempDir) {
         manager_with_smoke_suppress_retry_restore(false)
+    }
+
+    /// #143: a daemon whose HOME and project sit under a symlinked temp dir
+    /// (macOS `/tmp` -> `/private/tmp`) allocates in the canonical base. The
+    /// permit itself still refuses the non-canonical alias.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_under_symlinked_temp_dir_uses_canonical_base_143() {
+        let fixture = disk_backed_tempdir("symlinked-tmp-");
+        let real = fixture.path().join("private-tmp");
+        std::fs::create_dir(&real).unwrap();
+        let alias = fixture.path().join("tmp");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let configured_base = alias.join("home/.rsi/sandboxes");
+        let project = alias.join("project");
+        std::fs::create_dir(&project).unwrap();
+        init_d00_git_repo(&project);
+
+        let db_dir = disk_backed_tempdir("symlinked-tmp-db-");
+        let store = Store::open_test_fixture(&db_dir.path().join("rsi.db")).expect("open store");
+        let runtime_config = RuntimeConfig::from_config(&Config::from_env());
+        runtime_config
+            .sandbox_min_free_gib
+            .store(0, Ordering::Relaxed);
+        let manager = SessionManager::new(
+            Arc::new(EventBus::new(16)),
+            store,
+            false,
+            db_dir.path().join("daemon.sock"),
+            None,
+            Vec::new(),
+            runtime_config,
+            configured_base.clone(),
+        )
+        .expect("manager");
+
+        let canonical_base = std::fs::canonicalize(&real)
+            .unwrap()
+            .join("home/.rsi/sandboxes");
+        assert_eq!(manager.sandbox_allocator.base_dir(), canonical_base);
+        let alias_refusal = AllocationPermit::acquire(&configured_base)
+            .await
+            .err()
+            .expect("the permit still refuses a base reached through a symlink");
+        assert!(
+            alias_refusal
+                .to_string()
+                .contains("exact canonical directory")
+        );
+
+        let permit = manager
+            .admit_sandbox_allocation()
+            .await
+            .expect("admission under a symlinked temp dir");
+        let session_id = Uuid::new_v4();
+        let allocation = manager
+            .sandbox_allocator
+            .allocate_with_permit(
+                permit,
+                session_id,
+                &project,
+                SandboxKind::GitWorktree,
+                "HEAD",
+                None,
+            )
+            .expect("allocate a worktree for a project under the symlinked temp dir");
+        assert_eq!(allocation.root, canonical_base.join(session_id.to_string()));
+        assert_eq!(
+            std::fs::canonicalize(&allocation.root).unwrap(),
+            allocation.root
+        );
+        assert!(allocation.root.join("README.md").is_file());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -12880,6 +13239,131 @@ mod tests {
         );
     }
 
+    /// #3154: with the OpenRouter spend ceiling armed, an OpenRouter-billed
+    /// launch (the OpenRouter provider, or a Harness session on the OpenRouter
+    /// endpoint) is refused once the spend plus the per-launch reserve reaches
+    /// the stop line, before any sandbox exists; a launch that does not bill
+    /// the OpenRouter account is untouched, and so is every launch while the
+    /// cap is off.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn an_openrouter_billed_launch_is_refused_at_the_spend_ceiling() {
+        use crate::provider_status::{ProviderStatusService, SpendProbe};
+        let (manager, _db_dir, sandbox_base) = manager();
+        let work = tempfile::tempdir().expect("work dir");
+        let service = ProviderStatusService::global();
+        let openrouter = |work: &std::path::Path| {
+            let mut config = direct_interactive_test_config(work.to_path_buf());
+            config.provider = Some(SessionProvider::OpenRouter);
+            config.model = Some("deepseek/deepseek-v4.1-flash".into());
+            config
+        };
+        let harness_on = |work: &std::path::Path, url: &str| {
+            let mut config = direct_interactive_test_config(work.to_path_buf());
+            config.provider = Some(SessionProvider::Harness);
+            config.model = Some("vendor/model".into());
+            config.openai_base_url = Some(url.to_string());
+            config
+        };
+
+        // Cap off: nothing is checked and no probe is needed.
+        let mut off = openrouter(work.path());
+        manager
+            .freeze_launch_identity(&mut off, false)
+            .await
+            .expect("an off cap admits");
+
+        // Armed at baseline 514.968 with a $100 cap; $90 spent on the last probe.
+        manager
+            .runtime_config
+            .arm_openrouter_spend_cap(100.0, 514.968, chrono::Utc::now());
+        service.set_usage_probe_for_test(Some(SpendProbe {
+            total_usage: 514.968 + 90.0,
+            at: chrono::Utc::now(),
+        }));
+        let mut under = openrouter(work.path());
+        manager
+            .freeze_launch_identity(&mut under, false)
+            .await
+            .expect("under the line admits");
+
+        // $99.60 spent: inside the $0.50 launch reserve, so both billed shapes
+        // are refused with the typed code, and no sandbox was allocated.
+        service.set_usage_probe_for_test(Some(SpendProbe {
+            total_usage: 514.968 + 99.6,
+            at: chrono::Utc::now(),
+        }));
+        let mut refused = openrouter(work.path());
+        let error = manager
+            .freeze_launch_identity(&mut refused, false)
+            .await
+            .expect_err("the OpenRouter provider is refused at the line");
+        assert!(
+            error
+                .to_string()
+                .contains(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE),
+            "{error}"
+        );
+        let error = manager
+            .launch_session(harness_on(work.path(), "https://openrouter.ai/api/v1"))
+            .await
+            .expect_err("a Harness session on the OpenRouter endpoint is refused too");
+        assert!(
+            error
+                .to_string()
+                .contains(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(sandbox_base.path()).unwrap().count(),
+            0,
+            "a refused launch must not allocate a sandbox root"
+        );
+        // A Harness continuation or rotation rebuilds its config without the
+        // endpoint; the model still routes it to OpenRouter, so it is refused
+        // at the same line.
+        let mut resumed = harness_on(work.path(), "unused");
+        resumed.openai_base_url = None;
+        resumed.model = Some("openrouter/vendor-model".into());
+        let error = manager
+            .freeze_launch_identity(&mut resumed, false)
+            .await
+            .expect_err("a Harness launch routed to OpenRouter by its model is refused");
+        assert!(
+            error
+                .to_string()
+                .contains(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE),
+            "{error}"
+        );
+        // A Harness session on another endpoint does not bill this account.
+        let mut elsewhere = harness_on(work.path(), "https://api.example.test/v1");
+        manager
+            .freeze_launch_identity(&mut elsewhere, false)
+            .await
+            .expect("a launch that does not bill OpenRouter is not gated");
+
+        // An unreadable account fails closed: the probe is stale.
+        service.set_usage_probe_for_test(Some(SpendProbe {
+            total_usage: 514.968,
+            at: chrono::Utc::now() - chrono::Duration::minutes(30),
+        }));
+        // The async path would re-probe the real API; judge the synchronous
+        // backstop at the provider-spawn chokepoint, which reads the cache.
+        let cached = crate::openrouter_spend::check_launch_cached(
+            &manager.runtime_config,
+            service,
+            chrono::Utc::now(),
+        )
+        .expect_err("a stale probe fails closed at the spawn chokepoint");
+        assert!(
+            cached
+                .to_string()
+                .contains(rsi_common::openrouter_spend::SPEND_CAP_PROBE_STALE_CODE),
+            "{cached}"
+        );
+        service.set_usage_probe_for_test(None);
+    }
+
     /// Issue #692: a launch and its continuation name the same model with and
     /// without the `[1m]` context-variant tag (the daemon adds it at launch and
     /// stores the bare id), so the allowlist matches both spellings whichever
@@ -12991,6 +13475,42 @@ mod tests {
             .admit_sandbox_allocation()
             .await
             .expect("fixture admission ignores host free space");
+        assert_eq!(
+            manager
+                .sandbox_allocation_test_pressure_pages
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn sandbox_allocation_zero_floor_admits_injected_low_free_space() {
+        let (manager, _db_dir, _sandbox_base) = manager();
+        // The TUI E2E harness uses this supported config override before
+        // seeding work. Exercise it with no free space and the reported
+        // below-default-floor capacity, independent of the test host's disk.
+        manager
+            .runtime_config
+            .update_field("sandbox_min_free_gib", &serde_json::json!(0))
+            .unwrap();
+        assert_eq!(manager.runtime_config.to_json()["sandbox_min_free_gib"], 0);
+        for available_bytes in [0, 27 * GIB] {
+            manager
+                .sandbox_allocation_test_capacities
+                .lock()
+                .unwrap()
+                .push_back(SandboxCapacity {
+                    source_roots: 0,
+                    available_bytes,
+                    total_bytes: 512 * GIB,
+                });
+            let permit = manager
+                .admit_sandbox_allocation()
+                .await
+                .expect("zero fixture floor admits even below-default-floor capacity");
+            drop(permit);
+        }
         assert_eq!(
             manager
                 .sandbox_allocation_test_pressure_pages
@@ -13251,8 +13771,39 @@ mod tests {
     // Reclaim tests share the process-wide bounded coordinator and test hooks.
     // Hold this only in tests that exercise that shared lifecycle so parallel
     // unit-test execution cannot replace a hook or fill another test's queue.
-    fn reclaim_test_isolation() -> std::sync::MutexGuard<'static, ()> {
-        crate::sandbox::target_reclaim::reclaim_test_isolation_for_test()
+    //
+    // The fixtures also scan a private, empty procfs instead of the host's: whether
+    // a candidate is reclaimed must not depend on which processes the host runs
+    // (the cloud sweep host refused every candidate on an unreadable process of
+    // its own unit, #4014). A test that needs a real consumer process uses
+    // `reclaim_test_isolation_host_proc`.
+    struct ReclaimFixtureIsolation {
+        // Dropped first: the override is cleared before the lock is released.
+        proc_root: Option<crate::sandbox::target_reclaim::ProcRootForTest>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ReclaimFixtureIsolation {
+        #[cfg(target_os = "linux")]
+        fn proc_root(&self) -> &crate::sandbox::target_reclaim::ProcRootForTest {
+            self.proc_root.as_ref().expect("a private procfs")
+        }
+    }
+
+    fn reclaim_test_isolation() -> ReclaimFixtureIsolation {
+        let guard = crate::sandbox::target_reclaim::reclaim_test_isolation_for_test();
+        ReclaimFixtureIsolation {
+            proc_root: Some(crate::sandbox::target_reclaim::install_proc_root_for_test()),
+            _guard: guard,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reclaim_test_isolation_host_proc() -> ReclaimFixtureIsolation {
+        ReclaimFixtureIsolation {
+            proc_root: None,
+            _guard: crate::sandbox::target_reclaim::reclaim_test_isolation_for_test(),
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -13315,7 +13866,7 @@ mod tests {
         // restart tests model daemon reconstruction without test-only watcher
         // reads creating nondeterministic effect-time contention.
         if reopen_store {
-            manager.store = Arc::new(tokio::sync::Mutex::new(
+            manager.store = Arc::new(rsid_core::store_lock::Mutex::new(
                 Store::open(&database).expect("reopen fixture reclaim Store"),
             ));
         }
@@ -13606,6 +14157,9 @@ mod tests {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 
@@ -14935,11 +15489,104 @@ done
         }
     }
 
+    /// The cloud sweep host's observation (#4014), staged on any host: the
+    /// reclaimer runs in an `rsi-` unit (`rsi-cloud-sweep-<sha>`) beside a
+    /// same-user process whose `/proc` entry cannot be read. That sibling is
+    /// not a detached consumer of a sandbox, so an eligible cache is reclaimed
+    /// rather than refused `UnreadableEntry` with `eligible_candidates: 0`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn build_cache_reclaim_ignores_an_unreadable_process_in_the_reclaimers_own_unit() {
+        use crate::sandbox::target_reclaim::ProcRootForTest;
+        if !ProcRootForTest::can_stage_unreadable_process() {
+            return;
+        }
+        let isolation = reclaim_test_isolation();
+        let unit = "/system.slice/rsi-cloud-sweep-4001b92.service";
+        isolation.proc_root().set_own_cgroup(unit);
+        isolation.proc_root().add_unreadable_process(4242, unit);
+        let (report, cache, _fixture) = reclaim_one_stale_cache("reclaim-own-unit").await;
+        assert_eq!(report.fully_removed_count, 1, "{report:?}");
+        assert!(report.eligible_candidates > 0, "{report:?}");
+        assert!(!cache.exists(), "the eligible cache must be reclaimed");
+    }
+
+    /// The safety intent stays: an unreadable same-user process in a different
+    /// `rsi-` unit may be a detached consumer, so the cache is kept.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn build_cache_reclaim_keeps_a_cache_beside_an_unreadable_process_in_another_rsi_unit() {
+        use crate::sandbox::target_reclaim::ProcRootForTest;
+        if !ProcRootForTest::can_stage_unreadable_process() {
+            return;
+        }
+        let isolation = reclaim_test_isolation();
+        isolation
+            .proc_root()
+            .set_own_cgroup("/system.slice/rsi-cloud-sweep-4001b92.service");
+        isolation
+            .proc_root()
+            .add_unreadable_process(4242, "/system.slice/rsi-job-7.service");
+        let (report, cache, _fixture) = reclaim_one_stale_cache("reclaim-other-unit").await;
+        assert_eq!(report.fully_removed_count, 0, "{report:?}");
+        assert_eq!(
+            report.skip_counts.get(&ReclaimSkipReason::UnreadableEntry),
+            Some(&1),
+            "{report:?}"
+        );
+        assert!(cache.exists(), "a possibly-owned cache must be kept");
+    }
+
+    /// One terminal row idle past the TTL with a cache, then one actual pass;
+    /// the third value keeps the fixture directories alive for the caller.
+    #[cfg(target_os = "linux")]
+    async fn reclaim_one_stale_cache(
+        label: &str,
+    ) -> (
+        SandboxBuildCacheReclaimReport,
+        std::path::PathBuf,
+        Box<dyn std::any::Any>,
+    ) {
+        let db_dir = disk_backed_tempdir(&format!("{label}-db"));
+        let sandbox_base = disk_backed_tempdir(&format!("{label}-sandbox"));
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let repo = TempDir::new().expect("repo dir");
+        init_d00_git_repo(repo.path());
+        let stale = chrono::Utc::now() - chrono::Duration::hours(7);
+        let (row, cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        let report = run_build_cache_reclaim_fixture(&manager, false).await;
+        // The caller inspects the cache after the pass: keep the fixture alive.
+        (
+            report,
+            cache,
+            Box::new((db_dir, sandbox_base, repo, manager, row)),
+        )
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn build_cache_reclaim_preserves_manager_state_and_detached_consumers() {
-        let _isolation = reclaim_test_isolation();
+        let _isolation = reclaim_test_isolation_host_proc();
         let (manager, _db, sandbox_base) = manager();
         let repo = disk_backed_tempdir("reclaim-live-consumers");
         init_d00_git_repo(repo.path());
@@ -15404,7 +16051,7 @@ done
     /// Hub #3026: a fresh Completed worker on a satellite. Its commit lands
     /// through the hub queue, so there is never a local queue entry.
     struct SatelliteWorker {
-        _isolation: std::sync::MutexGuard<'static, ()>,
+        _isolation: ReclaimFixtureIsolation,
         _filesystem_stats_override: SandboxFilesystemStatsOverrideGuard,
         _db: tempfile::TempDir,
         _sandbox_base: tempfile::TempDir,
@@ -15503,6 +16150,306 @@ done
 
     const FINAL_HANDOFF: &str =
         "PIPELINE HANDOFF \u{2014} IMPLEMENTATION:\nRESULT: done\nFriction: none";
+
+    /// Drive the same acquisition path as AcquireAdmission, with free space
+    /// tied to the real fixture cache rather than allocating gigabytes. Hold
+    /// the owned reclaim worker long enough to exercise repeated client polls.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[cfg(target_os = "linux")]
+    async fn governor_disk_reclaim_fixture(
+        worker: &SatelliteWorker,
+    ) -> (crate::governor::Governor, crate::governor::AcquireParams) {
+        use crate::governor::{
+            AcquireOutcome, AcquireParams, AdmissionClass, BlockReason, Governor,
+        };
+        worker.manager.persistence.barrier().await.unwrap();
+        worker
+            .manager
+            .runtime_config
+            .governor_min_free_disk_gb
+            .store(30, Ordering::Relaxed);
+        let cache = worker.cache.clone();
+        let governor = Governor::new(
+            Box::new(move || crate::governor::ResourceSample {
+                load1: 0.0,
+                cores: 32,
+                disk_free_gb: if cache.join("debug/artifact.bin").exists() {
+                    29.0
+                } else {
+                    54.0
+                },
+                mem_available_gb: 1000.0,
+                swap_free_gb: 0.0,
+                workers_slice_anon_gb: None,
+            }),
+            Box::new(|pid| {
+                Some(crate::governor::Holder {
+                    pid,
+                    start_ticks: 7,
+                })
+            }),
+        );
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *reclaim_single_flight_hook().lock().unwrap() = Some(ReclaimSingleFlightHook {
+            manager_key: sandbox_reclaim_manager_key(&worker.manager.store),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mut params = AcquireParams {
+            class: AdmissionClass::Build,
+            pid: 123,
+            label: Some("scoped_test disk wait".into()),
+            ticket_id: None,
+        };
+        let outcome = worker
+            .manager
+            .acquire_resource_admission(&governor, &params)
+            .unwrap();
+        let AcquireOutcome::Queued {
+            ticket_id,
+            reason: BlockReason::Disk { .. },
+            ..
+        } = outcome
+        else {
+            panic!("disk floor must park the job: {outcome:?}");
+        };
+        params.ticket_id = Some(ticket_id);
+        let reached = tokio::time::timeout(Duration::from_secs(5), entered.acquire()).await;
+        // Always release the global fixture hook before asserting.
+        *reclaim_single_flight_hook().lock().unwrap() = None;
+        let mut polls_still_held = true;
+        if reached.is_ok() {
+            for _ in 0..3 {
+                polls_still_held &= matches!(
+                    worker
+                        .manager
+                        .acquire_resource_admission(&governor, &params)
+                        .unwrap(),
+                    AcquireOutcome::Queued {
+                        reason: BlockReason::Disk { .. },
+                        ..
+                    }
+                );
+            }
+            // A launch hold shares the governor's debounce too.
+            worker
+                .manager
+                .request_disk_hold_reclaim("launch_hold", "disk_pressure");
+        }
+        release.add_permits(1);
+        assert!(reached.is_ok(), "disk wait starts an owned reclaim pass");
+        assert!(
+            polls_still_held,
+            "polls remain queued until reclaim finishes"
+        );
+        let coordinator = SandboxReclaimCoordinator::process_wide().unwrap();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while coordinator.state.active.load(Ordering::Acquire) != 0
+                || coordinator.state.queued.load(Ordering::Acquire) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one reclaim pass finishes");
+        assert_eq!(
+            worker
+                .manager
+                .launch_hold_reclaim
+                .submissions
+                .load(Ordering::SeqCst),
+            1
+        );
+        (governor, params)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn governor_disk_wait_reclaims_finished_worker_and_admits_job() {
+        let worker = SatelliteWorker::new("governor-reclaim-finished", Some(FINAL_HANDOFF)).await;
+        let branch = worker.session.sandbox_branch.as_ref().unwrap();
+        // Published to a worker branch, with no local landing entry or rolling ref.
+        worker.publish_as(&format!("refs/remotes/origin/{branch}"));
+        let (_, live_cache) = build_cache_row(
+            &worker.manager,
+            worker.repo.path(),
+            worker._sandbox_base.path(),
+            SessionStatus::Running,
+            chrono::Utc::now(),
+        )
+        .await;
+        let live_scratch = live_cache.join(".rsi-tmp/harness-output");
+        std::fs::create_dir_all(live_scratch.parent().unwrap()).unwrap();
+        std::fs::write(&live_scratch, b"live harness scratch").unwrap();
+        let (governor, params) = governor_disk_reclaim_fixture(&worker).await;
+        assert!(
+            matches!(
+                worker
+                    .manager
+                    .acquire_resource_admission(&governor, &params)
+                    .unwrap(),
+                crate::governor::AcquireOutcome::Granted { .. }
+            ),
+            "reclaimed cache opens the disk floor and admits the parked job"
+        );
+        assert_eq!(
+            std::fs::read(live_cache.join("debug/artifact.bin"))
+                .unwrap()
+                .len(),
+            4096
+        );
+        assert_eq!(
+            std::fs::read(live_scratch).unwrap(),
+            b"live harness scratch"
+        );
+        assert!(
+            worker
+                .session
+                .sandbox_root
+                .as_ref()
+                .unwrap()
+                .join("README.md")
+                .is_file()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn governor_disk_wait_retains_worker_with_an_open_job() {
+        let worker = SatelliteWorker::new("governor-reclaim-job", Some(FINAL_HANDOFF)).await;
+        let branch = worker.session.sandbox_branch.as_ref().unwrap();
+        worker.publish_as(&format!("refs/remotes/origin/{branch}"));
+        let scratch = worker.cache.join(".rsi-tmp/harness-output");
+        std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+        std::fs::write(&scratch, b"parked harness scratch").unwrap();
+        let job = Uuid::new_v4();
+        worker
+            .manager
+            .store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                log_path,status_path,state,created_at,row_version)
+             VALUES(?1,?2,'test','{}',?3,?4,'/tmp/l','/tmp/s','queued',
+                '2026-10-01T00:00:00.000000000Z',1)",
+                rusqlite::params![
+                    job.to_string(),
+                    worker.session.id.to_string(),
+                    worker
+                        .session
+                        .sandbox_root
+                        .as_ref()
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                    format!("unit-{job}")
+                ],
+            )
+            .unwrap();
+        let (governor, params) = governor_disk_reclaim_fixture(&worker).await;
+        assert_eq!(
+            std::fs::read(worker.cache.join("debug/artifact.bin"))
+                .unwrap()
+                .len(),
+            4096
+        );
+        assert_eq!(std::fs::read(scratch).unwrap(), b"parked harness scratch");
+        assert!(matches!(
+            worker
+                .manager
+                .acquire_resource_admission(&governor, &params)
+                .unwrap(),
+            crate::governor::AcquireOutcome::Queued {
+                reason: crate::governor::BlockReason::Disk { .. },
+                ..
+            }
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn governor_disk_wait_retains_workers_with_resume_or_when_wakes() {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+        for predicate_wake in [false, true] {
+            let worker = SatelliteWorker::new("governor-reclaim-wake", Some(FINAL_HANDOFF)).await;
+            let branch = worker.session.sandbox_branch.as_ref().unwrap();
+            worker.publish_as(&format!("refs/remotes/origin/{branch}"));
+            let scratch = worker.cache.join(".rsi-tmp/harness-output");
+            std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+            std::fs::write(&scratch, b"parked harness scratch").unwrap();
+            let now = chrono::Utc::now();
+            let wake = ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "pending-result".into(),
+                message: "resume".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: WakeMode::Resume,
+                wake_session_id: Some(worker.session.id),
+            };
+            {
+                let store = worker.manager.store.lock().await;
+                if predicate_wake {
+                    // A jobs_terminal predicate must name an owned job. Make
+                    // it terminal so only the enabled wake fences this cache.
+                    let job = Uuid::new_v4();
+                    store.conn.execute(
+                        "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                            log_path,status_path,state,exit_code,created_at,finished_at,row_version)
+                         VALUES(?1,?2,'test','{}','/tmp',?3,'/tmp/l','/tmp/s','succeeded',0,
+                            '2026-10-01T00:00:00.000000000Z','2026-10-01T00:01:00.000000000Z',1)",
+                        rusqlite::params![job.to_string(), worker.session.id.to_string(), format!("unit-{job}")],
+                    ).unwrap();
+                    store
+                        .insert_wake_when(
+                            &wake,
+                            &WakeWhenState {
+                                predicate: serde_json::from_value::<WakePredicate>(
+                                    serde_json::json!({
+                                        "jobs_terminal": [job]
+                                    }),
+                                )
+                                .unwrap(),
+                                armed_at: now,
+                                deadline: None,
+                                repo_dir: None,
+                                delivered_shas: Vec::new(),
+                            },
+                            false,
+                        )
+                        .unwrap();
+                } else {
+                    store.insert_scheduled_job(&wake).unwrap();
+                }
+            }
+            governor_disk_reclaim_fixture(&worker).await;
+            assert_eq!(
+                std::fs::read(worker.cache.join("debug/artifact.bin"))
+                    .unwrap()
+                    .len(),
+                4096
+            );
+            assert_eq!(std::fs::read(scratch).unwrap(), b"parked harness scratch");
+        }
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
@@ -16536,8 +17483,10 @@ done
             .unwrap();
 
         let report = run_build_cache_reclaim_fixture(&manager, false).await;
-        assert_eq!(report.candidates_considered, 1);
-        assert_eq!(report.fully_removed_count, 1);
+        assert_eq!(report.candidates_considered, 1, "{report:?}");
+        // The report names the refusal when a busy host (not the candidate order) kept the
+        // oldest target (#3368).
+        assert_eq!(report.fully_removed_count, 1, "{report:?}");
         assert!(report.candidate_budget_exhausted);
         assert!(!oldest_cache.exists(), "oldest candidate must be first");
         assert!(
@@ -16951,6 +17900,92 @@ done
         assert!(
             !caches[&later.session_id].exists(),
             "later distinct root must progress in same bounded page"
+        );
+    }
+
+    /// #3609: a refused first candidate spends one page, not every future
+    /// pass. The persisted cursor survives a restart without reclaiming it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn reclaim_refusal_advances_cursor_across_restart() {
+        let _isolation = reclaim_test_isolation();
+        let db = disk_backed_tempdir("refused-cursor-db");
+        let base = disk_backed_tempdir("refused-cursor-sandboxes");
+        let _stats = install_no_pressure_stats_override_for_test(base.path());
+        let repo = disk_backed_tempdir("refused-cursor-repo");
+        init_d00_git_repo(repo.path());
+        let manager = manager_for_disk_fixture(db.path(), base.path());
+        let stale = chrono::Utc::now() - chrono::Duration::hours(9);
+        let (first, first_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            base.path(),
+            SessionStatus::Completed,
+            stale,
+        )
+        .await;
+        let (_, later_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            base.path(),
+            SessionStatus::Completed,
+            stale + chrono::Duration::seconds(1),
+        )
+        .await;
+        manager.persistence.barrier().await.unwrap();
+        manager
+            .runtime_config
+            .update_field(
+                "sandbox_build_cache_reclaim_max_candidates",
+                &serde_json::json!(1),
+            )
+            .unwrap();
+        let candidate = manager
+            .store
+            .lock()
+            .await
+            .preview_terminal_reclaim_page(1)
+            .unwrap()
+            .candidates
+            .remove(0);
+        assert_eq!(candidate.session_id, first.id);
+        let guard = crate::store::sandbox_custody::lock_custody_root(candidate.custody_id);
+        let refused = run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        drop(guard);
+        assert_eq!(
+            refused.report.skip_counts.get(&ReclaimSkipReason::RootBusy),
+            Some(&1)
+        );
+        let cursor = refused.evidence.candidate_sweep.unwrap().cursor_after;
+        assert_eq!(cursor.as_ref().unwrap().session_id, first.id);
+        assert!(first_cache.is_dir() && later_cache.is_dir());
+        drop(manager);
+
+        let manager = manager_for_disk_fixture(db.path(), base.path());
+        manager
+            .runtime_config
+            .update_field(
+                "sandbox_build_cache_reclaim_max_candidates",
+                &serde_json::json!(1),
+            )
+            .unwrap();
+        let progressed = run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        assert_eq!(
+            progressed.evidence.candidate_sweep.unwrap().cursor_before,
+            cursor
+        );
+        assert_eq!(
+            progressed.report.fully_removed_count, 1,
+            "{:?}",
+            progressed.report
+        );
+        assert!(
+            first_cache.is_dir(),
+            "the refused root is retained for a later cycle"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(later_cache).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 
@@ -18339,12 +19374,31 @@ done
         assert_eq!(state.active.load(Ordering::Acquire), 0);
     }
 
+    /// The reclaim worker answers a caller before it finishes the pass: after
+    /// `result_tx.send` it still runs pool GC and, for an actual pass, an
+    /// immediate Prepared-recovery pass that advances any Prepared intent it
+    /// finds. A fixture that prepares its own intent must not race that tail,
+    /// or the worker wins the row-version fence (#3445).
+    async fn wait_for_reclaim_worker_idle() {
+        let coordinator = SandboxReclaimCoordinator::process_wide().expect("reclaim coordinator");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while coordinator.state.active.load(Ordering::Acquire) != 0
+                || coordinator.state.queued.load(Ordering::Acquire) != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("reclaim worker finishes its post-result tail");
+    }
+
     async fn stage_pending_cache_for_contention(
         manager: &SessionManager,
         sandbox_base: &std::path::Path,
         session: &Session,
         generation: u64,
     ) -> Uuid {
+        wait_for_reclaim_worker_idle().await;
         let root = sandbox_base.join(session.id.to_string());
         let pinned = crate::sandbox::target_reclaim::PinnedSandboxRoot::open(
             sandbox_base,
@@ -20868,6 +21922,121 @@ done
         assert_eq!(wire.v2().expect("V2 envelope").refusals.len(), 3);
     }
 
+    /// hub #3260: a finished desktop-lane worker's target (`.rsi-desktop.lock`,
+    /// `desktop-tauri/`) is Cargo output and is reclaimed under pressure; the
+    /// same target with a live holder of the desktop lock is retained with the
+    /// typed live-process reason, for the preview and the pass alike.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn reclaim_pass_frees_desktop_lane_targets_and_retains_a_held_desktop_lock() {
+        use std::os::fd::AsRawFd;
+        let _isolation = reclaim_test_isolation_host_proc();
+        let db_dir = disk_backed_tempdir("reclaim-3260-db");
+        let sandbox_base = disk_backed_tempdir("reclaim-3260-sandbox");
+        let manager = manager_for_disk_fixture(db_dir.path(), sandbox_base.path());
+        let _filesystem_stats_override = install_sandbox_filesystem_stats_override_for_test(
+            sandbox_base.path(),
+            SandboxFilesystemStats {
+                total_bytes: 100,
+                available_bytes: 98,
+                used_bytes: 2,
+                used_percent: 2,
+            },
+        );
+        let repo = disk_backed_tempdir("reclaim-3260-repo");
+        init_d00_git_repo(repo.path());
+        let recent = || chrono::Utc::now() - chrono::Duration::minutes(2);
+
+        let seed_desktop_entries = |cache: &std::path::Path| {
+            populate_worker_target_scratch(cache);
+            std::fs::write(cache.join(".rsi-desktop.lock"), b"").expect("desktop lock");
+            std::fs::write(cache.join(".rsi-release.lock"), b"").expect("release lock");
+            // The standalone `desktop/src-tauri` workspace's own Cargo target,
+            // with the install script's lock inside it (`CARGO_TARGET_DIR`
+            // pointed at it).
+            let lane = cache.join("desktop-tauri");
+            std::fs::create_dir_all(lane.join("debug/deps")).expect("desktop target");
+            std::fs::write(lane.join("debug/deps/blob"), vec![1u8; 2048]).expect("blob");
+            std::fs::write(lane.join("CACHEDIR.TAG"), b"Signature: x\n").expect("tag");
+            std::fs::write(lane.join(".rustc_info.json"), b"{}").expect("info");
+            std::fs::write(lane.join(".rsi-desktop.lock"), b"").expect("lane lock");
+        };
+        let (free, free_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            recent(),
+        )
+        .await;
+        seed_desktop_entries(&free_cache);
+        let (held, held_cache) = build_cache_row(
+            &manager,
+            repo.path(),
+            sandbox_base.path(),
+            SessionStatus::Completed,
+            recent(),
+        )
+        .await;
+        seed_desktop_entries(&held_cache);
+
+        // A live `install-desktop.sh` stand-in: a child that holds the flock
+        // on the desktop lock through its inherited stdin.
+        let lock = std::fs::File::open(held_cache.join(".rsi-desktop.lock")).expect("open lock");
+        assert_eq!(
+            unsafe { nix::libc::flock(lock.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) },
+            0,
+            "the test takes the desktop lock"
+        );
+        let mut holder = Command::new("sleep")
+            .arg("120")
+            .current_dir("/")
+            .stdin(lock)
+            .spawn()
+            .expect("lock holder");
+
+        manager.persistence.barrier().await.unwrap();
+        for (field, pct) in [
+            ("sandbox_build_cache_reclaim_low_watermark_pct", 1),
+            ("sandbox_build_cache_reclaim_high_watermark_pct", 2),
+        ] {
+            manager
+                .runtime_config
+                .update_field(field, &serde_json::json!(pct))
+                .unwrap();
+        }
+        let preview = run_build_cache_reclaim_with_evidence_fixture(&manager, true).await;
+        let pass = run_build_cache_reclaim_with_evidence_fixture(&manager, false).await;
+        let holder_token = format!("process_uses_sandbox:{}", holder.id());
+        let _ = holder.kill();
+        let _ = holder.wait();
+
+        for (label, run) in [("preview", &preview), ("pass", &pass)] {
+            let refusal = |session: &Session| {
+                run.evidence
+                    .refusals
+                    .iter()
+                    .find(|refusal| refusal.session_id == session.id)
+                    .map(|refusal| (refusal.reason, refusal.check.clone()))
+            };
+            assert_eq!(
+                refusal(&free),
+                None,
+                "{label}: desktop build output is reclaimable: {:?}",
+                run.evidence.refusals
+            );
+            assert_eq!(
+                refusal(&held),
+                Some((ReclaimSkipReason::ActiveOwner, holder_token.clone())),
+                "{label}: a live holder of the desktop lock retains the target"
+            );
+        }
+        assert!(!free_cache.exists(), "the finished desktop target is gone");
+        assert!(held_cache.exists(), "the held desktop target stays");
+        assert!(held_cache.join(".rsi-desktop.lock").exists());
+    }
+
     async fn admitted_session_launch_permit(
         manager: &SessionManager,
         session_id: Uuid,
@@ -21028,10 +22197,13 @@ done
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 
-    async fn all_active_reservations(store: &Arc<tokio::sync::Mutex<Store>>) -> i64 {
+    async fn all_active_reservations(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> i64 {
         let store = store.lock().await;
         store
             .conn
@@ -21044,7 +22216,7 @@ done
     }
 
     async fn scheduled_job_active_reservations(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         scheduled_job_id: Uuid,
     ) -> i64 {
         let store = store.lock().await;
@@ -21961,6 +23133,622 @@ done
         server.abort();
     }
 
+    /// #169: appoint a project manager through the real launch funnel, with
+    /// the production sandbox resolution for `root`, and return the persisted
+    /// seat.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    async fn appoint_project_manager_in(
+        root: &std::path::Path,
+        sandbox: Option<bool>,
+    ) -> (
+        SessionManager,
+        rsi_common::types::Session,
+        (TempDir, TempDir),
+    ) {
+        use rsi_common::global_manager::{
+            AgentGlobalAppointManagerRequestV1, ConfigureGlobalManagerRequestV1,
+        };
+        use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
+        let (manager, dir, sandbox_base) = manager();
+        let (server, base_url, dispatches) = spawn_blocking_local_test_provider().await;
+        let root = root.to_path_buf();
+        let (project_id, grantor) = (Uuid::new_v4(), Uuid::new_v4());
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Local,
+            model: "scheduled-fresh-test-model".into(),
+            effort: None,
+        };
+        {
+            let store = manager.store.lock().await;
+            let now = chrono::Utc::now();
+            store
+                .insert_project(&rsi_common::types::Project {
+                    id: project_id,
+                    name: format!("seat sandbox {project_id}"),
+                    path: Some(root.clone()),
+                    description: None,
+                    color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            let mut grantor_row = test_session(grantor);
+            grantor_row.working_dir = root.clone();
+            store.insert_session(&grantor_row).unwrap();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: grantor,
+                        project_ids: vec![project_id],
+                        allowed_launches: vec![launch.clone()],
+                        project_policy: ManagerPolicyV2 {
+                            max_created_sessions: 1,
+                            ..ManagerPolicyV2::default()
+                        },
+                        expected_grant_version: 0,
+                        idempotency_key: "seat-sandbox-grant".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        let request = AgentGlobalAppointManagerRequestV1 {
+            project_id,
+            launch,
+            query: "You are the project manager.".into(),
+            idempotency_key: "seat-sandbox-launch".into(),
+            sandbox,
+        };
+        let child =
+            rsi_common::portfolio_delegation::AgentManagerAppointChildRequestV1::from(&request);
+        let root_admits =
+            super::super::global_manager_verbs::project_root_admits_sandbox(&root).await;
+        let result = super::super::global_manager_verbs::global_appoint_manager_with(
+            &manager.store,
+            grantor,
+            &request,
+            |session_id| {
+                let mut config = super::super::global_manager_verbs::child_launch_config(
+                    &child,
+                    project_id,
+                    root.clone(),
+                    session_id,
+                    root_admits,
+                );
+                config.openai_base_url = Some(base_url.clone());
+                manager.launch_global_appointment(config, session_id, None)
+            },
+        )
+        .await
+        .expect("the appointment launches");
+        wait_for_backend_dispatch(&dispatches).await;
+        let (seat, invocation_id) = {
+            let store = manager.store.lock().await;
+            assert_eq!(
+                store
+                    .get_harness_manager(project_id)
+                    .unwrap()
+                    .unwrap()
+                    .current_session_id,
+                Some(result.session_id)
+            );
+            (
+                store.get_session(result.session_id).unwrap().unwrap(),
+                store
+                    .session_model_invocation_id(result.session_id)
+                    .unwrap()
+                    .expect("the seat launch has an admission binding"),
+            )
+        };
+        cleanup_active_test_session(&manager, result.session_id, invocation_id).await;
+        server.abort();
+        (manager, seat, (dir, sandbox_base))
+    }
+
+    /// #169: the appointed manager of a git-backed project gets its own
+    /// git-worktree sandbox at appointment, even when the appointer asks for
+    /// none, so it runs `AgentSubmitJob` from its own tree and never writes
+    /// the project's shared root.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_git_backed_project_manager_seat_is_launched_in_its_own_sandbox() {
+        let root = disk_backed_tempdir("seat-sandbox-git-");
+        init_d00_git_repo(root.path());
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        for requested in [None, Some(false)] {
+            let (manager, seat, _dirs) = appoint_project_manager_in(&project_root, requested).await;
+            assert_eq!(
+                seat.sandbox_kind,
+                Some(SandboxKind::GitWorktree),
+                "{requested:?}"
+            );
+            let tree = seat
+                .sandbox_root
+                .clone()
+                .expect("the seat has its own tree");
+            assert_ne!(tree, project_root, "{requested:?}");
+            assert!(seat.sandbox_branch.is_some(), "{requested:?}");
+            assert_eq!(
+                manager
+                    .store
+                    .lock()
+                    .await
+                    .live_custody_for_session(seat.id)
+                    .expect("the seat owns a live custody root")
+                    .owner_session_id,
+                seat.id
+            );
+        }
+    }
+
+    /// #169: a non-git project root admits no sandbox, so its manager seat is
+    /// launched without one (the default no longer fails the appointment)
+    /// and keeps working in the registered root, as before.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_non_git_project_manager_seat_is_launched_without_a_sandbox() {
+        let root = crate::test_support::non_repository_tempdir("seat-sandbox-plain-");
+        for requested in [None, Some(false)] {
+            let (_manager, seat, _dirs) = appoint_project_manager_in(root.path(), requested).await;
+            assert_eq!(seat.sandbox_root, None, "{requested:?}");
+            assert_eq!(seat.working_dir, root.path(), "{requested:?}");
+        }
+    }
+
+    /// #169: the seat sandbox rule. A git-backed root always yields a
+    /// git-worktree sandbox; a non-git root yields one only when asked for.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn manager_seat_sandbox_follows_the_project_root() {
+        use super::super::global_manager_verbs::manager_seat_sandbox;
+        for requested in [None, Some(false), Some(true)] {
+            let spec = manager_seat_sandbox(requested, true).expect("git-backed root");
+            assert_eq!(spec.kind, Some(SandboxKind::GitWorktree));
+            assert_eq!(spec.branch, None);
+        }
+        assert!(manager_seat_sandbox(None, false).is_none());
+        assert!(manager_seat_sandbox(Some(false), false).is_none());
+        assert!(manager_seat_sandbox(Some(true), false).is_some());
+    }
+
+    /// Hub #3315: one portfolio-seat launch through `child_seat_launch_config`
+    /// and the ordinary appointment launch; returns the launched seat row and
+    /// its node.
+    async fn launch_portfolio_seat(
+        manager: &SessionManager,
+        caller: Uuid,
+        request: &rsi_common::portfolio_delegation::AgentManagerAppointChildRequestV1,
+    ) -> (rsi_common::types::Session, Uuid) {
+        let appointment = manager
+            .store
+            .lock()
+            .await
+            .begin_child_appointment(caller, request)
+            .unwrap();
+        let session_id = appointment.session_id;
+        let crate::store::portfolio_nodes::delegation::ChildTargetRef::Portfolio(node) =
+            appointment.target
+        else {
+            panic!("portfolio target");
+        };
+        let (server, base_url, dispatches) = spawn_blocking_local_test_provider().await;
+        let mut config = manager
+            .child_seat_launch_config(request, appointment.launch_project_id, session_id)
+            .await
+            .unwrap();
+        config.openai_base_url = Some(base_url);
+        manager
+            .launch_global_appointment(
+                config,
+                session_id,
+                Some(Box::new(
+                    super::super::types::PortfolioAppointmentLaunchContext {
+                        caller,
+                        request: request.clone(),
+                        appointment,
+                    },
+                )),
+            )
+            .await
+            .expect("the portfolio seat launches");
+        wait_for_backend_dispatch(&dispatches).await;
+        let (seat, invocation) = {
+            let store = manager.store.lock().await;
+            assert_eq!(
+                store.global_seat_grant(session_id).unwrap().seat_session_id,
+                session_id
+            );
+            (
+                store.get_session(session_id).unwrap().unwrap(),
+                store
+                    .session_model_invocation_id(session_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        cleanup_active_test_session(manager, session_id, invocation).await;
+        server.abort();
+        (seat, node)
+    }
+
+    /// Hub #3315 (#172 round 2): a home portfolio seat hands its seat on to
+    /// itself (`AgentManagerAppointChild` on its own node) with no commit
+    /// anywhere: the successor is again in the home project, and `$HOME`'s
+    /// repository keeps its HEAD, index and refs. The home seat's
+    /// `AgentCreateIssue` without `project_id` files into its admission
+    /// project; the home project holds no Issues on any create path.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_home_seat_self_handoff_leaves_home_untouched_and_files_into_its_admission_project() {
+        use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ManagerCapabilityV2, ManagerLaunchChoiceV2, ManagerOperatingModeV2, ManagerPolicyV2,
+        };
+        use rsi_common::portfolio_delegation::{
+            AgentManagerAppointChildRequestV1, AppointChildTargetV1,
+        };
+        use rsi_common::rpc::AgentCreateIssueParams;
+        use rsi_common::types::Project;
+        let (manager, _dir, _sandbox) = manager();
+        let home_dir = disk_backed_tempdir("home-handoff-home-");
+        init_d00_git_repo(home_dir.path());
+        let home = std::fs::canonicalize(home_dir.path()).unwrap();
+        let observe_home = || {
+            (
+                h1_7g_git(&home, &["rev-parse", "HEAD"]),
+                std::fs::read(home.join(".git/index")).unwrap(),
+                h1_7g_git(&home, &["for-each-ref"]),
+            )
+        };
+        let before = observe_home();
+        let repo_dir = disk_backed_tempdir("home-handoff-project-");
+        init_d00_git_repo(repo_dir.path());
+        let project_root = std::fs::canonicalize(repo_dir.path()).unwrap();
+        let projects = [Uuid::new_v4(), Uuid::new_v4()];
+        let caller = Uuid::new_v4();
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Local,
+            model: "scheduled-fresh-test-model".into(),
+            effort: None,
+        };
+        let policy = |created, active, containers| ManagerPolicyV2 {
+            mode: ManagerOperatingModeV2::Execute,
+            capabilities: vec![
+                ManagerCapabilityV2::IssueCoordinate,
+                ManagerCapabilityV2::SessionCreate,
+            ],
+            max_created_sessions: created,
+            max_active_sessions: active,
+            max_created_containers: containers,
+            ..ManagerPolicyV2::default()
+        };
+        {
+            let store = manager.store.lock().await;
+            for project in projects {
+                let now = chrono::Utc::now();
+                store
+                    .insert_project(&Project {
+                        id: project,
+                        name: format!("home handoff {project}"),
+                        path: Some(project_root.clone()),
+                        description: None,
+                        color: Project::DEFAULT_COLOR.into(),
+                        context_files: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .unwrap();
+            }
+            let mut root_seat = test_session(caller);
+            root_seat.project_id = Some(projects[0]);
+            store.insert_session(&root_seat).unwrap();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: caller,
+                        project_ids: projects.to_vec(),
+                        allowed_launches: vec![launch.clone()],
+                        project_policy: policy(1000, 96, 60),
+                        expected_grant_version: 0,
+                        idempotency_key: "home-handoff-root".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        manager.ensure_home_project(home.clone()).await.unwrap();
+        let appoint = |target, key: &str| AgentManagerAppointChildRequestV1 {
+            target,
+            launch: launch.clone(),
+            query: "You are a portfolio manager.".into(),
+            idempotency_key: key.into(),
+            sandbox: None,
+            handoff: None,
+        };
+        let (first, node) = launch_portfolio_seat(
+            &manager,
+            caller,
+            &appoint(
+                AppointChildTargetV1::Portfolio {
+                    node_id: None,
+                    tier_label: Some("home-handoff".into()),
+                    project_ids: projects[1..].to_vec(),
+                    allowed_launches: vec![launch.clone()],
+                    policy: Some(policy(190, 18, 11)),
+                    child_policy: None,
+                    max_direct_reports: Some(3),
+                    launch_project_id: Some(projects[1]),
+                    expected_grant_version: None,
+                },
+                "home-handoff-first",
+            ),
+        )
+        .await;
+        assert_eq!(first.project_id, Some(Project::HOME_ID));
+        let grant_version = manager
+            .store
+            .lock()
+            .await
+            .get_portfolio_node(node)
+            .unwrap()
+            .expect("the first seat holds its node")
+            .grant
+            .grant_version;
+        // The seat hands itself on: its own node, a host-local handoff, no commit.
+        let mut handoff = appoint(
+            AppointChildTargetV1::Portfolio {
+                node_id: Some(node),
+                tier_label: None,
+                project_ids: Vec::new(),
+                allowed_launches: Vec::new(),
+                policy: None,
+                child_policy: None,
+                max_direct_reports: None,
+                launch_project_id: None,
+                expected_grant_version: Some(grant_version),
+            },
+            "home-handoff-self",
+        );
+        handoff.handoff = Some("read ~/.rsi/gm/handoff-test.md first".into());
+        let (successor, successor_node) = launch_portfolio_seat(&manager, first.id, &handoff).await;
+        assert_eq!(successor_node, node);
+        assert_eq!(successor.project_id, Some(Project::HOME_ID));
+        assert_eq!(successor.working_dir, home);
+        assert_eq!(successor.sandbox_root, None);
+        assert_eq!(observe_home(), before, "no git write ever reaches $HOME");
+
+        let create = |project_id, key: &str| AgentCreateIssueParams {
+            project_id,
+            title: format!("home seat filing {key}"),
+            body: "a finding".into(),
+            priority: None,
+            labels: vec![],
+            assignee: None,
+            idempotency_key: key.into(),
+            harness: false,
+            source_issue: None,
+        };
+        let filed = manager
+            .agent_create_issue(successor.id, create(None, "default"))
+            .await
+            .unwrap();
+        assert_eq!(filed.issue.project_id, projects[1]);
+        let refused = manager
+            .agent_create_issue(successor.id, create(Some(Project::HOME_ID), "home"))
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains(Project::HOME_ISSUE_REFUSED),
+            "{refused}"
+        );
+        let store = manager.store.lock().await;
+        let direct = store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: Project::HOME_ID,
+                title: "operator create".into(),
+                body: String::new(),
+                priority: None,
+                labels: vec![],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap_err();
+        assert!(
+            direct.to_string().contains(Project::HOME_ISSUE_REFUSED),
+            "{direct}"
+        );
+    }
+
+    /// Hub #3315: a portfolio seat is launched in the built-in home project at
+    /// `$HOME` with no sandbox, although `$HOME` is a git repository and the
+    /// coverage project is git-backed. A seat appointed before the home project
+    /// existed stays in its coverage project and moves to home at its next
+    /// replacement. A project manager seat keeps #169's own sandbox.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_portfolio_seat_is_launched_in_the_home_project_without_a_sandbox() {
+        use rsi_common::global_manager::ConfigureGlobalManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ManagerCapabilityV2, ManagerLaunchChoiceV2, ManagerOperatingModeV2, ManagerPolicyV2,
+        };
+        use rsi_common::portfolio_delegation::{
+            AgentManagerAppointChildRequestV1, AppointChildTargetV1,
+        };
+        use rsi_common::types::Project;
+        let (manager, _dir, _sandbox) = manager();
+        let home_dir = disk_backed_tempdir("home-seat-home-");
+        init_d00_git_repo(home_dir.path());
+        let home = std::fs::canonicalize(home_dir.path()).unwrap();
+        let repo_dir = disk_backed_tempdir("home-seat-project-");
+        init_d00_git_repo(repo_dir.path());
+        let project_root = std::fs::canonicalize(repo_dir.path()).unwrap();
+        let projects = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let caller = Uuid::new_v4();
+        let launch = ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Local,
+            model: "scheduled-fresh-test-model".into(),
+            effort: None,
+        };
+        let policy = |created, active, containers| ManagerPolicyV2 {
+            mode: ManagerOperatingModeV2::Execute,
+            capabilities: vec![
+                ManagerCapabilityV2::IssueCoordinate,
+                ManagerCapabilityV2::SessionCreate,
+            ],
+            max_created_sessions: created,
+            max_active_sessions: active,
+            max_created_containers: containers,
+            ..ManagerPolicyV2::default()
+        };
+        {
+            let store = manager.store.lock().await;
+            for project in projects {
+                let now = chrono::Utc::now();
+                store
+                    .insert_project(&Project {
+                        id: project,
+                        name: format!("home seat {project}"),
+                        path: Some(project_root.clone()),
+                        description: None,
+                        color: Project::DEFAULT_COLOR.into(),
+                        context_files: None,
+                        created_at: now,
+                        updated_at: now,
+                    })
+                    .unwrap();
+            }
+            let mut root_seat = test_session(caller);
+            root_seat.project_id = Some(projects[0]);
+            store.insert_session(&root_seat).unwrap();
+            store
+                .configure_global_manager(
+                    &ConfigureGlobalManagerRequestV1 {
+                        session_id: caller,
+                        project_ids: projects.to_vec(),
+                        allowed_launches: vec![launch.clone()],
+                        project_policy: policy(1000, 96, 60),
+                        expected_grant_version: 0,
+                        idempotency_key: "home-seat-root".into(),
+                    },
+                    "operator:test",
+                )
+                .unwrap();
+        }
+        let appoint = |target, key: &str| AgentManagerAppointChildRequestV1 {
+            target,
+            launch: launch.clone(),
+            query: "You are a portfolio manager.".into(),
+            idempotency_key: key.into(),
+            // Even an explicit request gets no sandbox in the home project.
+            sandbox: Some(true),
+            handoff: None,
+        };
+        // Before the home project exists: the old placement, a coverage project.
+        let (first, node) = launch_portfolio_seat(
+            &manager,
+            caller,
+            &appoint(
+                AppointChildTargetV1::Portfolio {
+                    node_id: None,
+                    tier_label: Some("home-seat".into()),
+                    project_ids: projects[1..].to_vec(),
+                    allowed_launches: vec![launch.clone()],
+                    policy: Some(policy(190, 18, 11)),
+                    child_policy: None,
+                    max_direct_reports: Some(3),
+                    launch_project_id: Some(projects[1]),
+                    expected_grant_version: None,
+                },
+                "home-seat-first",
+            ),
+        )
+        .await;
+        assert_eq!(first.project_id, Some(projects[1]));
+
+        // The daemon start registers the home project; any number of starts
+        // leave one.
+        for _ in 0..2 {
+            manager.ensure_home_project(home.clone()).await.unwrap();
+        }
+        let grant_version = manager
+            .store
+            .lock()
+            .await
+            .get_portfolio_node(node)
+            .unwrap()
+            .expect("the first seat holds its node")
+            .grant
+            .grant_version;
+        // Its successor (a replacement of the non-home seat) lands in home.
+        let (successor, successor_node) = launch_portfolio_seat(
+            &manager,
+            caller,
+            &appoint(
+                AppointChildTargetV1::Portfolio {
+                    node_id: Some(node),
+                    tier_label: None,
+                    project_ids: Vec::new(),
+                    allowed_launches: Vec::new(),
+                    policy: None,
+                    child_policy: None,
+                    max_direct_reports: None,
+                    launch_project_id: Some(projects[1]),
+                    expected_grant_version: Some(grant_version),
+                },
+                "home-seat-successor",
+            ),
+        )
+        .await;
+        assert_eq!(successor_node, node);
+        assert_eq!(successor.project_id, Some(Project::HOME_ID));
+        assert_eq!(successor.working_dir, home);
+        assert_eq!(successor.sandbox_root, None);
+        assert_eq!(successor.sandbox_kind, None);
+        assert_eq!(successor.sandbox_branch, None);
+        assert!(
+            manager
+                .store
+                .lock()
+                .await
+                .live_custody_for_session(successor.id)
+                .is_err(),
+            "a home seat owns no custody root"
+        );
+        let homes = manager
+            .list_projects()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|project| project.id == Project::HOME_ID)
+            .count();
+        assert_eq!(homes, 1);
+
+        // A project manager seat is unchanged: its own project, its own sandbox.
+        let pm = manager
+            .child_seat_launch_config(
+                &appoint(
+                    AppointChildTargetV1::Project {
+                        project_id: projects[0],
+                    },
+                    "home-seat-pm",
+                ),
+                projects[0],
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pm.project_id, Some(projects[0]));
+        assert_eq!(pm.working_dir.as_deref(), Some(project_root.as_path()));
+        assert_eq!(
+            pm.sandbox.and_then(|spec| spec.kind),
+            Some(SandboxKind::GitWorktree)
+        );
+    }
+
     /// #1835: the very first provider request sees the complete portfolio
     /// authority, both on creation and when re-seating a carried child grant.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -22101,6 +23889,7 @@ done
                 projects[1],
                 cwd.clone(),
                 session_id,
+                false,
             );
             config.openai_base_url = Some(base_url);
             // Exercise the durable path even when context rotation is disabled.
@@ -22266,6 +24055,7 @@ done
                 projects[1],
                 cwd,
                 session_id,
+                false,
             );
             config.openai_base_url = Some(base_url);
             let control_key = direct_launch_custody_test_control_key(&config, session_id);
@@ -25060,6 +26850,223 @@ done
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    fn saved_provider_admission_fixture(store: &Store) -> Uuid {
+        let id = Uuid::new_v4();
+        store
+            .set_custom_provider_record(&crate::store::operator_settings::StoredCustomProvider {
+                id,
+                name: "Admission crash fixture".into(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+                default_model: "test-model".into(),
+                ordinal: 0,
+                deleted_at: None,
+            })
+            .unwrap();
+        id
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn saved_provider_binding_write_failure_leaves_no_resumable_row_625() {
+        let (manager, db, _sandbox) = manager();
+        let cwd = disk_backed_tempdir("binding-write-failure");
+        let id = {
+            let store = manager.store.lock().await;
+            let id = saved_provider_admission_fixture(&store);
+            store
+                .conn
+                .execute_batch(
+                    "CREATE TRIGGER fail_saved_binding BEFORE INSERT ON daemon_settings
+                 WHEN NEW.key LIKE 'session_custom_provider.%'
+                 BEGIN SELECT RAISE(ABORT, 'injected binding write failure'); END;",
+                )
+                .unwrap();
+            id
+        };
+        let mut config = direct_interactive_test_config(cwd.path().into());
+        config.query = "binding-write-failure-625".into();
+        let error = manager
+            .launch_session_with_custom_provider(config, Some(id))
+            .await
+            .expect_err("binding write must fail before provider effects");
+        assert!(
+            error.to_string().contains("injected binding write failure"),
+            "{error}"
+        );
+        let reopened = Store::open(&db.path().join("rsi.db")).unwrap();
+        let rows: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE query='binding-write-failure-625'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        eprintln!("binding-write-failure crash reconstruction: resumable session rows={rows}");
+        assert_eq!(
+            rows, 0,
+            "a rejected binding must never publish an unbound session"
+        );
+        assert!(manager.active.read().await.is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn saved_provider_legacy_split_write_reconstructs_route_loss_625() {
+        use super::super::custom_provider_launch::{persist, resolve};
+
+        // Reconstruct the two durable states possible at approved #609's
+        // row-before-binding boundary. This is not a live daemon crash test.
+        for write_failure in [false, true] {
+            let dir = disk_backed_tempdir("legacy-binding-window");
+            let database = dir.path().join("rsi.db");
+            let vault = crate::vault::VaultHandleBuilder::new(Arc::new(
+                crate::vault::VaultSettings::default(),
+            ))
+            .dir(dir.path().join("vault"))
+            .env(|_| None)
+            .open()
+            .unwrap();
+            let session_id = Uuid::new_v4();
+            {
+                let store = Store::open_test_fixture(&database).unwrap();
+                let id = saved_provider_admission_fixture(&store);
+                vault
+                    .set_custom_provider_key(id, "inert-saved-key-625")
+                    .unwrap();
+                let mut config = direct_interactive_test_config(dir.path().into());
+                let binding = resolve(&store, &vault, &mut config, None, Some(id))
+                    .unwrap()
+                    .unwrap();
+                let mut row = test_session(session_id);
+                row.provider = SessionProvider::Local;
+                row.working_dir = dir.path().into();
+                row.status = SessionStatus::Starting;
+                store.insert_session(&row).unwrap();
+                if write_failure {
+                    store
+                        .conn
+                        .execute_batch(
+                            "CREATE TRIGGER fail_legacy_binding BEFORE INSERT ON daemon_settings
+                         WHEN NEW.key LIKE 'session_custom_provider.%'
+                         BEGIN SELECT RAISE(ABORT, 'injected legacy binding failure'); END;",
+                        )
+                        .unwrap();
+                    let error =
+                        persist(&store, session_id, binding, SessionProvider::Local).unwrap_err();
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("injected legacy binding failure")
+                    );
+                    store
+                        .update_session_status(session_id, SessionStatus::Failed)
+                        .unwrap();
+                }
+            }
+            let reopened = Store::open(&database).unwrap();
+            for successor in [false, true] {
+                let mut config = direct_interactive_test_config(dir.path().into());
+                config.openai_base_url = Some("http://127.0.0.1:2/alternate".into());
+                config.openai_api_key = Some("inert-alternate-key-625".into());
+                let same_id = if successor {
+                    config.continued_from = Some(session_id);
+                    None
+                } else {
+                    Some(session_id)
+                };
+                assert_eq!(
+                    resolve(&reopened, &vault, &mut config, same_id, None).unwrap(),
+                    None
+                );
+                assert_eq!(
+                    config.openai_base_url.as_deref(),
+                    Some("http://127.0.0.1:2/alternate")
+                );
+                assert_eq!(
+                    config.openai_api_key.as_deref(),
+                    Some("inert-alternate-key-625")
+                );
+            }
+            eprintln!(
+                "legacy split-write reconstruction: write_failure={write_failure}, same-ID/successor both retain the alternate route/key"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn saved_provider_crash_after_row_preserves_resume_and_successor_binding_625() {
+        let (manager, db, _sandbox) = manager();
+        let cwd = disk_backed_tempdir("binding-crash-reconstruction");
+        let id = {
+            let store = manager.store.lock().await;
+            saved_provider_admission_fixture(&store)
+        };
+        let control_key = "binding-crash-after-row-625";
+        let mut config = direct_interactive_test_config(cwd.path().into());
+        config.model_invocation_dedup_key = Some(control_key.into());
+        let (reached, _resume) = install_direct_launch_custody_test_pause(control_key);
+        // Dropping this future at the existing post-row/pre-context pause
+        // reconstructs a process crash without any provider dispatch.
+        let session_id = {
+            let launch = manager.launch_session_with_custom_provider(config, Some(id));
+            tokio::pin!(launch);
+            tokio::select! {
+                reached = reached => reached.expect("post-row pause"),
+                result = &mut launch => panic!("launch ended before post-row pause: {result:?}"),
+            }
+        };
+        assert!(manager.active.read().await.is_empty());
+        let reopened = Store::open(&db.path().join("rsi.db")).unwrap();
+        assert_eq!(
+            reopened.get_session(session_id).unwrap().unwrap().status,
+            SessionStatus::Starting
+        );
+        let vault =
+            crate::vault::VaultHandleBuilder::new(Arc::new(crate::vault::VaultSettings::default()))
+                .dir(cwd.path().join("vault"))
+                .env(|_| None)
+                .open()
+                .unwrap();
+        vault
+            .set_custom_provider_key(id, "inert-bound-key-625")
+            .unwrap();
+        let other = saved_provider_admission_fixture(&reopened);
+        vault
+            .set_custom_provider_key(other, "inert-other-key-625")
+            .unwrap();
+        for successor in [false, true] {
+            let mut continued = direct_interactive_test_config(cwd.path().into());
+            continued.openai_base_url = Some("http://127.0.0.1:2/alternate".into());
+            continued.openai_api_key = Some("inert-alternate-key-625".into());
+            let same_id = if successor {
+                continued.continued_from = Some(session_id);
+                None
+            } else {
+                Some(session_id)
+            };
+            super::super::custom_provider_launch::resolve(
+                &reopened,
+                &vault,
+                &mut continued,
+                same_id,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                continued.openai_base_url.as_deref(),
+                Some("http://127.0.0.1:1/v1"),
+                "post-row crash must retain the route, successor={successor}"
+            );
+            assert_eq!(
+                continued.openai_api_key.as_deref(),
+                Some("inert-bound-key-625")
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn closure_replay_checks_custody_after_releasing_store_lock() {
         let (manager, _db, _sandbox) = manager();
@@ -26260,6 +28267,9 @@ done
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
         let provider = SessionProvider::Codex;
         let working_dir = std::path::PathBuf::from("/tmp/rsi-global-rotation-disabled");
@@ -26361,6 +28371,9 @@ done
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
         let session = build_starting_session(
             &config,
@@ -31202,12 +33215,12 @@ done
     /// guard(predecessor) and races a scheduled wake that captured the
     /// predecessor. The commit lands between capture and the guarded check:
     /// the wake is refused (retryable, retained with backoff) instead of
-    /// restarting the replaced lead, and the next pass delivers it to the
-    /// committed successor.
+    /// restarting the replaced lead, and every later pass still refuses it:
+    /// a self-wake never authorizes the committed successor (#360).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    async fn agent_successor_commit_refuses_racing_predecessor_wake_then_delivers_to_successor() {
+    async fn agent_successor_commit_refuses_racing_predecessor_wake_on_every_delivery() {
         use crate::issue_tracker::poller::SessionLauncher;
         use crate::store::manager_actions::fence::{
             CONTINUATION_LEAD_GENERATION_CHANGED, CONTINUATION_TIP_CHANGED,
@@ -31348,52 +33361,9 @@ done
         }
         assert_eq!(scripted.productive_start_count.load(Ordering::SeqCst), 1);
 
-        // Next pass: the fence chases the committed successor and delivers.
-        manager
-            .interrupt_session(candidate_id)
-            .await
-            .expect("settle the successor's first turn");
-        drop_controller_candidate_test_stream(candidate_id);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while manager.active.read().await.contains_key(&candidate_id)
-                || !manager.completed.read().await.contains_key(&candidate_id)
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("successor turn settles");
-        manager
-            .persistence
-            .barrier()
-            .await
-            .expect("persistence drains");
-        // The finalizer has published the settled row (the scripted provider
-        // reports no session id); a resumable successor has one.
-        let provider_session = format!("provider-{candidate_id}");
-        manager
-            .store
-            .lock()
-            .await
-            .conn
-            .execute(
-                "UPDATE sessions SET claude_session_id=?1 WHERE id=?2",
-                rusqlite::params![provider_session, candidate_id.to_string()],
-            )
-            .expect("resumable successor");
-        let settled_successor = manager
-            .store
-            .lock()
-            .await
-            .get_session(candidate_id)
-            .expect("load successor")
-            .expect("successor row");
-        manager
-            .completed
-            .write()
-            .await
-            .insert(candidate_id, CompletedSession::for_test(settled_successor));
-        let delivery = install_controller_candidate_test_process(candidate_id);
+        // Next pass (#360): the wake belongs to the displaced predecessor, so
+        // it is refused again for the committed successor instead of resuming
+        // it; the retry stays durable and nothing is delivered.
         let retained = manager
             .store
             .lock()
@@ -31408,35 +33378,30 @@ done
             &retained,
         )
         .await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let delivered = loop {
-            let count = manager
-                .store
-                .lock()
-                .await
-                .load_events(candidate_id)
-                .unwrap_or_default()
-                .iter()
-                .filter(|event| event.content.contains(WAKE))
-                .count();
-            if count > 0 || tokio::time::Instant::now() >= deadline {
-                break count;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert_eq!(delivered, 1);
-        assert_eq!(delivery.productive_start_count.load(Ordering::SeqCst), 1);
         {
             let store = manager.store.lock().await;
-            let settled = store
+            let row = store
                 .get_scheduled_job(&job.id)
                 .expect("load wake")
                 .expect("wake row kept");
-            assert!(
-                settled.last_fired_at.is_some(),
-                "the delivered one-shot is stamped"
+            assert!(row.enabled);
+            assert_eq!(row.last_fired_at, None, "the stale wake is never stamped");
+            let retry = store
+                .continuation_retry(job.id)
+                .expect("read retry")
+                .expect("retry kept");
+            assert_eq!(retry.attempts, 2);
+            assert_eq!(retry.last_code, CONTINUATION_TIP_CHANGED);
+            assert_eq!(
+                store
+                    .load_events(candidate_id)
+                    .expect("successor history")
+                    .iter()
+                    .filter(|event| event.content.contains(WAKE))
+                    .count(),
+                0,
+                "a displaced seat's wake never reaches the successor"
             );
-            assert_eq!(store.continuation_retry(job.id).expect("read retry"), None);
         }
         drop_controller_candidate_test_stream(candidate_id);
     }
@@ -33209,6 +35174,8 @@ done
 
     mod manager_admission_tests;
     mod manager_reseat_tests;
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    mod sandbox_retry_tests;
     #[cfg(target_os = "linux")]
     mod successor_recovery_tests;
 

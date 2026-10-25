@@ -26,7 +26,9 @@ pub(super) fn open_project_form_new(app: &mut App) {
         path: String::new(),
         color_index: 0,
         editing_id: None,
+        text: Default::default(),
     };
+    sync_project_text(app);
 }
 
 /// Open an edit form for the highlighted project (from Ctrl+e in picker).
@@ -64,7 +66,9 @@ pub(super) async fn open_project_form_edit(
         path: path_str,
         color_index,
         editing_id: Some(project_id),
+        text: Default::default(),
     };
+    sync_project_text(app);
 
     // Fetch FLYWHEEL.md status for this project (best-effort, non-blocking on error)
     if project.path.is_some() {
@@ -83,29 +87,81 @@ pub(super) async fn open_project_form_edit(
     }
 }
 
+/// How the project form's text fields are edited: one line each, wrapped on
+/// screen, no length limit.
+const PROJECT_FIELD: crate::form_text::FieldSpec = crate::form_text::FieldSpec::SINGLE_LINE;
+
+/// Point the form's text surface at its focused field (or drop it on the
+/// color field). A surface already showing that field's text is kept.
+pub(crate) fn sync_project_text(app: &mut App) {
+    let standard = app.standard_editing();
+    if let OverlayState::ProjectForm {
+        focused_field,
+        name,
+        path,
+        text,
+        ..
+    } = &mut app.overlay
+    {
+        match *focused_field {
+            0 => text.load(0, name, PROJECT_FIELD, standard),
+            1 => text.load(1, path, PROJECT_FIELD, standard),
+            _ => text.clear(),
+        }
+    }
+}
+
+/// Route a key into the focused text field. Returns whether the field took it.
+fn project_text_key(app: &mut App, key: KeyEvent) -> bool {
+    use crate::form_text::TextKey;
+
+    let standard = app.standard_editing();
+    let OverlayState::ProjectForm {
+        focused_field,
+        name,
+        path,
+        text,
+        ..
+    } = &mut app.overlay
+    else {
+        return false;
+    };
+    if *focused_field > 1 || matches!(key.code, KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter) {
+        return false;
+    }
+    let field = *focused_field;
+    let value = if field == 0 { &mut *name } else { &mut *path };
+    text.load(field, value, PROJECT_FIELD, standard);
+    // Esc at rest in normal mode cancels the form, as in the input modal.
+    if key.code == KeyCode::Esc && !text.consumes_esc(standard) {
+        return false;
+    }
+    match text.handle_key(key, PROJECT_FIELD, standard) {
+        TextKey::Ignored => false,
+        TextKey::Moved | TextKey::Refused => true,
+        TextKey::Edited => {
+            if let Some(content) = text.content() {
+                *value = content;
+            }
+            true
+        }
+    }
+}
+
 /// Handle keys in the project form overlay.
 pub(super) async fn handle_project_form_key(app: &mut App, key: KeyEvent) {
-    let (focused_field, editing_id) = match &app.overlay {
-        OverlayState::ProjectForm {
-            focused_field,
-            editing_id,
-            ..
-        } => (*focused_field, *editing_id),
+    let editing_id = match &app.overlay {
+        OverlayState::ProjectForm { editing_id, .. } => *editing_id,
         _ => return,
     };
 
-    // Standard editing: a real cursor and selection in the focused text field.
-    if app.edit_field(key, |overlay| match overlay {
-        OverlayState::ProjectForm { name, path, .. } => match focused_field {
-            0 => Some(name),
-            1 => Some(path),
-            _ => None,
-        },
-        _ => None,
-    }) != crate::field_edit::FieldKey::Ignored
-    {
+    if project_text_key(app, key) {
         return;
     }
+    let focused_field = match &app.overlay {
+        OverlayState::ProjectForm { focused_field, .. } => *focused_field,
+        _ => return,
+    };
 
     match key.code {
         // Shift+Tab: cycle fields backward (BackTab for legacy, Tab+Shift for DISAMBIGUATE)
@@ -113,17 +169,20 @@ pub(super) async fn handle_project_form_key(app: &mut App, key: KeyEvent) {
             if let OverlayState::ProjectForm { focused_field, .. } = &mut app.overlay {
                 *focused_field = (*focused_field + 2) % 3;
             }
+            sync_project_text(app);
         }
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
             if let OverlayState::ProjectForm { focused_field, .. } = &mut app.overlay {
                 *focused_field = (*focused_field + 2) % 3;
             }
+            sync_project_text(app);
         }
         // Tab: cycle fields forward
         KeyCode::Tab => {
             if let OverlayState::ProjectForm { focused_field, .. } = &mut app.overlay {
                 *focused_field = (*focused_field + 1) % 3;
             }
+            sync_project_text(app);
         }
         // Enter: save
         KeyCode::Enter => {
@@ -133,38 +192,10 @@ pub(super) async fn handle_project_form_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             open_project_picker(app, crate::types::ProjectPickerContext::GlobalFilter);
         }
-        // Typing: update the focused field
-        KeyCode::Char(c) => {
-            if focused_field == 2 {
-                // Color field: cycle through palette on any keystroke
-                if let OverlayState::ProjectForm { color_index, .. } = &mut app.overlay {
-                    *color_index = (*color_index + 1) % PROJECT_COLORS.len();
-                }
-            } else {
-                // Text fields
-                if let OverlayState::ProjectForm { name, path, .. } = &mut app.overlay {
-                    match focused_field {
-                        0 => name.push(c),
-                        1 => path.push(c),
-                        _ => {}
-                    }
-                }
-            }
-        }
-        // Backspace: delete last char in focused text field
-        KeyCode::Backspace => {
-            if focused_field < 2
-                && let OverlayState::ProjectForm { name, path, .. } = &mut app.overlay
-            {
-                match focused_field {
-                    0 => {
-                        name.pop();
-                    }
-                    1 => {
-                        path.pop();
-                    }
-                    _ => {}
-                }
+        // Typing on the color field: cycle through the palette on any keystroke
+        KeyCode::Char(_) if focused_field == 2 => {
+            if let OverlayState::ProjectForm { color_index, .. } = &mut app.overlay {
+                *color_index = (*color_index + 1) % PROJECT_COLORS.len();
             }
         }
         // Left/Right on color field: cycle colors
@@ -257,4 +288,137 @@ async fn submit_project_form(app: &mut App, editing_id: Option<uuid::Uuid>) {
 
     // Go back to picker
     open_project_picker(app, crate::types::ProjectPickerContext::GlobalFilter);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::app_test_helpers::with_session_list;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    async fn keys(app: &mut App, input: &str) {
+        let mut rest = input;
+        while !rest.is_empty() {
+            let (code, used) = if rest.starts_with("<Esc>") {
+                (KeyCode::Esc, 5)
+            } else if rest.starts_with("<Tab>") {
+                (KeyCode::Tab, 5)
+            } else {
+                let c = rest.chars().next().expect("a character");
+                (KeyCode::Char(c), c.len_utf8())
+            };
+            handle_project_form_key(app, KeyEvent::new(code, KeyModifiers::NONE)).await;
+            rest = &rest[used..];
+        }
+    }
+
+    fn form(app: &App) -> (&str, &str, usize) {
+        match &app.overlay {
+            OverlayState::ProjectForm {
+                name,
+                path,
+                focused_field,
+                ..
+            } => (name.as_str(), path.as_str(), *focused_field),
+            _ => panic!("the project form is open"),
+        }
+    }
+
+    fn rows(app: &mut App, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).expect("test terminal");
+        terminal
+            .draw(|frame| crate::ui::overlay::render_overlay(frame, frame.area(), app))
+            .expect("render the project form");
+        let buffer = terminal.backend().buffer();
+        (0..40)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_new_project_form_edits_name_and_path_in_place() {
+        let mut app = with_session_list(0);
+        open_project_form_new(&mut app);
+        // Opens in insert mode at the end of the (empty) name.
+        keys(&mut app, "Rsi tools<Esc>0wciwkit<Esc>").await;
+        assert_eq!(form(&app), ("Rsi kit", "", 0));
+        keys(&mut app, "u").await;
+        assert_eq!(form(&app).0, "Rsi tools");
+        keys(&mut app, "<Tab>/home/me/rsi<Esc>0x").await;
+        assert_eq!(form(&app), ("Rsi tools", "home/me/rsi", 1));
+        // Esc at rest in normal mode cancels the form to the picker.
+        keys(&mut app, "<Esc>").await;
+        assert!(!matches!(app.overlay, OverlayState::ProjectForm { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_edit_form_keeps_the_stored_text_and_edits_it_in_place() {
+        let mut app = with_session_list(0);
+        app.overlay = OverlayState::ProjectForm {
+            focused_field: 0,
+            name: "Old name".to_string(),
+            path: "/srv/app".to_string(),
+            color_index: 0,
+            editing_id: Some(uuid::Uuid::new_v4()),
+            text: Default::default(),
+        };
+        sync_project_text(&mut app);
+        keys(&mut app, "<Esc>0wciwtitle<Esc>").await;
+        assert_eq!(form(&app), ("Old title", "/srv/app", 0));
+        keys(&mut app, "<Tab>").await;
+        keys(&mut app, "<Esc>0lllihello<Esc>").await;
+        assert_eq!(form(&app).1, "/srhellov/app");
+    }
+
+    #[tokio::test]
+    async fn a_pasted_path_goes_in_at_the_cursor_on_one_line() {
+        let mut app = with_session_list(0);
+        open_project_form_new(&mut app);
+        keys(&mut app, "<Tab>").await;
+        assert!(crate::overlay::try_paste_text_overlay(
+            &mut app,
+            "/home/me/one\n/two"
+        ));
+        let (_, path, field) = form(&app);
+        assert_eq!(field, 1);
+        assert_eq!(path, "/home/me/one /two");
+    }
+
+    #[tokio::test]
+    async fn a_long_name_and_path_wrap_inside_the_form_with_the_mode_shown() {
+        let mut app = with_session_list(0);
+        open_project_form_new(&mut app);
+        let long_name = "name ".repeat(30) + "NAMEEND";
+        keys(&mut app, &long_name).await;
+        for width in [120_u16, 200] {
+            let rows = rows(&mut app, width);
+            assert!(rows.iter().any(|row| row.contains("Name: name")));
+            assert!(
+                rows.iter().any(|row| row.contains("NAMEEND")),
+                "{width} cols: the end of a long name is in view"
+            );
+            assert!(rows.iter().any(|row| row.contains("INSERT")));
+        }
+        keys(&mut app, "<Tab>").await;
+        let long_path = "/segment".repeat(20) + "/PATHEND";
+        keys(&mut app, &long_path).await;
+        let rows = rows(&mut app, 120);
+        assert!(rows.iter().any(|row| row.contains("Path: /segment")));
+        assert!(rows.iter().any(|row| row.contains("PATHEND")));
+        assert!(
+            rows.iter().any(|row| row.contains("Color:")),
+            "the color row stays below the wrapped fields"
+        );
+        keys(&mut app, "<Esc>").await;
+        let rows = rows_after_esc(&mut app);
+        assert!(rows.iter().any(|row| row.contains("NORMAL")));
+    }
+
+    fn rows_after_esc(app: &mut App) -> Vec<String> {
+        rows(app, 120)
+    }
 }

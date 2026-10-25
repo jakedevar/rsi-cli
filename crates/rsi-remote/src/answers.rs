@@ -1051,7 +1051,9 @@ mod tests {
                 }
                 OperatorCall::ManagerSeats(_)
                 | OperatorCall::ManagerConversation(_)
-                | OperatorCall::SendManagerMessage(_) => {
+                | OperatorCall::SendManagerMessage(_)
+                | OperatorCall::Dashboard(_)
+                | OperatorCall::Providers(_) => {
                     Err(OperatorError::Refused("answer rig has no v2".into()))
                 }
             }

@@ -15,7 +15,6 @@ use crate::store::Store;
 use rsi_common::model_control::{InvocationOwner, ModelInvocationPurpose, ModelUsageConfidence};
 use rsi_common::types::SessionProvider;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -28,7 +27,7 @@ pub struct DreamCallSuccess {
 
 #[derive(Clone)]
 pub struct DreamerLlmClient {
-    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) store: Arc<rsid_core::store_lock::Mutex<Store>>,
     pub(crate) event_bus: Arc<EventBus>,
     pub(crate) provider: SessionProvider,
     pub(crate) api_url: String,
@@ -83,7 +82,7 @@ impl DreamCompletionBackend for LiveDreamCompletionBackend {
 
 impl DreamerLlmClient {
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: Arc<EventBus>,
         provider: SessionProvider,
         api_url: String,
@@ -103,7 +102,7 @@ impl DreamerLlmClient {
 
     #[cfg(test)]
     pub(crate) fn new_with_backend(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: Arc<EventBus>,
         provider: SessionProvider,
         api_url: String,
@@ -389,7 +388,9 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let client = DreamerLlmClient::new(
-            Arc::new(Mutex::new(Store::open_in_memory().expect("store"))),
+            Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("store"),
+            )),
             Arc::new(EventBus::new(8)),
             SessionProvider::Local,
             "http://localhost:8080/v1/chat/completions".to_string(),
@@ -405,7 +406,9 @@ mod tests {
     #[tokio::test]
     async fn test_complete_with_context_uses_backend() {
         let backend = TestDreamCompletionBackend::with_response(Ok("response".to_string()));
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let client = DreamerLlmClient::new_with_backend(
             store,
             Arc::new(EventBus::new(8)),

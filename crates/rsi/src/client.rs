@@ -116,6 +116,9 @@ pub enum ClientError {
     #[error("Connection closed by daemon")]
     ConnectionClosed,
 
+    #[error("Daemon busy (no reply in {0} s); try again")]
+    Timeout(u64),
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 }
@@ -277,10 +280,12 @@ fn decode_source_worktree_run(value: Value) -> Result<SourceWorktreeSettlementRu
 /// Async client for communicating with flywheeld over Unix socket.
 pub struct DaemonClient {
     socket_path: PathBuf,
-    stream: Option<UnixStream>,
+    stream: Option<BufReader<UnixStream>>,
+    /// Retain partial lines and read-ahead across a cancelled/timed-out read.
+    response_buffer: Vec<u8>,
     next_id: AtomicI64,
-    /// True when a fire-and-forget request was sent and the response hasn't been consumed yet.
-    pending_response: bool,
+    /// ID of a fire-and-forget request whose response has not been consumed.
+    pending_response: Option<i64>,
     /// #2067: the transport-only session authority token from
     /// `$RSI_SESSION_TOKEN`, when this process runs inside an agent session.
     /// Forwarded on every request exactly as `rsi-rpc` does, so the daemon
@@ -703,8 +708,9 @@ impl DaemonClient {
         Self {
             socket_path,
             stream: None,
+            response_buffer: Vec::new(),
             next_id: AtomicI64::new(1),
-            pending_response: false,
+            pending_response: None,
             session_token: session_token_from_env(),
             config_write_epoch: AtomicU64::new(0),
         }
@@ -740,7 +746,8 @@ impl DaemonClient {
     /// Connect to the daemon socket.
     pub async fn connect(&mut self) -> Result<()> {
         let stream = UnixStream::connect(&self.socket_path).await?;
-        self.stream = Some(stream);
+        self.disconnect();
+        self.stream = Some(BufReader::new(stream));
         Ok(())
     }
 
@@ -757,13 +764,15 @@ impl DaemonClient {
     /// PID of the daemon at the other end of the socket (`SO_PEERCRED`);
     /// `None` when disconnected or when the platform does not report it.
     pub fn peer_pid(&self) -> Option<u32> {
-        let pid = self.stream.as_ref()?.peer_cred().ok()?.pid()?;
+        let pid = self.stream.as_ref()?.get_ref().peer_cred().ok()?.pid()?;
         u32::try_from(pid).ok().filter(|pid| *pid > 0)
     }
 
     /// Disconnect from daemon.
     pub fn disconnect(&mut self) {
         self.stream = None;
+        self.response_buffer.clear();
+        self.pending_response = None;
     }
 
     /// Send an RPC request and wait for the response.
@@ -783,18 +792,13 @@ impl DaemonClient {
         };
 
         let json = serde_json::to_string(&request)?;
-        stream.write_all(format!("{}\n", json).as_bytes()).await?;
-        stream.flush().await?;
+        stream
+            .get_mut()
+            .write_all(format!("{}\n", json).as_bytes())
+            .await?;
+        stream.get_mut().flush().await?;
 
-        let mut buf = String::new();
-        let mut reader = BufReader::new(&mut *stream);
-        let n = reader.read_line(&mut buf).await?;
-        if n == 0 {
-            self.stream = None;
-            return Err(ClientError::ConnectionClosed);
-        }
-
-        let response: RpcResponse = serde_json::from_str(buf.trim())?;
+        let response = self.read_response(id).await?;
 
         if let Some(error) = response.error {
             return Err(ClientError::Rpc {
@@ -827,29 +831,23 @@ impl DaemonClient {
         };
 
         let json = serde_json::to_string(&request)?;
-        stream.write_all(format!("{}\n", json).as_bytes()).await?;
-        self.pending_response = true;
+        stream
+            .get_mut()
+            .write_all(format!("{}\n", json).as_bytes())
+            .await?;
+        self.pending_response = Some(id);
         Ok(())
     }
 
     /// Consume a pending fire-and-forget response. Errors are logged, not propagated
     /// to the caller (since the original caller already returned).
     async fn drain_pending(&mut self) -> Result<()> {
-        if !self.pending_response {
+        let Some(id) = self.pending_response else {
             return Ok(());
-        }
-        self.pending_response = false;
+        };
 
-        let stream = self.stream.as_mut().ok_or(ClientError::NotConnected)?;
-        let mut buf = String::new();
-        let mut reader = BufReader::new(&mut *stream);
-        let n = reader.read_line(&mut buf).await?;
-        if n == 0 {
-            self.stream = None;
-            return Err(ClientError::ConnectionClosed);
-        }
-
-        let response: RpcResponse = serde_json::from_str(buf.trim())?;
+        let response = self.read_response(id).await?;
+        self.pending_response = None;
         if let Some(error) = response.error {
             tracing::warn!(
                 "Fire-and-forget RPC error: {} (code {})",
@@ -859,6 +857,38 @@ impl DaemonClient {
         }
 
         Ok(())
+    }
+
+    async fn read_response(&mut self, id: i64) -> Result<RpcResponse> {
+        let read = async {
+            loop {
+                let stream = self.stream.as_mut().ok_or(ClientError::NotConnected)?;
+                // read_until is cancellation safe: bytes already consumed stay
+                // in response_buffer, and the reader retains any read-ahead.
+                let n = stream.read_until(b'\n', &mut self.response_buffer).await?;
+                if n == 0 || self.response_buffer.last() != Some(&b'\n') {
+                    return Err(ClientError::ConnectionClosed);
+                }
+                let response = serde_json::from_slice::<RpcResponse>(&self.response_buffer);
+                self.response_buffer.clear();
+                let response = response?;
+                match response.id.as_ref().and_then(Value::as_i64) {
+                    Some(response_id) if response_id == id => return Ok(response),
+                    Some(response_id) if response_id < id => {
+                        tracing::debug!(response_id, id, "Discarding late daemon reply");
+                    }
+                    _ => return Err(ClientError::Protocol("daemon reply id mismatch".into())),
+                }
+            }
+        };
+        let result = read.await;
+        if matches!(
+            result,
+            Err(ClientError::Io(_) | ClientError::ConnectionClosed)
+        ) {
+            self.disconnect();
+        }
+        result
     }
 
     async fn request_launch_session(&mut self, params: Value) -> Result<uuid::Uuid> {
@@ -1123,6 +1153,18 @@ impl DaemonClient {
     pub async fn get_fleet_overview(&mut self) -> Result<rsi_common::fleet::FleetOverview> {
         let value = self
             .request("GetFleetOverview", serde_json::json!({}))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// #3317: operator-only bounded global dashboard snapshot (#3316).
+    pub async fn get_global_dashboard(
+        &mut self,
+        window: rsi_common::global_dashboard::DashboardWindow,
+    ) -> Result<rsi_common::global_dashboard::GlobalDashboard> {
+        let params = rsi_common::global_dashboard::GetGlobalDashboardParams { window };
+        let value = self
+            .request("GetGlobalDashboard", serde_json::to_value(params)?)
             .await?;
         serde_json::from_value(value).map_err(Into::into)
     }
@@ -2263,6 +2305,26 @@ impl DaemonClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// #3789: operator-only. The external harness-report import status.
+    pub async fn get_external_report_sync_status(
+        &mut self,
+    ) -> Result<rsi_common::external_report::SyncStatusV1> {
+        let result = self
+            .request("GetExternalReportSyncStatus", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// #3789: operator-only. Run one external report import pass now.
+    pub async fn sync_external_reports_now(
+        &mut self,
+    ) -> Result<rsi_common::external_report::SyncStatusV1> {
+        let result = self
+            .request("SyncExternalReportsNow", serde_json::json!({}))
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     /// Get the lifetime usage aggregate for the Settings -> Stats category,
     /// optionally scoped to a single project (tab-scoped filter, D1).
     ///
@@ -2382,6 +2444,22 @@ impl DaemonClient {
             )
             .await?;
         Ok(serde_json::from_value(result)?)
+    }
+
+    /// Clear the selected provider's old plan-window telemetry after switching accounts.
+    ///
+    /// # Errors
+    /// Returns the transport or daemon RPC error.
+    pub async fn clear_provider_usage_hold(
+        &mut self,
+        provider: rsi_common::types::SessionProvider,
+    ) -> Result<()> {
+        self.request(
+            "ClearProviderUsageHold",
+            serde_json::to_value(rsi_common::rpc::ClearProviderUsageHoldParams { provider })?,
+        )
+        .await?;
+        Ok(())
     }
 
     /// `GetProviderLoginState` (operator-only, #2753): the cached CLI login
@@ -3727,6 +3805,19 @@ impl DaemonClient {
         Ok(project)
     }
 
+    /// Open the operator intake seat for `request` in `project_id` (#3787).
+    pub async fn launch_intake_session(
+        &mut self,
+        project_id: uuid::Uuid,
+        request: &str,
+    ) -> Result<serde_json::Value> {
+        self.request(
+            "LaunchIntakeSession",
+            serde_json::json!({ "project_id": project_id, "request": request }),
+        )
+        .await
+    }
+
     /// Delete a project.
     pub async fn delete_project(&mut self, id: uuid::Uuid) -> Result<()> {
         self.request("DeleteProject", serde_json::json!({ "id": id }))
@@ -4209,6 +4300,64 @@ impl DaemonClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    // --- Claude skills (operator-only, local #91) ---
+
+    /// `ListSkills {user: true}`: the daemon user's `~/.claude/skills`.
+    pub async fn list_user_skills(
+        &mut self,
+    ) -> Result<rsi_common::input_assets::ListSkillsResponseV1> {
+        use rsi_common::input_assets::{ListSkillsRequestV1, METHOD_LIST_SKILLS};
+        let params = serde_json::to_value(ListSkillsRequestV1 {
+            user: true,
+            ..Default::default()
+        })?;
+        let result = self.request(METHOD_LIST_SKILLS, params).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `GetSkill {user: true}`: one user skill's `SKILL.md` (bounded).
+    pub async fn get_user_skill(
+        &mut self,
+        name: &str,
+    ) -> Result<rsi_common::input_assets::GetSkillResponseV1> {
+        use rsi_common::input_assets::{GetSkillRequestV1, METHOD_GET_SKILL};
+        let params = serde_json::to_value(GetSkillRequestV1 {
+            user: true,
+            name: name.to_string(),
+            ..Default::default()
+        })?;
+        let result = self.request(METHOD_GET_SKILL, params).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `SetSkillEnabled`: rename a user skill to or from `<name>.disabled`.
+    pub async fn set_skill_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<rsi_common::input_assets::SetSkillEnabledResponseV1> {
+        use rsi_common::input_assets::{METHOD_SET_SKILL_ENABLED, SetSkillEnabledRequestV1};
+        let params = serde_json::to_value(SetSkillEnabledRequestV1 {
+            name: name.to_string(),
+            enabled,
+        })?;
+        let result = self.request(METHOD_SET_SKILL_ENABLED, params).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    /// `DeleteSkill`: move a user skill into the daemon's skill trash.
+    pub async fn delete_skill(
+        &mut self,
+        name: &str,
+    ) -> Result<rsi_common::input_assets::DeleteSkillResponseV1> {
+        use rsi_common::input_assets::{DeleteSkillRequestV1, METHOD_DELETE_SKILL};
+        let params = serde_json::to_value(DeleteSkillRequestV1 {
+            name: name.to_string(),
+        })?;
+        let result = self.request(METHOD_DELETE_SKILL, params).await?;
+        Ok(serde_json::from_value(result)?)
+    }
+
     // --- Issue workspace (operator-only generic RPCs) ---
 
     pub async fn create_issue_v2(
@@ -4348,6 +4497,30 @@ impl DaemonClient {
 
     // --- Daemon Config ---
 
+    pub async fn get_host_tuning(&mut self) -> Result<rsi_common::host_tuning::TuningView> {
+        Ok(serde_json::from_value(
+            self.request("GetHostTuning", serde_json::json!({})).await?,
+        )?)
+    }
+    pub async fn configure_host_tuning(
+        &mut self,
+        params: &rsi_common::host_tuning::ConfigureHostTuning,
+    ) -> Result<rsi_common::host_tuning::TuningView> {
+        Ok(serde_json::from_value(
+            self.request("ConfigureHostTuning", serde_json::to_value(params)?)
+                .await?,
+        )?)
+    }
+    pub async fn switch_host_preset(
+        &mut self,
+        params: &rsi_common::host_tuning::SwitchHostPreset,
+    ) -> Result<rsi_common::host_tuning::SwitchReceipt> {
+        Ok(serde_json::from_value(
+            self.request("SwitchHostPreset", serde_json::to_value(params)?)
+                .await?,
+        )?)
+    }
+
     /// Fetch daemon runtime configuration (feature flags).
     pub async fn get_daemon_config(&mut self) -> Result<Value> {
         self.request("GetDaemonConfig", serde_json::json!({})).await
@@ -4452,11 +4625,13 @@ impl DaemonClient {
     pub async fn audit_source_worktree_cohort(
         &mut self,
         repository_identity: String,
+        after_custody_id: Option<uuid::Uuid>,
     ) -> Result<SourceWorktreeCohortAuditV1> {
         let value = self
             .request(
                 "AuditSourceWorktreeCohort",
                 serde_json::to_value(AuditSourceWorktreeCohortParams {
+                    after_custody_id,
                     repository_identity,
                 })?,
             )
@@ -4653,6 +4828,93 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn timeout_keeps_socket_and_next_request_ignores_late_replies() {
+        // Exercise an entire stale reply, a partial line consumed before
+        // cancellation, and a late RPC error. None may answer the next call.
+        for (partial, stale_error) in [(false, false), (true, false), (true, true)] {
+            let dir = crate::test_support::socket_tempdir().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let first: RpcRequest =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let stale = if stale_error {
+                    serde_json::json!({"jsonrpc":"2.0", "id":first.id,
+                        "error":{"code":-32000, "message":"old failure"}})
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0", "id":first.id, "result":"stale"})
+                };
+                let stale = format!("{stale}\n");
+                let split = if partial { 12 } else { 0 };
+                write.write_all(&stale.as_bytes()[..split]).await.unwrap();
+                // Deliberately withhold the reply until the NEXT request has
+                // reached this same socket; no reconnect can satisfy this.
+                let next: RpcRequest =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(next.method, "NextAction");
+                let current = serde_json::json!({"jsonrpc":"2.0", "id":next.id, "result":"fresh"});
+                let mut replies = stale.as_bytes()[split..].to_vec();
+                replies.extend_from_slice(format!("{current}\n").as_bytes());
+                write.write_all(&replies).await.unwrap();
+            });
+            let mut client = DaemonClient::new(socket);
+            client.connect().await.unwrap();
+            let deadline = tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                client.request("Slow", Value::Null),
+            )
+            .await;
+            assert!(deadline.is_err(), "slow request reaches its deadline");
+            assert!(client.is_connected());
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.request("NextAction", Value::Null),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(next, serde_json::json!("fresh"));
+            assert!(client.is_connected());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_during_reply_marks_socket_lost() {
+        for partial in [false, true] {
+            let dir = crate::test_support::socket_tempdir().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                lines.next_line().await.unwrap().unwrap();
+                if partial {
+                    write.write_all(b"{\"jsonrpc\":").await.unwrap();
+                }
+                // Closing the accepted socket is transport loss even if it
+                // occurs partway through a response.
+            });
+            let mut client = DaemonClient::new(socket);
+            client.connect().await.unwrap();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.request("Closed", Value::Null),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(error, ClientError::ConnectionClosed));
+            assert!(client.stream.is_none());
+            server.await.unwrap();
+        }
+    }
 
     /// #2067: the `rsi` client forwards the session token as the request's
     /// transport-only `session_token` (never in params), so the daemon applies
@@ -5182,6 +5444,7 @@ mod tests {
             refusals: Vec::new(),
             shared_target: None,
             stray_targets: None,
+            build_targets: None,
             computed_at: None,
             age_ms: None,
         };

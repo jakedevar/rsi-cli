@@ -417,7 +417,7 @@ fn daemon_text_editor_shows_the_path_the_reason_and_its_keys() {
 
     let mut app = crate::app::app_test_helpers::with_session_list(0);
     app.overlay = crate::types::OverlayState::DaemonTextEditor {
-        field: "cold_archive_dir",
+        field: "cold_archive_dir".to_string(),
         input: "/mnt/cold/rsi".to_string(),
         error: Some("the archive directory resolves into the sandbox root /sbx".to_string()),
     };
@@ -453,7 +453,7 @@ fn daemon_text_editor_is_titled_for_its_field() {
 
     let mut app = crate::app::app_test_helpers::with_session_list(0);
     app.overlay = crate::types::OverlayState::DaemonTextEditor {
-        field: "harness_searxng_url",
+        field: "harness_searxng_url".to_string(),
         input: "http://127.0.0.1:8888".to_string(),
         error: None,
     };

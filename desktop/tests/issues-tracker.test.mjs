@@ -10,7 +10,7 @@ import { ISSUES_ACTIONS, ISSUES_RULES } from '../dist/actions/issues.js';
 import { ISSUES_KEYS, idleKeys, resolveIssuesKey } from '../dist/issues-model.js';
 import {
   CANDIDATE_LIMIT, DEFAULT_ISSUE_TOPOLOGY, associatedSessions, candidateQuery, candidateRequest, dispatchFields, dispatchKey,
-  dispatchLine, moveDispatch, parseDispatched, pollSummary, reconcileAssociated, sortDispatched, stepTab, syncRows,
+  dispatchLine, moveDispatch, parseDispatched, pollSummary, reconcileAssociated, sortDispatched, stepTab, syncRows, TAB_TIPS,
 } from '../dist/issues-tracker-model.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
@@ -116,4 +116,13 @@ test('the Rust tracker commands exist and the run side calls them', () => {
     assert.match(dom, new RegExp(`'${cmd}'`), cmd);
   }
   assert.match(dom, /dispatch\('topology-run-issue', \{ source: 'key', arg: `run \$\{DEFAULT_ISSUE_TOPOLOGY\}` \}\)/);
+});
+
+test('each tab explains itself in plain words', () => {
+  assert.deepEqual(TAB_TIPS, {
+    local: 'Local: Issues in this project',
+    dispatched: 'Dispatched: Issues handed to agents to work on',
+    sync: 'Sync: links to an external tracker',
+  });
+  assert.match(readFileSync(here('../src/issues.ts'), 'utf8'), /b\.title = TAB_TIPS\[t\]/);
 });

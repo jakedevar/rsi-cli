@@ -49,7 +49,7 @@ absent is legitimate and is not flagged.
 #730). It rejects personal home paths / account names and public IP literals
 in tracked files outside `thoughts/` (historical records). Use `$HOME`, `~/`,
 repo-relative paths or placeholders (`remote.example.net`, `203.0.113.0/24`).
-The allowlist lives in `tools/check_personal_paths.py` and is deliberately tiny
+The allowlist lives in `crates/rsi-repo-guards/src/personal_paths.rs` and is deliberately tiny
 (GitHub repo slugs, the public resolver `8.8.8.8`); private, loopback, CGNAT and
 documentation ranges pass without an entry.
 
@@ -95,7 +95,8 @@ Rust is pinned by `rust-toolchain.toml`. Use the pinned toolchain when building,
 ## RPC Surface
 
 The full method list is the match arms in `crates/rsid/src/rpc.rs`; the
-non-obvious per-family contracts live in `crates/rsid/CLAUDE.md`. Operator-only
+non-obvious per-family contracts live in `crates/rsid/CLAUDE.md` (one line per fact) and
+`docs/agents/rsid-daemon-facts.md` (full text). Operator-only
 families (ProgramRun, source-worktree cohort settlement, harness-manager
 appointment/policy/state/decision methods, generic Issue verbs,
 `LinkIssueToIdea`, `ListIssueEvents`) must stay absent from `AGENT_VERBS`,
@@ -155,7 +156,7 @@ stay absent from `AGENT_VERBS`, `READ_VERBS`, native provider tools, and the
 agent CLI catalog. See issue #35 for the outstanding audit.
 
 Hard rules:
-1. Never change schema without a versioned migration: one new file `crates/rsid/src/store/migrations/vNNN.rs` (three-digit name; see `v139.rs` for the pattern) holding an `impl Store { fn migrate_vNNN }` with the `if version < N` block and the matching `user_version` bump. `crates/rsid/build.rs` collects the files in order into the runner table and derives `LATEST_SCHEMA_VERSION` from the highest file, so a new migration edits no shared file and never conflicts in `store/mod.rs` (which keeps only the runner). Released files are immutable. The provisional renumber tool (`tools/rolling-migration-renumber.py`) renames `v130.rs` to the next number and rewrites its declared sites; a declaration against the old inline layout must be ported first. **Released migration DDL, catalog projections, and fingerprints are immutable. Never repair them in place; add a forward migration.** Mark migration-owned helper/catalog regions for the released-migration inventory and refresh it only to append the new version; CI rejects any changed existing pin relative to the base.
+1. Never change schema without a versioned migration: one new file `crates/rsid/src/store/migrations/vNNN.rs` (three-digit name; see `v139.rs` for the pattern) holding an `impl Store { fn migrate_vNNN }` with the `if version < N` block and the matching `user_version` bump. `crates/rsid/build.rs` collects the files in order into the runner table and derives `LATEST_SCHEMA_VERSION` from the highest file, so a new migration edits no shared file and never conflicts in `store/mod.rs` (which keeps only the runner). Released files are immutable. The provisional renumber tool (`scripts/repo-guard rolling-migration-renumber`) renames `v130.rs` to the next number and rewrites its declared sites; a declaration against the old inline layout must be ported first. **Released migration DDL, catalog projections, and fingerprints are immutable. Never repair them in place; add a forward migration.** Mark migration-owned helper/catalog regions for the released-migration inventory and refresh it only to append the new version; CI rejects any changed existing pin relative to the base.
 2. Never hard-delete rows without explicit user consent. Prefer logical delete, archive, or status transitions.
 3. Timestamp values must be RFC3339 with nanosecond precision.
 4. UUIDs must be lowercase canonical strings.
@@ -164,19 +165,57 @@ Hard rules:
 
 ### `model_invocations.estimated_cost_usd` is session-cumulative on launch/resume rows (#2593)
 
-A `session.launch.fresh` / `session.continue.resume` row is settled from the session's
-running totals, so its `estimated_cost_usd` (and its token and `wall_time_ms` columns) is the
-session's CUMULATIVE figure at that moment: the rows of one session rise monotonically and the
-last equals `sessions.cost_usd`. A plain `SUM(estimated_cost_usd)` over them overstates spend
+A `session.launch.fresh` / `session.continue.resume` / `session.rotate.child` row is settled
+from the session's running totals, so its `estimated_cost_usd` is the session's CUMULATIVE cost
+at that moment: the rows of one session rise monotonically and the last equals
+`sessions.cost_usd`. Its token and `wall_time_ms` columns are the invocation's own delta (the
+settlement subtracts the baseline captured at admission), so they sum as they are. A plain `SUM(estimated_cost_usd)` over them overstates spend
 many times over. Every other purpose settles its own cost. The stored meaning is unchanged
 (released rows are not rewritten). Anything that adds invocation costs up (budgets, alerts,
-usage views, ad-hoc SQL) reads the per-invocation increment: join
-`model_control::cost::cost_increment_sql!()` (`cost_increment_usd` per `invocation_id`; the
-difference to the session's previous priced launch/resume row, a drop restarts from the row's
-own value). `usage_stats`, `efficiency_metrics`, the manager spend ledger and
-`session_model_invocation_cost_total` already do; a test in `model_control/cost.rs` pins it.
-Ad-hoc SQL: `scripts/export-issue-pipeline-evidence.py` (`session_invocations`) has the same
-`lag()` difference.
+usage views, ad-hoc SQL) needs per-invocation increments. The internal
+`model_control::cost::cost_increment_for_session_sql!()` and
+`cost_increment_for_ids_sql!()` restrict the predecessor window to the required session
+or session-ID set. Only admitted, priced rows of the three cumulative purposes above
+participate as predecessors, ordered within each session by `created_at`, then `id`.
+The first priced row and a drop count the row's own value; NULL stays unknown.
+Other purposes and session-less rows keep their recorded cost. Select whole sessions
+for the predecessor window before filtering the requested time range.
+
+These increments describe recorded estimates, not invoices. Billed totals also apply
+the current provider/model billing classification at read time: subscription usage
+contributes zero metered dollars without rewriting the stored estimate. See
+`crates/rsid-store/src/model_control/cost.rs` and `store/provider_billing.rs` for the
+internal rules; the historical export/report CLIs are
+[retired](issue-pipeline-measurement-retirement.md).
+
+### Token and cost accounting audit (#3534)
+
+Reconciled against Claude Code's own session JSONL (`~/.claude/projects`, per API message, deduped
+by `message.id`) and Codex's rollout logs (`~/.codex/sessions`, final `total_token_usage`):
+
+| Path | Counter | RSI / provider record |
+| --- | --- | --- |
+| Claude (10 sessions: Task workers, a Standard Opus worker, a 51-invocation Standard Sonnet) | prompt total (input + cache creation + cache read) | 1.00 (exact) |
+| Claude | cache read | 1.5x - 2.0x (one message's usage was summed once per content block) |
+| Claude | cache creation | 1.4x - 2.5x (same cause) |
+| Claude | output | 0.02x - 0.39x (stream `assistant` events carry the start-of-message placeholder) |
+| Claude | `sessions.cost_usd` | exact: the CLI's `total_cost_usd` equals the deduped tokens at list price with the 1-hour cache-write rate |
+| Codex (3 sessions) | prompt, output, cache read | 1.00 / 1.00 / 0.98 - 1.00 |
+| Fleet dashboard and fleet overview (24 h) | cost | about 10x: they summed the raw cumulative `estimated_cost_usd` of launch/resume rows |
+
+Fixed in the same change: every lifetime counter takes a Claude message once (`PromptTotals`
+keeps a bounded set of message ids, not only the previous one); the result's `usage.output_tokens`
+fills in the output the events missed; the dashboard and fleet reads use the cost increment; the
+increment table treats `session.rotate.child` as part of the running total (its first resume was
+charged the whole total again). Not changed: `input_tokens` on an invocation row is the whole
+prompt (cache read and creation are subsets of it), so a view that adds `cache_read_tokens` to
+`input_tokens` double counts; cost is never derived from those columns.
+
+Rows written before this change keep their old cache and output columns (a deduped cache or
+output figure cannot be rebuilt from the row, and released rows are not rewritten, hard rule 3).
+Treat `cache_read_tokens` / `cache_creation_tokens` as inflated by about 1.5x - 2.5x and
+`output_tokens` as an undercount on Claude rows older than the commit that carries this section;
+dollars on `sessions.cost_usd` and the increments are not affected.
 
 ### Copying the live database, and throwaway daemons (#2530)
 

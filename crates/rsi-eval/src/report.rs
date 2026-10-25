@@ -188,8 +188,12 @@ pub fn render_bench_markdown(record: &BenchRunRecord, summary: &Summary) -> Stri
     );
     let _ = writeln!(
         out,
-        "- **Harbor**: `{}`; adapter tree `{}`; harness build `{}`",
-        run.harbor_version, run.adapter_tree_hash, run.harness_build_digest
+        "- **Harbor**: `{}`; adapter tree `{}`; harness build `{}`; harness source `{}`; rsid build `{}`",
+        run.harbor_version,
+        run.adapter_tree_hash,
+        run.harness_build_digest,
+        run.harness_source_digest,
+        run.build_sha
     );
     let _ = writeln!(
         out,

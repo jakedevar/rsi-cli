@@ -552,6 +552,7 @@ pub(super) struct HostIdentity {
 }
 
 impl HostIdentity {
+    #[cfg(not(target_os = "macos"))]
     pub(super) fn read(proc_root: &Path) -> Option<Self> {
         let pid_ns = std::fs::read_link(proc_root.join("self/ns/pid")).ok()?;
         let boot_id = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id")).ok()?;
@@ -559,6 +560,57 @@ impl HostIdentity {
             pid_ns: pid_ns.to_str()?.to_string(),
             boot_id: boot_id.trim().to_string(),
         })
+    }
+
+    /// This host's identity as a sweep can read it: `/proc` under `proc_root`
+    /// on Linux; the kernel (`kern.boottime`, no PID namespaces) on macOS,
+    /// which ignores `proc_root`.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn current(proc_root: &Path) -> Option<Self> {
+        Self::read(proc_root)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn current(_proc_root: &Path) -> Option<Self> {
+        Some(Self {
+            pid_ns: super::macos::PID_NAMESPACE.to_string(),
+            boot_id: super::macos::boot_time().ok()?,
+        })
+    }
+
+    /// Whether a recorded boot id proves the machine rebooted since. Linux
+    /// `boot_id` is exact; macOS `kern.boottime` moves when the clock is
+    /// stepped, so there a mismatch proves nothing and liveness rests on the
+    /// pid and its start time alone.
+    fn reboot_since(&self, recorded: &str) -> bool {
+        cfg!(not(target_os = "macos")) && self.boot_id != recorded
+    }
+}
+
+/// What the recorded owner pid is now.
+enum PidState {
+    Started(u64),
+    Gone,
+    Unknown,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pid_state(proc_root: &Path, pid: u32) -> PidState {
+    match std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) {
+        Ok(stat) => {
+            crate::governor::parse_start_ticks(&stat).map_or(PidState::Unknown, PidState::Started)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => PidState::Gone,
+        Err(_) => PidState::Unknown,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pid_state(_proc_root: &Path, pid: u32) -> PidState {
+    match super::macos::probe(pid) {
+        Ok(super::macos::Probe::Started(micros)) => PidState::Started(micros),
+        Ok(super::macos::Probe::Gone) => PidState::Gone,
+        Err(_) => PidState::Unknown,
     }
 }
 
@@ -613,24 +665,20 @@ pub(super) fn lander_owner(owner_file: &OwnerFile, proc_root: &Path) -> LanderOw
         // A malformed or legacy owner cannot name its namespace.
         return LanderOwner::Ambiguous;
     };
-    let Some(host) = HostIdentity::read(proc_root) else {
+    let Some(host) = HostIdentity::current(proc_root) else {
         return LanderOwner::Ambiguous;
     };
-    if host.boot_id != boot_id {
+    if host.reboot_since(boot_id) {
         // The machine rebooted: no process of that boot is alive.
         return LanderOwner::Gone;
     }
     if host.pid_ns != pid_ns || ticks == 0 {
         return LanderOwner::Ambiguous;
     }
-    match std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) {
-        Ok(stat) => match crate::governor::parse_start_ticks(&stat) {
-            Some(live) if live == ticks => LanderOwner::Live,
-            // The pid was reused by another process.
-            Some(_) => LanderOwner::Gone,
-            None => LanderOwner::Ambiguous,
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => LanderOwner::Gone,
-        Err(_) => LanderOwner::Ambiguous,
+    match pid_state(proc_root, pid) {
+        PidState::Started(live) if live == ticks => LanderOwner::Live,
+        // The pid was reused by another process.
+        PidState::Started(_) | PidState::Gone => LanderOwner::Gone,
+        PidState::Unknown => LanderOwner::Ambiguous,
     }
 }

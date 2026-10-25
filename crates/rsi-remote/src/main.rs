@@ -1222,6 +1222,8 @@ mod tests {
 
     const V2_SEAT: &str = "550e8400-e29b-41d4-a716-446655440001";
     const V2_SEATS: &str = r#"{"projects":[{"project_id":"550e8400-e29b-41d4-a716-446655440000","name":"Alpha","project_manager":{"session_id":"550e8400-e29b-41d4-a716-446655440001","role":"project_manager","status":"Running","provider":"Claude","model":null,"last_activity_at":"2026-10-17T09:30:00.000000000Z","pending_decisions":0,"pending_decisions_truncated":false},"global_manager":null}]}"#;
+    const V2_DASHBOARD: &str = r#"{"observed_at":"2026-10-19T19:30:00.000000000Z","satellites":[{"label":"mac-mini","reachable":true,"build_sha":null,"last_seen_at":"2026-10-19T19:29:40.000000000Z","running_agents":3}],"satellites_truncated":false,"agents":[{"provider":"Claude","effort":"high","running":2}],"agents_total":2,"agents_truncated":false,"agents_incomplete":false}"#;
+    const V2_PROVIDERS: &str = r#"{"observed_at":"2026-10-22T12:00:00.000000000Z","providers":[{"provider":"Claude","status":"allowed","binding_window":"five_hour","overage_status":"rejected","is_using_overage":false,"observed_at":"2026-10-22T12:00:00.000000000Z","stale_reason":null,"windows":[{"key":"five_hour","utilization":0.42,"resets_at":"2026-10-22T15:00:00.000000000Z","resets_at_epoch":1792681200}],"windows_reason":null,"windows_truncated":false,"spend":{"cost_1h_usd":1.25,"cost_24h_usd":9.5},"spend_reason":null,"models":[],"models_truncated":false}],"providers_truncated":false,"windows_incomplete":false}"#;
     const V2_CONVERSATION: &str = r#"{"seat":{"session_id":"550e8400-e29b-41d4-a716-446655440001","role":"project_manager","status":"Running","provider":"Claude","model":null,"last_activity_at":"2026-10-17T09:30:00.000000000Z","pending_decisions":0,"pending_decisions_truncated":false},"items":[],"next_before":null,"has_more":false,"operator_messages":[]}"#;
     const V2_RECEIPT: &str = r#"{"message_id":"550e8400-e29b-41d4-a716-44665544000a","seat_session_id":"550e8400-e29b-41d4-a716-446655440001","state":"queued","created_at":"2026-10-17T09:31:00.000000000Z","deduplicated":false}"#;
 
@@ -1339,6 +1341,20 @@ mod tests {
                         .unwrap()
                         .push((call.method().into(), call.wire().unwrap()["params"].clone()));
                     self.v2_send.lock().unwrap().clone()
+                }
+                reads::OperatorCall::Dashboard(_) => {
+                    self.v2_calls
+                        .lock()
+                        .unwrap()
+                        .push((call.method().into(), call.wire().unwrap()["params"].clone()));
+                    Ok(V2_DASHBOARD.as_bytes().to_vec())
+                }
+                reads::OperatorCall::Providers(_) => {
+                    self.v2_calls
+                        .lock()
+                        .unwrap()
+                        .push((call.method().into(), call.wire().unwrap()["params"].clone()));
+                    Ok(V2_PROVIDERS.as_bytes().to_vec())
                 }
             }
         }
@@ -2371,8 +2387,28 @@ mod tests {
             harness.dispatch.v2_calls("RemoteGetManagerConversationV2")[1]["before"],
             serde_json::json!({"sequence": 3, "id": 903})
         );
+        // hub #3287: the dashboard, with no parameters.
+        let (status, _, body) = exchange(&harness, get("/api/v2/dashboard", Some(&origin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, V2_DASHBOARD.as_bytes());
+        assert_eq!(
+            harness.dispatch.v2_calls("RemoteGetDashboardV2"),
+            [serde_json::json!({})]
+        );
+        // hub #3796: the providers usage read, with no parameters.
+        let (status, _, body) = exchange(&harness, get("/api/v2/providers", Some(&origin))).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, V2_PROVIDERS.as_bytes());
+        assert_eq!(
+            harness.dispatch.v2_calls("RemoteGetProvidersV2"),
+            [serde_json::json!({})]
+        );
         // Neither an Origin nor Fetch Metadata: a read is refused.
         let before = harness.dispatch.operator_calls();
+        let (status, _, _) = exchange(&harness, get("/api/v2/dashboard", None)).await;
+        assert_eq!(status, 401);
+        let (status, _, _) = exchange(&harness, get("/api/v2/providers", None)).await;
+        assert_eq!(status, 401);
         let (status, _, _) = exchange(&harness, get("/api/v2/projects", None)).await;
         assert_eq!(status, 401);
         let (status, _, _) = exchange(

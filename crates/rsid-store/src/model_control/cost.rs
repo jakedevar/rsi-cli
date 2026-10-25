@@ -14,9 +14,12 @@
 //! The session total (`sessions.cost_usd`) for these providers is the sum of
 //! the session's settled invocation costs, so both columns always agree.
 //!
-//! # Session-cumulative rows (#2593)
+//! # Session-cumulative rows (#2593, #3534)
 //!
-//! A `session.launch.fresh` / `session.continue.resume` row is settled from the
+//! A `session.launch.fresh` / `session.continue.resume` / `session.rotate.child`
+//! row (the last is the first row of a rotation successor, and its resumes
+//! continue the same running total; leaving it out charged that first figure
+//! twice, #3534) is settled from the
 //! **session's running totals** (`session_invocation_completion`), so its
 //! `estimated_cost_usd` (and its token and wall-time columns) is the session's
 //! CUMULATIVE figure at that moment, not that invocation's own cost. The rows
@@ -34,8 +37,11 @@ use crate::model_control::call_control::ModelCallUsage;
 /// Purposes whose settled figures are the session's running totals (module
 /// docs). The single list behind [`COST_INCREMENT_SQL`].
 #[cfg(test)]
-pub(crate) const SESSION_CUMULATIVE_PURPOSES: [&str; 2] =
-    ["session.launch.fresh", "session.continue.resume"];
+pub(crate) const SESSION_CUMULATIVE_PURPOSES: [&str; 3] = [
+    "session.launch.fresh",
+    "session.continue.resume",
+    "session.rotate.child",
+];
 
 /// A derived table `(invocation_id, cost_increment_usd)` with one row per
 /// `model_invocations` row: that invocation's OWN cost.
@@ -68,7 +74,7 @@ macro_rules! cost_increment_sql {
         FROM model_invocations
         WHERE admission_status = 'admitted' AND session_id IS NOT NULL
           AND estimated_cost_usd IS NOT NULL
-          AND purpose IN ('session.launch.fresh', 'session.continue.resume')
+          AND purpose IN ('session.launch.fresh', 'session.continue.resume', 'session.rotate.child')
      ) l ON l.id = m.id"
     };
 }
@@ -82,7 +88,8 @@ macro_rules! cost_increment_sql {
 /// hub). The unary `+` keeps the planner on the session index: most admitted
 /// rows carry those purposes. Zero-argument macros (not one with a parameter)
 /// so the protected-DML source audit can expand them. The scoped tables also
-/// carry each invocation's `session_id` and `admission_status`, so a consumer
+/// carry each invocation's `session_id`, `admission_status`, provider and model
+/// (billing classification, #3533), so a consumer
 /// that groups by session reads them here instead of joining
 /// `model_invocations` again per invocation (#3043: the manager pass's spend
 /// ledger, bounded per member by #2494).
@@ -92,7 +99,7 @@ macro_rules! cost_increment_for_session_sql {
         m.admission_status AS admission_status,
         CASE WHEN m.estimated_cost_usd IS NULL THEN NULL
              WHEN l.prev_cost IS NULL OR m.estimated_cost_usd < l.prev_cost THEN m.estimated_cost_usd
-             ELSE m.estimated_cost_usd - l.prev_cost END AS cost_increment_usd
+             ELSE m.estimated_cost_usd - l.prev_cost END AS cost_increment_usd, m.provider AS provider, m.model AS model
      FROM model_invocations m
      LEFT JOIN (
         SELECT id, LAG(estimated_cost_usd) OVER (
@@ -100,7 +107,7 @@ macro_rules! cost_increment_for_session_sql {
         FROM model_invocations
         WHERE admission_status = 'admitted' AND session_id IN (?1)
           AND estimated_cost_usd IS NOT NULL
-          AND +purpose IN ('session.launch.fresh', 'session.continue.resume')
+          AND +purpose IN ('session.launch.fresh', 'session.continue.resume', 'session.rotate.child')
      ) l ON l.id = m.id
      WHERE m.session_id IN (?1)"
     };
@@ -116,7 +123,7 @@ macro_rules! cost_increment_for_ids_sql {
         m.admission_status AS admission_status,
         CASE WHEN m.estimated_cost_usd IS NULL THEN NULL
              WHEN l.prev_cost IS NULL OR m.estimated_cost_usd < l.prev_cost THEN m.estimated_cost_usd
-             ELSE m.estimated_cost_usd - l.prev_cost END AS cost_increment_usd
+             ELSE m.estimated_cost_usd - l.prev_cost END AS cost_increment_usd, m.provider AS provider, m.model AS model
      FROM model_invocations m
      LEFT JOIN (
         SELECT id, LAG(estimated_cost_usd) OVER (
@@ -124,7 +131,7 @@ macro_rules! cost_increment_for_ids_sql {
         FROM model_invocations
         WHERE admission_status = 'admitted' AND session_id IN (SELECT id FROM ids)
           AND estimated_cost_usd IS NOT NULL
-          AND +purpose IN ('session.launch.fresh', 'session.continue.resume')
+          AND +purpose IN ('session.launch.fresh', 'session.continue.resume', 'session.rotate.child')
      ) l ON l.id = m.id
      WHERE m.session_id IN (SELECT id FROM ids)"
     };
@@ -137,12 +144,66 @@ pub(crate) const COST_INCREMENT_SQL: &str = cost_increment_sql!();
 
 /// USD per 1M tokens for one model. `cache_read` is `None` when the source
 /// documents no cached-input rate; a usage with cache-read tokens then has no
-/// sound estimate and resolves to `None` rather than a guess.
+/// sound estimate and resolves to `None` rather than a guess. The optional
+/// `cache_write_per_mtok` is the 5-minute Anthropic write rate; existing
+/// OpenAI/OpenRouter prices leave it `None`.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ModelPrice {
+pub struct ModelPrice {
     pub input_per_mtok: f64,
     pub output_per_mtok: f64,
     pub cache_read_per_mtok: Option<f64>,
+    pub cache_write_per_mtok: Option<f64>,
+}
+
+/// A price the daemon read from OpenRouter's own model discovery (#3154),
+/// with the time of the fetch it came from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiscoveredPrice {
+    pub price: ModelPrice,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The prices OpenRouter's own discovery reported, by model id, each with the
+/// time of the fetch it came from. A fetch upserts the models it lists, so a
+/// narrower catalog query (the picker asks for text models only) never erases a
+/// price an earlier, wider one read.
+static DISCOVERED_PRICES: parking_lot::RwLock<
+    Option<std::collections::HashMap<String, DiscoveredPrice>>,
+> = parking_lot::RwLock::new(None);
+
+/// Upsert `prices` fetched at `fetched_at` into the discovered price table.
+pub fn publish_discovered_prices(
+    prices: impl IntoIterator<Item = (String, ModelPrice)>,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+) {
+    let mut table = DISCOVERED_PRICES.write();
+    let table = table.get_or_insert_with(std::collections::HashMap::new);
+    for (model, price) in prices {
+        table.insert(model, DiscoveredPrice { price, fetched_at });
+    }
+}
+
+/// The discovered price of `model`, if a catalog fetch listed one.
+#[must_use]
+pub fn discovered_price(model: &str) -> Option<DiscoveredPrice> {
+    DISCOVERED_PRICES.read().as_ref()?.get(model).copied()
+}
+
+/// When the newest catalog fetch happened, `None` before the first one.
+#[must_use]
+pub fn discovered_prices_fetched_at() -> Option<chrono::DateTime<chrono::Utc>> {
+    DISCOVERED_PRICES
+        .read()
+        .as_ref()?
+        .values()
+        .map(|entry| entry.fetched_at)
+        .max()
+}
+
+/// Test seam: forget the discovered table so a test sees only [`PRICES`].
+#[cfg(any(test, feature = "test-seam"))]
+pub fn clear_discovered_prices() {
+    *DISCOVERED_PRICES.write() = None;
 }
 
 /// Documented list prices, USD per 1M tokens, keyed by model id.
@@ -161,17 +222,104 @@ pub(crate) struct ModelPrice {
 /// <https://www.llmreference.com/model/gpt-6.1-sol/openai-api>,
 /// <https://www.requesty.ai/models/openai/gpt-6-luna>.
 ///
-/// Every other model in use (`gpt-6-astra`, direct-API Harness `gpt-*` and
-/// `claude-*`, any unlisted OpenRouter id) has no price documented in this
-/// repo and therefore stays NULL (the store logs an "unpriced" warning at
+/// Anthropic Claude (#3383 / laptop #480): standard global API list prices,
+/// fetched 2026-10-20 from
+/// <https://docs.anthropic.com/en/docs/about-claude/pricing>
+/// (redirects to <https://platform.claude.com/docs/en/about-claude/pricing>).
+/// The model-pricing table lists all four rates below, including 5-minute
+/// cache writes. The wire uses ephemeral caching without a TTL and settlement
+/// records no TTL, so use that default rather than the 1-hour write rate.
+/// IDs are from `rsi_common::claude_catalog::CLAUDE_MODEL_CATALOG` plus the
+/// Sonnet 5.5 / Haiku 4.5 fallback IDs accepted by the Claude launch path.
+/// No Bedrock regional prices or OpenRouter aliases are inferred.
+///
+/// Anthropic token accounting, fetched 2026-10-20:
+/// <https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching>
+/// (redirects to <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>).
+/// `input_tokens` excludes both cache writes and cache reads.
+///
+/// Every unlisted model stays NULL (the store logs an "unpriced" warning at
 /// settlement) until a cited price is added here.
 const PRICES: &[(&str, ModelPrice)] = &[
+    (
+        "claude-fable-5-1",
+        ModelPrice {
+            input_per_mtok: 10.0,
+            output_per_mtok: 50.0,
+            cache_read_per_mtok: Some(0.25),
+            cache_write_per_mtok: Some(12.5),
+        },
+    ),
+    (
+        "claude-opus-5-5",
+        ModelPrice {
+            input_per_mtok: 4.0,
+            output_per_mtok: 20.0,
+            cache_read_per_mtok: Some(0.2),
+            cache_write_per_mtok: Some(5.0),
+        },
+    ),
+    (
+        "claude-opus-4-8",
+        ModelPrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: Some(0.5),
+            cache_write_per_mtok: Some(6.25),
+        },
+    ),
+    (
+        "claude-opus-4-5",
+        ModelPrice {
+            input_per_mtok: 5.0,
+            output_per_mtok: 25.0,
+            cache_read_per_mtok: Some(0.5),
+            cache_write_per_mtok: Some(6.25),
+        },
+    ),
+    (
+        "claude-sonnet-5",
+        ModelPrice {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            cache_read_per_mtok: Some(0.2),
+            cache_write_per_mtok: Some(2.5),
+        },
+    ),
+    (
+        "claude-haiku-4-5-20251001",
+        ModelPrice {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+            cache_read_per_mtok: Some(0.1),
+            cache_write_per_mtok: Some(1.25),
+        },
+    ),
+    (
+        "claude-sonnet-5-5",
+        ModelPrice {
+            input_per_mtok: 2.0,
+            output_per_mtok: 10.0,
+            cache_read_per_mtok: Some(0.1),
+            cache_write_per_mtok: Some(2.5),
+        },
+    ),
+    (
+        "claude-haiku-4-5",
+        ModelPrice {
+            input_per_mtok: 1.0,
+            output_per_mtok: 5.0,
+            cache_read_per_mtok: Some(0.1),
+            cache_write_per_mtok: Some(1.25),
+        },
+    ),
     (
         "gpt-6.1-sol",
         ModelPrice {
             input_per_mtok: 2.0,
             output_per_mtok: 10.0,
             cache_read_per_mtok: Some(0.10),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -180,6 +328,7 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 2.0,
             output_per_mtok: 10.0,
             cache_read_per_mtok: Some(0.20),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -188,6 +337,7 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.10,
             output_per_mtok: 0.50,
             cache_read_per_mtok: Some(0.01),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -196,6 +346,16 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.37,
             output_per_mtok: 1.25,
             cache_read_per_mtok: Some(0.09),
+            cache_write_per_mtok: None,
+        },
+    ),
+    (
+        "z-ai/glm-5.3-flash",
+        ModelPrice {
+            input_per_mtok: 0.15,
+            output_per_mtok: 0.50,
+            cache_read_per_mtok: Some(0.03),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -204,6 +364,7 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.14,
             output_per_mtok: 0.42,
             cache_read_per_mtok: Some(0.0042),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -212,6 +373,7 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.15,
             output_per_mtok: 0.47,
             cache_read_per_mtok: Some(0.016),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -220,6 +382,7 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.30,
             output_per_mtok: 1.20,
             cache_read_per_mtok: Some(0.06),
+            cache_write_per_mtok: None,
         },
     ),
     (
@@ -228,16 +391,23 @@ const PRICES: &[(&str, ModelPrice)] = &[
             input_per_mtok: 0.12,
             output_per_mtok: 0.80,
             cache_read_per_mtok: Some(0.07),
+            cache_write_per_mtok: None,
         },
     ),
 ];
 
-/// The documented price for `model`, or `None` when none is known.
-pub(crate) fn price_for_model(model: &str) -> Option<ModelPrice> {
-    PRICES
-        .iter()
-        .find(|(id, _)| *id == model)
-        .map(|(_, price)| *price)
+/// The price for `model`: the one OpenRouter's own discovery reported (#3154),
+/// else the documented list price in [`PRICES`], else `None`. A price is never
+/// invented.
+pub fn price_for_model(model: &str) -> Option<ModelPrice> {
+    discovered_price(model)
+        .map(|entry| entry.price)
+        .or_else(|| {
+            PRICES
+                .iter()
+                .find(|(id, _)| *id == model)
+                .map(|(_, price)| *price)
+        })
 }
 
 /// Whether `provider` is the loopback `Local` backend (free by construction).
@@ -255,8 +425,10 @@ fn reported_cost(usage: &ModelCallUsage) -> Option<f64> {
 ///
 /// The OpenAI-compatible `input_tokens` already include cached prompt tokens
 /// (`cache_read_tokens` is a subset), so uncached input is the difference.
-/// Reasoning tokens are part of `output_tokens` and are not added again.
-fn estimate_from_tokens(model: &str, usage: &ModelCallUsage) -> Option<f64> {
+/// Direct Claude/Harness Anthropic calls instead report plain input separately
+/// from cache reads and writes. OpenRouter keeps its OpenAI-compatible counting
+/// even when the routed model is Claude. Reasoning is already in output.
+fn estimate_from_tokens(provider: &str, model: &str, usage: &ModelCallUsage) -> Option<f64> {
     let price = price_for_model(model)?;
     let input = usage.input_tokens?;
     let output = usage.output_tokens?;
@@ -266,10 +438,27 @@ fn estimate_from_tokens(model: &str, usage: &ModelCallUsage) -> Option<f64> {
         (tokens, Some(rate)) => tokens as f64 * rate,
         (_, None) => return None,
     };
-    let uncached_input = input.saturating_sub(cache_read);
+    let anthropic = model.starts_with("claude-")
+        && ["Harness", "Claude", "Anthropic"]
+            .iter()
+            .any(|name| provider.eq_ignore_ascii_case(name));
+    let (uncached_input, cache_write_cost) = if anthropic {
+        let write_cost = match (
+            usage.cache_creation_tokens.unwrap_or(0),
+            price.cache_write_per_mtok,
+        ) {
+            (0, _) => 0.0,
+            (tokens, Some(rate)) => tokens as f64 * rate,
+            (_, None) => return None,
+        };
+        (input, write_cost)
+    } else {
+        (input.saturating_sub(cache_read), 0.0)
+    };
     let micro_usd = uncached_input as f64 * price.input_per_mtok
         + output as f64 * price.output_per_mtok
-        + cache_read_cost;
+        + cache_read_cost
+        + cache_write_cost;
     Some(micro_usd / 1_000_000.0)
 }
 
@@ -285,7 +474,7 @@ pub(crate) fn resolve_invocation_cost(
     if is_local_provider(provider) {
         return Some(0.0);
     }
-    estimate_from_tokens(model?, usage)
+    estimate_from_tokens(provider, model?, usage)
 }
 
 #[cfg(test)]
@@ -318,6 +507,21 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+
+    /// #3135: batch 4 (`z-ai/glm-5.3-flash`) failed every launch with `bench_task_cost_unknown`
+    /// because the model had no documented price; a bench run needs one to bound a call.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn the_glm_flash_bench_model_has_a_documented_price() {
+        let price = PRICES
+            .iter()
+            .find(|(id, _)| *id == "z-ai/glm-5.3-flash")
+            .map(|(_, price)| *price)
+            .expect("z-ai/glm-5.3-flash is documented");
+        assert_eq!(price.input_per_mtok, 0.15);
+        assert_eq!(price.output_per_mtok, 0.50);
+        assert_eq!(price.cache_read_per_mtok, Some(0.03));
     }
 
     /// #2593: a launch/resume row's `estimated_cost_usd` is the SESSION's
@@ -445,6 +649,42 @@ mod tests {
         );
     }
 
+    /// #3534: a rotation successor's first row (`session.rotate.child`) carries
+    /// the session's running total and its resumes continue it, so a resume is
+    /// charged its growth over that row, not its whole running total again.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn a_resume_after_a_rotation_row_is_charged_its_growth_only_3534() {
+        let store = crate::store::Store::open_in_memory().expect("store");
+        let a = "00000000-0000-0000-0000-00000000000a";
+        insert_invocation(&store, "a1", "session.rotate.child", a, Some(0.97), 1);
+        insert_invocation(&store, "a2", "session.continue.resume", a, Some(1.10), 2);
+        insert_invocation(&store, "a3", "session.continue.resume", a, Some(1.50), 3);
+        let increment = |id: &str| -> f64 {
+            store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT cost_increment_usd FROM ({COST_INCREMENT_SQL}) WHERE invocation_id = ?1"
+                    ),
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert!((increment("a1") - 0.97).abs() < 1e-9);
+        assert!((increment("a2") - 0.13).abs() < 1e-9, "{}", increment("a2"));
+        assert!((increment("a3") - 0.40).abs() < 1e-9);
+        let total = store
+            .session_model_invocation_cost_total(a.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(
+            (total - 1.50).abs() < 1e-9,
+            "the session total is its last running total: {total}"
+        );
+    }
+
     /// `sessions` unrelated sessions of `rows` cumulative launch/resume rows
     /// each, none of them the sessions a consumer under test reads.
     fn seed_unrelated_sessions(store: &crate::store::Store, sessions: usize, rows: usize) {
@@ -562,6 +802,66 @@ mod tests {
         assert_eq!(cost, Some(0.0123));
     }
 
+    /// #3154: an estimate uses the price OpenRouter's discovery reported when
+    /// there is one, else the documented table; a provider-reported cost still
+    /// wins over both.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn discovered_price_feeds_the_estimate_and_never_beats_a_reported_cost() {
+        let model = "test-3154/discovered-only";
+        assert_eq!(price_for_model(model), None);
+        assert_eq!(
+            resolve_invocation_cost("OpenRouter", Some(model), &usage(1_000_000, 1_000_000)),
+            None,
+            "an unpriced model stays NULL"
+        );
+        let at = chrono::Utc::now();
+        publish_discovered_prices(
+            [(
+                model.to_string(),
+                ModelPrice {
+                    input_per_mtok: 0.20,
+                    output_per_mtok: 0.60,
+                    cache_read_per_mtok: Some(0.02),
+                    cache_write_per_mtok: None,
+                },
+            )],
+            at,
+        );
+        assert_eq!(discovered_price(model).unwrap().fetched_at, at);
+        // 1M in at $0.20 + 1M out at $0.60.
+        let cost = resolve_invocation_cost("OpenRouter", Some(model), &usage(1_000_000, 1_000_000))
+            .unwrap();
+        assert!((cost - 0.80).abs() < 1e-9, "{cost}");
+        let mut reported = usage(1_000_000, 1_000_000);
+        reported.estimated_cost_usd = Some(0.5);
+        assert_eq!(
+            resolve_invocation_cost("OpenRouter", Some(model), &reported),
+            Some(0.5)
+        );
+        // A later fetch replaces that model's price and keeps the others.
+        publish_discovered_prices(
+            [(
+                model.to_string(),
+                ModelPrice {
+                    input_per_mtok: 1.0,
+                    output_per_mtok: 1.0,
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
+                },
+            )],
+            at + chrono::Duration::minutes(5),
+        );
+        assert_eq!(price_for_model(model).unwrap().input_per_mtok, 1.0);
+        assert_eq!(
+            price_for_model("deepseek/deepseek-v4.1-flash")
+                .unwrap()
+                .input_per_mtok,
+            0.14,
+            "a model discovery never listed keeps its documented price"
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
     fn known_price_estimates_cost_from_tokens() {
@@ -586,6 +886,89 @@ mod tests {
             .expect("known price estimates");
         let expected = 0.4 * 0.30 + 0.6 * 0.06 + 0.1 * 1.20;
         assert!((cost - expected).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn claude_catalog_and_launch_fallbacks_have_complete_prices() {
+        let models = rsi_common::claude_catalog::CLAUDE_MODEL_CATALOG
+            .iter()
+            .map(|spec| spec.id)
+            .chain(["claude-sonnet-5-5", "claude-haiku-4-5"]);
+        for model in models {
+            let price = price_for_model(model).expect(model);
+            assert!(price.input_per_mtok > 0.0, "{model}");
+            assert!(price.output_per_mtok > 0.0, "{model}");
+            assert!(price.cache_read_per_mtok.is_some(), "{model}");
+            assert!(price.cache_write_per_mtok.is_some(), "{model}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn anthropic_cache_tokens_are_separate_from_plain_input() {
+        let mut call = usage(1_000, 500);
+        call.cache_creation_tokens = Some(2_000);
+        call.cache_read_tokens = Some(6_000);
+        for provider in ["Harness", "Claude", "Anthropic"] {
+            let cost = resolve_invocation_cost(provider, Some("claude-sonnet-5"), &call)
+                .expect("documented Claude price");
+            // .002 input + .005 writes + .0012 reads + .005 output.
+            assert!((cost - 0.0132).abs() < 1e-12, "{provider}: {cost}");
+        }
+        // Absent cache counters mean no cache activity, and zero plain input
+        // is valid for a fully cached request.
+        let plain = resolve_invocation_cost("Harness", Some("claude-sonnet-5"), &usage(1_000, 500))
+            .expect("plain Claude call");
+        assert!((plain - 0.007).abs() < 1e-12, "{plain}");
+        call.input_tokens = Some(0);
+        let cached = resolve_invocation_cost("Harness", Some("claude-sonnet-5"), &call)
+            .expect("fully cached Claude call");
+        assert!((cached - 0.0112).abs() < 1e-12, "{cached}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn openrouter_keeps_inclusive_input_accounting_even_for_a_claude_model() {
+        let mut call = usage(10_000, 500);
+        call.cache_creation_tokens = Some(2_000);
+        call.cache_read_tokens = Some(6_000);
+        let cost = resolve_invocation_cost("OpenRouter", Some("claude-sonnet-5"), &call)
+            .expect("documented price");
+        // The existing path bills 4k uncached + 6k cached input + 500 output;
+        // cache creation does not add an Anthropic surcharge to this path.
+        assert!((cost - 0.0142).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn anthropic_cache_usage_requires_documented_cache_rates() {
+        let model = "claude-test-3383-no-cache-rates";
+        publish_discovered_prices(
+            [(
+                model.to_string(),
+                ModelPrice {
+                    input_per_mtok: 2.0,
+                    output_per_mtok: 10.0,
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
+                },
+            )],
+            chrono::Utc::now(),
+        );
+        let mut call = usage(1_000, 500);
+        let plain = resolve_invocation_cost("Harness", Some(model), &call).unwrap();
+        assert!((plain - 0.007).abs() < 1e-12);
+        call.cache_creation_tokens = Some(2_000);
+        assert_eq!(resolve_invocation_cost("Harness", Some(model), &call), None);
+        call.cache_creation_tokens = Some(0);
+        call.cache_read_tokens = Some(6_000);
+        assert_eq!(resolve_invocation_cost("Harness", Some(model), &call), None);
+        call.estimated_cost_usd = Some(0.25);
+        assert_eq!(
+            resolve_invocation_cost("Harness", Some(model), &call),
+            Some(0.25)
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

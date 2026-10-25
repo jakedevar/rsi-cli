@@ -58,6 +58,19 @@ fails loudly on a missing toolchain. It installs:
 - macOS: `~/Applications/RSI Desktop.app`, an unsigned bundle around the same
   binary (open it from Finder, Launchpad or Spotlight).
 
+An agent session proves the build and install through the daemon, not a hand-run cargo:
+`AgentSubmitJob {"kind":"test","params":{"recipe":"desktop-install"}}` runs `make desktop-install-job`
+in `rsi-build.slice` against a job-owned throwaway HOME (removed afterwards; the receipt carries the
+exit code and the log path; `docs/agents/landing-and-gates.md`, "Desktop lane").
+
+The real-rsid graph-run E2E (hub #3279) is a job too: `AgentSubmitJob {"kind":"test","params":{"recipe":"desktop-e2e-graph"}}`
+builds `rsid` and `rsi-e2e-seed` together, runs `node scripts/smoke.mjs --isolated-write --only graph-run` and
+judges the report (`scripts/graph-run-receipt.mjs`). It exits 0 only when `graph-seeded-daemon`,
+`graph-seeded-render` and `graph-seeded-readback` all executed and passed; `graph-run-receipt.json`
+(source SHA, daemon sha256, command, exit code) and the raw `e2e-report.json` are printed into the job log (the
+output directory under the job's TMPDIR is removed when the job ends). A skipped
+`RSI_E2E_RSID` test in `npm test` is not that evidence.
+
 `make release-install` also runs the script, in its soft mode: a missing
 toolchain or a failed desktop build only warns, and the rsid install goes on.
 `RSI_INSTALL_BIN_DIR`, `RSI_DESKTOP_INSTALL_DIR`, `RSI_DESKTOP_APP_DIR` and
@@ -93,6 +106,7 @@ to understand it.
 | State | The pane says | Do |
 | --- | --- | --- |
 | rsid is not running (or the socket is wrong) | **Cannot reach the rsid daemon**: what the app is, the socket it looked at and the last error, how to start rsid (`rsid`, `./scripts/dev-daemon.sh`, `make release-install`), and `RSI_DAEMON_SOCKET` for another daemon | Start rsid; the top bar flips to "daemon connected" within about five seconds on its own, or press **Retry now** |
+| rsid stops while a session (or the Issues list, or the dashboard) is open | A strip above the window: **rsid is not running. What this window shows is the last known state and may be out of date.** with the same Start rsid / Restart rsid / Retry now as the card (never a Start that could not work, local #258) and More. The open session stays, its status is tagged *last known*, Stop, Pause and Archive are off, Send stays on and a failed send keeps the draft. The top-bar pill becomes a button that jumps to the strip (local #266) | Press **Start rsid** (or **Restart rsid** / **Retry now**); when rsid answers the strip goes away and the same session carries on |
 | rsid is up, no sessions yet | **Connected to rsid. No sessions yet.** with New session (Cmd-N, Ctrl-N elsewhere), the Actions… palette (Cmd-K) and the Vim keys switch | Press **New session** |
 | rsid is up, sessions exist | **Select a session.** | Click one |
 | the desktop backend itself did not answer | **The desktop backend did not answer** with the error | Reopen the app; read its terminal log |
@@ -141,7 +155,14 @@ menus" below cover the details.
 
 ### Settings
 
-Open Settings with View › Settings…, `<Space>,` or `:set`. The **Vim keys**
+Open Settings with the **Settings** button in the top bar, Cmd-, (Ctrl-, elsewhere;
+the app menu has Settings… on macOS), View › Settings…, `<Space>,` or `:set` (local #269).
+One click on a row's value starts the edit: a switch flips, a choice steps (its left arrow
+goes back), a text value opens its editor. Values read as words ("Provider: …", "On",
+"Off"); the raw field names sit under the info card's **Details**. Closing with changes
+that were not applied asks **Apply**, **Discard** or **Keep editing** (Esc means Keep
+editing); another full-window view opening over Settings keeps the changes for when you
+return. The **Vim keys**
 switch (Settings › Workspace › Editing Mode, or View › Vim keys) turns the
 modal keys off when you want a plain mouse-and-shortcut app; it is kept per
 machine. Rows that belong to rsid (providers, hooks, bridges, budgets) are
@@ -157,7 +178,15 @@ screenshots. It needs no Screen Recording, Accessibility or other macOS permissi
 cd desktop && npm run build
 node scripts/smoke.mjs --out /tmp/desktop-smoke-fake        # a fake rsid: the primary mode, safe anywhere
 node scripts/smoke.mjs --live --out /tmp/desktop-smoke      # the running rsid, READ-ONLY
+node scripts/smoke.mjs --steps keyboard --out /tmp/smk-kb   # boot plus one step group (local #250)
 ```
+
+With no flag every step runs, in order. `--steps core|settings|manager|keyboard|a11y[,…]` runs `boot` and the named groups
+(`scripts/smoke-groups.mjs`); `tests/smoke.test.mjs` runs one group per test with its own 90 s budget, and a test fails
+when a step declares no group, two, or an unknown one. `report.json` records each step's `durationMs`. A step names its
+own `group` (and `refuses`, the writes it tries that the read-only bridge refuses); `smoke-groups.mjs` holds only the group
+names and budgets. A new step: add a file under `scripts/smoke-steps/` (see the README there), so parallel slices never
+edit the same lines.
 
 - **How it works.** A local HTTP server serves `dist/` with a shim for the only Tauri surface the frontend
   uses (`__TAURI__.core.invoke`, `__TAURI__.event.listen`; `tests/smoke.test.mjs` fails when another file
@@ -166,7 +195,7 @@ node scripts/smoke.mjs --live --out /tmp/desktop-smoke      # the running rsid, 
   CDP `Input.dispatchKeyEvent`, screenshots come from `Page.captureScreenshot`.
 - **Steps** (each pass, fail, `blocked-by-daemon` or `substituted`, with a screenshot): boot with no uncaught
   page error; session list and j/k; Enter opens a conversation; the Issues workspace; `:` command mode; `?`
-  help; Settings; the hooks, providers and bridges dialogs; the terminal overlay. The embedded shell is
+  help; Settings; the hooks, providers and bridges dialogs; the terminal overlay; the default theme's text contrast (`text-contrast`). The embedded shell is
   Tauri-only, so the shim stubs the PTY (no process runs): the overlay renders, no shell. A step is
   `blocked-by-daemon` in `--live` when the running rsid answers `Method not found` for the read it needs.
 - **Read-only.** The bridge forwards an exact allowlist of read methods and refuses (and logs) any other
@@ -182,6 +211,49 @@ node scripts/smoke.mjs --live --out /tmp/desktop-smoke      # the running rsid, 
   Chrome-driven test in `npm test` is skipped with that reason). Exit 0 is all green, 1 a failed step.
 - `npm test` also runs `tests/smoke.test.mjs`: the shim, the allowlist (a mutation is refused and never reaches
   the daemon), the secret and Origin gate, redaction, and one full headless run against the fake daemon.
+
+### UX audit toolkit (`npm run audit`, local #277)
+
+An audit of window sizes, light/dark, many-session scale or mouse-first flows does not need a new driver:
+`scripts/audit-lib.mjs` opens the built app against the fake daemon at a chosen size, theme and system colour scheme with a
+bridge that records and stubs every write (never forwarded; it can fail on demand or play "rsid is down"), and carries a WCAG
+text-contrast walker, a cut-off-controls check and a many-session / long-conversation fixture generator
+(`scaleFixtures` in `smoke-fake.mjs`). `npm run audit -- sizes|themes|scale|all` reproduces audit 4's numbers in one command,
+and the smoke step `text-contrast` gates the default theme's contrast. How to run an audit, write a flow, and which checks are
+in the gate and which are on demand: [`docs/ux-audit.md`](docs/ux-audit.md).
+
+### macOS WebKit keyboard smoke (`npm run smoke:webkit`, local #247)
+
+Chrome is not the engine the macOS app ships: Tauri runs WKWebView, which with "Keyboard navigation" off (the macOS
+default) and WebKit's default preferences skips every button without a `tabindex` (#242). The shipped app's wry sets
+`tabFocusesLinks`, which lifts that skip (#257), so the smoke runs every step twice: `wry` (the shipped configuration,
+`tabFocusesLinks` on) and `default` (the preference off, so the `tabindex` stamps stay proven). `WRY_PREFERENCE` in the
+script pins the wry version that was read, and a test fails when `src-tauri/Cargo.lock` moves to another wry. `scripts/smoke-webkit.mjs` serves the built `dist/` on the
+same fake rsid and bridge, compiles `scripts/webkit-smoke.swift` with `swiftc` (no Xcode project; the binary is cached
+by source hash) and runs it with Keyboard navigation off for that process (`-AppleKeyboardUIMode 0`). The harness sends
+real Tab and Shift-Tab key events through an `NSWindow`; the script checks that Tab reaches New session, Stop, Archive,
+the conversation, the message box and Send in page order, Shift-Tab walks back, the confirm, question and New session
+dialogs keep Tab inside and reach their buttons, and with Vim keys off Tab follows native order in Settings and Issues.
+A control step per configuration proves it (`wry` reaches a button without `tabindex`, `default` skips it). Report:
+`DIR/report.json` (default `/tmp/desktop-smoke-webkit`), about 20-25 s. The app never activates, so the operator's keyboard focus stays put.
+It leaves nothing behind (#263): each harness run gets a temp `HOME` (removed afterwards) and the page a non-persistent
+WebKit data store, so nothing is written under the real `~/Library/WebKit` or `~/Library/Caches` (a bundle-less binary
+otherwise gets `webkit-smoke` folders there) and every run starts clean; `tests/smoke-webkit.test.mjs` compares those
+folders before and after a real run.
+Exit 3, `runner_unavailable`, off macOS, without a working `swiftc`, without a window server session (ssh), or when the
+`default` control shows Keyboard navigation stayed on (and `wry` passed); `tests/smoke-webkit.test.mjs` then skips the real run with that reason.
+Manual detail: `docs/acceptance-macos.md`.
+
+### Packaged macOS app acceptance (`npm run smoke:app`, local #259)
+
+The WebKit smoke is a bare WKWebView; the shipped app is Tauri's (wry configures WebKit differently, #257). This
+on-demand check builds the real app (`scripts/install-desktop.sh --build-only`, nothing installed; or `--app PATH`),
+runs a copy under the test bundle id `dev.rsi.desktop.smoke-app` with a temp HOME on the smoke's fake rsid, and drives
+it from inside with `scripts/app-driver.m` (a dylib loaded through `DYLD_INSERT_LIBRARIES` into that copy only; no
+macOS privacy grant). It checks the daemon-down card and the reconnect, Tab to New session, Stop and Send with Keyboard
+navigation off, F6 between dashboard panes, Esc reaching vim in the terminal, toast and dialog ARIA and the window's AX
+tree. Report and snapshots: `/tmp/desktop-smoke-app`. About 25 s plus the build (about 3.5 min cold). Not part of
+`npm test`; detail and the gate decision: `docs/acceptance-macos.md`.
 
 ### Real-rsid end-to-end smoke (`--isolated-write`, hub #3105)
 
@@ -224,6 +296,13 @@ RSI_E2E_RSID=/path/to/rsid npm test       # the opt-in test that runs the whole 
   repository from the daemon's working directory and its base from `origin/rolling`, so the harness starts the
   isolated rsid inside the synthetic project, whose `origin` is a bare repository beside it on the local disk. No
   Rust changed: the route needs no test-only code in any daemon build.
+  Step 2 of the same extra (local #150) covers a SUCCEEDED run: the seed also writes, through `rsi-e2e-seed`
+  (`graph_run` in its spec, `SEEDED_GRAPH_RUN` in `smoke-isolated.mjs`), a saved two-node workflow and its finished
+  durable execution, each node settled `succeeded` with its result. The desktop remembers each workflow's last run
+  (`localStorage` key `rsi.graph.lastExecution`, as the TUI keeps a draft's `last_execution_id`); the harness stands
+  in for the earlier app session that showed it, opens the workflow with `o` and `Enter`, and asserts the run view
+  (`E2E seeded run succeeded`, each node `succeeded  attempt 1 round 1`, a success badge on every node) against
+  rsid's `GetWorkflowExecution` (status, per-node state, attempt and recorded result).
 - **No outbound network (local #123, #130).** The isolated rsid runs in rsid's offline mode, `RSI_OFFLINE=1`
   (`crates/rsid-core/src/offline.rs`; tests and isolated harness runs only, never set by an install script):
   from its first boot no provider probe, poll, catalog fetch or credential check opens a connection, and each
@@ -334,8 +413,9 @@ PNG sizes; `node scripts/icons.mjs` rebuilds them after a PNG changes.
 desktop (see "Updating PARITY.md"). Completion means preserved TUI behaviour, not
 a row count: a read-only replacement for editing, or any unsupported feature, is
 `partial` with the Issue that owns it, never `substitute`. At the time of writing
-it lists 514 rows: none missing, none partial, 66 substitute, 448 done, so there
-is no open gap to name an owner for.
+it lists 520 rows: none missing, none partial, 65 substitute, 455 done (the
+global dashboard, `gd` / `:dashboard`, moved to done with #3366, and the New
+session settings, which keep the saved manager grant, with #204).
 
 Every `substitute` row is justified in `parity-audit.json` (see "Substitute audit
 and source guard"). Interaction evidence is model and unit tests in this tree;
@@ -416,8 +496,9 @@ p u C-r .`. A field in a dialog shows the TUI's mode row as a tag (`INSERT`,
 | Field | TUI surface | Desktop |
 | --- | --- | --- |
 | Message box (input bar) | Session input bar: vim on a non-empty draft | vim field; an empty draft hands every key to the session; mode badge before the text |
-| Launch / continue prompt, Ctrl+G editor, prompt creator, Issue body, manager and entity forms, approval answers (every `<textarea>`) | Prompt overlay, input modal, forms | vim fields |
-| One-line text fields of forms and Settings (Issue title and labels, manager and entity forms, `hierarchy-run` name / tags / model, Settings value editor, graph name, admin plain fields) | "Each field is a shared vim text surface" (Settings, forms) | vim fields (`data-vim="on"`), one-line: `o` / `O` act as `A` / `I`, `J` is a no-op, `p` flattens newlines; Enter still submits from normal mode |
+| Launch / continue prompt, Ctrl+G editor, prompt creator, Issue body, manager and entity forms, approval answers (every `<textarea>`) | Prompt overlay, input modal, forms | vim fields; the Issue description is multi-line and scrolls |
+| Every text field of the Issue editor and the project form (Issue title, description, labels, assignee, the dependency number, the filter and search inputs; project name and folder; hub #3421, desktop #317) | "Every field is a vim textarea": opens in INSERT at the end of its text, Esc in INSERT goes to NORMAL only, Esc in NORMAL on a dirty Issue form shows UNSAVED CHANGES and a further Esc discards, Tab / Shift-Tab move between fields, the mode in the field border | wrapping vim fields (`src/form-field.ts`, rules in `src/form-text.ts`): a one-line field is a `<textarea data-line="single">` that wraps and grows with its text (then scrolls) and never takes a newline: Enter submits, a paste has its line breaks turned to spaces; the Issue title is cut at 200 characters in the editor only (live counter `n/200` from 150, a `TITLE LIMIT` hint when typing is refused or a paste cut; an older, longer title can still be shortened); the mode shows in the field border and tag; a click still places the caret; Vim keys off: the same fields edit plainly |
+| One-line text fields of forms and Settings (manager and entity forms, manager and entity forms, `hierarchy-run` name / tags / model, Settings value editor, graph name, admin plain fields) | "Each field is a shared vim text surface" (Settings, forms) | vim fields (`data-vim="on"`), one-line: `o` / `O` act as `A` / `I`, `J` is a no-op, `p` flattens newlines; Enter still submits from normal mode |
 | Provider-key, token and every `type=password` / `data-secret` field | Masked, write-only | never a vim field: masked, Esc closes the dialog, nothing is echoed |
 | Search / filter boxes, the palette, the `:` line, the file viewer's `:` and `/` prompts, the destructive-confirmation phrase, the terminal's hidden textarea | single-line prompts, not vim textareas | plain fields (`data-vim="off"` or unmarked) |
 | File viewer buffer | shared vim surface | view mode: navigation and `/` search; `i a A I o O` (or any editing key) start the editor, a text box driven by the vim editor above (Esc and Vim keys off: a plain text box; Esc leaves a clean buffer); its `:` line: `:q` (refused while unsaved), `:q!` and `:quit!` close, `:<n>` goes to a line, `:w` / `:w!` / `:wq` / `:x` save through rsid (`:w` on an unedited file rewrites it, as the TUI does), `:e!` reloads from disk; Ctrl-S saves; `:set [no]autopair` toggles bracket auto-pairing (on by default); while editing the viewer's colours, search (`/ ? n N * #`), folds (`z a o c M R`), bracket match and git signs all work; Ctrl-V pastes the clipboard (the TUI has no visual-block mode) |
@@ -429,9 +510,11 @@ dialog. Source-backed exceptions: the TUI has no count before a text object
 ex commands in a text field outside the file viewer.
 
 Evidence is real keyboard events through the mounted controls:
-`node scripts/smoke-vim.mjs [--out DIR]` (nine scenarios in headless Chrome
+`node scripts/smoke-vim.mjs [--out DIR]` (fifteen scenarios in headless Chrome
 against the fake daemon: modes, counts, text objects, dot / undo / registers,
-the one-line and multi-line fields, the viewer's `:` line, Vim off, the secret
+the one-line and multi-line fields, every Issue editor field, the Esc contract,
+the 200-character title cap, the project form, the filter / search / dependency
+inputs, the viewer's `:` line, Vim off, the secret
 field; `runner_unavailable` and exit 3 without Chrome). `tests/vim-parity.test.mjs`
 holds the model's cases; `tests/vim-fields.test.mjs` runs the suite under
 `npm test` when Chrome and `dist/` exist. The secret field's real submission
@@ -455,13 +538,30 @@ availability rule that says why it cannot run now, and a `run` in
   order. Disabled actions stay listed with the reason. Arrows or Ctrl-N /
   Ctrl-P move, Enter runs, Esc closes. A query starting with `:` also offers
   to run it as a TUI command line (works with Vim keys off).
+- **Session list from the keyboard** (local #226, `src/sessionlist-keys.ts`):
+  the list is one tab stop, an ARIA tree whose active row is the cursor. Tab
+  enters it on the open session (else the first row); Up/Down, Home/End and
+  PageUp/PageDown move, Left/Right fold or unfold a Group/Epic row (or step to
+  its parent / first child), Enter opens. ArrowDown in the Filter field moves
+  into the list. These work with Vim keys on or off; `j`/`k`/`gg`/`G` keep
+  their Vim meaning. A row reads its name and plain status.
 - **Menu bar** (Tauri v2 menus, `src/menus.ts` → `src-tauri/src/menu.rs`):
-  File, Session, Go, View, Help built from the registry, with enabled state and
-  check marks kept in sync. macOS adds the app menu (About, Services, Hide,
-  Quit), an Edit menu (needed for Cmd-C/V in text fields) and a Window menu.
-  Plain Ctrl-letter keys become native accelerators (Cmd/Ctrl-N new session,
-  Cmd/Ctrl-K palette); a keystroke that reaches both the menu and the webview
-  runs once.
+  File, Session, Go, Issues, View, Help built from the registry, with enabled
+  state and check marks kept in sync. macOS adds the app menu (About,
+  Settings… Cmd-,, Services, Hide, Quit), an Edit menu (needed for Cmd-C/V in
+  text fields) and a Window menu. The big menus nest submenus laid out in
+  `MENU_LAYOUT` (`src/registry.ts`), grouped as the TUI's keybinding help
+  groups them (View › Files, View › Managers, Session › Organize, ...), so no
+  level has more than `MENU_SCAN_LIMIT` (30) entries; an action the layout does
+  not name still shows at the end of its menu, and a test fails until it is
+  placed. menu.rs caps each level at 64 items and installs the bar menu by
+  menu: a menu over a cap is logged (`rsi-desktop: menu "view" not installed:
+  ...`) and left out, the rest install, and the app shows a notice naming it
+  (#305). Plain Ctrl-letter keys become native accelerators (Cmd/Ctrl-N new
+  session, Cmd/Ctrl-K palette; off macOS none takes a text field's Ctrl-C/V/X/A/Z/Y);
+  Cmd-N (Ctrl-N elsewhere) also works in the webview with the Vim keys off,
+  from the message box too, and a keystroke that reaches both the menu and the
+  webview runs once.
 - **Right-click**: a session row opens it and shows its session actions; a
   message shows Copy message text, Expand or collapse, Message this session and
   Show tool events. A text selection keeps the webview's own menu.
@@ -497,18 +597,27 @@ slice adds files only:
 3. **Its parity rows** in `parity-status.d/<slice>.json` (see "Updating
    PARITY.md").
 4. **Tauri commands** as `#[tauri::command]` fns in
-   `src-tauri/src/<slice>.rs`. The one shared line: `pub mod <slice>;` in
-   `lib.rs`.
+   `src-tauri/src/<slice>.rs`. No shared line: the module declaration is
+   generated too (`modules.generated.rs`, below); a test-only file named
+   `*_tests.rs` is not a module (its owner pulls it in with `#[path]`).
 
 `npm run build` runs `node scripts/slices.mjs`, which writes
 `src/actions/index.generated.ts` (every `SLICE`; `ActionId` is
 `CoreActionId | SliceActionId`), `src/actions/runtime.generated.ts` (every
 `RUNTIME`) and `src-tauri/src/handlers.generated.rs` (the
 `tauri::generate_handler!` list of every `#[tauri::command]` in
-`src-tauri/src/*.rs`, which `lib.rs` includes). Commit the generated files;
-`node scripts/slices.mjs --check` (first step of `npm test`) fails when one is
-stale, and the generator refuses a Tauri command name defined in two modules
-(the webview calls commands by bare name). `tests/slices.test.mjs` checks with
+`src-tauri/src/*.rs`, which `lib.rs` includes), and
+`src-tauri/src/modules.generated.rs` (the `pub mod <file>;` list of every module
+file in `src-tauri/src/`, which `lib.rs` also includes, #181); `src-tauri/build.rs` runs the
+same generator, so a plain `cargo build` or `cargo test` is current too). These
+files, and `PARITY.md`, are build products listed in `desktop/.gitignore`: never
+commit them (#60). A slice therefore adds only its own files, two slices built
+from the same base merge with no conflict, and the merged tree needs no hand
+regeneration: the next `npm run build` / `npm test` / cargo build rewrites them
+from the merged sources (`tests/generated-merge.test.mjs` merges two scratch
+slices to prove it). The generator refuses a Tauri command name defined in two
+modules (the webview calls commands by bare name); `node scripts/slices.mjs
+--check` writes nothing and also fails when an output is missing or stale. `tests/slices.test.mjs` checks with
 `sliceProblems()` that no action id is registered twice, every action has
 exactly one rule (a slice may take over a core action's rule, as slice 6 does
 for `answer-question`), no rule is orphaned, no slice key or `:` command
@@ -517,6 +626,22 @@ rebinds a core one or another slice's to a different action, and every
 same action: the fold keys `zo zc za zM zR` live in both the detail and the
 session-list key tables, and `src/actions/folds.ts` owns the one spec per id
 and sends each run to the pane that has the keys.
+
+**Keys a slice routes outside the registry (#81).** A slice that handles keys in
+its own `window` / `document` keydown listener (G1's `routeGlobal` in
+`input-model.ts`, G2's `routeNavKey` in `nav-model.ts`, the detail arrows, the
+terminal toggle) declares the key tokens it takes in its `SliceSpec`, in
+keybindings.md notation: `rawKeys: ['C-h', 'C-l', 'C-S-Left']`. `sliceProblems()`
+then fails when two slices declare the same raw token, or a slice declares a
+token another slice binds in `keys`. The check cannot see a listener on its own,
+so `tests/slices.test.mjs` also scans `src/` for global keydown/keyup listeners
+(`window.`, `document.` or `win.addEventListener`, or `onkeydown =`): a listener
+in `src/actions/` fails unless its slice declares `rawKeys`, and one elsewhere
+fails unless it is in the test's `RAW_LISTENER_ALLOWLIST` with the reason it
+cannot collide (it only acts while its own pane or dialog is open, or it routes
+no key). Listeners on a dialog or field are not global and are not scanned.
+Declare a key as soon as you route it, or two parallel sweeps will collide at
+runtime instead of in the test.
 
 Core actions that open a slice's dialog (bare `:continue`, `<Space>gq`,
 refresh reloading labels) still call that slice from `src/commands.ts`, and
@@ -568,7 +693,8 @@ and forwards one existing daemon method (`DeleteSession`, `UnarchiveSession`,
 - **Question modal** (`<Space>gq`): the open session's pending question, else
   the first session with one. `j`/`k`, `Space`, `1`-`9`, `Enter`/`Backspace`
   between questions, `i` for a free-text answer, `Ctrl/Cmd-Enter` submits, `d`
-  declines, `Esc`/`q` hides it (the question stays pending). Free text is kept
+  sends "no preference; use your best judgment" (the button says **Let the agent decide**; the TUI has no
+  separate "no" answer, so to say no pick an option or type it), `Esc`/`q` hides it (the question stays pending). Free text is kept
   per question (the TUI keeps one box). The banner above the transcript stays.
 - **Notifications** (`<Space>n`, `:alerts`): every toast plus session
   transitions (completed, failed, interrupted, waiting for you), active first,
@@ -607,7 +733,7 @@ It halts running sessions; it does not spend anything.
 (see "How a slice registers"). The PTY is `src-tauri/src/pty.rs`
 (portable-pty, the crate the TUI uses; its `pty_*` commands reach the handler
 through `handlers.generated.rs`): no daemon method is involved. Shared lines
-it keeps, because no per-slice hook exists for them: `pub mod pty;`,
+it keeps, because no per-slice hook exists for them:
 `.manage(pty::Terminals::default())` and `.on_window_event(pty::on_window_event)`
 in `lib.rs`, and one guard in `src/palette.ts`'s capture listener so a focused
 shell keeps `Ctrl-K` (that listener runs ahead of xterm's, so the slice cannot
@@ -707,6 +833,16 @@ in `src/actions/settings-run.ts`; the DOM is `src/settings.ts`,
   resets the role, `Esc` restores the opening overrides. Choice and overrides
   persist in `localStorage`. Terminal-default and transparent backgrounds use the
   palette's colour (a window has no terminal behind it).
+  **Match system** (the first picker row, `:theme system`; the default on a new
+  install, local #274) follows the system light/dark setting live: Light when the
+  system is light, the desktop default otherwise. Any theme picked by name
+  overrides it, and a profile that already stored a choice keeps it. The page's
+  `color-scheme` follows the painted canvas, so checkboxes, selects and scrollbars
+  match the theme. Text on a filled accent (badges, primary and danger buttons)
+  uses `--on-<accent>`, which a theme sets to the colour that reaches 4.5:1
+  (`onColor`); `tests/contrast.test.mjs` enforces the text, accent and fill pairs
+  in Light, High Contrast and the default, and the smoke step `theme-system`
+  emulates `prefers-color-scheme` (every other smoke page starts as a dark system).
 - **Keybindings help** (`?`, Ctrl-Alt-G, `:help`, Help › Keyboard shortcuts):
   the core `help` action, which the slice's `afterAction` turns into the overlay.
   *Contextual* lists the actions that can run where you were, with their keys;
@@ -999,7 +1135,17 @@ shared widgets the other slices call:
 ## v1 features
 
 - Session list: polled every 3 s, active sessions first; filters for project,
-  text and show completed.
+  text and show completed. Finished sessions are listed by default (as in the
+  TUI) with a muted label; unticking Show completed hides them, is remembered
+  across launches (`rsi.desktop.showFinished` in localStorage), and never hides
+  the session that is open.
+  The filter box matches a session's label, id prefix, provider and prompt text
+  (the first 20,000 characters). When it leaves the list empty, the empty row
+  counts the matches that Show completed and the archive hide, or that sit in
+  other projects, and offers Show completed, Show archived, All projects and
+  Clear filter; it names only the filters that are on, and the Jobs tab has its
+  own text. On a list over 400 sessions the first key after a pause filters at
+  once and a burst of keys costs one more render, not one per key.
 - Conversation view: incremental `since_sequence` polling every 1.5 s. Tool
   calls, results and thinking are collapsed; base64 blobs are elided and long
   messages folded. Older events load in pages.
@@ -1010,21 +1156,36 @@ shared widgets the other slices call:
 ## Updating PARITY.md
 
 `PARITY.md` is the checklist for "the desktop mirrors the TUI" (hub #3000). It is
-generated; do not edit it by hand.
+generated and not committed (#60, `desktop/.gitignore`): **`npm run parity`**
+(in `desktop/`) regenerates the registration files and `PARITY.md` and prints the
+table to stdout, one command for a human who wants to read it (`npm test` also
+writes it). The committed source of truth is `parity-status.d/`.
 
 - `node scripts/parity.mjs` parses `docs/keybindings.md` and lists the
   `crates/rsi/src/ui/*.rs` and `ui/overlay/*.rs` modules, merges the hand-kept
-  status files `parity-status.d/*.json` and rewrites `PARITY.md`.
-- `node scripts/parity.mjs --check` exits 1 when `PARITY.md` is stale (run as
-  part of `npm test`). `--root DIR` reads `docs/` and `crates/` from another
-  tree, to try an edited scratch copy without touching the repo.
+  status files `parity-status.d/*.json` and writes `PARITY.md` (part of
+  `npm test`). It exits 1, writing nothing, when a status file names an unknown
+  row, two status files name the same row, a generated row has no status entry,
+  or `parity-audit.json` does not justify a substitute.
+- `node scripts/parity.mjs --print` writes the same file and prints it (what
+  `npm run parity` runs, after `node scripts/slices.mjs`).
+- `node scripts/parity.mjs --check` runs the same checks without writing and also
+  exits 1 when `PARITY.md` is missing or stale. `--root DIR` reads `docs/` and
+  `crates/` from another tree, to try an edited scratch copy without touching the repo.
+- Mid-stack, while a commit moves a row from one slice's file to another's, both
+  files briefly name it. `node scripts/parity.mjs --allow-duplicates` still writes
+  `PARITY.md` (the first file's entry wins, the second is still validated), warns
+  on stderr and puts a banner naming each pair atop `PARITY.md`; a row in three
+  files still fails. `--check` refuses the flag and `npm test` never passes it, so
+  a duplicate cannot land. Nothing needs regenerating during a rebase: no
+  generated file is tracked.
 - To record progress, edit your slice's file in `parity-status.d/` (a new
   slice adds `parity-status.d/<slice>.json`; `core.json` holds slices 1-3) and
   regenerate. Each file is
   `{"version":1,"rows":{"<id>":{"status":"done","location":"src/x.ts","note":"..."}}}`,
   and a row id in two files fails the check, so parallel slices never edit the
   same row: move a row into your file when your slice takes it over.
-  `status` is `missing` (the default for an id not listed), `partial`, `done` or
+  `status` is `missing`, `partial`, `done` or
   `substitute` (a note is required, and `parity-audit.json` must justify the row).
   A `partial` or `missing` row needs `"owner": ["#N", ...]`, the Issue that will
   close the gap, shown in `PARITY.md` as `(owner #N)`. An id the generator
@@ -1058,10 +1219,11 @@ tracked here.
 
 ### Substitute audit and source guard (hub #3104)
 
-- **Inventory guard (#3003).** `node scripts/parity.mjs --check` fails when the TUI
-  gains a keybinding, command, overlay heading or view module (`crates/rsi/src/ui`)
-  that `PARITY.md` does not list: the new row appears as `missing` and the file is
-  stale. `tests/parity-audit.test.mjs` demonstrates each case against a scratch copy
+- **Inventory guard (#3003).** `node scripts/parity.mjs` (and `--check`) fails when
+  the TUI gains a keybinding, command, overlay heading or view module
+  (`crates/rsi/src/ui`) that no `parity-status.d` file names: every row needs an
+  entry (`missing` with an owner when the desktop lacks it), and the error lists
+  the new row ids. `tests/parity-audit.test.mjs` demonstrates each case against a scratch copy
   of the TUI sources, and the hub's desktop lane runs `npm test` for any diff that
   touches `docs/keybindings.md` or `crates/rsi/src`.
 - **Substitute audit.** `parity-audit.json` maps every `substitute` row to a group
@@ -1139,6 +1301,20 @@ lists. One full-screen view (Esc/q closes) shows:
   `ConfigurePortfolioNode` or `ConfigureHarnessManagerPolicy` and read back.
 - **Fleet** (`:fleet`, `GetFleetOverview`), and the escalation, friction and
   portfolio lists (`:manager escalations|friction|portfolio`).
+- **Global Dashboard** (`gd`, `:dashboard`, `:gd`; #3366): one view above every
+  project over `GetGlobalDashboard {window}`. A row per project (the home
+  project first, then by the `s` sort) and a pinned TOTAL row: live agents by
+  role and provider, tokens in and out, cost, Issues open, in progress,
+  created and closed in the window, operator requests, landings and QA. Column
+  headers carry plain-words titles; zero counts are dim. A yellow
+  **Incomplete** badge shows whenever the daemon capped a read (the numbers
+  are then a lower bound). The side pane (`t`) shows the top-level manager's
+  conversation (`Tab` focuses it, `i` types to it); with no live seat `n`
+  opens the gm launch-and-appoint dialog, hosted in the home project, whose
+  button is the confirm. `j`/`k` move, `Enter`/`l` open the project, `w`
+  cycles 1h/24h/7d, `gm` opens the workspace, `r` refreshes (also every 10 s),
+  `Esc`/`q` close. Rules: `src/dashboard-model.ts` (tests:
+  `tests/dashboard.test.mjs`); DOM: `src/dashboard.ts`.
 
 Credential-like record fields are never shown. `src/managers-model.ts`
 (pure) and `src/actions/managers.ts` are tested in `tests/managers*.test.mjs`;
@@ -1166,6 +1342,11 @@ client calls.
   describe a credential, so only its state, the SHA-256 fingerprint prefix and
   the check metadata reach the webview. The tests feed it a daemon that echoes
   the secret back.
+- The settlement dialog reads the latest run's receipt the way the TUI does
+  (`GetSourceWorktreeSettlementRun`): who started the run, its outcome, each
+  root as settled, refused or needing recovery with its reason in plain words,
+  and the programs it left running because it could not prove them its own
+  (what that means, and to stop them by hand).
 - Settlement applies only after a fresh applyable audit and the exact typed
   `APPLY` phrase. The Tauri side checks the phrase again. Scratch adoption
   lists every path and sends nothing until `y`.

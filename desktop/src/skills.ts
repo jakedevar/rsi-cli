@@ -10,9 +10,10 @@ import { actions, button, inField, listBox, note, rowEl, show } from './admin-do
 import { dialogEl, overlayKey } from './actions/detail.js';
 import {
   type SkillContent, type SkillDeleted, type SkillToggled, type SkillsView, cursorAfterDelete, skillPreviewScroll,
-  skillRowValue, skillToggledNotice,
+  skillDeletedNotice, skillRowValue, skillToggledNotice,
 } from './skills-model.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
 
 /** Which skills overlay is open (the slice snapshot). */
 let openName: string | null = null;
@@ -53,7 +54,7 @@ async function loadSkills(): Promise<SkillsView | null> {
 /**
  * The Claude skills list (Settings › Claude Skills, `:skills`): Enter previews
  * SKILL.md, e enables or disables the selected skill (SetSkillEnabled), d asks
- * for a second d and then deletes it (DeleteSkill; the TUI asks for a second d too, #131).
+ * for a second d and then deletes it (DeleteSkill, a move into rsid's skill trash, #91; the TUI asks for a second d too, #131).
  */
 export async function openSkills(): Promise<void> {
   const view = await loadSkills();
@@ -88,11 +89,12 @@ export async function openSkills(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     previewBtn.disabled = rows.length === 0;
     toggleBtn.disabled = rows.length === 0 || busy;
     deleteBtn.disabled = rows.length === 0 || busy;
     confirm.textContent = armed !== null
-      ? `Press d again to delete skill "${armed}" (removes ${view.skills_dir}/${armed} on the daemon host; no undo).` : '';
+      ? `Press d again to delete skill "${armed}" (moves ${view.skills_dir}/${armed} to the daemon's skill trash).` : '';
   };
   const preview = (): void => {
     const r = rows[skillsAt];
@@ -120,7 +122,7 @@ export async function openSkills(): Promise<void> {
     busy = true;
     try {
       const gone = await invoke<SkillDeleted>('delete_skill', { name: step.run });
-      toast(`Deleted skill: ${gone.name}`);
+      toast(skillDeletedNotice(gone));
       skillsAt = cursorAfterDelete(skillsAt, rows.length - 1);
       reload();
     } catch (e) {

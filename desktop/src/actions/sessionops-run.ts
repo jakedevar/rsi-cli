@@ -1,16 +1,19 @@
 // The DOM side of the session operations (actions/sessionops.ts): each action
 // forwards one rsid method through a src-tauri/src/sessionops.rs command and
-// reports the TUI's toast. Landing keeps the shown commit armed for the
-// confirming press and then watches the queued entry until it settles, as
+// reports the TUI's toast. Landing asks in a confirm dialog (Land / Cancel, Enter
+// or <Space>gl confirms) and then watches the queued entry until it settles, as
 // crates/rsi/src/land.rs does. Daemon text is set with textContent only.
 import { api, invoke } from '../api.js';
 import type { Invocation, SliceRuntime } from '../commands.js';
+import { confirmDialog } from '../approvals.js';
+import { LAND_CHORD } from '../confirm-model.js';
 import { toast } from '../dom.js';
+import { isVimKeysOn } from '../vimkeys.js';
 import { refreshSessions, renderSessionList } from '../sessions.js';
 import {
-  type Armed, CI_COMMIT, LAND_WATCH_MS, type LandSource, type OpsSession, type QueueEntry, type ToggleKind, type Watched,
-  TOGGLES, confirmsLand, landBlocker, landKey, landPrompt, landSummary, retryCancelled, retryMessage, settle,
-  settledMessage, statusLine, toggleFailure, toggleMessage, toggledAt, watchIds,
+  CI_COMMIT, LAND_WATCH_MS, type LandSource, type OpsSession, type QueueEntry, type ToggleKind, type Watched,
+  TOGGLES, landBlocker, landConfirmCopy, landKey, landName, landQueuedMessage, retryCancelled, retryMessage, settle,
+  settledMessage, stageNotes, toggleFailure, toggleMessage, toggledAt, watchIds,
 } from '../sessionops-model.js';
 import { currentSessions, isReadOnly, selected, state } from '../state.js';
 import { SWEEP_CSS, injectCss } from '../sweep-css.js';
@@ -109,10 +112,10 @@ async function commitPush(): Promise<void> {
 
 // ---------- landing ----------
 
-let armed: Armed | null = null;
 let watching: Watched[] = [];
 let watchTimer: number | null = null;
 let watchBusy = false;
+let asking = false;
 
 interface EnqueueAnswer {
   source: LandSource;
@@ -123,32 +126,35 @@ function newKey(): string {
   return landKey(crypto.randomUUID());
 }
 
+/** Land opens a confirm dialog from every path (menu, button, palette, key chord); Land sends the RPC. */
 async function land(): Promise<void> {
   const t = target();
-  if (!t) return;
-  const now = Date.now();
-  const was = armed;
-  armed = null;
-  if (was && confirmsLand(was, t.id, now)) { await confirmLand(was); return; }
+  if (!t || asking) return;
+  asking = true;
   try {
     const r = await invoke<EnqueueAnswer>('land_session', { sessionId: t.id, commit: null, idempotencyKey: null, dryRun: true });
     const blocker = landBlocker(r.source);
-    if (blocker) { toast(`${landSummary(r.source)}: ${blocker}`); return; }
-    armed = { sessionId: t.id, commit: r.source.commit, at: now };
-    toast(landPrompt(r.source), true);
+    if (blocker) { toast(blocker); return; }
+    const copy = landConfirmCopy(r.source, t);
+    const ok = await confirmDialog(copy.message, copy.confirmLabel, {
+      title: copy.title, detail: copy.detail, cancelLabel: copy.cancelLabel, primary: true,
+      chord: LAND_CHORD, vimKeysOn: isVimKeysOn,
+    });
+    if (ok) await confirmLand(t.id, r.source.commit, landName(r.source, t));
   } catch (e) {
     toast(`Land: ${errText(e)}`);
+  } finally {
+    asking = false;
   }
 }
 
-async function confirmLand(a: Armed): Promise<void> {
+async function confirmLand(sessionId: string, commit: string, label: string): Promise<void> {
   try {
     const r = await invoke<EnqueueAnswer>('land_session', {
-      sessionId: a.sessionId, commit: a.commit, idempotencyKey: newKey(), dryRun: false,
+      sessionId, commit, idempotencyKey: newKey(), dryRun: false,
     });
-    const label = landSummary(r.source);
     if (r.entry) {
-      toast(`Queued: ${statusLine(r.entry)}`, true);
+      toast(landQueuedMessage(label), true);
       watching.push({ entryId: r.entry.id, label });
       startWatch();
     }
@@ -172,7 +178,10 @@ async function pollWatch(): Promise<void> {
   watchBusy = true;
   try {
     const r = await invoke<{ entries?: QueueEntry[] }>('rolling_queue_entries', { entryIds: watchIds(watching) });
-    const { settled, rest } = settle(watching, r.entries ?? []);
+    const entries = r.entries ?? [];
+    const progress = stageNotes(watching, entries);
+    for (const note of progress.notes) toast(note, true);
+    const { settled, rest } = settle(progress.watching, entries);
     watching = rest;
     for (const { label, entry } of settled) toast(settledMessage(label, entry), entry.state === 'published');
   } catch {

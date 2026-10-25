@@ -5,12 +5,17 @@ set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 fixture="$(mktemp -d)"
 trap 'rm -rf "$fixture"' EXIT
-python3 - "$root" "$fixture" <<'PY'
-import json
-import pathlib
-import sys
-root, fixture = map(pathlib.Path, sys.argv[1:])
-(fixture / "Cargo.toml").write_text('''[package]
+
+# toml_string <text>: a TOML basic string holding the text (backslash and quote escaped).
+toml_string() {
+    local text="${1//\\/\\\\}"
+    printf '"%s"' "${text//\"/\\\"}"
+}
+
+# Plain heredocs (#465; this was an interpreter heredoc): the fixture package names the
+# real sources by absolute path.
+cat >"$fixture/Cargo.toml" <<TOML
+[package]
 name = "rsi-socket-activation-portability"
 version = "0.0.0"
 edition = "2024"
@@ -27,7 +32,11 @@ name = "inherited-listener"
 path = "listener.rs"
 [[bin]]
 name = "rsi-socket-hold"
-path = ''' + json.dumps(str(root / "crates/rsi-socket-hold/src/main.rs")) + '\n')
-(fixture / "listener.rs").write_text('#[path = ' + json.dumps(str(root / "crates/rsid/src/instance_guard/inherited_listener.rs")) + ']\nmod inherited_listener;\nfn main() {}\n')
-PY
+path = $(toml_string "$root/crates/rsi-socket-hold/src/main.rs")
+TOML
+cat >"$fixture/listener.rs" <<RUST
+#[path = $(toml_string "$root/crates/rsid/src/instance_guard/inherited_listener.rs")]
+mod inherited_listener;
+fn main() {}
+RUST
 cargo check --manifest-path "$fixture/Cargo.toml" --target x86_64-apple-darwin --all-targets

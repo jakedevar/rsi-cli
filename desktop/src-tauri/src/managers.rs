@@ -171,6 +171,22 @@ pub fn budget_params(node_id: Option<&str>) -> Built {
     })
 }
 
+/// `GetGlobalDashboardParams::window` in its serde spelling (`DashboardWindow`).
+pub const DASHBOARD_WINDOWS: &[&str] = &["1h", "24h", "7d"];
+
+/// `GetGlobalDashboard {window}` (#3366): the window must be one the daemon's
+/// `DashboardWindow` accepts (its params deny unknown fields).
+pub fn dashboard_params(window: &str) -> Built {
+    if DASHBOARD_WINDOWS.contains(&window) {
+        Ok(json!({ "window": window }))
+    } else {
+        Err(format!(
+            "window must be one of {}",
+            DASHBOARD_WINDOWS.join(", ")
+        ))
+    }
+}
+
 /// `GetPortfolioNode {node_id}`.
 pub fn portfolio_node_params(node_id: &str) -> Built {
     Ok(json!({ "node_id": parse_uuid("node_id", node_id)? }))
@@ -573,6 +589,12 @@ pub async fn global_manager_revoke(
     .await
 }
 
+/// The operator-only global dashboard snapshot behind `gd` / `:dashboard` (#3366).
+#[tauri::command]
+pub async fn global_dashboard(state: State<'_, AppState>, window: String) -> CmdResult {
+    forward(&state, "GetGlobalDashboard", dashboard_params(&window)?).await
+}
+
 #[tauri::command]
 pub async fn fleet_overview(state: State<'_, AppState>) -> CmdResult {
     forward(&state, "GetFleetOverview", json!({})).await
@@ -708,6 +730,10 @@ mod tests {
         );
         assert_eq!(portfolio_node_params(S).unwrap(), json!({"node_id": S}));
         assert_eq!(friction_params(None).unwrap(), json!({}));
+        assert_eq!(dashboard_params("24h").unwrap(), json!({"window": "24h"}));
+        assert_eq!(dashboard_params("7d").unwrap(), json!({"window": "7d"}));
+        assert!(dashboard_params("2h").is_err());
+        assert!(dashboard_params("").is_err());
         assert_eq!(
             friction_params(Some(48)).unwrap(),
             json!({"window_hours": 48})

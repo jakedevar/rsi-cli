@@ -3,6 +3,9 @@
 # the freshly built binaries at a quiet point instead of cutting off running
 # turns. It is the operator front of the AgentRequestDeploy runner.
 
+# shellcheck source=scripts/repo-guard-bin.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/repo-guard-bin.sh"
+
 # request_quiet_restart <rsi-rpc> <socket> <binaries-dir> [max-wait-secs]
 #   0  a quiet-point restart is pending (status printed); the daemon restarts
 #      itself and verifies the running build, so the caller must not restart
@@ -15,75 +18,14 @@
 # `rsid_running_pids` (rsid-processes.sh) must be defined by the caller.
 request_quiet_restart() {
     local rpc="$1" socket="$2" dir="$3" wait="${4:-}" status=0
-    python3 - "$rpc" "$socket" "$dir" "$wait" <<'PY' || status=$?
-import json
-import socket as socket_module
-import subprocess
-import sys
-
-rpc, socket_path, directory, wait = sys.argv[1:5]
-NOW_HINT = "Retry later, or force an immediate restart with: make release-install NOW=1"
-
-
-def ambiguous(reason):
-    print(f"quiet-point restart not requested: {reason}", file=sys.stderr)
-    print(
-        "The daemon may still be running turns, so it was not restarted. " + NOW_HINT,
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-
-# Positive evidence that the daemon is down: its socket is absent or refuses.
-probe = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
-probe.settimeout(5)
-try:
-    probe.connect(socket_path)
-except (FileNotFoundError, ConnectionRefusedError):
-    sys.exit(11)
-except OSError as error:
-    ambiguous(f"cannot probe the daemon socket ({error})")
-finally:
-    probe.close()
-
-params = {"binaries_dir": directory}
-if wait:
-    params["max_wait_secs"] = int(wait)
-try:
-    run = subprocess.run(
-        [rpc, "--socket", socket_path, "RequestOperatorRestart", "--params", json.dumps(params)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-except subprocess.TimeoutExpired:
-    ambiguous("the daemon did not answer RequestOperatorRestart in time")
-except OSError as error:
-    ambiguous(f"cannot run {rpc} ({error})")
-try:
-    reply = json.loads(run.stdout)
-except ValueError:
-    reply = None
-if not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0":
-    ambiguous("the daemon's reply to RequestOperatorRestart was not understood")
-error = reply.get("error")
-if error:
-    message = str(error.get("message", error) if isinstance(error, dict) else error)
-    if "deploy_needs_supervisor" in message:
-        print("rsid is not under rsid-supervisor.sh; restarting it directly.", file=sys.stderr)
-        sys.exit(10)
-    print(f"quiet-point restart refused: {message}", file=sys.stderr)
-    print(NOW_HINT, file=sys.stderr)
-    sys.exit(1)
-status = reply.get("result") or {}
-print(
-    "Restart pending: rsid swaps in the new binaries and restarts at the next quiet "
-    f"point (sha {status.get('sha')}, release by {status.get('release_by')})."
-)
-print("  Waiting for running turns, jobs and landings to finish; the TUI shows the countdown.")
-print("  Force it now:  rsi-rpc ForceOperatorRestart    Cancel it:  rsi-rpc CancelOperatorRestart")
-sys.exit(0)
-PY
+    if rsid_resolve_repo_guard "$rpc" rsid-quiet-restart; then
+        # The request itself is `rsi-repo-guard rsid-quiet-restart` (#465).
+        "$RSI_GUARD_BIN" rsid-quiet-restart "$rpc" "$socket" "$dir" "$wait" || status=$?
+    else
+        echo "quiet-point restart not requested: the request helper is missing." >&2
+        echo "Retry later, or force an immediate restart with: make release-install NOW=1" >&2
+        status=1
+    fi
     case "$status" in
         0) return 0 ;;
         10) return 10 ;;
@@ -107,7 +49,17 @@ PY
 }
 
 # The deployable binaries, as AgentRequestDeploy names them (DEPLOY_BINARIES).
-RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-rolling-land rsi-remote rsi-turn-shim rsi-socket-hold rsid-supervisor.sh)
+RSID_DEPLOY_BINARIES=(rsid rsi rsi-rpc rsi-agent-mcp rsi-build-rustc rsi-contract-validate rsi-known-failure rsi-rolling-land rsi-repo-guard rsi-remote rsi-turn-shim rsi-socket-hold rsi-cloud rsi-eval rsid-supervisor.sh)
+# Keep the canonical literal inventory readable by its managed-set parity test.
+# Shell scripts are staged from source; only Cargo binaries need build coverage.
+RSID_CARGO_BINARIES=()
+for rsid_deploy_member in "${RSID_DEPLOY_BINARIES[@]}"; do
+    case "$rsid_deploy_member" in
+        *.sh) ;;
+        *) RSID_CARGO_BINARIES+=("$rsid_deploy_member") ;;
+    esac
+done
+unset rsid_deploy_member
 
 # stabilize_installed_binaries <bin-dir> <cargo-release-dir> <stable-dir>
 #

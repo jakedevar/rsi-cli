@@ -230,6 +230,56 @@ fn parse_catalog_tool_support(data: &[Value]) -> HashMap<String, bool> {
         .collect()
 }
 
+/// Every model of a catalog `data` array that lists a usable prompt and
+/// completion price, as USD per million tokens. A model with a dynamic
+/// (`"-1"`) or missing price is left out, never given a guessed one.
+fn catalog_prices(data: &[Value]) -> Vec<(String, crate::model_control::ModelPrice)> {
+    use rsi_common::openrouter_spend::per_token_to_per_mtok;
+    data.iter()
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = object.get("id")?.as_str()?.trim();
+            let pricing = object.get("pricing")?.as_object()?;
+            let input_per_mtok = per_token_to_per_mtok(pricing.get("prompt")?)?;
+            let output_per_mtok = per_token_to_per_mtok(pricing.get("completion")?)?;
+            (!id.is_empty()).then(|| {
+                (
+                    id.to_owned(),
+                    crate::model_control::ModelPrice {
+                        cache_write_per_mtok: None,
+                        input_per_mtok,
+                        output_per_mtok,
+                        cache_read_per_mtok: pricing
+                            .get("input_cache_read")
+                            .and_then(per_token_to_per_mtok),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// Parse a whole `/api/v1/models` body and publish its prices (#3154). Returns
+/// how many models carried a usable price.
+///
+/// # Errors
+/// [`OpenRouterError::MalformedCatalog`] when the body is not a catalog.
+pub fn publish_catalog_prices(bytes: &[u8]) -> Result<usize, OpenRouterError> {
+    if bytes.len() > CATALOG_MAX_BYTES {
+        return Err(OpenRouterError::CatalogTooLarge);
+    }
+    let document =
+        serde_json::from_slice::<Value>(bytes).map_err(|_| OpenRouterError::MalformedCatalog)?;
+    let data = document
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(OpenRouterError::MalformedCatalog)?;
+    let prices = catalog_prices(data);
+    let count = prices.len();
+    crate::model_control::publish_discovered_prices(prices, chrono::Utc::now());
+    Ok(count)
+}
+
 fn parse_picker_models(bytes: &[u8]) -> Result<Vec<(String, String)>, OpenRouterError> {
     if bytes.len() > CATALOG_MAX_BYTES {
         return Err(OpenRouterError::CatalogTooLarge);
@@ -241,6 +291,9 @@ fn parse_picker_models(bytes: &[u8]) -> Result<Vec<(String, String)>, OpenRouter
         .and_then(Value::as_array)
         .ok_or(OpenRouterError::MalformedCatalog)?;
 
+    // #3154: the same fetch keeps each model's `pricing` with its fetch time,
+    // so a per-run estimate never uses a hand-typed price.
+    crate::model_control::publish_discovered_prices(catalog_prices(data), chrono::Utc::now());
     let metadata = parse_catalog_tool_support(data);
     if let Ok(mut cached) = CATALOG_TOOL_SUPPORT
         .get_or_init(|| std::sync::RwLock::new(HashMap::new()))
@@ -356,6 +409,81 @@ mod tests {
         assert_eq!(metadata.get("vendor/tool-model"), Some(&true));
         assert_eq!(metadata.get("vendor/no-tool-model"), Some(&false));
         assert_eq!(metadata.get("vendor/unknown"), None);
+    }
+
+    /// #3154: the catalog fetch keeps each model's `pricing` (per token, as
+    /// OpenRouter reports it) as per-million-token prices with the fetch time,
+    /// and `price_for_model` uses the discovered price over the hand-typed
+    /// table, falling back to it when discovery has none.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn catalog_prices_are_discovered_parsed_and_used_by_price_for_model() {
+        let before = chrono::Utc::now();
+        let body = serde_json::to_vec(&serde_json::json!({ "data": [
+            {"id": "test-3154/disc-1", "name": "Disc", "supported_parameters": ["tools"],
+             "pricing": {"prompt": "0.00000014", "completion": "0.00000042",
+                         "input_cache_read": "0.0000000042"}},
+            // Overrides a hand-typed PRICES row: the discovered price wins.
+            {"id": "qwen/qwen3-coder-next", "name": "Qwen", "supported_parameters": ["tools"],
+             "pricing": {"prompt": "0.0000005", "completion": "0.000002"}},
+            // A dynamic or unparsable price is no price.
+            {"id": "test-3154/dyn", "name": "Dyn", "supported_parameters": ["tools"],
+             "pricing": {"prompt": "-1", "completion": "-1"}},
+            {"id": "test-3154/free-form", "name": "Free", "supported_parameters": ["tools"],
+             "pricing": {"prompt": "free", "completion": "0"}},
+            {"id": "test-3154/no-pricing", "name": "None", "supported_parameters": ["tools"]}
+        ]}))
+        .unwrap();
+        parse_picker_models(&body).unwrap();
+
+        let found = crate::model_control::discovered_price("test-3154/disc-1").unwrap();
+        assert!((found.price.input_per_mtok - 0.14).abs() < 1e-9);
+        assert!((found.price.output_per_mtok - 0.42).abs() < 1e-9);
+        assert!((found.price.cache_read_per_mtok.unwrap() - 0.0042).abs() < 1e-9);
+        assert!(found.fetched_at >= before && found.fetched_at <= chrono::Utc::now());
+        for unpriced in [
+            "test-3154/dyn",
+            "test-3154/free-form",
+            "test-3154/no-pricing",
+        ] {
+            assert!(
+                crate::model_control::discovered_price(unpriced).is_none(),
+                "{unpriced}"
+            );
+            assert!(
+                crate::model_control::price_for_model(unpriced).is_none(),
+                "{unpriced}"
+            );
+        }
+        let used = crate::model_control::price_for_model("test-3154/disc-1").unwrap();
+        assert!((used.input_per_mtok - 0.14).abs() < 1e-9);
+        // The hand-typed row (0.12 / 0.80) is overridden by the discovered one.
+        let overridden = crate::model_control::price_for_model("qwen/qwen3-coder-next").unwrap();
+        assert!((overridden.input_per_mtok - 0.5).abs() < 1e-9);
+        assert!((overridden.output_per_mtok - 2.0).abs() < 1e-9);
+        // A model discovery never listed keeps its documented list price.
+        let fallback = crate::model_control::price_for_model("deepseek/deepseek-v4.1-flash")
+            .expect("the documented price stays the fallback");
+        assert!((fallback.input_per_mtok - 0.14).abs() < 1e-9);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_whole_catalog_body_publishes_its_prices_and_refuses_a_malformed_one() {
+        let body = br#"{"data":[{"id":"test-3154/whole-1","pricing":{"prompt":"0.000001","completion":"0.000003"}}]}"#;
+        assert_eq!(publish_catalog_prices(body).unwrap(), 1);
+        let found = crate::model_control::discovered_price("test-3154/whole-1").unwrap();
+        assert!((found.price.input_per_mtok - 1.0).abs() < 1e-9);
+        assert!((found.price.output_per_mtok - 3.0).abs() < 1e-9);
+        assert_eq!(found.price.cache_read_per_mtok, None);
+        assert!(matches!(
+            publish_catalog_prices(b"not json"),
+            Err(OpenRouterError::MalformedCatalog)
+        ));
+        assert!(matches!(
+            publish_catalog_prices(br#"{"nope":[]}"#),
+            Err(OpenRouterError::MalformedCatalog)
+        ));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

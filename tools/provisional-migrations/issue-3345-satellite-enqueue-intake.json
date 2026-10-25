@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "version": 190,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v190.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:1901a19c7efe75f500920e1d3bd150aa4d37a746714475ef8c8cc180042d94f6",
+      "sites": [
+        {
+          "anchor": "fn migrate_v190(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 190 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 190)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:cbe134174a9cd1404c24a33e0bf9dc992b0ee57aa96d22cfaffb64088657e698",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 190;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 190 && target < 190 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": ".pragma_update(None, \"user_version\", 190 - 1)",
+          "replacement": ".pragma_update(None, \"user_version\", ${VERSION} - 1)",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if target_version >= 190 { 2 } else { 0 },",
+          "replacement": "if target_version >= ${VERSION} { 2 } else { 0 },",
+          "scope": "unit"
+        },
+        {
+          "anchor": "\"V190 satellite enqueue intakes replayed\"",
+          "replacement": "\"V${VERSION} satellite enqueue intakes replayed\"",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

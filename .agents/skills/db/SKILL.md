@@ -30,21 +30,29 @@ Add `--json` to any of the above for machine-readable output. Add `--db <PATH>` 
 
 `--grep` is the "retrieve **parts** of the schema" path: pull only the slice you need (e.g. `--grep sandbox`, `--grep parent`) instead of ingesting all 40+ tables.
 
-If `rsi-diag` is not built, `sqlite3 "$RSI_DB" ".schema <table>"` and `sqlite3 "$RSI_DB" ".tables"` are an equivalent read-only fallback.
+If `rsi-diag` is not built, use the read-only SQLite fallback (replace `<table>` with a discovered table name):
+
+```bash
+sqlite3 -readonly "${RSI_DB:-$HOME/.rsi/rsi.db}" ".tables"
+sqlite3 -readonly "${RSI_DB:-$HOME/.rsi/rsi.db}" ".schema <table>"
+```
 
 ## Choose the right access path
 
-1. **Prefer the daemon RPC for normal session flows and any mutation.** RPC preserves the status machine, timestamps, UUIDs, and validation invariants. Use the client:
+1. **For an rsi-managed agent, start with `AgentGetAuthorityCatalog`.** Use only the permitted `Agent*` controls it lists, within their current scope. Prefer their native `rsi_control_*` tools; `rsi-rpc <AgentVerb>` is the validated fallback:
    ```bash
-   cargo run -q -p rsi-common --bin rsi-rpc -- <Method> --params '{...}'
+   rsi-rpc AgentGetAuthorityCatalog --params '{}'
+   rsi-rpc AgentGetAuthorityCatalog --params '{"verb":"AgentGetStatus"}'
    ```
-   Read methods include `GetSession`, `ListSessions`, `GetConversation`, `GetTurnMetrics`, `ListProjects`, `GetHealthStatus`, `GetDaemonCapabilities`. See the RPC surface in `AGENTS.md` and `crates/rsid/src/rpc.rs` for the full method list and param shapes.
+   The second call returns that control's schema, example and refusal codes. Use a listed control such as `AgentGetStatus`, `AgentGetProgress` or `AgentReadSessionEvents` when it covers the diagnostic. Refresh the catalog after an authority change or refusal. `$RSI_SESSION_TOKEN` is transport-only and supplied automatically; never put it in parameters, files or logs. Operator RPC methods are not callable directly by tokened agents, even for reads; changing the client or invoking it through `cargo run` does not grant authority.
 
-2. **Raw `sqlite3` is allowed for read-only diagnostics, repairs, and bulk fixes** when it is the right tool:
+2. **Use raw read-only `sqlite3` for diagnostics outside the permitted controls.** Discover tables and columns first, then query only the needed rows:
    ```bash
-   sqlite3 "$RSI_DB" "SELECT id, status, created_at FROM sessions ORDER BY created_at DESC LIMIT 5;"
+   sqlite3 -readonly "${RSI_DB:-$HOME/.rsi/rsi.db}" "SELECT id, status, created_at FROM sessions ORDER BY created_at DESC LIMIT 5;"
    ```
-   Confirm column names with `rsi-diag schema <table>` first.
+   Confirm these column names with `rsi-diag schema sessions` or `.schema sessions` before running the example. Read-only diagnostics do not authorize repairs or bulk writes.
+
+3. **Prefer permitted daemon controls for mutations.** They preserve the status machine, timestamps, UUIDs and validation invariants. When an operator operation is needed, only an appointed manager with the required operator-saved grant and current catalog permission may use `AgentManagerControl` with action `operator_call` and `call: {"method":"<allowlisted method>","params":{...}}`. The catalog supplies the current delegation allowlist, grants and schema; delegation never permits a direct operator RPC call. A worker without that authority records the needed operation in its handoff for the manager or operator; it does not call manager controls. Raw SQL writes require the explicit consent and invariants below.
 
 ## Hard rules for any write (from AGENTS.md "Database Rules")
 
@@ -60,5 +68,5 @@ Only break out raw SQL writes with explicit user consent. When you do:
 ## Remember
 
 - Discover before you query: run `rsi-diag schema <table>` so you never go back and forth on missing or misnamed columns.
-- Read-only by default. Mutations go through the daemon RPC unless the user explicitly approves raw SQL.
+- Read-only by default. Use catalog-permitted agent controls, delegated `operator_call` only with manager authority, or explicitly approved raw SQL writes.
 - The schema evolves with migrations. Read the applied version with `rsi-diag schema --version`, and pull only the slice you need with `--grep`.

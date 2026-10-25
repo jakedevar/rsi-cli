@@ -11,11 +11,15 @@ impl AgentControlHandle {
     pub async fn agent_submit_review_receipt(
         &self,
         caller: Uuid,
-        request: AgentSubmitReviewReceiptRequestV1,
+        mut request: AgentSubmitReviewReceiptRequestV1,
     ) -> Result<ManagerReviewReceiptV1> {
-        request.validate().map_err(refused)?;
+        request.validate_wire().map_err(refused)?;
         {
             let store = self.store.lock().await;
+            // #3213: a bound reviewer may omit its assignment id, and a wrong
+            // one is refused with the caller's own id in the detail.
+            request.assignment_id =
+                store.resolve_manager_review_assignment_id(caller, request.assignment_id)?;
             if let Some(receipt) = store.manager_review_receipt_replay(caller, &request)? {
                 return Ok(receipt);
             }

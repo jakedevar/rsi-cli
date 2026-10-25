@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use rsi_common::codegraph::{CodegraphNativeReadV1, CodegraphReadV1};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
@@ -63,7 +62,7 @@ impl NativeCodegraphBinding {
     /// are frozen. The session can still be terminal in Store at this point.
     pub(crate) fn for_resumed_launch(
         handle: &IndexHandle,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         project_id: Uuid,
         session_id: Uuid,
         root: &Path,
@@ -239,7 +238,7 @@ fn variant(operation: &str, fields: Value, required: &[&str]) -> Value {
 /// project ID are captured at launch and never accepted in the JSON arguments.
 pub async fn execute_native_read(
     handle: IndexHandle,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     binding: NativeCodegraphBinding,
     kind: NativeCodegraphToolKind,

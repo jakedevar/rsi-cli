@@ -615,7 +615,7 @@ async fn input_asset_rpcs_are_operator_only_and_off_the_remote_gateway() {
 }
 
 /// `SetSkillEnabled` and `DeleteSkill` change only the daemon user's
-/// `~/.claude/skills`, with the TUI's rename and delete semantics, and refuse
+/// `~/.claude/skills` (a rename, and a move into the skill trash), and refuse
 /// a link, a non-directory entry, a path name and a scope field.
 #[cfg(unix)]
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -629,6 +629,8 @@ async fn skill_writes_toggle_and_delete_user_skills_only() {
     write_skill(&skills, "demo", "Demo.\n");
     std::os::unix::fs::symlink(outside.path().join("secret"), skills.join("away")).unwrap();
     fixture.server.skill_home = home.path().to_path_buf();
+    let data = tempfile::TempDir::new().unwrap();
+    fixture.server.skill_trash_dir = data.path().join("trash/skills");
     let canonical = skills.canonicalize().unwrap();
 
     let off = call_rpc(
@@ -719,15 +721,26 @@ async fn skill_writes_toggle_and_delete_user_skills_only() {
     .await
     .result
     .expect("delete");
+    let trash_path = std::path::PathBuf::from(deleted["trash_path"].as_str().unwrap());
     assert_eq!(
         deleted,
         serde_json::json!({
             "name": "demo",
             "enabled": true,
             "path": canonical.join("demo").to_string_lossy(),
+            "trash_path": trash_path.to_string_lossy(),
         })
     );
     assert_eq!(dir_names(&skills), vec!["away"]);
+    // local #91: the skill is recoverable from the daemon's skill trash.
+    assert_eq!(
+        trash_path.parent().unwrap().parent().unwrap(),
+        data.path().join("trash/skills")
+    );
+    assert_eq!(
+        std::fs::read_to_string(trash_path.join("SKILL.md")).unwrap(),
+        "Demo.\n"
+    );
     assert_eq!(
         std::fs::read_to_string(outside.path().join("secret/SKILL.md")).unwrap(),
         "kept\n"

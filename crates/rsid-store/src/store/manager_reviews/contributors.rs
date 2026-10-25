@@ -1016,6 +1016,36 @@ mod tests {
         assert!(!set.sessions.contains(&missing));
     }
 
+    /// #3640: a review whose allocation launch ended in the catch-all reads back
+    /// `Unsettled` with the launch's original error text (the action receipt's
+    /// `outcome_detail`), not a bare class.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn a_failed_review_launch_reads_back_with_its_original_error_text() {
+        let f = fixture();
+        let missing = Uuid::new_v4();
+        let (id, action) = prelaunch_assignment(&f, missing, "failed", "blocked", Some("blocked"));
+        assert_eq!(
+            f.store.topology_review_outcome(id).unwrap(),
+            TopologyReviewOutcome::Unsettled("manager_v2_lifecycle_unconfirmed".into()),
+            "no detail recorded: the bare class"
+        );
+        f.store
+            .conn
+            .execute(
+                "UPDATE harness_manager_v2_operations
+                    SET outcome_json=json_set(outcome_json,'$.outcome_detail',?2) WHERE id=?1",
+                params![action.to_string(), "provider refused the launch"],
+            )
+            .unwrap();
+        assert_eq!(
+            f.store.topology_review_outcome(id).unwrap(),
+            TopologyReviewOutcome::Unsettled(
+                "manager_v2_lifecycle_unconfirmed: provider refused the launch".into()
+            )
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
     #[test]
     fn a_persisted_terminal_reviewer_does_not_keep_its_family() {

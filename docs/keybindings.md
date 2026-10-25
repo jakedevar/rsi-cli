@@ -40,7 +40,7 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | --- | --- | --- |
 | `Ctrl-Alt-G` | any context | toggle contextual help without typing into the active editor |
 | `Ctrl-C` | embedded terminal open | send SIGINT to the embedded terminal's shell |
-| `Ctrl-C` | any context | quit rsi |
+| `Ctrl-C` | any context | does not quit; shows the hint naming the proper exit (:q or ZZ) |
 | `Ctrl-\` | any context | toggle the embedded terminal overlay (the shell keeps running) |
 | `Ctrl-O` | normal mode, no overlay, not inserting | jump back in the session jumplist |
 | `Ctrl-I` | normal mode, no overlay, not inserting | jump forward in the session jumplist |
@@ -141,6 +141,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `X` | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
+| `<Space>hu` | Clear provider usage hold | After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits. |
 | `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
@@ -162,6 +163,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>v` | Open graph review | Opens the visual workflow graph review editor. |
 | `gL` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
 | `gm` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `gd` | Open global dashboard | Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project. |
 | `<Space>q` | Close pane | Closes the focused pane. |
 | `>` | Next tab | Switches to the next tab. |
 | `<` | Previous tab | Switches to the previous tab. |
@@ -784,6 +786,10 @@ session list after restart).
 | Sync | `j` / `k` | Scroll the bounded status/manual-poll viewport |
 | Sync | `P` | Run one manual tracker poll, show every ephemeral error, then independently refresh Sync and Dispatched |
 | Form | `Tab` / `Shift-Tab` | Move between fields |
+| Form text field | `Esc` | Vim editing: leaves insert mode; from normal mode starts the discard confirmation (a second `Esc` discards). Every text field opens in insert mode at the end of its text |
+| Form text field, normal mode | `h j k l w b e 0 $ gg G x dd dw cw ciw u Ctrl-r p v` | Edit in place: motions, operators, undo and redo, paste, visual selection. The mode shows in the border |
+| Create/Edit form body | `Enter` | New line (insert mode); the other fields stay one line and wrap on screen |
+| Create/Edit form title | typing, paste | Stops at 200 characters (a counter shows from 150, a hint says input was refused or cut) |
 | Filter form | `Up` / `Down` | Choose saved view, readiness, or archive state; first Mine use captures a pane-local assignee |
 | Dependency form | `Up` / `Down` | Choose edge direction or a bounded candidate |
 | Status form | `Up` / `Down` | Choose the explicit lifecycle status, including reopen to Open |
@@ -880,7 +886,7 @@ its contrast.
 **Source Worktree Settlement:** open Settings with `<Space>,`, enter **Daemon
 Features**, select **⚠ Source worktree settlement**, and press `Enter`. In the
 overlay, `j`/`k` or `Down`/`Up` selects a daemon-discovered repository,
-`Enter` runs a zero-write audit, `A` opens empty authorization input for a fresh
+`Enter` restarts a zero-write audit, `n` audits the next custody page, and `A` opens empty authorization input for a fresh
 applyable audit, `r` refreshes the current durable receipt, `J`/`K` or
 `PageDown`/`PageUp` scrolls by eight lines, and `q`/`Esc` closes. While
 authorization input is active, character keys and `Backspace` edit the exact
@@ -960,6 +966,7 @@ arguments open that editor on Enter.
 | `:kill` | `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
 | `:pause soft` |  | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
+| `:provider-clear-hold` |  | Clear provider usage hold | After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits. |
 | `:continue [arg]` | `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `:archive` | `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
@@ -968,6 +975,7 @@ arguments open that editor on Enter.
 | `:manager-reseat [arg]` |  | Reseat failed manager | Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm. |
 | `:cold-restore` |  | Restore from cold storage | Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way. |
 | `:cold-archive [arg]` |  | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
+| `:external-reports [arg]` |  | External reports | `:external-reports` shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; `:external-reports sync` runs one import pass now with the hub's own gh login; `:external-reports filter` filters the focused Issues pane to the `external-report` label. Imported reports are untrusted P4 Issues until triage promotes them. |
 | `:archives` |  | Open archives | Switches the session list to the Archive zone. |
 | `:model [arg]` | `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `:sessions` | `:ls` | List sessions | Lists sessions in the session list. |
@@ -979,6 +987,7 @@ arguments open that editor on Enter.
 | `:project-new [arg]` |  | Create project | Creates a project: `:project-new <name> [path]`, or opens the form. |
 | `:project-edit [arg]` |  | Edit project | Edits the named or current project. |
 | `:project-delete <arg>` |  | Delete project | Deletes the named project; the name argument is required. |
+| `:intake <arg>` |  | Operator intake | Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager. |
 | `:set` | `:settings` | Open settings | Opens the settings pane. |
 | `:stopall` | `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `:hooks` |  | Open hook settings | Opens settings at the Claude hooks list. |
@@ -994,12 +1003,13 @@ arguments open that editor on Enter.
 | `:ask [arg]` |  | Ask a question | Opens the dialectic question overlay; `:ask <question>` asks directly. |
 | `:term` | `:terminal` `:shell` | Toggle terminal | Toggles the embedded terminal overlay (the shell keeps running when hidden). |
 | `:lead` | `:setlead` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
-| `:manager` |  | Open harness manager | Opens the harness manager overlay. |
+| `:manager` |  | Open harness manager | Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor. |
 | `:manager appoint` |  | Appoint harness manager | Appoints the selected session as the harness manager. |
 | `:manager scope` |  | Edit manager scope | Edits the harness manager's scope. |
 | `:manager clear` |  | Clear manager scope | Clears the harness manager's scope. |
 | `:fleet` |  | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `:global-manager` | `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `:dashboard` | `:gd` | Open global dashboard | Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project. |
 | `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
@@ -1074,6 +1084,13 @@ Appoint a Standard root manager with `:projects`, `:blank`, then `:manager appoi
 V2 policy is a separate opt-in. Observe, Execute, Full project control and Custom
 prepare a draft for one save. Saved and draft summaries retain explicit limits,
 including zero; Use suggested allowances edits only the named conflicting zeros.
+The screen opens with one summary block (mode, preset, session usage as a
+lifetime count, spend cap, allowed-model count, the saved line and, only while
+the draft differs, a Draft line naming each change). Presets are one line each
+saying what they change; grants are one `[x]` checklist with a meaning each;
+Provider limits show "none set" until expanded; allowed models are listed under
+their provider. Below 100 columns the checklist meaning moves to the detail line
+and long values wrap under their label.
 Advanced retains every field and exact legacy restriction. Empty allowed models
 means any valid choice, including future models. Catalog choices use exact IDs;
 default effort means no explicit effort. Distinct TUI-only custom endpoints are
@@ -1088,7 +1105,8 @@ editable. See [manager setup and bounds](harness-manager.md).
 | --- | --- |
 | `j` / `k`, arrows, Tab / Shift-Tab | Move between fields |
 | `g` / `G` | First / last field |
-| Enter / Space | Apply a preset, expand Preview/Advanced, apply named suggestions, or edit a field; launch rows open the catalog |
+| Enter / Space | Apply a preset, toggle a grant, expand Provider limits/Preview/Advanced, apply named suggestions, or edit a field; launch rows open the catalog |
+| `x` / Delete | Remove the focused allowed model from the draft |
 | Ctrl-U / Backspace while editing | Clear / delete text; blank removes optional limits or effort |
 | Enter / Esc while editing | Apply / cancel that scalar edit |
 | `s` | Save the complete policy with observed scope/policy versions |
@@ -1200,7 +1218,7 @@ New-session prompts (blank) flip to a settings side where the launch is adjusted
 | Policy | `h` / `l` (`Space` = forward) | `Observe`, `Execute` (default) or `Full project control` |
 | Grant | `Space` / `Enter` / `p` | Opens the grant page, the second page of the settings side: preset, mode, every capability, the creation and concurrency allowances, the spend ceiling and the manager's allowed launches. `p` also toggles it from any row; `Esc` returns to the launch rows |
 
-The appointment runs after the daemon accepts the launch, through one operator RPC, `ConfigureHarnessManagerWithPolicy` (#2237): the chosen scope and the policy are saved in one transaction, so a refused grant leaves no appointment behind. The policy is the preset applied to a fresh policy (the editor's suggested allowances included) unless the grant page was opened: then it is the grant as edited there. The grant page rows are the preset (`h` / `l` cycle Observe, Execute, Full project control and reset the rows below), the mode, one check box per capability, the `Containers`, `Sessions` and `Active` allowances (type digits or step with `h` / `l`), the `Spend` ceiling (`h` at the lowest value lifts it) and one check box per launch the manager may use for the sessions it creates. Every row is bounded the way the daemon bounds it, and a line under the rows says what the selected row does. Appointing replaces the project's current manager. A refused appointment is reported in a notification; the session is launched either way and can be appointed later with `:manager appoint`.
+The appointment runs after the daemon accepts the launch, through one operator RPC, `ConfigureHarnessManagerWithPolicy` (#2237): the chosen scope and the policy are saved in one transaction, so a refused grant leaves no appointment behind. The policy is the project's saved grant when it has one (#3270: a re-seat re-grants the operator's last launches and caps; the Grant row says "re-grants the saved grant" and the confirmation names it), else the preset applied to a fresh policy (the editor's suggested allowances included). Stepping the Policy row picks a preset on purpose and applies it instead. When the grant page was opened the policy is the grant as edited there; it starts from the saved grant, and a launch that the ancestor (global) grant does not cover is marked "not granted by global manager" (the effective launches are the project list intersected with every ancestor grant; add the entry with `:manager portfolio launch add`). The grant page rows are the preset (`h` / `l` cycle Observe, Execute, Full project control and reset the rows below), the mode, one check box per capability, the `Containers`, `Sessions` and `Active` allowances (type digits or step with `h` / `l`), the `Spend` ceiling (`h` at the lowest value lifts it) and one check box per launch the manager may use for the sessions it creates. Every row is bounded the way the daemon bounds it, and a line under the rows says what the selected row does. Appointing replaces the project's current manager. A refused appointment is reported in a notification; the session is launched either way and can be appointed later with `:manager appoint`.
 
 #### Insert Mode (default when opened)
 
@@ -1363,9 +1381,9 @@ The Prompt Creator's picker has a fixed catalog (no `Tab`); there `m` also close
 | `Tab` | Next Field | Cycle to next field (Name → Path → Color) |
 | `Shift+Tab` | Prev Field | Cycle to previous field |
 | `Enter` | Save | Save project and return to picker |
-| `Esc` | Cancel | Return to picker without saving |
-| Text keys | Type | Insert text in Name/Path fields |
-| `Backspace` | Delete Char | Remove last character from Name/Path |
+| `Esc` | Normal mode / Cancel | Leaves insert mode in Name/Path; from normal mode returns to picker without saving |
+| Text keys | Type | Insert text in Name/Path fields (they open in insert mode and wrap to the form width) |
+| `h j k l w b e 0 $ x dd cw ciw u Ctrl+r p v` | Vim editing | Edit Name/Path in place from normal mode |
 | `Left` / `Right` | Cycle Color | Cycle through color palette (Color field) |
 
 ### Card Editor Overlay (`:card` / `:card user`)
@@ -1634,11 +1652,11 @@ Keys of the settings pane (category rail and items).
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
 | `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `Delete` | Reset selected role | Resets the selected theme role to the active theme's default color. |
-| `h` | Return to categories | Returns focus from the settings items to the category rail. |
-| `Left` | Return to categories | Returns focus from the settings items to the category rail. |
-| `l` | Enter selected category | Moves focus from the category rail into the selected category's items. |
-| `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. |
-| `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
+| `h` | Return to categories | Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row. |
+| `Left` | Return to categories | Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row. |
+| `l` | Enter selected category | Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w. |
+| `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w. |
+| `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row. |
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
@@ -1897,7 +1915,7 @@ Recovery continuation confirmation is the explicit budget. `max_graphs` is requi
 
 The inspector is read-only and degraded until daemon preview/test/diff/report readbacks exist. It renders currently loaded artifact metadata, paginated artifact summary load-more/end/error states, validation details and issues, selected live-attempt artifact buckets, and explicit capability-disabled states. Bounded artifact preview unavailable, typed test detail unavailable, typed diff detail unavailable, and typed scheduler report inspector unavailable states do not call mutation, control, model, live execution, or background RPCs.
 
-There are no global recursive DAG keybindings yet; `gd`/`gD` are intentionally unused in this phase.
+There are no global recursive DAG keybindings yet; `gD` is intentionally unused in this phase (`gd` opens the global dashboard, #3317).
 
 ### Graph Review Overlay (`<Space>v` or `:graph`)
 
@@ -2003,6 +2021,27 @@ Open **Settings → Integrations → Satellites → Satellite registry**. The br
 | `r` | Refresh the registry and cached page |
 | `Esc` / `q` | Close the browser |
 
+### Host Tuning
+
+Open `:manager tune` to inspect this host's CPUs/quota, host RAM, disk free,
+load and CPU temperature. Unknown or unsupported probes are shown explicitly.
+The Resource Limits settings tab points to this panel.
+
+Use `b` to edit the operator reserve %, `d` for dedicated use, or `g` for
+live-session cap guidance. These preferences do not automatically change settings.
+`n` captures current resource settings under a new preset name (for example
+`day/shared` or `night/all-out`). Tab switches between preset and setting
+selection; j/k move; Enter edits a setting's draft value; m/M edit the
+operator's minimum/maximum for that key. Initial bounds equal captured values;
+widen them explicitly before saving different values.
+
+`w` saves the profile, bounds and preset drafts. `a` applies the selected saved
+preset, and `u` undoes the last switch. Actual values and apply classes remain
+visible; a partial failure keeps pending recovery and the original undo record.
+`r` refreshes and discards unsaved drafts; Esc/q close. Test threads remain a
+per-job option; worker CPU quotas affect new scopes, and the shared CPU slice
+requires Linux/systemd. No timer or automatic retuning runs.
+
 ### Legacy Scratch Adoption
 
 Open **Settings → Providers & Sandboxes → Sandbox Storage → Legacy scratch adoption**. Scratch reclaim deletes only directories that carry a creation record; worker TMPDIRs, `/var/tmp/rsi-*` and lander workspaces made before that rule have none and are kept. The list shows each such directory with the daemon's verdict (adoptable now, or why not). Adopting re-runs the full reclaim proof (no live holder, no symlink, an allowed scratch root, clean published git work) and records the directory. Adopting itself deletes nothing, but **scratch reclaim is enabled**: an adopted directory that is old enough and unheld is then deleted automatically. So adoption is two steps: the first key only opens a confirmation that lists every full path and the count; nothing is sent until you press `y`.
@@ -2085,6 +2124,29 @@ The same console renders any manager node (#1240). Enter on a Portfolio, Project
 | `b` | Open the Budget panel: `j`/`k` move, `+` raise one step, digits type a limit, Enter review then save, `r` reload, `b`/Esc back |
 | `T` | Open the manager tree |
 | `:` | Open the command palette (`:manager global appoint ...`, `:manager global revoke`, ...) |
+| `r` | Refresh the snapshot |
+| `Esc` / `q` | Close |
+
+### Global Dashboard (`gd`, `:dashboard`)
+
+`gd` (the `g` leader, then `d`) or `:dashboard` (also `:gd`) opens the RSI-wide dashboard: one full-screen view above every project, outside any project tab (#3317, slice C of #3314). It is a different feature from `gm`: `gm` is the manager seat console; `gd` is metrics plus a line to the top manager. `q` / `Esc` returns to where you were.
+
+The numbers come from one bounded operator-only read (`GetGlobalDashboard {window}`). The header reads `RSI / Dashboard`, the window (`1h`, `24h` or `7d`), the sort, the snapshot age and an `incomplete` marker when the daemon reports a capped read (the sums are then a lower bound). One row per project (the home project first, then by the chosen sort, then by name) and a pinned TOTAL row, with the columns: project, PM seat glyph, live agents (total), agents by role (`MGR` / `LEAD` / `WRK` / `REV`), top providers (`Claude 4 · Codex 2`), tokens in and out, cost, Issues open and in progress, Issues created and closed in the window, open operator requests, landings in the window, and QA (the age of the last full-library green, or a red count when `qa` Issues are open). Zero counts are dim. Narrow terminals drop the least important columns first. A detail band under the table shows the selected row's agents by provider and model (and effort), tokens and cost by provider and model, and the Issue flow.
+
+A side pane (`t` toggles it; shown by default when the terminal is at least 160 columns wide) renders the top-level manager seat's live conversation with the same renderer and input bar as the gm console. `i` types to it and Enter sends through the same path the gm console uses. When no top-level seat is live the pane says so, and `n` starts one through the gm console's appoint flow, hosted in the home project when there is one. The view refreshes on a bounded poll (at most every 10 seconds) and on `r`.
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `g` / `G` | Move the selection (TOTAL is the last row) |
+| `Enter` / `l` | Open the selected project's tab and session list |
+| `w` | Cycle the window: 1h, 24h, 7d |
+| `s` | Cycle the sort: agents, tokens, cost, Issues (the home project always leads) |
+| `t` | Show or hide the conversation pane |
+| `i` | Type to the top-level manager; Enter sends, Esc stops typing |
+| `n` | Start a top-level manager (the appoint flow) when none is live |
+| `Tab` | Focus the conversation: `j`/`k`, Ctrl-D/U scroll, `g`/`G` ends |
+| `gm` | Open the global manager workspace |
+| `:` | Open the command palette |
 | `r` | Refresh the snapshot |
 | `Esc` / `q` | Close |
 
@@ -2242,8 +2304,8 @@ Keys of the theme role editor.
 <!-- rsi:generated:begin overlay-project-picker -->
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter projects |
 | `Enter` | Select project |
 | `Ctrl-N` | New project |
@@ -2259,8 +2321,8 @@ Keys of the theme role editor.
 <!-- rsi:generated:begin overlay-label-picker -->
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter labels |
 | `Enter` | Assign label |
 | `Ctrl-N` | New label |
@@ -2276,8 +2338,8 @@ Keys of the theme role editor.
 <!-- rsi:generated:begin overlay-parent-picker -->
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter parents |
 | `Enter` | Set parent |
 | `Esc` | Close picker |
@@ -2455,6 +2517,7 @@ Keys of the theme role editor.
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
 | `Enter / Space` | Edit selected policy field |
+| `x / Delete` | Remove the focused allowed model (draft only) |
 | `s` | Save policy |
 | `r` | Reload policy |
 | `Esc / q` | Close manager |
@@ -2484,6 +2547,7 @@ Keys of the theme role editor.
 | `x` | Halt the selected seat session (soft stop) |
 | `X` | Halt the selected seat session now (press twice) |
 | `a` | Archive the selected earlier seat session |
+| `g e` | Edit global manager coverage and permissions; b views budget; y on Review saves |
 | `n` | Launch and appoint a manager (seat, launch, scope, grant) |
 | `b` | Budget panel: every cap of the global node and each PM as used / limit, binding cap marked |
 | `b: + / 0-9` | Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back |
@@ -2493,6 +2557,26 @@ Keys of the theme role editor.
 | `p` | Open the selected project's tab |
 | `T` | Open the manager tree |
 | `F` | Open the fleet workspace |
+| `r` | Refresh the snapshot |
+| `:` | Open the command palette |
+| `Esc / q` | Close (Esc leaves typing or the conversation first) |
+<!-- rsi:generated:end -->
+
+### Global Dashboard
+
+<!-- rsi:generated:begin overlay-global-dashboard -->
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move selection |
+| `g / G` | Jump to first / last |
+| `w` | Cycle the window: 1h, 24h, 7d |
+| `s` | Cycle the sort: agents, tokens, cost, Issues |
+| `Enter / l` | Open the selected project's tab and session list |
+| `t` | Show or hide the conversation pane |
+| `i` | Type to the top-level manager; Enter sends |
+| `n` | Start a top-level manager (the appoint flow) when none is live |
+| `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
+| `gm` | Open the global manager workspace |
 | `r` | Refresh the snapshot |
 | `:` | Open the command palette |
 | `Esc / q` | Close (Esc leaves typing or the conversation first) |
@@ -2578,6 +2662,7 @@ Keys of the theme role editor.
 | `j / k, Down / Up` | Move selection |
 | `J / K, PageDown / PageUp` | Page selection |
 | `Enter` | Audit selected worktree |
+| `n` | Audit next custody page |
 | `A` | Begin authorization |
 | `r` | Refresh receipt |
 | `Esc / q` | Close |
@@ -2699,9 +2784,10 @@ Keys of the theme role editor.
 | --- | --- |
 | `Tab / Shift-Tab` | Next / previous field |
 | `Type, Backspace` | Edit focused field |
+| `Esc, h j k l w b e 0 $, x dd cw ciw, u` | Vim editing in Name and Path: Esc leaves insert mode |
 | `Left / Right` | Cycle color (color field) |
 | `Enter` | Save project |
-| `Esc` | Cancel |
+| `Esc` | Cancel (from normal mode) |
 <!-- rsi:generated:end -->
 
 ### Label Form
@@ -2955,8 +3041,8 @@ Sessions on providers that cannot switch in place get the reason as a toast.
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Search memory |
-| `j / k, Down / Up` | Move selection |
-| `Esc / q` | Close |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Esc` | Close |
 <!-- rsi:generated:end -->
 
 ### AI Command
@@ -3168,6 +3254,7 @@ Screens without an overlay key catalog, and where their keys are documented.
 | Remote settings | The page owns its enable, device and project keys. | keybindings.md § Remote Settings |
 | Manager tree (:manager tree) | The tree owns its fold, paging, jump and in-tree action keys. | keybindings.md § Manager Tree |
 | Legacy scratch adoption | The browser owns its select, adopt and refresh keys. | keybindings.md § Legacy Scratch Adoption |
+| Host tuning (:manager tune) | The panel owns its profile, preset, bounds and apply/undo keys. | keybindings.md § Host Tuning |
 <!-- rsi:generated:end -->
 
 ### Surfaces Documented by Hand
@@ -3208,7 +3295,7 @@ When the `editing_mode` setting is `standard` (Settings > Editing Mode, or the f
 | `Shift` + any of the above | Extend the selection (with a draft; on an empty draft `Shift+Up` / `Shift+Down` still step transcript events) |
 | `Backspace` / `Delete`, `Ctrl+Backspace` / `Ctrl+Delete` | Delete a character / a word (or the selection) |
 | `Ctrl+A` | Select all (the AI command moves to `Ctrl+Alt+A`) |
-| `Ctrl+C` | Copy the selection; with no selection it keeps its global meaning (quit) |
+| `Ctrl+C` | Copy the selection; with no selection it only shows a hint (Ctrl-C never quits rsi; use `:q` or `ZZ`) |
 | `Ctrl+X` / `Ctrl+V` / `Ctrl+Z` | Cut / paste / undo (`Ctrl+Shift+Z` redo) |
 | `Enter` / `Shift+Enter` | Send / newline |
 | `Esc` | Clear the selection or dismiss suggestions; with neither, return to the session list (works on any terminal) |
@@ -3298,6 +3385,8 @@ Prefix any motion, operator, or editing command with a numeric count:
 | Example | Description |
 |---------|-------------|
 | `3w` | Move forward 3 words |
+| `2W` | Move forward 2 WORDs (runs of non-blank characters) |
+| `c2W` | Change through the end of 2 WORDs, preserving following whitespace |
 | `5j` | Move down 5 lines |
 | `2dd` | Delete 2 lines |
 | `3x` | Delete 3 characters |
@@ -3317,6 +3406,9 @@ Digits `1`-`9` start a count, `0` continues it (bare `0` is the line-start motio
 | `w` | Word Forward | Jump to start of next word |
 | `b` | Word Back | Jump to start of previous word |
 | `e` | Word End | Jump to end of current/next word |
+| `W` | WORD Forward | Jump to start of next whitespace-separated WORD |
+| `B` | WORD Back | Jump to start of current/previous WORD |
+| `E` | WORD End | Jump to end of current/next WORD |
 | `0` | Line Start | Jump to beginning of line |
 | `$` | Line End | Jump to end of line |
 | `^` | First Non-Blank | Jump to first non-whitespace character on line |
@@ -3325,6 +3417,8 @@ Digits `1`-`9` start a count, `0` continues it (bare `0` is the line-start motio
 | `{` | Paragraph Back | Jump to previous blank line |
 | `}` | Paragraph Forward | Jump to next blank line |
 | `%` | Match Bracket | Jump to matching `()`, `[]`, or `{}` |
+
+WORDs are runs of non-blank characters: `foo.bar` and `a-b` each form one WORD. `W`, `B`, and `E` accept counts and work in normal, operator-pending, and visual modes. For example, `dW` deletes a WORD and following blanks, `yE` yanks through a WORD's end, and `cW` on a non-blank changes through the current WORD's end while preserving following whitespace and the next line.
 
 ### Character Search (f/t/F/T)
 

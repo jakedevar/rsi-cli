@@ -193,7 +193,7 @@ async fn test_e2e_manager_seat_list_lineage_keys_and_host() -> E2eResult<()> {
     )?;
     fs::set_permissions(h.bin_dir.join("codex"), fs::Permissions::from_mode(0o755))?;
     h.phase = "manager-seats-daemon";
-    h.start_daemon()?;
+    h.start_daemon_with_fixture_scopes()?;
     let mut client = h.wait_for_daemon().await?;
     let project = client
         .create_project("Seat fixture project", Some(&repo), None, None)
@@ -310,7 +310,7 @@ async fn test_e2e_manager_seat_list_lineage_keys_and_host() -> E2eResult<()> {
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     let _ = client.interrupt_session(current).await;
     h.shutdown_daemon();
     if let Err(error) = outcome {

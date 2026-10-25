@@ -8,8 +8,9 @@
 //! of the daemon user (`RpcServer::skill_home`) and read one `SKILL.md`,
 //! read-only and contained in the root. `SetSkillEnabled` and `DeleteSkill`
 //! (#97) are the TUI's Settings > Skills `e` and `d` on the daemon user's
-//! skills: a rename to or from `<name>.disabled`, and removal of the skill
-//! directory tree. None is in
+//! skills: a rename to or from `<name>.disabled`, and a move of the skill
+//! directory into the recoverable trash `RpcServer::skill_trash_dir`
+//! (`~/.rsi/trash/skills`, local #91). None is in
 //! the attributed verb registry, so a tokened caller is default-denied
 //! (AGENTS.md rule 10), and the rsi-remote gateway never calls them. Wire
 //! types and the shared discovery are `rsi_common::input_assets`.
@@ -39,8 +40,7 @@ pub(crate) const SKILL_INVALID_REQUEST: &str = "skill_invalid_request";
 
 /// The default upload directory: `~/.rsi/paste/rsid` (the rsi home helper).
 pub(crate) fn default_paste_dir() -> std::path::PathBuf {
-    rsi_common::identity::data_path("paste", "paste")
-        .join(rsi_common::input_assets::PASTE_UPLOAD_SUBDIR)
+    crate::paste_retention::default_paste_dir()
 }
 
 /// Decode params by reference: an image request is tens of megabytes, so the
@@ -67,6 +67,8 @@ pub(crate) fn store_paste_image(
     dir: &Path,
     request: &UploadPasteImageRequestV1,
 ) -> Result<UploadPasteImageResponseV1> {
+    // #86: a retention pass never runs while an upload writes or reuses.
+    let _guard = crate::paste_retention::lock();
     store_paste_image_before_write(dir, request, || {})
 }
 
@@ -145,6 +147,7 @@ fn store_paste_image_before_write(
 }
 
 /// True when `path` is a regular file (not a link) holding exactly `bytes`.
+/// A reused file gets a fresh mtime, so its retention age (#86) restarts.
 fn already_stored(dir: &AssetDir, name: &Path, bytes: &[u8]) -> bool {
     use std::io::Read as _;
     let Ok(file) = dir.read_file(name) else {
@@ -157,9 +160,14 @@ fn already_stored(dir: &AssetDir, name: &Path, bytes: &[u8]) -> bool {
         return false;
     }
     let mut existing = Vec::new();
-    file.take(bytes.len() as u64 + 1)
+    let same = (&file)
+        .take(bytes.len() as u64 + 1)
         .read_to_end(&mut existing)
-        .is_ok_and(|_| existing == bytes)
+        .is_ok_and(|_| existing == bytes);
+    if same {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    same
 }
 
 fn create_upload_dir(dir: &Path) -> std::io::Result<AssetDir> {
@@ -242,6 +250,53 @@ mod tests {
             bytes
         );
     }
+
+    /// #86: re-uploading the same bytes restarts the image's retention age,
+    /// so a pass never removes an image a fresh message names.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_reused_upload_restarts_its_retention_age() {
+        let fixture = tempfile::TempDir::new().unwrap();
+        let upload = fixture.path().join("home/.rsi/paste/rsid");
+        let bytes = b"\x89PNG\r\n\x1a\nreused";
+        let request = UploadPasteImageRequestV1 {
+            mime: "image/png".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        let first = store_paste_image(&upload, &request).unwrap();
+        let path = upload.join(&first.name);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let again = store_paste_image(&upload, &request).unwrap();
+        assert!(again.reused);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            modified.elapsed().unwrap() < std::time::Duration::from_secs(3600),
+            "{modified:?}"
+        );
+        // Even a pass that would remove it, were it old, keeps it.
+        let references = crate::paste_retention::References {
+            scanned: std::collections::HashSet::from([first.name.clone()]),
+            ..Default::default()
+        };
+        let report = crate::paste_retention::prune_paste_dir(
+            &upload,
+            &references,
+            crate::paste_retention::RetentionPolicy {
+                abandoned_age: crate::paste_retention::PASTE_IMAGE_MAX_AGE,
+                referenced_age: None,
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(report.kept_young, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 }
 
 impl RpcServer {
@@ -254,6 +309,12 @@ impl RpcServer {
         let stored = tokio::task::spawn_blocking(move || store_paste_image(&dir, &params))
             .await
             .map_err(|e| DaemonError::Process(e.to_string()))??;
+        // #86: a bounded retention pass, at most hourly per directory.
+        crate::paste_retention::prune_after_upload(
+            self.session_manager.store(),
+            self.paste_dir.clone(),
+        )
+        .await;
         Ok(serde_json::to_value(stored)?)
     }
 
@@ -352,10 +413,12 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: DeleteSkillRequestV1 = decode(request, SKILL_INVALID_REQUEST)?;
         let scope = self.user_skill_scope();
-        let deleted = tokio::task::spawn_blocking(move || delete_skill(&scope, &params.name))
-            .await
-            .map_err(|e| DaemonError::Process(e.to_string()))?
-            .map_err(|e| refuse(e.code(), e))?;
+        let trash = self.skill_trash_dir.clone();
+        let deleted =
+            tokio::task::spawn_blocking(move || delete_skill(&scope, &params.name, &trash))
+                .await
+                .map_err(|e| DaemonError::Process(e.to_string()))?
+                .map_err(|e| refuse(e.code(), e))?;
         Ok(serde_json::to_value(deleted)?)
     }
 }

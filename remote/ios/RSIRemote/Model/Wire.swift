@@ -160,11 +160,20 @@ struct HistoryEvent: Decodable, Sendable, Hashable, Identifiable {
     let text: String
     let truncated: Bool
     let toolName: String?
+    /// The provider call id a ToolUse and its ToolResult share (hub #3797 and
+    /// the V1 `tool_pair_key`). Nil when the hub has none for the event (no id
+    /// stored, or one over 256 bytes) or predates it.
+    let toolPairKey: String?
+    /// `exact`, `ambiguous`, `oversized` or `missing`; kept as text so a new
+    /// state is carried, not rejected. Nil from a hub that predates it.
+    let pairingState: String?
 
     enum CodingKeys: String, CodingKey {
         case id, sequence, kind, role, text, truncated
         case createdAt = "created_at"
         case toolName = "tool_name"
+        case toolPairKey = "tool_pair_key"
+        case pairingState = "pairing_state"
     }
 
     enum Speaker: Sendable { case user, assistant, tool, system, thinking }

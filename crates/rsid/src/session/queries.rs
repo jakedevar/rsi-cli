@@ -159,7 +159,7 @@ pub(super) fn fresh_replacement_sandbox_binding(
 pub(super) async fn get_session_snapshot(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Option<Session> {
     if let Some(tracked) = active.read().await.get(&session_id) {
@@ -247,7 +247,7 @@ fn is_visible_in_session_list(session: &Session) -> bool {
 /// it's actually needed (a TUI poll, a resume, a rotation). `load_events` is
 /// index-backed (`idx_events_session_sequence`), so this is a cheap query.
 pub(super) async fn load_completed_events_from_store(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Result<Vec<ConversationEvent>> {
     let store = store.clone();
@@ -272,7 +272,7 @@ pub(super) async fn load_completed_events_from_store(
 /// unique and increasing. A store that cannot be read falls back to the memory
 /// copy, as before.
 pub(super) async fn next_transcript_sequence(
-    store: &tokio::sync::Mutex<crate::store::Store>,
+    store: &rsid_core::store_lock::Mutex<crate::store::Store>,
     session_id: Uuid,
     cached: &[ConversationEvent],
 ) -> i32 {
@@ -1108,6 +1108,7 @@ impl SessionManager {
         let store = self.store.clone();
         let archived = tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock();
+            store.verify_session_rotation_restore_gate(session_id)?;
             let session = store.get_session(session_id)?;
             if session.as_ref().is_some_and(|session| {
                 matches!(

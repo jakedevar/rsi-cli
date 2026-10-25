@@ -44,7 +44,7 @@ use crate::app::App;
 pub(crate) const CAP_CONFIRM_NOTICE: &str =
     "This lowers project caps: review the preview, y confirms, Esc cancels.";
 
-const USAGE: &str = "Use :manager global [appoint [--defaults] [project names...]|prefill [project names...]|add-project <names...>|revoke|set <field> <value> [confirm]|configure <JSON>].";
+const USAGE: &str = "Use :manager global [edit|appoint [--defaults] [project names...]|prefill [project names...]|add-project <names...>|revoke|set <field> <value> [confirm]|configure <JSON>].";
 const SET_USAGE: &str = "Use :manager global set <active|sessions|containers|spend|groups> <value> [confirm] (spend: USD or none; groups: on|off).";
 
 /// The caps of a grant's per-project policy the operator edits directly
@@ -505,6 +505,15 @@ fn set_cap_request(
 }
 
 pub(crate) async fn dispatch_global_command(app: &mut App, command: &str) {
+    if command.trim() == "edit" {
+        super::global_manager_workspace::open(app).await;
+        if let crate::types::OverlayState::GlobalManagerWorkspace(workspace) = &mut app.overlay {
+            workspace.selected = 0;
+        }
+        super::global_manager_workspace::open_coverage(app).await;
+        app.mark_dirty();
+        return;
+    }
     match run_global_command(app, command).await {
         Ok(message) => app.notify_success(message),
         Err(error) => app.notify_error(error),

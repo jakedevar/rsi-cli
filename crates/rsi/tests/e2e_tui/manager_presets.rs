@@ -188,12 +188,13 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
     )?;
     fs::set_permissions(h.bin_dir.join("codex"), fs::Permissions::from_mode(0o755))?;
     h.phase = "manager-presets-daemon";
-    h.start_daemon()?;
+    h.start_daemon_with_fixture_scopes()?;
     let mut client = h.wait_for_daemon().await?;
     let daemon_config = client.get_daemon_config().await?;
     for field in [
         "host_load_admission_threshold",
         "governor_min_free_disk_gb",
+        "sandbox_min_free_gib",
         "job_thermal_ceiling_c",
     ] {
         assert_eq!(daemon_config[field], 0, "fixture admission setting {field}");
@@ -320,7 +321,7 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
                 execute.policy.max_created_sessions,
                 execute.policy.max_recovery_attempts
             ),
-            (8, 32, 3)
+            (8, 256, 3)
         );
         assert_eq!(execute.policy.max_active_sessions, 4);
         assert_eq!(execute.policy.allowed_launches, vec![]);
@@ -364,7 +365,7 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
                 full.policy.max_created_sessions,
                 full.policy.max_recovery_attempts
             ),
-            (8, 32, 3)
+            (8, 256, 3)
         );
         fs::write(
             h.artifacts_dir.join("full-screen.txt"),
@@ -516,7 +517,8 @@ async fn run(h: &mut E2eHarness, fixture: &mut Value) -> E2eResult<()> {
         press(&term, Key::Char('q')).await?;
         command(&term, "manager policy").await?;
         visible(&term, "Saved: Custom").await?;
-        visible(&term, "Draft: Custom").await?;
+        // An unchanged draft shows no Draft line, only the saved line's note.
+        visible(&term, "draft unchanged").await?;
         visible(&term, "gpt-6-sol").await?;
         press(&term, Key::Char('s')).await?;
         visible(&term, &format!("policy {}", saved.row_version + 1)).await?;

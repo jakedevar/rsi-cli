@@ -109,7 +109,24 @@ impl Store {
         });
         let (open_qa_issues, open_qa_issues_total) =
             self.open_qa_issues(project, ROLLING_HEALTH_MAX_QA_ISSUES)?;
+        // Read the latest placement, including a satellite placement (which
+        // clears an earlier hub reason). The durable receipt needs no migration.
+        let qa_hub_fallback_reason = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_extract(e.detail_json, '$.ran_on') = 'hub' \
+                    THEN json_extract(e.detail_json, '$.reason') END \
+             FROM rolling_queue_events e \
+             JOIN rolling_queue_entries q ON q.id = e.entry_id \
+             WHERE e.kind = 'bounded_qa_requested' AND q.project_id = ?1 \
+             ORDER BY e.id DESC LIMIT 1",
+                [project.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
         Ok(RollingHealthV1 {
+            qa_hub_fallback_reason,
             qa_green,
             qa_green_age_secs,
             open_qa_issues,

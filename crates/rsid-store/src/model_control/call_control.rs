@@ -207,7 +207,7 @@ fn retain_settlement(
 }
 
 fn settle_one(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     job: AbandonedCallSettlement,
 ) -> std::result::Result<(), RetainedSettlement> {
@@ -246,7 +246,7 @@ fn abandon_if_expired(entry: &mut RetainedSettlement, max_age: Duration) {
 }
 
 fn retry_retained(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     state: &Arc<StdMutex<SettlementState>>,
     policy: &SettlementPolicy,
@@ -310,7 +310,7 @@ fn helper_sweepable(
 /// Settle orphaned or expired-and-inactive background-helper rows as typed
 /// failures. Failures here are logged and retried on the next sweep.
 fn sweep_stale_helper_invocations(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     policy: &SettlementPolicy,
     orphan_seen: &mut HashMap<uuid::Uuid, Instant>,
@@ -348,7 +348,7 @@ fn sweep_stale_helper_invocations(
 }
 
 fn settlement_worker_loop(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     state: Arc<StdMutex<SettlementState>>,
     rx: std_mpsc::Receiver<SettlementCommand>,
@@ -519,12 +519,15 @@ impl Drop for ModelCallSettlementHandle {
 }
 
 impl ModelCallSettlementWorker {
-    pub fn new(store: Arc<Mutex<Store>>, event_bus: Arc<EventBus>) -> Result<Self> {
+    pub fn new(
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+        event_bus: Arc<EventBus>,
+    ) -> Result<Self> {
         Self::with_policy(store, event_bus, SettlementPolicy::default())
     }
 
     pub(crate) fn with_policy(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: Arc<EventBus>,
         policy: SettlementPolicy,
     ) -> Result<Self> {
@@ -820,7 +823,7 @@ impl ModelCallSettlement {
 
     pub async fn settle_result<T>(
         mut self,
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<EventBus>,
         completion: InvocationCompletion,
         result: Result<T>,
@@ -906,7 +909,7 @@ impl ModelCallControl for NoopModelCallControl {
 }
 
 pub struct StoreBackedModelCallControl {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     settlements: ModelCallSettlementHandle,
     owner: InvocationOwner,
@@ -931,7 +934,7 @@ struct StoreBackedState {
 impl StoreBackedModelCallControl {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: Arc<EventBus>,
         settlements: ModelCallSettlementHandle,
         owner: InvocationOwner,
@@ -1206,7 +1209,7 @@ mod tests {
     use std::time::Duration;
 
     async fn root_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<EventBus>,
         session_id: uuid::Uuid,
     ) -> AdmissionPermit {
@@ -1221,7 +1224,7 @@ mod tests {
     }
 
     async fn purpose_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<EventBus>,
         session_id: uuid::Uuid,
         purpose: ModelInvocationPurpose,
@@ -1278,7 +1281,7 @@ mod tests {
     }
 
     fn control(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<EventBus>,
         settlements: ModelCallSettlementHandle,
         session_id: uuid::Uuid,
@@ -1319,7 +1322,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn dropped_settlement_identity_fails_the_row_exactly_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -1383,7 +1388,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transient_settlement_failure_retries_without_shutdown_and_releases_cohort_capacity() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (config, lead) = {
             let guard = store.lock().await;
             fixture(&guard, ManagerPolicyV2::default())
@@ -1479,7 +1486,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn background_helper_calls_do_not_hold_lead_cohort_capacity() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (config, lead) = {
             let guard = store.lock().await;
             fixture(
@@ -1554,7 +1563,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn permanently_failing_settlement_is_abandoned_with_a_typed_failure_and_frees_capacity() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (config, lead) = {
             let guard = store.lock().await;
             fixture(&guard, ManagerPolicyV2::default())
@@ -1646,7 +1657,9 @@ mod tests {
         // starved host: a full-library run on a CPU-capped laptop stalled
         // this test past the old 5 s. A state that never arrives still fails.
         const EVENTUALLY: Duration = Duration::from_secs(30);
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (config, lead) = {
             let guard = store.lock().await;
             fixture(&guard, ManagerPolicyV2::default())
@@ -1724,12 +1737,12 @@ mod tests {
         })
         .await
         .expect("capacity is released within the bound");
-        assert!(
-            !lock_unpoisoned(&worker.handle.inner.state)
-                .retained
-                .is_empty(),
-            "the row stays retained for reconciliation"
-        );
+        // The row stays retained for reconciliation: the loop above only exits once it
+        // observed `retained` non-empty while holding the Store guard. Reading it again here,
+        // guard released, would race the worker's retry pass, which takes the whole list out of
+        // the state while it retries (a starved host stretches that window to hundreds of
+        // milliseconds), so the check is made once, under the guard, where the worker cannot be
+        // mid-pass.
 
         {
             let guard = store.lock().await;
@@ -1776,7 +1789,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn orphaned_helper_rows_are_swept_but_live_and_lead_calls_are_not() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (_config, lead) = {
             let guard = store.lock().await;
             fixture(&guard, ManagerPolicyV2::default())
@@ -1868,7 +1883,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_healthy_helper_stream_is_not_swept_until_it_goes_inactive() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let (_config, lead) = {
             let guard = store.lock().await;
             fixture(&guard, ManagerPolicyV2::default())
@@ -1936,7 +1953,9 @@ mod tests {
             .build()
             .expect("runtime");
         let (store, invocation_id, control, worker) = runtime.block_on(async {
-            let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("store"),
+            ));
             let event_bus = Arc::new(EventBus::new(8));
             let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
                 .expect("settlement worker");
@@ -1978,7 +1997,9 @@ mod tests {
             .build()
             .expect("runtime");
         let (store, invocation_id, worker) = runtime.block_on(async {
-            let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("store"),
+            ));
             let event_bus = Arc::new(EventBus::new(8));
             let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
                 .expect("settlement worker");
@@ -2024,7 +2045,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn explicit_completion_wins_a_race_with_fallback_drop_settlement() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2076,7 +2099,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn settlement_drop_returns_while_store_mutex_is_contended_then_drains() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2121,7 +2146,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn controller_drop_returns_while_store_mutex_is_contended_then_drains() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2159,7 +2186,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn shutdown_waits_for_a_late_settlement_owner_before_returning_success() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = Arc::new(
             ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
@@ -2225,7 +2254,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn shutdown_reports_a_live_producer_instead_of_abandoning_its_row() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2278,7 +2309,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_reply_timeout_retries_boundedly_then_returns_cached_success() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2350,7 +2383,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_returns_the_cached_worker_error_after_join() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2399,7 +2434,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_fail_pending_hands_its_taken_permit_to_settlement_recovery() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2456,7 +2493,9 @@ mod tests {
     /// Settles one call through the real controller for `provider`/`model` and
     /// returns the `estimated_cost_usd` the row recorded (#584/#585).
     async fn settled_cost(provider: &str, model: &str, usage: ModelCallUsage) -> Option<f64> {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(8));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -2544,6 +2583,32 @@ mod tests {
         .await
         .expect("known price estimates");
         assert!((cost - 0.90).abs() < 1e-9, "cost was {cost}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn harness_claude_settlement_prices_plain_input_cache_writes_reads_and_output() {
+        let mut usage = token_usage(1_000, 500);
+        usage.cache_creation_tokens = Some(2_000);
+        usage.cache_read_tokens = Some(6_000);
+        // Sonnet 5 per MTok: $2 plain input, $2.50 writes, $0.20 reads,
+        // $10 output. Input excludes both caches: .002 + .005 + .0012 + .005.
+        let cost = settled_cost("Harness", "claude-sonnet-5", usage)
+            .await
+            .expect("documented Claude price is persisted");
+        assert!((cost - 0.0132).abs() < 1e-12, "cost was {cost}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn harness_unpriced_claude_settlement_keeps_cost_null_with_cache_usage() {
+        let mut usage = token_usage(1_000, 500);
+        usage.cache_creation_tokens = Some(2_000);
+        usage.cache_read_tokens = Some(6_000);
+        assert_eq!(
+            settled_cost("Harness", "claude-unpriced-test-3383", usage).await,
+            None
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

@@ -122,6 +122,10 @@ pub struct GrantEditor {
     /// A global grant must allow at least one launch.
     require_launches: bool,
     scope_mode: HarnessManagerScopeModeV1,
+    preset_origin: ManagerPolicyOrigin,
+    /// What the ancestor grants admit, when any ancestor restricts launches
+    /// (#3270). `None`: nothing above restricts, or it is not known yet.
+    ancestor_launches: Option<Vec<ManagerLaunchChoiceV2>>,
     pub selected: usize,
     /// Digits typed for the selected numeric row (Spend also holds a decimal
     /// prefix such as `0.`).
@@ -156,6 +160,8 @@ impl GrantEditor {
             launches_in_policy: false,
             require_launches: true,
             scope_mode: HarnessManagerScopeModeV1::Project,
+            ancestor_launches: None,
+            preset_origin: ManagerPolicyOrigin::New,
             selected: 0,
             typed: String::new(),
             error: None,
@@ -179,6 +185,8 @@ impl GrantEditor {
             launches_in_policy: true,
             require_launches: false,
             scope_mode,
+            ancestor_launches: None,
+            preset_origin: ManagerPolicyOrigin::New,
             selected: 0,
             typed: String::new(),
             error: None,
@@ -220,10 +228,68 @@ impl GrantEditor {
         &self.policy
     }
 
+    pub(crate) fn set_preset_origin(&mut self, origin: ManagerPolicyOrigin) {
+        self.preset_origin = origin;
+    }
+
+    pub(crate) fn policy_mut(&mut self) -> &mut ManagerPolicyV2 {
+        &mut self.policy
+    }
+
+    pub(crate) fn toggle_allowed_launch(&mut self, choice: ManagerLaunchChoiceV2) {
+        let index = self.catalog.iter().position(|entry| entry == &choice);
+        let index = index.unwrap_or_else(|| {
+            self.catalog.push(choice);
+            self.catalog.len() - 1
+        });
+        self.toggle_launch(index);
+    }
+
     /// The checked launches.
     #[must_use]
     pub fn launches(&self) -> &[ManagerLaunchChoiceV2] {
         &self.launches
+    }
+
+    /// Record the launches the live ancestor grants admit (`None`: no ancestor
+    /// restricts). A project manager's effective launches are its own list
+    /// intersected with every ancestor grant, so a checked launch outside this
+    /// set is refused at launch time (#3270).
+    pub fn set_ancestor_launches(&mut self, ancestor_launches: Option<Vec<ManagerLaunchChoiceV2>>) {
+        self.ancestor_launches = ancestor_launches;
+    }
+
+    /// Checked launches the ancestor grants do not cover.
+    #[must_use]
+    pub fn uncovered_launches(&self) -> Vec<&ManagerLaunchChoiceV2> {
+        let Some(ancestors) = self.ancestor_launches.as_deref() else {
+            return Vec::new();
+        };
+        if !self.launches_in_policy {
+            return Vec::new();
+        }
+        self.launches
+            .iter()
+            .filter(|launch| {
+                rsi_common::grant_narrowing::intersect_launches(
+                    std::slice::from_ref(*launch),
+                    ancestors,
+                )
+                .is_empty()
+            })
+            .collect()
+    }
+
+    /// Short marker after a launch row the ancestor grants do not cover.
+    #[must_use]
+    pub fn launch_hint(&self, row: GrantRow) -> Option<String> {
+        let GrantRow::Launch(index) = row else {
+            return None;
+        };
+        let choice = self.catalog.get(index)?;
+        self.uncovered_launches()
+            .contains(&choice)
+            .then(|| "✗ not granted by global manager".to_string())
     }
 
     /// Digits typed for the selected row but not yet a full value.
@@ -314,6 +380,10 @@ impl GrantEditor {
             GrantRow::Spend => {
                 "Spend ceiling in USD; h at the lowest value lifts the cap.".into()
             }
+            GrantRow::Launch(_) if self.launch_hint(row).is_some() => {
+                "Not granted by the global manager, so launches are refused until it covers this entry: add it with :manager portfolio launch add."
+                    .into()
+            }
             GrantRow::Launch(_) => {
                 if self.launches_in_policy {
                     "Launches this manager may use for the sessions it creates.".into()
@@ -345,6 +415,17 @@ impl GrantEditor {
             out.push(
                 "Mode Status only reports: set Execute for the capabilities to take effect.".into(),
             );
+        }
+        let uncovered = self.uncovered_launches();
+        if !uncovered.is_empty() {
+            out.push(format!(
+                "Not granted by the global manager (launches stay refused; add with :manager portfolio launch add): {}.",
+                uncovered
+                    .iter()
+                    .map(|launch| launch.display())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         out
     }
@@ -399,7 +480,7 @@ impl GrantEditor {
             &self.policy,
             preset,
             &ManagerPresetContext {
-                origin: ManagerPolicyOrigin::New,
+                origin: self.preset_origin,
                 touched: &touched,
                 scope_mode: self.scope_mode,
             },

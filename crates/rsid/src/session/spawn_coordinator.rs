@@ -486,7 +486,7 @@ impl SpawnCoordinator {
         directive: SpawnDirective,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> SpawnState {
         let request = AgentSpawnChildRequestV1 {
             kind: directive.kind,
@@ -521,7 +521,7 @@ impl SpawnCoordinator {
         request: AgentSpawnChildRequestV1,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> SpawnState {
         let directive = SpawnDirective {
             kind: request.kind,
@@ -547,7 +547,7 @@ impl SpawnCoordinator {
         &self,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> crate::error::Result<usize> {
         let requests = store.lock().await.list_incomplete_agent_spawn_requests()?;
         let mut requeued = 0usize;
@@ -602,7 +602,7 @@ impl SpawnCoordinator {
         request: AgentSpawnChildRequestV1,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         startup_requeue: bool,
     ) -> SpawnState {
         let request = match request.normalized() {
@@ -1348,6 +1348,9 @@ impl SpawnCoordinator {
             topology_iteration: bound_iteration,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
 
         let req = SpawnRequest {
@@ -1418,7 +1421,7 @@ impl SpawnCoordinator {
         &self,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         id: Uuid,
     ) -> Vec<String> {
         if let Some(tracked) = active.read().await.get(&id) {
@@ -1588,14 +1591,14 @@ mod tests {
         }
     }
 
-    fn open_store() -> (Arc<tokio::sync::Mutex<Store>>, TempDir) {
+    fn open_store() -> (Arc<rsid_core::store_lock::Mutex<Store>>, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("rsi.db");
         let store = Store::open_test_fixture(&path).expect("open store");
-        (Arc::new(tokio::sync::Mutex::new(store)), dir)
+        (Arc::new(rsid_core::store_lock::Mutex::new(store)), dir)
     }
 
-    async fn insert(store: &Arc<tokio::sync::Mutex<Store>>, s: &Session) {
+    async fn insert(store: &Arc<rsid_core::store_lock::Mutex<Store>>, s: &Session) {
         let g = store.lock().await;
         g.insert_session(s).expect("insert session");
     }
@@ -1629,7 +1632,7 @@ mod tests {
         emitter_id: Uuid,
         block_hash: u64,
         directive: SpawnDirective,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> SpawnState {
         let (active, completed) = empty_runtime();
         coord
@@ -1692,7 +1695,7 @@ mod tests {
     /// `model_invocations` schema; string spellings mirror the `parse_*`
     /// helpers in `store/model_control.rs`.
     async fn seed_root_invocation(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         model_tier: &str,
         effort: &str,
@@ -3142,7 +3145,7 @@ worker prompt body\n\
 
     /// Setup: epic + lead in store, epic has workflow_id = topology_id.
     async fn setup_topology_test(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         topology_id: Uuid,
         nodes: Vec<rsi_common::types::TopologyNode>,
         edges: Vec<rsi_common::types::TopologyEdge>,

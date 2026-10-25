@@ -348,6 +348,17 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "worker_build_reserve_gb".to_string(),
+                label: "Worker build reserve (GiB)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "4", "8", "12", "16", "32", "64"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
                 field: "worker_cpu_quota_percent".to_string(),
                 label: "Worker CPU quota".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -418,6 +429,17 @@ impl DaemonFeatureEntry {
                     .map(str::to_string)
                     .collect(),
                     current: 3,
+                },
+            },
+            Self {
+                field: "manager_max_turns_per_hour".to_string(),
+                label: "Manager wake-turn cap (per hour, 0 off)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "2", "3", "4", "6", "8", "12", "20", "30", "60"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
                 },
             },
             Self {
@@ -799,6 +821,33 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Bool(false),
             },
             Self {
+                field: "error_disposition_enabled".to_string(),
+                label: "Resolve errored sessions".to_string(),
+                value: DaemonFeatureValue::Bool(true),
+            },
+            Self {
+                field: "error_disposition_grace_minutes".to_string(),
+                label: "Error grace (minutes)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "5", "15", "30", "60", "240", "1440"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 2,
+                },
+            },
+            Self {
+                field: "error_disposition_continuation_budget".to_string(),
+                label: "Error continuations per day".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "1", "2", "3", "5", "10"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
                 field: "cold_archive_enabled".to_string(),
                 label: "Cold-storage archive".to_string(),
                 // The daemon's default since slice S5 (on); the daemon's own value
@@ -927,6 +976,18 @@ impl DaemonFeatureEntry {
                 },
             },
             Self {
+                field: "paste_retention_referenced_days".to_string(),
+                label: "Keep referenced pasted images (days)".to_string(),
+                // 0 keeps referenced images forever (the daemon's default).
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "7", "14", "30", "60", "90", "180", "365"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
                 field: "qa_target_max_gib".to_string(),
                 label: "QA target size cap (GiB)".to_string(),
                 value: DaemonFeatureValue::Cycle {
@@ -946,6 +1007,61 @@ impl DaemonFeatureEntry {
                         .map(str::to_string)
                         .collect(),
                     current: 3,
+                },
+            },
+            Self {
+                field: "claude_billing_mode".to_string(),
+                label: "Claude billing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_billing::BILLING_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "codex_billing_mode".to_string(),
+                label: "Codex billing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_billing::BILLING_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "codexappserver_billing_mode".to_string(),
+                label: "CodexAppServer billing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_billing::BILLING_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "pioneer_billing_mode".to_string(),
+                label: "Pioneer billing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_billing::BILLING_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    current: 0,
+                },
+            },
+            Self {
+                field: "antigravity_billing_mode".to_string(),
+                label: "Antigravity billing mode".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: rsi_common::provider_billing::BILLING_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    current: 0,
                 },
             },
             Self {
@@ -1023,6 +1139,17 @@ impl DaemonFeatureEntry {
                 label: "Health alert: CPU hot (C)".to_string(),
                 value: DaemonFeatureValue::Cycle {
                     options: ["0", "70", "75", "80", "85", "90", "95"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "health_provider_window_used_pct".to_string(),
+                label: "Health alert: provider window used (%)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["0", "50", "60", "70", "80", "90", "100"]
                         .into_iter()
                         .map(str::to_string)
                         .collect(),
@@ -1212,6 +1339,38 @@ impl DaemonFeatureEntry {
                 value: DaemonFeatureValue::Display(String::new()),
             },
             Self {
+                field: "bench.docker_hosts".to_string(),
+                label: "Benchmark docker hosts".to_string(),
+                // The daemon's allowlist as comma-separated text, "" while
+                // unset (every container exec target refused); Enter opens the
+                // text editor (#3176).
+                value: DaemonFeatureValue::Display(String::new()),
+            },
+            Self {
+                field: "bench.enabled".to_string(),
+                label: "Benchmark jobs enabled".to_string(),
+                // Off until the operator allows benchmark runs (#3181).
+                value: DaemonFeatureValue::Bool(false),
+            },
+            Self {
+                field: "bench.max_concurrency".to_string(),
+                label: "Benchmark concurrency".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["1", "2", "3", "4", "5", "6", "7", "8"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 3,
+                },
+            },
+            Self {
+                field: "bench.laptop_host".to_string(),
+                label: "Benchmark laptop host".to_string(),
+                // The ssh host as text, arch-laptop until set; Enter opens the
+                // text editor (#3181).
+                value: DaemonFeatureValue::Display("arch-laptop".to_string()),
+            },
+            Self {
                 field: "harness_context_editing".to_string(),
                 label: "Harness context editing".to_string(),
                 value: DaemonFeatureValue::Bool(true),
@@ -1301,6 +1460,31 @@ impl DaemonFeatureEntry {
                         .map(str::to_string)
                         .collect(),
                     current: 2,
+                },
+            },
+            Self {
+                field: "openrouter_spend_status".to_string(),
+                label: "OpenRouter spend ceiling".to_string(),
+                // The daemon's one-line state (#3154): cap, spent since
+                // arming, remainder and state.
+                value: DaemonFeatureValue::Display("?".to_string()),
+            },
+            Self {
+                field: "openrouter_spend_cap_usd".to_string(),
+                label: "OpenRouter spend cap (USD)".to_string(),
+                // The daemon's cap in USD, "0" = off; Enter opens the text
+                // editor, and saving a cap from off arms it (#3154).
+                value: DaemonFeatureValue::Display("0".to_string()),
+            },
+            Self {
+                field: "openrouter_spend_warn_pct".to_string(),
+                label: "OpenRouter spend warn line (%)".to_string(),
+                value: DaemonFeatureValue::Cycle {
+                    options: ["50", "60", "70", "75", "80", "85", "90", "95"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    current: 4,
                 },
             },
             Self {
@@ -1706,11 +1890,21 @@ impl DaemonFeatureEntry {
                             _ => String::new(),
                         };
                         let mut options = options.clone();
-                        if options.iter().all(|option| option.parse::<u64>().is_ok())
-                            && new_str.parse::<u64>().is_ok()
+                        // A numeric row (a leading `Default` allowed) shows a live
+                        // value no preset matches, e.g. a typed 190 (#3468).
+                        let is_number = |option: &str| option.parse::<f64>().is_ok();
+                        if new_str != "Default"
+                            && is_number(&new_str)
+                            && options
+                                .iter()
+                                .all(|option| option == "Default" || is_number(option))
+                            && !options.contains(&new_str)
                         {
+                            let key = |option: &String| {
+                                option.parse::<f64>().unwrap_or(f64::NEG_INFINITY)
+                            };
                             options.push(new_str.clone());
-                            options.sort_by_key(|option| option.parse::<u64>().unwrap_or(u64::MAX));
+                            options.sort_by(|a, b| key(a).total_cmp(&key(b)));
                             options.dedup();
                         }
                         let current = options.iter().position(|o| o == &new_str).unwrap_or(0);
@@ -4383,6 +4577,58 @@ mod tests {
         assert_eq!(options.last().map(String::as_str), Some("21600"));
     }
 
+    /// #3181: the three benchmark job rows start at the daemon defaults (off, 4,
+    /// arch-laptop) and follow the daemon's config JSON.
+    #[test]
+    fn bench_job_rows_start_at_the_daemon_defaults_and_follow_the_config() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let find = |features: &[DaemonFeatureEntry], field: &str| {
+            features
+                .iter()
+                .find(|feature| feature.field == field)
+                .unwrap_or_else(|| panic!("missing TUI setting {field}"))
+                .value
+                .clone()
+        };
+        assert!(matches!(
+            find(&features, "bench.enabled"),
+            DaemonFeatureValue::Bool(false)
+        ));
+        match find(&features, "bench.max_concurrency") {
+            DaemonFeatureValue::Cycle { options, current } => {
+                assert_eq!(options.get(current).map(String::as_str), Some("4"));
+                assert_eq!(options.last().map(String::as_str), Some("8"));
+            }
+            other => panic!("concurrency is a cycle, got {other:?}"),
+        }
+        assert!(matches!(
+            find(&features, "bench.laptop_host"),
+            DaemonFeatureValue::Display(host) if host == "arch-laptop"
+        ));
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({
+                "bench.enabled": true,
+                "bench.max_concurrency": 6,
+                "bench.laptop_host": "me@box.lan",
+            }),
+        );
+        assert!(matches!(
+            find(&features, "bench.enabled"),
+            DaemonFeatureValue::Bool(true)
+        ));
+        match find(&features, "bench.max_concurrency") {
+            DaemonFeatureValue::Cycle { options, current } => {
+                assert_eq!(options.get(current).map(String::as_str), Some("6"));
+            }
+            other => panic!("concurrency is a cycle, got {other:?}"),
+        }
+        assert!(matches!(
+            find(&features, "bench.laptop_host"),
+            DaemonFeatureValue::Display(host) if host == "me@box.lan"
+        ));
+    }
+
     #[test]
     fn harness_tool_policy_tui_defaults_match_daemon_defaults() {
         let features = DaemonFeatureEntry::defaults();
@@ -4562,6 +4808,101 @@ mod tests {
             DaemonFeatureEntry::display_value(&features, "cloud_spend_status"),
             Some("today $3.50 of $12 · total $33.15 of $90")
         );
+    }
+
+    /// #3468: a numeric row shows the daemon's live value even when no preset
+    /// matches it: a whole number, a decimal, and a value on a `Default` row.
+    #[test]
+    fn a_numeric_row_shows_a_live_value_no_preset_matches() {
+        let mut features = DaemonFeatureEntry::defaults();
+        let shown = |features: &[DaemonFeatureEntry], field: &str| {
+            let entry = features.iter().find(|entry| entry.field == field).unwrap();
+            let DaemonFeatureValue::Cycle { options, current } = &entry.value else {
+                panic!("{field} is a cycle");
+            };
+            (options.clone(), options[*current].clone())
+        };
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({
+                "cloud_spend_daily_cap_usd": 190,
+                "cloud_spend_stop_line_usd": 1330,
+                "stall_classifier_confidence_floor": 0.55,
+                "context_rotation_global_pct": 40,
+            }),
+        );
+        let (options, now) = shown(&features, "cloud_spend_daily_cap_usd");
+        assert_eq!(now, "190");
+        assert_eq!(options.last().map(String::as_str), Some("190"), "sorted in");
+        assert_eq!(shown(&features, "cloud_spend_stop_line_usd").1, "1330");
+        let (options, now) = shown(&features, "stall_classifier_confidence_floor");
+        assert_eq!(now, "0.55");
+        assert_eq!(options[..3], ["0.5", "0.55", "0.6"]);
+        assert_eq!(shown(&features, "context_rotation_global_pct").1, "40");
+        // A null on a `Default` row selects `Default` again.
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({ "context_rotation_global_pct": null }),
+        );
+        assert_eq!(shown(&features, "context_rotation_global_pct").1, "Default");
+    }
+
+    /// #3154: the OpenRouter spend ceiling row shows the cap, the amount spent
+    /// since arming, the remainder and the state the daemon reports, and its
+    /// cap and warn rows follow the daemon's values.
+    #[test]
+    fn openrouter_spend_rows_show_cap_spent_remainder_and_state() {
+        let mut features = DaemonFeatureEntry::defaults();
+        assert_eq!(
+            DaemonFeatureEntry::display_value(&features, "openrouter_spend_cap_usd"),
+            Some("0")
+        );
+        let warn = features
+            .iter()
+            .find(|feature| feature.field == "openrouter_spend_warn_pct")
+            .expect("warn line row");
+        let DaemonFeatureValue::Cycle { options, current } = &warn.value else {
+            panic!("the warn line is a cycle");
+        };
+        assert_eq!(options.get(*current).map(String::as_str), Some("80"));
+
+        let cap = rsi_common::openrouter_spend::OpenRouterSpendCapV1 {
+            cap_usd: 100.0,
+            baseline_usage: 514.968,
+            spent_usd: Some(82.5),
+            remaining_usd: Some(17.5),
+            warn_pct: 80,
+            state: rsi_common::openrouter_spend::SpendCapState::Warn,
+            stop_line_usd: Some(614.968),
+            launch_reserve_usd: 0.5,
+            armed_at: None,
+            probed_at: None,
+        };
+        DaemonFeatureEntry::update_from_json(
+            &mut features,
+            &serde_json::json!({
+                "openrouter_spend_cap_usd": 100,
+                "openrouter_spend_warn_pct": 90,
+                "openrouter_spend_status": rsi_common::openrouter_spend::summary_line(&cap),
+            }),
+        );
+        let status = DaemonFeatureEntry::display_value(&features, "openrouter_spend_status")
+            .expect("status row");
+        for part in ["warn", "$82.50", "$100.00", "$17.50"] {
+            assert!(status.contains(part), "{part} in {status}");
+        }
+        assert_eq!(
+            DaemonFeatureEntry::display_value(&features, "openrouter_spend_cap_usd"),
+            Some("100")
+        );
+        let warn = features
+            .iter()
+            .find(|feature| feature.field == "openrouter_spend_warn_pct")
+            .unwrap();
+        let DaemonFeatureValue::Cycle { options, current } = &warn.value else {
+            panic!("the warn line is a cycle");
+        };
+        assert_eq!(options.get(*current).map(String::as_str), Some("90"));
     }
 
     #[test]

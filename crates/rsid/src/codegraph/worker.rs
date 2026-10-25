@@ -155,6 +155,47 @@ pub fn project_db_path(index_root: &Path, project_id: uuid::Uuid) -> std::path::
         .join("codegraph.sqlite")
 }
 
+/// An index pass whose resident size grew by at least this much is logged at
+/// info with its corpus size, so the journal names the lane behind a start-up
+/// memory spike (#3491).
+const HEAVY_PASS_RSS_DELTA_BYTES: u64 = 64 * 1024 * 1024;
+
+fn log_pass_memory(
+    workspace: &RegisteredWorkspace,
+    files: usize,
+    source_bytes: usize,
+    rss_start: Option<u64>,
+    rss_after_update: Option<u64>,
+    cache_retained: bool,
+) {
+    let (Some(start), Some(after)) = (rss_start, rss_after_update) else {
+        return;
+    };
+    let grown = after.saturating_sub(start);
+    let workspace_id = workspace.workspace_id;
+    if grown >= HEAVY_PASS_RSS_DELTA_BYTES {
+        tracing::info!(
+            %workspace_id,
+            files,
+            source_bytes,
+            rss_start_mb = start >> 20,
+            rss_after_update_mb = after >> 20,
+            rss_peak_mb = crate::process_memory::peak_rss_bytes().map_or(0, |peak| peak >> 20),
+            cache_retained,
+            "Codegraph index pass grew resident memory"
+        );
+    } else {
+        tracing::debug!(
+            %workspace_id,
+            files,
+            source_bytes,
+            grown_mb = grown >> 20,
+            cache_retained,
+            "Codegraph index pass memory"
+        );
+    }
+}
+
 pub(super) fn extraction_manifest() -> StagedExtraction {
     let config_digest = blake3::hash(b"rsid-codegraph-discovery-policy-v1")
         .to_hex()
@@ -375,22 +416,27 @@ fn index_once_with_ceiling_and_gate(
     publish_status_hint(&store, workspace, events);
     let mut reused_files = 0usize;
     let mut extracted_files = 0usize;
+    let rss_start = crate::process_memory::rss_bytes();
+    let mut rss_after_update = None;
     let result = (|| -> Result<(RunOutcome, Vec<SourceVersion>)> {
-        let update = if let Some(metadata) = &cargo.workspace {
-            state.cache.update_with_cargo(discovery.files, metadata)?
-        } else {
-            state.cache.update(discovery.files)?
-        };
+        // A corpus over the cache's retention budget streams: its facts spill to
+        // an unlinked file beside the index and flow back one file at a time into
+        // staging, so the pass holds the resolver's inputs, not the corpus (#3491).
+        let mut update =
+            state
+                .cache
+                .update_pass(discovery.files, cargo.workspace.as_ref(), parent)?;
+        rss_after_update = crate::process_memory::rss_bytes();
         let owners = update
             .facts
-            .iter()
-            .map(|facts| {
-                let digest = blake3::hash(&facts.file.bytes).to_hex().to_string();
-                if state.cache_versions.get(&facts.file.relative_path) == Some(&digest) {
+            .source_digests()
+            .into_iter()
+            .map(|(relative_path, digest)| {
+                if state.cache_versions.get(&relative_path) == Some(&digest) {
                     reused_files += 1;
                 }
                 SourceVersion {
-                    relative_path: facts.file.relative_path.clone(),
+                    relative_path,
                     source_digest: digest,
                 }
             })
@@ -409,15 +455,16 @@ fn index_once_with_ceiling_and_gate(
                 return Err(IndexError::DiscoveryLimit("run deadline"));
             }
             let run = store.begin_staged(&scope, &manifest, &owners)?;
-            for facts in &update.facts {
+            update.facts.for_each(|facts| {
                 if revision.load(Ordering::Acquire) != observed_revision {
                     return Err(IndexError::Superseded);
                 }
                 store.stage_file(&run, facts)?;
-            }
+                Ok::<(), IndexError>(())
+            })?;
             // Filesystem notifications can be lost; the second exact-byte scan
             // prevents publishing a manifest that changed during extraction.
-            if discovery::discover(workspace)?.digest != discovery.digest {
+            if discovery::discover_digest(workspace)?.digest != discovery.digest {
                 return Err(IndexError::SourceChanged);
             }
             if !cargo.unchanged(&workspace.root)? {
@@ -477,6 +524,14 @@ fn index_once_with_ceiling_and_gate(
         }
     })()
     .map_err(|error| retention::typed_budget_failure(error, index_root, ceiling));
+    log_pass_memory(
+        workspace,
+        discovered_count,
+        discovery.bytes,
+        rss_start,
+        rss_after_update,
+        state.cache.retains_raw_facts(),
+    );
     let metrics = match &result {
         Ok((outcome, _)) => IndexRunMetrics {
             files_discovered: outcome.files_discovered,
@@ -1124,6 +1179,87 @@ mod tests {
             .unwrap();
         assert_eq!(status.phase, IndexLifecyclePhase::Ready);
         assert_eq!(status.metrics.overflow_count, 7);
+    }
+
+    /// #3491: a corpus over the extraction cache's retention budget is streamed
+    /// (its facts spill and flow back into staging one file at a time); it must
+    /// publish exactly the rows the in-memory pass publishes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn a_streamed_pass_publishes_the_same_rows_as_the_in_memory_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let memory_dir = tempfile::tempdir().unwrap();
+        let streamed_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "mod util;\nuse util::helper;\npub fn caller() { helper(); util::helper(); missing(); }\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("util.rs"), "pub fn helper() {}\n").unwrap();
+        std::fs::write(root.path().join("plan.md"), "# Plan\nsatisfies: [F-001]\n").unwrap();
+        std::fs::write(
+            root.path().join("findings.md"),
+            "# Findings\n## F-001 Evidence\n",
+        )
+        .unwrap();
+        let revision = AtomicU64::new(1);
+
+        // One workspace identity, two index roots: row ids derive from it.
+        let workspace = RegisteredWorkspace::primary(uuid::Uuid::new_v4(), root.path()).unwrap();
+        let memory_workspace = workspace.clone();
+        let memory_db = project_db_path(memory_dir.path(), memory_workspace.project_id);
+        let mut memory = WorkerState::default();
+        let in_memory =
+            index_once(&mut memory, &memory_workspace, &memory_db, &revision, 1).unwrap();
+        assert!(in_memory.published);
+
+        let streamed_workspace = workspace;
+        let streamed_db = project_db_path(streamed_dir.path(), streamed_workspace.project_id);
+        let mut streamed = WorkerState {
+            cache: ExtractionCache::with_retain_budget(0),
+            ..WorkerState::default()
+        };
+        let outcome = index_once(
+            &mut streamed,
+            &streamed_workspace,
+            &streamed_db,
+            &revision,
+            1,
+        )
+        .unwrap();
+        assert!(outcome.published);
+        assert_eq!(outcome.files_discovered, in_memory.files_discovered);
+        assert!(
+            !streamed.cache.retains_raw_facts(),
+            "a streamed pass keeps digests only"
+        );
+        assert_ready_facts_equal(&streamed_db, &outcome.ready, &memory_db, &in_memory.ready);
+
+        // The streamed state still recognises an unchanged tree and a change.
+        let unchanged = index_once(
+            &mut streamed,
+            &streamed_workspace,
+            &streamed_db,
+            &revision,
+            1,
+        )
+        .unwrap();
+        assert!(!unchanged.published);
+        std::fs::write(
+            root.path().join("util.rs"),
+            "pub fn helper() { }\npub fn more() {}\n",
+        )
+        .unwrap();
+        let changed = index_once(
+            &mut streamed,
+            &streamed_workspace,
+            &streamed_db,
+            &revision,
+            1,
+        )
+        .unwrap();
+        assert!(changed.published);
+        assert_eq!(changed.changed_paths, 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

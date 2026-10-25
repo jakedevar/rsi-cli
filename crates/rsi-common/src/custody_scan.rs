@@ -21,6 +21,12 @@
 //! straight-line `cd <absolute dir> && git checkout --detach <rev>` (#2573,
 //! #3037); the hook probes the directory and refuses when it is the sandbox.
 //!
+//! A discard of dirty paths is refused, except taking one side of a conflict:
+//! `git checkout --ours|--theirs -- <paths>` or `git restore --ours|--theirs
+//! [--] <paths>`, alone in its line, while a merge, cherry-pick or revert is in
+//! progress and every path is an unmerged index entry (#156). The refusal names
+//! that form when it fires mid-merge.
+//!
 //! The scan follows `bash -c '...'`, `eval` and the usual wrappers, refuses
 //! aliases rather than resolving them, and fails closed on a script nested
 //! deeper than [`MAX_DEPTH`]. It is a guard rail for cooperative agents, not a
@@ -57,7 +63,7 @@ pub struct Scan {
     pub crowded: bool,
     /// Subcommands that are not built-in git commands: each could be a
     /// configured alias (#2287).
-    pub alias_candidates: Vec<String>,
+    pub alias_candidates: Vec<AliasCandidate>,
     /// The line reassigns where git reads its configuration (`GIT_CONFIG_GLOBAL=`,
     /// `HOME=`, ...), so the alias probe, which runs without that assignment,
     /// cannot see the aliases the command would (#2319).
@@ -86,6 +92,21 @@ pub struct Scan {
     /// The line assigns `GIT_DIR=` or `GIT_WORK_TREE=` somewhere, so a `cd` or
     /// `-C` no longer decides which repository git works on.
     pub repository_env_set: bool,
+    /// The line changes external-command resolution, unseen by our probes.
+    pub exec_source_overridden: bool,
+}
+
+/// A subcommand that is not a built-in git command, with the literal absolute
+/// directory chain it is certain to run in (`cd /abs && git NAME`, `git -C /abs
+/// NAME`) when the line names one. With a chain the alias check probes that
+/// directory's configuration instead of refusing the relocation (#331).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasCandidate {
+    pub name: String,
+    pub directory: Option<Vec<String>>,
+    /// Only the documented object-only subtree split form is proven safe in
+    /// managed repositories; all other external commands need scratch custody.
+    pub read_only: bool,
 }
 
 /// A branch change or ancestry rewrite in the worktree `git -C <directory>`
@@ -202,6 +223,12 @@ pub enum Discard {
     Tracked {
         command: &'static str,
         pathspecs: Vec<String>,
+        /// `--ours`/`--theirs` when the command only takes one side of
+        /// conflicted files: no other option, no tree-ish, and every pathspec a
+        /// literal path. Allowed on dirty paths only while a merge, cherry-pick
+        /// or revert is in progress and every path is unmerged
+        /// ([`resolves_conflict_side`], #156).
+        side: Option<&'static str>,
     },
     /// `clean -f`: deletes untracked (and maybe ignored) files.
     Untracked {
@@ -275,6 +302,21 @@ pub fn scan_script(script: &str, depth: usize, alone: bool, scan: &mut Scan) {
             note_scratch_assignments(&args[skipped..], scan);
         }
         let prefix = &words[..words.len() - args.len() - 1];
+        // An env reset/unset can select a different git or external helper
+        // than a probe inheriting this process's environment.
+        if prefix.iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "--ignore-environment"
+                    | "GIT_EXEC_PATH"
+                    | "PATH"
+                    | "--unset=GIT_EXEC_PATH"
+                    | "--unset=PATH"
+            ) || (is_short_cluster(word) && word[1..].contains('i'))
+                || matches!(word.as_str(), "-uGIT_EXEC_PATH" | "-uPATH")
+        }) {
+            scan.exec_source_overridden = true;
+        }
         if wrapper_changes_directory(prefix) {
             scan.relocated = true;
         }
@@ -310,6 +352,9 @@ pub fn scan_script(script: &str, depth: usize, alone: bool, scan: &mut Scan) {
             program => {
                 // `git-stash` is the same program as `git stash`.
                 if let Some(subcommand) = program.strip_prefix("git-") {
+                    if !BUILTIN_SUBCOMMANDS.contains(&subcommand) {
+                        scan.refuse(alias_unverifiable(subcommand, "a direct git-NAME executable is resolved through PATH, not git's exec path"));
+                    }
                     let mut git_args = vec![subcommand.to_owned()];
                     git_args.extend_from_slice(args);
                     scan_git_pinned(&git_args, scan, command_pins(prefix));
@@ -433,6 +478,9 @@ pub fn scan_environment(words: &[String], scan: &mut Scan) {
             let name = name.strip_suffix('+').unwrap_or(name);
             if CONFIG_SOURCE_VARIABLES.contains(&name) {
                 scan.config_source_overridden = true;
+            }
+            if matches!(name, "GIT_EXEC_PATH" | "PATH") {
+                scan.exec_source_overridden = true;
             }
             let value = value.to_ascii_lowercase();
             let injects = if name == "GIT_CONFIG_PARAMETERS" {
@@ -560,6 +608,14 @@ pub fn scan_git_pinned(args: &[String], scan: &mut Scan, env: EnvPins) {
                 index += 2;
             }
             "--namespace" | "--super-prefix" => index += 2,
+            "--exec-path" => {
+                scan.exec_source_overridden = true;
+                index += 2;
+            }
+            _ if arg.starts_with("--exec-path=") => {
+                scan.exec_source_overridden = true;
+                index += 1;
+            }
             _ if arg.starts_with("--config-env=") => {
                 if names_alias(&arg["--config-env=".len()..]) {
                     scan.refuse(ALIAS_REFUSAL.to_owned());
@@ -605,7 +661,23 @@ pub fn scan_git_pinned(args: &[String], scan: &mut Scan, env: EnvPins) {
     // A built-in command cannot be shadowed by an alias, so only the rest can
     // hide one; `settle` checks them against the configured aliases.
     if !subcommand.is_empty() && !BUILTIN_SUBCOMMANDS.contains(&subcommand) {
-        scan.alias_candidates.push(subcommand.to_owned());
+        scan.alias_candidates.push(AliasCandidate {
+            name: subcommand.to_owned(),
+            // Branch-change probes retain relative chains for their existing
+            // policy; external admission requires every component absolute.
+            directory: scan
+                .invocation_directory
+                .clone()
+                .filter(|chain| chain.iter().all(|value| pins_repository(value))),
+            read_only: subcommand == "subtree"
+                && rest.len() == 3
+                && rest[0] == "split"
+                && rest[1]
+                    .strip_prefix("--prefix=")
+                    .is_some_and(|p| !p.is_empty())
+                && !rest[2].starts_with('-')
+                && !rest.iter().any(|arg| arg.contains(['$', '`'])),
+        });
     }
     // Preserve the actionable scratch-chain refusal before a newly guarded
     // rewrite queues a worktree probe. Only an explicit repository pin makes
@@ -787,7 +859,7 @@ fn note_directory_change(program: &str, args: &[String], scan: &mut Scan) {
 /// a variable or command substitution (`"$dir"`, `$(mktemp -d)`) may expand to
 /// nothing, so none of those pins anything.
 pub fn pins_repository(value: &str) -> bool {
-    value.starts_with('/') && !value.contains(['$', '`'])
+    Path::new(value).is_absolute() && !value.contains(['$', '`', '~'])
 }
 
 /// True when `git <subcommand> <rest>` changes a repository: commits, ref and
@@ -859,8 +931,15 @@ pub fn scan_checkout(rest: &[String], scan: &mut Scan) {
     };
     let mut force = false;
     let mut operands: Vec<&str> = Vec::new();
+    let mut side = None;
+    let mut other_option = false;
     for arg in before {
         let arg = arg.as_str();
+        match conflict_side_flag(arg) {
+            Some(flag) => side = side.map_or(Some(flag), |seen| (seen == flag).then_some(flag)),
+            None if !matches!(arg, "-q" | "--quiet") && arg.starts_with('-') => other_option = true,
+            None => {}
+        }
         if arg == "--force" {
             force = true;
         } else if arg == "--ignore-other-worktrees" {
@@ -894,22 +973,28 @@ pub fn scan_checkout(rest: &[String], scan: &mut Scan) {
         Some(paths) => scan.discards.push(Discard::Tracked {
             command: "git checkout",
             pathspecs: paths.to_vec(),
+            side: side.filter(|_| {
+                operands.is_empty() && !force && !other_option && all_literal_paths(paths)
+            }),
         }),
         None => match operands.as_slice() {
             // Bare `git checkout` only prints status; `-f` resets the tree.
             [] if force => scan.discards.push(Discard::Tracked {
                 command: "git checkout",
                 pathspecs: Vec::new(),
+                side: None,
             }),
             [] => {}
             [only] if matches!(*only, "." | "./" | ":/") => scan.discards.push(Discard::Tracked {
                 command: "git checkout",
                 pathspecs: vec![(*only).to_owned()],
+                side: None,
             }),
             [_] => scan.branch_change("checkout"),
             [_, paths @ ..] => scan.discards.push(Discard::Tracked {
                 command: "git checkout",
                 pathspecs: paths.iter().map(|path| (*path).to_owned()).collect(),
+                side: None,
             }),
         },
     }
@@ -918,9 +1003,20 @@ pub fn scan_checkout(rest: &[String], scan: &mut Scan) {
 pub fn scan_restore(rest: &[String], scan: &mut Scan) {
     let (mut staged, mut worktree) = (false, false);
     let mut pathspecs = Vec::new();
+    let mut side = None;
+    let mut other_option = false;
     let mut index = 0;
     while let Some(arg) = rest.get(index).map(String::as_str) {
         index += 1;
+        match conflict_side_flag(arg) {
+            Some(flag) => side = side.map_or(Some(flag), |seen| (seen == flag).then_some(flag)),
+            None if !matches!(arg, "--" | "-q" | "--quiet" | "-W" | "--worktree")
+                && arg.starts_with('-') =>
+            {
+                other_option = true;
+            }
+            None => {}
+        }
         match arg {
             "--" => {
                 pathspecs.extend(rest[index..].iter().cloned());
@@ -939,11 +1035,36 @@ pub fn scan_restore(rest: &[String], scan: &mut Scan) {
     }
     // `--staged` alone only unstages; any other form rewrites the worktree.
     if !(staged && !worktree) {
+        let side = side.filter(|_| !other_option && all_literal_paths(&pathspecs));
         scan.discards.push(Discard::Tracked {
             command: "git restore",
             pathspecs,
+            side,
         });
     }
+}
+
+/// `--ours`/`--theirs`: take one side of conflicted files.
+fn conflict_side_flag(arg: &str) -> Option<&'static str> {
+    match arg {
+        "--ours" => Some("--ours"),
+        "--theirs" => Some("--theirs"),
+        _ => None,
+    }
+}
+
+/// Every pathspec names one path literally: no `.`, directory form, glob or
+/// pathspec magic, so `git ls-files -u` can vouch for each of them (#156).
+fn all_literal_paths(pathspecs: &[String]) -> bool {
+    !pathspecs.is_empty()
+        && pathspecs.iter().all(|path| {
+            let path = path.strip_prefix("./").unwrap_or(path);
+            !path.is_empty()
+                && !matches!(path, "." | "..")
+                && !path.starts_with(':')
+                && !path.ends_with('/')
+                && !path.contains(['*', '?', '[', '\\'])
+        })
 }
 
 pub fn scan_clean(rest: &[String], scan: &mut Scan) {
@@ -1323,7 +1444,7 @@ command runs in this RSI-owned sandbox, where it can commit, move HEAD or change
 configuration (AGENTS.md hard rule 2). Create and check the directory first, then run \
 `git -C <absolute scratch dir> {subcommand} ...` (or set `GIT_DIR` and `GIT_WORK_TREE`) and \
 never `cd <dir> && git ...`. A variable or `$(...)` that may expand to nothing does not count as \
-a path, and neither does a relative one. In Python fixtures use `scripts/scratch_git.py`. Nothing \
+a path, and neither does a relative one. In Rust fixtures use `rsi_repo_guards::scratch_git`. Nothing \
 was run."
     )
 }
@@ -1333,11 +1454,16 @@ fn rewrites_ancestry(subcommand: &str) -> bool {
 }
 
 fn ancestry_rewrite(subcommand: &str) -> String {
+    let follow_up = if subcommand == "commit --amend" {
+        "For edits or formatting, commit a follow-up instead. "
+    } else {
+        ""
+    };
     format!(
         "rsi refused this command: `git {subcommand}` can drop the allocated custody source \
 from HEAD's ancestry and strand a verified worker. Preserve the sandbox's source ancestry: \
 merge origin/rolling, never rebase; the lander integrates rolling. Use `git revert` to undo \
-commits and `git reset -- <paths>` to unstage. Nothing was run."
+commits and `git reset -- <paths>` to unstage. {follow_up}Nothing was run."
     )
 }
 
@@ -1381,6 +1507,23 @@ is a git worktree, then retry.  Nothing was run.",
 }
 
 pub fn dirty(command: &str, paths: &[String]) -> String {
+    dirty_with_hint(command, paths, "")
+}
+
+/// [`dirty`] while a merge, cherry-pick or revert is in progress: it also
+/// names the conflict-side form the hook allows (#156).
+pub fn dirty_during_merge(command: &str, paths: &[String]) -> String {
+    dirty_with_hint(
+        command,
+        paths,
+        "A merge, cherry-pick or revert is in progress: to take one side of a conflicted \
+file, run `git checkout --theirs -- <path>` or `git restore --theirs -- <path>` (or `--ours`) \
+as the only command of its tool call, naming only literal paths `git ls-files -u` lists as \
+unmerged. ",
+    )
+}
+
+fn dirty_with_hint(command: &str, paths: &[String], hint: &str) -> String {
     let shown: Vec<&str> = paths
         .iter()
         .take(MAX_PATHS_SHOWN)
@@ -1396,7 +1539,7 @@ pub fn dirty(command: &str, paths: &[String]) -> String {
         "rsi refused this command: `{command}` would discard uncommitted work in {}{more}. \
 AGENTS.md hard rules 8 and 9: uncommitted sandbox work can be reclaimed and cannot be stashed \
 here. Commit it first (a WIP commit is fine) or save it with `scripts/rsi-stash save`, then \
-retry. Nothing was run.",
+retry. {hint}Nothing was run.",
         shown.join(", ")
     )
 }
@@ -1455,8 +1598,168 @@ pub fn paths_at_risk_from_status(discard: &Discard, stdout: &str) -> Vec<String>
         .collect()
 }
 
+/// Probe arguments printing where this worktree keeps `MERGE_HEAD`,
+/// `CHERRY_PICK_HEAD` and `REVERT_HEAD`, one path per line (#156).
+#[must_use]
+pub fn conflict_state_args() -> Vec<String> {
+    let mut args = vec!["rev-parse".to_owned()];
+    for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        args.push("--git-path".to_owned());
+        args.push(name.to_owned());
+    }
+    args
+}
+
+/// Whether a merge, cherry-pick or revert is in progress: one of the
+/// [`conflict_state_args`] paths exists. A relative path is relative to `cwd`.
+#[must_use]
+pub fn conflict_in_progress_from(stdout: &str, cwd: &Path) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .any(|line| cwd.join(line).is_file())
+}
+
+/// `git ls-files -u` arguments listing the unmerged index entries among the
+/// discard's pathspecs; `None` unless it is a conflict-side resolution.
+#[must_use]
+pub fn unmerged_args(discard: &Discard) -> Option<Vec<String>> {
+    match discard {
+        Discard::Tracked {
+            pathspecs,
+            side: Some(_),
+            ..
+        } => {
+            let mut args = ["ls-files", "-u", "--"].map(str::to_owned).to_vec();
+            args.extend(pathspecs.iter().cloned());
+            Some(args)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `discard` only takes one side of conflicted files (#156): it is a
+/// `checkout`/`restore --ours|--theirs` of literal paths, a merge, cherry-pick
+/// or revert is in progress, and every path it names is an unmerged index
+/// entry in `ls_files_u` (the [`unmerged_args`] output, paths relative to the
+/// working directory like the pathspecs). Anything else keeps the dirty-path
+/// refusal.
+#[must_use]
+pub fn resolves_conflict_side(discard: &Discard, in_progress: bool, ls_files_u: &str) -> bool {
+    let Discard::Tracked {
+        pathspecs,
+        side: Some(_),
+        ..
+    } = discard
+    else {
+        return false;
+    };
+    let unmerged: Vec<&str> = ls_files_u
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, path)| path))
+        .collect();
+    in_progress
+        && !pathspecs.is_empty()
+        && pathspecs.iter().all(|path| {
+            let path = path.strip_prefix("./").unwrap_or(path);
+            unmerged.contains(&path)
+        })
+}
+
 /// `git config --get-regexp` arguments listing every configured alias name.
 pub const ALIAS_PROBE_ARGS: [&str; 4] = ["config", "--name-only", "--get-regexp", "^alias\\."];
+
+/// [`ALIAS_PROBE_ARGS`] run in `directory` (a `-C` chain), or where the probe
+/// runs when `None`.
+#[must_use]
+pub fn alias_probe_args(directory: Option<&[String]>) -> Vec<String> {
+    let mut args = Vec::new();
+    for value in directory.unwrap_or_default() {
+        args.push("-C".to_owned());
+        args.push(value.clone());
+    }
+    args.extend(ALIAS_PROBE_ARGS.map(str::to_owned));
+    args
+}
+
+/// `git --exec-path` arguments: where git keeps the commands it ships.
+pub const EXEC_PATH_ARGS: [&str; 1] = ["--exec-path"];
+
+/// Whether git ships `git-<name>` in the exec path printed by
+/// [`EXEC_PATH_ARGS`] (`subtree` is such a script, not a built-in).
+#[must_use]
+pub fn ships_in_exec_path(stdout: &str, name: &str) -> bool {
+    let exec_path = stdout.trim();
+    if !Path::new(exec_path).is_absolute()
+        || name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    let executable = Path::new(exec_path).join(format!("git-{name}"));
+    #[cfg(windows)]
+    let executable = executable.with_extension("exe");
+    let Ok(metadata) = executable.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Refuse without probing when the alias check cannot read the configuration
+/// the candidates would run under: one of them runs somewhere the line does not
+/// name by a literal absolute directory after a relocation, or the line points
+/// git at other configuration.
+#[must_use]
+pub fn alias_precheck(scan: &Scan) -> Option<String> {
+    let first = scan.alias_candidates.first()?;
+    if scan.relocated
+        && scan
+            .alias_candidates
+            .iter()
+            .any(|candidate| candidate.directory.is_none())
+    {
+        return Some(alias_unverifiable(
+            &first.name,
+            "it changes directory or repository first (cd, env -C, git -C, --git-dir, --work-tree or GIT_DIR) to somewhere that is not a literal absolute directory",
+        ));
+    }
+    if scan.config_source_overridden {
+        return Some(alias_unverifiable(
+            &first.name,
+            "the line points git at other configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG, GIT_CONFIG_NOSYSTEM, GIT_COMMON_DIR, HOME or XDG_CONFIG_HOME), which the alias check does not see",
+        ));
+    }
+    if scan.exec_source_overridden {
+        return Some(alias_unverifiable(
+            &first.name,
+            "the line changes external command resolution (GIT_EXEC_PATH, PATH or --exec-path), so the exact executable cannot be checked",
+        ));
+    }
+    None
+}
+
+/// A candidate that runs in a named directory is allowed only as a command git
+/// ships (see [`ships_in_exec_path`]): the check reads that directory's
+/// configuration, but an arbitrary `git-NAME` found on `PATH` is not vetted.
+pub fn not_shipped(name: &str) -> String {
+    alias_unverifiable(
+        name,
+        "it runs in another directory and git does not ship a `git-NAME` command of that name in its exec path (`git --exec-path`)",
+    )
+}
 
 /// Lowercase alias names from [`ALIAS_PROBE_ARGS`] output.
 #[must_use]
@@ -1479,6 +1782,102 @@ pub fn worktree_identity_args(directory: &[String]) -> Vec<String> {
     }
     args.extend(["rev-parse", "--absolute-git-dir", "--show-toplevel"].map(str::to_owned));
     args
+}
+
+/// Repository identity for external admission, including the shared ref store.
+#[must_use]
+pub fn external_identity_args(directory: &[String]) -> Vec<String> {
+    let mut args = worktree_identity_args(directory);
+    args.extend(["--path-format=absolute", "--git-common-dir"].map(str::to_owned));
+    args
+}
+
+/// All worktrees sharing the candidate's refs, with unquoted paths on every OS.
+#[must_use]
+pub fn external_worktrees_args(directory: &[String]) -> Vec<String> {
+    let mut args = alias_probe_args(Some(directory));
+    args.truncate(directory.len() * 2);
+    args.extend(["worktree", "list", "--porcelain", "-z"].map(str::to_owned));
+    args
+}
+
+/// Refuse an unresolved or RSI-owned external-command target. Both provider
+/// guards use this verdict, resolving symlinks with portable filesystem APIs.
+#[must_use]
+pub fn external_repository_verdict(
+    candidate: &AliasCandidate,
+    target: Option<&str>,
+    own: Option<&str>,
+    worktrees: Option<&str>,
+    cwd: &Path,
+    sandbox_base: &Path,
+) -> Option<String> {
+    let refused = || {
+        alias_unverifiable(
+            &candidate.name,
+            "external commands require a resolved independent scratch repository outside RSI-owned trees (assigned sandbox, other sandboxes, shared checkout and their common-dir/worktree identities)",
+        )
+    };
+    if candidate.directory.is_none() || sandbox_base.as_os_str().is_empty() {
+        return Some(refused());
+    }
+    let identity = |text: &str| -> Option<Vec<std::path::PathBuf>> {
+        let paths: Option<Vec<_>> = text
+            .lines()
+            .map(|line| {
+                let path = Path::new(line);
+                path.is_absolute()
+                    .then(|| path.canonicalize().ok())
+                    .flatten()
+            })
+            .collect();
+        paths.filter(|paths| paths.len() == 3)
+    };
+    let Some(target) = target.and_then(identity) else {
+        return Some(refused());
+    };
+    let Some(own) = own.and_then(identity) else {
+        return Some(refused());
+    };
+    let Some(worktrees) = worktrees else {
+        return Some(refused());
+    };
+    let mut roots = vec![
+        cwd.to_path_buf(),
+        sandbox_base.to_path_buf(),
+        own[1].clone(),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("rsi"));
+    }
+    let mut canonical_roots = Vec::new();
+    for root in roots {
+        match root.canonicalize() {
+            Ok(root) => canonical_roots.push(root),
+            // A missing protected tree cannot contain the resolved candidate.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Some(refused()),
+        }
+    }
+    let roots = canonical_roots;
+    let protected = |path: &Path| roots.iter().any(|root| path.starts_with(root));
+    if target.iter().any(|path| protected(path)) || target[0] == own[0] || target[2] == own[2] {
+        return Some(refused());
+    }
+    let mut found = false;
+    for path in worktrees
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+    {
+        found = true;
+        let Ok(path) = Path::new(path).canonicalize() else {
+            return Some(refused());
+        };
+        if protected(&path) {
+            return Some(refused());
+        }
+    }
+    (!found).then(refused)
 }
 
 /// `(git dir, top level)` from [`worktree_identity_args`] output.
@@ -1608,42 +2007,76 @@ pub fn check_command_sync_in(command: &str, cwd: &Path, base: &Path) -> Option<S
         }
     }
     if let Some(first) = scan.alias_candidates.first() {
-        if scan.relocated {
-            return Some(alias_unverifiable(
-                first,
-                "it changes directory or repository first (cd, env -C, git -C, --git-dir, --work-tree or GIT_DIR)",
-            ));
+        if let Some(message) = alias_precheck(&scan) {
+            return Some(message);
         }
-        if scan.config_source_overridden {
-            return Some(alias_unverifiable(
-                first,
-                "the line points git at other configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG, GIT_CONFIG_NOSYSTEM, GIT_COMMON_DIR, HOME or XDG_CONFIG_HOME), which the alias check does not see",
-            ));
-        }
-        let args = ALIAS_PROBE_ARGS.map(str::to_owned);
-        match probe_git(&args, cwd) {
-            // Exit 1 is "no such key": no alias is defined.
-            Ok((Some(0 | 1), stdout)) => {
-                let aliases = alias_names_from(&stdout);
-                if let Some(name) = scan
-                    .alias_candidates
-                    .iter()
-                    .find(|name| aliases.contains(&name.to_ascii_lowercase()))
-                {
-                    return Some(alias_in_use(name));
+        let mut probed: Vec<Option<&Vec<String>>> = Vec::new();
+        let mut exec_path: Option<Option<String>> = None;
+        for candidate in &scan.alias_candidates {
+            if !probed.contains(&candidate.directory.as_ref()) {
+                probed.push(candidate.directory.as_ref());
+                let args = alias_probe_args(candidate.directory.as_deref());
+                match probe_git(&args, cwd) {
+                    // Exit 1 is "no such key": no alias is defined.
+                    Ok((Some(0 | 1), stdout)) => {
+                        let aliases = alias_names_from(&stdout);
+                        if let Some(name) = scan
+                            .alias_candidates
+                            .iter()
+                            .filter(|other| other.directory == candidate.directory)
+                            .map(|other| &other.name)
+                            .find(|name| aliases.contains(&name.to_ascii_lowercase()))
+                        {
+                            return Some(alias_in_use(name));
+                        }
+                    }
+                    Ok((code, _)) => {
+                        return Some(alias_unverifiable(
+                            &first.name,
+                            &format!("`git config` exited with {}", code.unwrap_or(-1)),
+                        ));
+                    }
+                    Err(error) => {
+                        return Some(alias_unverifiable(
+                            &first.name,
+                            &format!("`git config` failed: {error}"),
+                        ));
+                    }
                 }
             }
-            Ok((code, _)) => {
-                return Some(alias_unverifiable(
-                    first,
-                    &format!("`git config` exited with {}", code.unwrap_or(-1)),
-                ));
+            if !candidate.read_only {
+                let success = |args: Vec<String>| {
+                    probe_git(&args, cwd)
+                        .ok()
+                        .filter(|(code, _)| *code == Some(0))
+                        .map(|(_, stdout)| stdout)
+                };
+                let directory = candidate.directory.as_deref().unwrap_or_default();
+                let target = success(external_identity_args(directory));
+                let own = success(external_identity_args(&[]));
+                let worktrees = success(external_worktrees_args(directory));
+                if let Some(message) = external_repository_verdict(
+                    candidate,
+                    target.as_deref(),
+                    own.as_deref(),
+                    worktrees.as_deref(),
+                    cwd,
+                    base,
+                ) {
+                    return Some(message);
+                }
             }
-            Err(error) => {
-                return Some(alias_unverifiable(
-                    first,
-                    &format!("`git config` failed: {error}"),
-                ));
+            let exec_path = exec_path.get_or_insert_with(|| {
+                probe_git(&EXEC_PATH_ARGS.map(str::to_owned), cwd)
+                    .ok()
+                    .filter(|(code, _)| *code == Some(0))
+                    .map(|(_, stdout)| stdout)
+            });
+            if !exec_path
+                .as_deref()
+                .is_some_and(|path| ships_in_exec_path(path, &candidate.name))
+            {
+                return Some(not_shipped(&candidate.name));
             }
         }
     }
@@ -1665,7 +2098,24 @@ pub fn check_command_sync_in(command: &str, cwd: &Path, base: &Path) -> Option<S
             Ok((Some(0), stdout)) => {
                 let paths = paths_at_risk_from_status(discard, &stdout);
                 if !paths.is_empty() {
-                    return Some(dirty(discard.command(), &paths));
+                    let in_progress = matches!(discard, Discard::Tracked { .. })
+                        && probe_git(&conflict_state_args(), cwd).is_ok_and(|(code, stdout)| {
+                            code == Some(0) && conflict_in_progress_from(&stdout, cwd)
+                        });
+                    if !in_progress {
+                        return Some(dirty(discard.command(), &paths));
+                    }
+                    let unmerged = unmerged_args(discard).and_then(|args| {
+                        probe_git(&args, cwd)
+                            .ok()
+                            .filter(|(code, _)| *code == Some(0))
+                            .map(|(_, stdout)| stdout)
+                    });
+                    if !unmerged
+                        .is_some_and(|stdout| resolves_conflict_side(discard, true, &stdout))
+                    {
+                        return Some(dirty_during_merge(discard.command(), &paths));
+                    }
                 }
             }
             Ok((code, _)) => {
@@ -1840,21 +2290,15 @@ mod scratch_cd_tests {
 mod other_worktree_tests {
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    macro_rules! rsi_common_manifest_dir {
+        () => {
+            crate::manifest_dir!()
+        };
     }
+    mod fixtures {
+        include!("custody_scan_fixtures.rs");
+    }
+    use fixtures::{ExternalFixture, git, scratch_tempdir};
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -1866,7 +2310,7 @@ mod other_worktree_tests {
     /// A repository with a sandbox worktree on a branch and a detached deploy
     /// worktree beside it.
     fn fixture() -> Fixture {
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = scratch_tempdir();
         let base = root.path().canonicalize().expect("canonical");
         let main = base.join("main");
         std::fs::create_dir(&main).unwrap();
@@ -1956,6 +2400,12 @@ mod other_worktree_tests {
                     refusal.contains("merge origin/rolling, never rebase"),
                     "{script}: {refusal}"
                 );
+                if command.contains("--amend") {
+                    assert!(
+                        refusal.contains("commit a follow-up instead"),
+                        "{script}: {refusal}"
+                    );
+                }
             }
         }
         for command in [
@@ -2137,6 +2587,227 @@ mod other_worktree_tests {
         }
     }
 
+    /// A `git clone --no-local` of the sandbox beside it, the way a brief's
+    /// "clone to /tmp" scratch repository is made (#331).
+    fn scratch_clone(fixture: &Fixture, name: &str) -> std::path::PathBuf {
+        let scratch = fixture.sandbox.parent().unwrap().join(name);
+        git(
+            fixture.sandbox.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                "--no-local",
+                fixture.sandbox.to_str().unwrap(),
+                scratch.to_str().unwrap(),
+            ],
+        );
+        scratch
+    }
+
+    fn ships_subtree() -> bool {
+        let scratch = scratch_tempdir();
+        ships_in_exec_path(&git(scratch.path(), &["--exec-path"]), "subtree")
+    }
+
+    #[test]
+    fn external_commands_require_independent_scratch_and_exact_dispatch() {
+        let fixture = ExternalFixture::new();
+        for (label, command, reason) in &fixture.refused {
+            let message =
+                check_command_sync_in(command, &fixture.sandbox, &fixture.base).expect(label);
+            assert!(message.contains(reason.as_str()), "{label}: {message}");
+        }
+        if fixture.shipped_subtree() {
+            for command in fixture.allowed() {
+                assert_eq!(
+                    check_command_sync_in(&command, &fixture.sandbox, &fixture.base),
+                    None,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn external_commands_canonicalize_symlinked_parents() {
+        let fixture = ExternalFixture::new();
+        let scratch_parent = fixture.symlink(fixture.root.path(), "scratch-parent");
+        let managed_parent = fixture.symlink(&fixture.base, "managed-parent");
+        let refused = format!(
+            "git -C {}/assigned subtree split --prefix=d -b escaped HEAD",
+            managed_parent.display()
+        );
+        let message = check_command_sync_in(&refused, &fixture.sandbox, &fixture.base)
+            .expect("managed symlink");
+        assert!(
+            message.contains("independent scratch repository"),
+            "{message}"
+        );
+        if fixture.shipped_subtree() {
+            let allowed = format!(
+                "git -C {}/scratch subtree split --prefix=d -b desktop-only HEAD",
+                scratch_parent.display()
+            );
+            assert_eq!(
+                check_command_sync_in(&allowed, &fixture.sandbox, &fixture.base),
+                None
+            );
+        }
+    }
+
+    /// #331: a scratch clone outside every sandbox is not this sandbox.
+    #[test]
+    fn checkout_in_a_scratch_clone_outside_the_sandbox_is_allowed() {
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "scratch");
+        let scratch = scratch.to_str().unwrap();
+        let sha = &fixture.sha;
+        for command in [
+            format!("cd {scratch} && git checkout --detach {sha}"),
+            format!("cd {scratch} && git checkout -q -b other {sha}"),
+            format!("cd {scratch} && git switch --detach {sha}"),
+            format!("git -C {scratch} checkout --detach {sha}"),
+            format!("git -C {scratch} switch -c other {sha}"),
+        ] {
+            assert_eq!(verdict(&command, &fixture.sandbox), None, "{command}");
+        }
+    }
+
+    /// #331: `git subtree` ships in git's exec path and is no alias.
+    #[test]
+    fn a_shipped_external_subcommand_in_a_scratch_clone_is_allowed() {
+        if !ships_subtree() {
+            return;
+        }
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "scratch");
+        let scratch = scratch.to_str().unwrap();
+        let sha = &fixture.sha;
+        for command in [
+            format!("cd {scratch} && git subtree split --prefix=desktop -b desktop-only {sha}"),
+            format!("git -C {scratch} subtree split --prefix=desktop {sha}"),
+            format!("cd {scratch}; git subtree split --prefix=desktop {sha}"),
+        ] {
+            assert_eq!(verdict(&command, &fixture.sandbox), None, "{command}");
+        }
+        // From the sandbox itself nothing changes: no relocation, no alias.
+        assert_eq!(
+            verdict(
+                &format!("git subtree split --prefix=desktop {sha}"),
+                &fixture.sandbox
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_external_subcommand_stays_refused_when_it_cannot_be_vetted() {
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "scratch");
+        let scratch = scratch.to_str().unwrap();
+        // Not shipped by git: only an alias check passes, never a `PATH` script.
+        let message = verdict(
+            &format!("cd {scratch} && git nosuchcommand x"),
+            &fixture.sandbox,
+        )
+        .expect("an unshipped command is refused");
+        assert!(message.contains("exec path"), "{message}");
+        let message = verdict(
+            &format!("git -C {scratch} nosuchcommand x"),
+            &fixture.sandbox,
+        )
+        .expect("an unshipped command is refused");
+        assert!(message.contains("exec path"), "{message}");
+        // The relocation is not a literal absolute directory.
+        for command in [
+            "cd scratch && git subtree split --prefix=d HEAD".to_owned(),
+            "cd \"$SCRATCH\" && git subtree split --prefix=d HEAD".to_owned(),
+            format!("cd {scratch} && cd .. && git subtree split --prefix=d HEAD"),
+            format!("git -C {scratch} -C sub subtree split --prefix=d HEAD"),
+            format!("cd {scratch} && env -C . git subtree split --prefix=d HEAD"),
+            format!("cd {scratch} && GIT_DIR=.git git subtree split --prefix=d HEAD"),
+            format!("git -C {scratch} --git-dir=.git subtree split --prefix=d HEAD"),
+            format!("cd {scratch} || true; git subtree split --prefix=d HEAD"),
+            format!("cd {scratch} && HOME=/x git subtree split --prefix=d HEAD"),
+        ] {
+            let message =
+                verdict(&command, &fixture.sandbox).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                message.contains("may be a git alias"),
+                "{command}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alias_in_the_scratch_clone_is_still_refused() {
+        if !ships_subtree() {
+            return;
+        }
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "aliased");
+        git(&scratch, &["config", "alias.subtree", "!true"]);
+        let scratch = scratch.to_str().unwrap();
+        for command in [
+            format!("cd {scratch} && git subtree split --prefix=d HEAD"),
+            format!("git -C {scratch} subtree split --prefix=d HEAD"),
+        ] {
+            let message = verdict(&command, &fixture.sandbox).expect(&command);
+            assert!(
+                message.contains("git alias from your git configuration"),
+                "{command}: {message}"
+            );
+        }
+    }
+
+    /// #331: the scratch clone exemption covers custody of the branch, not the
+    /// force, reset and stash rules.
+    #[test]
+    fn a_scratch_clone_keeps_the_force_reset_and_stash_refusals() {
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "scratch");
+        let scratch = scratch.to_str().unwrap();
+        for command in [
+            format!("cd {scratch} && git stash"),
+            format!("git -C {scratch} stash push -u"),
+            format!("cd {scratch} && git push --force origin HEAD"),
+            format!("git -C {scratch} push origin +HEAD:main"),
+            format!("cd {scratch} && git reset --hard HEAD"),
+            format!("git -C {scratch} branch -D main"),
+            format!("cd {scratch} && git -c alias.x=stash x"),
+        ] {
+            let message = verdict(&command, &fixture.sandbox).expect(&command);
+            assert!(
+                message.contains("AGENTS.md hard rule"),
+                "{command}: {message}"
+            );
+        }
+        // The sandbox itself and its other worktrees keep every refusal.
+        let sandbox = fixture.sandbox.to_str().unwrap();
+        for command in [
+            format!("cd {sandbox} && git checkout --detach HEAD"),
+            format!("git -C {sandbox} switch main"),
+            format!("cd {sandbox} && git reset --hard HEAD"),
+            format!("git -C {sandbox} stash"),
+        ] {
+            let message = verdict(&command, &fixture.sandbox).expect(&command);
+            assert!(message.contains("hard rule"), "{command}: {message}");
+        }
+    }
+
+    /// A clone under the sandbox base is another agent's sandbox.
+    #[test]
+    fn a_scratch_clone_under_the_sandbox_base_is_still_refused() {
+        let fixture = fixture();
+        let scratch = scratch_clone(&fixture, "scratch");
+        let base = fixture.sandbox.parent().unwrap();
+        let scratch = scratch.to_str().unwrap();
+        let command = format!("cd {scratch} && git checkout --detach {}", fixture.sha);
+        let message = check_command_sync_in(&command, &fixture.sandbox, base)
+            .expect("a worktree under the base is refused");
+        assert!(message.contains("hard rule 2"), "{message}");
+    }
+
     #[test]
     fn straight_lines_are_all_and_then_or_all_sequenced() {
         for script in [
@@ -2179,5 +2850,233 @@ mod other_worktree_tests {
             branch_change_verdict(&pending, Ok(target), Some(own), Path::new("/elsewhere")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod conflict_side_tests {
+    use super::*;
+
+    fn git_status(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@test.invalid"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run git")
+            .success()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        assert!(git_status(dir, args), "git {args:?}");
+    }
+
+    fn verdict(command: &str, cwd: &Path) -> Option<String> {
+        check_command_sync_in(command, cwd, Path::new("/nonexistent-sandbox-base"))
+    }
+
+    /// A repository on `main` with `a.txt` changed on both `main` and `other`,
+    /// and `b.txt` committed beside it.
+    fn diverged() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "gc.auto", "0"]);
+        std::fs::write(dir.join("a.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "two\n").unwrap();
+        git(dir, &["add", "a.txt", "b.txt"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        git(dir, &["branch", "other"]);
+        std::fs::write(dir.join("a.txt"), "ours\n").unwrap();
+        git(dir, &["commit", "-q", "-am", "ours"]);
+        git(dir, &["checkout", "-q", "other"]);
+        std::fs::write(dir.join("a.txt"), "theirs\n").unwrap();
+        git(dir, &["commit", "-q", "-am", "theirs"]);
+        git(dir, &["checkout", "-q", "main"]);
+        root
+    }
+
+    /// `diverged` mid-merge of `other`: `a.txt` is unmerged, and `b.txt` then
+    /// holds real uncommitted work.
+    fn mid_merge() -> tempfile::TempDir {
+        let root = diverged();
+        let dir = root.path();
+        assert!(
+            !git_status(dir, &["merge", "-q", "other"]),
+            "merge must conflict"
+        );
+        std::fs::write(dir.join("b.txt"), "real work\n").unwrap();
+        root
+    }
+
+    const RESOLUTIONS: [&str; 6] = [
+        "git checkout --theirs -- a.txt",
+        "git checkout --ours -- a.txt",
+        "git checkout --theirs -- ./a.txt",
+        "git restore --theirs a.txt",
+        "git restore --ours -- a.txt",
+        "git restore --worktree --theirs -- a.txt",
+    ];
+
+    /// #156: taking one side of an unmerged path mid-merge is the normal
+    /// resolution step, not a discard of uncommitted work.
+    #[test]
+    fn taking_a_side_of_an_unmerged_path_mid_merge_is_allowed() {
+        let repo = mid_merge();
+        for command in RESOLUTIONS {
+            assert_eq!(verdict(command, repo.path()), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn taking_a_side_mid_cherry_pick_is_allowed() {
+        let repo = diverged();
+        let dir = repo.path();
+        assert!(!git_status(dir, &["cherry-pick", "other"]), "must conflict");
+        for command in RESOLUTIONS {
+            assert_eq!(verdict(command, dir), None, "{command}");
+        }
+    }
+
+    /// Every other discard of a dirty path mid-merge keeps the refusal, which
+    /// now names the allowed resolution form.
+    #[test]
+    fn other_discards_mid_merge_are_refused_naming_the_resolution_form() {
+        let repo = mid_merge();
+        for (command, program, paths) in [
+            // A bare checkout or restore with no side.
+            ("git checkout -- a.txt", "git checkout", vec!["a.txt"]),
+            ("git restore a.txt", "git restore", vec!["a.txt"]),
+            // A path with real work that is not unmerged.
+            (
+                "git checkout --theirs -- b.txt",
+                "git checkout",
+                vec!["b.txt"],
+            ),
+            ("git restore --ours b.txt", "git restore", vec!["b.txt"]),
+            (
+                "git checkout --theirs -- a.txt b.txt",
+                "git checkout",
+                vec!["a.txt", "b.txt"],
+            ),
+            // `.` and globs are not literal paths.
+            (
+                "git checkout --theirs -- .",
+                "git checkout",
+                vec!["a.txt", "b.txt"],
+            ),
+            (
+                "git checkout --theirs -- '*.txt'",
+                "git checkout",
+                vec!["a.txt", "b.txt"],
+            ),
+            (
+                "git restore --theirs '*.txt'",
+                "git restore",
+                vec!["a.txt", "b.txt"],
+            ),
+            // Any other option or a tree-ish is not a side resolution.
+            (
+                "git checkout -f --theirs -- a.txt",
+                "git checkout",
+                vec!["a.txt"],
+            ),
+            (
+                "git checkout --theirs HEAD -- a.txt",
+                "git checkout",
+                vec!["a.txt"],
+            ),
+            (
+                "git restore --theirs --source HEAD a.txt",
+                "git restore",
+                vec!["a.txt"],
+            ),
+            (
+                "git checkout --ours --theirs -- a.txt",
+                "git checkout",
+                vec!["a.txt"],
+            ),
+        ] {
+            let paths: Vec<String> = paths.into_iter().map(str::to_owned).collect();
+            assert_eq!(
+                verdict(command, repo.path()),
+                Some(dirty_during_merge(program, &paths)),
+                "{command}"
+            );
+        }
+        let hint = dirty_during_merge("git checkout", &["a.txt".to_owned()]);
+        assert!(hint.contains("`git checkout --theirs -- <path>`"), "{hint}");
+        assert!(hint.contains("`git ls-files -u`"), "{hint}");
+    }
+
+    #[test]
+    fn a_side_resolution_after_a_directory_change_is_refused_as_unverifiable() {
+        let repo = mid_merge();
+        let dir = repo.path().display();
+        for command in [
+            "cd . && git checkout --theirs -- a.txt".to_owned(),
+            "pushd . && git restore --theirs a.txt".to_owned(),
+            format!("git -C {dir} checkout --theirs -- a.txt"),
+            format!("git -C {dir} restore --theirs a.txt"),
+        ] {
+            let refusal = verdict(&command, repo.path()).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                refusal.contains("rsi cannot check that nothing would be lost"),
+                "{command}: {refusal}"
+            );
+        }
+    }
+
+    /// With no merge in progress a side checkout of a dirty path discards real
+    /// work: the plain refusal stands.
+    #[test]
+    fn a_side_resolution_with_no_merge_in_progress_is_refused() {
+        let repo = diverged();
+        let dir = repo.path();
+        std::fs::write(dir.join("a.txt"), "real work\n").unwrap();
+        let paths = vec!["a.txt".to_owned()];
+        for (command, program) in [
+            ("git checkout --theirs -- a.txt", "git checkout"),
+            ("git restore --theirs a.txt", "git restore"),
+        ] {
+            assert_eq!(
+                verdict(command, dir),
+                Some(dirty(program, &paths)),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_pure_side_form_over_literal_paths_carries_a_side() {
+        let side = |command: &str| {
+            let mut scan = Scan::default();
+            scan_script(command, 0, true, &mut scan);
+            match scan.discards.first() {
+                Some(Discard::Tracked { side, .. }) => *side,
+                _ => None,
+            }
+        };
+        assert_eq!(side("git checkout --theirs -- a.txt"), Some("--theirs"));
+        assert_eq!(side("git checkout -q --ours -- a b"), Some("--ours"));
+        assert_eq!(side("git restore --theirs a.txt"), Some("--theirs"));
+        for command in [
+            "git checkout -- a.txt",
+            "git checkout --theirs -- .",
+            "git checkout --theirs -- src/",
+            "git checkout --theirs -- ':/a.txt'",
+            "git checkout --theirs -- 'a?.txt'",
+            "git checkout --theirs -p -- a.txt",
+            "git checkout --theirs main -- a.txt",
+            "git restore --theirs",
+            "git restore --theirs --pathspec-from-file list",
+            "git restore --theirs -s HEAD a.txt",
+        ] {
+            assert_eq!(side(command), None, "{command}");
+        }
     }
 }

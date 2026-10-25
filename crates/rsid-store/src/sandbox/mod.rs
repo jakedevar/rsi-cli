@@ -199,6 +199,54 @@ impl SandboxAllocator {
         Self { base_dir }
     }
 
+    /// Resolve the symlinked ancestors of the configured base, once, at
+    /// startup (#143). The configured base comes from `RSI_SANDBOX_BASE` or
+    /// `$HOME`, and either may sit under a symlink (macOS `/tmp` ->
+    /// `/private/tmp`, `/var` -> `/private/var`). [`AllocationPermit::acquire`]
+    /// still refuses any non-canonical base it is handed; this only lets the
+    /// daemon hand it the real directory. Resolving once fixes the identity: a
+    /// later swap of an ancestor symlink does not move the base, and the
+    /// permit's dev/inode binding still refuses a replaced directory.
+    ///
+    /// Only the parent is resolved and the final component is kept as
+    /// configured (#3303). A base that is itself a symlink therefore stays
+    /// non-canonical and `acquire` keeps refusing it, rather than silently
+    /// adopting its (possibly foreign) target. A base whose parent cannot be
+    /// resolved yet is kept as configured, so allocation reports its own error.
+    #[must_use]
+    pub fn with_canonical_base(self) -> Self {
+        let Some(name) = self.base_dir.file_name() else {
+            return self;
+        };
+        if std::fs::symlink_metadata(&self.base_dir)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return self;
+        }
+        let parent = match self.base_dir.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+            Some(parent) => parent,
+            None => return self,
+        };
+        match std::fs::canonicalize(parent) {
+            Ok(canonical_parent) => {
+                let canonical = canonical_parent.join(name);
+                if canonical == self.base_dir {
+                    return self;
+                }
+                tracing::info!(
+                    configured = %self.base_dir.display(),
+                    canonical = %canonical.display(),
+                    "Resolved the configured sandbox base to its canonical path"
+                );
+                Self {
+                    base_dir: canonical,
+                }
+            }
+            Err(_) => self,
+        }
+    }
+
     /// Base directory for all sandboxes. Callers generally do not need this;
     /// exposed for diagnostics and the orphan sweep.
     pub fn base_dir(&self) -> &Path {

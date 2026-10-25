@@ -2745,11 +2745,13 @@ fn local_settings_row_for(
         | SettingsSection::Scheduling
         | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
+        | SettingsSection::ProviderBilling
         | SettingsSection::ProviderIsolation
         | SettingsSection::ProviderSubagents
         | SettingsSection::ProviderSkills
         | SettingsSection::ApiRoutes
         | SettingsSection::HarnessTools
+        | SettingsSection::Benchmarks
         | SettingsSection::ResourceLimits
         | SettingsSection::BuildGovernor
         | SettingsSection::MergeQueue
@@ -3440,6 +3442,7 @@ mod tests {
             effective_tokens: Some(103_360),
             effective_pct: Some(40.0),
             binding_limit: Some("coordinator_context_cap_tokens".into()),
+            turn_budget: None,
         };
         let seats = vec![CoordinatorSeatBudgetV1 {
             session_id: uuid::Uuid::new_v4(),
@@ -3494,11 +3497,13 @@ mod tests {
             SettingsSection::Scheduling,
             SettingsSection::RecursiveDag,
             SettingsSection::CodeIntelligence,
+            SettingsSection::ProviderBilling,
             SettingsSection::ProviderIsolation,
             SettingsSection::ProviderSubagents,
             SettingsSection::ProviderSkills,
             SettingsSection::ApiRoutes,
             SettingsSection::HarnessTools,
+            SettingsSection::Benchmarks,
             SettingsSection::ResourceLimits,
             SettingsSection::BuildGovernor,
             SettingsSection::MergeQueue,

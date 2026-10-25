@@ -348,6 +348,7 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                         path: path_str,
                         color_index,
                         editing_id: Some(project.id),
+                        text: Default::default(),
                     };
                 }
                 None => {
@@ -355,6 +356,18 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                 }
             }
         }
+
+        LcAction::LaunchIntake(request) => match app.current_project_id {
+            Some(project_id) => {
+                match app.client.launch_intake_session(project_id, &request).await {
+                    Ok(_) => app.notify_success(
+                        "Intake agent is filing your request; it mails the manager only for a P1.",
+                    ),
+                    Err(e) => app.notify_error(format!("Intake failed: {}", e)),
+                }
+            }
+            None => app.notify("Select a project first: the intake agent files into it."),
+        },
 
         LcAction::DeleteProjectByName(name) => {
             let name_lower = name.to_lowercase();

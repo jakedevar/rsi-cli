@@ -4,8 +4,11 @@
 import { el, toast } from './dom.js';
 import { type ColorChoice, filterByName } from './listmodel.js';
 import { movePick } from './registry.js';
-import { pickerLeader } from './overlay-keys.js';
+import { formChord, pickerLeader } from './overlay-keys.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
+import { setKeyTable } from './keytable.js';
+import { lineField } from './form-field.js';
 
 export interface PickItem {
   id: string;
@@ -30,6 +33,8 @@ export interface PickButton {
 
 export interface PickerOpts {
   title: string;
+  /** The key table the ? help lists for this picker, when its title is not that table's name (for example "Sort Picker"). */
+  keyTable?: string;
   hint: string;
   items: readonly PickItem[];
   filterable?: boolean;
@@ -45,24 +50,25 @@ export function runLeader(what: 'launch' | 'palette'): void {
   void import('./commands.js').then((m) => m.dispatch(what, { source: 'key' }));
 }
 
-function dialog(cls: string, label: string): HTMLDialogElement {
+function dialog(cls: string, label: string, keyTable?: string): HTMLDialogElement {
   const dlg = el('dialog', `pick ${cls}`);
   dlg.setAttribute('aria-label', label);
+  setKeyTable(dlg, keyTable);
   dlg.addEventListener('close', () => dlg.remove());
   document.body.append(dlg);
   return dlg;
 }
 
 export function openPicker(o: PickerOpts): HTMLDialogElement {
-  const dlg = dialog('pick-list-dialog', o.title);
+  const dlg = dialog('pick-list-dialog', o.title, o.keyTable);
   const input = el('input');
   input.type = 'text';
   input.placeholder = 'Type to filter…';
+  input.setAttribute('aria-label', `Filter the list: ${o.title}`);
   input.autocomplete = 'off';
   input.spellcheck = false;
   input.hidden = !o.filterable;
   const list = el('ul', 'pick-list');
-  list.setAttribute('role', 'listbox');
   const keys = o.buttons?.filter((b) => b.ctrl).map((b) => `Ctrl-${b.ctrl!.toUpperCase()} ${b.text.toLowerCase()}`) ?? [];
   const hint = el('div', 'pick-hint', [o.hint, ...keys].join(' · '));
   const foot = el('div', 'pick-actions');
@@ -74,6 +80,7 @@ export function openPicker(o: PickerOpts): HTMLDialogElement {
   const render = (): void => {
     if (shown.length === 0) {
       list.replaceChildren(el('li', 'pick-empty', o.emptyText ?? 'Nothing matches'));
+      syncListbox(list, o.filterable ? input : list, { label: o.title });
       return;
     }
     list.replaceChildren(...shown.map((item, i) => {
@@ -93,6 +100,7 @@ export function openPicker(o: PickerOpts): HTMLDialogElement {
       return li;
     }));
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, o.filterable ? input : list, { label: o.title });
   };
 
   const choose = (item: PickItem | undefined): void => {
@@ -119,6 +127,7 @@ export function openPicker(o: PickerOpts): HTMLDialogElement {
   foot.append(close);
 
   const move = (delta: number): void => { pick = movePick(shown.length, pick, delta); render(); };
+  const jump = (end: boolean): void => { if (shown.length > 0) { pick = end ? shown.length - 1 : 0; render(); } };
   // The TUI's picker leader (gap sweep G4): Space N closes and opens a blank
   // session prompt, Space ; the command palette. With a filter box, only
   // while the filter is empty (a leading space filters nothing).
@@ -140,13 +149,17 @@ export function openPicker(o: PickerOpts): HTMLDialogElement {
     if (ev.key === 'ArrowDown') { ev.preventDefault(); move(1); return; }
     if (ev.key === 'ArrowUp') { ev.preventDefault(); move(-1); return; }
     if (ev.key === 'Enter') { ev.preventDefault(); choose(shown[pick]); return; }
+    // The TUI's pickers list Home / End (jump) and Ctrl-J / Ctrl-K (move) whatever the filter box holds (#321).
+    if (ev.key === 'Home' || ev.key === 'End') { ev.preventDefault(); jump(ev.key === 'End'); return; }
     if (ctrl) {
+      const lk = ev.key.toLowerCase();
+      if (lk === 'j' || lk === 'k') { ev.preventDefault(); move(lk === 'j' ? 1 : -1); return; }
       const b = o.buttons?.find((x) => x.ctrl && x.ctrl.toLowerCase() === ev.key.toLowerCase());
       if (b) { ev.preventDefault(); runButton(b); }
       return;
     }
     if (!typing && o.vimKeys) {
-      if (ev.key === 'j') { ev.preventDefault(); move(1); } else if (ev.key === 'k') { ev.preventDefault(); move(-1); } else if (ev.key === 'q') { ev.preventDefault(); dlg.close(); }
+      if (ev.key === 'g' || ev.key === 'G') { ev.preventDefault(); jump(ev.key === 'G'); } else if (ev.key === 'j') { ev.preventDefault(); move(1); } else if (ev.key === 'k') { ev.preventDefault(); move(-1); } else if (ev.key === 'q') { ev.preventDefault(); dlg.close(); }
     }
   });
   input.addEventListener('input', () => {
@@ -177,10 +190,18 @@ export interface FormField {
   type: 'text' | 'password' | 'checkbox' | 'color';
   palette?: readonly ColorChoice[];
   placeholder?: string;
+  /** One plain-word line under the field saying what it is for. */
+  hint?: string;
+  /** A text field whose Up and Down step through these values, wrapping (the TUI's hook form cycles its event this way); typing still works. */
+  cycle?: readonly string[];
+  /** `text` only: a one-line value that wraps and never takes a newline (a wrapping vim field, form-field.ts) instead of an <input>. */
+  wrap?: boolean;
 }
 
 export interface FormOpts {
   title: string;
+  /** The key table the ? help lists for this form, when its title is not that table's name. */
+  keyTable?: string;
   submit: string;
   fields: readonly FormField[];
   /** Null when the values can be sent. */
@@ -190,7 +211,7 @@ export interface FormOpts {
 }
 
 export function openForm(o: FormOpts): HTMLDialogElement {
-  const dlg = dialog('pick-form-dialog', o.title);
+  const dlg = dialog('pick-form-dialog', o.title, o.keyTable);
   const form = el('form', 'launch-form');
   form.method = 'dialog';
   form.noValidate = true;
@@ -206,6 +227,10 @@ export function openForm(o: FormOpts): HTMLDialogElement {
       label.classList.add('check');
       label.append(box);
       read.push(() => [f.name, box.checked ? 'true' : 'false']);
+    } else if (f.type === 'text' && f.wrap) {
+      const lf = lineField({ name: f.name, value: f.value, ...(f.placeholder ? { placeholder: f.placeholder } : {}) });
+      label.append(lf.field);
+      read.push(() => [f.name, lf.field.value]);
     } else if (f.type === 'text' || f.type === 'password') {
       const input = el('input');
       if (f.type === 'password') input.type = 'password'; else input.dataset.vim = 'on';
@@ -214,6 +239,18 @@ export function openForm(o: FormOpts): HTMLDialogElement {
       input.autocomplete = 'off';
       input.spellcheck = false;
       if (f.placeholder) input.placeholder = f.placeholder;
+      const choices = f.cycle;
+      if (choices && choices.length > 0) {
+        input.addEventListener('keydown', (ev) => {
+          if ((ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') || ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey || ev.isComposing) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          const at = choices.indexOf(input.value);
+          const step = ev.key === 'ArrowDown' ? 1 : -1;
+          // A typed value that is not a choice starts at the first (Down) or the last (Up).
+          input.value = choices[at < 0 ? (step > 0 ? 0 : choices.length - 1) : (at + step + choices.length) % choices.length]!;
+        });
+      }
       label.append(input);
       read.push(() => [f.name, input.value]);
     } else {
@@ -237,6 +274,7 @@ export function openForm(o: FormOpts): HTMLDialogElement {
       label.append(group);
       read.push(() => [f.name, value]);
     }
+    if (f.hint) label.append(el('small', 'field-hint', f.hint));
     form.append(label);
   }
   const error = el('p', 'form-error');
@@ -251,8 +289,8 @@ export function openForm(o: FormOpts): HTMLDialogElement {
   form.append(error, actions);
   dlg.append(form);
 
-  form.addEventListener('submit', (ev) => {
-    ev.preventDefault();
+  const submit = (): void => {
+    if (save.disabled) return;
     const values = Object.fromEntries(read.map((r) => r()));
     const bad = o.validate(values);
     const fail = (m: string): void => { error.textContent = m; error.hidden = false; };
@@ -262,9 +300,20 @@ export function openForm(o: FormOpts): HTMLDialogElement {
       fail(e instanceof Error ? e.message : String(e));
       save.disabled = false;
     });
+  };
+  form.addEventListener('submit', (ev) => { ev.preventDefault(); submit(); });
+  // The chords the TUI's form table lists (local #338): Ctrl/Cmd-Enter saves, Ctrl-Q closes, from any field. A focused
+  // button keeps Ctrl-Enter (its own click), so Cancel never saves.
+  dlg.addEventListener('keydown', (ev) => {
+    const chord = formChord(ev);
+    if (chord === null) return;
+    if (chord === 'save' && (ev.target as Element | null)?.closest?.('button')) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    if (chord === 'save') form.requestSubmit(); else dlg.close();
   });
   dlg.showModal();
-  form.querySelector<HTMLElement>('input[type="text"]')?.focus();
+  form.querySelector<HTMLElement>('input[type="text"], textarea.line-field')?.focus();
   return dlg;
 }
 

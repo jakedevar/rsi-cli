@@ -1,0 +1,5 @@
+#!/bin/sh
+# Python-free migration inspection/transform/proof entry (#361).
+set -eu
+root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
+exec "$root/scripts/repo-guard" rolling-migration-renumber "$@"

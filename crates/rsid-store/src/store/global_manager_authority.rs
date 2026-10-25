@@ -396,6 +396,26 @@ impl Store {
         config: &HarnessManagerConfigV1,
         own: &[ManagerLaunchChoiceV2],
     ) -> Result<Vec<ManagerLaunchChoiceV2>> {
+        let mut launches = self.manager_exact_effective_launches(config, own)?;
+        // #3417: the project's active provider grants add their any-model
+        // entries, narrowed by every ancestor like an own list. A spent or
+        // expired grant adds nothing, and an exact tuple is untouched.
+        let granted = self.project_provider_grant_launches(config.project_id)?;
+        if !granted.is_empty() {
+            for choice in self.manager_exact_effective_launches(config, &granted)? {
+                if !launches.contains(&choice) {
+                    launches.push(choice);
+                }
+            }
+        }
+        Ok(launches)
+    }
+
+    fn manager_exact_effective_launches(
+        &self,
+        config: &HarnessManagerConfigV1,
+        own: &[ManagerLaunchChoiceV2],
+    ) -> Result<Vec<ManagerLaunchChoiceV2>> {
         let (ancestors, _) = self.portfolio_ancestors_of(config)?;
         let mut launches = (!own.is_empty()).then(|| own.to_vec());
         for head in &ancestors {
@@ -420,12 +440,17 @@ impl Store {
     ) -> Result<()> {
         let allowed = self.manager_effective_launches(config, own)?;
         if !allowed.iter().any(|choice| choice.allows(launch)) {
-            let hint = if allowed.is_empty() && self.portfolio_ancestors_of(config)?.0.is_empty() {
-                // #1941: name the fix; the stable code prefix stays first.
-                format!("; {NO_LAUNCH_CHOICES_HINT}")
-            } else {
-                String::new()
-            };
+            let hint =
+                if let Some(grant) = self.provider_grant_refusal_hint(config.project_id, launch) {
+                    // #3417: the provider grant that did not admit it names itself,
+                    // its spend and the screen that raises it.
+                    format!("; {grant}")
+                } else if allowed.is_empty() && self.portfolio_ancestors_of(config)?.0.is_empty() {
+                    // #1941: name the fix; the stable code prefix stays first.
+                    format!("; {NO_LAUNCH_CHOICES_HINT}")
+                } else {
+                    String::new()
+                };
             return Err(refused(&format!(
                 "manager_v2_launch_not_granted: allowed_launches={}{hint}",
                 serde_json::to_string(&allowed)?

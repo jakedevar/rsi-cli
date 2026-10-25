@@ -65,7 +65,7 @@ impl RpcServer {
             )
         })?;
         let params = crate::agent_issue_validation::decode_list(&request.params)
-            .map_err(crate::error::agent_issue_invalid_request)?;
+            .map_err(crate::error::agent_issue_list_invalid_request)?;
         serialize_agent_issue_result(self.session_manager.agent_list_issues(caller, params).await)
     }
 

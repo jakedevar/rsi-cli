@@ -12,10 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tokio::sync::Mutex;
 
 pub(crate) async fn capture_or_replay_terminal_output(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     source_id: ClosureSourceIdV1,
 ) -> Result<Option<ClosureOutputValidationResultV1>> {
     let candidate = {
@@ -34,7 +33,7 @@ pub(crate) async fn capture_or_replay_terminal_output(
 }
 
 pub(crate) async fn capture_for_terminal_session(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: uuid::Uuid,
 ) -> Result<Option<ClosureOutputValidationResultV1>> {
     let source_id = store.lock().await.closure_source_for_session(session_id)?;
@@ -45,7 +44,7 @@ pub(crate) async fn capture_for_terminal_session(
 }
 
 pub(crate) async fn reconcile_after_restart(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     budget: ClosureOutputRecoveryBudgetV1,
     cursor: Option<ClosureOutputRecoveryCursorV1>,
     high_water: Option<ClosureOutputRecoveryCursorV1>,
@@ -363,7 +362,7 @@ mod tests {
 
     struct IngressFixture {
         _tempdir: tempfile::TempDir,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         program_id: ClosureProgramIdV1,
         source_id: ClosureSourceIdV1,
         session_id: Uuid,
@@ -545,7 +544,7 @@ mod tests {
                 .expect("Closure source");
             Self {
                 _tempdir: tempdir,
-                store: Arc::new(Mutex::new(store)),
+                store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
                 program_id: created.program_id,
                 source_id,
                 session_id: session.id,

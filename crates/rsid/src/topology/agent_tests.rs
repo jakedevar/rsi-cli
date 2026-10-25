@@ -26,10 +26,14 @@ use super::store::{self as rows, AttemptStatus, ExecutionStatus};
 use super::tests::{Harness, ReviewScript, error_code, git, green_receipt, scoped_test_job};
 use crate::error::{DaemonError, Result};
 
+#[path = "auto_dispatch_tests.rs"]
+mod auto_dispatch_tests;
 #[path = "get_tests.rs"]
 mod get_tests;
 #[path = "issue_close_tests.rs"]
 mod issue_close_tests;
+#[path = "reappointment_tests.rs"]
+mod reappointment_tests;
 #[path = "review_work_tests.rs"]
 mod review_work_tests;
 #[path = "reviewer_read_tests.rs"]
@@ -1011,7 +1015,14 @@ async fn t4_a5_max_created_sessions_is_charged() {
     );
     let third = world.harness.attempt(runs[2], "A", 0, 1).await;
     assert_eq!(third.failure_class.as_deref(), Some("policy_refused"));
-    assert_eq!(third.error.as_deref(), Some("creation_limit"));
+    assert!(
+        third
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("creation_limit: ")),
+        "{:?}",
+        third.error
+    );
     assert_eq!(world.harness.launches().len(), 2);
     // A new admission is refused up front.
     assert_eq!(
@@ -1023,6 +1034,167 @@ async fn t4_a5_max_created_sessions_is_charged() {
         ),
         "creation_limit"
     );
+}
+
+// ─── #3497: a spent creation window says when it refills ───────────────────
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn t4_3497_a_spent_creation_window_names_the_refill_and_admits_after_expiry() {
+    let world = World::new(policy(&[ManagerCapabilityV2::Automation], vec![luna()], 2)).await;
+    let mut single = upsert_request("single", definition(&[("A", &luna())], &[]));
+    single.scope = AgentTopologyScopeV1::Manager;
+    let single = world.upsert(world.manager, &single).await.unwrap();
+    let mut pair = upsert_request("pair", definition(&[("A", &luna()), ("B", &luna())], &[]));
+    pair.scope = AgentTopologyScopeV1::Manager;
+    let pair = world.upsert(world.manager, &pair).await.unwrap();
+
+    // Two launches spend the allowance; a third admitted run finds it spent.
+    let mut runs = Vec::new();
+    for key in ["one", "two", "three"] {
+        runs.push(
+            world
+                .execute(world.manager, &single, world.epic_a, key)
+                .await
+                .unwrap()
+                .execution_id,
+        );
+    }
+    for run in &runs[..2] {
+        world.harness.executor.advance(*run).await.unwrap();
+    }
+    assert_eq!(world.created_usage().await, 2);
+    world.harness.executor.advance(runs[2]).await.unwrap();
+
+    // Expected refill: the charged launches' creation times plus the window.
+    let created: Vec<chrono::DateTime<chrono::Utc>> = {
+        let store = world.harness.executor.store.lock().await;
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT created_at FROM topology_node_attempts \
+                 WHERE node_kind='session' AND boot_id IS NOT NULL ORDER BY created_at",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|at| {
+                chrono::DateTime::parse_from_rfc3339(&at.unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            })
+            .collect()
+    };
+    assert_eq!(created.len(), 2);
+    let frees = |at: chrono::DateTime<chrono::Utc>| {
+        (at + chrono::Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    };
+
+    // Execution time: the blocked launch records the window, count, need and
+    // refill time, not a bare code.
+    let third = world.harness.attempt(runs[2], "A", 0, 1).await;
+    let error = third.error.clone().unwrap();
+    assert_eq!(third.failure_class.as_deref(), Some("policy_refused"));
+    for needle in [
+        "creation_limit: ",
+        "2 of 2 created in the last 24 h; next slot frees at ",
+        "this launch needs 1 slot(s)",
+        &format!("retry after {}", frees(created[0])),
+        "no operator change",
+    ] {
+        assert!(error.contains(needle), "{needle}: {error}");
+    }
+    // The same gate at a later injected clock admits the launch again.
+    {
+        let store = world.harness.executor.store.lock().await;
+        let execution = rows::load_execution(&store, runs[2]).unwrap().unwrap();
+        let now = chrono::Utc::now();
+        let refused = agent::launch_gate_at(&store, &execution, &third, now)
+            .unwrap()
+            .expect("spent at the present");
+        assert_eq!(refused.code, "creation_limit");
+        let after_first = created[0] + chrono::Duration::hours(24) + chrono::Duration::minutes(1);
+        assert_eq!(
+            agent::launch_gate_at(&store, &execution, &third, after_first).unwrap(),
+            None,
+            "one slot expired"
+        );
+    }
+
+    // Admission of a two-node topology needs two slots: it names the second
+    // oldest launch's expiry, not the first.
+    let refused = world
+        .execute(world.manager, &pair, world.epic_a, "pair-refused")
+        .await
+        .unwrap_err();
+    assert_eq!(error_code(&refused), "creation_limit");
+    let DaemonError::StructuredRpc { data, .. } = &refused else {
+        panic!("{refused}");
+    };
+    let next_action = data["next_action"].as_str().unwrap();
+    for needle in [
+        "2 of 2 created in the last 24 h",
+        "this launch needs 2 slot(s)",
+        &format!("retry after {}", frees(created[1])),
+        "no operator change",
+        "to raise it instead",
+    ] {
+        assert!(next_action.contains(needle), "{needle}: {next_action}");
+    }
+
+    // The allowance refills by itself: once the launches are a day old the
+    // same admission succeeds with no operator change.
+    {
+        let store = world.harness.executor.store.lock().await;
+        let old = (chrono::Utc::now() - chrono::Duration::hours(25))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET created_at=?1 \
+                 WHERE node_kind='session' AND boot_id IS NOT NULL",
+                [old],
+            )
+            .unwrap();
+    }
+    assert_eq!(world.created_usage().await, 0);
+    world
+        .execute(world.manager, &pair, world.epic_a, "pair-admitted")
+        .await
+        .expect("admitted after the window refilled");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn t4_3497_an_ancestor_refusal_names_its_node_window_and_refill() {
+    let node = Uuid::new_v4();
+    let message = rsi_common::manager_budget::CreationCapRefusalV1 {
+        code: rsi_common::global_manager::MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED.to_string(),
+        node_kind: rsi_common::manager_budget::BudgetNodeKindV1::Portfolio,
+        node_id: node,
+        project_id: Uuid::new_v4(),
+        cap_field: "max_created_sessions".into(),
+        used: 5,
+        limit: 6,
+        needed: 3,
+        counted: 0,
+        window_start: None,
+        raise_in: "b Budget > portfolio x".into(),
+        window_hours: Some(24),
+        next_free_at: Some("2026-10-21T04:12:00.000000000Z".into()),
+    }
+    .message();
+    let text = agent::creation_refusal_detail(&message, false);
+    for needle in [
+        &format!("manager {node}'s"),
+        "5 of 6 created in the last 24 h; next slot frees at 2026-10-21 04:12 UTC",
+        "this launch needs 3 slot(s)",
+        "retry after 2026-10-21T04:12:00.000000000Z",
+        "to raise it instead: b Budget > portfolio x",
+    ] {
+        assert!(text.contains(needle), "{needle}: {text}");
+    }
 }
 
 // ─── A6: an idempotent execute is deduplicated ─────────────────────────────
@@ -2946,9 +3118,12 @@ async fn topology_launches_are_charged_against_every_ancestor_allowance() {
     );
     let third = world.harness.attempt(runs[2], "A", 0, 1).await;
     assert_eq!(third.failure_class.as_deref(), Some("policy_refused"));
-    assert_eq!(
-        third.error.as_deref(),
-        Some(MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED)
+    assert!(
+        third.error.as_deref().is_some_and(
+            |error| error.starts_with(&format!("{MANAGER_ANCESTOR_ALLOWANCE_EXCEEDED}: "))
+        ),
+        "{:?}",
+        third.error
     );
     assert_eq!(world.harness.launches().len(), 2);
     // A new admission is refused up front by the ancestor's allowance.
@@ -3156,7 +3331,7 @@ async fn landing_gate_follows_the_owners_live_authority() {
         }
     };
 
-    // An Epic lead's execution may land while that lead still leads the Epic.
+    // An Epic lead's execution follows the current lead of that same Epic.
     let by_lead = world
         .execute(world.lead_a, &flow, world.epic_a, "lead-run")
         .await
@@ -3172,10 +3347,33 @@ async fn landing_gate_follows_the_owners_live_authority() {
             )
             .unwrap();
     }
+    assert_eq!(gate(by_lead.execution_id).await, None);
+
+    // A replacement still needs live authority over the execution's Epic.
+    {
+        let store = world.harness.executor.store.lock().await;
+        store
+            .update_session_status(world.worker, SessionStatus::Archived)
+            .unwrap();
+    }
     assert_eq!(
         gate(by_lead.execution_id).await,
         Some("requester_unauthorized")
     );
+    {
+        let store = world.harness.executor.store.lock().await;
+        store
+            .update_session_status(world.worker, SessionStatus::Running)
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET lead_session_id=?1 WHERE id=?2",
+                rusqlite::params![world.lead_b.to_string(), world.epic_a.to_string()],
+            )
+            .unwrap();
+    }
+    assert_eq!(gate(by_lead.execution_id).await, Some("epic_not_landable"));
 
     // The project manager's execution may land in an Epic it covers while its
     // grant is in force and unpaused; a pause or a moved scope stops it.
@@ -3382,7 +3580,7 @@ async fn landing_gate_follows_a_rotated_epic_lead() {
     // The predecessor's execution lands under the successor lead.
     assert_eq!(gate(run.execution_id).await, None);
 
-    // A later replacement outside the rotation lineage is not the lead's heir.
+    // A later explicit replacement also acts for the same Epic's execution.
     {
         let store = world.harness.executor.store.lock().await;
         store
@@ -3394,7 +3592,7 @@ async fn landing_gate_follows_a_rotated_epic_lead() {
             .unwrap();
         assert_eq!(store.epic_lead_seat_now(world.lead_a).unwrap(), None);
     }
-    assert_eq!(gate(run.execution_id).await, Some("requester_unauthorized"));
+    assert_eq!(gate(run.execution_id).await, None);
 }
 
 // ─── #1687: a cancellation during the land probe stops the enqueue ──────────
@@ -3959,6 +4157,26 @@ async fn land_verified_admission_rechecks_the_job_row() {
     assert!(entries().await.is_empty());
 }
 
+/// #465: the enqueue probe proves a provisional declaration with a trusted
+/// `rsi-repo-guard` executable and fails closed (hub #3545) when none is
+/// resolvable. These tests exercise the review routing of a source that
+/// declares a provisional migration, not the renumber proof, so the repository
+/// gets a stub guard that answers "already landed" (nothing to renumber).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+fn register_landed_guard(repo: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("rsi-landed-guard-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("rsi-repo-guard");
+    std::fs::write(
+        &exe,
+        "#!/bin/sh\necho '{\"old_version\":901,\"new_version\":901,\"renumber_noop\":true,\"migration_already_landed\":true}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::repo_guard_call::register_test_tool(repo, exe);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn land_admitted_by_verification_refuses_a_migration_source() {
@@ -3970,6 +4188,7 @@ async fn land_admitted_by_verification_refuses_a_migration_source() {
     ))
     .await;
     let repo = world.harness.repo.clone();
+    register_landed_guard(&repo);
     let commit = |message: &str| {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", message]);
@@ -4055,6 +4274,7 @@ async fn land_with_review_coverage_blocks_a_stricter_candidate_before_an_entry_e
     ))
     .await;
     let repo = world.harness.repo.clone();
+    register_landed_guard(&repo);
     let commit = |message: &str| {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", message]);
@@ -4635,6 +4855,119 @@ async fn backdate_attempt(world: &World, run: Uuid, hours: i64) {
             rusqlite::params![run.to_string(), hours_ago(hours)],
         )
         .unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_gap_does_not_spend_node_wall_time_or_trigger_progress_notice() {
+    let mut world = World::new(automation()).await;
+    let run = on_call_run(&world, None, "restart-clock").await;
+    world.harness.executor.advance(run).await.unwrap();
+    let attempt = world.harness.attempt(run, "A", 0, 1).await;
+    {
+        let store = world.harness.executor.store.lock().await;
+        // One hour running, then six hours without a daemon observation.
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET started_at=?2,updated_at=?3 WHERE id=?1",
+                rusqlite::params![attempt.id.to_string(), hours_ago(7), hours_ago(6)],
+            )
+            .unwrap();
+    }
+    world.harness.restart();
+    for _ in 0..2 {
+        world.harness.executor.advance(run).await.unwrap();
+    }
+    assert_eq!(
+        world.harness.attempt(run, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    assert!(world.harness.owner_notices().is_empty());
+    assert_eq!(
+        event_kinds(&world, run)
+            .await
+            .iter()
+            .filter(|kind| *kind == "node_clock_rebased")
+            .count(),
+        1
+    );
+
+    // A second boot retains the exclusion rather than charging the old gap.
+    world.harness.restart();
+    world.harness.executor.advance(run).await.unwrap();
+    assert_eq!(
+        world.harness.attempt(run, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    assert!(world.harness.owner_notices().is_empty());
+
+    // Runtime before restart still counts: another four active hours expires.
+    backdate_attempt(&world, run, 11).await;
+    world.harness.executor.advance(run).await.unwrap();
+    let expired = world.harness.attempt(run, "A", 0, 1).await;
+    assert_eq!(expired.status, AttemptStatus::Failed);
+    assert_eq!(expired.failure_class.as_deref(), Some("timeout"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_gap_overlapping_an_answer_wait_is_excluded_only_once() {
+    let mut world = World::new(automation()).await;
+    let run = on_call_run(&world, None, "restart-wait-clock").await;
+    world.harness.executor.advance(run).await.unwrap();
+    let attempt = world.harness.attempt(run, "A", 0, 1).await;
+    // Eleven hours since launch: five running, three offline, three waiting.
+    // The wait is first observed after recovery, inside the six-hour gap.
+    world.harness.set_waiting_since(
+        attempt.session_id,
+        chrono::Utc::now() - chrono::Duration::hours(3),
+    );
+    world
+        .harness
+        .set_status(attempt.session_id, SessionStatus::WaitingApproval);
+    {
+        let store = world.harness.executor.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET started_at=?2,updated_at=?3 WHERE id=?1",
+                rusqlite::params![attempt.id.to_string(), hours_ago(11), hours_ago(6)],
+            )
+            .unwrap();
+    }
+    world.harness.restart();
+    world.harness.executor.advance(run).await.unwrap();
+    let expired = world.harness.attempt(run, "A", 0, 1).await;
+    assert_eq!(expired.status, AttemptStatus::Failed);
+    assert_eq!(expired.failure_class.as_deref(), Some("timeout"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_gap_does_not_extend_the_absolute_execution_deadline() {
+    let mut world = World::new(automation()).await;
+    let run = on_call_run(&world, None, "restart-deadline").await;
+    world.harness.executor.advance(run).await.unwrap();
+    {
+        let store = world.harness.executor.store.lock().await;
+        store.conn.execute(
+            "UPDATE topology_node_attempts SET started_at=?2,updated_at=?3 WHERE execution_id=?1",
+            rusqlite::params![run.to_string(), hours_ago(7), hours_ago(6)],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE topology_executions SET deadline_at=?2 WHERE id=?1",
+                rusqlite::params![run.to_string(), hours_ago(1)],
+            )
+            .unwrap();
+    }
+    world.harness.restart();
+    world.harness.executor.advance(run).await.unwrap();
+    let expired = world.harness.attempt(run, "A", 0, 1).await;
+    assert_eq!(expired.status, AttemptStatus::Failed);
+    assert_eq!(expired.failure_class.as_deref(), Some("timeout"));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -7042,4 +7375,135 @@ async fn operator_owned_execution_lands_under_the_managers_live_authority() {
         })
         .await;
     assert!(gate(owned).await.is_some());
+}
+
+/// A queued fix is advisory: the manager can deliberately accept another run,
+/// and the warning names the live entry in the same project for that Issue.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn execute_warns_about_linked_live_landings_without_refusing() {
+    use crate::store::rolling_queue::NewQueueEntry;
+    use rsi_common::rolling_queue::{RollingQueueBinding, RollingQueueEntryState};
+    let world = World::new(automation()).await;
+    let flow = world
+        .upsert(
+            world.lead_a,
+            &upsert_request("queued-issue-warning", definition(&[("A", &luna())], &[])),
+        )
+        .await
+        .unwrap();
+    for (index, state) in [
+        RollingQueueEntryState::Queued,
+        RollingQueueEntryState::Admitted,
+        RollingQueueEntryState::Gating,
+        RollingQueueEntryState::Published,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let issue = issue_close_tests::open_issue(&world, &format!("Queue warning {index}")).await;
+        let entry = {
+            let store = world.harness.executor.store.lock().await;
+            let mut new = NewQueueEntry {
+                project_id: Some(world.project),
+                repo_path: world.harness.repo.display().to_string(),
+                source_commit: format!("{:040x}", index + 1),
+                source_session_id: world.manager,
+                owner_epic_id: None,
+                binding: RollingQueueBinding::Unbound,
+                work_key: None,
+                migration_version: None,
+                hot_files: Vec::new(),
+                test_filters: Vec::new(),
+                fixes_tests: Vec::new(),
+                idempotency_key: format!("linked-{index}"),
+            };
+            let entry = store
+                .enqueue_rolling_queue_source_linked(
+                    &new,
+                    None,
+                    None,
+                    false,
+                    Some(issue.display_number),
+                    chrono::Utc::now(),
+                )
+                .unwrap()
+                .0;
+            store
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state=?2 WHERE id=?1",
+                    rusqlite::params![entry.id.to_string(), state.as_str()],
+                )
+                .unwrap();
+            // Same number in another project, and an unlinked source in this
+            // project, do not appear in this Issue's warning list.
+            new.project_id = Some(Uuid::new_v4());
+            new.source_commit = format!("{:040x}", index + 100);
+            new.idempotency_key = format!("foreign-{index}");
+            // A link to another project's Issue is refused at admission, so
+            // the foreign row is an unlinked source re-pointed by hand.
+            let foreign = store
+                .enqueue_rolling_queue_source(&new, chrono::Utc::now())
+                .unwrap()
+                .0;
+            store
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET issue=?2 WHERE id=?1",
+                    rusqlite::params![foreign.id.to_string(), issue.display_number],
+                )
+                .unwrap();
+            new.project_id = Some(world.project);
+            new.source_commit = format!("{:040x}", index + 200);
+            new.idempotency_key = format!("unlinked-{index}");
+            store
+                .enqueue_rolling_queue_source(&new, chrono::Utc::now())
+                .unwrap();
+            entry
+        };
+        let request = AgentTopologyExecuteRequestV1 {
+            project_id: None,
+            on_call: None,
+            supersedes_execution: None,
+            wake: None,
+            topology_id: flow.topology_id.unwrap(),
+            expected_digest: flow.definition_digest.clone(),
+            epic_id: world.epic_a,
+            inputs: serde_json::json!({"issue": issue.display_number}),
+            base_commit: Some(world.harness.base.clone()),
+            idempotency_key: format!("run-warning-{index}"),
+        };
+        let accepted = agent::execute(
+            &world.harness.executor.store,
+            || KNOBS,
+            world.manager,
+            &request,
+        )
+        .await
+        .unwrap();
+        assert!(accepted.accepted.is_some());
+        let expected = if state == RollingQueueEntryState::Published {
+            Vec::new()
+        } else {
+            vec![rsi_common::topology_agent::TopologyQueuedLandingWarningV1 {
+                code: "topology_issue_landing_queued".into(),
+                issue: issue.display_number,
+                entry_id: entry.id,
+                entry_sequence: entry.sequence,
+                state,
+            }]
+        };
+        assert_eq!(accepted.result.warnings, expected);
+        let replay = agent::execute(
+            &world.harness.executor.store,
+            || KNOBS,
+            world.manager,
+            &request,
+        )
+        .await
+        .unwrap();
+        assert!(replay.result.deduplicated);
+        assert_eq!(replay.result.warnings, expected);
+    }
 }

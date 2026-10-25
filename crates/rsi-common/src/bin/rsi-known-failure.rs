@@ -1,7 +1,7 @@
 //! Known-failure signature CLI: export, classify, query and block (#1016).
 
 use rsi_common::failure_signature::{
-    Classification, DEFAULT_SNAPSHOT_RELATIVE, FENCE_INFO, Matcher, SCHEMA_VERSION, SignatureClass,
+    Classification, DEFAULT_SNAPSHOT_RELATIVE, Matcher, SCHEMA_VERSION, SignatureClass,
     SignatureRecord, Snapshot, build_snapshot, classify, digest, failing_tests, failure_text_for,
 };
 use std::collections::BTreeMap;
@@ -348,14 +348,13 @@ fn cmd_block(args: &[String]) -> ExitCode {
         host_scope: flags.get("host").map(str::to_string),
         note: flags.get("note").map(str::to_string),
     };
-    if let Err(error) = record.validate() {
-        eprintln!("refusing to print invalid record: {error}");
-        return ExitCode::from(2);
+    match record.issue_block() {
+        Ok(block) => print!("{block}"),
+        Err(error) => {
+            eprintln!("refusing to print invalid record: {error}");
+            return ExitCode::from(2);
+        }
     }
-    let json = serde_json::to_string_pretty(&record).unwrap_or_else(|_| "{}".to_string());
-    println!("```{FENCE_INFO}");
-    println!("{json}");
-    println!("```");
     ExitCode::SUCCESS
 }
 

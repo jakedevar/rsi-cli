@@ -4,6 +4,8 @@
 // keys, the exact read requests and the gated control inputs. dag.ts runs the
 // requests and draws it. Daemon rows stay loosely typed (`Row`): the browser
 // shows what the readback holds and never invents a field.
+import { hintLine } from './key-hints.js';
+import type { Platform } from './keyengine.js';
 
 export type Row = Record<string, unknown>;
 
@@ -422,6 +424,66 @@ export function dagKey(s: DagState, k: DagKey): { state: DagState; effect: DagEf
   }
 }
 
+// ---------- operator actions as buttons (local #231) ----------
+
+export type DagActionId = 'run-fake' | 'run-live' | 'cancel-graph' | 'cancel-run' | 'recover' | 'inspect' | 'artifact-prev' | 'artifact-next' | 'gates';
+
+export interface DagAction {
+  readonly id: DagActionId;
+  readonly label: string;
+  /** What the button does now; when disabled, why not. No key names: the buttons are the path with Vim keys off. */
+  readonly title: string;
+  readonly enabled: boolean;
+}
+
+/** The keys one action presses, in order: each is the TUI key that opens the same control (handle_recursive_dag_key). */
+export const DAG_ACTION_KEYS: Readonly<Record<DagActionId, readonly string[]>> = {
+  'run-fake': ['R'], 'run-live': ['L'], 'cancel-graph': ['C', 'g'], 'cancel-run': ['C', 'r'], recover: ['c'],
+  inspect: ['Enter'], 'artifact-prev': [], 'artifact-next': [], gates: ['!'],
+};
+
+/** The inspector's views as buttons, with the key each one presses (the inspector is open). */
+export const DAG_INSPECTOR_VIEWS: ReadonlyArray<{ view: InspectorView; label: string; key: string }> = [
+  { view: 'metadata', label: 'Metadata', key: 'm' }, { view: 'links', label: 'Links', key: 'l' }, { view: 'preview', label: 'Preview', key: 'p' },
+  { view: 'test', label: 'Test', key: 't' }, { view: 'diff', label: 'Diff', key: 'd' },
+];
+
+/** Whether Enter would open an inspector or a live-attempt readback on the cursor row. */
+function inspectWhy(s: DagState): string | null {
+  if (s.status !== 'ready') return 'the browser is not loaded';
+  if (s.control.kind !== 'none') return 'finish or cancel the open control first';
+  if (s.panel === 'artifacts') return s.detail && s.detail.artifacts.items.length > 0 ? null : 'no artifact row to inspect';
+  if (s.panel === 'live') return s.detail && s.detail.live.length > 0 ? null : 'no live attempt to inspect';
+  return 'select a row in Artifacts or Live attempts first';
+}
+
+/**
+ * The operator buttons of the browser, enabled from the selection and capabilities exactly as the
+ * keys are gated (controlGate). With Vim keys off the letter keys do nothing, so each control
+ * (cancel a graph or run, recovery budget, run, inspect) is reachable here. Pure.
+ */
+export function dagActions(s: DagState): DagAction[] {
+  const busy = s.control.kind !== 'none';
+  const gated = (which: Parameters<typeof controlGate>[1], on: string): { enabled: boolean; title: string } => {
+    const why = busy ? 'finish or cancel the open control first' : controlGate(s, which);
+    return { enabled: why === null, title: why === null ? on : `Unavailable: ${why}` };
+  };
+  const inspectProblem = inspectWhy(s);
+  const artifacts = s.detail?.artifacts.items.length ?? 0;
+  const stepOk = !busy && s.status === 'ready' && artifacts > 0;
+  return [
+    { id: 'cancel-graph', label: 'Cancel graph…', ...gated('cancel-graph', 'Cancel the selected graph (asks for a reason)') },
+    { id: 'cancel-run', label: 'Cancel run…', ...gated('cancel-run', 'Cancel the selected scheduler run (asks for a reason)') },
+    { id: 'recover', label: 'Recovery budget…', ...gated('recover', 'Continue deferred recovery with a budget (asks for max_graphs)') },
+    { id: 'run-fake', label: 'Run (fake)…', ...gated('fake', 'Run the scheduler on the fake backend (asks for max_steps)') },
+    { id: 'run-live', label: 'Run (live)…', ...gated('live', 'Run the scheduler live; this launches provider sessions (asks for max_steps)') },
+    { id: 'inspect', label: 'Inspect', enabled: inspectProblem === null, title: inspectProblem === null ? 'Inspect the selected artifact or live attempt' : `Unavailable: ${inspectProblem}` },
+    { id: 'artifact-prev', label: 'Previous artifact', enabled: stepOk, title: stepOk ? 'Select the previous artifact row' : 'Unavailable: no artifact rows' },
+    { id: 'artifact-next', label: 'Next artifact', enabled: stepOk, title: stepOk ? 'Select the next artifact row' : 'Unavailable: no artifact rows' },
+    { id: 'gates', label: s.gates ? 'Hide gates' : 'Show gates', enabled: true, title: 'Show or hide what each control needs' },
+  ];
+}
+
 /** `]a` / `[a`: the next / previous artifact row (only inside `:dag`). */
 export function artifactStep(s: DagState, by: 1 | -1): DagState {
   const n = s.detail?.artifacts.items.length ?? 0;
@@ -450,12 +512,34 @@ export function capsLine(c: Caps | null): string {
   return `inspect=${yn('recursive_dag_inspection')} run=${yn('recursive_dag_run_inspection')} recovery=${yn('recursive_dag_recovery_status')} live=${yn('recursive_dag_live_status_inspection')} validation=${yn('recursive_dag_live_validation_inspection')} artifacts=${yn('recursive_dag_artifact_list_pagination')}/${yn('recursive_dag_artifact_lookup')}/${yn('recursive_dag_artifact_preview_inspection')} fakectl=${yn('recursive_dag_scheduler_control')} livectl=${yn('recursive_dag_live_scheduler_control')} cancelctl=${yn('recursive_dag_cancellation_control')} recoverctl=${yn('recursive_dag_recovery_control')} liveexec=${yn('recursive_dag_live_execution')} background=${yn('recursive_dag_background_loop')}`;
 }
 
-export function footerText(s: DagState): string {
+export function footerText(s: DagState, vimOn = true, platform?: Platform): string {
   const c = s.control;
   if (c.kind === 'reason') return `CANCEL ${c.target.toUpperCase()} reason input  Enter submit  Esc cancel`;
   if (c.kind === 'budget') return 'RECOVER budget input  digits edit  Tab field  Enter submit  Esc cancel';
   if (c.kind === 'cancel-prefix') return 'CANCEL prefix  g graph  r run  t reserved task  Esc cancel';
   if (c.kind === 'steps') return `${c.live ? 'LIVE' : 'FAKE'} max_steps input  digits edit  Enter submit  Esc cancel`;
-  if (s.inspector.open) return 'inspector  ]a/[a artifact row  m metadata  l links  p preview  t test  d diff  q/Esc close inspector';
-  return 'inspect  Tab/h/l panels  j/k nav  Enter load/inspect  ]a/[a artifacts  r refresh  R FAKE  L LIVE  C cancel prefix  c recover  ! gates  q/Esc close';
+  if (s.inspector.open) {
+    return hintLine([
+      { do: 'Step between artifact rows', key: ']a / [a' },
+      { do: 'Show the metadata', key: 'm' },
+      { do: 'Show the links', key: 'l' },
+      { do: 'Show the preview', key: 'p' },
+      { do: 'Show the test', key: 't' },
+      { do: 'Show the diff', key: 'd' },
+      { do: 'Close the inspector', key: 'Esc' },
+    ], vimOn, platform);
+  }
+  return hintLine([
+    { click: 'a panel tab', key: 'Tab', to: 'switch panels' },
+    { do: 'Move through the list', key: 'j / k' },
+    { do: 'Load or inspect the selected row', key: 'Enter' },
+    { do: 'Step between artifacts', key: ']a / [a' },
+    { click: 'Reload', key: 'r' },
+    { do: 'Run the scheduler on the fake backend', key: 'R' },
+    { do: 'Run the scheduler live', key: 'L' },
+    { do: 'Cancel a graph, run or task', key: 'C' },
+    { do: 'Recover a run', key: 'c' },
+    { do: 'Show what is gated', key: '!' },
+    { click: 'Close', key: 'q' },
+  ], vimOn, platform);
 }

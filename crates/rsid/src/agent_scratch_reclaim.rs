@@ -53,10 +53,13 @@
 //! run reports the same decisions with no effects.
 
 mod adopt;
+mod build_targets;
 mod cargo_targets;
 mod fsys;
 mod gitproof;
 mod holders;
+#[cfg(any(target_os = "macos", test))]
+mod macos;
 mod record;
 mod registry;
 #[cfg(all(test, target_os = "linux"))]
@@ -95,6 +98,98 @@ mod unsupported_tests {
             Some(fsys::InventoryError::Unproven)
         );
     }
+
+    #[cfg(target_os = "macos")]
+    fn macos_owner(pid: u32, ticks: u64, boot: &str) -> LanderOwner {
+        let host = HostIdentity::current(Path::new("/proc")).unwrap();
+        let host = HostIdentity {
+            boot_id: boot.to_string(),
+            ..host
+        };
+        let text = holders::owner_text(pid, ticks, &host, Path::new("/sandbox"));
+        holders::lander_owner(&OwnerFile::Text(text), Path::new("/proc"))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn macos_lander_owner_is_live_gone_or_ambiguous_by_start_time() {
+        let pid = std::process::id();
+        let ticks = lander_start_ticks().unwrap();
+        assert_ne!(ticks, 0);
+        let boot = macos::boot_time().unwrap();
+        assert_eq!(macos_owner(pid, ticks, &boot), LanderOwner::Live);
+        // A reused pid has another start time.
+        assert_eq!(macos_owner(pid, ticks + 1, &boot), LanderOwner::Gone);
+        // kern.boottime moves with clock steps: a stale value alone is not a reboot.
+        assert_eq!(macos_owner(pid, ticks, "1.000000"), LanderOwner::Live);
+        // A child that exited and was reaped no longer exists.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let child_pid = child.id();
+        let child_ticks = match macos::probe(child_pid).unwrap() {
+            macos::Probe::Started(micros) => micros,
+            macos::Probe::Gone => ticks,
+        };
+        child.wait().unwrap();
+        assert_eq!(macos::probe(child_pid).unwrap(), macos::Probe::Gone);
+        assert_eq!(
+            macos_owner(child_pid, child_ticks, &boot),
+            LanderOwner::Gone
+        );
+        // An owner file from another PID namespace cannot be interpreted.
+        let foreign = format!("v2 {pid} {ticks} pid:[4026531836] {boot} /sandbox\n");
+        assert_eq!(
+            holders::lander_owner(&OwnerFile::Text(foreign), Path::new("/proc")),
+            LanderOwner::Ambiguous
+        );
+        // #252: a recorded pid now held by another user's process (root's
+        // launchd, which libproc refuses this uid) is read exactly: its own
+        // start time is that process, any other is a reused pid.
+        let macos::Probe::Started(launchd) = macos::probe(1).expect("launchd start") else {
+            panic!("launchd is running");
+        };
+        assert_eq!(macos_owner(1, launchd, &boot), LanderOwner::Live);
+        assert_eq!(macos_owner(1, launchd + 1, &boot), LanderOwner::Gone);
+    }
+
+    // macOS keeps a birth time in `fstat` (#166): a fresh directory carries it,
+    // so a scratch directory (and the manager's per-worktree build target) can
+    // be registered. The mount proof stays unknown there.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn macos_fresh_directory_has_a_birth_time_and_registers() {
+        // Canonical: the root is opened component by component with O_NOFOLLOW.
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let fresh = base.join("fresh");
+        fs::create_dir(&fresh).unwrap();
+        let pinned = record::pin_dir(&fresh).unwrap();
+        let btime = pinned.btime.expect("APFS keeps a birth time");
+        let now = i128::from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ) * 1_000_000_000;
+        assert!(
+            (now - btime).abs() < 60 * 1_000_000_000,
+            "birth time {btime} is not now ({now})"
+        );
+        assert!(pinned.mount.is_none());
+
+        let registry = base.join("registry");
+        let dir =
+            record::create_scratch_dir_in(&registry, &base, "rsi-btime-macos", RootKind::VarTmp)
+                .expect("a fresh directory registers once it has a birth time");
+        assert!(dir.join(RECORD_FILE).is_file());
+
+        let work = base.join("worktree");
+        fs::create_dir(&work).unwrap();
+        let target = cargo_targets::manager_target_in(&base.join("targets"), &registry, &work)
+            .expect("manager separate-worktree build target is allocated");
+        assert!(target.starts_with(base.join("targets")));
+    }
 }
 
 use std::fs;
@@ -106,6 +201,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+pub use build_targets::build_targets_status;
 use fsys::{Budget, Census, GitRoot, Ident, Pinned};
 use gitproof::GitVerdict;
 pub use holders::{Blocker, ProofFailure};
@@ -115,7 +211,7 @@ use registry::{CloneBinding, Entry, ManifestState, Registry};
 pub use adopt::{
     AdoptOutcome, AdoptRefusal, LegacyCandidate, LegacyListing, adopt_legacy, list_legacy,
 };
-pub(crate) use cargo_targets::manager_target;
+pub(crate) use cargo_targets::{manager_target, seat_qa_target};
 pub use record::{RECORD_FILE, create_scratch_dir, create_scratch_dir_in};
 
 /// Conservative fixed default: three days.
@@ -130,7 +226,9 @@ const ASIDE_PREFIX: &str = ".rsi-reclaiming-";
 /// Name prefix of a lander's private workspace (`tempfile` adds a random tail).
 pub const LANDER_SCRATCH_PREFIX: &str = "rsi-rolling-land-";
 /// File the lander writes in its workspace: `v2 <pid> <start_ticks> <pid_ns>
-/// <boot_id> <sandbox>`.
+/// <boot_id> <sandbox>`. On macOS the start ticks are the process start time in
+/// microseconds, the namespace is the fixed label `macos` and the boot id is
+/// `kern.boottime` (see `macos.rs`).
 pub const LANDER_OWNER_FILE: &str = ".rsi-lander-owner";
 /// The directory name of a lander's private clone inside its workspace.
 pub const LANDER_CLONE_DIR: &str = "repo";
@@ -209,6 +307,13 @@ fn name_allowed(kind: RootKind, name: &str) -> bool {
     kind.allows(name) || parse_aside(name).is_some_and(|original| kind.allows(original))
 }
 
+/// A job that is still queued or running: its id and working directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenJob {
+    pub id: String,
+    pub cwd: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct ScratchConfig {
     pub roots: Vec<(PathBuf, RootKind)>,
@@ -231,6 +336,10 @@ pub struct ScratchConfig {
     /// Deploy roots and installed symlinks are consumers even with no process.
     pub deploy_roots: Vec<PathBuf>,
     pub install_dirs: Vec<PathBuf>,
+    /// The jobs still queued or running, so a build target whose source
+    /// worktree is gone can be told from one a job is about to use (#646).
+    /// `None` means unknown: the age floor then always applies.
+    pub open_jobs: Option<Vec<OpenJob>>,
     /// Test seam: runs after a candidate was renamed aside, before the
     /// re-proof, to simulate a late writer.
     #[cfg(test)]
@@ -267,6 +376,7 @@ impl ScratchConfig {
             registry_prune: true,
             deploy_roots: Vec::new(),
             install_dirs: Vec::new(),
+            open_jobs: None,
             #[cfg(test)]
             after_rename: None,
             #[cfg(test)]
@@ -332,6 +442,15 @@ pub fn lander_scratch_roots() -> Vec<(PathBuf, RootKind)> {
     roots
 }
 
+#[cfg(target_os = "macos")]
+fn lander_start_ticks() -> io::Result<u64> {
+    match macos::probe(std::process::id())? {
+        macos::Probe::Started(micros) => Ok(micros),
+        macos::Probe::Gone => Err(io::Error::other("cannot read lander start time")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn lander_start_ticks() -> io::Result<u64> {
     let pid = std::process::id();
     fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -365,7 +484,7 @@ pub fn register_lander_owner_in(
     sandbox: &Path,
 ) -> io::Result<()> {
     let ticks = lander_start_ticks()?;
-    let host = HostIdentity::read(Path::new("/proc"))
+    let host = HostIdentity::current(Path::new("/proc"))
         .ok_or_else(|| io::Error::other("cannot read PID namespace identity"))?;
     let (pinned, _entry) = record::allocate(
         registry_path,
@@ -477,6 +596,46 @@ pub struct EntryReport {
     pub holder_proof: Option<ProofFailure>,
 }
 
+/// Build targets one report names, at most (#3261); the totals stay exact.
+const MAX_BUILD_TARGETS_REPORTED: usize = 64;
+/// Build-target lines one logged pass writes, at most.
+const MAX_BUILD_TARGET_LOG_LINES: usize = 16;
+
+/// What one pass decided about one registered manager build target (#3261).
+#[derive(Clone, Debug, Serialize)]
+pub struct BuildTargetReport {
+    /// The allocation's directory name under `build-targets`.
+    pub name: String,
+    pub decision: Decision,
+    /// Why the decision stands: a closed token, see [`decision_reason`].
+    pub reason: &'static str,
+    /// Allocated bytes, when the walk fitted the pass budget.
+    pub bytes: Option<u64>,
+    /// Seconds since the newest write below it, when established.
+    pub idle_secs: Option<u64>,
+    /// The worktree the target was allocated for, when it was recorded (#646).
+    pub worktree: Option<String>,
+    /// An open job working in that worktree, when one is known (#646).
+    pub job_id: Option<String>,
+}
+
+/// The closed reason token a decision is reported under.
+#[must_use]
+pub fn decision_reason(decision: Decision) -> &'static str {
+    match decision {
+        Decision::Reclaim => "reclaimable",
+        Decision::Young => "idle_below_age_floor",
+        Decision::Held => "held_by_consumer",
+        Decision::DirtyWorktree => "dirty_git_worktree",
+        Decision::Unpublished => "unpublished_git_history",
+        Decision::Unrecorded => "unrecorded_allocation",
+        Decision::Unproven => "not_provable_safe",
+        Decision::Changed => "changed_during_proof",
+        Decision::Partial => "removal_unfinished",
+        Decision::Failed => "removal_failed",
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScratchReport {
     pub dry_run: bool,
@@ -497,6 +656,10 @@ pub struct ScratchReport {
     pub refused_roots: u32,
     pub budget_exhausted: bool,
     pub entries: Vec<EntryReport>,
+    /// Every registered build target the pass met (#3261), bounded.
+    pub build_targets: Vec<BuildTargetReport>,
+    /// Build targets met, including those past the bound.
+    pub build_targets_total: u32,
     /// Blocking processes named in `entries` so far (capped per report).
     #[serde(skip)]
     blockers_named: usize,
@@ -567,6 +730,46 @@ impl ScratchReport {
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    fn note_build_target(
+        &mut self,
+        name: &str,
+        decision: Decision,
+        bytes: Option<u64>,
+        idle_ns: Option<i128>,
+    ) {
+        self.note_build_target_owned(name, decision, bytes, idle_ns, None);
+    }
+
+    fn note_build_target_owned(
+        &mut self,
+        name: &str,
+        decision: Decision,
+        bytes: Option<u64>,
+        idle_ns: Option<i128>,
+        owner: Option<cargo_targets::TargetOwner>,
+    ) {
+        self.build_targets_total += 1;
+        if self.build_targets.len() >= MAX_BUILD_TARGETS_REPORTED {
+            return;
+        }
+        self.build_targets.push(BuildTargetReport {
+            name: name.to_string(),
+            decision,
+            reason: decision_reason(decision),
+            bytes,
+            idle_secs: idle_ns.map(|ns| u64::try_from(ns / 1_000_000_000).unwrap_or(0)),
+            worktree: owner.as_ref().map(|owner| owner.worktree.clone()),
+            job_id: owner.and_then(|owner| owner.job),
+        });
+    }
+
+    /// Whether `path` is a child of the manager build-targets root.
+    fn is_build_target(&self, path: &Path) -> bool {
+        path.parent()
+            .is_some_and(cargo_targets::is_build_targets_root)
+    }
+
     fn refuse_root(&mut self, root: &Path) {
         self.refused_roots += 1;
         self.push_entry(root, Decision::Unproven, 0, None);
@@ -584,9 +787,66 @@ pub fn last_report() -> Option<ScratchReport> {
         .clone()
 }
 
-/// Run one pass with the standard config and log what it freed.
+/// One bounded line per registered build target the pass met, with its reason
+/// (#3261): a manager can see why the space stays pinned. Reclaimed targets are
+/// named too, so a freed target is traceable to the pass that removed it.
+fn log_build_targets(trigger: &str, report: &ScratchReport) {
+    for target in report.build_targets.iter().take(MAX_BUILD_TARGET_LOG_LINES) {
+        tracing::info!(
+            trigger,
+            dry_run = report.dry_run,
+            target = %target.name,
+            decision = ?target.decision,
+            reason = target.reason,
+            bytes = target.bytes,
+            idle_secs = target.idle_secs,
+            "Agent scratch reclaim build target decision"
+        );
+    }
+    let logged = u32::try_from(report.build_targets.len().min(MAX_BUILD_TARGET_LOG_LINES))
+        .unwrap_or(u32::MAX);
+    let unlogged = report.build_targets_total.saturating_sub(logged);
+    if unlogged > 0 {
+        tracing::info!(
+            trigger,
+            build_targets_total = report.build_targets_total,
+            unlogged,
+            "Agent scratch reclaim build target decisions truncated"
+        );
+    }
+}
+
+/// The jobs still queued or running, for [`ScratchConfig::open_jobs`]. `None`
+/// when the store cannot say, which keeps the age floor on every build target.
+#[must_use]
+pub fn open_jobs(store: &rsid_store::store::Store) -> Option<Vec<OpenJob>> {
+    let rows = store.list_open_agent_jobs().ok()?;
+    Some(
+        rows.into_iter()
+            .map(|row| OpenJob {
+                id: row.job.id.to_string(),
+                cwd: PathBuf::from(row.job.cwd),
+            })
+            .collect(),
+    )
+}
+
+/// Run one pass with the standard config and log what it freed. The age floor
+/// stays on every build target: the open-job list is unknown.
 pub fn run_and_log(dry_run: bool, trigger: &str) -> ScratchReport {
-    let report = run(&ScratchConfig::standard(), SystemTime::now(), dry_run);
+    run_and_log_with_jobs(dry_run, trigger, None)
+}
+
+/// [`run_and_log`] knowing the open jobs, so a build target whose worktree is
+/// gone and that no open job names is reclaimed at once (#646).
+pub fn run_and_log_with_jobs(
+    dry_run: bool,
+    trigger: &str,
+    open_jobs: Option<Vec<OpenJob>>,
+) -> ScratchReport {
+    let mut config = ScratchConfig::standard();
+    config.open_jobs = open_jobs;
+    let report = run(&config, SystemTime::now(), dry_run);
     if report.reclaimed > 0
         || report.failed > 0
         || report.kept_dirty > 0
@@ -615,12 +875,15 @@ pub fn run_and_log(dry_run: bool, trigger: &str) -> ScratchReport {
             "Agent scratch reclaim pass completed"
         );
     }
+    log_build_targets(trigger, &report);
     // A candidate kept for lack of provenance or proof stays on disk until an
-    // operator acts (#2488): name the first few, never silently.
+    // operator acts (#2488): name the first few, never silently. A registered
+    // build target has its own line above and never competes for these slots.
     for entry in report
         .entries
         .iter()
         .filter(|entry| matches!(entry.decision, Decision::Unrecorded | Decision::Unproven))
+        .filter(|entry| !report.is_build_target(&entry.path))
         .take(8)
     {
         tracing::info!(
@@ -710,6 +973,12 @@ struct Pass<'a> {
     /// Why the last holder proof failed, for the candidate being assessed.
     /// Taken by the run loop after each candidate.
     failure: Option<ProofFailure>,
+    /// How long the candidate being assessed has been quiet, when the age was
+    /// established (#3261). Taken by the run loop after each candidate.
+    idle_ns: Option<i128>,
+    /// The source worktree and open job of the build target being assessed
+    /// (#646). Taken by the run loop after each candidate.
+    owner: Option<cargo_targets::TargetOwner>,
 }
 
 /// Whether `git` is the lander's exact registered private clone, still
@@ -791,16 +1060,20 @@ fn is_registered_clone_worktree(pinned: &Pinned, entry: &Entry, git: &GitRoot) -
 }
 
 /// A lander's workspace is private: its registered clone and the linked
-/// worktrees it made of that clone are exempt; everything else is checked.
+/// worktrees it made of that clone are exempt; a Cargo target's test-fixture
+/// repositories are exempt too (#3261); everything else is checked.
 fn git_exemption<'e>(
     kind: RootKind,
     pinned: &'e Pinned,
     entry: &'e Entry,
 ) -> impl Fn(&GitRoot) -> bool + 'e {
-    move |git| {
-        kind == RootKind::LanderScratch
-            && (is_registered_clone(pinned, entry, git)
-                || is_registered_clone_worktree(pinned, entry, git))
+    move |git| match kind {
+        RootKind::LanderScratch => {
+            is_registered_clone(pinned, entry, git)
+                || is_registered_clone_worktree(pinned, entry, git)
+        }
+        RootKind::CargoTarget => cargo_targets::is_fixture_repo(git),
+        _ => false,
     }
 }
 
@@ -815,7 +1088,22 @@ impl<'a> Pass<'a> {
             registry: Registry::open(&config.registry, uid).ok(),
             holders: None,
             failure: None,
+            idle_ns: None,
+            owner: None,
         }
+    }
+
+    /// Records the owner of a registered build target for the report, and
+    /// whether it is orphaned: its source worktree is gone, the open-job list is
+    /// known and no open job works there (#646). Anything unknown is not orphaned.
+    fn is_orphaned_build_target(&mut self, root_path: &Path, entry: &Entry) -> bool {
+        if !cargo_targets::is_build_targets_root(root_path) {
+            return false;
+        }
+        let owner = cargo_targets::owner_of(entry, self.config.open_jobs.as_deref());
+        let orphaned = owner.as_ref().is_some_and(|owner| owner.orphaned);
+        self.owner = owner;
+        orphaned
     }
 
     fn holders(&mut self, own_fds: &[RawFd]) -> Option<&holders::Holders> {
@@ -934,6 +1222,9 @@ impl<'a> Pass<'a> {
                 entry
             }
         };
+        // Name the owning worktree and job for the report whatever the verdict
+        // (#646); an orphaned target skips the age floor below.
+        let orphaned = self.is_orphaned_build_target(root_path, &entry);
         match cargo_targets::has_consumer(&path, &entry.path, self.config, &mut self.budget) {
             Ok(true) => return Assessment::Keep(Decision::Held),
             Err(_) => return Assessment::Keep(Decision::Unproven),
@@ -978,7 +1269,10 @@ impl<'a> Pass<'a> {
                 }
             }
         } else if resume.is_none() {
-            age_gate = Some(self.config.min_age);
+            // A build target whose source worktree is gone and that no open
+            // job names has nothing left to wait for (#646): no age floor.
+            // Every other proof below still runs.
+            age_gate = (!orphaned).then_some(self.config.min_age);
         }
         if let Some(gate) = age_gate
             && let Some(keep) = self.too_young(&pinned, gate)
@@ -1005,6 +1299,7 @@ impl<'a> Pass<'a> {
         } else if let Some(gate) = age_gate {
             // Quiet means quiet everywhere: a deep recent write keeps it young.
             let age = self.now_ns.saturating_sub(census.newest_mtime_ns).max(0);
+            self.idle_ns = Some(age);
             if age < i128::try_from(gate.as_nanos()).unwrap_or(i128::MAX) {
                 return Assessment::Keep(Decision::Young);
             }
@@ -1033,6 +1328,24 @@ impl<'a> Pass<'a> {
         }))
     }
 
+    /// Allocated bytes of a kept candidate, by one more bounded walk (#3261);
+    /// `None` when the budget no longer allows it. Also fills the idle age when
+    /// the proof stopped before establishing it.
+    fn measure(&mut self, root: &Pinned, cand: &Candidate) -> Option<u64> {
+        if self.budget.is_exhausted() {
+            return None;
+        }
+        let pinned = fsys::pin_child(root, &cand.name).ok()?;
+        if pinned.ident != cand.ident {
+            return None;
+        }
+        let census = fsys::census(&pinned, &mut self.budget)?;
+        if self.idle_ns.is_none() {
+            self.idle_ns = Some(self.now_ns.saturating_sub(census.newest_mtime_ns).max(0));
+        }
+        Some(census.bytes)
+    }
+
     /// `Some(reason)` to keep: too young, or the age could not be established
     /// within the budget.
     fn too_young(&mut self, pinned: &Pinned, min_age: Duration) -> Option<Decision> {
@@ -1040,6 +1353,7 @@ impl<'a> Pass<'a> {
             return Some(Decision::Unproven);
         };
         let age = self.now_ns.saturating_sub(newest).max(0);
+        self.idle_ns = Some(age);
         (age < i128::try_from(min_age.as_nanos()).unwrap_or(i128::MAX)).then_some(Decision::Young)
     }
 
@@ -1290,6 +1604,7 @@ pub fn run(config: &ScratchConfig, now: SystemTime, dry_run: bool) -> ScratchRep
                 continue;
             }
         };
+        let build_targets = cargo_targets::is_build_targets_root(root_path);
         let candidates = match pass.enumerate(&root, *kind) {
             Ok(candidates) => candidates,
             Err(_) if pass.budget.is_exhausted() => {
@@ -1308,24 +1623,65 @@ pub fn run(config: &ScratchConfig, now: SystemTime, dry_run: bool) -> ScratchRep
             }
             let path = root_path.join(&cand.name);
             pass.failure = None;
+            pass.idle_ns = None;
+            pass.owner = None;
+            let build_target = *kind == RootKind::CargoTarget && build_targets;
             match pass.assess(&root, root_path, *kind, &cand, Provenance::Recorded) {
                 Assessment::Skip | Assessment::AlreadyRecorded => {}
                 Assessment::Keep(decision) => {
                     report.considered += 1;
+                    if build_target {
+                        let bytes = pass.measure(&root, &cand);
+                        report.note_build_target_owned(
+                            &cand.name,
+                            decision,
+                            bytes,
+                            pass.idle_ns,
+                            pass.owner.take(),
+                        );
+                    }
                     report.record_with(&path, decision, 0, pass.failure.take());
                 }
                 Assessment::Reclaim(prepared) => {
                     report.considered += 1;
                     effects += 1;
                     let bytes = prepared.census.bytes;
+                    let idle_ns = pass.idle_ns;
                     if dry_run {
+                        if build_target {
+                            report.note_build_target_owned(
+                                &cand.name,
+                                Decision::Reclaim,
+                                Some(bytes),
+                                idle_ns,
+                                pass.owner.take(),
+                            );
+                        }
                         report.record(&path, Decision::Reclaim, bytes);
                         continue;
                     }
-                    match pass.reclaim(&root, root_path, *kind, &cand, &prepared) {
-                        Ok(Decision::Reclaim) => report.record(&path, Decision::Reclaim, bytes),
-                        Ok(other) => report.record_with(&path, other, 0, pass.failure.take()),
-                        Err(_) => report.record(&path, Decision::Failed, 0),
+                    let outcome = match pass.reclaim(&root, root_path, *kind, &cand, &prepared) {
+                        Ok(Decision::Reclaim) => {
+                            report.record(&path, Decision::Reclaim, bytes);
+                            Decision::Reclaim
+                        }
+                        Ok(other) => {
+                            report.record_with(&path, other, 0, pass.failure.take());
+                            other
+                        }
+                        Err(_) => {
+                            report.record(&path, Decision::Failed, 0);
+                            Decision::Failed
+                        }
+                    };
+                    if build_target {
+                        report.note_build_target_owned(
+                            &cand.name,
+                            outcome,
+                            Some(bytes),
+                            idle_ns,
+                            pass.owner.take(),
+                        );
                     }
                 }
             }

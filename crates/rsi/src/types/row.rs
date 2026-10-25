@@ -398,7 +398,9 @@ pub fn compute_session_row_for_state_with_focus(
     };
 
     // ---- Cost ----
-    let cost = if settings.is_card_field_enabled(CardField::Cost) {
+    let cost = if settings.is_card_field_enabled(CardField::Cost)
+        && crate::provider_billing_view::session_is_metered(session)
+    {
         match session.cost_usd {
             None => CostCell::Missing,
             Some(c) if c < 0.01 => CostCell::BelowThreshold,
@@ -782,6 +784,7 @@ mod tests {
         mutate_session(&mut app, session_id, |s| {
             s.status = SessionStatus::Running;
             s.model = Some("claude-sonnet-5".to_string());
+            s.provider = rsi_common::types::SessionProvider::OpenRouter;
             s.cost_usd = Some(0.42);
             s.num_turns = Some(7);
         });
@@ -910,6 +913,7 @@ mod tests {
     fn cost_below_threshold_emits_below_threshold_cell() {
         let (mut app, session_id) = one_session_app();
         mutate_session(&mut app, session_id, |s| {
+            s.provider = rsi_common::types::SessionProvider::OpenRouter;
             s.cost_usd = Some(0.005);
         });
         let row = compute_session_row(&app, session_id, &app.settings);
@@ -920,6 +924,7 @@ mod tests {
     fn cost_zero_dot_zero_one_emits_amount() {
         let (mut app, session_id) = one_session_app();
         mutate_session(&mut app, session_id, |s| {
+            s.provider = rsi_common::types::SessionProvider::OpenRouter;
             s.cost_usd = Some(0.01);
         });
         let row = compute_session_row(&app, session_id, &app.settings);

@@ -8,9 +8,11 @@
 //! revision, and a stale revision reapplies the edit to the current hooks and
 //! opens the Overwrite / Reload / Cancel prompt (the Q7 conflict check).
 //!
-//! Skills are still read from this host's `~/.claude/skills/`.
+//! Skills (local #91): the daemon owns the user skill tier
+//! (`~/.claude/skills` of the daemon user) through `ListSkills`, `GetSkill`,
+//! `SetSkillEnabled` and `DeleteSkill`; the TUI keeps the daemon's listing
+//! in `App::cached_user_skills` ([`skill_entries`]), like the desktop.
 
-use std::io;
 use std::path::PathBuf;
 
 pub use rsi_common::claude_hooks::{
@@ -164,20 +166,7 @@ pub fn flatten_hooks(hooks: &ClaudeHooks) -> Vec<HookRow> {
 // Skills (Phase 2)
 // ---------------------------------------------------------------------------
 
-/// The home directory whose `.claude/skills` is the user skill tier.
-pub(crate) fn skills_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default()
-}
-
-/// Absolute path to the user-tier skills directory.
-#[must_use]
-pub fn skills_dir() -> PathBuf {
-    skills_home().join(".claude").join("skills")
-}
-
-/// One user-installed skill under `~/.claude/skills/`.
+/// One skill of the daemon user's `~/.claude/skills/` (`ListSkills`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEntry {
     /// Display name with any `.disabled` suffix stripped.
@@ -190,24 +179,15 @@ pub struct SkillEntry {
     pub description: Option<String>,
 }
 
-/// List the skill directories of `~/.claude/skills/` through the shared
-/// `rsi_common::input_assets::list_skills` that `rsid`'s `ListSkills` serves
-/// (hub #3062): files are skipped, and so is any entry whose canonical path
-/// leaves that directory. Order is alphabetical by stripped name.
-pub fn list_user_skills() -> io::Result<Vec<SkillEntry>> {
-    list_skills_in(&skills_home())
-}
-
-pub(crate) fn list_skills_in(home: &std::path::Path) -> io::Result<Vec<SkillEntry>> {
-    use rsi_common::input_assets::{DISABLED_SKILL_SUFFIX, MAX_SKILLS, SkillScope, list_skills};
-    let scope = SkillScope::User {
-        home: home.to_path_buf(),
-    };
-    let listing = list_skills(&scope, MAX_SKILLS)?;
+/// The Settings › Claude Skills rows of a daemon `ListSkills` listing
+/// (`user: true`), in the daemon's (alphabetical) order.
+#[must_use]
+pub fn skill_entries(listing: &rsi_common::input_assets::ListSkillsResponseV1) -> Vec<SkillEntry> {
+    use rsi_common::input_assets::DISABLED_SKILL_SUFFIX;
     let dir = PathBuf::from(&listing.skills_dir);
-    Ok(listing
+    listing
         .skills
-        .into_iter()
+        .iter()
         .map(|skill| {
             let dir_name = if skill.enabled {
                 skill.name.clone()
@@ -216,82 +196,18 @@ pub(crate) fn list_skills_in(home: &std::path::Path) -> io::Result<Vec<SkillEntr
             };
             SkillEntry {
                 path: dir.join(dir_name),
-                name: skill.name,
+                name: skill.name.clone(),
                 enabled: skill.enabled,
-                description: skill.description,
+                description: skill.description.clone(),
             }
         })
-        .collect())
-}
-
-/// Enable or disable a user skill (the `e` key) through the shared
-/// `rsi_common::input_assets::toggle_skill` that `rsid`'s `SetSkillEnabled`
-/// serves (#97): renames `<name>` <-> `<name>.disabled` inside the pinned
-/// `~/.claude/skills`. Returns the new enabled state.
-pub fn toggle_skill(name: &str) -> io::Result<bool> {
-    toggle_skill_in(&skills_home(), name)
-}
-
-fn toggle_skill_in(home: &std::path::Path, name: &str) -> io::Result<bool> {
-    let scope = rsi_common::input_assets::SkillScope::User {
-        home: home.to_path_buf(),
-    };
-    Ok(rsi_common::input_assets::toggle_skill(&scope, name)?.enabled)
-}
-
-/// Delete a user skill directory (regardless of disabled state, the `d`
-/// key) through the shared `rsi_common::input_assets::delete_skill` that
-/// `rsid`'s `DeleteSkill` serves (#97): the whole tree, never following a link.
-pub fn delete_skill(name: &str) -> io::Result<()> {
-    delete_skill_in(&skills_home(), name)
-}
-
-pub(crate) fn delete_skill_in(home: &std::path::Path, name: &str) -> io::Result<()> {
-    let scope = rsi_common::input_assets::SkillScope::User {
-        home: home.to_path_buf(),
-    };
-    rsi_common::input_assets::delete_skill(&scope, name)?;
-    Ok(())
-}
-
-/// Read the SKILL.md content for a given skill name (enabled or disabled)
-/// through the shared `rsi_common::input_assets::read_skill` that `rsid`'s
-/// `GetSkill` serves (hub #3062): contained in `~/.claude/skills`, capped at
-/// `MAX_SKILL_BYTES`.
-pub fn read_skill_content(name: &str) -> io::Result<String> {
-    read_skill_content_in(&skills_home(), name)
-}
-
-fn read_skill_content_in(home: &std::path::Path, name: &str) -> io::Result<String> {
-    use rsi_common::input_assets::{MAX_SKILL_BYTES, SkillScope, read_skill};
-    let scope = SkillScope::User {
-        home: home.to_path_buf(),
-    };
-    Ok(read_skill(&scope, name, MAX_SKILL_BYTES)?.content)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    /// Per-process unique tempdir under the system temp root. Avoids the
-    /// `tempfile` dependency since `rsi` doesn't already pull it in.
-    fn fresh_tmp(label: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "rsi-claude-config-{}-{}-{}",
-            label,
-            std::process::id(),
-            n
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn hook_command_default_timeout() {
@@ -409,100 +325,35 @@ mod tests {
 
     // --- Skills tests --------------------------------------------------------
 
-    fn touch_skill(root: &std::path::Path, name: &str, description: Option<&str>) {
-        let skill_dir = root.join(name);
-        fs::create_dir_all(&skill_dir).unwrap();
-        let body = match description {
-            Some(d) => format!("---\ndescription: {}\n---\n\nhello\n", d),
-            None => "no frontmatter\n".to_string(),
-        };
-        fs::write(skill_dir.join("SKILL.md"), body).unwrap();
-    }
-
     #[test]
-    fn list_user_skills_filters_files_and_strips_disabled_suffix() {
-        let home = fresh_tmp("skills");
-        let dir = home.join(".claude").join("skills");
-        // alpha — enabled, with description
-        touch_skill(&dir, "alpha", Some("Alpha skill"));
-        // beta.disabled — disabled
-        touch_skill(&dir, "beta.disabled", Some("Beta skill"));
-        // gamma — enabled, no frontmatter
-        touch_skill(&dir, "gamma", None);
-        // a stray plain file
-        fs::write(dir.join("README.txt"), "ignore me").unwrap();
-
-        let skills = list_skills_in(&home).unwrap();
-        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
-
-        let alpha = skills.iter().find(|s| s.name == "alpha").unwrap();
-        assert!(alpha.enabled);
-        assert_eq!(alpha.description.as_deref(), Some("Alpha skill"));
-        assert_eq!(alpha.path, dir.canonicalize().unwrap().join("alpha"));
-
-        let beta = skills.iter().find(|s| s.name == "beta").unwrap();
-        assert!(!beta.enabled);
-        assert_eq!(beta.description.as_deref(), Some("Beta skill"));
-        assert_eq!(beta.path, dir.canonicalize().unwrap().join("beta.disabled"));
-
-        let gamma = skills.iter().find(|s| s.name == "gamma").unwrap();
-        assert!(gamma.enabled);
-        assert!(gamma.description.is_none());
-    }
-
-    #[test]
-    fn toggle_skill_round_trips() {
-        let home = fresh_tmp("toggle");
-        let dir = home.join(".claude").join("skills");
-        touch_skill(&dir, "demo", None);
-
-        let now_enabled = toggle_skill_in(&home, "demo").unwrap();
-        assert!(!now_enabled, "first toggle must disable");
-        assert!(dir.join("demo.disabled").exists());
-        assert!(!dir.join("demo").exists());
-
-        let now_enabled = toggle_skill_in(&home, "demo").unwrap();
-        assert!(now_enabled, "second toggle must re-enable");
-        assert!(dir.join("demo").exists());
-        assert!(!dir.join("demo.disabled").exists());
-
-        let missing = toggle_skill_in(&home, "nope").unwrap_err();
-        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
-    }
-
-    #[test]
-    fn delete_skill_removes_directory() {
-        let home = fresh_tmp("delete");
-        let dir = home.join(".claude").join("skills");
-        touch_skill(&dir, "tobedeleted", None);
-        assert!(dir.join("tobedeleted").exists());
-        delete_skill_in(&home, "tobedeleted").unwrap();
-        assert!(!dir.join("tobedeleted").exists());
-    }
-
-    #[test]
-    fn delete_skill_works_on_disabled_dir_too() {
-        let home = fresh_tmp("delete-disabled");
-        let dir = home.join(".claude").join("skills");
-        touch_skill(&dir, "x.disabled", None);
-        delete_skill_in(&home, "x").unwrap();
-        assert!(!dir.join("x.disabled").exists());
-        let escape = delete_skill_in(&home, "../x").unwrap_err();
-        assert_eq!(escape.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn read_skill_content_returns_md_body() {
-        let home = fresh_tmp("read-content");
-        let dir = home.join(".claude").join("skills");
-        touch_skill(&dir, "demo", Some("Demo"));
-        touch_skill(&dir, "parked.disabled", Some("Parked"));
-        let content = read_skill_content_in(&home, "demo").unwrap();
-        assert_eq!(content, "---\ndescription: Demo\n---\n\nhello\n");
-        let parked = read_skill_content_in(&home, "parked").unwrap();
-        assert!(parked.contains("Parked"));
-        let escape = read_skill_content_in(&home, "../demo").unwrap_err();
-        assert_eq!(escape.kind(), io::ErrorKind::InvalidInput);
+    fn skill_entries_map_the_daemon_listing_to_rows() {
+        let listing: rsi_common::input_assets::ListSkillsResponseV1 =
+            serde_json::from_value(serde_json::json!({
+                "skills_dir": "/home/op/.claude/skills",
+                "skills": [
+                    {"name": "alpha", "enabled": true, "description": "Alpha skill", "has_skill_md": true},
+                    {"name": "beta", "enabled": false, "description": null, "has_skill_md": true}
+                ],
+                "truncated": false,
+                "skipped_outside_root": 0
+            }))
+            .unwrap();
+        assert_eq!(
+            skill_entries(&listing),
+            vec![
+                SkillEntry {
+                    name: "alpha".to_string(),
+                    path: PathBuf::from("/home/op/.claude/skills/alpha"),
+                    enabled: true,
+                    description: Some("Alpha skill".to_string()),
+                },
+                SkillEntry {
+                    name: "beta".to_string(),
+                    path: PathBuf::from("/home/op/.claude/skills/beta.disabled"),
+                    enabled: false,
+                    description: None,
+                },
+            ]
+        );
     }
 }

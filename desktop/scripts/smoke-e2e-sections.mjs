@@ -12,6 +12,32 @@ const fail = (note, evidence = {}) => ({ status: 'fail', note, evidence });
 /** The synthetic credential the Provider keys step types. Never a real key. */
 export const SYNTHETIC_KEY = 'synthetic-e2e-key-0001';
 
+/**
+ * Hub #3280: DOM expressions that drive the Settings pane's shared text editor by mouse: the rail group,
+ * the section tab, the row's value cell, the editor's own buttons and its error line.
+ */
+export const settingsMouse = {
+  group: (label) => `[...document.querySelectorAll('#settings-view .settings-rail button')].find((b) => (b.querySelector('.sg-label') || {}).textContent === ${JSON.stringify(label)})`,
+  tab: (section) => `[...document.querySelectorAll('#settings-view .settings-tabs button')].find((b) => b.dataset.section === ${JSON.stringify(section)})`,
+  value: (label) => `(([...document.querySelectorAll('#settings-view .settings-row')].find((r) => (r.querySelector('.sv-label') || {}).textContent === ${JSON.stringify(label)})) || document.createElement('i')).querySelector('.sv-value')`,
+  open: `!!document.querySelector('#settings-text[open]')`,
+  button: (text) => `[...document.querySelectorAll('#settings-text[open] .pick-actions button')].find((b) => b.textContent === ${JSON.stringify(text)})`,
+  error: `(document.querySelector('#settings-text[open] .form-error:not([hidden])') || {}).textContent || ''`,
+  status: `(document.querySelector('#settings-view .settings-head-status') || {}).textContent || ''`,
+};
+
+/**
+ * Open a Settings text row's editor with mouse clicks only: the group in the rail, the section tab, then the
+ * row's value (one click on the row's value opens its editor, local #269; a second try covers a slow redraw). The
+ * editor's input has focus with its text selected, so typed keys replace the value. True once it is open.
+ */
+export async function openTextRowByMouse(page, { group, section, label }) {
+  await page.click(settingsMouse.group(group)); await sleep(250);
+  await page.click(settingsMouse.tab(section)); await sleep(250);
+  for (let i = 0; i < 2 && !(await page.eval(settingsMouse.open)); i++) { await page.click(settingsMouse.value(label)); await sleep(350); }
+  return page.waitFor(settingsMouse.open, 3000);
+}
+
 const cursorIndex = `[...document.querySelectorAll('#session-list li')].findIndex(l => l.classList.contains('cursor'))`;
 
 /** Show completed sessions (the seeded one is finished), then park focus on the page body. */
@@ -47,6 +73,65 @@ async function openLeaf(h) {
 
 const vimOn = (page) => page.eval(`document.getElementById('vim-keys').checked`);
 const stored = (page) => page.eval(`localStorage.getItem('rsi.desktop.vimKeys')`);
+
+/**
+ * Local #150: open the seeded, finished, SUCCEEDED graph run in the graph review and check what the DOM renders
+ * against rsid's own GetWorkflowExecution. Expects the graph review open on a draft (step 1 leaves it there).
+ */
+async function seededRunSteps(h, step) {
+  const { page } = h;
+  const run = h.seed.graphRun;
+  const out = { title: null, nodes: null };
+  if (!run) { step('seeded-precondition', 'the seed carries a succeeded graph run', fail('h.seed.graphRun is missing (smoke-isolated.mjs seedSynthetic)')); return out; }
+  // rsid first: the seeded run is there, succeeded, and every node settled succeeded with its result.
+  const lookup = (await h.rpc('GetWorkflowExecution', { execution_id: run.executionId })).lookup ?? {};
+  const ex = lookup.execution ?? null;
+  const lastState = (id) => [...(ex?.updates ?? [])].reverse().find((u) => u.node_id === id && u.node_state) ?? null;
+  const daemonNodes = run.nodes.map((n) => {
+    const settled = lastState(n.id);
+    const attempt = (ex?.node_attempts ?? []).find((a) => a.node_id === n.id) ?? null;
+    return { id: n.id, state: settled?.node_state ?? null, preview: settled?.output_preview ?? '', attempt: attempt?.attempt_no ?? null, round: attempt ? attempt.iteration + 1 : null, result: n.result };
+  });
+  const daemonOk = lookup.status === 'found' && ex.status === 'succeeded' && ex.workflow_id === run.workflowId && !!ex.finished_at
+    && daemonNodes.every((n) => n.state === 'succeeded' && n.attempt === 1 && n.round === 1 && n.preview.includes(n.result));
+  step('seeded-daemon', 'rsid holds the seeded run: succeeded, each node succeeded on attempt 1 with its result (GetWorkflowExecution)', daemonOk
+    ? pass(`GetWorkflowExecution ${run.executionId.slice(0, 8)}: succeeded; ${daemonNodes.map((n) => `${n.id} ${n.state} attempt ${n.attempt} (${n.preview})`).join('; ')}`, { executionId: run.executionId, nodes: daemonNodes })
+    : fail(`rsid: ${lookup.status} ${ex?.status ?? '-'}; nodes ${JSON.stringify(daemonNodes)}`));
+  if (!daemonOk) return out;
+
+  // The page: the desktop's remembered last run for the workflow, then o, the seeded workflow, Enter.
+  await page.eval(`(() => { const k = 'rsi.graph.lastExecution'; const all = JSON.parse(localStorage.getItem(k) || '{}'); all[${JSON.stringify(run.workflowId)}] = ${JSON.stringify(run.executionId)}; localStorage.setItem(k, JSON.stringify(all)); return true; })()`);
+  if (await page.eval(`document.getElementById('graph-view').hidden`)) { await page.keys(' v'); await page.waitFor(`!document.getElementById('graph-view').hidden`, 6000); }
+  // The pickers stay shut while the page still polls step 1's run as active (graph-model.ts readOnly); wait for its end.
+  await page.waitFor(`!/ (accepted|running)$/.test((document.querySelector('.gv-run-title')||{}).textContent || '')`, 10000);
+  // Step 1's toasts take the focus; the pane's keys need it back, as a click on the pane would give it.
+  await page.eval(`document.getElementById('graph-view').focus({ preventScroll: true })`);
+  await page.key('o');
+  const listed = await page.waitFor(`[...document.querySelectorAll('.gv-picker li')].some((li) => li.innerText.includes(${JSON.stringify(run.title)}))`, 6000);
+  let selected = false;
+  for (let i = 0; listed && i < 8 && !selected; i++) {
+    selected = await page.eval(`(document.querySelector('.gv-picker li.sel')||{}).innerText?.includes(${JSON.stringify(run.title)}) === true`);
+    if (!selected) { await page.key('j'); await sleep(150); }
+  }
+  step('seeded-pick', 'o lists the seeded workflow and the picker selects it', listed && selected ? pass(`the saved-workflow picker selected "${run.title}" (ListWorkflows)`) : fail(`listed ${listed}, selected ${selected}: ${(await h.text("#graph-view")).slice(0, 300)} active=${await page.eval("document.activeElement && (document.activeElement.id || document.activeElement.className)")} toast=${await h.text("#toast")}`));
+  if (!(listed && selected)) return out;
+  await page.key('Enter');
+  const want = (n) => `${n.id}  succeeded  attempt 1 round 1`;
+  const rendered = await page.waitFor(`(() => { const t = (document.querySelector('.gv-run-title')||{}).textContent || ''; const rows = [...document.querySelectorAll('.gv-run-node')].map((e) => e.textContent.trim()); return t === ${JSON.stringify(`${run.title} succeeded`)} && ${JSON.stringify(run.nodes.map(want))}.every((w) => rows.includes(w)); })()`, 8000);
+  const dom = await page.eval(`({ title: (document.querySelector('.gv-run-title')||{}).textContent || '', rows: [...document.querySelectorAll('.gv-run-node')].map((e) => e.textContent.trim()), badges: [...document.querySelectorAll('.gv-node .gv-node-badge')].map((e) => e.textContent), canvas: (document.querySelector('.graph-canvas')||{}).textContent || '' })`);
+  out.title = dom.title;
+  out.nodes = dom.rows.join(' | ');
+  const badges = dom.badges.length === run.nodes.length && dom.badges.every((b) => b === '✓') && run.nodes.every((n) => dom.canvas.includes(n.name));
+  step('seeded-render', 'the run view renders the run succeeded and each node succeeded on attempt 1, with a success badge on every node', rendered && badges
+    ? pass(`run view: "${dom.title}"; ${dom.rows.join('; ')}; canvas badges ${dom.badges.join(' ')}`, { dom })
+    : fail(`rendered ${rendered}, badges ${badges}: ${JSON.stringify(dom)}`));
+  // The DOM and rsid agree node by node (the page shows rsid's state, not a local guess).
+  const agree = rendered && daemonNodes.every((n) => dom.rows.includes(`${n.id}  ${n.state}  attempt ${n.attempt} round ${n.round}`)) && dom.title === `${run.title} ${ex.status}`;
+  step('seeded-readback', 'what the DOM shows equals rsid\'s GetWorkflowExecution, run and per node', agree
+    ? pass(`DOM "${dom.title}" = rsid ${ex.status}; per node ${daemonNodes.map((n) => `${n.id}=${n.state}/attempt ${n.attempt}`).join(', ')}`)
+    : fail(`DOM ${JSON.stringify(dom.rows)} / "${dom.title}" vs rsid ${JSON.stringify(daemonNodes)} / ${ex.status}`));
+  return out;
+}
 
 export const E2E_SECTIONS = [
   {
@@ -368,6 +453,65 @@ export const E2E_EXTRAS = [
   },
   {
     extra: true,
+    id: 'settings-text-mouse', section: '(extra) hub #3280: the Settings text editor by mouse', parityRow: 'overlay:settings-pane-space-or-set',
+    source: 'desktop/src/settings.ts (editText)',
+    interaction: 'Benchmark docker hosts is opened by mouse (rail, tab, value); Cancel writes nothing, an invalid host shows the error and stays open, Save writes the host now (UpdateDaemonConfig) and rsid reads it back; Stall classifier model is staged with Stage (1 pending) and discarded by mouse',
+    async run(h) {
+      const { page } = h;
+      const field = 'bench.docker_hosts';
+      const read = async () => (await h.rpc('GetDaemonConfig', {}))[field];
+      const before = await read();
+      const host = 'ssh://e2e-mouse-host';
+      const bench = { group: 'PROVIDERS & SANDBOXES', section: 'benchmarks', label: 'Benchmark docker hosts' };
+      await h.command('set');
+      if (!(await page.waitFor(`!document.getElementById('settings-view').hidden && document.getElementById('settings-view').innerText.includes('AGENT AUTOMATION')`, 5000))) return fail('Settings did not boot from rsid');
+      const evidence = { before };
+      // Cancel by mouse: the typed value is dropped and rsid is unchanged.
+      if (!(await openTextRowByMouse(page, bench))) return fail('clicking the Benchmark docker hosts value never opened its editor', evidence);
+      if (!(await page.eval(`!!(${settingsMouse.button('Save')}) && !!(${settingsMouse.button('Cancel')})`))) return fail('the editor has no Save and Cancel buttons', evidence);
+      await page.keys('ssh://e2e-cancelled'); await sleep(150);
+      await page.click(settingsMouse.button('Cancel')); await sleep(800);
+      evidence.afterCancel = await read();
+      if (await page.eval(settingsMouse.open)) return fail('Cancel did not close the editor', evidence);
+      if (evidence.afterCancel !== before) return fail('Cancel wrote to rsid', evidence);
+      // An invalid host: rsid refuses it, the editor shows the error and stays open.
+      if (!(await openTextRowByMouse(page, bench))) return fail('the editor did not reopen', evidence);
+      await page.keys('laptop'); await sleep(150);
+      await page.click(settingsMouse.button('Save'));
+      await page.waitFor(`(${settingsMouse.error}) !== ''`, 4000);
+      evidence.refused = await page.eval(settingsMouse.error);
+      if (!evidence.refused || !(await page.eval(settingsMouse.open))) return fail('an invalid host neither showed an error nor kept the editor open', evidence);
+      // Save by mouse: written now and read back from rsid.
+      await page.click(`document.querySelector('#settings-text[open] input')`);
+      await page.eval(`(() => { const i = document.querySelector('#settings-text[open] input'); i.select(); })()`);
+      await page.keys(host); await sleep(150);
+      await page.click(settingsMouse.button('Save'));
+      let after = before;
+      for (let i = 0; i < 20 && after !== host; i++) { await sleep(200); after = await read(); }
+      evidence.afterSave = after;
+      await sleep(400);
+      const closed = !(await page.eval(settingsMouse.open));
+      // A staged text row: Stage by mouse leaves one pending change and writes nothing yet.
+      const model = 'e2e-mouse-model';
+      const liveModel = (await h.rpc('GetDaemonConfig', {})).stall_classifier_model;
+      if (!(await openTextRowByMouse(page, { group: 'MODELS', section: 'model_roles', label: 'Stall classifier model' }))) return fail('the Stall classifier model editor did not open by mouse', evidence);
+      if (!(await page.eval(`!!(${settingsMouse.button('Stage')})`))) return fail('a staged row\'s editor has no Stage button', evidence);
+      await page.keys(model); await sleep(150);
+      await page.click(settingsMouse.button('Stage')); await sleep(500);
+      evidence.staged = await page.eval(settingsMouse.status);
+      const stagedOnly = (await h.rpc('GetDaemonConfig', {})).stall_classifier_model === liveModel;
+      await page.click(`document.querySelector('#settings-view [data-settings="discard"]')`); await sleep(400);
+      evidence.discarded = await page.eval(settingsMouse.status);
+      await h.rpc('UpdateDaemonConfig', { updates: [{ field, value: before ?? '' }] });
+      await h.closeAll();
+      if (after !== host || !closed) return fail(`Save did not write ${host} and close (rsid ${JSON.stringify(after)}, closed ${closed})`, evidence);
+      if (!evidence.staged.includes('1 pending') || !stagedOnly) return fail('Stage did not stage exactly one pending change without a write', evidence);
+      if (!evidence.discarded.includes('No pending')) return fail('Discard did not clear the staged value', evidence);
+      return pass(`by mouse only: Cancel kept ${JSON.stringify(before)}, an invalid host showed "${evidence.refused.slice(0, 60)}", Save wrote ${after} (rsid read back), Stage left 1 pending with no write`, evidence);
+    },
+  },
+  {
+    extra: true,
     id: 'settings-state', section: '(extra) Settings daemon-state rows (local #125)', parityRow: 'overlay:settings-pane-space-or-set',
     source: 'desktop/src/settings-state.ts, desktop/src/settings-model.ts, desktop/src-tauri/src/settings_state.rs',
     interaction: 'the status rows load their line from rsid; the Model control mode row is stepped with Space and applied with w (UpdateModelControlPolicy), read back from rsid; a TUI-only row says so',
@@ -401,7 +545,7 @@ export const E2E_EXTRAS = [
       let after = before;
       for (let i = 0; i < 20 && after === before; i++) { await sleep(200); after = await mode(); }
       await h.closeAll();
-      const loaded = Object.entries(observed).filter(([k]) => k !== 'tuiOnly').every(([, t]) => t !== '' && !t.endsWith('…') && !t.includes('Enter opens ▸'));
+      const loaded = Object.entries(observed).filter(([k]) => k !== 'tuiOnly').every(([, t]) => t !== '' && !t.endsWith('…') && !t.includes('Open ▸'));
       const evidence = { before, after, modeRow, observed };
       if (!loaded) return fail('a daemon-state row never loaded its line', evidence);
       if (!observed.tuiOnly.includes('TUI only')) return fail('the TUI-only row does not say so', evidence);
@@ -747,9 +891,9 @@ export const E2E_EXTRAS = [
   },
   {
     extra: true,
-    id: 'graph-run', section: '(extra) Local #128: a graph run binds the session\'s workflow', parityRow: 'overlay:graph-review-overlay-space-v-or-graph',
+    id: 'graph-run', section: '(extra) Local #128 + #150: a graph run binds the session\'s workflow; a seeded succeeded run renders', parityRow: 'overlay:graph-review-overlay-space-v-or-graph',
     source: 'desktop/src/graphs.ts, desktop/src/graph-model.ts, desktop/src-tauri/src/graphs.rs',
-    interaction: '<Space>v on the finished session, o and Enter open a saved one-node workflow, r runs it: ExecuteWorkflow, then UpdateSessionWorkflow links the selected session (the TUI\'s run_graph_draft); the workflow_id and the execution are read back from rsid',
+    interaction: 'Step 1 (#128, drive and read back): <Space>v on the finished session, o and Enter open a saved one-node workflow, r runs it: ExecuteWorkflow, then UpdateSessionWorkflow links the selected session (the TUI\'s run_graph_draft); the workflow_id and the execution are read back from rsid. Step 2 (#150, seeded succeeded run): o and Enter open the saved two-node workflow whose finished run rsi-e2e-seed wrote, the run view shows it succeeded with each node succeeded on attempt 1, and the same status and per-node results are read back from rsid (GetWorkflowExecution)',
     async run(h) {
       const { page } = h;
       const steps = [];
@@ -814,9 +958,14 @@ export const E2E_EXTRAS = [
       const finished = ex?.status ?? null;
       const terminal = ['succeeded', 'failed', 'cancelled', 'blocked'].includes(finished) && ex.workflow_id === workflowId;
       step('execution', 'rsid recorded the execution for the workflow and ended it', terminal ? pass(`GetWorkflowExecution ${executionId.slice(0, 8)}: ${finished}${ex.error ? ` (${String(ex.error).slice(0, 80)})` : ''}`, { executionId, status: finished }) : fail(`rsid's execution for the run: ${JSON.stringify(ex?.status ?? null)} (id ${executionId})`));
+
+      // Step 2 (local #150): the SUCCEEDED run rsi-e2e-seed wrote (smoke-isolated.mjs SEEDED_GRAPH_RUN). The desktop
+      // remembers each workflow's last run (localStorage, as the TUI keeps a draft's last_execution_id); the harness
+      // stands in for an earlier app session that showed this run, then opens the workflow from the saved picker.
+      const seeded = await seededRunSteps(h, step);
       await h.closeAll();
       const bad = steps.filter((x) => x.status !== 'pass');
-      return { status: bad.length ? 'fail' : 'pass', note: bad.length ? `${bad[0].id}: ${bad[0].note}` : `the run was accepted, UpdateSessionWorkflow set the session's workflow_id to the workflow in rsid, and the execution ended "${finished}" with no provider`, evidence: { workflowId, linked, executionId, execution: finished }, steps };
+      return { status: bad.length ? 'fail' : 'pass', note: bad.length ? `${bad[0].id}: ${bad[0].note}` : `step 1: the run was accepted, UpdateSessionWorkflow set the session's workflow_id to the workflow in rsid, and the execution ended "${finished}" with no provider; step 2: the seeded run rendered "${seeded.title}" with ${seeded.nodes} and rsid read back the same succeeded status and per-node results`, evidence: { workflowId, linked, executionId, execution: finished, seeded }, steps };
     },
   },
 ];

@@ -533,6 +533,173 @@ async fn manager_intent_completed_lead_with_own_wake_stays_parked_until_wake_dis
     }
 }
 
+/// #3896: seed one open (`running`) daemon job owned by the lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn lead_open_job(p: &Pilot, wake: rsi_common::agent_jobs::JobWake) -> Uuid {
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::JobParams;
+    let id = Uuid::new_v4();
+    let dir = p._dir.path();
+    let params: JobParams =
+        serde_json::from_value(serde_json::json!({"kind": "test", "shard": "store-01"})).unwrap();
+    p.manager
+        .store
+        .lock()
+        .await
+        .insert_agent_job(
+            &NewAgentJob {
+                id,
+                owner_session_id: p.lead,
+                project_id: Some(p.project),
+                name: None,
+                params,
+                cwd: dir.display().to_string(),
+                unit_name: format!("rsi-job-3896-{id}"),
+                log_path: dir.join("log").display().to_string(),
+                status_path: dir.join("status").display().to_string(),
+                idempotency_key: None,
+                wake,
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    id
+}
+
+/// #3896: seed one live rolling-queue entry whose settlement wakes the lead.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+async fn lead_queue_entry(p: &Pilot) {
+    use crate::store::rolling_queue::NewQueueEntry;
+    use rsi_common::rolling_queue::RollingQueueBinding;
+    let commit = git(&p.repo, &["rev-parse", "HEAD"]).trim().to_owned();
+    p.manager
+        .store
+        .lock()
+        .await
+        .enqueue_rolling_queue_source_for(
+            &NewQueueEntry {
+                project_id: Some(p.project),
+                repo_path: p.repo.display().to_string(),
+                source_commit: commit,
+                source_session_id: p.lead,
+                owner_epic_id: Some(p.epic),
+                binding: RollingQueueBinding::Unbound,
+                work_key: None,
+                migration_version: None,
+                hot_files: Vec::new(),
+                test_filters: Vec::new(),
+                fixes_tests: Vec::new(),
+                idempotency_key: "intent-parked-3896".to_owned(),
+            },
+            Some(p.lead),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+}
+
+/// #3896: a Completed lead waiting on a job, queue entry or wake the daemon
+/// will wake it for is parked: no recovery resume, nothing counted against
+/// the recovery budget, and the intent reads `parked` (with what it waits on)
+/// where it used to end `blocked` on the exhausted budget.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_lead_parked_on_its_job_queue_entry_or_wake_is_not_resumed() {
+    for parked_on in ["job", "queue", "wake"] {
+        let p = pilot().await;
+        work(&p, "parked-3896-product").await;
+        p.manager
+            .store
+            .lock()
+            .await
+            .update_session_status(p.lead, SessionStatus::Completed)
+            .unwrap();
+        match parked_on {
+            "job" => {
+                lead_open_job(&p, rsi_common::agent_jobs::JobWake::Owner).await;
+            }
+            "queue" => lead_queue_entry(&p).await,
+            _ => {
+                intent_when_wake(
+                    &p,
+                    rsi_common::wake_predicate::WakePredicate {
+                        issue_closed: Some(7),
+                        ..Default::default()
+                    },
+                    60,
+                    Some(600),
+                )
+                .await;
+            }
+        }
+        // Far more passes than the recovery budget allows resumes.
+        for _ in 0..(p.policy.max_recovery_attempts + 2) {
+            let pass = reconcile(&p).await;
+            assert_eq!(
+                (pass.unfinished, pass.queued, pass.blocked),
+                (1, 0, 0),
+                "{parked_on}"
+            );
+            let state = intent(&p).await;
+            assert_eq!(state["state"], "parked", "{parked_on}: {state}");
+            assert_eq!(state["parked_on"], parked_on, "{parked_on}: {state}");
+            assert_eq!(count_actions(&p).await, 0, "{parked_on}: budget untouched");
+        }
+        assert_eq!(intent_notice_count(&p).await, 0, "{parked_on}");
+    }
+}
+
+/// #3896: an open job nothing wakes the lead for (`wake: none`, no
+/// `jobs_terminal` wake) does not park it: the stalled lead is still recovered.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_lead_with_an_open_job_that_never_wakes_it_is_still_recovered() {
+    let p = pilot().await;
+    work(&p, "unparked-3896-product").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(p.lead, SessionStatus::Completed)
+        .unwrap();
+    lead_open_job(&p, rsi_common::agent_jobs::JobWake::None).await;
+    assert_eq!(reconcile(&p).await.queued, 1);
+    assert_eq!(intent(&p).await["state"], "recovery_action");
+    assert_eq!(count_actions(&p).await, 1);
+}
+
+/// #3896: a job-parked lead that is also past an unbounded wake reads parked,
+/// not blocked on the wake; with the job gone it is blocked on the wake again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_intent_open_job_outranks_an_unbounded_wake() {
+    let p = pilot().await;
+    work(&p, "job-over-unbounded-3896-product").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .update_session_status(p.lead, SessionStatus::Completed)
+        .unwrap();
+    intent_when_wake(
+        &p,
+        rsi_common::wake_predicate::WakePredicate {
+            issue_closed: Some(7),
+            ..Default::default()
+        },
+        2 * 3600,
+        None,
+    )
+    .await;
+    assert_eq!(reconcile(&p).await.blocked, 1);
+    assert_eq!(intent(&p).await["state"], "blocked");
+    lead_open_job(&p, rsi_common::agent_jobs::JobWake::Owner).await;
+    assert_eq!(reconcile(&p).await.blocked, 0);
+    let state = intent(&p).await;
+    assert_eq!(state["state"], "parked", "{state}");
+    assert_eq!(state["parked_on"], "job", "{state}");
+    assert_eq!(count_actions(&p).await, 0);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 async fn intent_notice_count(p: &Pilot) -> i64 {
     let store = p.manager.store.lock().await;
@@ -1422,7 +1589,11 @@ async fn manager_intent_dependencies_and_decisions_explain_unfinished_idle() {
         let row = intent(&p).await;
         if needs_decision {
             assert_eq!(row["state"], "blocked");
-            assert_eq!(row["reason"], "pending_operator_decision");
+            // #3240: named by who can answer it, with the question's first line.
+            assert_eq!(row["reason"], "pending_manager_decision");
+            assert_eq!(row["answerable_by"], "manager");
+            assert_eq!(row["decision_key"], "operator-choice");
+            assert_eq!(row["summary"], "Choose the feature behavior");
         } else {
             assert_eq!(row["state"], "dependency_wait");
             assert!(
@@ -1512,7 +1683,7 @@ async fn manager_intent_race_scenario() {
         assert_eq!(
             receipt.outcome.as_deref(),
             Some(match gate {
-                "decision" => "manager_v2_pending_operator_decision",
+                "decision" => "manager_v2_pending_manager_decision",
                 "dependency" => "manager_v2_no_ready_work",
                 _ => "manager_v2_manager_paused",
             })

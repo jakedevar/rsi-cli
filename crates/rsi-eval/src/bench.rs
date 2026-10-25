@@ -5,6 +5,13 @@
 //! * `rsi-eval bench compare <a> <b> [--fail-on-regression]`: paired compare; exit 2 on a
 //!   regression when asked. This replaces the percent threshold of `gate.rs` for bench records.
 //! * `rsi-eval bench lookup <dir> <fingerprint>`: prints the stored record path, exit 3 on a miss.
+//! * `rsi-eval bench candidate new|rename|verify|index`: the Meta-Harness candidate store (#3194,
+//!   see [`crate::candidate`]).
+//! * `rsi-eval bench select <state.json>`: the preregistered M6 loop rules (#3196,
+//!   [`crate::bench_select`]); exit 10 propose, 11 extend, 12 validate, 13 stop, 14 defer.
+//! * `rsi-eval bench digest --record <record.json> --out <dir>`: bounded mechanical per-trial trace
+//!   excerpts of search-split runs for the Meta-Harness proposer (#3195,
+//!   [`crate::bench_digest`]); exit 4 when a trial is not in `split.json` `search`.
 //!
 //! Exit 1 is a setup error (unreadable or invalid record, mismatched task sets).
 
@@ -29,6 +36,12 @@ pub struct BenchCli {
 
 #[derive(Subcommand, Debug)]
 enum BenchCommand {
+    /// Native Terminal-Bench 2.0 tooling: leak-audit, pin-check, split, refresh-dataset.
+    #[command(disable_help_flag = true)]
+    Tb2 {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Markdown report of one record.
     Report {
         record: PathBuf,
@@ -50,6 +63,46 @@ enum BenchCommand {
     },
     /// Find a stored record whose observation fingerprint is identical.
     Lookup { dir: PathBuf, fingerprint: String },
+    /// Meta-Harness candidate store (#3194): `new`, `rename`, `verify`, `index`.
+    #[command(disable_help_flag = true)]
+    Candidate {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
+    /// Bounded, mechanical per-trial trace excerpts of a search-split record (no model calls).
+    Digest {
+        /// `BenchRunRecord` v1 of the run to digest (`record.json`).
+        #[arg(long)]
+        record: PathBuf,
+        /// Output directory (`eval/bench/tb2/candidates/<id>/digest/`).
+        #[arg(long)]
+        out: PathBuf,
+        /// `split.json`; a trial whose task is not in its `search` list is refused.
+        #[arg(long, default_value = "eval/bench/tb2/split.json")]
+        split: PathBuf,
+        /// The daemon's bench directory (default `~/.rsi/bench`).
+        #[arg(long)]
+        bench_dir: Option<PathBuf>,
+        /// Only look for traces in this run directory under the bench directory.
+        #[arg(long)]
+        run: Option<String>,
+        /// Additional Rust run or legacy Harbor job directory (or parent) holding ATIF fallbacks.
+        #[arg(long)]
+        trajectories: Option<PathBuf>,
+    },
+    /// Apply the preregistered M6 rules to a selection state file and print the next action.
+    Select {
+        /// Selection state JSON (baseline records, candidates' records, spend).
+        state: PathBuf,
+        /// Seed of the sign-flip test and the bootstrap (default fixed, so numbers reproduce).
+        #[arg(long, default_value_t = DEFAULT_BOOTSTRAP_SEED)]
+        seed: u64,
+        #[arg(long, value_enum, default_value = "markdown")]
+        format: crate::bench_select::SelectFormat,
+        /// Also write the JSON report to this path.
+        #[arg(long)]
+        json_out: Option<PathBuf>,
+    },
 }
 
 /// Reads and validates a record file.
@@ -76,13 +129,10 @@ fn record_path(dir: &Path, fingerprint: &str) -> Result<PathBuf, EvalError> {
 /// # Errors
 /// [`EvalError::Bench`] or [`EvalError::Io`].
 pub fn store_record(dir: &Path, record: &BenchRunRecord) -> Result<PathBuf, EvalError> {
+    record
+        .validate()
+        .map_err(|error| EvalError::Bench(error.to_string()))?;
     let computed = record.computed_fingerprint();
-    if computed != record.run.observation_fingerprint {
-        return Err(EvalError::Bench(format!(
-            "stored fingerprint {} does not match inputs ({computed})",
-            record.run.observation_fingerprint
-        )));
-    }
     let path = record_path(dir, &computed)?;
     std::fs::create_dir_all(dir)?;
     let json = record
@@ -116,9 +166,11 @@ pub fn lookup_reusable(
 
 fn run_command(command: BenchCommand) -> Result<ExitCode, EvalError> {
     match command {
+        BenchCommand::Tb2 { args } => Ok(crate::tb2::run_cli(args)),
         BenchCommand::Report { record, seed } => {
             let record = load_record(&record)?;
-            let summary = summarize(&record, seed);
+            let summary =
+                summarize(&record, seed).map_err(|error| EvalError::Bench(error.to_string()))?;
             println!("{}", render_bench_markdown(&record, &summary));
             Ok(ExitCode::SUCCESS)
         }
@@ -140,6 +192,41 @@ fn run_command(command: BenchCommand) -> Result<ExitCode, EvalError> {
                 },
             )
         }
+        BenchCommand::Candidate { args } => Ok(crate::candidate::run_cli(args)),
+        BenchCommand::Digest {
+            record,
+            out,
+            split,
+            bench_dir,
+            run,
+            trajectories,
+        } => {
+            let bench_dir = match bench_dir {
+                Some(dir) => dir,
+                None => crate::bench_digest::default_bench_dir()?,
+            };
+            let outcome = crate::bench_digest::run_digest(&crate::bench_digest::DigestArgs {
+                record,
+                out: out.clone(),
+                split,
+                bench_dir,
+                run,
+                trajectories,
+            })?;
+            println!(
+                "rsi-eval bench digest: {} trial file(s), {} bytes in {}",
+                outcome.trial_files,
+                outcome.total_bytes,
+                out.display()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        BenchCommand::Select {
+            state,
+            seed,
+            format,
+            json_out,
+        } => crate::bench_select::run(&state, seed, format, json_out.as_deref()),
         BenchCommand::Lookup { dir, fingerprint } => match lookup_reusable(&dir, &fingerprint)? {
             Some((path, _)) => {
                 println!("{}", path.display());
@@ -161,25 +248,33 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         Ok(code) => code,
         Err(error) => {
             eprintln!("rsi-eval: {error}");
-            ExitCode::from(1)
+            ExitCode::from(match error {
+                EvalError::HeldOutRefused { .. } => 4,
+                _ => 1,
+            })
         }
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use rsi_common::bench_record::{RunInfo, SCHEMA_VERSION, Timeouts, Totals, TrialRow};
+    use rsi_common::bench_record::{
+        EffectiveInputs, RunInfo, SCHEMA_VERSION, Timeouts, Totals, TrialRow,
+    };
     use std::collections::BTreeMap;
 
     fn trial(task: &str, passed: bool) -> TrialRow {
         TrialRow {
             attempt: 0,
+            build_sha: "b".repeat(40),
             cached_tokens: 10,
             cost_usd: 0.5,
             exception_type: None,
             failure_cause: None,
+            harness_source_digest: "sha256:src".to_string(),
+            harness_version_hash: format!("hvh-{task}"),
             image_digest: "sha256:aa".to_string(),
             infra_interrupted: false,
             invalid_route: false,
@@ -192,6 +287,8 @@ mod tests {
             session_id: None,
             split: "held_out".to_string(),
             stop_reason: None,
+            read_output_calls: 0,
+            spills: 0,
             suspected_solution_lookup: false,
             task: task.to_string(),
             trace_sha256: None,
@@ -200,18 +297,21 @@ mod tests {
         }
     }
 
-    pub(super) fn record(results: &[(&str, bool)], model: &str) -> BenchRunRecord {
+    pub(crate) fn record(results: &[(&str, bool)], model: &str) -> BenchRunRecord {
         let mut record = BenchRunRecord {
             run: RunInfo {
                 adapter_tree_hash: "tree".to_string(),
+                build_sha: "b".repeat(40),
                 concurrency: 1,
                 config_digest: "sha256:cfg".to_string(),
                 dataset_commit: "2fd12b88".to_string(),
                 dataset_repo: "harbor-framework/terminal-bench-2".to_string(),
+                effective_inputs: EffectiveInputs::default(),
                 effort: "high".to_string(),
                 finished_at: "2026-10-19T13:00:00.000000000Z".to_string(),
                 harbor_version: "0.24.0".to_string(),
                 harness_build_digest: "sha256:build".to_string(),
+                harness_source_digest: "sha256:src".to_string(),
                 host: "h".to_string(),
                 image_digests: BTreeMap::new(),
                 k: 1,
@@ -234,6 +334,25 @@ mod tests {
         };
         record.seal();
         record
+    }
+
+    #[test]
+    fn select_parses_its_arguments_with_a_fixed_default_seed() {
+        let cli = BenchCli::try_parse_from(["rsi-eval bench", "select", "state.json"]).unwrap();
+        match cli.command {
+            BenchCommand::Select {
+                state,
+                seed,
+                format,
+                json_out,
+            } => {
+                assert_eq!(state, PathBuf::from("state.json"));
+                assert_eq!(seed, DEFAULT_BOOTSTRAP_SEED);
+                assert_eq!(format, crate::bench_select::SelectFormat::Markdown);
+                assert_eq!(json_out, None);
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
     }
 
     #[test]
@@ -272,6 +391,34 @@ mod tests {
     }
 
     #[test]
+    fn report_compare_and_store_refuse_a_zero_k_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut zero = record(&[("t1", true)], "m");
+        zero.run.k = 0;
+        zero.seal();
+        assert!(store_record(dir.path(), &zero).is_err());
+        let good = record(&[("t1", true)], "m");
+        let (pz, pg) = (dir.path().join("zero.json"), dir.path().join("good.json"));
+        std::fs::write(&pz, zero.to_json().unwrap()).unwrap();
+        std::fs::write(&pg, good.to_json().unwrap()).unwrap();
+        for command in [
+            BenchCommand::Report {
+                record: pz.clone(),
+                seed: DEFAULT_BOOTSTRAP_SEED,
+            },
+            BenchCommand::Compare {
+                a: pg.clone(),
+                b: pz.clone(),
+                seed: DEFAULT_BOOTSTRAP_SEED,
+                fail_on_regression: false,
+            },
+        ] {
+            let error = run_command(command).unwrap_err().to_string();
+            assert!(error.contains("run.k"), "{error}");
+        }
+    }
+
+    #[test]
     fn report_and_compare_render_markdown_from_stored_files() {
         let dir = tempfile::tempdir().unwrap();
         let a = record(&[("t1", false), ("t2", true)], "m");
@@ -282,7 +429,7 @@ mod tests {
         let (la, lb) = (load_record(&pa).unwrap(), load_record(&pb).unwrap());
         assert_eq!(la, a);
 
-        let md = render_bench_markdown(&lb, &summarize(&lb, DEFAULT_BOOTSTRAP_SEED));
+        let md = render_bench_markdown(&lb, &summarize(&lb, DEFAULT_BOOTSTRAP_SEED).unwrap());
         assert!(md.contains("| pass rate | 100.0% |"), "{md}");
         assert!(md.contains("95% Wilson"));
         assert!(md.contains(&b.run.observation_fingerprint));

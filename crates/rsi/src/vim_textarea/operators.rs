@@ -1,6 +1,6 @@
 //! Operator-pending mode handling (d, c, y + motion/textobject).
 
-use super::motions::move_cursor_to;
+use super::motions::{move_cursor_to, move_word};
 use super::state::{CharSearchDir, VimAction, VimState};
 use crate::text_objects::{self, TextObjectKind, TextRange};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -53,24 +53,85 @@ pub(super) fn handle_operator_pending(
             move_cursor_to(textarea, row, first_non_blank);
             return result;
         }
+        KeyCode::Char('W')
+            if op == 'c'
+                && textarea.lines()[textarea.cursor().0]
+                    .chars()
+                    .nth(textarea.cursor().1)
+                    .is_some_and(|ch| !ch.is_whitespace()) =>
+        {
+            // cW includes the current WORD's end, even when already on its
+            // final character. Only subsequent counted WORDs advance from it.
+            let (row, col) = textarea.cursor();
+            let at_end = textarea.lines()[row]
+                .chars()
+                .nth(col + 1)
+                .is_none_or(|ch| ch.is_whitespace());
+            move_word(
+                textarea,
+                CursorMove::WordEnd,
+                count - usize::from(at_end),
+                true,
+            );
+            let (row, col) = textarea.cursor();
+            if col < textarea.lines()[row].chars().count() {
+                textarea.move_cursor(CursorMove::Forward);
+            }
+            true
+        }
         // Motions
-        KeyCode::Char('w') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordForward);
+        KeyCode::Char('w')
+            if op == 'c'
+                && textarea.lines()[textarea.cursor().0]
+                    .chars()
+                    .nth(textarea.cursor().1)
+                    .is_some_and(|ch| !ch.is_whitespace()) =>
+        {
+            // Vim treats cw on a nonblank as an inclusive change to the current
+            // word's end. In particular, a one-character word (or its last
+            // character) must not advance to the next word as e normally does.
+            let (row, col) = textarea.cursor();
+            if let Some(word) =
+                text_objects::word_object(textarea.lines(), row, col, TextObjectKind::Inner)
+            {
+                move_cursor_to(textarea, row, word.end_col);
             }
-            true
-        }
-        KeyCode::Char('b') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordBack);
-            }
-            true
-        }
-        KeyCode::Char('e') => {
-            for _ in 0..count {
+            for _ in 1..count {
                 textarea.move_cursor(CursorMove::WordEnd);
             }
-            textarea.move_cursor(CursorMove::Forward); // include char under cursor
+            let (row, col) = textarea.cursor();
+            if col < textarea.lines()[row].chars().count() {
+                textarea.move_cursor(CursorMove::Forward); // inclusive end
+            }
+            true
+        }
+        KeyCode::Char(ch @ ('w' | 'W')) => {
+            for step in 0..count {
+                let (row, col) = textarea.cursor();
+                move_word(textarea, CursorMove::WordForward, 1, ch == 'W');
+                if ch == 'W'
+                    && step + 1 == count
+                    && textarea.cursor().0 > row
+                    && col < textarea.lines()[row].chars().count()
+                {
+                    // A final operator W stops at this line's end rather than
+                    // consuming its newline and the next line's indentation.
+                    let end = textarea.lines()[row].chars().count();
+                    move_cursor_to(textarea, row, end);
+                }
+            }
+            true
+        }
+        KeyCode::Char(ch @ ('b' | 'B')) => {
+            move_word(textarea, CursorMove::WordBack, count, ch == 'B');
+            true
+        }
+        KeyCode::Char(ch @ ('e' | 'E')) => {
+            move_word(textarea, CursorMove::WordEnd, count, ch == 'E');
+            let (row, col) = textarea.cursor();
+            if ch == 'e' || col < textarea.lines()[row].chars().count() {
+                textarea.move_cursor(CursorMove::Forward); // include char under cursor
+            }
             true
         }
         KeyCode::Char('l') => {

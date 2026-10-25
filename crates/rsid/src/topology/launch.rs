@@ -7,6 +7,7 @@ use crate::topology::custody::{NodeForkPlan, TopologyCustody, TopologyForkSource
 use rsi_common::model_control::ModelInvocationPurpose;
 use rsi_common::types::{SandboxKind, SandboxSpec, SessionKind};
 use rsi_graph::format::NodeDef;
+use serde_json::Value;
 use uuid::Uuid;
 
 pub(crate) struct NodeLaunchBuilder<'a> {
@@ -15,6 +16,44 @@ pub(crate) struct NodeLaunchBuilder<'a> {
     pub(crate) workflow_id: Uuid,
     pub(crate) project_id: Option<Uuid>,
     pub(crate) parent_id: Option<Uuid>,
+}
+
+/// Byte ceiling for a topology node session title (matches the generated-title
+/// ceiling so the session list reads the same).
+const NODE_TITLE_MAX_BYTES: usize = 72;
+
+/// #3222: the deterministic title of a topology node session,
+/// `<node_id> #<issue>: <issue title prefix>`. The node's query opens with the
+/// untrusted-data envelope, so a model-generated title named an implement
+/// node "Reviewer: Issue Data Validation". The node id and the execution's
+/// Issue snapshot already say what the session is; no model call is needed.
+pub(crate) fn node_session_title(node_id: &str, input: Option<&Value>) -> String {
+    let issue = input.and_then(|input| input.get(crate::topology::starters::ISSUE_INPUT_KEY));
+    let number = issue
+        .and_then(|issue| issue.get("display_number"))
+        .and_then(Value::as_i64);
+    let issue_title = issue
+        .and_then(|issue| issue.get("title"))
+        .and_then(Value::as_str)
+        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let mut title = node_id.trim().to_owned();
+    if let Some(number) = number {
+        title.push_str(&format!(" #{number}"));
+    }
+    if !issue_title.is_empty() {
+        title.push_str(": ");
+        title.push_str(&issue_title);
+    }
+    if title.len() > NODE_TITLE_MAX_BYTES {
+        let mut end = NODE_TITLE_MAX_BYTES;
+        while !title.is_char_boundary(end) {
+            end -= 1;
+        }
+        title.truncate(end);
+        title.truncate(title.trim_end().len());
+    }
+    title
 }
 
 struct NodeLaunchOptions {
@@ -174,6 +213,47 @@ impl NodeLaunchBuilder<'_> {
             topology_iteration: options.iteration,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    use super::*;
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    use serde_json::json;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn title_names_node_issue_number_and_title() {
+        let input =
+            json!({"issue": {"display_number": 3222, "title": "kaizen:  topology\nnode titles"}});
+        assert_eq!(
+            node_session_title("implement", Some(&input)),
+            "implement #3222: kaizen: topology node titles"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn title_without_an_issue_is_the_node_id() {
+        assert_eq!(node_session_title("review", None), "review");
+        assert_eq!(
+            node_session_title("review", Some(&json!({"x": 1}))),
+            "review"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn title_is_clamped_at_a_char_boundary() {
+        let input = json!({"issue": {"display_number": 7, "title": "é".repeat(100)}});
+        let title = node_session_title("implement", Some(&input));
+        assert!(title.len() <= NODE_TITLE_MAX_BYTES);
+        assert!(title.starts_with("implement #7: é"));
     }
 }

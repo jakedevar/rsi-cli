@@ -1495,3 +1495,342 @@ async fn a_refused_default_settle_wake_reports_its_reason() {
             .is_empty()
     );
 }
+
+/// What a seeded settled run left behind (#3387): the input Issue's state, the
+/// review verdict, a filed follow-up and a refused Issue close.
+struct SeededRun {
+    issue_closed: bool,
+    review_verdict: &'static str,
+    followup: bool,
+    close_refused: bool,
+}
+
+impl SeededRun {
+    const CLEAN: Self = Self {
+        issue_closed: true,
+        review_verdict: "accepted",
+        followup: false,
+        close_refused: false,
+    };
+}
+
+/// Give `execution` the durable rows of a run that landed `landed` for a new
+/// input Issue, shaped by `run`. Returns the input Issue's display number.
+async fn seed_run(world: &World, execution: Uuid, run: &SeededRun, landed: &str) -> i64 {
+    let store = world.harness.executor.store.lock().await;
+    let new = |title: &str, by: Option<Uuid>| rsi_common::types::NewIssue {
+        project_id: world.project,
+        title: title.into(),
+        body: String::new(),
+        priority: None,
+        labels: Vec::new(),
+        created_by_session_id: by,
+        assignee: None,
+        idea_id: None,
+        source_event_id: None,
+        source_finding_ref: None,
+    };
+    let issue = store.create_issue(&new("the input issue", None)).unwrap();
+    if run.issue_closed {
+        store
+            .update_issue_status(issue.id, IssueStatus::Closed)
+            .unwrap();
+    }
+    if run.followup {
+        store
+            .create_issue(&new("kaizen: the run found a gap", Some(world.worker)))
+            .unwrap();
+    }
+    store
+        .conn
+        .execute(
+            "UPDATE topology_executions SET input_json=?2,project_id=?3 WHERE id=?1",
+            rusqlite::params![
+                execution.to_string(),
+                serde_json::json!({"issue": {
+                    "display_number": issue.display_number,
+                    "title": issue.title,
+                    "body": "",
+                    "project_id": world.project,
+                }})
+                .to_string(),
+                world.project.to_string(),
+            ],
+        )
+        .unwrap();
+    attempt_row(
+        &store,
+        execution,
+        world.worker,
+        ("review", "review"),
+        (0, 1),
+        "succeeded",
+        None,
+        Some(serde_json::json!({"fields": {
+            "verdict": run.review_verdict, "reviewer_model": "gpt-6-astra", "round": 1,
+        }})),
+        None,
+    );
+    let mut fields = serde_json::json!({"state": "published", "landed_sha": landed});
+    if run.close_refused {
+        fields["issue_close"] =
+            serde_json::json!({"status": "refused", "code": "agent_issue_authority_denied"});
+    }
+    attempt_row(
+        &store,
+        execution,
+        world.worker,
+        ("land", "land"),
+        (0, 1),
+        "succeeded",
+        None,
+        Some(serde_json::json!({ "fields": fields })),
+        None,
+    );
+    i64::from(issue.display_number)
+}
+
+/// Accept a fresh execution with the daemon's default settle wake, seed its
+/// run and settle it. Returns the execution and its one settle wake.
+async fn default_wake_run(
+    world: &World,
+    name: &str,
+    run: &SeededRun,
+    landed: &str,
+    status: ExecutionStatus,
+) -> (Uuid, Uuid) {
+    let flow = flow_named(world, name).await;
+    let (result, armed) = execute_with_default_wake(world, &flow, name, None).await;
+    assert!(armed, "the default arms the requester's settle wake");
+    seed_run(world, result.execution_id, run, landed).await;
+    settle(world, result.execution_id, status, None).await;
+    let wakes = settle_wakes(world, result.execution_id).await;
+    assert_eq!(wakes.len(), 1);
+    (result.execution_id, wakes[0].id)
+}
+
+/// #3387: a clean success (execution succeeded, Issue Closed, review approved,
+/// no follow-up, no refused close) opens no owner turn. It waits in the
+/// owner's digest and rides on the owner's next wake, which retires it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_clean_success_opens_no_turn_and_rides_the_next_wake_3387() {
+    let world = World::new(automation()).await;
+    let lane = Lane::new();
+    let landed = "a".repeat(40);
+    let (clean, clean_wake) = default_wake_run(
+        &world,
+        "quiet-clean",
+        &SeededRun::CLEAN,
+        &landed,
+        ExecutionStatus::Succeeded,
+    )
+    .await;
+    lane.pass(&world, clean_wake).await;
+    lane.pass(&world, clean_wake).await;
+    assert!(
+        lane.launcher.deliveries().is_empty(),
+        "a clean success opens no owner turn: {:?}",
+        lane.launcher.deliveries()
+    );
+    {
+        let store = world.harness.executor.store.lock().await;
+        let held = store
+            .quiet_settle_state(clean_wake)
+            .unwrap()
+            .and_then(|record| record.held)
+            .expect("the clean success is held in the digest");
+        assert!(held.line.contains(&clean.to_string()), "{}", held.line);
+        assert!(held.line.contains(&landed), "{}", held.line);
+        assert_eq!(
+            store
+                .held_quiet_settles(world.lead_a, Uuid::new_v4())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(settle_wakes(&world, clean).await.len(), 1, "still armed");
+
+    // The owner's next wake (a failure settles at once) carries the digest.
+    let (failed, failed_wake) = default_wake_run(
+        &world,
+        "quiet-then-failed",
+        &SeededRun::CLEAN,
+        &landed,
+        ExecutionStatus::Failed,
+    )
+    .await;
+    lane.pass(&world, failed_wake).await;
+    let deliveries = lane.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    let message = &deliveries[0].1;
+    assert!(
+        message.contains(&format!("execution_id={failed} status=failed")),
+        "{message}"
+    );
+    assert!(
+        message.contains("Clean topology successes since your last wake (1"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("execution {clean} succeeded")),
+        "{message}"
+    );
+    assert!(
+        settle_wakes(&world, clean).await.is_empty(),
+        "digest drained"
+    );
+    lane.pass(&world, clean_wake).await;
+    assert_eq!(lane.launcher.deliveries().len(), 1, "never delivered twice");
+}
+
+/// #3387: every outcome that is not a clean success still wakes the owner at
+/// once: failed, cancelled, blocked, and a `succeeded` run whose Issue stayed
+/// open (refused close), asked for changes, or filed a follow-up.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn every_non_clean_outcome_still_wakes_the_owner_at_once_3387() {
+    let world = World::new(automation()).await;
+    let landed = "b".repeat(40);
+    let cases: [(&str, SeededRun, ExecutionStatus); 7] = [
+        ("failed", SeededRun::CLEAN, ExecutionStatus::Failed),
+        ("cancelled", SeededRun::CLEAN, ExecutionStatus::Cancelled),
+        ("blocked", SeededRun::CLEAN, ExecutionStatus::Blocked),
+        (
+            "issue-open",
+            SeededRun {
+                issue_closed: false,
+                ..SeededRun::CLEAN
+            },
+            ExecutionStatus::Succeeded,
+        ),
+        (
+            "close-refused",
+            SeededRun {
+                issue_closed: false,
+                close_refused: true,
+                ..SeededRun::CLEAN
+            },
+            ExecutionStatus::Succeeded,
+        ),
+        (
+            "changes-requested",
+            SeededRun {
+                review_verdict: "changes_requested",
+                ..SeededRun::CLEAN
+            },
+            ExecutionStatus::Succeeded,
+        ),
+        (
+            "followup",
+            SeededRun {
+                followup: true,
+                ..SeededRun::CLEAN
+            },
+            ExecutionStatus::Succeeded,
+        ),
+    ];
+    for (name, run, status) in cases {
+        let lane = Lane::new();
+        let (execution, wake) =
+            default_wake_run(&world, &format!("loud-{name}"), &run, &landed, status).await;
+        lane.pass(&world, wake).await;
+        let deliveries = lane.launcher.deliveries();
+        assert_eq!(deliveries.len(), 1, "{name} wakes at once: {deliveries:?}");
+        assert!(
+            deliveries[0]
+                .1
+                .contains(&format!("execution_id={execution} ")),
+            "{name}: {}",
+            deliveries[0].1
+        );
+        assert!(
+            !deliveries[0].1.contains("Clean topology successes"),
+            "{name}: {}",
+            deliveries[0].1
+        );
+    }
+}
+
+/// #3387: a settle wake the owner armed itself keeps its immediate turn even
+/// for a clean success.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn an_owner_armed_settle_wake_keeps_its_turn_on_a_clean_success_3387() {
+    let world = World::new(automation()).await;
+    let lane = Lane::new();
+    let execution = started(&world, "quiet-manual").await;
+    seed_run(&world, execution, &SeededRun::CLEAN, &"c".repeat(40)).await;
+    let (manual, _) = arm_manual(&world, world.lead_a, execution, None).await;
+    settle(&world, execution, ExecutionStatus::Succeeded, None).await;
+    lane.pass(&world, manual.id).await;
+    assert_eq!(lane.launcher.deliveries().len(), 1);
+}
+
+/// #3387: a held success is not lost when the owner has no other wake: once it
+/// has waited the batch deadline it is delivered alone, with the rest of the
+/// digest, as one wake.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_held_success_is_delivered_as_one_batch_after_the_deadline_3387() {
+    let world = World::new(automation()).await;
+    let lane = Lane::new();
+    let landed = "d".repeat(40);
+    let (first, first_wake) = default_wake_run(
+        &world,
+        "batch-first",
+        &SeededRun::CLEAN,
+        &landed,
+        ExecutionStatus::Succeeded,
+    )
+    .await;
+    let (second, second_wake) = default_wake_run(
+        &world,
+        "batch-second",
+        &SeededRun::CLEAN,
+        &landed,
+        ExecutionStatus::Succeeded,
+    )
+    .await;
+    lane.pass(&world, first_wake).await;
+    lane.pass(&world, second_wake).await;
+    assert!(lane.launcher.deliveries().is_empty());
+
+    // The first success has now waited past the batch deadline.
+    {
+        let store = world.harness.executor.store.lock().await;
+        let mut held = store
+            .quiet_settle_state(first_wake)
+            .unwrap()
+            .and_then(|record| record.held)
+            .expect("held");
+        held.at = chrono::Utc::now()
+            - chrono::Duration::seconds(rsi_common::wake_predicate::QUIET_SETTLE_MAX_HOLD_SECS + 5);
+        store
+            .hold_quiet_settle(first_wake, &held, chrono::Utc::now())
+            .unwrap();
+    }
+    lane.pass(&world, first_wake).await;
+    let deliveries = lane.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1, "one batched wake: {deliveries:?}");
+    let message = &deliveries[0].1;
+    assert!(
+        message.contains(&format!("execution_id={first} status=succeeded")),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("execution {second} succeeded")),
+        "the batch carries the other held success: {message}"
+    );
+    assert!(
+        settle_wakes(&world, second).await.is_empty(),
+        "retired with the batch"
+    );
+    lane.pass(&world, second_wake).await;
+    assert_eq!(
+        lane.launcher.deliveries().len(),
+        1,
+        "nothing delivered twice"
+    );
+}

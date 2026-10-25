@@ -15,7 +15,7 @@ use crate::store::Store;
 use rsi_common::types::{ConversationEvent, EventType, Role, SessionStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::types::{ChildSummary, ClassificationInput};
@@ -28,7 +28,7 @@ use super::types::{ChildSummary, ClassificationInput};
 pub(crate) async fn build_classification_input(
     session_id: Uuid,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     excerpt_event_limit: usize,
     excerpt_char_cap: usize,
 ) -> Result<ClassificationInput> {
@@ -481,7 +481,7 @@ mod tests {
             ))
             .unwrap();
 
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let mut active = HashMap::new();
         let tracked = TrackedSession::new_for_test(parent.clone());
         active.insert(parent_id, tracked);
@@ -512,7 +512,7 @@ mod tests {
         store.insert_session(&child_a).unwrap();
         store.insert_session(&child_b).unwrap();
 
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let mut active = HashMap::new();
         active.insert(parent_id, TrackedSession::new_for_test(parent.clone()));
         let active = Arc::new(RwLock::new(active));
@@ -529,7 +529,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn build_classification_input_missing_session_errors() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let active: Arc<RwLock<HashMap<Uuid, TrackedSession>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let r = build_classification_input(Uuid::new_v4(), &active, &store, 10, 200).await;

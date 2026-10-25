@@ -15,7 +15,7 @@ import {
   NEW_PROMPT_CONTENT, formatSize, movePromptCursor, newPromptName, promptCursorAfter, promptListKey, promptNameError,
   relativeTime,
 } from '../dist/prompt-creator-model.js';
-import { cursorAfterDelete, skillPreviewScroll, skillRowValue, skillToggledNotice } from '../dist/skills-model.js';
+import { cursorAfterDelete, skillDeletedNotice, skillPreviewScroll, skillRowValue, skillToggledNotice } from '../dist/skills-model.js';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const snap = (over = {}) => ({
@@ -126,6 +126,7 @@ test('skills e/d go through rsid (#97): SetSkillEnabled flips the selected skill
   assert.match(ts, /if \(step\.run === null \|\| busy\) return;/);
   assert.match(ts, /invoke<SkillDeleted>\('delete_skill', \{ name: step\.run \}\)/);
   assert.match(ts, /Press d again to delete skill/);
+  assert.match(ts, /to the daemon's skill trash/);
   const rs = readFileSync(here('../src-tauri/src/input.rs'), 'utf8');
   assert.match(rs, /METHOD_SET_SKILL_ENABLED: &str = "SetSkillEnabled"/);
   assert.match(rs, /METHOD_DELETE_SKILL: &str = "DeleteSkill"/);
@@ -137,6 +138,11 @@ test('skills e/d go through rsid (#97): SetSkillEnabled flips the selected skill
 test('skills e/d notices and cursor follow the TUI', () => {
   assert.equal(skillToggledNotice({ name: 'debug', enabled: false, changed: true, path: '/s/debug.disabled' }), 'Disabled skill: debug');
   assert.equal(skillToggledNotice({ name: 'debug', enabled: true, changed: true, path: '/s/debug' }), 'Enabled skill: debug');
+  assert.equal(
+    skillDeletedNotice({ name: 'debug', enabled: true, path: '/s/debug', trash_path: '/t/20261019T000000-abcd1234/debug' }),
+    'Deleted skill: debug (moved to /t/20261019T000000-abcd1234/debug)',
+    'a delete names the trash path it is recoverable from (#91)',
+  );
   assert.equal(cursorAfterDelete(2, 2), 1, 'the last row deleted: the cursor moves up');
   assert.equal(cursorAfterDelete(0, 3), 0);
   assert.equal(cursorAfterDelete(0, 0), 0, 'an empty list keeps row 0');

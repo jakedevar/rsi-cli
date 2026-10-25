@@ -1,0 +1,36 @@
+{
+  "name": "dashboard_incomplete_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/dashboard"
+  },
+  "response": {
+    "body": {
+      "agents": [
+        {
+          "effort": "high",
+          "provider": "Claude",
+          "running": 1000
+        },
+        {
+          "effort": "xhigh",
+          "provider": "Codex",
+          "running": 24
+        }
+      ],
+      "agents_incomplete": true,
+      "agents_total": 1024,
+      "agents_truncated": false,
+      "observed_at": "2026-10-19T19:30:00.000000000Z",
+      "satellites": [],
+      "satellites_truncated": false
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

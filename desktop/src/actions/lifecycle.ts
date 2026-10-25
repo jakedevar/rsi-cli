@@ -5,10 +5,10 @@
 // calls runLifecycle / lifecycleSnapshot / openQuestionModal from its single
 // dispatch path. Daemon text is set with textContent only.
 import { type Session, api, invoke } from '../api.js';
-import { DECLINE_RESPONSE, pendingQuestions } from '../approvals-model.js';
-import { confirmDialog, forgetPause } from '../approvals.js';
+import { DECLINE_RESPONSE, SKIP_LABEL, SKIP_NOTE, SKIP_TITLE, SKIP_TOAST, pendingQuestions } from '../approvals-model.js';
+import { confirmDialog, forgetPause, offerNextWaiting } from '../approvals.js';
 import type { Invocation, SliceRuntime } from '../commands.js';
-import { $, el, onToast, toast } from '../dom.js';
+import { $, el, errorDetails, onToast, toast } from '../dom.js';
 import {
   type NoticeStore, type QuestionState, type SeenMap, type TrashState,
   EMPTY_NOTICES, activeNotices, deleteBlock, dismissAll, dismissAt, lifecycleTarget, listKey, noticeRows, openQuestion,
@@ -21,6 +21,10 @@ import { currentSessions, onUiChange, selected, state } from '../state.js';
 import { button, dialogEl, errorLine, focusDialog, overlayKey, showError } from './detail.js';
 import { type LifecycleActionId, type LifecycleSnapshot, SLICE } from './lifecycle-spec.js';
 import { focusOwnsKey } from '../modal-gate.js';
+import { loadView } from '../view-load.js';
+import { sendChord } from '../keylabel.js';
+import { currentPlatform, isVimKeysOn } from '../vimkeys.js';
+import { syncListbox } from '../listbox-a11y.js';
 
 // ---------- state ----------
 
@@ -62,6 +66,7 @@ function closeIfOpen(id: string): void {
   if (state.cursorId === id) state.cursorId = null;
   if (state.selectedId !== id) return;
   state.selectedId = null;
+  state.departed = null;
   state.selectionEpoch += 1;
   state.events = [];
   $('events').replaceChildren();
@@ -99,7 +104,7 @@ async function deleteSession(inv: Invocation): Promise<void> {
   // The TUI's confirmation is the double-tap DD (or typing the whole command).
   // Menus, the palette and buttons have no double-tap, so they ask.
   if (inv.source !== 'key') {
-    const ok = await confirmDialog(`Move "${previewQuery(s)}" to the trash? Space g X opens the trash to restore it.`, 'Delete');
+    const ok = await confirmDialog(`Move "${previewQuery(s)}" to the trash? Restore it from Go › Trash….`, 'Delete');
     if (!ok) return;
   }
   try {
@@ -117,7 +122,7 @@ async function unarchiveSession(): Promise<void> {
   if (!s) return;
   try {
     await invoke('unarchive_session', { sessionId: s.id });
-    toast(`Unarchived: ${previewQuery(s, 30)}`, true);
+    toast(`Restored: ${previewQuery(s, 30)}`, true);
     closeIfOpen(s.id);
     await reload();
   } catch (e) {
@@ -161,16 +166,16 @@ function list(label: string): HTMLUListElement {
 
 // ---------- trash browser ----------
 
-async function openTrashBrowser(): Promise<void> {
-  let sessions: Session[];
-  try {
-    sessions = await invoke<Session[]>('list_deleted_sessions', {
-      projectId: $<HTMLSelectElement>('project-filter').value || null,
-    });
-  } catch (e) {
-    toast(`Failed to load trash: ${String(e)}`);
-    return;
-  }
+function openTrashBrowser(): Promise<void> {
+  const projectId = $<HTMLSelectElement>('project-filter').value || null;
+  return loadView({
+    key: 'open-trash', title: 'Trash', failed: 'Failed to load trash',
+    read: () => invoke<Session[]>('list_deleted_sessions', { projectId }),
+    open: showTrash,
+  });
+}
+
+function showTrash(sessions: Session[]): void {
   if (sessions.length === 0) { toast('Trash is empty'); return; }
   let st: TrashState = openTrash(sessions);
   const dlg = dialogEl('trash-dialog');
@@ -205,6 +210,7 @@ async function openTrashBrowser(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     const armed = st.purge && st.purge.id === sel?.id;
     note.textContent = armed ? `Press D again within 5 s to purge "${previewQuery(sel!, 40)}" permanently.` : '';
     purgeBtn.textContent = armed ? 'Purge permanently?' : 'Purge (D)';
@@ -288,11 +294,13 @@ function openNotifications(): void {
       const active = !n.dismissed && now - n.at < n.ttl;
       const li = row(`notice notice-${n.kind}${active ? ' notice-active' : ''}`, i === at);
       li.append(noticeMsg(n.message), el('span', 'pick-id', `${active ? 'new · ' : ''}${relativeTime(new Date(n.at).toISOString(), now)}`));
+      if (n.detail) li.append(errorDetails(n.detail));
       li.addEventListener('click', () => { at = i; draw(); });
       li.addEventListener('dblclick', () => openLinked());
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
   };
   const openLinked = (): void => {
     const id = noticeRows(notices, Date.now())[at]?.sessionId;
@@ -343,6 +351,7 @@ function openRecent(): void {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
   };
   const openAt = (): void => {
     const s = recentCompletions(state.sessions)[at];
@@ -380,6 +389,9 @@ export function openQuestionModal(): void {
   const head = el('div', 'approval-header');
   const text = el('div', 'approval-q');
   const ul = list('Options');
+  ul.setAttribute('role', 'group');
+  let builtFor = -1;
+  let focusCursor = false;
   const area = el('textarea');
   area.rows = 3;
   area.setAttribute('aria-label', 'Your own answer');
@@ -387,14 +399,17 @@ export function openQuestionModal(): void {
   areaLabel.append(area);
   const err = errorLine();
   const note = hint('');
-  const declineBtn = button('Decline (d)', 'btn danger');
+  // Neutral: it sends "no preference; use your best judgment", not a "no" (local #270).
+  const declineBtn = button(`${SKIP_LABEL} (d)`);
+  declineBtn.title = SKIP_TITLE;
+  const skipNote = el('div', 'approval-note', SKIP_NOTE);
   const hideBtn = button('Hide (Esc)');
   const prevBtn = button('◀ Previous');
   const nextBtn = button('Next ▶');
-  const submitBtn = button('Submit (Ctrl+Enter)', 'btn primary');
+  const submitBtn = button(`Submit (${sendChord(currentPlatform())})`, 'btn primary');
   const actions = el('div', 'actions');
   actions.append(declineBtn, hideBtn, prevBtn, nextBtn, submitBtn);
-  box.append(title, head, text, ul, areaLabel, err, note, actions);
+  box.append(title, head, text, ul, areaLabel, err, note, actions, skipNote);
 
   const draw = (): void => {
     err.hidden = true;
@@ -405,20 +420,49 @@ export function openQuestionModal(): void {
     const chosen = st.chosen[st.current] ?? [];
     const options = q.options ?? [];
     ul.hidden = options.length === 0;
-    ul.replaceChildren(...options.map((o, i) => {
-      const li = row('question-opt', i === st.cursor[st.current] && st.mode === 'normal');
+    // Each option is a real button (role radio, or checkbox for "choose any"): a tab stop, and Space or
+    // Enter on it clicks it natively, which the Vim-off dialog gate lets through (local #246). The rows
+    // are built once per question and updated in place so focus survives a pick.
+    if (builtFor !== st.current) {
+      builtFor = st.current;
+      ul.replaceChildren(...options.map((o, i) => {
+        const li = row('question-opt', false);
+        li.removeAttribute('role');
+        li.removeAttribute('aria-selected');
+        const b = button('', 'opt-btn');
+        b.setAttribute('role', q.multiSelect ? 'checkbox' : 'radio');
+        const mark = el('span', 'opt-mark');
+        mark.setAttribute('aria-hidden', 'true');
+        b.append(mark, el('span', undefined, `${i + 1}. ${o.label}`));
+        li.append(b);
+        if (o.description) li.append(el('span', 'pick-id', o.description));
+        li.addEventListener('click', (ev) => {
+          st = pickOption(st, i);
+          draw();
+          // A mouse click leaves focus on the button; with Vim keys on Enter must keep meaning "next question".
+          if (isVimKeysOn() && ((ev as MouseEvent).detail ?? 0) > 0) focusDialog(dlg);
+        });
+        return li;
+      }));
+    }
+    const optionRows = Array.from(ul.children) as HTMLElement[];
+    optionRows.forEach((li, i) => {
+      li.classList.toggle('sel', i === st.cursor[st.current] && st.mode === 'normal');
+      const b = li.querySelector('button')!;
+      b.setAttribute('aria-checked', String(chosen.includes(i)));
       const mark = q.multiSelect ? (chosen.includes(i) ? '☑' : '☐') : (chosen.includes(i) ? '●' : '○');
-      li.append(el('span', 'opt-mark', mark), el('span', undefined, `${i + 1}. ${o.label}`));
-      if (o.description) li.append(el('span', 'pick-id', o.description));
-      li.addEventListener('click', () => { st = pickOption(st, i); draw(); });
-      return li;
-    }));
+      const m = b.querySelector('.opt-mark');
+      if (m && m.textContent !== mark) m.textContent = mark;
+    });
+    if (focusCursor && st.mode === 'normal') (optionRows[st.cursor[st.current] ?? 0]?.querySelector('button') as HTMLElement | undefined)?.focus();
+    focusCursor = false;
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
     const want = st.text[st.current] ?? '';
     if (area.value !== want) area.value = want;
     prevBtn.disabled = st.current === 0;
     nextBtn.disabled = st.current + 1 >= st.questions.length;
-    note.textContent = questionHint(st);
+    note.textContent = questionHint(st, isVimKeysOn(), currentPlatform());
+    if (isVimKeysOn()) delete note.dataset.keyPlain; else note.dataset.keyPlain = '';
     if (st.mode === 'insert') { if (document.activeElement !== area) area.focus(); }
     else if (document.activeElement === area) { area.blur(); focusDialog(dlg); }
   };
@@ -426,6 +470,7 @@ export function openQuestionModal(): void {
   const finish = async (response: string, done: string): Promise<void> => {
     try {
       await api.answerQuestion(target.id, response);
+      offerNextWaiting(target.id);
       dlg.close();
       toast(done, true);
       void refreshSessions();
@@ -438,7 +483,7 @@ export function openQuestionModal(): void {
     if (!r.ok) { showError(err, r.error); return; }
     void finish(r.text, 'Answer sent');
   };
-  const decline = (): void => void finish(DECLINE_RESPONSE, 'Declined');
+  const decline = (): void => void finish(DECLINE_RESPONSE, SKIP_TOAST);
   const step = (delta: number): void => {
     st = { ...st, current: st.current + delta, mode: (st.questions[st.current + delta]?.options?.length ?? 0) > 0 ? 'normal' : 'insert' };
     draw();
@@ -457,6 +502,8 @@ export function openQuestionModal(): void {
     if (!r.consumed) return;
     ev.preventDefault();
     st = r.st;
+    // Vim keys off: Space only reaches a focused option, so the arrows carry focus with the cursor.
+    focusCursor = !isVimKeysOn() && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp');
     if (r.effect === 'submit') submit();
     else if (r.effect === 'decline') decline();
     else if (r.effect === 'hide') dlg.close();
@@ -487,7 +534,9 @@ export function initLifecycle(): void {
   css.href = 'lifecycle.css';
   document.head.append(css);
   // The notification browser keeps what the desktop said and what the sessions did.
-  onToast((msg, ok) => { notices = pushNotice(notices, { kind: toastKind(msg, ok), message: msg }, Date.now()); });
+  onToast((msg, ok, detail) => {
+    notices = pushNotice(notices, { kind: toastKind(msg, ok, detail), ...(detail !== null ? { detail } : {}), message: msg }, Date.now());
+  });
   onUiChange(trackSessions);
 }
 

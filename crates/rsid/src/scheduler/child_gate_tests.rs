@@ -100,7 +100,7 @@ fn agent_job(
 }
 
 struct World {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     parent: Uuid,
     child: Uuid,
@@ -126,7 +126,7 @@ async fn world(idle_secs: i64) -> World {
     );
     store.insert_scheduled_job(&watch).unwrap();
     World {
-        store: Arc::new(Mutex::new(store)),
+        store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
         bus: Arc::new(EventBus::new(64)),
         parent,
         child,
@@ -634,7 +634,7 @@ async fn ineligible_parents_get_no_valve_row() {
 /// admission wait on a custody stripe the test holds; every other target
 /// resumes at once.
 struct StripeBlockedLauncher {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     blocked: Uuid,
     custody_id: Uuid,
     resumes: StdMutex<Vec<Uuid>>,

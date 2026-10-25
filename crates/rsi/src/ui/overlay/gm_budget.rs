@@ -354,7 +354,14 @@ pub(crate) fn render(
         )));
     }
     bottom.push(Line::from(Span::styled(
-        format!(" {HINTS}"),
+        format!(
+            " {}",
+            if state.coverage.is_some() {
+                "Read-only · j/k move · r reload · b/Esc back to draft"
+            } else {
+                HINTS
+            }
+        ),
         Style::default().fg(theme::dim_metadata()),
     )));
     let bottom_height = u16::try_from(bottom.len())

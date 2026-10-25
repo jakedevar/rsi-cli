@@ -78,6 +78,7 @@ async function showJobs(): Promise<void> {
 
 function closeSession(): void {
   state.selectedId = null;
+  state.departed = null;
   state.selectionEpoch += 1;
   state.events = [];
   $('events').replaceChildren();
@@ -200,12 +201,31 @@ function onKey(ev: KeyboardEvent): void {
     case 'focus': {
       const s = selected();
       if (r.to === 'list') { setDetailFocus('list'); return; }
-      if (!s) { toast('Open a session first (j/k, then Enter)'); return; }
+      if (!s) { toast('Open a session first: click one in the list (j/k, then Enter)'); return; }
       if (r.to === 'transcript') { setDetailFocus('transcript'); return; }
       if (isReadOnly(s)) { toast('This session is read-only'); return; }
       $('message').focus();
     }
   }
+}
+
+/**
+ * Home / End with the keys in the transcript: first loaded / newest event, with Vim keys off as well as on
+ * (the same jump as `gg` / `G`, local #306). The session list keeps its own Home / End.
+ */
+function onJumpKey(ev: KeyboardEvent): void {
+  if (ev.key !== 'Home' && ev.key !== 'End') return;
+  if (ev.defaultPrevented || ev.isComposing || ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+  if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
+  if (!selected() || focus() !== 'transcript' || overlayUp()) return;
+  if (document.querySelector('dialog[open]') !== null) return;
+  const t = document.activeElement as HTMLElement | null;
+  if (isTypingTarget(t)) return;
+  if (t && t !== document.body && !t.closest('.layout')) return;
+  if (t?.closest('#session-list')) return;
+  ev.preventDefault();
+  ev.stopImmediatePropagation();
+  jumpTranscript(ev.key === 'Home' ? 'first' : 'last');
 }
 
 // ---------- mouse: links and file paths in the transcript ----------
@@ -303,6 +323,7 @@ function initNav(): void {
   // Capture on the window: ahead of the vim engine, so Ctrl-w's h / j / k / l
   // is not read as an unbound Normal-mode key.
   window.addEventListener('keydown', onKey, true);
+  window.addEventListener('keydown', onJumpKey, true);
   wireMouse();
 }
 

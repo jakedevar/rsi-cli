@@ -56,6 +56,23 @@ impl SessionManager {
         Ok(project)
     }
 
+    /// Hub #3315: register the built-in home project at `home` (the daemon's
+    /// `$HOME`), idempotently, and refresh the project index. Called once at
+    /// every daemon start; any number of calls leave exactly one home project.
+    ///
+    /// # Errors
+    /// `home` cannot be canonicalized, or a persistence error.
+    pub async fn ensure_home_project(&self, home: std::path::PathBuf) -> Result<Project> {
+        let home = crate::path_safety::canonicalize_working_dir(&home)?;
+        let store = self.store.clone();
+        let project =
+            tokio::task::spawn_blocking(move || store.blocking_lock().ensure_home_project(&home))
+                .await
+                .map_err(|e| DaemonError::Store(e.to_string()))??;
+        self.rebuild_project_index().await;
+        Ok(project)
+    }
+
     /// Update an existing project.
     pub async fn update_project(
         &self,
@@ -74,6 +91,19 @@ impl SessionManager {
         .await
         .map_err(|e| DaemonError::Store(e.to_string()))??
         .ok_or_else(|| DaemonError::Store(format!("Project {} not found", id)))?;
+
+        // Hub #3315: the home project's path is always the daemon's `$HOME`.
+        // Refused here because the store write below is not awaited.
+        if Project::is_home_id(id)
+            && path.as_ref().is_some_and(|path| {
+                Some(path) != existing.path.as_ref()
+                    && path.canonicalize().ok().as_ref() != existing.path.as_ref()
+            })
+        {
+            return Err(DaemonError::InvalidParam(
+                Project::HOME_REPATH_REFUSED.into(),
+            ));
+        }
 
         // Apply updates
         let updated = Project {
@@ -107,7 +137,16 @@ impl SessionManager {
     }
 
     /// Delete a project.
+    ///
+    /// # Errors
+    /// `home_project_delete_refused` for the built-in home project (hub
+    /// #3315; refused here because the store write is not awaited).
     pub async fn delete_project(&self, id: Uuid) -> Result<()> {
+        if Project::is_home_id(id) {
+            return Err(DaemonError::InvalidParam(
+                Project::HOME_DELETE_REFUSED.into(),
+            ));
+        }
         self.persistence.delete_project(id).await?;
 
         // Invalidate project cache

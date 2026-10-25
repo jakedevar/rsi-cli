@@ -107,6 +107,9 @@ pub(crate) struct TokenUsage {
     /// Raw full-prompt tokens from the provider, before cache subtraction.
     /// Metric-only; does not affect context fill or confidence.
     pub prompt_tokens_total: u64,
+    /// The full prompt total covers the provider thread, including earlier
+    /// process launches (Codex CLI), rather than just this call or launch.
+    pub prompt_tokens_cumulative: bool,
     /// `usage.output_tokens_details.thinking_tokens` for this turn.
     pub thinking: u64,
     /// `usage.cache_creation.ephemeral_1h_input_tokens` for this turn.
@@ -264,6 +267,10 @@ pub(crate) fn extract_token_usage(stream_event: &StreamEvent) -> Option<TokenUsa
         output,
         total_input: input + cache_creation + cache_read,
         prompt_tokens_total,
+        prompt_tokens_cumulative: usage
+            .and_then(|u| u.get("prompt_tokens_cumulative"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         confidence,
         stop_reason,
         thinking,
@@ -998,6 +1005,7 @@ mod tests {
             output: 500,
             total_input: 1500,
             prompt_tokens_total: 0,
+            prompt_tokens_cumulative: false,
             confidence: ContextUsageConfidence::Full,
             stop_reason: Some("end_turn".to_string()),
             thinking: 120,
@@ -1038,6 +1046,7 @@ mod tests {
             output: 50,
             total_input: 100,
             prompt_tokens_total: 0,
+            prompt_tokens_cumulative: false,
             confidence: ContextUsageConfidence::Partial,
             stop_reason: None,
             thinking: 0,

@@ -106,6 +106,15 @@ fn admission(identity: &SatelliteIdentityV1) -> Result<(), QaLinkError> {
     {
         return Err(QaLinkError::NoEffect(SATELLITE_QA_DEPLOY_PENDING));
     }
+    if health
+        .governor_disk
+        .as_ref()
+        .is_some_and(|disk| disk.oldest_wait_seconds.is_some())
+    {
+        return Err(QaLinkError::NoEffect(
+            rsi_common::satellite_qa::SATELLITE_QA_DISK_LOW,
+        ));
+    }
     let admission = health
         .qa_admission
         .as_ref()

@@ -368,7 +368,7 @@ impl SessionManager {
         target: Uuid,
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<EventBus>,
         guard_mode: LeadGuardMode<'_>,
     ) -> Result<()> {
@@ -665,7 +665,7 @@ impl SessionManager {
     }
 
     async fn persist_clear_lead_session_if_matches_runtime(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         target: Uuid,
     ) -> Result<()> {
         let store = store.clone();
@@ -713,7 +713,7 @@ fn map_containment_error(e: crate::session::hierarchy::ContainmentError) -> Daem
 pub(super) async fn mark_lead_session_runtime(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     event_bus: &Arc<EventBus>,
     lead_id: Uuid,
 ) {
@@ -727,7 +727,7 @@ pub(super) async fn mark_lead_session_runtime(
 async fn pin_lead_session_runtime(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     event_bus: &Arc<EventBus>,
     lead_id: Uuid,
 ) {
@@ -901,7 +901,7 @@ pub fn effective_topology_with_override<V: SessionsView>(
 /// Queries the store via the V47 compound index
 /// `idx_sessions_topology_node(parent_id, topology_node_id)`.
 pub async fn max_iter_for_node(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     epic_id: Uuid,
     node_id: &str,
 ) -> crate::error::Result<u32> {

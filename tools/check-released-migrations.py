@@ -673,6 +673,85 @@ def parse_pending_predecessors(texts: Iterable[str], base_latest: int) -> list[i
     return sorted(gaps)
 
 
+DECLARATION_KEYS = {"schema_version", "version", "files"}
+DECLARATION_FILE_KEYS = {"path", "path_template", "source_blob", "sites"}
+DECLARATION_SITE_KEYS = {"anchor", "replacement", "scope"}
+DECLARATION_TOKEN = "${VERSION}"
+
+
+def _key_problem(actual: Any, required: set[str], optional: set[str] = frozenset()) -> str | None:
+    if not isinstance(actual, dict):
+        return "must be a JSON object"
+    missing = sorted(required - set(actual))
+    extra = sorted(set(actual) - required - set(optional))
+    if not (missing or extra):
+        return None
+    parts = []
+    if missing:
+        parts.append("missing key " + ", ".join(f"`{key}`" for key in missing))
+    if extra:
+        parts.append("unexpected key " + ", ".join(f"`{key}`" for key in extra))
+    return "; ".join(parts)
+
+
+def validate_declaration_shape(declaration: Any, name: str, expected_version: int | None = None) -> None:
+    """Refuse a provisional declaration whose shape the renumber tool would reject.
+
+    The renumber tool only checks a declaration when it must renumber the source.
+    A source that lands onto head + 1 never reaches that check, so its malformed
+    declaration reached `rolling` and broke the next provisional source in the
+    batch (#3304). Run this whenever a source carries a declaration; it names the
+    declaration, the file entry and the missing key.
+    """
+    problem = _key_problem(declaration, DECLARATION_KEYS, {"pending_predecessors"})
+    if problem:
+        raise GuardError(f"provisional declaration {name}: {problem}")
+    version = declaration["version"]
+    if declaration["schema_version"] != 1 or isinstance(declaration["schema_version"], bool):
+        raise GuardError(f"provisional declaration {name}: `schema_version` must be 1")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise GuardError(f"provisional declaration {name}: `version` must be a positive integer")
+    if expected_version is not None and version != expected_version:
+        raise GuardError(
+            f"provisional declaration {name}: `version` {version} does not match the migration V{expected_version}"
+        )
+    files = declaration["files"]
+    if not isinstance(files, list) or not files:
+        raise GuardError(f"provisional declaration {name}: `files` must be a non-empty list")
+    for index, file in enumerate(files):
+        label = file.get("path") if isinstance(file, dict) and isinstance(file.get("path"), str) else f"files[{index}]"
+        problem = _key_problem(file, DECLARATION_FILE_KEYS)
+        if problem:
+            raise GuardError(f"provisional declaration {name}: file entry {label}: {problem}")
+        if not isinstance(file["sites"], list):
+            raise GuardError(f"provisional declaration {name}: file entry {label}: `sites` must be a list")
+        for key in ("path", "path_template", "source_blob"):
+            if not isinstance(file[key], str) or not file[key]:
+                raise GuardError(
+                    f"provisional declaration {name}: file entry {label}: `{key}` must be a non-empty string"
+                )
+        if DECLARATION_TOKEN not in file["path_template"] and file["path_template"] != file["path"]:
+            raise GuardError(
+                f"provisional declaration {name}: file entry {label}: `path_template` must equal `path` "
+                f"or carry {DECLARATION_TOKEN}"
+            )
+        for site_index, site in enumerate(file["sites"]):
+            where = f"provisional declaration {name}: file entry {label}: sites[{site_index}]"
+            problem = _key_problem(site, DECLARATION_SITE_KEYS)
+            if problem:
+                raise GuardError(f"{where}: {problem}")
+            if site["scope"] not in ("unit", "head"):
+                raise GuardError(f"{where}: `scope` must be `unit` or `head`")
+            anchor, replacement = site["anchor"], site["replacement"]
+            if not isinstance(anchor, str) or not isinstance(replacement, str) or not anchor:
+                raise GuardError(f"{where}: `anchor` and `replacement` must be non-empty strings")
+            if DECLARATION_TOKEN not in replacement or replacement.replace(DECLARATION_TOKEN, str(version)) != anchor:
+                raise GuardError(
+                    f"{where}: `replacement` must be `anchor` with the version {version} "
+                    f"replaced by {DECLARATION_TOKEN}"
+                )
+
+
 def declared_gaps(base_ref: str, head_ref: str, base_latest: int) -> list[int]:
     """Pending predecessors declared by declarations added between base and head."""
     listing = subprocess.run(
@@ -682,10 +761,65 @@ def declared_gaps(base_ref: str, head_ref: str, base_latest: int) -> list[int]:
     if listing.returncode:
         return []
     names = [name for name in listing.stdout.splitlines() if name.endswith(".json")]
+    for name in names:
+        declaration = read_declaration(head_ref, name)
+        validate_declaration_shape(declaration, name)
     return parse_pending_predecessors(
         [text for text in (git_show(head_ref, name) for name in names) if text is not None],
         base_latest,
     )
+
+
+def read_declaration(ref: str, name: str) -> dict[str, Any]:
+    try:
+        declaration = json.loads(read_revision(ref, name))
+    except ValueError as error:
+        raise GuardError(f"provisional declaration {name} is not valid JSON: {error}") from error
+    if not isinstance(declaration, dict):
+        raise GuardError(f"provisional declaration {name} must be a JSON object")
+    return declaration
+
+
+def validated_base_inventory(
+    manifest: dict[str, Any], actual: dict[str, Any], base_ref: str
+) -> dict[str, Any]:
+    """Trust declared provisional blocks in a stacked base, without publishing pins.
+
+    Released fingerprints still come from the base's manifest. Only declarations
+    present in that same revision can cover its unpinned blocks; historical
+    declarations at or below the released head remain inert.
+    """
+    try:
+        validate_manifest(manifest, actual, "base migration manifest")
+    except GuardError:
+        extra = set(actual["blocks"]) - set(manifest["blocks"])
+        if not extra:
+            raise
+        listing = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", base_ref, "--", DECLARATIONS_DIR],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        declarations = []
+        for name in listing.stdout.splitlines():
+            if not name.endswith(".json"):
+                continue
+            declaration = read_declaration(base_ref, name)
+            if str(declaration.get("version")) not in extra:
+                continue
+            validate_declaration_shape(declaration, name)
+            declarations.append(declaration)
+        if {str(item["version"]) for item in declarations} != extra:
+            raise
+        derived = refreshed_manifest(manifest, actual)
+        validate_append_only(
+            manifest, derived,
+            parse_pending_predecessors(
+                [json.dumps(item) for item in declarations], int(manifest["latest_schema_version"])
+            ),
+        )
+        validate_manifest(derived, actual, "base migration inventory")
+        return derived
+    return manifest
 
 
 def validate_append_only(
@@ -729,6 +863,14 @@ def validate_append_only(
                 "(a slice numbered after an in-flight sibling declares it as "
                 "`pending_predecessors` in its tools/provisional-migrations declaration, #1285)"
             )
+
+
+def is_merge_commit(rev: str) -> bool:
+    parents = subprocess.run(
+        ["git", "rev-list", "--parents", "-n", "1", rev],
+        capture_output=True, text=True, check=False,
+    )
+    return parents.returncode == 0 and len(parents.stdout.split()) > 2
 
 
 def main() -> int:
@@ -834,7 +976,7 @@ def main() -> int:
             return 0
         base_manifest = load_manifest_text(base_text, f"{base_ref}:{MANIFEST_PATH}")
         base_actual = inventory(load_revision_files(base_ref, base_manifest))
-        validate_manifest(base_manifest, base_actual, "base migration manifest")
+        base_manifest = validated_base_inventory(base_manifest, base_actual, base_ref)
         validate_append_only(
             base_manifest,
             head_manifest,
@@ -852,6 +994,15 @@ def main() -> int:
         return 0
     except (GuardError, OSError, subprocess.SubprocessError) as error:
         print(f"released-migration guard: FAIL: {error}", file=sys.stderr)
+        if not args.refresh and args.base is None and is_merge_commit(args.head):
+            # #151: after a source merges origin/rolling, HEAD^ is its own previous
+            # commit, which may hold its unpinned migration; judge against rolling.
+            print(
+                f"The default base {args.head}^ is the first parent of a merge commit, not "
+                "the base you branched from. Rerun against the real base: "
+                f"`python3 tools/check-released-migrations.py origin/rolling {args.head}`.",
+                file=sys.stderr,
+            )
         print(
             "Released migration DDL, catalog projections, and fingerprints are immutable. "
             "Never repair them in place; add a forward migration. The pin file is derived: "

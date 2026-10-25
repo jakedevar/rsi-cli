@@ -238,6 +238,23 @@ impl AssetDir {
         }
     }
 
+    /// Move `from` below this directory to `to` below `dest`, another pinned
+    /// directory, with one `renameat` (the entry itself is moved, never
+    /// followed). Different filesystems fail `CrossesDevices`; nothing moves.
+    pub fn rename_into(&self, from: &Path, dest: &AssetDir, to: &Path) -> io::Result<()> {
+        let (src, from) = self.parent(from)?;
+        let (dst, to) = dest.parent(to)?;
+        #[cfg(unix)]
+        {
+            Ok(rustix::fs::renameat(&src.file, &from, &dst.file, &to)?)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (src, from, dst, to);
+            Err(unsupported())
+        }
+    }
+
     /// What `name` is, without following a final link: `None` when missing,
     /// `Some(true)` for a real directory, `Some(false)` for anything else (a
     /// symlink, a regular file, a FIFO, a socket, a device).

@@ -5,7 +5,7 @@
 //! guarded status UPDATE; it never runs archive cleanup and never deletes rows.
 use super::{ManagerActionClaimV2, Store};
 use crate::error::{DaemonError, Result};
-use crate::store::harness_manager_v2::{ManagerAuthorityV2, refused};
+use crate::store::harness_manager_v2::{ManagerAuthorityV2, refused, session_changed};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rsi_common::archive_cleanup::ArchiveSessionResultV1;
 use rsi_common::harness_manager_v2::{
@@ -192,7 +192,7 @@ impl Store {
         }
         let fence = expected.ok_or_else(|| refused("manager_v2_operator_fence_required"))?;
         if session.updated_at != fence.session_updated_at {
-            return Err(refused("manager_v2_session_changed"));
+            return Err(session_changed(session.updated_at));
         }
         Ok(())
     }
@@ -348,6 +348,7 @@ impl Store {
             ManagerActionStateV2::Succeeded,
             "session_archived",
             Some(result),
+            None,
         )?;
         tx.commit()?;
         Ok(params.session_id)
@@ -384,6 +385,7 @@ impl Store {
             ManagerActionStateV2::Succeeded,
             "session_restored",
             Some(result),
+            None,
         )?;
         tx.commit()?;
         Ok(params.session_id)
@@ -403,6 +405,7 @@ impl Store {
             ManagerActionStateV2::Succeeded,
             "operator_call_succeeded",
             Some(result),
+            None,
         )?;
         tx.commit()?;
         Ok(())
@@ -422,6 +425,7 @@ impl Store {
             ManagerActionStateV2::Succeeded,
             "operator_call_succeeded",
             Some(page),
+            None,
         )?;
         tx.commit()?;
         Ok(())

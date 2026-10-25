@@ -50,7 +50,7 @@ struct InFlight {
 
 pub struct CompileEngine {
     http: reqwest::Client,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime_config: Arc<RuntimeConfig>,
     bus: Arc<EventBus>,
     cache: Mutex<LruCache<CacheKey, CompileResult>>,
@@ -62,7 +62,7 @@ const DEFAULT_CACHE_CAPACITY: usize = 128;
 impl CompileEngine {
     pub fn new(
         http: reqwest::Client,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         runtime_config: Arc<RuntimeConfig>,
         bus: Arc<EventBus>,
     ) -> Arc<Self> {
@@ -344,9 +344,17 @@ impl CompileEngine {
         let raw_result = if crate::memory::llm::uses_native_ollama(&llm_target)
             .map_err(|e| CompileFailure::Other(e.to_string()))?
         {
+            // An interactive compile always tries the endpoint (#261): only
+            // background helpers back off; its outcome still feeds the breaker.
             ollama_client::generate_stream(
                 &self.http,
-                &target.model,
+                &crate::memory::helper_breaker::HelperCall {
+                    purpose: rsi_common::model_control::ModelInvocationPurpose::PromptCompile
+                        .as_str(),
+                    setting_key: "prompt_compile_model_local",
+                    model: &target.model,
+                    gate: false,
+                },
                 Some(&system),
                 input,
                 opts,
@@ -453,7 +461,7 @@ mod tests {
     fn make_engine() -> Arc<CompileEngine> {
         let cfg = flywheeld_test_runtime_config();
         let bus = Arc::new(EventBus::new(256));
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().expect("store"),
         ));
         CompileEngine::new(reqwest::Client::new(), store, cfg, bus)
@@ -503,7 +511,7 @@ mod tests {
         let cfg = flywheeld_test_runtime_config();
         let engine = Arc::new(CompileEngine {
             http: reqwest::Client::new(),
-            store: Arc::new(tokio::sync::Mutex::new(
+            store: Arc::new(rsid_core::store_lock::Mutex::new(
                 crate::store::Store::open_in_memory().expect("store"),
             )),
             runtime_config: cfg,

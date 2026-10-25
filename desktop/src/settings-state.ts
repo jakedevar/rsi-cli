@@ -190,32 +190,32 @@ function openAdmin(id: string): () => void {
 export function registerStateRows(): void {
   const view = (id: string) => (): string | null => lines.get(id) ?? null;
   registerRowOverlay('emergency_stop', {
-    enter: 'Asks, then denies new model work, cancels active invocations and interrupts running sessions (UpdateModelControlPolicy stop_all)',
-    stored: 'the daemon (model control)',
+    enter: 'Asks, then stops running sessions and starts nothing new until you resume; set Model control mode back to normal, or use Resume AI work in the banner',
+    stored: 'the daemon',
     run: openAdmin('emergency-stop'),
   });
   for (const id of ['usage_stats', 'usage_actions']) {
     registerRowOverlay(id, {
       enter: 'Opens Usage: lifetime spend, model control, live model work (Enter cancels the picked one, X stops all; both ask first)',
-      stored: 'the daemon (GetUsageStats, GetModelControlStatus)',
+      stored: 'the daemon',
       value: view(id),
       refresh: loadUsage,
       run: () => openUsage(),
     });
   }
   const admin: ReadonlyArray<[string, string, string, string]> = [
-    ['source_worktree_settlement', 'admin-settlement', 'Opens the settlement audit (applying asks for the exact APPLY phrase)', 'the daemon (source-worktree cohorts)'],
-    ['legacy_scratch_adoption', 'admin-scratch', 'Opens the unrecorded scratch directories (adopting lists every full path to confirm)', 'the daemon (ListLegacyScratch, AdoptLegacyScratch)'],
-    ['satellite_registry', 'admin-satellites', 'Opens the satellite registry: peers, links, cached remote sessions and the inbound policy', 'the daemon (satellite registry)'],
-    ['remote_access', 'admin-remote', 'Opens remote access: the read-only phone view, devices and exposed projects', 'the daemon (remote access)'],
-    ['mcp_server_configurations', 'admin-mcp', 'Opens the MCP servers (add, edit, enable or disable; credentials are write-only)', 'the daemon (ListMcpServers, UpsertMcpServer)'],
+    ['source_worktree_settlement', 'admin-settlement', 'Opens the settlement audit (applying asks for the exact APPLY phrase)', 'the daemon'],
+    ['legacy_scratch_adoption', 'admin-scratch', 'Opens the unrecorded scratch directories (adopting lists every full path to confirm)', 'the daemon'],
+    ['satellite_registry', 'admin-satellites', 'Opens the satellite registry: peers, links, cached remote sessions and the inbound policy', 'the daemon'],
+    ['remote_access', 'admin-remote', 'Opens remote access: the read-only phone view, devices and exposed projects', 'the daemon'],
+    ['mcp_server_configurations', 'admin-mcp', 'Opens the MCP servers (add, edit, enable or disable; credentials are write-only)', 'the daemon'],
   ];
   for (const [row, action, enter, stored] of admin) registerRowOverlay(row, { enter, stored, run: openAdmin(action) });
 
   for (const id of ['cold_archive_status', 'cold_archive_last_run']) {
     registerRowOverlay(id, {
-      enter: 'Refreshes the status (GetColdArchiveStatus) and announces it',
-      stored: 'the daemon (GetColdArchiveStatus)',
+      enter: 'Refreshes the status and shows it',
+      stored: 'the daemon',
       value: view(id),
       refresh: loadCold,
       run: () => {
@@ -225,13 +225,13 @@ export function registerStateRows(): void {
   }
   registerRowOverlay('cold_archive_run_now', {
     enter: 'Starts a copy-only archive pass (stage and verify) in the background; :cold-archive move and verify are commands',
-    stored: 'the daemon (RunColdArchiveNow stage)',
+    stored: 'the daemon',
     value: () => 'Enter starts a pass',
     run: () => void runCold(),
   });
   registerRowOverlay('sandbox_storage_status', {
-    enter: 'Refreshes the sandbox storage report (GetSandboxStorageStatus)',
-    stored: 'the daemon (GetSandboxStorageStatus)',
+    enter: 'Refreshes the sandbox storage report',
+    stored: 'the daemon',
     value: view('sandbox_storage_status'),
     refresh: loadStorage,
     run: () => {
@@ -240,19 +240,19 @@ export function registerStateRows(): void {
   });
   registerRowOverlay('preview_reclaim', {
     enter: 'Runs a dry-run reclaim pass and reports what it would free (nothing is deleted)',
-    stored: 'the daemon (RunSandboxBuildCacheReclaim dry_run)',
+    stored: 'the daemon',
     value: () => 'Enter previews',
     run: () => void runReclaim(true),
   });
   registerRowOverlay('reclaim_now', {
     enter: 'Asks, then runs a real reclaim pass over the eligible sandbox target caches',
-    stored: 'the daemon (RunSandboxBuildCacheReclaim)',
+    stored: 'the daemon',
     value: () => 'Enter reclaims (asks)',
     run: () => void runReclaim(false),
   });
   registerRowOverlay('target_pool_status', {
-    enter: 'Refreshes the warm build pools (GetTargetPoolStatus)',
-    stored: 'the daemon (GetTargetPoolStatus)',
+    enter: 'Refreshes the warm build pools',
+    stored: 'the daemon',
     value: view('target_pool_status'),
     refresh: loadPool,
     run: () => {

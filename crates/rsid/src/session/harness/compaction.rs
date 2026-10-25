@@ -184,7 +184,7 @@ mod tests {
     }
 
     async fn root_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
     ) -> crate::model_control::AdmissionPermit {
         let request = crate::model_control::ModelAdmissionRequest {
@@ -230,7 +230,9 @@ mod tests {
     /// denies background compaction, so a fired trigger surfaces as an error
     /// and an unfired one as `Ok(None)`, both without a provider call.
     async fn denying_compaction_control() -> Arc<dyn ModelCallControl> {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let event_bus = Arc::new(crate::bus::EventBus::new(8));
@@ -330,7 +332,7 @@ mod tests {
         let control = denying_compaction_control().await;
         let provider = fake_provider();
         let mut history = vec![ChatMessage::system("system")];
-        for idx in 0..160 {
+        for idx in 0..185 {
             history.push(ChatMessage::user(format!(
                 "message {idx} {}",
                 "x".repeat(64)
@@ -377,6 +379,7 @@ mod tests {
                     tool_calls: Vec::new(),
                     usage: Default::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
             ])),
@@ -476,6 +479,7 @@ mod tests {
                             tool_calls: Vec::new(),
                             usage: Default::default(),
                             reasoning_content: None,
+                            reasoning_details: None,
                             stop_reason: None,
                         },
                     );

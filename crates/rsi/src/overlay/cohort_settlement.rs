@@ -75,7 +75,21 @@ pub(super) async fn handle_source_worktree_settlement_key(app: &mut App, key: Ke
                 state.scroll_offset = state.scroll_offset.saturating_sub(8);
             }
         }
-        KeyCode::Enter => audit_selected(app).await,
+        KeyCode::Enter => audit_selected(app, None).await,
+        KeyCode::Char('n') => {
+            let next = match &app.overlay {
+                OverlayState::SourceWorktreeSettlement(state) => state
+                    .audit
+                    .as_ref()
+                    .and_then(|audit| audit.traversal.as_ref())
+                    .filter(|page| page.has_more)
+                    .map(|page| page.last_custody_id),
+                _ => None,
+            };
+            if let Some(after) = next {
+                audit_selected(app, Some(after)).await;
+            }
+        }
         KeyCode::Char('A') => begin_authorization(app),
         KeyCode::Char('r') => refresh_receipt(app).await,
         _ => {}
@@ -92,7 +106,7 @@ fn invalidate_audit(state: &mut SourceWorktreeSettlementOverlayState) {
     state.scroll_offset = 0;
 }
 
-async fn audit_selected(app: &mut App) {
+async fn audit_selected(app: &mut App, after_custody_id: Option<uuid::Uuid>) {
     let selected = match &app.overlay {
         OverlayState::SourceWorktreeSettlement(state) => {
             state.cohorts.get(state.selected_index).map(|cohort| {
@@ -112,7 +126,7 @@ async fn audit_selected(app: &mut App) {
     };
     let result = app
         .client
-        .audit_source_worktree_cohort(identity.clone())
+        .audit_source_worktree_cohort(identity.clone(), after_custody_id)
         .await;
     let result = match result {
         Ok(audit) => match validate_selected_audit(&identity, &canonical_repo_dir, &audit) {
@@ -317,6 +331,10 @@ async fn apply_exact_authorization(app: &mut App) {
             } else {
                 Some((
                     ApplySourceWorktreeCohortParams {
+                        after_custody_id: audit
+                            .traversal
+                            .as_ref()
+                            .and_then(|page| page.after_custody_id),
                         repository_identity: audit.repository_identity.clone(),
                         plan_digest: audit.plan_digest.clone(),
                         authorization: state.authorization_input.clone(),
@@ -545,6 +563,7 @@ mod tests {
                 after_observation: Some("settled".into()),
             }],
             retained_roots: Vec::new(),
+            unproven_survivors: Vec::new(),
             created_at: "2026-08-24T00:00:00.000000000Z".into(),
             updated_at: "2026-08-24T00:00:01.000000000Z".into(),
             finished_at: Some("2026-08-24T00:00:01.000000000Z".into()),
@@ -560,6 +579,7 @@ mod tests {
         digest: Sha256Digest,
     ) -> SourceWorktreeCohortAuditV1 {
         SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: identity.clone(),
@@ -617,6 +637,7 @@ mod tests {
             selected_index: 0,
             scroll_offset: 9,
             audit: Some(SourceWorktreeCohortAuditV1 {
+                traversal: None,
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                 repository_identity: "/repo/.git".into(),
@@ -676,6 +697,7 @@ mod tests {
         let identity = "/repo/.git".to_string();
         let digest = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
         let audit = SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: identity.clone(),
@@ -892,6 +914,7 @@ mod tests {
                 selected_index: 0,
                 scroll_offset: 0,
                 audit: Some(SourceWorktreeCohortAuditV1 {
+                    traversal: None,
                     schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                     policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                     repository_identity: identity,
@@ -962,6 +985,7 @@ mod tests {
                 scroll_offset: 0,
                 audit: Some(
                     SourceWorktreeCohortAuditV1 {
+                        traversal: None,
                         schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                         policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                         repository_identity: identity,

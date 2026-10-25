@@ -383,8 +383,15 @@ async fn merge_source(
         if paths.is_empty() {
             return Err(git::failed(&args, &output));
         }
-        let _ = git::run(config, worktree, &["merge", "--abort"]).await;
-        return Err(Refusal::Conflict { paths }.into());
+        // #3717: a conflict confined to the derived root `Cargo.lock` is
+        // re-derived rather than refused; anything else stays a conflict.
+        let resolved = super::cargo_lock::is_lock_only(&paths)
+            && super::cargo_lock::resolve(config, worktree).await
+            && conclude_resolved_merge(config, worktree, &message).await;
+        if !resolved {
+            let _ = git::run(config, worktree, &["merge", "--abort"]).await;
+            return Err(Refusal::Conflict { paths }.into());
+        }
     }
     let parents = git::stdout(
         config,
@@ -401,6 +408,27 @@ async fn merge_source(
             "merge candidate does not have exactly the parents (target tip, source)".to_string(),
         )),
     }
+}
+
+/// Commit the merge in progress once its only conflict was resolved and staged.
+/// `false` leaves the merge open for the caller to abort.
+async fn conclude_resolved_merge(
+    config: &IntegrationConfig,
+    worktree: &Path,
+    message: &str,
+) -> bool {
+    let unmerged = git::stdout_raw(
+        config,
+        worktree,
+        &["diff", "--name-only", "--diff-filter=U", "-z"],
+    )
+    .await;
+    if !unmerged.is_ok_and(|paths| paths.is_empty()) {
+        return false;
+    }
+    git::run(config, worktree, &["commit", "-q", "-m", message])
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 async fn create_candidate_worktree(
@@ -2028,12 +2056,37 @@ async fn remove_engine_worktree_checked(
 /// Constant daemon-owned reference-transaction hook. Nothing is interpolated
 /// into these bytes: every path, ref, and OID enters only through environment
 /// variables. `preparing` has no ref locks and validates only; `prepared`
-/// holds the locks and is the only mutation phase.
-const REFERENCE_TRANSACTION_HOOK: &str = r#"#!/bin/sh
+/// holds the locks and is the only mutation phase. The script is the prelude,
+/// the platform's [`HOOK_FILE_IDENTITY`] and then this body.
+pub(super) const REFERENCE_TRANSACTION_HOOK_PRELUDE: &str = r#"#!/bin/sh
 set -eu
 PATH=/usr/bin:/bin
 export PATH
-refuse() { echo "rsi-custody-hook: $1" >&2; exit 1; }
+"#;
+
+/// `file_identity <path>` prints `<st_dev>:<st_ino>` in decimal, the same text
+/// [`file_identity`] renders from Rust metadata. The hook pins
+/// `PATH=/usr/bin:/bin`, so the `stat` it runs is the platform's own: GNU
+/// coreutils (`-c`) on Linux and Git for Windows, BSD (`-f`) on macOS and the
+/// BSDs, where `stat -c` is an illegal option (#198).
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+pub(super) const HOOK_FILE_IDENTITY: &str = "file_identity() { stat -c '%d:%i' \"$1\"; }\n";
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+pub(super) const HOOK_FILE_IDENTITY: &str = "file_identity() { stat -f '%d:%i' \"$1\"; }\n";
+
+const REFERENCE_TRANSACTION_HOOK: &str = r#"refuse() { echo "rsi-custody-hook: $1" >&2; exit 1; }
 sync_file() { sync -d "$1" || refuse "sync failed: $1"; }
 : "${RSI_CUSTODY_TARGET_REF:?required}"
 : "${RSI_CUSTODY_EXPECTED_OID:?required}"
@@ -2069,6 +2122,7 @@ git_cmd() {
             git --no-optional-locks \
               -c core.fsmonitor=false -c core.hooksPath=/dev/null \
               -c commit.gpgsign=false -c rerere.enabled=false -c gc.auto=0 \
+              -c advice.graftFileDeprecated=false \
               -C "$RSI_CUSTODY_HOLDER" "$@"
     else
         env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C \
@@ -2077,6 +2131,7 @@ git_cmd() {
             git --no-optional-locks \
               -c core.fsmonitor=false -c core.hooksPath=/dev/null \
               -c commit.gpgsign=false -c rerere.enabled=false -c gc.auto=0 \
+              -c advice.graftFileDeprecated=false \
               -C "$RSI_CUSTODY_HOLDER" "$@"
     fi
 }
@@ -2101,13 +2156,12 @@ validate_expected() {
     fi
 }
 validate_lock() {
-    [ "$(stat -c '%d:%i' "$RSI_CUSTODY_LOCK_PATH")" = "$RSI_CUSTODY_LOCK_IDENTITY" ] || refuse "index lock identity changed"
+    [ "$(file_identity "$RSI_CUSTODY_LOCK_PATH")" = "$RSI_CUSTODY_LOCK_IDENTITY" ] || refuse "index lock identity changed"
 }
 validate_mutable_artifacts() {
-    [ "$(stat -c '%d:%i' "$RSI_CUSTODY_STATUS_FILE")" = "$RSI_CUSTODY_STATUS_IDENTITY" ] || refuse "status artifact identity changed"
-    [ "$(stat -c '%d:%i' "$RSI_CUSTODY_VERIFY_INDEX")" = "$RSI_CUSTODY_VERIFY_IDENTITY" ] || refuse "verify artifact identity changed"
+    [ "$(file_identity "$RSI_CUSTODY_STATUS_FILE")" = "$RSI_CUSTODY_STATUS_IDENTITY" ] || refuse "status artifact identity changed"
+    [ "$(file_identity "$RSI_CUSTODY_VERIFY_INDEX")" = "$RSI_CUSTODY_VERIFY_IDENTITY" ] || refuse "verify artifact identity changed"
 }
-file_identity() { stat -c '%d:%i' "$1"; }
 regular_identity() {
     [ -f "$1" ] && [ ! -L "$1" ] && [ "$(file_identity "$1")" = "$2" ]
 }
@@ -3110,7 +3164,9 @@ async fn transition_marker(old: &CustodyRecord, new: &CustodyRecord) -> Result<(
 }
 
 fn transaction_hook_script() -> String {
-    let mut script = String::from(REFERENCE_TRANSACTION_HOOK);
+    let mut script = String::from(REFERENCE_TRANSACTION_HOOK_PRELUDE);
+    script.push_str(HOOK_FILE_IDENTITY);
+    script.push_str(REFERENCE_TRANSACTION_HOOK);
     #[cfg(test)]
     script.push_str(REFERENCE_TRANSACTION_HOOK_TEST_TRAILER);
     script.push_str("exit 0\n");

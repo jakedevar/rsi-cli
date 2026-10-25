@@ -33,9 +33,9 @@ export async function interrupt(): Promise<void> {
   if (!id || isReadOnly(selected())) return;
   try {
     await api.interrupt(id);
-    toast('Interrupt requested', true);
+    toast('Stopping this turn', true);
     void refreshSessions();
   } catch (e) {
-    toast(`Interrupt failed: ${String(e)}`);
+    toast(`Could not stop the turn: ${String(e)}`);
   }
 }

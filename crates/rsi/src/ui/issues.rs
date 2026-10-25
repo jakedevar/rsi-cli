@@ -241,6 +241,10 @@ fn render_local(
 }
 
 fn render_local_side(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceState, app: &App) {
+    let standard = app.standard_editing();
+    if let Some(editor) = state.transient.editor.as_mut() {
+        editor.sync_text(standard);
+    }
     if let Some(editor) = &state.transient.editor {
         render_editor(frame, area, editor);
     } else if state.local.inspector_open {
@@ -478,114 +482,121 @@ fn render_inspector(frame: &mut Frame, area: Rect, state: &mut IssueWorkspaceSta
     );
 }
 
-/// The text of the issue editor's active field, when that field is typed
-/// into (the same field the key handler edits).
-fn editor_active_text(editor: &crate::types::IssueEditorState, field: usize) -> Option<&str> {
-    if editor.active_field != field {
-        return None;
+/// One labelled row of the Issue editor form.
+struct EditorRow {
+    label: String,
+    value: String,
+    /// The text field this row edits, when it is one.
+    field: Option<usize>,
+    /// The row that takes the leftover height (the Issue body).
+    flex: bool,
+}
+
+impl EditorRow {
+    fn field(
+        editor: &crate::types::IssueEditorState,
+        index: usize,
+        label: &str,
+        value: String,
+    ) -> Self {
+        let marker = if editor.active_field == index {
+            ">"
+        } else {
+            " "
+        };
+        let typed = editor
+            .text_field_spec()
+            .is_some()
+            .then_some(index)
+            .filter(|index| *index == editor.active_field);
+        Self {
+            label: format!("{marker} {label}: "),
+            value,
+            field: typed,
+            flex: false,
+        }
     }
-    match editor.mode {
-        IssueEditorMode::Filter => {
-            matches!(field, 1 | 2 | 3 | 5 | 6 | 7).then_some(editor.dependency_text.as_str())
+
+    fn text(value: String) -> Self {
+        Self {
+            label: String::new(),
+            value,
+            field: None,
+            flex: false,
         }
-        IssueEditorMode::Dependency { .. } => {
-            (field == 1).then_some(editor.dependency_text.as_str())
-        }
-        _ => match field {
-            0 => Some(editor.title.as_str()),
-            1 => Some(editor.body.as_str()),
-            2..=4 => Some(editor.dependency_text.as_str()),
-            _ => None,
-        },
     }
 }
 
-/// `plain` for a field's value, or in a Standard frame the active field's
-/// text with the cursor and selection marked for [`crate::field_edit::marked_row`].
-fn editor_value(editor: &crate::types::IssueEditorState, field: usize, plain: String) -> String {
-    match editor_active_text(editor, field) {
-        Some(text) if crate::field_edit::standard_frame() => crate::field_edit::mark(text, ""),
-        _ => plain,
+fn filter_value(editor: &crate::types::IssueEditorState, field: usize) -> String {
+    let filters = editor.filter_draft.as_ref();
+    if editor.active_field == field {
+        return editor.dependency_text.clone();
+    }
+    match (filters, field) {
+        (_, 0) => editor
+            .filter_saved_view
+            .map(|view| format!("{view:?}"))
+            .unwrap_or_else(|| "Custom".to_string()),
+        (Some(filters), 1) => filters.query.clone().unwrap_or_default(),
+        (Some(filters), 2) => filters
+            .statuses
+            .iter()
+            .map(|status| status.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        (Some(filters), 3) => filters
+            .priorities
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        (Some(filters), 4) => format!("{:?}", filters.readiness),
+        (Some(filters), 5) if filters.unassigned => "- (unassigned)".to_string(),
+        (Some(filters), 5) => filters.assignee.clone().unwrap_or_default(),
+        (Some(filters), 6) => filters.labels_all.join(","),
+        (Some(filters), 7) => filters
+            .provenance
+            .iter()
+            .map(|value| format!("{value:?}"))
+            .collect::<Vec<_>>()
+            .join(","),
+        (Some(filters), 8) => format!("{:?}", filters.archive),
+        _ => String::new(),
     }
 }
 
 fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEditorState) {
-    let marker = |field| {
-        if editor.active_field == field {
-            ">"
-        } else {
-            " "
-        }
-    };
-    let (mode, text) = match editor.mode {
+    use crate::ui::form_field::{Field, field_rows, mode_pill, render_field};
+
+    let error_suffix = editor
+        .error
+        .as_ref()
+        .map(|error| format!("\n{error}"))
+        .unwrap_or_default();
+    let (mode, mut rows) = match editor.mode {
         IssueEditorMode::Filter => {
-            let filters = editor.filter_draft.as_ref();
-            let value = |field| {
-                if editor.active_field == field {
-                    editor_value(editor, field, editor.dependency_text.clone())
-                } else {
-                    match (filters, field) {
-                        (_, 0) => editor
-                            .filter_saved_view
-                            .map(|view| format!("{view:?}"))
-                            .unwrap_or_else(|| "Custom".to_string()),
-                        (Some(filters), 1) => filters.query.clone().unwrap_or_default(),
-                        (Some(filters), 2) => filters
-                            .statuses
-                            .iter()
-                            .map(|status| status.as_str())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        (Some(filters), 3) => filters
-                            .priorities
-                            .iter()
-                            .map(u8::to_string)
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        (Some(filters), 4) => format!("{:?}", filters.readiness),
-                        (Some(filters), 5) if filters.unassigned => "- (unassigned)".to_string(),
-                        (Some(filters), 5) => filters.assignee.clone().unwrap_or_default(),
-                        (Some(filters), 6) => filters.labels_all.join(","),
-                        (Some(filters), 7) => filters
-                            .provenance
-                            .iter()
-                            .map(|value| format!("{value:?}"))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        (Some(filters), 8) => format!("{:?}", filters.archive),
-                        _ => String::new(),
-                    }
-                }
-            };
-            (
-                "Filters",
-                format!(
-                    "{} Saved view: {}\n{} Query: {}\n{} Statuses: {}\n{} Priorities: {}\n{} Readiness: {}\n{} Assignee (- = unassigned): {}\n{} Labels: {}\n{} Provenance: {}\n{} Archive: {}\n\nTab fields · ↑/↓ choices · Enter select · Ctrl-Enter apply · Esc cancel{}",
-                    marker(0),
-                    value(0),
-                    marker(1),
-                    value(1),
-                    marker(2),
-                    value(2),
-                    marker(3),
-                    value(3),
-                    marker(4),
-                    value(4),
-                    marker(5),
-                    value(5),
-                    marker(6),
-                    value(6),
-                    marker(7),
-                    value(7),
-                    marker(8),
-                    value(8),
-                    editor
-                        .error
-                        .as_ref()
-                        .map(|error| format!("\n{error}"))
-                        .unwrap_or_default(),
-                ),
-            )
+            let labels = [
+                "Saved view",
+                "Query",
+                "Statuses",
+                "Priorities",
+                "Readiness",
+                "Assignee (- = unassigned)",
+                "Labels",
+                "Provenance",
+                "Archive",
+            ];
+            let mut rows: Vec<EditorRow> = labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    EditorRow::field(editor, index, label, filter_value(editor, index))
+                })
+                .collect();
+            rows.push(EditorRow::text(format!(
+                "\nTab fields · ↑/↓ choices · Enter select · Ctrl-Enter apply · Esc cancel{error_suffix}"
+            )));
+            ("Filters", rows)
         }
         IssueEditorMode::Dependency { .. } => {
             let candidates = if editor.dependency_candidates.is_empty() {
@@ -611,27 +622,19 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            (
-                "Dependencies",
-                format!(
-                    "{} Direction: {}\n{} Candidate query: {}\n{} Candidates:\n{}\n\nTab fields · ↑/↓ choose · Enter select · Ctrl-Enter add · Ctrl-D remove · Esc cancel{}",
-                    marker(0),
-                    match editor.dependency_direction {
-                        rsi_common::issue_workspace::IssueDependencyDirectionV1::BlockedBy =>
-                            "Blocked by",
-                        rsi_common::issue_workspace::IssueDependencyDirectionV1::Blocks => "Blocks",
-                    },
-                    marker(1),
-                    editor_value(editor, 1, editor.dependency_text.clone()),
-                    marker(2),
-                    candidates,
-                    editor
-                        .error
-                        .as_ref()
-                        .map(|error| format!("\n{error}"))
-                        .unwrap_or_default(),
-                ),
-            )
+            let direction = match editor.dependency_direction {
+                rsi_common::issue_workspace::IssueDependencyDirectionV1::BlockedBy => "Blocked by",
+                rsi_common::issue_workspace::IssueDependencyDirectionV1::Blocks => "Blocks",
+            };
+            let rows = vec![
+                EditorRow::field(editor, 0, "Direction", direction.to_string()),
+                EditorRow::field(editor, 1, "Candidate query", editor.dependency_text.clone()),
+                EditorRow::field(editor, 2, "Candidates", format!("\n{candidates}")),
+                EditorRow::text(format!(
+                    "\nTab fields · ↑/↓ choose · Enter select · Ctrl-Enter add · Ctrl-D remove · Esc cancel{error_suffix}"
+                )),
+            ];
+            ("Dependencies", rows)
         }
         IssueEditorMode::Create | IssueEditorMode::Edit { .. } | IssueEditorMode::Status { .. } => {
             let select_hint = if matches!(editor.mode, IssueEditorMode::Status { .. }) {
@@ -674,48 +677,42 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
             } else {
                 String::new()
             };
-            (
-                match editor.mode {
-                    IssueEditorMode::Create => "Create",
-                    IssueEditorMode::Edit { .. } => "Edit",
-                    IssueEditorMode::Status { .. } => "Status",
-                    _ => unreachable!(),
-                },
-                format!(
-                    "{} Title: {}\n{} Body: {}\n{} Priority: {}\n{} Assignee: {}\n{} Labels: {}\nStatus: {}\n\nTab/Shift-Tab fields{select_hint} · Ctrl-Enter save · Esc cancel{}{}{}",
-                    marker(0),
-                    editor_value(editor, 0, editor.title.clone()),
-                    marker(1),
-                    editor_value(editor, 1, editor.body.clone()),
-                    marker(2),
-                    editor_value(
-                        editor,
-                        2,
-                        editor
-                            .priority
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "clear".into())
-                    ),
-                    marker(3),
-                    editor_value(
-                        editor,
-                        3,
-                        editor
-                            .assignee
-                            .as_deref()
-                            .unwrap_or("unassigned")
-                            .to_string()
-                    ),
-                    marker(4),
-                    editor_value(
-                        editor,
-                        4,
-                        if editor.labels.is_empty() {
-                            "none".to_string()
-                        } else {
-                            editor.labels.join(", ")
-                        }
-                    ),
+            let mut body = EditorRow::field(editor, 1, "Body", editor.body.clone());
+            body.flex = true;
+            let rows = vec![
+                EditorRow::field(editor, 0, "Title", editor.title.clone()),
+                body,
+                EditorRow::field(
+                    editor,
+                    2,
+                    "Priority",
+                    editor
+                        .priority
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "clear".into()),
+                ),
+                EditorRow::field(
+                    editor,
+                    3,
+                    "Assignee",
+                    editor
+                        .assignee
+                        .as_deref()
+                        .unwrap_or("unassigned")
+                        .to_string(),
+                ),
+                EditorRow::field(
+                    editor,
+                    4,
+                    "Labels",
+                    if editor.labels.is_empty() {
+                        "none".to_string()
+                    } else {
+                        editor.labels.join(", ")
+                    },
+                ),
+                EditorRow::text(format!(
+                    "Status: {}\n\nTab/Shift-Tab fields{select_hint} · Ctrl-Enter save · Esc cancel{}{}{}",
                     editor.status.map(issue_status_label).unwrap_or("—"),
                     if editor.submitted {
                         "\nSaving immutable request…"
@@ -723,34 +720,101 @@ fn render_editor(frame: &mut Frame, area: Rect, editor: &crate::types::IssueEdit
                         ""
                     },
                     reconciliation,
-                    editor
-                        .error
-                        .as_ref()
-                        .map(|error| format!("\n{error}"))
-                        .unwrap_or_default(),
-                ),
+                    error_suffix,
+                )),
+            ];
+            (
+                match editor.mode {
+                    IssueEditorMode::Create => "Create",
+                    IssueEditorMode::Edit { .. } => "Edit",
+                    _ => "Status",
+                },
+                rows,
             )
         }
     };
-    let mut in_selection = false;
-    let lines: Vec<Line<'static>> = text
-        .split('\n')
-        .map(|row| {
-            Line::from(crate::field_edit::marked_row(
-                row,
-                &mut in_selection,
-                Style::default(),
-            ))
+    // The active field's live text replaces its plain value in the table.
+    for row in &mut rows {
+        if row.field.is_some() && editor.text.surface_for(editor.active_field).is_none() {
+            row.field = None;
+        }
+    }
+
+    let mut title = vec![Span::raw(format!(" {mode} Issue "))];
+    if editor.text_field_spec().is_some() && editor.text.surface_for(editor.active_field).is_some()
+    {
+        title.push(mode_pill(editor.text.mode_label()));
+        title.push(Span::raw(" "));
+    }
+    let title_chars = editor.title.chars().count();
+    if matches!(
+        editor.mode,
+        IssueEditorMode::Create | IssueEditorMode::Edit { .. }
+    ) && title_chars >= crate::form_text::ISSUE_TITLE_COUNTER_FROM
+    {
+        title.push(Span::raw(format!(
+            "Title {title_chars}/{} ",
+            crate::form_text::ISSUE_TITLE_LIMIT
+        )));
+    }
+    let block = Block::default()
+        .title(Line::from(title))
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let last = rows.len().saturating_sub(1);
+    let fields: Vec<Field<'_>> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| Field {
+            label: row.label.clone(),
+            label_style: if row.field.is_some() {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+            value: &row.value,
+            surface: row.field.and_then(|field| editor.text.surface_for(field)),
+            min_rows: if row.flex { 3 } else { 1 },
+            max_rows: if row.flex || index == last { 400 } else { 6 },
         })
         .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(format!(" {mode} Issue "))
-                .borders(Borders::ALL),
-        ),
-        area,
-    );
+    let mut heights: Vec<u16> = fields
+        .iter()
+        .map(|field| field_rows(field, inner.width))
+        .collect();
+    let mut excess = heights.iter().sum::<u16>().saturating_sub(inner.height);
+    // The body gives up height first, then the trailing hint block.
+    let shrink_order = rows
+        .iter()
+        .position(|row| row.flex)
+        .into_iter()
+        .chain((last > 0).then_some(last));
+    for index in shrink_order {
+        let floor = if rows[index].flex { 3 } else { 1 };
+        let cut = excess.min(heights[index].saturating_sub(floor));
+        heights[index] -= cut;
+        excess -= cut;
+    }
+    let mut y = inner.y;
+    let bottom = inner.y + inner.height;
+    for (field, height) in fields.iter().zip(heights) {
+        if y >= bottom {
+            break;
+        }
+        let height = height.min(bottom - y);
+        render_field(
+            frame,
+            Rect::new(inner.x, y, inner.width, height),
+            field,
+            theme::root_bg(),
+        );
+        y += height;
+    }
 }
 
 fn issue_projection(issue: &rsi_common::types::Issue) -> String {
@@ -1951,6 +2015,159 @@ mod tests {
         assert!(failed_poll.contains("Status refresh error: Status refresh retained last good"));
     }
 
+    fn render_rows(
+        app: &crate::app::App,
+        state: &mut IssueWorkspaceState,
+        width: u16,
+        height: u16,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| render_issue_workspace(frame, frame.area(), true, state, app))
+            .expect("render Issues workspace");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn create_editor_state(title: &str, body: &str, active_field: usize) -> IssueWorkspaceState {
+        let mut state = IssueWorkspaceState::new(Some(Uuid::new_v4()));
+        state.transient.editor = Some(crate::types::IssueEditorState {
+            mode: crate::types::IssueEditorMode::Create,
+            title: title.to_string(),
+            body: body.to_string(),
+            priority: None,
+            assignee: None,
+            labels: Vec::new(),
+            status: None,
+            dependency_issue_id: None,
+            dependency_direction:
+                rsi_common::issue_workspace::IssueDependencyDirectionV1::BlockedBy,
+            dependency_candidates: Vec::new(),
+            dependency_selected_row: 0,
+            dependency_text: String::new(),
+            filter_draft: None,
+            filter_saved_view: None,
+            filter_mine_assignee: None,
+            base_issue: None,
+            latest_issue: None,
+            stale_conflict: false,
+            active_field,
+            dirty: true,
+            discard_armed: false,
+            retry_key: String::new(),
+            error: None,
+            submitted: false,
+            text: Default::default(),
+        });
+        state
+    }
+
+    fn type_into_editor(state: &mut IssueWorkspaceState, keys: &[crossterm::event::KeyCode]) {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let editor = state.transient.editor.as_mut().expect("editor");
+        let spec = editor.text_field_spec().expect("text field");
+        editor.sync_text(false);
+        for code in keys {
+            editor
+                .text
+                .handle_key(KeyEvent::new(*code, KeyModifiers::NONE), spec, false);
+        }
+    }
+
+    #[test]
+    fn a_long_body_wraps_inside_its_field_with_the_cursor_in_view_at_120_and_200_columns() {
+        let app = with_session_list(0);
+        let words: Vec<String> = (0..90).map(|n| format!("word{n:02}")).collect();
+        let body = format!("{} ENDMARK", words.join(" "));
+        for width in [120_u16, 200] {
+            let mut state = create_editor_state("Wrapped body", &body, 1);
+            let rows = render_rows(&app, &mut state, width, 40);
+            let body_row = rows
+                .iter()
+                .position(|row| row.contains("Body: word00"))
+                .expect("the body starts on its own row");
+            let end_row = rows
+                .iter()
+                .position(|row| row.contains("ENDMARK"))
+                .expect("the cursor end of the wrapped body is visible");
+            assert!(
+                end_row > body_row,
+                "{width} cols: the body wraps onto following rows"
+            );
+            let editor_right = rows[body_row].trim_end().chars().count();
+            assert!(
+                rows.iter()
+                    .all(|row| row.chars().count() <= usize::from(width)),
+                "{width} cols: no row runs past the screen ({editor_right})"
+            );
+            assert!(
+                rows[end_row - 1].contains("word"),
+                "continuation rows hold the text"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("INSERT")),
+                "{width} cols: the border shows the mode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_taller_than_its_field_scrolls_to_the_cursor() {
+        use crossterm::event::KeyCode;
+        let app = with_session_list(0);
+        let body = (1..=80)
+            .map(|n| format!("line {n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for width in [120_u16, 200] {
+            let mut state = create_editor_state("Tall body", &body, 1);
+            let rows = render_rows(&app, &mut state, width, 30);
+            assert!(
+                rows.iter().any(|row| row.contains("line 80")),
+                "{width} cols: typing at the end shows the last line"
+            );
+            // Esc, then gg: the cursor goes to the top and the view follows.
+            type_into_editor(
+                &mut state,
+                &[KeyCode::Esc, KeyCode::Char('g'), KeyCode::Char('g')],
+            );
+            let rows = render_rows(&app, &mut state, width, 30);
+            assert!(
+                rows.iter().any(|row| row.contains("line 01")),
+                "{width} cols: gg scrolls back to the first line"
+            );
+            assert!(
+                rows.iter().any(|row| row.contains("NORMAL")),
+                "{width} cols: the border shows normal mode"
+            );
+        }
+    }
+
+    #[test]
+    fn the_title_counter_shows_from_150_characters_and_a_long_title_wraps() {
+        let app = with_session_list(0);
+        let mut state = create_editor_state(&"t".repeat(149), "", 0);
+        let rows = render_rows(&app, &mut state, 120, 30);
+        assert!(rows.iter().any(|row| row.contains("Title:")));
+        let mut state = create_editor_state(&"t".repeat(160), "", 0);
+        let rows = render_rows(&app, &mut state, 120, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("Title 160/200")),
+            "the counter is on the border from 150 characters"
+        );
+        let title_rows = rows.iter().filter(|row| row.contains("tttttttt")).count();
+        assert!(
+            title_rows >= 2,
+            "a 160-character title wraps onto a second row"
+        );
+    }
+
     #[test]
     fn issue_workspace_archived_all_form_conflict_and_confirmations_render_positive_states() {
         let app = with_session_list(0);
@@ -2017,6 +2234,7 @@ mod tests {
                 "STALE VERSION — Base v7, Latest v8, Draft retained; reload or rebase".to_string(),
             ),
             submitted: false,
+            text: Default::default(),
         });
         let conflict = render_text(&app, &state, 160);
         assert!(conflict.contains("Draft keeps the visible identity"));
@@ -2106,6 +2324,7 @@ mod tests {
             retry_key: String::new(),
             error: Some("Bounded custom filter state".to_string()),
             submitted: false,
+            text: Default::default(),
         });
         let filter = render_text(&app, &state, 180);
         assert!(filter.contains("Saved view: Ready"));
@@ -2148,6 +2367,7 @@ mod tests {
             retry_key: String::new(),
             error: Some("Server authority will validate this edge".to_string()),
             submitted: false,
+            text: Default::default(),
         });
         let dependency = render_text(&app, &state, 180);
         assert!(dependency.contains("Direction: Blocks"));

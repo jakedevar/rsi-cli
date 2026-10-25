@@ -129,7 +129,7 @@ async fn persist_tracked_provider_event(
 /// from a frame and the newline cursor share the store transaction.
 async fn persist_detached_batch(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     generation: u64,
     cursor: crate::store::provider_turn_custody::ProviderTurnCursor,
@@ -734,7 +734,7 @@ fn resolve_runtime_context_budget(
 async fn persist_runtime_context_observation(
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     persistence: &PersistenceHandle,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     expected_generation: u64,
     runtime_tokens: u64,
@@ -978,22 +978,60 @@ pub(super) fn context_fill_pct_for_tracked(tracked: &TrackedSession) -> Option<f
     measured.then_some(pct)
 }
 
-/// #1000: per-monitor state for the cumulative full-prompt total
-/// (`Session.total_prompt_tokens`), which sums every model call's prompt
-/// (uncached input + cache creation + cache read). `total_input_tokens` stays
-/// the largest single-call prompt (the context numerator).
+/// What one usage-bearing event adds to the session's lifetime counters.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UsageStep {
+    /// The session's cumulative full-prompt total after the event.
+    pub(super) prompt_total: u64,
+    /// Cache-creation tokens this event adds (0 for a repeated message).
+    pub(super) cache_creation: u64,
+    /// Cache-read tokens this event adds (0 for a repeated message).
+    pub(super) cache_read: u64,
+    /// Output tokens this event adds (0 for a repeated message).
+    pub(super) output: u64,
+}
+
+/// What was already counted for one provider message.
+#[derive(Debug, Default, Clone, Copy)]
+struct CountedMessage {
+    prompt: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    output: u64,
+}
+
+/// How many message ids one monitor remembers (a message repeats within one
+/// assistant turn, so the oldest are safe to forget).
+const MESSAGE_DEDUPE_CAP: usize = 4096;
+
+/// #1000, #3534: per-monitor state for the session's lifetime usage counters
+/// (`Session.total_prompt_tokens`, `total_cache_*`, `total_output_tokens`).
+///
+/// `total_prompt_tokens` sums every model call's prompt (uncached input +
+/// cache creation + cache read), either by adding per-call usage or copying a
+/// provider's thread-lifetime counter; `total_input_tokens` stays the largest
+/// single-call prompt (the context numerator). Claude Code emits one
+/// `assistant` event per content block (thinking, text, tool_use) of ONE API
+/// message and repeats that message's `usage` on each, so a message id is
+/// counted once for every counter, not only the prompt. A repeat adds only
+/// what grew since the last sighting, which also covers a usage that fills in
+/// across the blocks. Ids are remembered in a bounded set, not just the last
+/// one, because parallel subagents interleave their messages.
 #[derive(Debug, Default)]
 pub(super) struct PromptTotals {
-    /// Claude repeats one call's usage on each content-block `assistant`
-    /// event; a message id is counted once.
-    last_message_id: Option<String>,
+    seen: std::collections::HashMap<String, CountedMessage>,
+    order: std::collections::VecDeque<String>,
     /// The Harness loop reports a cumulative prompt for its own launch; it
     /// is added to the total the session had when this monitor started.
     harness_base: Option<u64>,
+    /// Output tokens this monitor added from per-event usage (see
+    /// [`Self::reconcile_output`]).
+    output_counted: u64,
 }
 
 impl PromptTotals {
     /// The session's cumulative prompt after one usage-bearing event.
+    #[cfg(test)]
     pub(super) fn observe(
         &mut self,
         provider: SessionProvider,
@@ -1001,26 +1039,95 @@ impl PromptTotals {
         message_id: Option<String>,
         usage: &monitor::TokenUsage,
     ) -> u64 {
-        if provider == SessionProvider::Harness {
-            let base = *self.harness_base.get_or_insert(current);
-            return base.saturating_add(usage.prompt_tokens_total);
-        }
-        let repeated = message_id.is_some() && message_id == self.last_message_id;
-        if message_id.is_some() {
-            self.last_message_id = message_id;
-        }
-        if repeated {
-            return current;
-        }
-        // Codex CLI/AppServer carry the raw turn prompt (cached included) in
+        self.observe_step(provider, current, message_id, usage)
+            .prompt_total
+    }
+
+    /// What one usage-bearing event adds to each lifetime counter.
+    pub(super) fn observe_step(
+        &mut self,
+        provider: SessionProvider,
+        current: u64,
+        message_id: Option<String>,
+        usage: &monitor::TokenUsage,
+    ) -> UsageStep {
+        // Codex CLI/AppServer carry the raw prompt (cached included) in
         // `prompt_tokens_total`; Claude's `total_input` is already
         // input + cache creation + cache read.
-        let call = if usage.prompt_tokens_total > 0 {
+        let call_prompt = if usage.prompt_tokens_total > 0 {
             usage.prompt_tokens_total
         } else {
             usage.total_input
         };
-        current.saturating_add(call)
+        let now = CountedMessage {
+            prompt: call_prompt,
+            cache_creation: usage.cache_creation,
+            cache_read: usage.cache_read,
+            output: usage.output,
+        };
+        // The Harness loop reports each call once (its prompt is cumulative
+        // by launch), so only the CLI providers repeat a message id.
+        let added = match message_id {
+            Some(id) if provider != SessionProvider::Harness => self.count_message(id, now),
+            _ => now,
+        };
+        self.output_counted = self.output_counted.saturating_add(added.output);
+        let prompt_total = if usage.prompt_tokens_cumulative {
+            // Codex exec resume reports the entire thread's input, just as
+            // its output counter does. The invocation ledger subtracts the
+            // stored session baseline; adding that baseline here counts every
+            // previous launch again and manufactures uncached resume usage.
+            call_prompt
+        } else if provider == SessionProvider::Harness {
+            let base = *self.harness_base.get_or_insert(current);
+            base.saturating_add(usage.prompt_tokens_total)
+        } else {
+            current.saturating_add(added.prompt)
+        };
+        UsageStep {
+            prompt_total,
+            cache_creation: added.cache_creation,
+            cache_read: added.cache_read,
+            output: added.output,
+        }
+    }
+
+    /// The growth of `now` over what this message id already counted.
+    fn count_message(&mut self, id: String, now: CountedMessage) -> CountedMessage {
+        if let Some(prev) = self.seen.get_mut(&id) {
+            let added = CountedMessage {
+                prompt: now.prompt.saturating_sub(prev.prompt),
+                cache_creation: now.cache_creation.saturating_sub(prev.cache_creation),
+                cache_read: now.cache_read.saturating_sub(prev.cache_read),
+                output: now.output.saturating_sub(prev.output),
+            };
+            prev.prompt = prev.prompt.max(now.prompt);
+            prev.cache_creation = prev.cache_creation.max(now.cache_creation);
+            prev.cache_read = prev.cache_read.max(now.cache_read);
+            prev.output = prev.output.max(now.output);
+            return added;
+        }
+        if self.order.len() >= MESSAGE_DEDUPE_CAP
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.seen.remove(&oldest);
+        }
+        self.order.push_back(id.clone());
+        self.seen.insert(id, now);
+        now
+    }
+
+    /// #3534: a Claude assistant event carries the usage of its message at the
+    /// START of the stream, when `output_tokens` is still a placeholder (a
+    /// few tokens, never the generated total). The final `result` event
+    /// reports the process's true output total, so the output the per-event
+    /// usage missed is added once, when the result arrives. Returns what to
+    /// add to the session's output counters; never negative, so a result that
+    /// reports less than was already counted changes nothing.
+    pub(super) fn reconcile_output(&mut self, reported_output: u64) -> u64 {
+        let extra = reported_output.saturating_sub(self.output_counted);
+        self.output_counted = self.output_counted.saturating_add(extra);
+        extra
     }
 }
 
@@ -1278,7 +1385,7 @@ async fn advance_coordinator_context_cap(
     tracked: &TrackedSession,
     session_id: Uuid,
     runtime_config: &crate::config::RuntimeConfig,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) {
     let rotation_on = tracked.rotation.is_enabled()
         && runtime_config
@@ -1339,7 +1446,7 @@ async fn advance_context_rotation_threshold(
     session_id: Uuid,
     pct: f64,
     runtime_config: &crate::config::RuntimeConfig,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
 ) {
     // Boxed: the monitor's stream future is stack-sensitive, and this check
@@ -1635,6 +1742,36 @@ fn terminal_provider_stop_reason(stream_event: &StreamEvent) -> Option<Cow<'stat
     }
     if !is_terminal_provider_error(stream_event) {
         return None;
+    }
+    // #3154: a Harness session the OpenRouter spend ceiling stopped at a model
+    // call ends with the typed `openrouter_spend_cap_reached` (also the class
+    // of a probe that went stale, which fails closed the same way); never
+    // retried automatically.
+    if data
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| {
+            text.contains(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE)
+                || text.contains(rsi_common::openrouter_spend::SPEND_CAP_PROBE_STALE_CODE)
+        })
+    {
+        return Some(Cow::Borrowed(
+            crate::store_support::provider_defaults::OPENROUTER_SPEND_CAP_STOP_REASON,
+        ));
+    }
+    // #3178: a bench session ended by its task's USD cap (or a model call a
+    // bench task refused: not running, cost unknown, trace write failed) ends
+    // with that typed code; the task is graded normally, never healed.
+    if let Some(code) = data
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| {
+            rsi_common::bench::BENCH_SESSION_STOP_CODES
+                .into_iter()
+                .find(|code| text.contains(code))
+        })
+    {
+        return Some(Cow::Borrowed(code));
     }
     if let Some(model) = data
         .get("error")
@@ -2011,7 +2148,7 @@ impl SessionManager {
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
         mut stop_rx: mpsc::Receiver<()>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         initial_sequence: i32,
@@ -3305,9 +3442,26 @@ impl SessionManager {
                                         // ContextUsageConfidence::Partial fires (cache fields
                                         // absent), collapsing to only non-cached input_tokens.
                                         // Never let the accumulated value go backward.
+                                        // #3534: Claude repeats one message's usage on
+                                        // each content-block event; every lifetime
+                                        // counter takes a message once.
+                                        let usage_step = has_usage.then(|| {
+                                            let message_id = stream_event
+                                                .data
+                                                .get("message")
+                                                .and_then(|message| message.get("id"))
+                                                .and_then(|id| id.as_str())
+                                                .map(str::to_owned);
+                                            prompt_totals.observe_step(
+                                                tracked.session.provider,
+                                                tracked.live_prompt_tokens,
+                                                message_id,
+                                                &usage,
+                                            )
+                                        });
                                         if has_usage {
                                             tracked.live_input_tokens = tracked.live_input_tokens.max(usage.total_input);
-                                            tracked.live_output_tokens += usage.output;
+                                            tracked.live_output_tokens += usage_step.map_or(0, |step| step.output);
                                             // Snapshot daemon total at time of API update for delta-based
                                             // estimation. Used by non-Claude API-primary providers
                                             // (Antigravity / CodexAppServer / Harness) to approximate
@@ -3352,41 +3506,31 @@ impl SessionManager {
                                                 Some(tracked.live_input_tokens);
                                             tracked.session.total_output_tokens =
                                                 Some(tracked.live_output_tokens);
+                                            let step = usage_step.unwrap_or_default();
                                             tracked.session.total_cache_creation_tokens = Some(
                                                 tracked
                                                     .session
                                                     .total_cache_creation_tokens
                                                     .unwrap_or(0)
-                                                    + usage.cache_creation,
+                                                    + step.cache_creation,
                                             );
                                             tracked.session.total_cache_read_tokens = Some(
                                                 tracked
                                                     .session
                                                     .total_cache_read_tokens
                                                     .unwrap_or(0)
-                                                    + usage.cache_read,
+                                                    + step.cache_read,
                                             );
 
                                             // Cumulative full-prompt tokens per model call.
                                             // Per-provider feeding:
                                             // - Claude: usage.total_input already includes cache
                                             //   (input + cc + cr), so the accumulator is correct.
-                                            // - Codex/AppServer: mapper adds prompt_tokens_total
-                                            //   (raw turn.completed input before cache subtraction).
+                                            // - Codex CLI: copy thread-lifetime prompt_tokens_total.
+                                            // - AppServer: add each call's raw prompt.
                                             // - Harness: agent loop emits a cumulative total; the
                                             //   monitor copies it directly.
-                                            let message_id = stream_event
-                                                .data
-                                                .get("message")
-                                                .and_then(|message| message.get("id"))
-                                                .and_then(|id| id.as_str())
-                                                .map(str::to_owned);
-                                            tracked.live_prompt_tokens = prompt_totals.observe(
-                                                tracked.session.provider,
-                                                tracked.live_prompt_tokens,
-                                                message_id,
-                                                &usage,
-                                            );
+                                            tracked.live_prompt_tokens = step.prompt_total;
                                             tracked.session.total_prompt_tokens =
                                                 Some(tracked.live_prompt_tokens);
                                         }
@@ -4522,6 +4666,19 @@ impl SessionManager {
                                                 tracked.session.output_tokens = Some(output);
                                             }
                                         }
+                                        // #3534: the result's output total is the
+                                        // authoritative one for a Claude run; the
+                                        // per-event usage only carried placeholders.
+                                        if tracked.session.provider == SessionProvider::Claude
+                                            && let Some(output) = meta.final_output_tokens
+                                        {
+                                            let extra = prompt_totals.reconcile_output(output);
+                                            if extra > 0 {
+                                                tracked.live_output_tokens += extra;
+                                                tracked.session.total_output_tokens =
+                                                    Some(tracked.live_output_tokens);
+                                            }
+                                        }
                                         if let Some(reason) = meta.stop_reason {
                                             tracked.session.stop_reason = Some(reason);
                                         }
@@ -5163,6 +5320,12 @@ impl SessionManager {
                 // #2320: a sandbox that ends its turn off its assigned branch
                 // is put back when that is safe, and reported either way.
                 super::branch_custody::check_turn_end_boxed(&active, session_id, &event_bus).await;
+                // #3765: a manager seat that exited 0 cleanly stays resumable
+                // (idle `Completed`), never `Interrupted` with an empty slot.
+                let decision = Box::pin(super::manager_idle::settle_clean_exit(
+                    &store, session_id, decision, &evidence,
+                ))
+                .await;
                 let mut active_guard = active.write().await;
                 let Some(tracked) = active_guard.get_mut(&session_id) else {
                     return;
@@ -5464,7 +5627,7 @@ impl SessionManager {
         current_sequence: i32,
         do_short: bool,
         do_long: bool,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         persistence: PersistenceHandle,
         event_bus: Arc<crate::bus::EventBus>,
         runtime_config: Arc<crate::config::RuntimeConfig>,
@@ -5554,6 +5717,14 @@ impl SessionManager {
                         });
                     }
                 }
+                // #261: an open helper breaker already said so once.
+                Err(e) if crate::memory::helper_breaker::is_refusal(&e) => {
+                    tracing::debug!(
+                        error = %e,
+                        session_id = %session_id,
+                        "Short summary skipped: helper endpoint breaker is open"
+                    );
+                }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -5606,6 +5777,14 @@ impl SessionManager {
                             content,
                         });
                     }
+                }
+                // #261: an open helper breaker already said so once.
+                Err(e) if crate::memory::helper_breaker::is_refusal(&e) => {
+                    tracing::debug!(
+                        error = %e,
+                        session_id = %session_id,
+                        "Long summary skipped: helper endpoint breaker is open"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -5670,6 +5849,12 @@ impl SessionManager {
         session_id: Uuid,
         sequence: &mut i32,
     ) -> Option<Vec<ConversationEvent>> {
+        // #3177: route-audit events become typed System rows.
+        if let Some(event) =
+            crate::provider_stream_health::route_audit_event(stream, session_id, sequence)
+        {
+            return Some(vec![event]);
+        }
         let event_type = match stream.event_type.as_str() {
             super::harness::agent_loop::COMPLETION_GATE_STREAM_EVENT => {
                 *sequence += 1;
@@ -5770,6 +5955,36 @@ impl SessionManager {
                     tool_use_id: None,
                     metadata: Some(Box::new(serde_json::json!({
                         "final_answer_retry": { "provider_stop_reason": provider_stop_reason },
+                    }))),
+                }]);
+            }
+            // #4028: a length stop with no tool call was discarded and the step
+            // re-requested; record it as a visible System row.
+            super::harness::agent_loop::LENGTH_ACT_RETRY_STREAM_EVENT => {
+                *sequence += 1;
+                let attempt = stream
+                    .data
+                    .get("attempt")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1);
+                return Some(vec![ConversationEvent {
+                    id: 0,
+                    session_id,
+                    sequence: *sequence,
+                    event_type: EventType::System,
+                    role: None,
+                    content: format!(
+                        "[harness] the model spent its whole output budget reasoning and made no \
+                         tool call; the turn is discarded and the step retried (length retry \
+                         {attempt})"
+                    ),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: Some(Box::new(serde_json::json!({
+                        "length_act_retry": { "attempt": attempt },
                     }))),
                 }]);
             }
@@ -6097,7 +6312,16 @@ impl SessionManager {
                             created_at: chrono::Utc::now(),
                             offload_id: None,
                             tool_use_id: None,
-                            metadata: None,
+                            // #3170: the route's structured reasoning blocks,
+                            // kept verbatim so a resumed session rebuilds them.
+                            metadata: stream
+                                .data
+                                .get("message")
+                                .and_then(|m| m.get("reasoning_details"))
+                                .filter(|details| details.as_array().is_some_and(|d| !d.is_empty()))
+                                .map(|details| {
+                                    Box::new(serde_json::json!({ "reasoning_details": details }))
+                                }),
                         });
                     }
 
@@ -8355,12 +8579,181 @@ mod live_context_state_tests {
         assert_eq!(total, 1_100 + 1_250 + 1_320);
     }
 
-    /// #1000: Codex CLI and CodexAppServer count each turn's raw prompt,
-    /// cached tokens included, and a resumed session keeps counting from its
-    /// restored total.
+    /// The lifetime counters the monitor keeps for one Claude run, folded from
+    /// the same steps the live path applies.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Lifetime {
+        prompt: u64,
+        cache_creation: u64,
+        cache_read: u64,
+        output: u64,
+    }
+
+    fn fold(
+        totals: &mut PromptTotals,
+        lifetime: &mut Lifetime,
+        events: &[(Option<String>, monitor::TokenUsage)],
+    ) {
+        for (id, usage) in events {
+            let step =
+                totals.observe_step(SessionProvider::Claude, lifetime.prompt, id.clone(), usage);
+            lifetime.prompt = step.prompt_total;
+            lifetime.cache_creation += step.cache_creation;
+            lifetime.cache_read += step.cache_read;
+            lifetime.output += step.output;
+        }
+    }
+
+    fn claude_block(
+        id: &str,
+        input: u64,
+        created: u64,
+        read: u64,
+        output: u64,
+    ) -> (Option<String>, monitor::TokenUsage) {
+        usage_event(
+            "assistant",
+            serde_json::json!({"message":{"id":id,"usage":{
+                "input_tokens":input,
+                "cache_creation_input_tokens":created,
+                "cache_read_input_tokens":read,
+                "output_tokens":output}}}),
+        )
+    }
+
+    /// #3534: one API message streamed as a thinking, a text and a tool_use
+    /// block repeats the same `usage` on three `assistant` events. Every
+    /// counter takes the message once (the cache columns were summed three
+    /// times, so a fleet's cache read ran at 3x the provider's own record).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
-    fn prompt_totals_sum_codex_turn_prompts_with_cached_tokens() {
+    fn one_message_with_three_content_blocks_counts_its_cache_once() {
+        let mut totals = PromptTotals::default();
+        let mut lifetime = Lifetime::default();
+        let blocks: Vec<_> = (0..3)
+            .map(|_| claude_block("msg_a", 4, 1_500, 90_000, 2))
+            .collect();
+        fold(&mut totals, &mut lifetime, &blocks);
+        assert_eq!(
+            lifetime,
+            Lifetime {
+                prompt: 4 + 1_500 + 90_000,
+                cache_creation: 1_500,
+                cache_read: 90_000,
+                output: 2,
+            }
+        );
+    }
+
+    /// #3534: a multi-turn process interleaves messages (parallel subagents,
+    /// a thinking block of the next message before the last block of the
+    /// previous one). Remembering only the previous id re-counted the repeat;
+    /// each message id counts once wherever its blocks land.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn interleaved_messages_of_a_multi_turn_process_count_once_each() {
+        let mut totals = PromptTotals::default();
+        let mut lifetime = Lifetime::default();
+        fold(
+            &mut totals,
+            &mut lifetime,
+            &[
+                claude_block("msg_1", 3, 100, 1_000, 1),
+                claude_block("msg_2", 2, 50, 1_100, 1),
+                claude_block("msg_1", 3, 100, 1_000, 1),
+                claude_block("msg_2", 2, 50, 1_100, 1),
+                claude_block("msg_3", 1, 0, 1_150, 1),
+            ],
+        );
+        assert_eq!(lifetime.cache_creation, 150);
+        assert_eq!(lifetime.cache_read, 3_250);
+        assert_eq!(lifetime.prompt, 1_103 + 1_152 + 1_151);
+    }
+
+    /// #3534: a usage that fills in across the blocks of one message adds only
+    /// its growth, so the counters never exceed the message's final usage.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn a_repeated_message_adds_only_what_grew() {
+        let mut totals = PromptTotals::default();
+        let mut lifetime = Lifetime::default();
+        fold(
+            &mut totals,
+            &mut lifetime,
+            &[
+                claude_block("msg_1", 1, 10, 100, 1),
+                claude_block("msg_1", 1, 10, 100, 40),
+                claude_block("msg_1", 1, 10, 100, 25),
+            ],
+        );
+        assert_eq!(lifetime.output, 40, "the largest sighting, never a sum");
+        assert_eq!(lifetime.cache_read, 100);
+    }
+
+    /// #3534: the stream's per-message output is a start-of-message
+    /// placeholder; the result's total is added once, and only the part the
+    /// events missed. A result that reports no more than was counted changes
+    /// nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn the_result_output_total_fills_in_what_the_events_missed() {
+        let mut totals = PromptTotals::default();
+        let mut lifetime = Lifetime::default();
+        fold(
+            &mut totals,
+            &mut lifetime,
+            &[
+                claude_block("msg_1", 1, 10, 100, 1),
+                claude_block("msg_1", 1, 10, 100, 1),
+                claude_block("msg_2", 1, 0, 110, 2),
+            ],
+        );
+        assert_eq!(lifetime.output, 3);
+        assert_eq!(totals.reconcile_output(1_200), 1_197);
+        assert_eq!(totals.reconcile_output(1_200), 0, "a repeat adds nothing");
+        assert_eq!(totals.reconcile_output(900), 0, "never negative");
+    }
+
+    /// #3534: a resumed session is a new monitor with a new `PromptTotals`
+    /// starting at the stored lifetime totals. Its own events add to that
+    /// base; the predecessor's totals are not counted again, and a message id
+    /// the predecessor already saw is a new message for the new process.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn a_resumed_monitor_adds_only_its_own_messages_to_the_stored_totals() {
+        let mut first = PromptTotals::default();
+        let mut stored = Lifetime::default();
+        fold(
+            &mut first,
+            &mut stored,
+            &[claude_block("msg_1", 2, 100, 1_000, 5)],
+        );
+        assert_eq!(stored.cache_read, 1_000);
+
+        let mut resumed = PromptTotals::default();
+        let mut lifetime = Lifetime {
+            prompt: stored.prompt,
+            cache_creation: stored.cache_creation,
+            cache_read: stored.cache_read,
+            output: stored.output,
+        };
+        fold(
+            &mut resumed,
+            &mut lifetime,
+            &[
+                claude_block("msg_2", 1, 0, 1_100, 3),
+                claude_block("msg_2", 1, 0, 1_100, 3),
+            ],
+        );
+        assert_eq!(lifetime.cache_read, 1_000 + 1_100);
+        assert_eq!(lifetime.cache_creation, 100);
+        assert_eq!(lifetime.prompt, 1_102 + 1_101);
+    }
+
+    /// Per-call prompts (including AppServer) remain additive across resumes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn prompt_totals_sum_per_call_prompts_with_cached_tokens() {
         let turn = |uncached: u64, raw: u64| {
             usage_event(
                 "result",
@@ -8374,9 +8767,44 @@ mod live_context_state_tests {
         let restored = 5_000;
         let mut total = restored;
         for (id, usage) in [turn(300, 40_300), turn(500, 60_500)] {
-            total = totals.observe(SessionProvider::Codex, total, id, &usage);
+            total = totals.observe(SessionProvider::CodexAppServer, total, id, &usage);
         }
         assert_eq!(total, restored + 40_300 + 60_500);
+    }
+
+    /// #3916: real e8987383 thread counters. Each resume starts a new monitor
+    /// but retains the provider thread and subtracts the prior session total
+    /// to settle the invocation. Cache reads below are the observed per-turn
+    /// reads, not a lifetime counter, so mixing scopes looks like cache loss.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn prompt_totals_measure_codex_resumes_from_thread_counters() {
+        let mut total = 0;
+        for (input, cached, output, turn_input, turn_cached, uncached) in [
+            (4_280_802, 4_119_168, 15_538, 4_280_802, 4_119_168, 161_634),
+            (6_866_959, 6_666_880, 18_088, 2_586_157, 2_547_712, 38_445),
+            (8_235_096, 8_026_496, 21_257, 1_368_137, 1_359_616, 8_521),
+        ] {
+            let baseline = total;
+            let mut thread = Some("same-provider-thread".to_string());
+            let event = crate::codex::map_codex_json_to_stream_event(
+                &serde_json::json!({"type":"turn.completed", "usage":{
+                    "input_tokens":input, "cached_input_tokens":cached,
+                    "output_tokens":output}}),
+                &mut thread,
+            )
+            .unwrap();
+            let usage = monitor::extract_token_usage(&event).unwrap();
+            let mut resumed = PromptTotals::default();
+            total = resumed.observe(SessionProvider::Codex, total, None, &usage);
+            assert_eq!(total - baseline, turn_input);
+            assert_eq!((total - baseline) - turn_cached, uncached);
+            // A replay of the final frame must keep the same lifetime total.
+            assert_eq!(
+                resumed.observe(SessionProvider::Codex, total, None, &usage),
+                total
+            );
+        }
     }
 
     /// #1000: the Harness loop reports its launch's cumulative prompt on both
@@ -8651,7 +9079,9 @@ mod live_context_state_tests {
         tracked.codex_context_tokens = 180_000;
         tracked.rotation.set_enabled(true);
         let session_id = tracked.session.id;
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
             let guard = store.lock().await;
             guard.insert_session(&tracked.session).unwrap();
@@ -8777,7 +9207,9 @@ mod live_context_state_tests {
         tracked.rotation.set_enabled(true);
         let session_id = tracked.session.id;
         let task = tracked.session.query.clone();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         store.lock().await.insert_session(&tracked.session).unwrap();
         let event_bus = Arc::new(crate::bus::EventBus::new(16));
         let runtime_config =
@@ -8838,7 +9270,9 @@ mod live_context_state_tests {
         tracked.codex_context_tokens = 180_000;
         tracked.rotation.set_enabled(false);
         let session_id = tracked.session.id;
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         {
             let guard = store.lock().await;
             guard.insert_session(&tracked.session).unwrap();
@@ -8986,7 +9420,7 @@ mod live_context_state_tests {
             .clone()
             .expect("fixture starts with a typed budget");
         let directory = tempfile::tempdir().expect("create runtime rollback store");
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open_test_fixture(&directory.path().join("runtime-rollback.db"))
                 .expect("open runtime rollback store"),
         ));
@@ -10039,6 +10473,66 @@ mod retry_tests {
         assert!(is_auth_stop_reason(&logged_out));
         assert!(is_auth_stop_reason(&rejected));
         assert!(!is_auth_stop_reason("provider_error:codex_usage_limit"));
+    }
+
+    /// #3154: a Harness session the OpenRouter spend ceiling stopped at a
+    /// model call ends with the typed `openrouter_spend_cap_reached` stop
+    /// reason (the loop's `PolicyDenied` rides the Harness `process_error`),
+    /// and it is never healed as transient capacity.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn a_spend_ceiling_stop_maps_to_the_typed_stop_reason_and_is_never_healed() {
+        use crate::model_control::transient_heal::classify_transient_failure_with_stop;
+        for code in [
+            rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE,
+            rsi_common::openrouter_spend::SPEND_CAP_PROBE_STALE_CODE,
+        ] {
+            let error = crate::error::DaemonError::PolicyDenied(format!(
+                "{code}: OpenRouter spend since arming is $100.01 of the $100.00 cap"
+            ));
+            let event = crate::session::harness::process_error_event(&error);
+            let stop = terminal_provider_stop_reason(&event)
+                .expect("a terminal Harness error has a stop reason");
+            assert_eq!(stop, "openrouter_spend_cap_reached", "{code}");
+            assert!(
+                !classify_transient_failure_with_stop(
+                    Some("policy_denied"),
+                    Some(&stop),
+                    None,
+                    &[]
+                )
+                .is_transient(),
+                "{code}: a heal would spend past the line again"
+            );
+        }
+    }
+
+    /// #3178: a bench session its task's USD cap stopped (or whose call a bench
+    /// task refused) ends with that typed code as its stop reason, and is never
+    /// healed: the task is graded normally.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn a_bench_task_stop_maps_to_the_typed_stop_reason_and_is_never_healed() {
+        use crate::model_control::transient_heal::classify_transient_failure_with_stop;
+        for code in rsi_common::bench::BENCH_SESSION_STOP_CODES {
+            let error = crate::error::DaemonError::PolicyDenied(format!(
+                "{code}: the task spent $0.30 of its $0.40 cap"
+            ));
+            let event = crate::session::harness::process_error_event(&error);
+            let stop = terminal_provider_stop_reason(&event)
+                .expect("a terminal Harness error has a stop reason");
+            assert_eq!(stop, code);
+            assert!(
+                !classify_transient_failure_with_stop(
+                    Some("policy_denied"),
+                    Some(&stop),
+                    None,
+                    &[]
+                )
+                .is_transient(),
+                "{code}: a heal would resume a finished task"
+            );
+        }
     }
 
     /// #2735: the Codex 400 for a model the ChatGPT account cannot use is the

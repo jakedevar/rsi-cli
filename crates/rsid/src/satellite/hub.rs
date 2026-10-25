@@ -3,13 +3,14 @@
 //! Only the daemon starts this loop. A TUI render reads the bounded cache and
 //! never dials a peer or starts a local daemon on a peer socket.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use rsi_common::satellite::{SatelliteLinkDirectionV1, SatellitePeerV1};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
@@ -17,6 +18,7 @@ use uuid::Uuid;
 use crate::config::RuntimeConfig;
 use crate::store::Store;
 use crate::store::satellite_registry::SatelliteFailure;
+use crate::store::satellite_reports::HubReportLinkStatus;
 
 use super::poll::{MAX_IN_FLIGHT, PeerSnapshot, PollSchedule, probe_link};
 use super::registry::{LinkDirection, PeerContinuity, RegistryLink, RegistryPeer};
@@ -32,6 +34,48 @@ const PEER_ROUND_DEADLINE: Duration = Duration::from_secs(30);
 const STARTUP_STALE_ATTEMPTS: usize = 5;
 
 type PollOutcome = std::result::Result<PeerSnapshot, SatelliteFailure>;
+
+/// Own the single-flight tasks rather than a flag cleared only on normal
+/// return. A panic or cancellation is observed and retried on the next tick.
+#[derive(Default)]
+struct LinkRounds {
+    dispatch: Option<tokio::task::JoinHandle<()>>,
+    reports: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LinkRounds {
+    async fn tick<D, R>(&mut self, dispatch: D, reports: R)
+    where
+        D: std::future::Future<Output = ()> + Send + 'static,
+        R: std::future::Future<Output = ()> + Send + 'static,
+    {
+        Self::start(&mut self.dispatch, "delivery", dispatch).await;
+        Self::start(&mut self.reports, "reports", reports).await;
+    }
+
+    async fn start<F>(slot: &mut Option<tokio::task::JoinHandle<()>>, round: &'static str, work: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        if let Some(task) = slot.take() {
+            if let Err(error) = task.await {
+                tracing::warn!(round, %error, "satellite link round exited; restarting");
+            }
+        }
+        *slot = Some(tokio::spawn(work));
+    }
+}
+
+impl Drop for LinkRounds {
+    fn drop(&mut self) {
+        for task in [&self.dispatch, &self.reports].into_iter().flatten() {
+            task.abort();
+        }
+    }
+}
 
 pub(crate) fn registry_peer(value: &SatellitePeerV1) -> RegistryPeer {
     let config = &value.config;
@@ -141,10 +185,73 @@ where
 /// How often the satellite re-homes failure notices a re-appointment retired.
 const FAILURE_ADOPTION_EVERY: Duration = Duration::from_secs(15);
 
+/// Remember only link state, so normal pulls and repeated outage ticks are
+/// silent. Removing pairing forgets its state without inventing a recovery.
+#[derive(Default)]
+struct HubLinkTransitions {
+    stale: HashMap<Uuid, bool>,
+}
+
+impl HubLinkTransitions {
+    fn observe(
+        &mut self,
+        link: Option<&HubReportLinkStatus>,
+        now: DateTime<Utc>,
+    ) -> Vec<(Uuid, bool)> {
+        let Some(link) = link else {
+            self.stale.clear();
+            return Vec::new();
+        };
+        self.stale
+            .retain(|id, _| link.hub_installations.contains(id));
+        let stale = crate::health_anomaly::hub_pull_stale(&link.reports, now);
+        link.hub_installations
+            .iter()
+            .filter_map(|id| {
+                let previous = self.stale.insert(*id, stale);
+                if previous.is_some_and(|previous| previous != stale)
+                    || (previous.is_none() && stale)
+                {
+                    Some((*id, stale))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+fn sweep_hub_link(store: &Store, transitions: &mut HubLinkTransitions, now: DateTime<Utc>) {
+    let link = match store.hub_report_link_status(now) {
+        Ok(link) => link,
+        Err(error) => {
+            tracing::warn!("satellite hub link status read failed: {error}");
+            return;
+        }
+    };
+    let changes = transitions.observe(link.as_ref(), now);
+    let Some(link) = link else { return };
+    for (hub, stale) in changes {
+        let last_hub_pull_at = link.reports.last_hub_pull_at.as_deref().unwrap_or("never");
+        let backlog_depth = link.reports.backlog.depth;
+        let oldest_age_secs = link.reports.backlog.oldest_age_secs;
+        if stale {
+            tracing::warn!(hub_installation_id = %hub, last_hub_pull_at, backlog_depth,
+                ?oldest_age_secs, "satellite hub link stopped pulling reports");
+        } else {
+            tracing::info!(hub_installation_id = %hub, last_hub_pull_at, backlog_depth,
+                ?oldest_age_secs, "satellite hub link resumed pulling reports");
+        }
+    }
+}
+
 /// #2453: record the satellite's due report failures as durable notices for
 /// its manager, and (paced) re-home the ones a re-appointment retired
 /// unretrieved. A failure leaves the notice due, so the next tick retries.
-async fn sweep_report_failures(store: &Arc<Mutex<Store>>, next_adoption: &mut Instant) {
+async fn sweep_report_failures(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    next_adoption: &mut Instant,
+) {
     let guard = store.lock().await;
     match guard.sweep_hub_report_failures() {
         Ok(0) => {}
@@ -176,7 +283,7 @@ async fn sweep_report_failures(store: &Arc<Mutex<Store>>, next_adoption: &mut In
 /// Run once for the hub daemon. Registry revision fences prevent an in-flight
 /// read from publishing after an operator edits policy or disables a peer.
 pub(crate) async fn run_hub_poller(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime_config: Arc<RuntimeConfig>,
     satellite_root: PathBuf,
 ) {
@@ -199,12 +306,15 @@ pub(crate) async fn run_hub_poller(
     let mut schedule = PollSchedule::with_test_timing(Duration::from_millis(25), 0);
     let mut registered = HashSet::new();
     let dispatch_state = Arc::new(Mutex::new(super::dispatch::DispatchState::default()));
-    let report_state = Arc::new(Mutex::new(super::reports::ReportState::default()));
-    let dispatch_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reports = super::reports::ReportState::default();
+    let report_health = Arc::clone(&reports.health);
+    let report_state = Arc::new(Mutex::new(reports));
+    let mut link_rounds = LinkRounds::default();
     let (done_tx, mut done_rx) = mpsc::channel::<(Uuid, u64, PollOutcome)>(MAX_IN_FLIGHT * 2);
     let mut ticker = tokio::time::interval(REGISTRY_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_adoption = Instant::now();
+    let mut hub_link_transitions = HubLinkTransitions::default();
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -212,7 +322,14 @@ pub(crate) async fn run_hub_poller(
                 // this tick whether or not the hub polls it or this daemon
                 // polls peers.
                 sweep_report_failures(&store, &mut next_adoption).await;
+                {
+                    let guard = store.lock().await;
+                    sweep_hub_link(&guard, &mut hub_link_transitions, Utc::now());
+                }
                 if !runtime_config.satellite_polling_enabled.load(Ordering::Relaxed) {
+                    // An intentional pause is not a failed link. Start a new
+                    // observation window when polling is enabled again.
+                    report_health.lock().unwrap_or_else(|e| e.into_inner()).clear();
                     continue;
                 }
                 let view = store.lock().await.satellite_registry_view();
@@ -223,6 +340,10 @@ pub(crate) async fn run_hub_poller(
                         continue;
                     }
                 };
+                // This monitor does not need the round's state lock: even a
+                // round waiting on I/O cannot hide a stale pull.
+                report_health.lock().unwrap_or_else(|e| e.into_inner())
+                    .watch(&view.peers, Instant::now());
                 if stale_pending {
                     let marked = store.lock().await.mark_satellite_observations_stale();
                     match marked {
@@ -235,23 +356,28 @@ pub(crate) async fn run_hub_poller(
                         }
                     }
                 }
-                // Queued manager messages ride the same tick, in one paced
-                // background round, so a slow peer never blocks polling.
-                if !dispatch_running.swap(true, Ordering::AcqRel) {
+                // Delivery can spend 16 * 30 seconds on queued rows. Pulls
+                // schedule their own per-peer single flights, so neither that
+                // backlog nor another peer's stalled fetch can starve them.
+                let dispatch = {
                     let store = Arc::clone(&store);
                     let root = satellite_root.clone();
                     let state = Arc::clone(&dispatch_state);
-                    let reports = Arc::clone(&report_state);
-                    let running = Arc::clone(&dispatch_running);
-                    tokio::spawn(async move {
+                    async move {
                         let mut state = state.lock().await;
                         super::dispatch::dispatch_round(&store, &root, &mut state).await;
-                        // #1103: pull satellite reports on the same paced round.
+                    }
+                };
+                let reports = {
+                    let store = Arc::clone(&store);
+                    let root = satellite_root.clone();
+                    let reports = Arc::clone(&report_state);
+                    async move {
                         let mut reports = reports.lock().await;
-                        super::reports::report_round(&store, &root, &mut reports).await;
-                        running.store(false, Ordering::Release);
-                    });
-                }
+                        super::reports::report_tick(&store, &root, &mut reports).await;
+                    }
+                };
+                link_rounds.tick(dispatch, reports).await;
                 let current: HashSet<Uuid> = view.peers.iter().map(|peer| peer.config.peer_id.0).collect();
                 for id in registered.difference(&current) {
                     schedule.remove(*id);
@@ -332,6 +458,184 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    async fn finished(task: &Option<tokio::task::JoinHandle<()>>) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.as_ref().unwrap().is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("link round settled");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_stalled_delivery_round_does_not_starve_report_pulls() {
+        let mut rounds = LinkRounds::default();
+        let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+        let (pulled, pull) = tokio::sync::oneshot::channel();
+        rounds
+            .tick(
+                async move {
+                    let _ = stalled.await;
+                },
+                async move {
+                    pulled.send(()).unwrap();
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), pull)
+            .await
+            .unwrap()
+            .unwrap();
+        finished(&rounds.reports).await;
+
+        // The next registry tick pulls again while delivery still owns its
+        // single flight. A second delivery future must never start.
+        let (pulled, pull) = tokio::sync::oneshot::channel();
+        rounds
+            .tick(
+                async {
+                    panic!("overlapping delivery");
+                },
+                async move {
+                    pulled.send(()).unwrap();
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), pull)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!rounds.dispatch.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        finished(&rounds.dispatch).await;
+
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
+        rounds
+            .tick(
+                async move {
+                    delivered.send(()).unwrap();
+                },
+                async {},
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_panicked_link_round_restarts_on_the_next_tick() {
+        let mut rounds = LinkRounds::default();
+        rounds
+            .tick(
+                async {
+                    panic!("injected delivery panic");
+                },
+                async {
+                    panic!("injected pull panic");
+                },
+            )
+            .await;
+        finished(&rounds.dispatch).await;
+        finished(&rounds.reports).await;
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
+        let (pulled, pull) = tokio::sync::oneshot::channel();
+        rounds
+            .tick(
+                async move {
+                    delivered.send(()).unwrap();
+                },
+                async move {
+                    pulled.send(()).unwrap();
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            delivery.await.unwrap();
+            pull.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_cancelled_link_round_restarts_on_the_next_tick() {
+        let mut rounds = LinkRounds::default();
+        rounds
+            .tick(std::future::pending(), std::future::pending())
+            .await;
+        rounds.dispatch.as_ref().unwrap().abort();
+        rounds.reports.as_ref().unwrap().abort();
+        finished(&rounds.dispatch).await;
+        finished(&rounds.reports).await;
+        let (delivered, delivery) = tokio::sync::oneshot::channel();
+        let (pulled, pull) = tokio::sync::oneshot::channel();
+        rounds
+            .tick(
+                async move {
+                    delivered.send(()).unwrap();
+                },
+                async move {
+                    pulled.send(()).unwrap();
+                },
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            delivery.await.unwrap();
+            pull.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn hub_link_logs_only_outage_and_recovery_transitions() {
+        use rsi_common::health_anomaly::HUB_PULL_STALE_SECS;
+        use rsi_common::satellite_dispatch::SatelliteReportStatusV1;
+        let start = Utc::now();
+        let hub = Uuid::new_v4();
+        let mut link = HubReportLinkStatus {
+            hub_installations: vec![hub],
+            reports: SatelliteReportStatusV1 {
+                last_hub_pull_at: Some(start.to_rfc3339()),
+                ..Default::default()
+            },
+        };
+        let mut transitions = HubLinkTransitions::default();
+        assert!(transitions.observe(None, start).is_empty());
+        assert!(transitions.observe(Some(&link), start).is_empty());
+        let stale = start + chrono::Duration::seconds(HUB_PULL_STALE_SECS + 1);
+        assert_eq!(transitions.observe(Some(&link), stale), vec![(hub, true)]);
+        assert!(transitions.observe(Some(&link), stale).is_empty());
+        link.reports.last_hub_pull_at = Some(stale.to_rfc3339());
+        assert_eq!(transitions.observe(Some(&link), stale), vec![(hub, false)]);
+        for tick in 1..=3 {
+            let at = stale + chrono::Duration::seconds(tick);
+            link.reports.last_hub_pull_at = Some(at.to_rfc3339());
+            assert!(transitions.observe(Some(&link), at).is_empty());
+        }
+        let down_again = stale + chrono::Duration::seconds(HUB_PULL_STALE_SECS + 5);
+        assert_eq!(
+            transitions.observe(Some(&link), down_again),
+            vec![(hub, true)]
+        );
+        assert!(transitions.observe(None, down_again).is_empty());
+        assert!(transitions.stale.is_empty());
+        // A startup with an already stale link emits one warning, too.
+        assert_eq!(
+            transitions.observe(Some(&link), down_again),
+            vec![(hub, true)]
+        );
+        assert!(transitions.observe(Some(&link), down_again).is_empty());
+    }
 
     fn socket_root() -> (tempfile::TempDir, PathBuf) {
         let temp = crate::test_support::socket_tempdir("sat-hub-");
@@ -496,7 +800,7 @@ mod tests {
         _temp: tempfile::TempDir,
         root: PathBuf,
         socket: PathBuf,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         peer_id: SatelliteUuidV1,
     }
 
@@ -506,7 +810,9 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let socket = root.join("peer.sock");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let installation = Uuid::new_v4();
         let peer_id = SatelliteUuidV1(Uuid::new_v4());
         let link_id = SatelliteUuidV1(Uuid::new_v4());
@@ -570,7 +876,10 @@ mod tests {
         }
     }
 
-    async fn observation_state(store: &Arc<Mutex<Store>>, peer_id: SatelliteUuidV1) -> String {
+    async fn observation_state(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        peer_id: SatelliteUuidV1,
+    ) -> String {
         store
             .lock()
             .await

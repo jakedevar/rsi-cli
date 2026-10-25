@@ -8,8 +8,10 @@ members = [
     "crates/rsid-harness",
     "crates/rsi",
     "crates/rsi-common",
+    "crates/rsi-scoped-receipt",
     "crates/rsi-turn-shim",
     "crates/rsi-socket-hold",
+    "crates/rsi-cloud",
     "crates/rsi-signal",
     "crates/rsi-graph",
     "crates/rsi-eval",
@@ -17,6 +19,7 @@ members = [
     "crates/rsi-baseline",
     "crates/rsi-codegraph",
     "crates/rsi-remote",
+    "crates/rsi-repo-guards",
     "crates/flywheel-imessage",
     "crates/flywheel-signal",
 ]

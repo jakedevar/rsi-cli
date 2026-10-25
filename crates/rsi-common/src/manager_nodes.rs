@@ -16,7 +16,7 @@ pub const MANAGER_NODE_DEFAULT_MAX_DIRECT_REPORTS: u16 = 5;
 /// A project selector is explicit: an empty selected set never means an
 /// entire project. Group membership is resolved against the live topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ManagerNodeSelectorV1 {
     Project,
     Selected {
@@ -26,6 +26,30 @@ pub enum ManagerNodeSelectorV1 {
 }
 
 impl ManagerNodeSelectorV1 {
+    // Internally tagged enums buffer their fields inside Serde, so ignored-field
+    // tracking cannot enforce this input boundary. Use a strict input enum.
+    fn deserialize_input<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+        enum Input {
+            Project,
+            Selected {
+                group_ids: Vec<Uuid>,
+                epic_ids: Vec<Uuid>,
+            },
+        }
+        Ok(match Input::deserialize(d)? {
+            Input::Project => Self::Project,
+            Input::Selected {
+                group_ids,
+                epic_ids,
+            } => Self::Selected {
+                group_ids,
+                epic_ids,
+            },
+        })
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Project => Ok(()),
@@ -160,8 +184,11 @@ pub struct ConfigureManagerNodeRequestV1 {
     pub parent_node_id: Uuid,
     pub project_id: Uuid,
     pub seat_root_session_id: Uuid,
+    #[serde(deserialize_with = "ManagerNodeSelectorV1::deserialize_input")]
     pub selector: ManagerNodeSelectorV1,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub grant: ManagerNodeGrantV1,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub policy: ManagerPolicyV2,
     pub expected_parent_grant_version: i64,
     pub expected_parent_policy_version: i64,
@@ -177,9 +204,13 @@ pub struct ConfigureManagerNodeRequestV1 {
 pub struct DelegateManagerNodeRequestV1 {
     pub node_id: Option<Uuid>,
     pub parent_node_id: Uuid,
+    /// A parentless Standard session or a Task directly under a selected Epic.
     pub seat_root_session_id: Uuid,
+    #[serde(deserialize_with = "ManagerNodeSelectorV1::deserialize_input")]
     pub selector: ManagerNodeSelectorV1,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub grant: ManagerNodeGrantV1,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub policy: ManagerPolicyV2,
     pub expected_parent_grant_version: i64,
     pub expected_parent_policy_version: i64,
@@ -319,7 +350,6 @@ pub struct ListManagerNodesResultV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagerNodeAllowanceV1 {
     pub max_created_containers: u16,
     pub max_created_sessions: u16,
@@ -361,7 +391,6 @@ impl ManagerNodeAllowanceV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagerNodeGrantV1 {
     pub capabilities: Vec<ManagerCapabilityV2>,
     pub allowed_launches: Vec<ManagerLaunchChoiceV2>,
@@ -372,6 +401,9 @@ pub struct ManagerNodeGrantV1 {
 impl ManagerNodeGrantV1 {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.allowance.validate()?;
+        if !(1..=64).contains(&self.max_direct_reports) {
+            return Err("manager_node_invalid_grant_max_direct_reports");
+        }
         if self.capabilities.len() > 16
             || self.allowed_launches.len() > crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES
             || self
@@ -388,7 +420,6 @@ impl ManagerNodeGrantV1 {
                 .iter()
                 .enumerate()
                 .any(|(index, capability)| self.capabilities[..index].contains(capability))
-            || !(1..=64).contains(&self.max_direct_reports)
         {
             return Err("manager_node_invalid_grant");
         }
@@ -423,6 +454,16 @@ mod tests {
             },
             max_direct_reports: MANAGER_NODE_DEFAULT_MAX_DIRECT_REPORTS,
         }
+    }
+
+    #[test]
+    fn selector_reads_accept_additions_while_writes_reject_them() {
+        let value = serde_json::json!({"mode": "selected", "group_ids": [],
+            "epic_ids": [Uuid::new_v4()], "future_field": true});
+        let read: ManagerNodeSelectorV1 = serde_json::from_value(value.clone()).unwrap();
+        assert!(read.validate().is_ok());
+        let error = ManagerNodeSelectorV1::deserialize_input(value).unwrap_err();
+        assert!(error.to_string().contains("future_field"));
     }
 
     #[test]

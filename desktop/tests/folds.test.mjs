@@ -2,7 +2,7 @@
 // per id, and the rule of the pane that has the keys (actions/folds.ts).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ACTIONS, appMenuModel, keyHints, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, keyHints, unavailable } from '../dist/registry.js';
 import { FOLD_ACTIONS, foldPane } from '../dist/actions/folds.js';
 import { focusAfter } from '../dist/detail-model.js';
 
@@ -25,7 +25,7 @@ test('each fold action is registered once, in the View menu, with its TUI key', 
     assert.equal(ACTIONS.filter((x) => x.id === a.id).length, 1, a.id);
     assert.deepEqual(keyHints(a.id), [keys[a.id]], a.id);
   }
-  const view = appMenuModel('other', snap({ cursorFoldable: true, foldable: 1 })).find((m) => m.id === 'view').items;
+  const view = menuItems(appMenuModel('other', snap({ cursorFoldable: true, foldable: 1 })).find((m) => m.id === 'view').items);
   for (const id of Object.keys(keys)) assert.ok(view.some((n) => n.id === `act:${id}`), id);
 });
 

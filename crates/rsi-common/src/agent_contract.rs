@@ -367,6 +367,32 @@ fn missing_field_message(field: &str) -> String {
     format!("missing required field `{field}` (write any one of: {list})")
 }
 
+/// #3319: one error naming every required field that is absent (a single
+/// absent field keeps the plain [`ContractError::MissingField`]).
+fn missing_fields_error(fields: &[(&str, bool)]) -> Result<(), ContractError> {
+    let mut missing = fields
+        .iter()
+        .filter(|(_, absent)| *absent)
+        .map(|(field, _)| (*field).to_string())
+        .collect::<Vec<_>>();
+    match missing.len() {
+        0 => Ok(()),
+        1 => Err(ContractError::MissingField {
+            field: missing.remove(0),
+        }),
+        _ => Err(ContractError::MissingFields { fields: missing }),
+    }
+}
+
+fn missing_fields_message(fields: &[String]) -> String {
+    let list = fields
+        .iter()
+        .map(|field| format!("`{field}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("missing required fields {list}")
+}
+
 /// Serialized to JSON when the binary exits non-zero so the master can
 /// route the corrective `SendMessage` based on the `kind`.
 #[derive(Debug, Clone, Error, Serialize, PartialEq, Eq)]
@@ -383,6 +409,10 @@ pub enum ContractError {
     UnknownStage { stage: String },
     #[error("{}", missing_field_message(field))]
     MissingField { field: String },
+    /// Several required fields are absent at once (#3319): one message names
+    /// them all, so a single correction repairs the handoff.
+    #[error("{}", missing_fields_message(fields))]
+    MissingFields { fields: Vec<String> },
     #[error("ticket mismatch: expected `{expected}`, got `{got}`")]
     TicketMismatch { expected: String, got: String },
     /// Cross-stage drift (S6/D1): the VERIFY handoff declared plan/research
@@ -762,11 +792,6 @@ pub fn parse_pipeline_handoff_v2(
             }
         }
         PipelineStatusV2::Partial => {
-            if blocker.is_none() {
-                return Err(ContractError::MissingField {
-                    field: "blocker".into(),
-                });
-            }
             if blocker_class.is_some() {
                 return Err(ContractError::InvalidField {
                     field: "blocker_class".into(),
@@ -774,28 +799,19 @@ pub fn parse_pipeline_handoff_v2(
                         .into(),
                 });
             }
-            if blocker_evidence.is_none() {
-                return Err(ContractError::MissingField {
-                    field: "blocker_evidence".into(),
-                });
-            }
+            missing_fields_error(&[
+                ("blocker", blocker.is_none()),
+                ("blocker_evidence", blocker_evidence.is_none()),
+            ])?;
         }
         PipelineStatusV2::Blocked | PipelineStatusV2::HumanGate => {
-            if blocker.is_none() {
-                return Err(ContractError::MissingField {
-                    field: "blocker".into(),
-                });
-            }
-            if blocker_class.is_none() {
-                return Err(ContractError::MissingField {
-                    field: "blocker_class".into(),
-                });
-            }
-            if blocker_evidence.is_none() {
-                return Err(ContractError::MissingField {
-                    field: "blocker_evidence".into(),
-                });
-            }
+            // #3319: name every absent field in one error, so the one format
+            // continuation a node gets can repair the whole handoff.
+            missing_fields_error(&[
+                ("blocker", blocker.is_none()),
+                ("blocker_class", blocker_class.is_none()),
+                ("blocker_evidence", blocker_evidence.is_none()),
+            ])?;
         }
     }
 
@@ -1342,16 +1358,83 @@ pub fn parse_worker_report(reply: &str) -> Result<WorkerReport, ContractError> {
 ///
 /// Lower-cases keys for case-insensitive lookup. Skips lines without a
 /// colon and lines that begin with `#` or `=` (the marker underline).
+///
+/// A value that is a YAML block-scalar header (`>` folded, `|` literal, with
+/// an optional `-`/`+` chomping and `1`-`9` indentation indicator) takes the
+/// more-indented lines that follow as its value (#3754). Those lines are not
+/// scanned as keys of their own.
 fn collect_key_values(reply: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for line in reply.lines() {
+    let mut lines = reply.lines().peekable();
+    while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('=') || trimmed.starts_with('#') {
             continue;
         }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            out.push((k.trim().to_lowercase(), v.trim().to_string()));
+        let Some((k, v)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_lowercase();
+        let value = v.trim();
+        let Some((folded, keep)) = block_scalar_header(value) else {
+            out.push((key, value.to_string()));
+            continue;
+        };
+        let key_indent = line.len() - line.trim_start().len();
+        let mut body: Vec<&str> = Vec::new();
+        while let Some(next) = lines.peek() {
+            let indent = next.len() - next.trim_start().len();
+            if !next.trim().is_empty() && indent <= key_indent {
+                break;
+            }
+            body.push(next.trim());
+            lines.next();
         }
+        out.push((key, join_block_scalar(&body, folded, keep)));
+    }
+    out
+}
+
+/// `Some((folded, keep_trailing_newline))` when `value` is exactly a YAML
+/// block-scalar header: `>` or `|` plus at most one chomping (`-`/`+`) and
+/// one indentation (`1`-`9`) indicator, in either order.
+fn block_scalar_header(value: &str) -> Option<(bool, bool)> {
+    let mut chars = value.chars();
+    let folded = match chars.next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    let (mut chomp, mut digit) = (None, false);
+    for c in chars {
+        match c {
+            '-' | '+' if chomp.is_none() => chomp = Some(c),
+            '1'..='9' if !digit => digit = true,
+            _ => return None,
+        }
+    }
+    Some((folded, chomp == Some('+')))
+}
+
+fn join_block_scalar(body: &[&str], folded: bool, keep: bool) -> String {
+    let end = body
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .map_or(0, |i| i + 1);
+    let body = &body[..end];
+    let mut out = String::new();
+    for (i, line) in body.iter().enumerate() {
+        if i > 0 {
+            if !folded || line.is_empty() {
+                out.push('\n');
+            } else if !body[i - 1].is_empty() {
+                out.push(' ');
+            }
+        }
+        out.push_str(line);
+    }
+    if keep && !out.is_empty() {
+        out.push('\n');
     }
     out
 }
@@ -1649,6 +1732,119 @@ mod tests {
         );
     }
 
+    /// #3754: the exact shape a repair node wrote: a ```yaml fence with folded
+    /// scalars. The question must be the folded text, never the literal `>`.
+    #[test]
+    fn yaml_folded_blocker_fields_in_a_fence_parse_as_their_text() {
+        let r = "PIPELINE HANDOFF — FIX:\n\
+             ```yaml\n\
+             doc_path: inline\n\
+             manifest_path: inline\n\
+             status: blocked\n\
+             blocker: needs a ruling\n\
+             blocker_class: technical_impasse\n\
+             blocker_evidence: >\n\
+             \x20\x20[observed] the gate failed on\n\
+             \x20\x20two unrelated tests.\n\
+             blocker_question: >\n\
+             \x20\x20Should the repair\n\
+             \x20\x20land first?\n\
+             ```\n";
+        let handoff = parse_pipeline_handoff_v2(r, "").expect("folded handoff parses");
+        assert_eq!(
+            handoff.blocker_question.as_deref(),
+            Some("Should the repair land first?")
+        );
+        assert_eq!(
+            handoff.blocker_evidence.as_deref(),
+            Some("[observed] the gate failed on two unrelated tests.")
+        );
+    }
+
+    #[test]
+    fn yaml_block_scalar_styles_fold_keep_and_chomp() {
+        let kv = |text: &str, key: &str| {
+            collect_key_values(text)
+                .into_iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        };
+        let literal = "a: |\n  one\n  two: not a key\n\n  three\nb: next\n";
+        assert_eq!(
+            kv(literal, "a").as_deref(),
+            Some("one\ntwo: not a key\n\nthree")
+        );
+        assert_eq!(kv(literal, "b").as_deref(), Some("next"));
+        assert_eq!(kv(literal, "two"), None);
+        assert_eq!(
+            kv("a: >\n  x\n\n  y\n  z\n", "a").as_deref(),
+            Some("x\ny z")
+        );
+        assert_eq!(kv("a: |+\n  x\n", "a").as_deref(), Some("x\n"));
+        assert_eq!(kv("a: >-\n  x\n  y\n", "a").as_deref(), Some("x y"));
+        assert_eq!(kv("a: |2-\n  x\n", "a").as_deref(), Some("x"));
+        // Not a header: ordinary values keep their text.
+        assert_eq!(kv("a: > b\n", "a").as_deref(), Some("> b"));
+        assert_eq!(kv("a: >>\n", "a").as_deref(), Some(">>"));
+        // An empty block yields an empty value, never the literal header.
+        assert_eq!(kv("a: >\nb: c\n", "a").as_deref(), Some(""));
+        // An indented key's block ends at the next line of equal indent.
+        assert_eq!(kv("  a: >\n    x\n  b: y\n", "a").as_deref(), Some("x"));
+    }
+
+    /// #3319: a blocked handoff missing several blocker fields is refused once,
+    /// naming all of them, so the single format continuation can repair it.
+    #[test]
+    fn blocked_handoff_names_every_missing_blocker_field_at_once() {
+        let r = "PIPELINE HANDOFF — FIX:\n\
+             doc_path: inline\n\
+             manifest_path: inline\n\
+             status: blocked\n\
+             blocker_class: technical_impasse\n\
+             blocker_question: Which side of the conflict is right?\n";
+        let err = parse_pipeline_handoff_v2(r, "").unwrap_err();
+        match &err {
+            ContractError::MissingFields { fields } => {
+                assert_eq!(
+                    fields,
+                    &vec!["blocker".to_string(), "blocker_evidence".into()]
+                );
+            }
+            other => panic!("expected MissingFields, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "missing required fields `blocker`, `blocker_evidence`"
+        );
+
+        let none = "PIPELINE HANDOFF — FIX:\n\
+             doc_path: inline\n\
+             manifest_path: inline\n\
+             status: human_gate\n";
+        match parse_pipeline_handoff_v2(none, "").unwrap_err() {
+            ContractError::MissingFields { fields } => assert_eq!(
+                fields,
+                ["blocker", "blocker_class", "blocker_evidence"].map(String::from)
+            ),
+            other => panic!("expected MissingFields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_handoff_missing_one_blocker_field_keeps_the_single_field_error() {
+        let r = "PIPELINE HANDOFF — FIX:\n\
+             doc_path: inline\n\
+             manifest_path: inline\n\
+             status: blocked\n\
+             blocker: the refusal repeats\n\
+             blocker_class: technical_impasse\n\
+             blocker_question: Can the gate be re-run?\n";
+        match parse_pipeline_handoff_v2(r, "").unwrap_err() {
+            ContractError::MissingField { field } => assert_eq!(field, "blocker_evidence"),
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_pipeline_handoff_requires_manifest_for_implementation() {
         let r = "PIPELINE HANDOFF — IMPLEMENTATION:\n\
@@ -1763,7 +1959,12 @@ mod tests {
              Status: blocked\n\
              Blocker: review budget ended\n";
         let err = parse_pipeline_handoff_v2(missing, "RSI-021").unwrap_err();
-        assert!(matches!(err, ContractError::MissingField { field } if field == "blocker_class"));
+        // #3319: every absent blocker field is named at once.
+        assert!(matches!(
+            err,
+            ContractError::MissingFields { fields }
+                if fields == ["blocker_class", "blocker_evidence"].map(String::from)
+        ));
 
         let forbidden_class =
             format!("{missing}Blocker class: review_findings\nBlocker evidence: HIGH=1\n");

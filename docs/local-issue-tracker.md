@@ -116,6 +116,9 @@ does not grant cross-project filing authority. Keys are session-scoped: using
 the same key for an own-project and harness filing is a conflict, so use a
 distinct key for each filing. Names and filesystem paths are not copied into
 provenance.
+`source_issue` without `harness: true` is refused
+`agent_create_issue_source_issue_requires_harness`; the refusal names the fix: to
+link an Issue in your own project, cite it as `#N` in the body (andon #188).
 
 ## V97 guarded project Issue control and audit
 

@@ -91,6 +91,7 @@ token; the recipe is promote, then rotate.
 - **Do not poll.** Dispatch the work (child, job, review, landing) and end the
   turn; rely on the event wakes (terminal watches, job and lander completion,
   manager mail, `AgentScheduleWake`). A self-wake is always `mode:"resume"`. Every `AgentScheduleWake` call needs `message` (the prompt run on resume), including `mode:"when"` (`{"mode":"when","message":"jobs finished: read the receipts","when":{"jobs_terminal":["<job id>"]}}`); without it the call is refused `invalid_input`.
+- **Batch dependency commits.** One `when.shas_on_rolling` wake accepts 1-32 distinct full lowercase commit ids, fires once all are ancestors of `origin/rolling`, and reports each SHA as `on_rolling`, `pending` or `unknown` (also on timeout or manual trigger). The single-commit `when.sha_on_rolling` form remains supported. Add `"fire":"each"` beside `shas_on_rolling` to be resumed once per landing (the report names `landed_since_last_firing` and marks those SHAs `new=true`); the wake retires after the last lands or at its timeout. A session holds at most 16 enabled `mode:"when"` wakes (`topology_execution_settled` counted apart, 128); one more is refused `wake_when_cap_reached`, so batch instead of arming one wake per SHA.
 - **Automatic session retries are fail-closed.** The daemon applies no default
   retry budget to any session kind: a positive budget comes only from an explicit
   session retry policy or launch `max_retries`, and `retry_enabled=false` is a

@@ -640,7 +640,7 @@ pub(crate) fn validate_live_workflow(
 /// with the node working-dir and catalog-crate checks (plan §3.2). Shared by
 /// the operator `ExecuteTopology` path and the agent verbs (#633).
 pub(crate) async fn resolve_live_custody_base(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     workflow: &WorkflowDefinition,
     steps: &crate::topology::steps::WorkflowSteps,
     repo: &std::path::Path,
@@ -3355,6 +3355,7 @@ mod tests {
         *pressure.lock().unwrap() = Some(PressureHold::DiskPressure {
             free_gb: 9.0,
             min_gb: 30,
+            reserve_gb: 0,
         });
         assert_eq!(
             effects.launch_held(true, older_since, &older),

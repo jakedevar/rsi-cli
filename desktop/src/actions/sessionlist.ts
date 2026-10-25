@@ -27,8 +27,10 @@ export interface ListSnapshot {
   attentionQueue: number;
   /** The list filter text. */
   search: string;
-  /** A session is open and a filter is set: n / N can step through its events. */
+  /** A session is open and a filter is set (kept for the snapshot's readers; n / N use `findActive`). */
   detailSearchable: boolean;
+  /** A conversation find (actions/find-run.ts) is open or remembered: n / N step its matches. */
+  findActive?: boolean;
   projects: number;
   /** More than one label group among the rows. */
   labelGroups: boolean;
@@ -48,16 +50,17 @@ export const SESSIONLIST_ACTIONS: readonly ActionSpec[] = [
   { id: 'label-next', title: 'Next label group', group: 'go', menuBreak: true },
   { id: 'label-prev', title: 'Previous label group', group: 'go' },
   { id: 'attention-list', title: 'Attention queue…', group: 'go', menuBreak: true, detail: 'Sessions waiting for you, numbered' },
-  { id: 'attention-slot', title: 'Jump to attention slot', group: 'go', detail: '<Space>1 to <Space>9: the Nth waiting session' },
-  { id: 'search-next', title: 'Next filter match', group: 'go', menuBreak: true, detail: 'The open conversation’s events that contain the filter text, else the next matching session' },
-  { id: 'search-prev', title: 'Previous filter match', group: 'go' },
+  { id: 'attention-slot', title: 'Jump to attention slot', group: 'go', detail: 'Jump to the Nth waiting session (<Space>1 to <Space>9)' },
+  { id: 'search-next', title: 'Next match', group: 'go', menuBreak: true, detail: 'The next match of the conversation find (/ with the keys in the transcript, Cmd-F), else the next session that matches the list filter' },
+  { id: 'search-prev', title: 'Previous match', group: 'go' },
   { id: 'clear-search', title: 'Clear filter', group: 'go', extraKeys: ['Esc'], detail: 'Esc in the list clears a confirmed filter' },
+  // File: the project actions sit right after New session… (registry menuAfter).
+  { id: 'project-new', title: 'New project…', group: 'file', menuAfter: 'launch', menuBreak: true, detail: 'A folder with your code that sessions work in' },
+  { id: 'project-edit', title: 'Edit project…', group: 'file', menuAfter: 'project-new', detail: ':project-edit <name> edits that project' },
+  { id: 'project-delete', title: 'Delete project…', group: 'file', menuAfter: 'project-edit', detail: ':project-delete <name>' },
   // View
   { id: 'choose-project', title: 'Choose project…', group: 'view', menuBreak: true, detail: 'Filter the list to one project; :project <name> switches directly' },
   { id: 'choose-sort', title: 'Sort sessions…', group: 'view', detail: 'Longest idle, recently active, created, grouped by label' },
-  { id: 'project-new', title: 'New project…', group: 'view', menuBreak: true, detail: 'Name, path and color' },
-  { id: 'project-edit', title: 'Edit project…', group: 'view', detail: ':project-edit <name> edits that project' },
-  { id: 'project-delete', title: 'Delete project…', group: 'view', detail: ':project-delete <name>' },
 ];
 
 export const SESSIONLIST_KEYS: Readonly<Record<string, DesktopBinding<SessionListActionId>>> = {
@@ -96,7 +99,7 @@ export const SESSIONLIST_COMMANDS: Readonly<Record<string, DesktopBinding<Sessio
 // ---------- availability ----------
 
 type Rule = (s: UiSnapshot) => string | null;
-const NEED_OPEN = 'Open a session first (j/k, then Enter)';
+const NEED_OPEN = 'Open a session first: click one in the list (j/k, then Enter)';
 const open = (more?: (o: NonNullable<UiSnapshot['open']>, l: ListSnapshot) => string | null): Rule =>
   (s) => (s.open ? (more ? more(s.open, s.list ?? EMPTY) : null) : NEED_OPEN);
 const writable = (o: NonNullable<UiSnapshot['open']>): string | null => (o.readOnly ? 'This session is read-only' : null);
@@ -107,6 +110,7 @@ export const EMPTY: ListSnapshot = {
 };
 const list = (more: (l: ListSnapshot, s: UiSnapshot) => string | null): Rule => (s) => more(s.list ?? EMPTY, s);
 
+const NO_SEARCH = 'Type a filter (/) first, or search a conversation with / (keys in the transcript) or Cmd-F';
 const NOT_FOLDABLE = 'The cursor is not on a session with children';
 const NO_FOLDS = 'No session has children to fold';
 
@@ -126,9 +130,9 @@ export const SESSIONLIST_RULES: Readonly<Record<Exclude<SessionListActionId, Fol
   'label-prev': list((l) => (l.labelGroups ? null : 'No session has a different label')),
   'attention-list': () => null,
   'attention-slot': list((l) => (l.attentionQueue > 0 ? null : 'No session is waiting for you')),
-  // With a session open they step its events; otherwise the filtered list's rows (G2).
-  'search-next': list((l) => (l.search.trim() !== '' ? null : 'Type a filter (/) first')),
-  'search-prev': list((l) => (l.search.trim() !== '' ? null : 'Type a filter (/) first')),
+  // They step the conversation find's matches while one is active, else the filtered list's rows (G2).
+  'search-next': list((l) => (l.search.trim() !== '' || l.findActive ? null : NO_SEARCH)),
+  'search-prev': list((l) => (l.search.trim() !== '' || l.findActive ? null : NO_SEARCH)),
   'clear-search': list((l) => (l.search.trim() !== '' ? null : 'No filter is active')),
 };
 
@@ -153,6 +157,8 @@ export const SLICE: SliceSpec<SessionListActionId> = {
   order: 30,
   actions: SESSIONLIST_ACTIONS,
   rules: SESSIONLIST_RULES,
+  // Esc clears a confirmed filter, from the document keydown listener in actions/sessionlist-run.ts.
+  rawKeys: ['Esc'],
   keys: SESSIONLIST_KEYS,
   commands: SESSIONLIST_COMMANDS,
 };

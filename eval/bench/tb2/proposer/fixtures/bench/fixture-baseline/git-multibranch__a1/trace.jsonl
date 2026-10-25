@@ -1,0 +1,10 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Configure the repository and hooks the task describes.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"pwd && ls -la && git --version"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"/app\ngit version 2.43.0","success":true},"seq":2}
+{"args":{"command":"git init --bare repo.git && chmod +x repo.git/hooks/post-receive"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 1","output":"chmod: cannot access 'repo.git/hooks/post-receive'","success":false},"seq":4}
+{"args":{"command":"printf '#!/bin/sh\\necho deployed\\n' > repo.git/hooks/post-receive && chmod +x repo.git/hooks/post-receive"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"","success":true},"seq":6}
+{"args":{"command":"git push repo.git main dev"},"kind":"tool_call","name":"shell","seq":7}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"To repo.git\n * [new branch] main -> main\n * [new branch] dev -> dev","success":true},"seq":8}
+{"kind":"model_response","response":{"content":"Created the bare repository, made the hook executable and pushed both branches.","stop_reason":"stop","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":9}

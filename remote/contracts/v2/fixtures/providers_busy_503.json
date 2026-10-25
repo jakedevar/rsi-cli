@@ -1,0 +1,19 @@
+{
+  "name": "providers_busy_503",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/providers"
+  },
+  "response": {
+    "body": {
+      "error": "busy"
+    },
+    "retry_after": 2,
+    "status": 503
+  }
+}

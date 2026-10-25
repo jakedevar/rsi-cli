@@ -33,6 +33,22 @@ impl AgentControlHandle {
                     .map(|hold| hold.reason().to_owned());
             }
         }
+        let store = self.store.lock().await;
+        if let Some(config) = &self.runtime_config {
+            crate::agent_jobs::project_roster_disk_holds(
+                &store,
+                &config.governor_policy(),
+                &mut roster,
+            );
+        }
+        for launch in &mut roster.queued_launches {
+            if store
+                .sandbox_git_timeout_retry_at(launch.operation_id)?
+                .is_some()
+            {
+                launch.held_reason = Some("sandbox_git_timeout".into());
+            }
+        }
         Ok(roster)
     }
 }

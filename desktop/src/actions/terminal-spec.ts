@@ -62,5 +62,7 @@ export const SLICE: SliceSpec<TerminalActionId> = {
   order: 60,
   actions: TERMINAL_ACTIONS,
   rules: TERMINAL_RULES,
+  // isToggleChord (terminal-model.ts), run from the window keydown listener in actions/terminal.ts (Cmd-\ too on macOS).
+  rawKeys: ['C-\\'],
   commands: TERMINAL_COMMAND_BINDINGS,
 };

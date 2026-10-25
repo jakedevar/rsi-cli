@@ -15,17 +15,21 @@ use uuid::Uuid;
 /// directory and reported in the receipt's `skipped` list when absent (#1110).
 /// A missing `cargo-slot` or `target-pool` is never silent either: it is named
 /// in `skipped` like any other absent member (#2722).
-pub const DEPLOY_BINARIES: [&str; 14] = [
+pub const DEPLOY_BINARIES: [&str; 18] = [
     "rsid",
     "rsi",
     "rsi-rpc",
     "rsi-agent-mcp",
     "rsi-build-rustc",
     "rsi-contract-validate",
+    "rsi-known-failure",
     "rsi-rolling-land",
+    "rsi-repo-guard",
     "rsi-remote",
     "rsi-turn-shim",
     "rsi-socket-hold",
+    "rsi-cloud",
+    "rsi-eval",
     "rsid-supervisor.sh",
     "cargo-slot",
     "target-pool",
@@ -94,9 +98,18 @@ pub const DEPLOY_KEY_CONFLICT: &str = "deploy_idempotency_key_conflict";
 pub const DEPLOY_SOURCE_REQUIRED: &str = "deploy_source_required";
 pub const DEPLOY_SOURCE_AMBIGUOUS: &str = "deploy_source_ambiguous";
 pub const DEPLOY_BUILD_NOT_SUPPORTED: &str = "deploy_build_not_supported";
+pub const DEPLOY_BINARIES_DIR_NOT_ABSOLUTE: &str = "deploy_binaries_dir_not_absolute";
 pub const DEPLOY_DIR_NOT_ALLOWED: &str = "deploy_directory_not_allowed";
 pub const DEPLOY_BINARY_MISSING: &str = "deploy_binary_missing";
 pub const DEPLOY_STAGE_FAILED: &str = "deploy_stage_failed";
+/// The build a deploy would put live runs from a directory with no trusted
+/// `rsi-repo-guard` beside its `rsid` or `rsi-rolling-land`, so the daemon's
+/// provisional probe and the lander would refuse every landing (hub #3886). The
+/// message names the consumer and the directory.
+pub const DEPLOY_GUARD_UNRESOLVABLE: &str = "deploy_guard_unresolvable";
+/// A plain member the build installed is not the file beside its `rsid`, where the
+/// daemon and the lander resolve it (hub #3886); the message names the member.
+pub const DEPLOY_MEMBER_UNRESOLVABLE: &str = "deploy_member_unresolvable";
 pub const DEPLOY_SHA_MISMATCH: &str = "deploy_sha_mismatch";
 pub const DEPLOY_SCHEMA_DOWNGRADE: &str = "deploy_schema_downgrade";
 pub const DEPLOY_NEEDS_SUPERVISOR: &str = "deploy_needs_supervisor";
@@ -117,12 +130,6 @@ pub const DEPLOY_NOT_FOUND: &str = "deploy_not_found";
 /// Default (seconds) of the operator setting `deploy_drain_hold_secs`: how
 /// long an agent deploy may hold new worker starts while it waits.
 pub const DEPLOY_DRAIN_HOLD_DEFAULT_SECS: u64 = 600;
-/// #2048: how long a staged `interrupt_workers` deploy waits for running
-/// `test`/`scoped_test` jobs (counted from the request) before it stops them
-/// with `interrupted_by_deploy`. A fixed policy, not an operator setting: it
-/// only bounds how long re-runnable verification may hold the line, and the
-/// receipt reports it. Build and landing jobs are never stopped.
-pub const DEPLOY_JOB_GRACE_SECS: u64 = 300;
 /// #2278: after a staged `interrupt_workers` deploy times out, new and
 /// requeued `test`/`build` jobs stay held this long (seconds), so an immediate
 /// retry of the deploy meets the same held set instead of a fresh crop of
@@ -219,8 +226,11 @@ pub struct AgentRequestDeployRequestV1 {
     /// #1461: once the operator's drain hold (`deploy_drain_hold_secs`) is over,
     /// a worker still mid-turn no longer blocks the quiet point: the restart
     /// interrupts it and the existing post-restart path resumes the turn with
-    /// a continue prompt. A landing and a local test/build/landing job still
-    /// block. Default false (workers block, as always).
+    /// a continue prompt. Ordinary test jobs are never stopped or rerun (#3554): they
+    /// keep running across the restart and the new daemon re-adopts them; landing,
+    /// build and protected jobs still block. Omission defaults
+    /// to true with `peer_id`, false for a local deploy. Explicit false waits
+    /// for a lull on either target.
     /// The outcome lists the interrupted worker session ids and each one is an
     /// andon friction event. With `peer_id` (#2587) the satellite applies the
     /// same semantics to its own workers, provided it advertises the
@@ -241,7 +251,7 @@ impl AgentRequestDeployRequestV1 {
     /// True when workers mid-turn may be interrupted after the drain hold.
     #[must_use]
     pub fn interrupts_workers(&self) -> bool {
-        self.interrupt_workers == Some(true)
+        !self.is_cancel() && self.interrupt_workers.unwrap_or(self.peer_id.is_some())
     }
 
     /// # Errors
@@ -266,7 +276,7 @@ impl AgentRequestDeployRequestV1 {
         }
         if self.is_cancel() {
             // A cancel names an existing deploy; the source fields are ignored.
-            return if self.interrupts_workers() {
+            return if self.interrupt_workers == Some(true) {
                 Err(DEPLOY_INVALID_REQUEST)
             } else {
                 Ok(())
@@ -275,8 +285,12 @@ impl AgentRequestDeployRequestV1 {
         match (self.binaries_dir.as_deref(), self.build) {
             (Some(_), Some(true)) => Err(DEPLOY_SOURCE_AMBIGUOUS),
             (None, Some(true)) => Err(DEPLOY_BUILD_NOT_SUPPORTED),
-            (Some(dir), _) if dir.is_empty() || !dir.starts_with('/') => {
-                Err(DEPLOY_DIR_NOT_ALLOWED)
+            (Some(dir), _) if !std::path::Path::new(dir).is_absolute() => {
+                Err(if self.peer_id.is_some() {
+                    DEPLOY_BINARIES_DIR_NOT_ABSOLUTE
+                } else {
+                    DEPLOY_DIR_NOT_ALLOWED
+                })
             }
             (Some(_), _) => Ok(()),
             (None, _) => Err(DEPLOY_SOURCE_REQUIRED),
@@ -393,15 +407,36 @@ pub struct AgentRequestDeployReceiptV1 {
     /// began (each gets a continue prompt after it); empty until the restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interrupted_workers: Vec<Uuid>,
-    /// #2048: with `interrupt_workers`, the grace (seconds from the request)
-    /// after which running `test`/`scoped_test` jobs are stopped as
-    /// `interrupted_by_deploy`; absent without it.
+    /// Live prediction while staged; workers still mid-turn may finish first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_interrupted_workers: Vec<Uuid>,
+    /// Legacy (#2278): ordinary test jobs are no longer stopped and requeued by
+    /// a deploy (#3554), so a current daemon leaves this empty; an older daemon
+    /// listed the running ordinary test jobs expected to requeue after the grace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_requeued_jobs: Vec<Uuid>,
+    /// Legacy: jobs a deploy of an older daemon requeued under their own ids.
+    /// Empty from a current daemon (#3554).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requeued_jobs: Vec<Uuid>,
+    /// #3554: live prediction while staged. The running ordinary test jobs
+    /// (`scoped_test` included) that keep running across the restart: the new
+    /// daemon re-adopts each unit and settles it once, with one owner wake. They
+    /// do not block the quiet point. Empty without `interrupt_workers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_surviving_jobs: Vec<Uuid>,
+    /// #3554: the jobs that were still running when this deploy restarted the
+    /// daemon, and so kept running. A job that finished before the restart is
+    /// not listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surviving_jobs: Vec<Uuid>,
+    /// Legacy: the grace an older daemon gave ordinary test jobs before it
+    /// requeued them. Absent from a current daemon, which stops none (#3554).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_grace_secs: Option<u64>,
-    /// #2048: the jobs this deploy stopped; empty until the grace passes. A test
-    /// job it stopped is requeued under its own id (#2278): the owner's wake
-    /// fires once, when the rerun ends. A hub QA run settles
-    /// `interrupted_by_deploy` instead and wakes its owner at once.
+    /// #2048: the jobs this deploy stopped. A hub QA run settles
+    /// `interrupted_by_deploy` and wakes its owner at once. An ordinary test job
+    /// is not stopped (#3554); an older daemon requeued it here (#2278).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cancelled_jobs: Vec<Uuid>,
     /// #2056: while the deploy is `staged`, what holds its quiet point right
@@ -456,6 +491,13 @@ mod tests {
         let mut relative = request();
         relative.binaries_dir = Some("bin".into());
         assert_eq!(relative.validate(), Err(DEPLOY_DIR_NOT_ALLOWED));
+        relative.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
+        for dir in ["bin", "~/.rsi/staging/bin", ""] {
+            relative.binaries_dir = Some(dir.into());
+            assert_eq!(relative.validate(), Err(DEPLOY_BINARIES_DIR_NOT_ABSOLUTE));
+        }
+        relative.cancel = Some(true);
+        assert_eq!(relative.validate(), Ok(()));
         let mut wait = request();
         wait.max_wait_secs = Some(DEPLOY_MAX_WAIT_SECS + 1);
         assert_eq!(wait.validate(), Err(DEPLOY_INVALID_REQUEST));
@@ -473,10 +515,10 @@ mod tests {
         );
     }
 
-    /// #1461: `interrupt_workers` is optional and off by default, travels on the
-    /// wire only when set, and (#2587) is available with a satellite deploy.
+    /// Omitted peer requests interrupt; local requests and explicit false wait.
+    /// Cancellation must not acquire the peer default.
     #[test]
-    fn interrupt_workers_is_optional_off_by_default_and_allowed_for_a_peer() {
+    fn interrupt_workers_defaults_to_peer_only_and_explicit_false_waits() {
         let plain = request();
         assert!(!plain.interrupts_workers());
         assert!(
@@ -502,9 +544,15 @@ mod tests {
         assert!(!explicit_false.interrupts_workers());
         let mut with_peer = parsed;
         with_peer.peer_id = Some(crate::satellite::SatelliteUuidV1(Uuid::new_v4()));
-        // #2587: a satellite deploy carries the same option.
+        with_peer.interrupt_workers = None;
         assert_eq!(with_peer.validate(), Ok(()));
         assert!(with_peer.interrupts_workers());
+        with_peer.interrupt_workers = Some(false);
+        assert!(!with_peer.interrupts_workers());
+        with_peer.interrupt_workers = None;
+        with_peer.cancel = Some(true);
+        assert_eq!(with_peer.validate(), Ok(()));
+        assert!(!with_peer.interrupts_workers());
     }
 
     #[test]
@@ -534,6 +582,11 @@ mod tests {
             reason: None,
             interrupt_workers: false,
             interrupted_workers: Vec::new(),
+            expected_interrupted_workers: Vec::new(),
+            expected_requeued_jobs: Vec::new(),
+            requeued_jobs: Vec::new(),
+            expected_surviving_jobs: Vec::new(),
+            surviving_jobs: Vec::new(),
             job_grace_secs: None,
             cancelled_jobs: Vec::new(),
             blockers: Vec::new(),
@@ -546,10 +599,11 @@ mod tests {
         receipt.interrupt_workers = true;
         receipt.interrupted_workers = vec![worker];
         let job = Uuid::new_v4();
-        receipt.job_grace_secs = Some(DEPLOY_JOB_GRACE_SECS);
         receipt.cancelled_jobs = vec![job];
+        receipt.surviving_jobs = vec![job];
         let value = serde_json::to_value(&receipt).unwrap();
-        assert_eq!(value["job_grace_secs"], DEPLOY_JOB_GRACE_SECS);
+        assert!(value.get("job_grace_secs").is_none());
+        assert_eq!(value["surviving_jobs"], serde_json::json!([job]));
         assert_eq!(value["cancelled_jobs"], serde_json::json!([job]));
         assert_eq!(value["interrupt_workers"], true);
         assert_eq!(value["interrupted_workers"], serde_json::json!([worker]));
@@ -574,5 +628,337 @@ mod tests {
                 serde_json::json!(state.as_str())
             );
         }
+    }
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(crate::manifest_dir!()).join("../..")
+    }
+
+    fn repo_file(relative: &str) -> String {
+        let path = repo_root().join(relative);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    /// #451: `rsi-repo-guard` ships beside `rsid` and `rsi-rolling-land`. The
+    /// lander and the queue probe find it only as the sibling of the running
+    /// binary and fail closed without it (`repo_guard_call::trusted_tool`).
+    #[test]
+    fn repo_guard_is_a_deployed_binary_next_to_the_lander() {
+        assert!(DEPLOY_BINARIES.contains(&"rsi-repo-guard"));
+        assert!(!is_deploy_tool_script("rsi-repo-guard"));
+        let position = |name: &str| DEPLOY_BINARIES.iter().position(|n| *n == name).unwrap();
+        assert!(position("rsi-repo-guard") > position("rsi-rolling-land"));
+        let absent = skipped_binaries(&[]);
+        assert!(absent.contains(&"rsi-repo-guard".to_string()));
+    }
+
+    /// The shell installer's list (`scripts/rsid-quiet-restart.sh`) is a second
+    /// copy of the managed set; it must name exactly the binaries, in order,
+    /// that `DEPLOY_BINARIES` names, minus the tool scripts the installer copies
+    /// by hand (`cargo-slot`, `target-pool`, `rsi-spill`).
+    #[test]
+    fn the_shell_installer_list_matches_the_managed_set() {
+        let script = repo_file("scripts/rsid-quiet-restart.sh");
+        let line = script
+            .lines()
+            .find(|line| line.starts_with("RSID_DEPLOY_BINARIES=("))
+            .expect("RSID_DEPLOY_BINARIES array");
+        let listed: Vec<&str> = line
+            .trim_start_matches("RSID_DEPLOY_BINARIES=(")
+            .trim_end_matches(')')
+            .split_whitespace()
+            .collect();
+        let expected: Vec<&str> = DEPLOY_BINARIES
+            .iter()
+            .copied()
+            .filter(|name| !is_deploy_tool_script(name))
+            .collect();
+        assert_eq!(listed, expected);
+    }
+
+    /// #451 constraint: `crates/rsi-repo-guards` enables `serde_json/preserve_order`
+    /// and Cargo unifies features across one build, so co-building it with `rsid`
+    /// reorders every `serde_json::Map` in the daemon (starter digests moved).
+    /// The installer builds it in its own cargo invocation.
+    #[test]
+    fn the_installer_builds_the_repo_guard_in_its_own_cargo_invocation() {
+        let script = repo_file("scripts/install-release.sh");
+        let start = script
+            .find("build_release_binaries() {")
+            .expect("build_release_binaries");
+        let body = &script[start..];
+        let body = &body[..body.find("\n}\n").expect("end of build_release_binaries")];
+        let builds: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("cargo build"))
+            .collect();
+        assert_eq!(
+            builds.len(),
+            2,
+            "one daemon build, one guard build: {builds:?}"
+        );
+        let (daemon, guard): (Vec<&str>, Vec<&str>) = builds
+            .iter()
+            .copied()
+            .partition(|line| line.contains("--bin rsid "));
+        assert_eq!((daemon.len(), guard.len()), (1, 1), "{builds:?}");
+        assert!(daemon[0].contains("--bin rsi-rolling-land"));
+        assert!(!daemon[0].contains("repo-guard"), "{}", daemon[0]);
+        assert!(guard[0].contains("-p rsi-repo-guards --bin rsi-repo-guard"));
+        assert!(!guard[0].contains("--bin rsid"), "{}", guard[0]);
+        assert!(!guard[0].contains("--workspace"), "{}", guard[0]);
+    }
+
+    // Cargo.lock does not distinguish production and dev edges. Validate the
+    // manifests first, including aliases and target-specific dependency tables,
+    // then allow only those verified fixture consumers in the resolved graph.
+    fn repo_guard_fixture_aliases(manifest: &toml::Value) -> Result<Vec<String>, String> {
+        fn visit(value: &toml::Value, aliases: &mut Vec<String>) -> Result<(), String> {
+            let Some(table) = value.as_table() else {
+                return Ok(());
+            };
+            for (section, value) in table {
+                if matches!(
+                    section.as_str(),
+                    "dependencies" | "dev-dependencies" | "build-dependencies"
+                ) {
+                    for (alias, dependency) in value.as_table().ok_or("dependency table")? {
+                        let package = dependency
+                            .get("package")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or(alias);
+                        if package != "rsi-repo-guards" {
+                            continue;
+                        }
+                        if section != "dev-dependencies"
+                            || dependency
+                                .get("default-features")
+                                .and_then(toml::Value::as_bool)
+                                != Some(false)
+                            || dependency.get("workspace").and_then(toml::Value::as_bool)
+                                == Some(true)
+                            || dependency
+                                .get("features")
+                                .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+                        {
+                            return Err(format!(
+                                "{section}.{alias}: rsi-repo-guards must be fixture-only, \
+                                 with default-features = false and no requested features"
+                            ));
+                        }
+                        aliases.push(alias.clone());
+                    }
+                } else {
+                    visit(value, aliases)?;
+                }
+            }
+            Ok(())
+        }
+        let mut aliases = Vec::new();
+        visit(manifest, &mut aliases)?;
+        if let Some(features) = manifest.get("features").and_then(toml::Value::as_table) {
+            for feature in features.values() {
+                for enabled in feature.as_array().ok_or("feature array")? {
+                    if let Some((dependency, _)) =
+                        enabled.as_str().ok_or("feature string")?.split_once('/')
+                        && aliases
+                            .iter()
+                            .any(|alias| alias == dependency.trim_end_matches('?'))
+                    {
+                        return Err(format!("fixture dependency feature forwarded: {enabled}"));
+                    }
+                }
+            }
+        }
+        Ok(aliases)
+    }
+
+    fn repo_guard_lock_is_isolated(
+        lock: &toml::Value,
+        fixtures: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        for package in lock["package"].as_array().ok_or("lock packages")? {
+            let name = package["name"].as_str().ok_or("lock package name")?;
+            for dependency in package
+                .get("dependencies")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if dependency
+                    .as_str()
+                    .ok_or("lock dependency")?
+                    .split_whitespace()
+                    .next()
+                    == Some("rsi-repo-guards")
+                    && !fixtures.contains(name)
+                {
+                    return Err(format!(
+                        "{name} has an unverified rsi-repo-guards lock edge"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve the hub's inline, table-form and target-specific regression
+    /// cases (#3937), using the same feature-isolation check as the live scan.
+    #[test]
+    fn guard_dependency_is_accepted_only_in_dev_dependency_tables() {
+        for dev in [
+            "[package]\nname = 'a'\n[dev-dependencies]\nrsi-repo-guards = { path = '../rsi-repo-guards', default-features = false }\n",
+            "[target.'cfg(unix)'.dev-dependencies]\nrsi-repo-guards = { version = '0.1', default-features = false }\n",
+            "[dev-dependencies.rsi-repo-guards]\npath = '../rsi-repo-guards'\ndefault-features = false\n",
+            "[target.'cfg(unix)'.dev-dependencies.rsi-repo-guards]\npath = '../rsi-repo-guards'\ndefault-features = false\n",
+        ] {
+            assert_eq!(
+                repo_guard_fixture_aliases(&toml::from_str(dev).unwrap()),
+                Ok(vec!["rsi-repo-guards".into()]),
+                "{dev}"
+            );
+        }
+        for shipped in [
+            "[dependencies]\nrsi-repo-guards = { path = '../rsi-repo-guards', default-features = false }\n",
+            "[build-dependencies]\nrsi-repo-guards = { version = '0.1', default-features = false }\n",
+            "[target.'cfg(unix)'.dependencies]\nrsi-repo-guards = { version = '0.1', default-features = false }\n",
+            "[dependencies.rsi-repo-guards]\npath = '../rsi-repo-guards'\ndefault-features = false\n",
+            "[dev-dependencies.rsi-repo-guards]\npath = '../rsi-repo-guards'\ndefault-features = false\n[features]\nguards = ['rsi-repo-guards/preserve-json-order']\n",
+        ] {
+            assert!(
+                repo_guard_fixture_aliases(&toml::from_str(shipped).unwrap()).is_err(),
+                "{shipped}"
+            );
+        }
+        let commented = "[dependencies]\n# rsi-repo-guards stays out of the daemon (#451)\n";
+        assert_eq!(
+            repo_guard_fixture_aliases(&toml::from_str(commented).unwrap()),
+            Ok(Vec::new())
+        );
+    }
+
+    /// Production edges to the guard remain forbidden (#451). Fixture consumers
+    /// may use its feature-isolated library (#413); its default preserve-order
+    /// feature must never be unified into the daemon through those fixtures.
+    #[test]
+    fn no_crate_but_the_guard_crate_depends_on_rsi_repo_guards() {
+        let crates = repo_root().join("crates");
+        let mut checked = Vec::new();
+        let mut fixtures = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(&crates).unwrap() {
+            let dir = entry.unwrap().path();
+            let manifest = dir.join("Cargo.toml");
+            if !manifest.is_file() || dir.file_name().unwrap() == "rsi-repo-guards" {
+                continue;
+            }
+            let data: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+            let aliases = repo_guard_fixture_aliases(&data)
+                .unwrap_or_else(|error| panic!("{}: {error}", manifest.display()));
+            if !aliases.is_empty() {
+                fixtures.insert(data["package"]["name"].as_str().unwrap().to_owned());
+            }
+            checked.push(dir.file_name().unwrap().to_string_lossy().into_owned());
+        }
+        for required in ["rsid", "rsi-common", "rsid-store"] {
+            assert!(
+                checked.iter().any(|name| name == required),
+                "{required} not scanned"
+            );
+        }
+        let root: toml::Value = toml::from_str(&repo_file("Cargo.toml")).unwrap();
+        repo_guard_fixture_aliases(&root).unwrap();
+        let lock: toml::Value = toml::from_str(&repo_file("Cargo.lock")).unwrap();
+        repo_guard_lock_is_isolated(&lock, &fixtures).unwrap();
+    }
+
+    #[test]
+    fn repo_guard_accepts_only_feature_isolated_fixture_declarations() {
+        for section in ["dev-dependencies", "target.'cfg(unix)'.dev-dependencies"] {
+            for (alias, package) in [
+                ("rsi-repo-guards", ""),
+                ("fixtures", "package = 'rsi-repo-guards',"),
+            ] {
+                let text = format!(
+                    "[{section}]\n{alias} = {{ {package} path = '../rsi-repo-guards', \
+                     default-features = false, features = [] }}"
+                );
+                assert_eq!(
+                    repo_guard_fixture_aliases(&toml::from_str(&text).unwrap()),
+                    Ok(vec![alias.into()])
+                );
+            }
+        }
+        let data = toml::from_str(
+            "# rsi-repo-guards mentioned in a comment is harmless\n\
+             [dev-dependencies.fixtures]\npackage = 'rsi-repo-guards'\n\
+             path = '../rsi-repo-guards'\ndefault-features = false\n\
+             [features]\ndefault = []",
+        )
+        .unwrap();
+        assert_eq!(
+            repo_guard_fixture_aliases(&data),
+            Ok(vec!["fixtures".into()])
+        );
+    }
+
+    #[test]
+    fn repo_guard_rejects_production_and_feature_enabling_dependencies() {
+        for section in [
+            "dependencies",
+            "build-dependencies",
+            "target.'cfg(windows)'.dependencies",
+            "target.'cfg(unix)'.build-dependencies",
+            "workspace.dependencies",
+        ] {
+            let text = format!(
+                "[{section}]\nfixtures = {{ package = 'rsi-repo-guards', default-features = false }}"
+            );
+            assert!(
+                repo_guard_fixture_aliases(&toml::from_str(&text).unwrap()).is_err(),
+                "{text}"
+            );
+        }
+        for settings in [
+            "",
+            "default-features = true,",
+            "default-features = false, features = ['preserve-json-order'],",
+            "default-features = false, features = ['default'],",
+            "default-features = false, workspace = true,",
+        ] {
+            let text = format!(
+                "[dev-dependencies]\nrsi-repo-guards = {{ {settings} path = '../rsi-repo-guards' }}"
+            );
+            assert!(
+                repo_guard_fixture_aliases(&toml::from_str(&text).unwrap()).is_err(),
+                "{text}"
+            );
+        }
+        for enabled in [
+            "fixtures/preserve-json-order",
+            "fixtures?/preserve-json-order",
+            "fixtures/default",
+        ] {
+            let text = format!(
+                "[dev-dependencies.fixtures]\npackage = 'rsi-repo-guards'\ndefault-features = false\n[features]\nindirect = ['{enabled}']"
+            );
+            assert!(
+                repo_guard_fixture_aliases(&toml::from_str(&text).unwrap()).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_guard_lock_edges_require_a_validated_fixture_consumer() {
+        let lock = toml::from_str("[[package]]\nname = 'rsid'\ndependencies = ['rsi-repo-guards 0.1.0']\n[[package]]\nname = 'rsi-common'\ndependencies = ['serde_json']").unwrap();
+        let fixtures = std::collections::BTreeSet::from(["rsid".into()]);
+        assert_eq!(repo_guard_lock_is_isolated(&lock, &fixtures), Ok(()));
+        assert!(repo_guard_lock_is_isolated(&lock, &std::collections::BTreeSet::new()).is_err());
+        let transitive =
+            toml::from_str("[[package]]\nname = 'transitive'\ndependencies = ['rsi-repo-guards']")
+                .unwrap();
+        assert!(repo_guard_lock_is_isolated(&transitive, &fixtures).is_err());
     }
 }

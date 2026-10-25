@@ -46,28 +46,21 @@ pub(super) async fn handle_memory_search_key(app: &mut App, key: KeyEvent) {
         crate::field_edit::FieldKey::Moved => return,
         crate::field_edit::FieldKey::Ignored => {}
     }
-    let standard = app.standard_editing();
+    // The query is a type-to-filter field: every printable key (q, j, k, g, G
+    // included) types into it in both editing modes. Navigation uses only
+    // non-printable keys, and Esc closes.
+    if let OverlayState::MemorySearch {
+        results,
+        selected_index,
+        ..
+    } = &mut app.overlay
+        && super::list::handle_filter_list_nav_key(selected_index, results.len(), &key)
+    {
+        return;
+    }
     match key.code {
-        KeyCode::Char('q') | KeyCode::Char('j') | KeyCode::Char('k') if standard => {}
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
             app.overlay = OverlayState::None;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let OverlayState::MemorySearch {
-                results,
-                selected_index,
-                ..
-            } = &mut app.overlay
-            {
-                if *selected_index + 1 < results.len() {
-                    *selected_index += 1;
-                }
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if let OverlayState::MemorySearch { selected_index, .. } = &mut app.overlay {
-                *selected_index = selected_index.saturating_sub(1);
-            }
         }
         KeyCode::Backspace => {
             let new_query = if let OverlayState::MemorySearch { query, .. } = &app.overlay {

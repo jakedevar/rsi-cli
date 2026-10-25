@@ -1,0 +1,23 @@
+# Cloud QA sweep — aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+Tip SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`$BR
+Started: 2026-09-27T00:00:00Z$BR
+Finished: 2026-09-27T00:01:00Z$BR
+Wall: 1.0 min$BR
+Lanes: 2$BR
+Failing names needing signature review: 2
+
+| Lane | Pass | Fail | Skip | Exit |
+| --- | ---: | ---: | ---: | ---: |
+| rsid-session-04 | 407 | 2 | 0 | 100 |
+| rsid-store-01 | 0 | 0 | 0 | 0 |
+
+Seed set: absent; classification unavailable
+Unclassified failing names (seed names alone do not verify failure signatures):
+- `session::h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection`
+- `session::tests::timed_out`
+FLAKE lines:
+- none observed
+Crash and timeout classes:
+- `session::h2_rotation_successor_interleaving_matrix_preserves_one_authority_projection` [crash]
+- `session::tests::timed_out` [timeout]

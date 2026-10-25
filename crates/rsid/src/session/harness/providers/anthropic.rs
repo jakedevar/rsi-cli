@@ -276,6 +276,7 @@ impl ApiProvider for AnthropicProvider {
             tool_calls: Self::convert_tool_calls(tool_calls),
             usage,
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason,
         })
     }
@@ -396,6 +397,187 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
+    async fn multi_turn_cache_usage_reaches_stream_and_invocation_cost_telemetry() {
+        use crate::model_control::call_control::{
+            ModelCallSettlementWorker, StoreBackedModelCallControl,
+        };
+        use crate::model_control::{AdmissionDecision, ModelAdmissionRequest, admit_invocation};
+        use crate::session::harness::loop_ports::DaemonModelPort;
+        use rsi_common::model_control::{InvocationOwner, ModelInvocationPurpose};
+        use rsid_harness::ports::ModelPort;
+        use std::sync::Arc;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = request.body_json().unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+                assert_eq!(messages.last().unwrap()["content"][0]["cache_control"]["type"], "ephemeral");
+                let second_turn = messages.len() > 1;
+                let usage = json!({
+                    "input_tokens": 12, "output_tokens": 4,
+                    "cache_creation_input_tokens": if second_turn {0} else {2048},
+                    "cache_read_input_tokens": if second_turn {2048} else {0},
+                });
+                if body["stream"] == true {
+                    let stream = format!(
+                        "event: message_start\ndata: {}\n\nevent: message_delta\ndata: {}\n\nevent: message_stop\ndata: {}\n\n",
+                        json!({"type":"message_start", "message":{"usage":usage}}),
+                        json!({"type":"message_delta", "delta":{"stop_reason":"end_turn"}, "usage":{"output_tokens":4}}),
+                        json!({"type":"message_stop"}),
+                    );
+                    ResponseTemplate::new(200).set_body_raw(stream, "text/event-stream")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "content":[{"type":"text", "text":"answer"}],
+                        "stop_reason":"end_turn", "usage":usage,
+                    }))
+                }
+            })
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let bus = Arc::new(crate::bus::EventBus::new(8));
+        let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&bus)).unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let owner = InvocationOwner {
+            session_id: Some(session_id),
+            ..Default::default()
+        };
+        let model = "claude-sonnet-5";
+        let purpose = ModelInvocationPurpose::SessionHarnessTurn;
+        let admission = ModelAdmissionRequest {
+            purpose,
+            provider: Some("Harness".into()),
+            model: Some(model.into()),
+            backend: Some("anthropic".into()),
+            effort: None,
+            trigger: "test_prompt_cache".into(),
+            owner: owner.clone(),
+            dedup_key: Some("cache-test-root".into()),
+            request_fingerprint: Some("sha256:cache-test".into()),
+            parent_invocation_id: None,
+            retry_of_invocation_id: None,
+            expected_usage: Some(crate::model_control::explicit_expected_usage(
+                purpose,
+                Some("Harness"),
+                Some("anthropic"),
+                Some(model),
+            )),
+            baseline_input_tokens: 0,
+            baseline_output_tokens: 0,
+            baseline_cache_creation_tokens: 0,
+            baseline_cache_read_tokens: 0,
+            baseline_reasoning_tokens: 0,
+            baseline_embedding_input_count: 0,
+            baseline_wall_time_ms: 0,
+        };
+        let AdmissionDecision::Admitted(permit) =
+            admit_invocation(&store, admission, &bus).await.unwrap()
+        else {
+            panic!("cache test admitted")
+        };
+        let control = Arc::new(StoreBackedModelCallControl::new(
+            Arc::clone(&store),
+            Arc::clone(&bus),
+            worker.handle().unwrap(),
+            owner,
+            "Harness",
+            Some(model.into()),
+            "anthropic",
+            None,
+            "test_prompt_cache",
+            permit,
+            purpose,
+            None,
+            RuntimeExecutionRoute::SessionHarnessAnthropicHttp,
+        ));
+        let provider = AnthropicProvider::with_credential(
+            server.uri(),
+            ApiCredential::explicit(Some("test-key")),
+        )
+        .unwrap();
+        let port = DaemonModelPort::new(Box::new(provider), control, None);
+        let mut expected_total = 0.0;
+        for stream in [false, true] {
+            let mut request = request(model, None);
+            request
+                .messages
+                .insert(0, ChatMessage::system(&"Stable context ".repeat(1024)));
+            let first_prefix = serde_json::to_vec(
+                &anthropic_wire::build_request_body(&request, false, true)["system"],
+            )
+            .unwrap();
+            for turn in 0..2 {
+                let mut admission = port
+                    .admit_primary(&format!("{stream}:{turn}"), "cache-test", None)
+                    .await
+                    .unwrap();
+                let id = admission.invocation_id().unwrap();
+                let response = if stream {
+                    let (tx, mut rx) = mpsc::channel(8);
+                    let response = admission
+                        .stream_chat(&request, tx, &tokio_util::sync::CancellationToken::new())
+                        .await
+                        .unwrap();
+                    let final_chunk = rx.recv().await.unwrap();
+                    assert!(final_chunk.is_final);
+                    assert_eq!(
+                        final_chunk.usage.unwrap().cache_read_tokens,
+                        response.usage.cache_read_tokens
+                    );
+                    response
+                } else {
+                    admission.chat(&request).await.unwrap()
+                };
+                let (created, read) = if turn == 0 { (2048, 0) } else { (0, 2048) };
+                assert_eq!(response.usage.cache_creation_tokens, created);
+                assert_eq!(response.usage.cache_read_tokens, read);
+                assert_eq!(response.usage.total_tokens, 2064);
+                admission.complete(&response.usage).await.unwrap();
+                let store = store.lock().await;
+                let record = store.load_model_invocation_record(id).unwrap().unwrap();
+                assert_eq!(record.usage.cache_creation_tokens, Some(created));
+                assert_eq!(record.usage.cache_read_tokens, Some(read));
+                assert_eq!(record.usage.input_tokens, Some(12));
+                assert_eq!(record.usage.output_tokens, Some(4));
+                // Sonnet 5: $2 input, $10 output, $2.50 cache write,
+                // $0.20 cache read per MTok. Plain input remains 12 on both
+                // turns; cache tokens are separate, never subtracted from it.
+                let expected = if turn == 0 { 0.005184 } else { 0.0004736 };
+                let cost = record.usage.estimated_cost_usd.expect("Claude is priced");
+                assert!((cost - expected).abs() < 1e-12, "cost was {cost}");
+                expected_total += expected;
+                let total = store
+                    .session_model_invocation_cost_total(session_id)
+                    .unwrap()
+                    .expect("session has priced calls");
+                assert!((total - expected_total).abs() < 1e-12, "total was {total}");
+                request.messages.extend([
+                    ChatMessage::assistant(&response.content),
+                    ChatMessage::user("continue"),
+                ]);
+                assert_eq!(
+                    serde_json::to_vec(
+                        &anthropic_wire::build_request_body(&request, false, true)["system"]
+                    )
+                    .unwrap(),
+                    first_prefix
+                );
+            }
+        }
+        drop(port);
+        worker.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
     async fn anthropic_stream_preserves_hosted_tool_result_for_replay() {
         let server = MockServer::start().await;
         let search_result = json!({
@@ -498,7 +680,8 @@ mod tests {
             body["tools"],
             json!([
                 {"type":"web_search_20250305", "name":"web_search"},
-                {"type":"web_fetch_20250910", "name":"web_fetch"}
+                {"type":"web_fetch_20250910", "name":"web_fetch",
+                 "cache_control":{"type":"ephemeral"}}
             ])
         );
     }
@@ -704,6 +887,20 @@ mod tests {
         history.push(ChatMessage::assistant("done"));
         let second = turn(&history);
 
+        // The rolling cache checkpoint moves on the wire. It is not transcript
+        // content and does not participate in Anthropic's cached-prefix identity.
+        let without_checkpoints = |mut body: Value| {
+            for message in body["messages"].as_array_mut().unwrap() {
+                if let Some(blocks) = message["content"].as_array_mut() {
+                    for block in blocks {
+                        block.as_object_mut().unwrap().remove("cache_control");
+                    }
+                }
+            }
+            body
+        };
+        let first = without_checkpoints(first);
+        let second = without_checkpoints(second);
         let before = first["messages"].as_array().unwrap();
         let after = second["messages"].as_array().unwrap();
         assert!(after.len() > before.len());

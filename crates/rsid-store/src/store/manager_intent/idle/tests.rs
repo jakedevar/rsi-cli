@@ -335,6 +335,8 @@ fn idle_intent_deadlines_resets_backstop_clock_and_capacity_are_bounded_211() {
         version,
         event_inserts: 0,
         events_high_water: 0,
+        table_writes: [0; INPUT_TABLE_COUNT],
+        event_deletes: 0,
     };
     let project = Uuid::new_v4();
     cache.remember(

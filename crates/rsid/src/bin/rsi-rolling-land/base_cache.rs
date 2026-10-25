@@ -19,6 +19,10 @@ pub(super) struct BaseShardEntry {
     pub shard: String,
     pub fingerprint: String,
     pub failures: BTreeSet<String>,
+    /// Signature evidence from the base report. Older names-only entries
+    /// remain readable, but cannot prove a known-red timeout exemption.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failure_texts: BTreeMap<String, String>,
     pub provenance: String,
     /// `<package>:<target>` the base run proved absent, which is why an empty
     /// `failures` is empty (#1812). Entries written before it carry none.
@@ -40,6 +44,7 @@ impl BaseShardEntry {
             shard: shard.into(),
             fingerprint: fingerprint.into(),
             failures,
+            failure_texts: BTreeMap::new(),
             provenance: provenance.into(),
             absent_targets: BTreeSet::new(),
         }
@@ -47,6 +52,15 @@ impl BaseShardEntry {
 
     pub(super) fn with_absent_targets(mut self, absent_targets: BTreeSet<String>) -> Self {
         self.absent_targets = absent_targets;
+        self
+    }
+
+    pub(super) fn with_failure_texts(mut self, texts: &BTreeMap<String, String>) -> Self {
+        self.failure_texts = texts
+            .iter()
+            .filter(|(name, _)| self.failures.contains(*name))
+            .map(|(name, text)| (name.clone(), text.clone()))
+            .collect();
         self
     }
 
@@ -94,6 +108,13 @@ struct BaseTestOutcomes {
     class: String,
     red: BTreeSet<String>,
     green: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    failure_texts: BTreeMap<String, String>,
+}
+
+pub(super) struct TestOutcome {
+    pub red: bool,
+    pub failure_text: Option<String>,
 }
 
 impl BaseTestOutcomes {
@@ -129,14 +150,15 @@ fn test_outcome_paths(
     ))
 }
 
-/// The recorded outcome of each test name on `rolling_sha`: `true` is red on the
-/// base, `false` is green. An unreadable, mismatched or self-contradicting
-/// file answers nothing, so every test is run.
+/// The recorded outcome and optional failure text per test on `rolling_sha`.
+/// Older files still prove membership but cannot prove a known-red timeout.
+/// An unreadable, mismatched or self-contradicting file answers nothing, so
+/// every test is run.
 pub(super) fn load_test_outcomes(
     root: &Path,
     rolling_sha: &str,
     class: &str,
-) -> BTreeMap<String, bool> {
+) -> BTreeMap<String, TestOutcome> {
     let Ok((path, _)) = test_outcome_paths(root, rolling_sha, class) else {
         return BTreeMap::new();
     };
@@ -151,8 +173,25 @@ pub(super) fn load_test_outcomes(
     }
     file.red
         .into_iter()
-        .map(|name| (name, true))
-        .chain(file.green.into_iter().map(|name| (name, false)))
+        .map(|name| {
+            let failure_text = file.failure_texts.get(&name).cloned();
+            (
+                name,
+                TestOutcome {
+                    red: true,
+                    failure_text,
+                },
+            )
+        })
+        .chain(file.green.into_iter().map(|name| {
+            (
+                name,
+                TestOutcome {
+                    red: false,
+                    failure_text: None,
+                },
+            )
+        }))
         .collect()
 }
 
@@ -165,6 +204,7 @@ pub(super) fn record_test_outcomes(
     class: &str,
     red: &BTreeSet<String>,
     green: &BTreeSet<String>,
+    failure_texts: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let (path, lock_path) = test_outcome_paths(root, rolling_sha, class)?;
     let parent = path.parent().ok_or("outcome file has no parent")?;
@@ -195,14 +235,21 @@ pub(super) fn record_test_outcomes(
         });
     for name in red.iter().filter(|name| plain_name(name)) {
         if file.green.remove(name) {
+            file.failure_texts.remove(name);
             continue;
         }
         if file.red.len() + file.green.len() < TEST_OUTCOME_LIMIT {
             file.red.insert(name.clone());
+            // Never retain text from an earlier report when this run has none.
+            file.failure_texts.remove(name);
+            if let Some(text) = failure_texts.get(name) {
+                file.failure_texts.insert(name.clone(), text.clone());
+            }
         }
     }
     for name in green.iter().filter(|name| plain_name(name)) {
         if file.red.remove(name) {
+            file.failure_texts.remove(name);
             continue;
         }
         if file.red.len() + file.green.len() < TEST_OUTCOME_LIMIT {
@@ -224,7 +271,7 @@ pub(super) fn record_test_outcomes(
 }
 
 pub(super) fn default_root() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("RSI_ROLLING_BASE_CACHE_DIR") {
+    if let Some(path) = crate::lander_env::var_os("RSI_ROLLING_BASE_CACHE_DIR") {
         return Ok(PathBuf::from(path));
     }
     dirs::home_dir()

@@ -13,6 +13,7 @@ mod dialectic;
 mod esp_square;
 mod file_explorer;
 mod fleet;
+mod global_dashboard;
 mod global_manager_workspace;
 pub(crate) mod gm_budget;
 pub(crate) mod grant_editor;
@@ -20,6 +21,7 @@ pub(crate) mod graph;
 pub(crate) mod graph_layout;
 mod harness_manager;
 mod hook_form;
+mod host_tuning;
 mod input_modal;
 pub(crate) mod keybindings_help;
 mod label_form;
@@ -149,11 +151,15 @@ pub(crate) fn tall_centered_rect(area: Rect, width: u16) -> Rect {
 /// Mirrors the wrapping logic in `render_wrapped_textarea` (indent-aware word-boundary breaks)
 /// so that height predictions match what actually renders.
 fn count_visual_lines(textarea: &tui_textarea::TextArea<'_>, content_width: usize) -> usize {
+    count_visual_lines_in(textarea.lines(), content_width)
+}
+
+/// [`count_visual_lines`] for plain buffer lines (a form field's text).
+pub(crate) fn count_visual_lines_in(lines: &[String], content_width: usize) -> usize {
     if content_width == 0 {
         return 0;
     }
-    textarea
-        .lines()
+    lines
         .iter()
         .map(|line| {
             if line.is_empty() {
@@ -635,6 +641,11 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         global_manager_workspace::render(frame, area, app);
         return;
     }
+    // The dashboard's pane is a conversation too (#3317).
+    if matches!(app.overlay, OverlayState::GlobalDashboard(..)) {
+        global_dashboard::render(frame, area, app);
+        return;
+    }
     match &app.overlay {
         OverlayState::None => {}
         OverlayState::ThemePicker {
@@ -670,6 +681,7 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
             daemon_text_editor::render_daemon_text_editor(
                 frame,
                 area,
+                &app.daemon_features,
                 field,
                 input,
                 error.as_deref(),
@@ -788,6 +800,9 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         OverlayState::LegacyScratch(state) => {
             legacy_scratch::render(frame, area, state);
         }
+        OverlayState::HostTuning(state) => {
+            host_tuning::render(frame, area, state);
+        }
         OverlayState::SatelliteRegistry(state) => {
             satellite_registry::render(frame, area, state);
         }
@@ -799,7 +814,7 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         OverlayState::Fleet(state) => fleet::render(frame, area, state),
         // Rendered from the mutable borrow above.
-        OverlayState::GlobalManagerWorkspace(..) => {}
+        OverlayState::GlobalManagerWorkspace(..) | OverlayState::GlobalDashboard(..) => {}
         OverlayState::HarnessManagerV2(state) => {
             manager_v2::render(frame, area, state);
         }
@@ -847,6 +862,7 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
             path,
             color_index,
             editing_id,
+            text,
         } => {
             let workflow_status = editing_id
                 .as_ref()
@@ -857,6 +873,7 @@ fn render_regular_overlay_inner(frame: &mut Frame, area: Rect, app: &mut App) {
                 *focused_field,
                 name,
                 path,
+                text,
                 *color_index,
                 editing_id.is_some(),
                 workflow_status,

@@ -235,6 +235,174 @@ fn manager_can_withdraw_own_request_without_lead_retrieval() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
 #[test]
+fn request_withdraw_by_successor_settles_overdue_request_with_reason_668() {
+    let f = fixture();
+    let id = send(&f, "obsolete-request").unwrap().message_id;
+    // Seed elapsed wall time in this private fixture, then restore the real
+    // immutability guard before exercising any withdrawal or reply behavior.
+    let guard: String = f.store.conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='harness_manager_messages_no_update'",
+        [], |row| row.get(0),
+    ).unwrap();
+    f.store
+        .conn
+        .execute_batch("DROP TRIGGER harness_manager_messages_no_update")
+        .unwrap();
+    f.store.conn.execute(
+        "UPDATE harness_manager_messages SET created_at='2020-01-01T00:00:00.000000000Z' WHERE id=?1",
+        [id.to_string()],
+    ).unwrap();
+    f.store.conn.execute_batch(&guard).unwrap();
+    let rows = f
+        .store
+        .manager_v2_request_rows(&config(&f), None, "", 32, true)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["overdue"], true);
+    f.store.reconcile_manager_intent(f.project, true).unwrap();
+    let intent = f
+        .store
+        .manager_v2_record(&config(&f), "intent", &f.epic.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        intent.payload["overdue_requests"][0]["request_id"],
+        json!(id)
+    );
+
+    let mut next = f.store.get_session(f.manager).unwrap().unwrap();
+    next.id = Uuid::new_v4();
+    next.continued_from = Some(f.manager);
+    next.rotation_depth += 1;
+    f.store.insert_session(&next).unwrap();
+    f.store
+        .update_session_status(f.manager, SessionStatus::Archived)
+        .unwrap();
+    f.store
+        .record_harness_manager_rotation(f.manager, next.id)
+        .unwrap();
+    let withdraw = request(
+        ManagerUpdateV2::RequestWithdraw {
+            request_id: id,
+            expected_row_version: 0,
+            reason: "Superseded by the revised implementation request".into(),
+        },
+        "typed-withdraw",
+    );
+    assert!(
+        f.store
+            .manager_v2_commit_update(f.manager, &withdraw, &LedgerObservation::default())
+            .is_err()
+    );
+    assert_refused(
+        f.store
+            .manager_v2_commit_update(f.lead, &withdraw, &LedgerObservation::default()),
+        "manager_v2_manager_required",
+    );
+    let stale = request(
+        ManagerUpdateV2::RequestWithdraw {
+            request_id: id,
+            expected_row_version: 1,
+            reason: "Wrong observed version".into(),
+        },
+        "stale-withdraw",
+    );
+    assert!(
+        f.store
+            .manager_v2_commit_update(next.id, &stale, &LedgerObservation::default())
+            .is_err()
+    );
+    assert_eq!(open_total(&f), 1);
+    assert!(settlement(&f, id).is_none());
+    let receipt = f
+        .store
+        .manager_v2_commit_update(next.id, &withdraw, &LedgerObservation::default())
+        .unwrap();
+    assert_eq!(receipt.row_version, 1);
+    assert!(
+        f.store
+            .manager_v2_commit_update(next.id, &withdraw, &LedgerObservation::default())
+            .unwrap()
+            .deduplicated
+    );
+    assert_eq!(open_total(&f), 0);
+    assert!(
+        f.store
+            .manager_v2_request_rows(&config(&f), None, "", 32, true)
+            .unwrap()
+            .is_empty()
+    );
+    let rows = f
+        .store
+        .manager_v2_request_rows(&config(&f), None, "", 32, false)
+        .unwrap();
+    assert_eq!(rows[0]["state"], "declined");
+    assert_eq!(rows[0]["settlement"], "withdrawn");
+    assert_eq!(rows[0]["overdue"], false);
+    f.store.reconcile_manager_intent(f.project, true).unwrap();
+    let intent = f
+        .store
+        .manager_v2_record(&config(&f), "intent", &f.epic.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.payload["overdue_requests"], json!([]));
+    let settled = settlement(&f, id).unwrap();
+    assert_eq!(settled.payload["actor"], json!(next.id));
+    assert_eq!(
+        settled.payload["reason"],
+        "Superseded by the revised implementation request"
+    );
+    let progress = f.store.manager_progress(next.id).unwrap();
+    assert_eq!(progress.rows[0].pending_requests, 0);
+    assert_eq!(progress.recent_requests[0].state, "settled");
+    assert_refused(
+        reply(&f, f.lead, id, "late-reply"),
+        "manager_request_settled",
+    );
+
+    // A different pending request still uses the lead's ordinary reply path.
+    let active = f
+        .store
+        .manager_send(
+            next.id,
+            &AgentManagerSendRequestV1 {
+                epic_id: f.epic,
+                message: "Independent work".into(),
+                idempotency_key: "independent-request".into(),
+                informational: false,
+            },
+        )
+        .unwrap()
+        .message_id;
+    retrieve(&f, f.lead);
+    reply(&f, f.lead, active, "ordinary-reply").unwrap();
+    let rows = f
+        .store
+        .manager_v2_request_rows(&config(&f), None, "", 32, false)
+        .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row["request_id"] == json!(active))
+        .unwrap();
+    assert_eq!(row["replied"], true);
+    assert_eq!(row["state"], "completed");
+    let settled_withdraw = request(
+        ManagerUpdateV2::RequestWithdraw {
+            request_id: active,
+            expected_row_version: 1,
+            reason: "Already answered".into(),
+        },
+        "withdraw-answered",
+    );
+    assert_refused(
+        f.store
+            .manager_v2_commit_update(next.id, &settled_withdraw, &LedgerObservation::default()),
+        "manager_v2_request_settled",
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
 fn reply_settles_unless_lead_marks_still_running() {
     let f = fixture();
     let id = send(&f, "reply-state").unwrap().message_id;

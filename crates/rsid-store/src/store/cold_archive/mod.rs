@@ -71,6 +71,8 @@ pub use containment::{
     check_archive_dir, default_forbidden_roots, forbidden_roots_for, resolve_real_path,
     validate_archive_dir_setting, validate_archive_dir_setting_with,
 };
+#[cfg(any(test, feature = "test-seam"))]
+pub use format::stream_stats;
 pub use format::{ROW_CODEC, ZSTD_LEVEL};
 pub use index::{ColdFileRow, ColdRunRow, ColdSessionRow, RunSummary, StageIntent};
 #[cfg(any(test, feature = "test-seam"))]
@@ -81,8 +83,12 @@ pub use pass::{
     run_stage_pass, run_verify_pass,
 };
 pub use reader::{
-    ColdRef, ColdSessionStorage, UNAVAILABLE_CODE, is_unavailable_error, unavailable_error,
+    ColdArchiveStream, ColdRef, ColdSessionStorage, OVER_BOUND_CODE,
+    PASTE_REFERENCE_ARCHIVE_MAX_RAW_BYTES, UNAVAILABLE_CODE, is_unavailable_error,
+    paste_reference_archive_bound, unavailable_error,
 };
+#[cfg(any(test, feature = "test-seam"))]
+pub use reader::{PasteBoundOverride, override_paste_reference_archive_bound_for_test};
 pub use restore::{
     ColdRestoreCommit, DecodedColdSession, RESTORE_ATTEMPTS, RestoreReceipt, decode_cold_session,
 };

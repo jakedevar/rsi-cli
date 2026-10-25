@@ -108,7 +108,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let outcome = read_openai_sse_stream(stream, &tx, &CancellationToken::new())
             .await
-            .map(|(content, calls, _, _)| (content, calls.len()))
+            .map(|result| (result.content, result.tool_calls.len()))
             .map_err(|error| guard.classify(error));
         drop(tx);
         let mut chunks = Vec::new();

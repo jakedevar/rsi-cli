@@ -101,6 +101,16 @@ pub struct SignatureRecord {
 }
 
 impl SignatureRecord {
+    /// Render the same validated fence consumed by the Issue signature reader.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid record or failed JSON serialization.
+    pub fn issue_block(&self) -> Result<String, Error> {
+        self.validate()?;
+        let json = serde_json::to_string_pretty(self)?;
+        Ok(format!("```{FENCE_INFO}\n{json}\n```\n"))
+    }
+
     /// Reject structurally unusable records.
     ///
     /// # Errors
@@ -371,6 +381,54 @@ pub fn failure_text_for(log: &str, test: &str) -> String {
     slice.to_string()
 }
 
+/// Build a matcher only from this test's own panic section. Missing output
+/// (including a timeout) must not borrow the next test's panic.
+#[must_use]
+pub fn panic_matcher_for(log: &str, test: &str) -> Option<Matcher> {
+    let payload = panic_excerpt_for(log, test)?;
+    let line = payload
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(Matcher {
+        digest: Some(digest(&payload)),
+        contains: vec![line.chars().take(512).collect()],
+    })
+}
+
+/// Extract only this test's panic payload, without a source or log path.
+#[must_use]
+pub fn panic_excerpt_for(log: &str, test: &str) -> Option<String> {
+    let thread = format!("thread '{test}'");
+    let header = format!("---- {test} stdout ----");
+    let start = log.find(&thread).or_else(|| log.find(&header))?;
+    let section = &log[start..];
+    if section.starts_with(&thread)
+        && !section.lines().next().is_some_and(|line| {
+            line.contains("panicked at ") || line.contains("has overflowed its stack")
+        })
+    {
+        return None;
+    }
+    let end = section[1..]
+        .find("\n---- ")
+        .map_or(section.len(), |end| end + 1);
+    let end = if section.starts_with(&thread) {
+        section.find("\nthread '").map_or(end, |next| end.min(next))
+    } else {
+        end
+    };
+    let section = &section[..end];
+    // A helper thread may panic inside this test's stdout section. A new
+    // test's thread without an enclosing section is not evidence for this one.
+    if !section.contains("panicked at ") && !section.contains("has overflowed its stack") {
+        return None;
+    }
+    let text = failure_text_for(section, test);
+    let payload = panic_payload(&text);
+    (!payload.trim().is_empty()).then_some(payload)
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -385,6 +443,72 @@ fn is_closing_fence(line: &str) -> bool {
     line.trim()
         .strip_prefix("```")
         .is_some_and(|rest| rest.trim().is_empty())
+}
+
+/// Trimmed text of every `rsi-failure-signature` fence in `body`, in order.
+fn signature_block_texts(body: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        let Some(info) = fence_info(line.trim_start()) else {
+            continue;
+        };
+        let mut block = String::new();
+        for inner in lines.by_ref() {
+            if is_closing_fence(inner) {
+                break;
+            }
+            block.push_str(inner);
+            block.push('\n');
+        }
+        if info == FENCE_INFO {
+            blocks.push(block.trim().to_string());
+        }
+    }
+    blocks
+}
+
+/// Validate the signature blocks a publication adds or changes (#3595).
+///
+/// Only a fence in `new_body` whose text is not already a fence of
+/// `prior_body` is checked, so an unrelated edit of an Issue that carries a
+/// legacy malformed block is never blocked. `issue` is the hosting Issue's
+/// display number when it is already known (an update); a create passes `None`
+/// and skips the owner check.
+///
+/// # Errors
+///
+/// Returns the exact parse, enum or validation diagnostic of the first bad
+/// block, prefixed with its 1-based block ordinal within `new_body`.
+pub fn validate_published_blocks(
+    prior_body: &str,
+    new_body: &str,
+    issue: Option<u64>,
+) -> Result<(), String> {
+    let prior = signature_block_texts(prior_body);
+    for (index, text) in signature_block_texts(new_body).iter().enumerate() {
+        if prior.contains(text) {
+            continue;
+        }
+        let ordinal = index + 1;
+        let record: SignatureRecord = serde_json::from_str(text)
+            .map_err(|error| format!("{FENCE_INFO} block {ordinal}: invalid JSON: {error}"))?;
+        record
+            .validate()
+            .map_err(|error| format!("{FENCE_INFO} block {ordinal}: {error}"))?;
+        if let Some(expected) = issue
+            && record.issue != expected
+        {
+            return Err(format!(
+                "{FENCE_INFO} block {ordinal}: {}",
+                Error::IssueMismatch {
+                    expected,
+                    actual: record.issue,
+                }
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Collect every `rsi-failure-signature` block in `body` as a validated record.
@@ -615,6 +739,58 @@ mod tests {
         );
     }
 
+    fn contains_matcher() -> Matcher {
+        Matcher {
+            digest: None,
+            contains: vec!["boom".to_string()],
+        }
+    }
+
+    #[test]
+    fn publication_accepts_a_valid_block_and_reports_an_invalid_class() {
+        let valid = serde_json::to_string(&record("a::b", 7, contains_matcher())).unwrap();
+        assert_eq!(
+            validate_published_blocks("", &block(&valid), Some(7)),
+            Ok(())
+        );
+        assert_eq!(validate_published_blocks("", &block(&valid), None), Ok(()));
+
+        let bad = valid.replace("\"regression\"", "\"flaky\"");
+        let message = validate_published_blocks("", &block(&bad), Some(7)).unwrap_err();
+        assert!(message.contains("block 1"), "{message}");
+        assert!(message.contains("unknown variant `flaky`"), "{message}");
+        assert!(message.contains("flake"), "{message}");
+    }
+
+    #[test]
+    fn publication_reports_json_validation_and_owner_diagnostics() {
+        let message = validate_published_blocks("", &block("{not json}"), Some(7)).unwrap_err();
+        assert!(message.contains("invalid JSON"), "{message}");
+
+        let mut empty = record("a::b", 7, Matcher::default());
+        empty.matcher = Matcher::default();
+        let text = serde_json::to_string(&empty).unwrap();
+        let message = validate_published_blocks("", &block(&text), Some(7)).unwrap_err();
+        assert!(message.contains("matcher must set"), "{message}");
+
+        let other = serde_json::to_string(&record("a::b", 9, contains_matcher())).unwrap();
+        let message = validate_published_blocks("", &block(&other), Some(7)).unwrap_err();
+        assert!(message.contains("declares issue #9"), "{message}");
+    }
+
+    #[test]
+    fn publication_leaves_an_unchanged_legacy_malformed_block_alone() {
+        let legacy = block("{\"class\":\"flaky\"}");
+        let valid = serde_json::to_string(&record("a::b", 7, contains_matcher())).unwrap();
+        let edited = format!("{legacy}\nunrelated edit\n");
+        assert_eq!(validate_published_blocks(&legacy, &edited, Some(7)), Ok(()));
+        let added = format!("{legacy}{}", block(&valid));
+        assert_eq!(validate_published_blocks(&legacy, &added, Some(7)), Ok(()));
+        let changed = block("{\"class\":\"flaky\",\"x\":1}");
+        let message = validate_published_blocks(&legacy, &changed, Some(7)).unwrap_err();
+        assert!(message.contains("block 1"), "{message}");
+    }
+
     #[test]
     fn parse_accepts_two_blocks_and_rejects_mismatch() {
         let first = serde_json::to_string(&record(
@@ -817,6 +993,40 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
         assert!(first.contains("first payload"), "{first}");
         assert!(second.contains("second payload"), "{second}");
         assert_ne!(digest(&first), digest(&second));
+    }
+
+    #[test]
+    fn panic_excerpts_stop_at_the_next_thread_without_a_backtrace_note() {
+        let log = "thread 'a::first' panicked at src/a.rs:1:1:\nfirst payload\nthread 'b::second' panicked at src/b.rs:2:2:\nsecond payload\n";
+        assert_eq!(
+            panic_excerpt_for(log, "a::first"),
+            Some("first payload".into())
+        );
+        assert_eq!(
+            panic_excerpt_for(log, "b::second"),
+            Some("second payload".into())
+        );
+    }
+
+    #[test]
+    fn panic_matchers_use_each_tests_payload_and_round_trip_through_the_writer() {
+        for (test, payload) in [
+            ("a::first", "first payload"),
+            ("b::second", "second payload"),
+        ] {
+            let matcher = panic_matcher_for(LIBTEST_LOG, test).unwrap();
+            assert_eq!(matcher.contains, [payload]);
+            let record = record(test, 42, matcher);
+            let parsed = parse_issue_blocks(&record.issue_block().unwrap(), 42).unwrap();
+            assert_eq!(parsed, [record]);
+        }
+        let missing = "---- a::missing stdout ----\nno panic emitted\n\n---- b::second stdout ----\nthread 'b::second' panicked at src/b.rs:2:2:\nsecond payload\n";
+        assert!(panic_matcher_for(missing, "a::missing").is_none());
+        assert!(panic_matcher_for(LIBTEST_LOG, "a::unknown").is_none());
+        assert_eq!(
+            panic_matcher_for(OVERFLOW_TEXT, "x::y").unwrap().contains,
+            ["has overflowed its stack"]
+        );
     }
 
     #[test]

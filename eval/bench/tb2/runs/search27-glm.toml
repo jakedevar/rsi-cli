@@ -1,0 +1,17 @@
+# Run config (#3135, #3685): batch 4 of the published-numbers plan. Same 27 oracle-solvable search
+# tasks and k=1 as search27-flash.toml, run with z-ai/glm-5.3-flash at a $0.30 per-task cap, to compare with
+# the deepseek-v4.1-flash row. Concurrency 2 (hub load throttle). Submit with budget_usd 8. Needs allowed_launches
+# for (OpenRouter, z-ai/glm-5.3-flash, high).
+schema_version = 1
+name = "search27-glm"
+description = "RSI harness, z-ai/glm-5.3-flash, 27 search tasks (oracle-solvable), k=1"
+host = "ssh://arch-laptop"
+tasks = ["break-filter-js-from-html", "code-from-image", "constraints-scheduling", "db-wal-recovery", "dna-assembly", "extract-elf", "extract-moves-from-video", "feal-differential-cryptanalysis", "financial-document-processor", "fix-git", "git-leak-recovery", "git-multibranch", "headless-terminal", "hf-model-inference", "merge-diff-arc-agi-task", "multi-source-data-merger", "openssl-selfsigned-cert", "password-recovery", "path-tracing-reverse", "polyglot-rust-c", "pytorch-model-recovery", "raman-fitting", "regex-chess", "sparql-university", "sqlite-with-gcov", "torch-pipeline-parallelism", "winning-avg-corewars"]
+k = 1
+concurrency = 2
+
+[agent]
+kind = "rsi"
+model = "z-ai/glm-5.3-flash"
+effort = "high"
+per_task_cap_usd = 0.30

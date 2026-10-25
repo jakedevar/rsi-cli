@@ -59,6 +59,9 @@ pub struct SessionWriteStamp {
 /// Shared historical restore gate. Call through the current transaction so
 /// settlement and custody checks remain atomic with the status transition.
 pub(super) fn historical_session_restore_blocked_on(conn: &Connection, id: Uuid) -> Result<bool> {
+    if archived_rotation_predecessor_on(conn, id)? {
+        return Ok(true);
+    }
     Ok(conn.query_row(
         "SELECT
             EXISTS(SELECT 1 FROM sessions
@@ -76,6 +79,28 @@ pub(super) fn historical_session_restore_blocked_on(conn: &Connection, id: Uuid)
         [id.to_string()],
         |row| row.get(0),
     )?)
+}
+
+/// A published rotation owns its archived predecessor even after the old
+/// provider exits. Check under the write transaction before changing status:
+/// V103 treats every transition out of Archived as retirement of the receipt.
+pub(super) fn archived_rotation_predecessor_on(conn: &Connection, id: Uuid) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions s
+         JOIN harness_manager_rotation_edges e ON e.predecessor_session_id=s.id
+         WHERE s.id=?1 AND s.status='Archived' AND e.retired_at IS NULL)",
+        [id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+pub(super) fn verify_session_rotation_restore_gate_on(conn: &Connection, id: Uuid) -> Result<()> {
+    if archived_rotation_predecessor_on(conn, id)? {
+        return Err(DaemonError::InvalidParam(
+            "session_rotation_successor_current: restore refused; use the current successor or explicitly change the manager appointment".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1375,11 +1400,36 @@ impl Store {
         if crate::terminal_cause::is_terminal_status(status) {
             return self.set_session_terminal_status_default(id, status);
         }
+        // A queued non-terminal write (Starting/Running/WaitingApproval) must not
+        // lift a published rotation predecessor out of Archived either: V103
+        // would retire the edge (#3978). Archived itself stays idempotent.
+        self.conn.execute(
+            "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3
+             AND NOT (status='Archived' AND ?1<>'Archived' AND EXISTS (
+                 SELECT 1 FROM harness_manager_rotation_edges e
+                 WHERE e.predecessor_session_id=sessions.id AND e.retired_at IS NULL))",
+            params![
+                session_status_to_str(status),
+                chrono::Utc::now().to_rfc3339(),
+                id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Test seam (#4005): move a session out of `Archived` with a raw
+    /// `UPDATE`, bypassing the #667 fences on [`Self::update_session_status`]
+    /// and the restore gates. It stands in for the unfenced transition that the
+    /// V103 `harness_manager_rotation_retire_on_restore` trigger and the
+    /// manager-authority-epoch trigger remain the backstop for, so tests of
+    /// receipt retirement and epoch bumps still exercise those triggers.
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn unfenced_status_write_for_test(&self, id: Uuid, status: SessionStatus) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![
                 session_status_to_str(status),
-                chrono::Utc::now().to_rfc3339(),
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
                 id.to_string(),
             ],
         )?;
@@ -1409,6 +1459,7 @@ impl Store {
     /// Terminal status plus its normalized cause in one statement (#588).
     /// `status` must be terminal and `cause` non-empty; both are refused
     /// otherwise, so a new terminal writer cannot forget the cause.
+    /// A late provider exit preserves a published rotation's Archived predecessor.
     pub fn set_session_terminal_status(
         &self,
         id: Uuid,
@@ -1423,7 +1474,10 @@ impl Store {
         let cause = crate::terminal_cause::validate_cause(cause)
             .map_err(|message| DaemonError::InvalidParam(message.into()))?;
         self.conn.execute(
-            "UPDATE sessions SET status = ?1, stop_reason = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE sessions SET status = ?1, stop_reason = ?2, updated_at = ?3 WHERE id = ?4
+             AND NOT (status='Archived' AND EXISTS (
+                 SELECT 1 FROM harness_manager_rotation_edges e
+                 WHERE e.predecessor_session_id=sessions.id AND e.retired_at IS NULL))",
             params![
                 session_status_to_str(status),
                 cause,
@@ -1443,7 +1497,10 @@ impl Store {
         self.conn.execute(
             "UPDATE sessions SET status = ?1,
              stop_reason = COALESCE(NULLIF(TRIM(stop_reason), ''), ?2),
-             updated_at = ?3 WHERE id = ?4",
+             updated_at = ?3 WHERE id = ?4
+             AND NOT (status='Archived' AND EXISTS (
+                 SELECT 1 FROM harness_manager_rotation_edges e
+                 WHERE e.predecessor_session_id=sessions.id AND e.retired_at IS NULL))",
             params![
                 session_status_to_str(status),
                 cause,
@@ -1768,6 +1825,28 @@ impl Store {
                 "SELECT id FROM sessions WHERE sandbox_branch = ?1 \
                  ORDER BY created_at DESC, id LIMIT 1",
                 params![branch],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id.and_then(|id| Uuid::parse_str(&id).ok()) {
+            Some(id) => self.get_session(id),
+            None => Ok(None),
+        }
+    }
+
+    /// #3992: the oldest live Group of `project_id` that carries `tag` (a bench
+    /// run's group is found again by its run tag, so every trial of the run
+    /// lands in the same one).
+    pub fn find_group_by_tag(&self, project_id: Uuid, tag: &str) -> Result<Option<Session>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT s.id FROM sessions s \
+                 JOIN session_tags t ON t.session_id = s.id \
+                 WHERE s.session_kind = 'Group' AND s.project_id = ?1 AND t.tag = ?2 \
+                   AND s.status NOT IN ('Archived','Deleted') \
+                 ORDER BY s.created_at ASC, s.id LIMIT 1",
+                params![project_id.to_string(), tag],
                 |row| row.get(0),
             )
             .optional()?;
@@ -2284,12 +2363,20 @@ impl Store {
         self.restore_historical_session(id, "Archived")
     }
 
+    /// Restoring a published predecessor would retire its receipt in V103 and
+    /// displace the successor. An operator must change the appointment instead.
+    /// Restore writers repeat this gate inside their status-write transaction.
+    pub fn verify_session_rotation_restore_gate(&self, id: Uuid) -> Result<()> {
+        verify_session_rotation_restore_gate_on(&self.conn, id)
+    }
+
     fn restore_historical_session(
         &self,
         id: Uuid,
         expected_status: &str,
     ) -> Result<Option<Session>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        self.verify_session_rotation_restore_gate(id)?;
         let settlement_blocks = historical_session_restore_blocked_on(&tx, id)?;
         if settlement_blocks {
             return Err(crate::error::DaemonError::InvalidParam(
@@ -2682,6 +2769,17 @@ impl Store {
                 return Err(DaemonError::Store(format!(
                     "rotation Epic lead transfer lost durable witness:{epic_id}:{holder}"
                 )));
+            }
+        }
+        // #498 / hub #3223: a rotating Epic lead keeps its pending results
+        // and backstop. Publish ownership with the lead CAS, using the same
+        // successor transcript/input fence as manager-seat succession. Only
+        // the lead's obligations move; terminal watches keep their routes.
+        for holder in &lead_holders {
+            if affected.iter().any(|(_, lead)| lead == holder) {
+                super::manager_obligations::transfer_seat_obligations_on(
+                    &tx, *holder, successor, true, false,
+                )?;
             }
         }
         let mut archived = Vec::with_capacity(hops.len());
@@ -3990,6 +4088,25 @@ mod rotation_publication_tests {
     async fn publish_rotation_successor_moves_lead_generation_and_tip_in_one_commit() {
         let store = Store::open_in_memory().expect("store");
         let lineage = reserved_rotation(&store, "rot-1");
+        use crate::store_support::schedule_wake_job::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+            message: "Continue the Epic".into(),
+            in_seconds: Some(600),
+            at: None,
+            name: None,
+            every_seconds: None,
+            mode: Some("resume".into()),
+            working_dir: "/tmp/rotation-wake".into(),
+            provider: None,
+            model: None,
+            project_id: None,
+            origin_session_id: Some(lineage.predecessor),
+            watch_session_id: None,
+        })
+        .expect("wake");
+        store.insert_scheduled_job(&wake).expect("insert wake");
         let (tip, lead, generation) = observe(&store, &lineage);
         assert_eq!(
             tip, None,
@@ -4020,6 +4137,15 @@ mod rotation_publication_tests {
             (None, Some(lineage.predecessor), generation),
             "a failed publication leaves the predecessor tip, lead, and generation"
         );
+        assert_eq!(
+            store
+                .get_scheduled_job(&wake.id)
+                .expect("wake read")
+                .expect("wake row")
+                .wake_session_id,
+            Some(lineage.predecessor),
+            "failed publication rolls wake ownership back with the lead"
+        );
         store
             .conn
             .execute_batch("DROP TRIGGER fail_rotation_event;")
@@ -4030,6 +4156,15 @@ mod rotation_publication_tests {
             .publish_rotation_successor(&guards(&lineage).await, "rot-1", &metadata)
             .expect("publish");
         assert_eq!(affected, vec![lineage.epic]);
+        assert_eq!(
+            store
+                .get_scheduled_job(&wake.id)
+                .expect("wake read")
+                .expect("wake row")
+                .wake_session_id,
+            Some(lineage.successor),
+            "successful publication hands the lead's wake to its successor"
+        );
         assert_eq!(
             observe(&store, &lineage),
             (

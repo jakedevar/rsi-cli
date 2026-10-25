@@ -10,7 +10,7 @@ cd src-tauri
 # build.rs watches ../dist, so cargo re-embeds frontend changes by itself.
 if [ "${1:-}" = "release" ]; then
   cargo build --release
-  echo "built: $(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/release/rsi-desktop"
+  echo "built: $(cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)/release/rsi-desktop"
 else
   exec cargo run
 fi

@@ -1,0 +1,17 @@
+# Run config (#3685): the $0 oracle run over the 30 search tasks. The Rust runner's oracle
+# agent (#3681) replays each task's reference solution, so no model is called and the run
+# costs $0. It proves the transport, shard plan, collection and cleanup at the full search
+# scale before any paid trial. Submit it with `AgentSubmitJob {kind:"bench", params:{config:
+# "eval/bench/tb2/runs/oracle-search30.toml", budget_usd: 1}}` (the budget is not spent).
+# A task whose verifier needs the network (#3895, sqlite-with-gcov fetched from
+# releases.astral.sh) is reported as a network-dependent verifier, not a runner bug.
+schema_version = 1
+name = "oracle-search30"
+description = "Oracle agent on the 30 search tasks: $0, no model"
+host = "ssh://arch-laptop"
+split = "search"
+k = 1
+concurrency = 4
+
+[agent]
+kind = "oracle"

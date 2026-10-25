@@ -1,0 +1,3 @@
+#!/bin/sh
+# A clean automatic merge does not run pre-commit. Apply the same config guard.
+exec sh "$(dirname "$0")/check-rerere"

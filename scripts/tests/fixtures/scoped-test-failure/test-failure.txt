@@ -1,0 +1,7 @@
+running 1 test
+test tests::example ... FAILED
+failures:
+    tests::example
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+SCOPED_FAILURE lib:rsid tests::example
+SCOPED_PHASE test_failed

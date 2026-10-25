@@ -430,6 +430,7 @@ mod tests {
                     refusal: Some("queue_test_failed".into()),
                     failing_tests: Vec::new(),
                     detail: None,
+                    ..Default::default()
                 },
                 now,
             )
@@ -890,6 +891,59 @@ mod tests {
         assert_eq!(
             rsi_common::rolling_queue::failing_tests_listed(&legacy),
             vec!["demo::red".to_string()]
+        );
+    }
+
+    /// #3905: the auto-filer's own Issue bodies round-trip through the
+    /// `fixes_issue` selection: a `cargo test -p PKG --lib <filter>` shard
+    /// command selects the exact lib filter of each named test, so a fix whose
+    /// diff lives in another package still gates the claimed tests. The filer's
+    /// format and the parser cannot drift apart without this going red.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_filed_issue_round_trips_through_the_fixes_issue_selection() {
+        use rsi_common::rolling_queue::issue_selecting_filters;
+        let one = base_red_issue(
+            Uuid::new_v4(),
+            &red_on(
+                "agent_deploy::tests::no_crate_but_the_guard_crate_depends_on_rsi_repo_guards",
+                Some("cargo test -p rsi-common --lib agent_deploy -- --test-threads=4"),
+            ),
+            Some("abc"),
+            Some("/tmp/gate.log"),
+        );
+        assert_eq!(
+            issue_selecting_filters(&one.body),
+            [
+                "rsi-common=test(=agent_deploy::tests::no_crate_but_the_guard_crate_depends_on_rsi_repo_guards)"
+            ]
+        );
+        let command = Some("cargo test -p rsi-common --lib agent_deploy");
+        let (a, b) = (
+            red_on("agent_deploy::tests::a", command),
+            red_on("agent_deploy::tests::b", command),
+        );
+        let shard = base_shard_red_issue(Uuid::new_v4(), &[&a, &b], Some("abc"), None);
+        assert_eq!(
+            issue_selecting_filters(&shard.body),
+            [
+                "rsi-common=test(=agent_deploy::tests::a)",
+                "rsi-common=test(=agent_deploy::tests::b)"
+            ]
+        );
+        // The target form the filer also writes keeps selecting its target.
+        let target = base_red_issue(
+            Uuid::new_v4(),
+            &red_on(
+                "guard::a",
+                Some("cargo test -p rsi-common --test manifest_dir_guard"),
+            ),
+            None,
+            None,
+        );
+        assert_eq!(
+            issue_selecting_filters(&target.body),
+            ["rsi-common=test:manifest_dir_guard"]
         );
     }
 

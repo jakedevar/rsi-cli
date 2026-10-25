@@ -2,6 +2,8 @@
 // as pure state (crates/rsi/src/overlay/graph.rs, app/graph.rs and the run
 // view in ui/overlay/graph.rs). The DOM side is graphs.ts; the layout is
 // graph-layout.ts. No DOM; tested in tests/graphs.test.mjs.
+import { type NextStep, hintLine } from './key-hints.js';
+import type { Platform } from './keyengine.js';
 import { type Direction, type GraphLayout, type Point, directionalNeighbor, HORIZONTAL_PAN_STEP, VERTICAL_PAN_STEP } from './graph-layout.js';
 
 // ---------- the workflow document (rsi_graph::format, serde names) ----------
@@ -389,6 +391,12 @@ export interface KeyContext {
   executing: boolean;
   /** Entries in the open picker. */
   pickerCount: number;
+  /**
+   * Esc on the canvas closes the review (local #231): set with the Vim keys switch off, where `q`
+   * is blocked and Esc is the one key that closes every other full-window view. With the switch on
+   * Esc keeps the TUI meaning (nothing to do on the canvas).
+   */
+  escCloses?: boolean;
 }
 
 const PICKER_PAGE = 10;
@@ -444,6 +452,8 @@ export function graphKey(r: Review, k: GraphKey, ctx: KeyContext): { review: Rev
   }
   if (mode.kind === 'edit') return ignored(r);
   if (k.ctrl) return ignored(r);
+  // A picker and the node detail took their own Esc above; on the canvas itself it closes (switch off).
+  if (key === 'Escape' && ctx.escCloses && mode.kind === 'navigate') return out(r, { kind: 'close' });
 
   const authored = isAuthored(r.draft);
   const readOnly = ctx.executing || !authored;
@@ -683,4 +693,85 @@ export function resolveParams(executionId: string, attemptId: string, action: Re
     idempotency_key: `tui:${executionId}:${attemptId}:${action}:${rowVersion}`,
     ...(confirm ? { confirm_preserved_commit: confirm } : {}),
   };
+}
+
+// ---------- footer and side hints: plain words first, keys second (local #218, via key-hints nextStep) ----------
+
+const GRAPH_EMPTY_STEPS: readonly NextStep[] = [
+  { click: 'Starter', key: 't', to: 'start from a template' },
+  { click: 'Saved', key: 'o', to: 'open a saved workflow' },
+  { do: 'Pan the view', key: 'H / J / K / L' },
+  { do: 'Follow the running node with the camera', key: 'c' },
+  { click: 'Close', key: 'q' },
+];
+
+const GRAPH_STEPS: readonly NextStep[] = [
+  { click: 'a node in the graph', key: 'h / j / k / l', to: 'select it' },
+  { do: 'Step between edges', key: '[ / ]' },
+  { do: 'Jump to the first or last node', key: 'g / G' },
+  { do: 'Open the node detail', key: 'Enter' },
+  { do: 'Delete the node', key: 'd' },
+  { do: 'Undo the last edit', key: 'u' },
+  { do: 'Fold or unfold a node', key: 'z' },
+  { click: 'Starter, Saved or Recursive', key: 't / o / R', to: 'open another graph' },
+  { click: 'Run', key: 'r', to: 'save, check and run the workflow' },
+  { click: 'Interrupt', key: 'x', to: 'stop the running execution' },
+  { do: 'Pan the view', key: 'H / J / K / L' },
+  { do: 'Follow the running node with the camera', key: 'c' },
+  { do: 'Switch to the dashboard', key: 'Tab' },
+  { click: 'Close', key: 'q' },
+];
+
+/**
+ * The empty canvas's text (local #231). Vim keys on keeps the TUI's key lines; with them off it
+ * names the buttons, never a key the switch blocks.
+ */
+export function graphEmptyLines(vimOn: boolean): { title: string; lines: string[] } {
+  if (!vimOn) return { title: 'Empty graph', lines: ['Click Starter to begin from a template or Saved to open a saved workflow.'] };
+  return { title: 'Empty graph', lines: ['t  open a starter topology', 'o  open a saved workflow', 'q  close'] };
+}
+
+/** The graph pane's status line before the key hints: which node, and whether the view follows it (no "camera" jargon). */
+export function graphStatusLine(r: { follow: boolean; pan: { x: number; y: number }; selected: number }, nodeCount: number): string {
+  const view = r.follow ? 'view follows the running node' : `view panned (${r.pan.x},${r.pan.y})`;
+  return `node ${nodeCount === 0 ? 0 : r.selected + 1}/${nodeCount} · ${view}`;
+}
+
+/** Header-button tooltips: what the button does, in plain words (the Recursive and Interrupt ones were unexplained). */
+export const GRAPH_BUTTON_TITLES = {
+  t: 'Open a starter topology',
+  o: 'Open a saved workflow',
+  R: 'Browse recursive graphs (read-only)',
+  r: 'Save, check and run the workflow',
+  x: 'Stop the running workflow',
+  q: 'Close graph review',
+} as const;
+
+/** The graph pane's footer hints (after the camera and node counters). */
+export function graphFooterHints(emptyDraft: boolean, vimOn = true, platform?: Platform): string {
+  return hintLine(emptyDraft ? GRAPH_EMPTY_STEPS : GRAPH_STEPS, vimOn, platform);
+}
+
+/** The node-detail side panel's hint under the edge list. */
+export function graphEdgeHints(authored: boolean, vimOn = true, platform?: Platform): string {
+  return hintLine([
+    ...(authored ? [{ do: 'Rename the node', key: 'i' }] : []),
+    { do: 'Edit the instructions', key: 'I' },
+    ...(authored ? [] : [{ do: 'Change the strategy', key: 's / S' }]),
+    { do: 'Move between edges', key: 'j / k' },
+    ...(authored ? [{ do: 'Delete the edge', key: 'x' }] : []),
+    { do: 'Follow an edge', key: '[ / ]' },
+    { do: 'Go back', key: 'Esc' },
+  ], vimOn, platform);
+}
+
+/** The starter / saved picker's hint. */
+export function graphPickerHints(vimOn = true, platform?: Platform): string {
+  return hintLine([
+    { do: 'Move through the list', key: 'j / k' },
+    { do: 'Jump to the first or last', key: 'g / G' },
+    { do: 'Page through it', key: 'PageDown / PageUp' },
+    { do: 'Open the selected one', key: 'Enter' },
+    { do: 'Go back', key: 'Esc' },
+  ], vimOn, platform);
 }

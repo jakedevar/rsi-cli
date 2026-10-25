@@ -63,7 +63,11 @@ impl SessionManager {
         } else {
             plan.tags.clone()
         };
-        let config = successor_launch_config(&plan, &params, tags.clone());
+        // #169: a seat launched without a sandbox in a root that now admits one
+        // (a project `git init`ed after appointment) is reseated into its own.
+        let root_admits_sandbox =
+            super::global_manager_verbs::project_root_admits_sandbox(&seat.working_dir).await;
+        let config = successor_launch_config(&plan, &params, tags.clone(), root_admits_sandbox);
         let successor = Box::pin(self.launch_session(config)).await?;
         if let Err(error) = self.update_session_tags(successor, tags).await {
             tracing::warn!(%successor, %error, "reseat successor tags were not persisted");
@@ -157,21 +161,23 @@ impl SessionManager {
 }
 
 /// The successor's launch: a root session in the seat's working directory on
-/// the requested provider, `continued_from` the seat. A separate function so
+/// the requested provider, `continued_from` the seat, in a sandbox of its own
+/// when the seat had one or its root admits one (#169). A separate function so
 /// the large config stays out of the async state of the reseat.
 fn successor_launch_config(
     plan: &crate::store::manager_reseat::ManagerReseatPlan,
     params: &ReseatHarnessManagerParams,
     tags: Vec<String>,
+    root_admits_sandbox: bool,
 ) -> LaunchConfig {
     let seat = &plan.seat;
-    let sandbox = seat
-        .sandbox_kind
-        .filter(|kind| *kind != SandboxKind::None)
-        .map(|kind| SandboxSpec {
+    let sandbox = match seat.sandbox_kind.filter(|kind| *kind != SandboxKind::None) {
+        Some(kind) => Some(SandboxSpec {
             kind: Some(kind),
             branch: None,
-        });
+        }),
+        None => super::global_manager_verbs::manager_seat_sandbox(None, root_admits_sandbox),
+    };
     LaunchConfig {
         completion_gates: None,
         query: successor_brief(seat.id, seat.provider, &params.reason),
@@ -222,5 +228,8 @@ fn successor_launch_config(
         topology_iteration: 0,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     }
 }

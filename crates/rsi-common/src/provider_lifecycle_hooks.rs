@@ -26,7 +26,8 @@
 //!   daemon's reply carries it and the hook prints it as
 //!   `hookSpecificOutput.additionalContext` ([`render_session_start_output`]),
 //!   the one output shape both providers accept. Anything else prints nothing,
-//!   and the next launch puts an undelivered preamble back in the prompt.
+//!   and a UserPromptSubmit handler retries unconfirmed parts before the
+//!   first model response. The next-launch prompt remains the final fallback.
 //!
 //! An empty set installs exactly the hooks installed before this module existed.
 
@@ -64,7 +65,8 @@ pub const KIND_SESSION_START_CONTEXT: &str = "session_start_context";
 /// hub #2919: the longest preamble a `SessionStart` hook carries. Claude Code
 /// caps each `additionalContext` string at 10,000 characters and replaces a
 /// longer one with a file path and a 2,000-character preview [source] Claude
-/// Code hooks reference, so a longer preamble stays in the prompt.
+/// Code hooks reference. Claude splits longer preambles at startup part
+/// boundaries; an indivisible part that cannot fit stays in the prompt.
 pub const MAX_SESSION_START_CONTEXT_CHARS: usize = 10_000;
 /// hub #2919: the `SessionStart` `source` values RSI records; any other value
 /// is `other`. Claude sends all five, Codex `startup`, `resume` and `clear`.
@@ -277,6 +279,17 @@ pub fn tui_options() -> Vec<String> {
 /// same `command`. No `onFailure`: a hook that fails to run is skipped.
 #[must_use]
 pub fn claude_settings_json(command: &str, set: LifecycleHookSet) -> String {
+    claude_settings_json_with_parts(command, set, 1)
+}
+
+/// Install independent numbered SessionStart handlers for a multipart preamble.
+/// Other events and single-part launches keep their existing commands.
+#[must_use]
+pub fn claude_settings_json_with_parts(
+    command: &str,
+    set: LifecycleHookSet,
+    parts: usize,
+) -> String {
     let base = crate::boundary_mail_hook::claude_settings_json(command);
     if set.is_empty() {
         return base;
@@ -288,22 +301,44 @@ pub fn claude_settings_json(command: &str, set: LifecycleHookSet) -> String {
         return base;
     };
     for event in set.events() {
+        let handlers: Vec<Value> = (1..=if event == LifecycleHookEvent::SessionStart {
+            parts.max(1)
+        } else {
+            1
+        })
+            .map(|part| {
+                json!({
+                    "type": "command",
+                    "command": if event == LifecycleHookEvent::SessionStart && parts > 1 {
+                        format!("{command} --session-start-part={part}")
+                    } else {
+                        command.to_string()
+                    },
+                    "timeout": crate::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+                })
+            })
+            .collect();
         hooks.insert(
             event.name().to_string(),
             json!([{
-                "hooks": [{
-                    "type": "command",
-                    "command": command,
-                    "timeout": crate::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
-                }]
+                "hooks": handlers
             }]),
         );
+    }
+    if set.contains(LifecycleHookEvent::SessionStart) {
+        let handlers: Vec<_> = (1..=parts.max(1)).map(|part| json!({
+            "type": "command",
+            "command": format!("{command} --session-start-fallback --session-start-part={part}"),
+            "timeout": crate::boundary_mail_hook::CLAUDE_HOOK_TIMEOUT_SECS,
+        })).collect();
+        hooks.insert("UserPromptSubmit".into(), json!([{"hooks": handlers}]));
     }
     value.to_string()
 }
 
 /// `RecordProviderLifecycleEvent` params: the event and a bounded, normalized
-/// summary of the provider's hook input. Never the transcript or the prompt.
+/// summary of the provider's hook input, plus the SessionStart transcript locator.
+/// Never the transcript contents or the prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordProviderLifecycleEventParams {
@@ -321,6 +356,17 @@ pub struct RecordProviderLifecycleEventParams {
     /// `SessionStart`: one of [`SESSION_START_SOURCES`] or `other`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// One-based SessionStart chunk selected by RSI's installed handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_start_part: Option<usize>,
+    /// Set only by RSI's UserPromptSubmit fallback handler.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_start_fallback: bool,
+    /// SessionStart evidence locator from the provider hook input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 impl RecordProviderLifecycleEventParams {
@@ -340,6 +386,10 @@ impl RecordProviderLifecycleEventParams {
                 error_details: text("error_details"),
                 trigger: None,
                 source: None,
+                session_start_part: None,
+                session_start_fallback: false,
+                provider_session_id: None,
+                transcript_path: None,
             },
             LifecycleHookEvent::PreCompact => Self {
                 event,
@@ -347,6 +397,10 @@ impl RecordProviderLifecycleEventParams {
                 error_details: None,
                 trigger: Some(text("trigger").unwrap_or_default()),
                 source: None,
+                session_start_part: None,
+                session_start_fallback: false,
+                provider_session_id: None,
+                transcript_path: None,
             },
             LifecycleHookEvent::SessionStart => Self {
                 event,
@@ -354,6 +408,10 @@ impl RecordProviderLifecycleEventParams {
                 error_details: None,
                 trigger: None,
                 source: Some(text("source").unwrap_or_default()),
+                session_start_part: None,
+                session_start_fallback: false,
+                provider_session_id: text("session_id"),
+                transcript_path: text("transcript_path"),
             },
         };
         Some(params.normalized())
@@ -370,6 +428,10 @@ impl RecordProviderLifecycleEventParams {
                 error_details: self.error_details.as_deref().and_then(bounded_details),
                 trigger: None,
                 source: None,
+                session_start_part: None,
+                session_start_fallback: false,
+                provider_session_id: None,
+                transcript_path: None,
             },
             LifecycleHookEvent::PreCompact => Self {
                 event: self.event,
@@ -377,6 +439,10 @@ impl RecordProviderLifecycleEventParams {
                 error_details: None,
                 trigger: Some(normalized_trigger(self.trigger.as_deref())),
                 source: None,
+                session_start_part: None,
+                session_start_fallback: false,
+                provider_session_id: None,
+                transcript_path: None,
             },
             LifecycleHookEvent::SessionStart => Self {
                 event: self.event,
@@ -384,6 +450,14 @@ impl RecordProviderLifecycleEventParams {
                 error_details: None,
                 trigger: None,
                 source: Some(normalized_source(self.source.as_deref())),
+                session_start_part: self.session_start_part,
+                session_start_fallback: self.session_start_fallback,
+                provider_session_id: self
+                    .provider_session_id
+                    .filter(|s| !s.is_empty() && s.len() <= 256),
+                transcript_path: self
+                    .transcript_path
+                    .filter(|s| !s.is_empty() && s.len() <= 4096),
             },
         }
     }
@@ -545,13 +619,18 @@ pub fn render_pre_compact_output(
 /// Codex both read `hookSpecificOutput.additionalContext` for this event.
 #[must_use]
 pub fn render_session_start_output(reply: &RpcResponse) -> Option<String> {
+    render_start_context_output(reply, "SessionStart")
+}
+
+/// Shared capped output for the startup and prompt-submit recovery channels.
+pub fn render_start_context_output(reply: &RpcResponse, event: &str) -> Option<String> {
     let context = reply.result.as_ref()?.get("additional_context")?.as_str()?;
     if context.trim().is_empty() || context.chars().count() > MAX_SESSION_START_CONTEXT_CHARS {
         return None;
     }
     Some(
         json!({"hookSpecificOutput": {
-            "hookEventName": LifecycleHookEvent::SessionStart.name(),
+            "hookEventName": event,
             "additionalContext": context,
         }})
         .to_string(),
@@ -632,7 +711,15 @@ mod tests {
             let set = LifecycleHookSet::empty().with(event);
             let value: Value = serde_json::from_str(&claude_settings_json(command, set)).unwrap();
             let hooks = value["hooks"].as_object().unwrap();
-            assert_eq!(hooks.len(), 3, "{event:?}");
+            assert_eq!(
+                hooks.len(),
+                if event == LifecycleHookEvent::SessionStart {
+                    4
+                } else {
+                    3
+                },
+                "{event:?}"
+            );
             assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
             assert_eq!(value["hooks"]["PostToolUse"][0]["matcher"], "*");
             let group = &value["hooks"][event.name()][0];
@@ -646,6 +733,55 @@ mod tests {
             );
             assert!(handler.get("onFailure").is_none());
         }
+    }
+
+    #[test]
+    fn multipart_settings_install_one_numbered_handler_per_chunk() {
+        let set = LifecycleHookSet::empty()
+            .with(LifecycleHookEvent::SessionStart)
+            .with(LifecycleHookEvent::PreCompact);
+        let settings: Value = serde_json::from_str(&claude_settings_json_with_parts(
+            "rsi-rpc boundary-mail-hook",
+            set,
+            3,
+        ))
+        .unwrap();
+        let handlers = settings["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(handlers.len(), 3);
+        let fallback = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(fallback.len(), 3);
+        for (index, handler) in fallback.iter().enumerate() {
+            assert_eq!(
+                handler["command"],
+                format!(
+                    "rsi-rpc boundary-mail-hook --session-start-fallback --session-start-part={}",
+                    index + 1
+                )
+            );
+        }
+
+        for (index, handler) in handlers.iter().enumerate() {
+            assert_eq!(
+                handler["command"],
+                format!(
+                    "rsi-rpc boundary-mail-hook --session-start-part={}",
+                    index + 1
+                )
+            );
+        }
+        assert_eq!(
+            settings["hooks"]["PreCompact"][0]["hooks"][0]["command"],
+            "rsi-rpc boundary-mail-hook"
+        );
+        let params: RecordProviderLifecycleEventParams = serde_json::from_value(
+            json!({"event":"SessionStart", "source":"startup", "session_start_part":2}),
+        )
+        .unwrap();
+        assert_eq!(params.normalized().session_start_part, Some(2));
     }
 
     #[test]
@@ -830,7 +966,10 @@ mod tests {
             assert_eq!(params.event, LifecycleHookEvent::SessionStart);
             assert_eq!(params.source.as_deref(), Some(expected));
             let wire = serde_json::to_value(&params).unwrap();
-            assert_eq!(wire, json!({"event": "SessionStart", "source": expected}));
+            assert_eq!(
+                wire,
+                json!({"event": "SessionStart", "source": expected, "transcript_path": "/t.jsonl"})
+            );
             assert_eq!(params.health_metadata()["kind"], KIND_SESSION_START_CONTEXT);
             assert_eq!(params.health_metadata()["session_source"], expected);
         }
@@ -849,7 +988,8 @@ mod tests {
     /// Codex (`session-start.command.output` in codex-cli 0.163.0).
     #[test]
     fn a_session_start_prints_the_preamble_as_additional_context_for_both_providers() {
-        let input = json!({"hook_event_name": "SessionStart", "source": "startup"});
+        let input = json!({"hook_event_name": "SessionStart", "source": "startup",
+            "session_id": "provider-thread", "transcript_path": "/provider-thread.jsonl"});
         let preamble =
             "# RPI Worker Preamble\n\n## Agent control (rsi)\nCall AgentGetAuthorityCatalog.";
         for dialect in [HookOutputDialect::Claude, HookOutputDialect::Codex] {
@@ -868,7 +1008,8 @@ mod tests {
                 calls,
                 [(
                     RECORD_METHOD.to_string(),
-                    json!({"event": "SessionStart", "source": "startup"})
+                    json!({"event": "SessionStart", "source": "startup",
+                        "provider_session_id": "provider-thread", "transcript_path": "/provider-thread.jsonl"})
                 )]
             );
             let printed: Value = serde_json::from_slice(&out).unwrap();

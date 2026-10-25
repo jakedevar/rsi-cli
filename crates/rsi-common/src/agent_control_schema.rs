@@ -110,6 +110,7 @@ pub enum AgentControlVerbV1 {
     ReportToHub,
     GetDaemonInfo,
     RequestDeploy,
+    SwitchHostPreset,
     PushSatelliteManagerPolicy,
     ReseatSatelliteManager,
     QueryFailureSignatures,
@@ -195,6 +196,21 @@ pub enum NativeAgentControlToolV1 {
     RsiControlListRollingQueue,
     RsiControlCancelRollingQueueEntry,
     RsiControlCheckLandingCandidate,
+    RsiControlContinueChild,
+    RsiControlCancelWake,
+    RsiControlManagerDelegateNode,
+    RsiControlManagerEscalate,
+    RsiControlManagerListEscalations,
+    RsiControlManagerResolveEscalation,
+    RsiControlEnqueueLandingSource,
+    RsiControlGetProviderStatus,
+    RsiControlSubmitJob,
+    RsiControlGetJob,
+    RsiControlListJobs,
+    RsiControlCancelJob,
+    RsiControlSendSatelliteMessage,
+    RsiControlGetDaemonInfo,
+    RsiControlRequestDeploy,
 }
 
 impl NativeAgentControlToolV1 {
@@ -261,7 +277,49 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlListRollingQueue => "rsi_control_list_rolling_queue",
             Self::RsiControlCancelRollingQueueEntry => "rsi_control_cancel_rolling_queue_entry",
             Self::RsiControlCheckLandingCandidate => "rsi_control_check_landing_candidate",
+            Self::RsiControlContinueChild => "rsi_control_continue_child",
+            Self::RsiControlCancelWake => "rsi_control_cancel_wake",
+            Self::RsiControlManagerDelegateNode => "rsi_control_manager_delegate_node",
+            Self::RsiControlManagerEscalate => "rsi_control_manager_escalate",
+            Self::RsiControlManagerListEscalations => "rsi_control_manager_list_escalations",
+            Self::RsiControlManagerResolveEscalation => "rsi_control_manager_resolve_escalation",
+            Self::RsiControlEnqueueLandingSource => "rsi_control_enqueue_landing_source",
+            Self::RsiControlGetProviderStatus => "rsi_control_get_provider_status",
+            Self::RsiControlSubmitJob => "rsi_control_submit_job",
+            Self::RsiControlGetJob => "rsi_control_get_job",
+            Self::RsiControlListJobs => "rsi_control_list_jobs",
+            Self::RsiControlCancelJob => "rsi_control_cancel_job",
+            Self::RsiControlSendSatelliteMessage => "rsi_control_send_satellite_message",
+            Self::RsiControlGetDaemonInfo => "rsi_control_get_daemon_info",
+            Self::RsiControlRequestDeploy => "rsi_control_request_deploy",
         }
+    }
+
+    /// #3774: tools the `rsi-agent-mcp` gateway serves by forwarding the verb to
+    /// the daemon socket. Their handlers live in the RPC layer (jobs, deploy,
+    /// queue, daemon info, ...), which the in-process Harness and
+    /// CodexAppServer registries do not reach, so those registries do not
+    /// register them; the verb and its authority checks are unchanged.
+    #[must_use]
+    pub const fn mcp_gateway_only(self) -> bool {
+        matches!(
+            self,
+            Self::RsiControlContinueChild
+                | Self::RsiControlCancelWake
+                | Self::RsiControlManagerDelegateNode
+                | Self::RsiControlManagerEscalate
+                | Self::RsiControlManagerListEscalations
+                | Self::RsiControlManagerResolveEscalation
+                | Self::RsiControlEnqueueLandingSource
+                | Self::RsiControlGetProviderStatus
+                | Self::RsiControlSubmitJob
+                | Self::RsiControlGetJob
+                | Self::RsiControlListJobs
+                | Self::RsiControlCancelJob
+                | Self::RsiControlSendSatelliteMessage
+                | Self::RsiControlGetDaemonInfo
+                | Self::RsiControlRequestDeploy
+        )
     }
 
     /// The closed RPC verb served by this native tool.
@@ -336,6 +394,23 @@ impl NativeAgentControlToolV1 {
             Self::RsiControlListRollingQueue => AgentControlVerbV1::ListRollingQueue,
             Self::RsiControlCancelRollingQueueEntry => AgentControlVerbV1::CancelRollingQueueEntry,
             Self::RsiControlCheckLandingCandidate => AgentControlVerbV1::CheckLandingCandidate,
+            Self::RsiControlContinueChild => AgentControlVerbV1::ContinueChild,
+            Self::RsiControlCancelWake => AgentControlVerbV1::CancelWake,
+            Self::RsiControlManagerDelegateNode => AgentControlVerbV1::ManagerDelegateNode,
+            Self::RsiControlManagerEscalate => AgentControlVerbV1::ManagerEscalate,
+            Self::RsiControlManagerListEscalations => AgentControlVerbV1::ManagerListEscalations,
+            Self::RsiControlManagerResolveEscalation => {
+                AgentControlVerbV1::ManagerResolveEscalation
+            }
+            Self::RsiControlEnqueueLandingSource => AgentControlVerbV1::EnqueueLandingSource,
+            Self::RsiControlGetProviderStatus => AgentControlVerbV1::GetProviderStatus,
+            Self::RsiControlSubmitJob => AgentControlVerbV1::SubmitJob,
+            Self::RsiControlGetJob => AgentControlVerbV1::GetJob,
+            Self::RsiControlListJobs => AgentControlVerbV1::ListJobs,
+            Self::RsiControlCancelJob => AgentControlVerbV1::CancelJob,
+            Self::RsiControlSendSatelliteMessage => AgentControlVerbV1::SendSatelliteMessage,
+            Self::RsiControlGetDaemonInfo => AgentControlVerbV1::GetDaemonInfo,
+            Self::RsiControlRequestDeploy => AgentControlVerbV1::RequestDeploy,
         }
     }
 }
@@ -594,7 +669,8 @@ impl AgentControlVerbV1 {
             ),
             Self::SubmitReviewReceipt => decode!(
                 crate::harness_manager_v2::AgentSubmitReviewReceiptRequestV1,
-                |r: &crate::harness_manager_v2::AgentSubmitReviewReceiptRequestV1| r.validate()
+                |r: &crate::harness_manager_v2::AgentSubmitReviewReceiptRequestV1| r
+                    .validate_wire()
             ),
             Self::ManagerControl => decode!(
                 crate::harness_manager_v2::AgentManagerControlRequestV2,
@@ -613,11 +689,23 @@ impl AgentControlVerbV1 {
                 crate::harness_manager_v2::AgentManagerGetActionRequestV2,
                 |r: &crate::harness_manager_v2::AgentManagerGetActionRequestV2| r.validate()
             ),
-            Self::ManagerLaunchIssueWorker => decode!(
-                crate::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1,
-                |r: &crate::manager_issue_worker::AgentManagerLaunchIssueWorkerRequestV1| r
-                    .validate()
-            ),
+            Self::ManagerLaunchIssueWorker => {
+                use crate::manager_issue_worker::{
+                    AgentManagerLaunchIssueWorkerRequestV1,
+                    MANAGER_ISSUE_WORKER_REVIEW_CONTINUATION_CONFLICT,
+                };
+                let request: AgentManagerLaunchIssueWorkerRequestV1 =
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| AgentControlParamErrorV1::params())?;
+                request.validate().map_err(|reason| {
+                    let mut error = AgentControlParamErrorV1::params();
+                    if reason == MANAGER_ISSUE_WORKER_REVIEW_CONTINUATION_CONFLICT {
+                        error.path = Some("params.continue_from".into());
+                        error.constraint = Some(reason.into());
+                    }
+                    error
+                })
+            }
             Self::ManagerWorkView => decode!(
                 crate::harness_manager::AgentManagerWorkViewRequestV1,
                 |r: &crate::harness_manager::AgentManagerWorkViewRequestV1| r.validate()
@@ -700,10 +788,21 @@ impl AgentControlVerbV1 {
                 crate::agent_provider_status::AgentGetProviderStatusRequestV1,
                 |r: &crate::agent_provider_status::AgentGetProviderStatusRequestV1| r.validate()
             ),
-            Self::SubmitJob => decode!(
-                crate::agent_jobs::AgentSubmitJobRequestV1,
-                |r: &crate::agent_jobs::AgentSubmitJobRequestV1| r.typed_params().map(drop)
-            ),
+            Self::SubmitJob => {
+                let request: crate::agent_jobs::AgentSubmitJobRequestV1 =
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| AgentControlParamErrorV1::params())?;
+                request.typed_params().map(drop).map_err(|code| {
+                    // Name the reason (an unallowed build feature, an oversize
+                    // filter) instead of an opaque `invalid_input`.
+                    let mut error = AgentControlParamErrorV1::params();
+                    let detail = request.refusal_detail(code);
+                    if detail != code {
+                        error.constraint = Some(detail);
+                    }
+                    error
+                })
+            }
             Self::GetJob => decode!(
                 crate::agent_jobs::AgentGetJobRequestV1,
                 |_: &crate::agent_jobs::AgentGetJobRequestV1| Ok::<(), ()>(())
@@ -749,6 +848,10 @@ impl AgentControlVerbV1 {
             Self::RequestDeploy => decode!(
                 crate::agent_deploy::AgentRequestDeployRequestV1,
                 |r: &crate::agent_deploy::AgentRequestDeployRequestV1| r.validate()
+            ),
+            Self::SwitchHostPreset => decode!(
+                crate::host_tuning::SwitchHostPreset,
+                |r: &crate::host_tuning::SwitchHostPreset| r.validate()
             ),
             Self::GlobalOverview => decode!(
                 crate::global_manager::AgentGlobalOverviewRequestV1,
@@ -1084,6 +1187,11 @@ const AUDIT_SOURCE_WORKTREE_COHORT_SCHEMA: &str = r##"{
     "repository_identity"
   ],
   "properties": {
+    "after_custody_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Exclusive custody-key page hint from traversal.last_custody_id. Omit to restart. Apply must repeat the audited hint; never authorizes unexamined roots."
+    },
     "fields": {
       "type": "string",
       "enum": ["summary", "full"],
@@ -1106,6 +1214,11 @@ const APPLY_SOURCE_WORKTREE_COHORT_SCHEMA: &str = r##"{
     "idempotency_key"
   ],
   "properties": {
+    "after_custody_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Exclusive custody-key page hint from traversal.last_custody_id. Omit to restart. Apply must repeat the audited hint; never authorizes unexamined roots."
+    },
     "repository_identity": {
       "type": "string",
       "minLength": 1,
@@ -1449,6 +1562,11 @@ const READ_SESSION_EVENTS_SCHEMA: &str = r##"{
       "type": "boolean",
       "default": false,
       "description": "Return final_message.content up to 32768 characters instead of the default 8000-character cap"
+    },
+    "full_fields": {
+      "type": "boolean",
+      "default": false,
+      "description": "Raise the per-event cap on content, tool_input and metadata from 2000 to 262144 characters so a long tool call (a Write over 2 KB) is exported whole; max_bytes still bounds the page and an event over the raised cap stays truncated:true"
     }
   }
 }"##;
@@ -1718,7 +1836,7 @@ const REQUEST_DEPLOY_SCHEMA: &str = r##"{
         "null"
       ],
       "default": null,
-      "description": "true: once the operator's drain hold (deploy_drain_hold_secs) is over, a worker still mid-turn no longer blocks the quiet point; the restart interrupts it and the existing post-restart path resumes its turn with a continue prompt. A landing and a local test/build/landing job still block. The outcome lists the interrupted worker session ids and each is an andon friction event (deploy_interrupt). Default false; not with cancel. With peer_id the paired satellite applies it to its own workers (#2587); a satellite build that predates it is refused satellite_deploy_interrupt_unsupported"
+      "description": "Optional boolean: omitted defaults to true with peer_id, false for a local hub deploy. Explicit false waits for a lull. True stops waiting for mid-turn workers after deploy_drain_hold_secs; the restart interrupts and resumes them. Ordinary test/scoped_test jobs are never stopped or rerun: their units keep running across the restart and the new daemon re-adopts them (one wake each, when the job ends); landing, build and protected jobs still block. The receipt names expected_interrupted_workers, expected_surviving_jobs, interrupted_workers and surviving_jobs; the outcome names interrupted sessions and the jobs that kept running. Not with cancel. A peer without deploy_interrupt is refused satellite_deploy_interrupt_unsupported; explicit false remains compatible"
     }
   }
 }"##;
@@ -1751,6 +1869,12 @@ const WORKER_ROSTER_SCHEMA: &str = r##"{
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "fields": {
+      "type": ["string", "null"],
+      "enum": ["summary", "full", null],
+      "default": null,
+      "description": "summary (default): live workers plus final_handoff/failed active within the last hour; older finished history is counted in hidden_finished. full or nonempty states restores matching history, including stale strands"
+    },
     "project_id": {
       "type": [
         "string",
@@ -1775,7 +1899,7 @@ const WORKER_ROSTER_SCHEMA: &str = r##"{
       },
       "maxItems": 6,
       "default": [],
-      "description": "Only workers in these derived states; empty lists every state"
+      "description": "Only workers in these derived states, including all matching history; empty uses the summary view unless fields is full"
     },
     "limit": {
       "type": [
@@ -1802,6 +1926,20 @@ const MANAGER_OVERVIEW_SCHEMA: &str = r##"{
       ],
       "default": "summary",
       "description": "Fleet rollup detail: summary is one row per model (1h and 24h invocations, errors, cost) plus active and totals; full is every project, provider and model group over 5m/1h/24h"
+    },
+    "detail": {
+      "type": "string",
+      "enum": [
+        "compact",
+        "full"
+      ],
+      "default": "compact",
+      "description": "compact (default) drops repeats: one seat digest per project child, standing directives as id/scope/title/updated_at, coordinator_budget once per distinct budget under coordinator_budgets, predecessors as a count plus the newest, one launches form (grant.allowed_launches); full is the whole workspace"
+    },
+    "directives": {
+      "type": "boolean",
+      "default": false,
+      "description": "Return the full text of every standing directive (compact returns only id, scope, title, updated_at and text_bytes); implied by detail full"
     }
   }
 }"##;
@@ -1987,7 +2125,20 @@ const STANDING_DIRECTIVE_SCHEMA: &str = r##"{
       ],
       "maxLength": 512,
       "default": null,
-      "description": "For set: where and when the operator said it (required)"
+      "description": "For set: where and when the operator said it (required for kind operator_relay); with kind manager an optional note on why"
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "operator_relay",
+        "manager",
+        null
+      ],
+      "default": null,
+      "description": "For set: operator_relay (default) relays the operator's words; manager is your own standing ruling for the scope (#3736), shown to its seats as manager-authored, never as operator words"
     },
     "expires_in_secs": {
       "type": [
@@ -2107,7 +2258,7 @@ const MANAGER_LAUNCH_ISSUE_WORKER_BASE_SCHEMA: &str = r##"{
       "type": "string",
       "minLength": 1,
       "maxLength": 24576,
-      "description": "The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue"
+      "description": "The worker's task text; it reads its own Issue with AgentGetIssue, so do not paste the Issue. Launch selectors come from this admitted request.brief field, not the whole daemon-compiled visible query. References only in daemon-copied records grant no additional live Issue reads; explicitly select required same-project dependencies here (a valid #N) or in related."
     },
     "launch": {
       "type": "object",
@@ -2165,13 +2316,13 @@ static MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA: LazyLock<String> = LazyLock::new(|| {
         "type": ["string", "null"],
         "format": "uuid",
         "default": null,
-        "description": "#1254: the terminal worker of this Issue to continue after it passed the baton; the new worker branches from its committed HEAD, inherits its lineage and starts from its final message and the Issue's latest handoff. Exclusive with sandbox_source."
+        "description": "#1254: the terminal worker of this Issue to continue after it passed the baton; the new worker branches from its committed HEAD, inherits its lineage and starts from its final message and the Issue's latest handoff. Exclusive with sandbox_source and review_of; omit continue_from to launch a fresh review with the latest implementer handoff."
     });
     schema["properties"]["review_of"] = serde_json::json!({
         "type": ["integer", "null"],
         "minimum": 1,
         "default": null,
-        "description": "#1590: display number of the implementer Issue this worker reviews. The daemon copies that Issue's text and its complete latest handoff (landing filters included) into the worker's brief; a bound reviewer cannot read it. Do not paste the handoff yourself."
+        "description": "#1590: display number of the implementer Issue this worker reviews. The daemon copies that Issue's text and its complete latest handoff (landing filters included) into the worker's brief. review_of alone grants no reverse live read of that Issue; explicit selection in the admitted request.brief field or related can independently grant it. References only in copied records grant no additional reads. Without sandbox_source, the latest handoff's declared commit pins the reviewer sandbox when available locally; otherwise it stays on origin/rolling and the brief disallows jobs for missing source tests. An explicit sandbox_source always wins. Do not paste the handoff yourself. Exclusive with continue_from; omit continue_from to launch a fresh review with the latest handoff. Explicit unknown sandbox_source commits are refused."
     });
     schema["properties"]["related"] = serde_json::json!({
         "type": "array",
@@ -2179,7 +2330,7 @@ static MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA: LazyLock<String> = LazyLock::new(|| {
         "maxItems": 16,
         "uniqueItems": true,
         "default": [],
-        "description": "#218: display numbers of same-project Issues whose COMPLETE text and latest handoff the daemon copies into the worker's brief as read-only context (a snapshot at launch; one too large for the brief is named, never cut, and the worker reads it with AgentGetIssue). The worker may also read each live. Writes, status changes and handoffs stay on `issue`. Not the bound Issue; an unknown number is refused manager_issue_worker_related_unavailable. A `#N` or `#A-#B` in `brief` (a range wider than 32 selects only its endpoints), in the Issue's body or in its handoffs is also readable (read-only) without listing it here; more than 64 distinct selectors in the brief are refused manager_issue_worker_references_overflow. A plain relaunch of the same Issue (no continue_from) also carries over the related Issues of its earlier launches (#275; result carried_related, and skipped_related for one that no longer exists or is archived)."
+        "description": "#218: display numbers of same-project Issues whose COMPLETE text and latest handoff the daemon copies into the worker's brief as read-only context (a snapshot at launch; one too large for the brief is named, never cut, and the worker reads it with AgentGetIssue). The worker may also read each live. References only in these copied records grant no additional reads. Writes, status changes and handoffs stay on `issue`. Not the bound Issue; an unknown number is refused manager_issue_worker_related_unavailable. A `#N` or `#A-#B` in the admitted request.brief field (not the whole compiled query; a range wider than 32 selects only its endpoints), in the Issue's body or in its handoffs is also readable (read-only) without listing it here; more than 64 distinct selectors in the brief are refused manager_issue_worker_references_overflow. A plain relaunch of the same Issue (no continue_from) also carries over the related Issues of its earlier launches (#275; result carried_related, and skipped_related for one that no longer exists or is archived)."
     });
     schema["properties"]["qa_lane"] = serde_json::json!({
         "type": "boolean", "default": false,
@@ -2529,6 +2680,36 @@ const GET_PROVIDER_STATUS_SCHEMA: &str = r##"{
       ],
       "default": null,
       "description": "Provider to report; omit for every provider"
+    },
+    "models": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "default": [],
+      "description": "OpenRouter model ids to price (needs provider openrouter): the openrouter entry then carries model_prices (per-million-token prompt, completion and cache-read prices with fetched_at, from the daemon's own model discovery) and model_prices_unknown"
+    },
+    "run_budget_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0,
+      "default": null,
+      "description": "A benchmark run's USD budget (needs provider openrouter): the openrouter entry then carries run_budget {admitted, refusal_code, status{run_budget_usd, spent_usd, remaining_usd, exhausted}}. Not admitted when the run spent its budget (stop launching tasks), what is left is larger than the cap's remainder, or the cap is reached or cannot be judged"
+    },
+    "run_sessions": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "default": [],
+      "description": "The sessions the run launched so far (with run_budget_usd); their invocation spend is the run's spend. Empty for a run about to start"
     }
   }
 }"##;
@@ -2636,7 +2817,7 @@ const WAKE_SCHEMA: &str = r##"{
       ],
       "default": null,
       "additionalProperties": false,
-      "description": "Required with mode when (and only then): exactly one predicate the daemon evaluates. jobs_terminal fires once every listed AgentSubmitJob job you own is terminal (submit them with wake none for one wake per batch); sha_on_rolling fires once that commit is an ancestor of origin/rolling in your repository (polled). issue_closed fires once that Issue is Closed (the manager closes an Issue when its work is on rolling), so you can wait on a dependency without its SHA; a Cancelled or missing Issue wakes you as unsatisfiable. todo_closed fires once that operator to-do item (in your own manager scope) is done or dismissed and carries its status and evidence, so you wait on the operator without polling; an unknown or out-of-scope item is refused at scheduling time. topology_execution_settled fires once when that topology execution (one you requested, or one under an Epic you manage or lead) is succeeded, failed, cancelled or blocked, and carries its status, error, blocked-reason summary (kind, node_id, attempt_id) and finish time; an owner keeps exactly one enabled settle wake per execution: arming another for the same execution, under any name, replaces the earlier one (reported in replaced_job_ids); a blocked execution that is later resolved needs a new wake, and an unknown or out-of-scope id is refused at scheduling time. settlement_run_settled fires once when that source-worktree settlement run (the run_id AgentApplySourceWorktreeCohort returned while the run was still applying) is finished, every root settled, refused, recovery_required or unattempted, and carries the run state, per-phase counts and terminal error; an unknown run or one outside your cohort authority is refused at scheduling time. health_anomaly (manager seats only; a project manager watches its project, a portfolio seat every project) is the replacement for an hourly check-in turn: the daemon evaluates the PM slots, context fill against the rotation threshold, blocked or overrun topology work, hub disk and CPU temperature, satellite disk, provider faults and an untracked red rolling QA every minute with no model call and resumes you once with a condition=<kind> subject=<id> ignore_key=<kind>:<subject> detail=\"...\" line per anomaly, so a quiet daemon costs you no turn; re-arm after handling, and list a persisting condition's printed ignore_key value, verbatim, in ignore. in_seconds, at and every_seconds are not accepted with mode when",
+      "description": "Required with mode when (and only then): exactly one predicate the daemon evaluates. jobs_terminal fires once every listed AgentSubmitJob job you own or may watch through proven succession is terminal (submit them with wake none for one wake per batch); sha_on_rolling fires once that commit is an ancestor of origin/rolling in your repository (polled); shas_on_rolling accepts 1-32 distinct commits and fires once all are ancestors, reporting each SHA as on_rolling, pending or unknown (also on timeout or manual trigger); with fire \"each\" beside it the one wake instead resumes you once per landing (each firing lists landed_since_last_firing and marks those SHAs new=true) and retires after the last listed commit lands or the timeout passes, so watch every queued source with one wake, not one wake per SHA. A session holds at most 16 enabled when wakes (topology_execution_settled wakes are counted apart, up to 128); one more is refused wake_when_cap_reached. issue_closed fires once that Issue is Closed (the manager closes an Issue when its work is on rolling), so you can wait on a dependency without its SHA; a Cancelled or missing Issue wakes you as unsatisfiable. todo_closed fires once that operator to-do item (in your own manager scope) is done or dismissed and carries its status and evidence, so you wait on the operator without polling; an unknown or out-of-scope item is refused at scheduling time. topology_execution_settled fires once when that topology execution (one you requested, or one under an Epic you manage or lead) is succeeded, failed, cancelled or blocked, and carries its status, error, blocked-reason summary (kind, node_id, attempt_id) and finish time; an owner keeps exactly one enabled settle wake per execution: arming another for the same execution, under any name, replaces the earlier one (reported in replaced_job_ids); a blocked execution that is later resolved needs a new wake, and an unknown or out-of-scope id is refused at scheduling time. settlement_run_settled fires once when that source-worktree settlement run (the run_id AgentApplySourceWorktreeCohort returned while the run was still applying) is finished, every root settled, refused, recovery_required or unattempted, and carries the run state, per-phase counts and terminal error; an unknown run or one outside your cohort authority is refused at scheduling time. health_anomaly (manager seats only; a project manager watches its project, a portfolio seat every project) is the replacement for an hourly check-in turn: the daemon evaluates the PM slots, context fill against the rotation threshold, blocked or overrun topology work, hub disk and CPU temperature, satellite disk, provider faults and an untracked red rolling QA every minute with no model call and resumes you once with a condition=<kind> subject=<id> ignore_key=<kind>:<subject> detail=\"...\" line per anomaly, so a quiet daemon costs you no turn; re-arm after handling, and list a persisting condition's printed ignore_key value, verbatim, in ignore. in_seconds, at and every_seconds are not accepted with mode when",
       "properties": {
         "jobs_terminal": {
           "type": "array",
@@ -2646,12 +2827,31 @@ const WAKE_SCHEMA: &str = r##"{
           },
           "minItems": 1,
           "maxItems": 32,
-          "description": "Job ids you own; an unknown or foreign id is refused at scheduling time"
+          "description": "Job ids you own or may watch through manager succession or a published Issue-worker continuation; an unknown or unrelated id is refused at scheduling time"
         },
         "sha_on_rolling": {
           "type": "string",
           "pattern": "^[0-9a-f]{40}$",
           "description": "Full lowercase 40-hex commit id"
+        },
+        "shas_on_rolling": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "description": "Full lowercase 40-hex commit ids; fires once all are ancestors of origin/rolling and reports each SHA's state"
+        },
+        "fire": {
+          "type": "string",
+          "enum": [
+            "all",
+            "each"
+          ],
+          "description": "shas_on_rolling only (wake_when_predicate_invalid otherwise): all (the default) fires once when every listed commit is on rolling; each fires once per landing, naming the commits newly on rolling, and stays armed until all have landed or the timeout passes"
         },
         "issue_closed": {
           "type": "integer",
@@ -2827,7 +3027,7 @@ const CREATE_ISSUE_SCHEMA: &str = r##"{
       ],
       "minimum": 1,
       "default": null,
-      "description": "With harness: display number of the Issue in your own project this one mirrors"
+      "description": "Only with harness:true: display number of the Issue in your own project this harness filing mirrors. Refused without harness. To link an Issue in your own project, omit this and cite it as #N in the body"
     }
   }
 }"##;
@@ -2931,7 +3131,7 @@ const LIST_ISSUES_SCHEMA: &str = r##"{
       "minLength": 1,
       "maxLength": 128,
       "default": null,
-      "description": "Case-insensitive substring filter over Issue titles; required for bound workers"
+      "description": "Case-insensitive substring filter over Issue titles; a bound worker needs this, labels or status (at least one)"
     },
     "fields": {
       "type": [
@@ -2944,7 +3144,7 @@ const LIST_ISSUES_SCHEMA: &str = r##"{
         null
       ],
       "default": null,
-      "description": "summary: display_number, id, title, status, labels, priority, created_at, updated_at (no body). full: whole records. Default: summary when title_contains is set, else full. Fetch one body with AgentGetIssue"
+      "description": "summary: display_number, id, row_version, title, status, labels, priority, created_at, updated_at (no body). full: whole records. Default: summary when title_contains is set, else full. Fetch one body with AgentGetIssue"
     }
   }
 }"##;
@@ -3090,7 +3290,12 @@ const UPDATE_ISSUE_SCHEMA: &str = r##"{
       ],
       "maxLength": 65536,
       "default": null,
-      "description": "Issue-bound worker only: your complete handoff as its own append-only record (up to 65536 bytes), published even when the body is at its ceiling; set no other field. expected_row_version is not checked. AgentGetIssue returns the newest records in full as handoffs."
+      "description": "An append-only record on the Issue (up to 65536 bytes), published even when the body is at its ceiling: an Issue-bound worker's complete handoff, or a lead's or manager's note (#3052) that needs no body copy; set no other field. expected_row_version is not checked and a closed Issue accepts it. AgentGetIssue returns the newest records in full as handoffs."
+    },
+    "replace_body": {
+      "type": "boolean",
+      "default": false,
+      "description": "Lead or manager: set true with body to replace the body on purpose. Without it a body that does not keep the end of the current body is refused body_would_drop_tail (#3052)."
     }
   }
 }"##;
@@ -3425,7 +3630,7 @@ const MANAGER_INBOX_SCHEMA: &str = r##"{
         "summary"
       ],
       "default": "compact",
-      "description": "compact (default) omits repeated historical work_versions and carries work_versions_count; full restores the complete state payload and includes outbound manager sends. summary drops the state payload and returns a short state_summary string instead (a ledger_change's payload state and reason; an action_result's action_kind, state and outcome; otherwise the record_kind). Returned notices settle in every form. Use summary to drain a routine backlog."
+      "description": "compact (default) omits repeated historical work_versions and carries work_versions_count; full restores the complete state payload and includes outbound manager sends. summary drops the state payload and returns a short state_summary string instead (a ledger_change's payload state and reason; a satellite_report's kind, peer and whole untrusted_text, up to the 1024 bytes AgentReportToHub accepts; an action_result's action_kind, state and outcome; otherwise the record_kind). Returned notices settle in every form. Use summary to drain a routine backlog."
     },
     "after_sequence": {
       "type": "integer",
@@ -3599,6 +3804,7 @@ const MANAGER_DELEGATE_NODE_SCHEMA: &str = r##"{
       "format": "uuid"
     },
     "seat_root_session_id": {
+      "description": "A parentless Standard session or a Task directly under an Epic covered by selector, in the same project, without a predecessor or another active seat.",
       "type": "string",
       "format": "uuid"
     },
@@ -3606,7 +3812,10 @@ const MANAGER_DELEGATE_NODE_SCHEMA: &str = r##"{
       "type": "object"
     },
     "grant": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "max_direct_reports": {"type": "integer", "minimum": 1, "maximum": 64}
+      }
     },
     "policy": {
       "type": "object"
@@ -3818,12 +4027,13 @@ const SUBMIT_JOB_SCHEMA: &str = r##"{
         "build",
         "landing",
         "cloud_gate",
-        "cloud_sweep"
+        "cloud_sweep",
+        "bench"
       ]
     },
     "params": {
       "type": "object",
-      "description": "test: {recipe: declared name in the worktree .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration; scoped-test/scoped-test-tmpfs names and targets are retired (job_recipe_use_scoped_test); use scoped_test instead} or {scoped_test:{base,head?}: run the rolling-tip scripts/scoped-test --base <ref> [--head <ref>] in your sandbox (candidate tool changes run their own copy; receipt.tool names path, blob, source and rev; bare branch, origin/<branch> or 40-hex refs only, no other arguments; submit with wake none, arm ONE AgentScheduleWake mode when, end your turn; result.exit_code and the job log_path are set, result.receipt is the scoped-test receipt {ok,exit_code,base,head,filters,log_dir,packages[{package,status,completed}]}, refusal scoped_test_receipt_missing when none was printed)} or {shard,filterset?: one or more nextest atoms test(NAME), test(=NAME) or test(/REGEX/) joined by ` | `, at most 32 atoms and 1024 bytes} or {package,filters[],lib_only?,test_target?:integration test name (ASCII letters, digits, underscore or hyphen; no leading hyphen, path or shell syntax; passes cargo --test <name>; requires exact:true and nonempty filters; mutually exclusive with lib_only),exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test; with filters, a run whose whole log proves libtest executed no test, 0 passed and 0 failed in every test binary, settles failed refusal job_filter_matched_no_tests with exit_code 0 kept, so a mistyped name is never green; log evidence you cannot read, such as a custom harness, keeps the ordinary result; optional early feedback for a new runtime or schema assertion, never acceptance: only the committed scoped_test is)} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every package, shard or scoped_test job (not recipe or candidate_receipt) and every build job also takes cpu_quota_percent? (100-1600, percent of one CPU; omitted keeps the daemon-derived budget; the daemon applies the smaller of it and its own ceiling, so a request only lowers the operator/hub budget, before the unit starts: the unit CPUQuota, a scoped_test --cpu-quota, and the build and test thread counts, a scoped_test receipt records the effective cpu_quota); every test job also takes timeout_minutes? (5-180; default the operator job_test_timeout_mins, 20, except a scoped_test job whose default is 60 or job_test_timeout_mins if larger (its tool budgets each package up to the timeout minus 2 minutes, total minus 1; the stamped params and the receipt's job_timeout_minutes show the effective timeout); above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two outstanding QA lanes per owner (queued or running); QA never supports recipe, scoped_test, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build, one of package:<workspace-member-name> or workspace:true, all_targets?,release?,cpu_quota_percent?,sha?:40-lowercase-hex (pins the commit the build compiles; refused job_source_sha_mismatch when the job worktree HEAD differs at submit)} (hub #2954: every build job compiles exactly one commit; the daemon records the job worktree HEAD and whether it has uncommitted changes at submit and rechecks at start, while it runs (slot grant included) and at finish; a moved HEAD, or a clean tree that became dirty, stops the unit and settles it failed refusal job_source_moved naming both SHAs; result.source_head and result.source_dirty carry the HEAD and dirtiness observed at the end so a deploy can compare them with the SHA it installs; a dirty tree at submit is built as is and only a HEAD move fails it) or {command:test_no_run (#2692), package, no_default_features?, then either features?:[test-shard-NAME,...] (one build of the lib test harness, cargo test --lib --no-run) or shards?:[NAME,...] (a shard-feature sweep: each shard built with --no-default-features --features test-shard-NAME one after another, the package cleaned after each so the target holds one harness at a time; at most 32); runs in rsi-build.slice under the hub CPU budget; result.receipt is the SHARD_SWEEP_RECEIPT {ok,package,shards[{shard,features,exit_code,warnings{package:count},warning_keys},...],warnings:<warning-baseline gate verdict>}, settled failed when any shard build fails or the baseline gate reports new_warnings; this is the way to verify shard features, never a self-launched cargo unit}; package names are checked against cargo metadata at submission and unknown names are refused as invalid_input field=params.package; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip}. Typed fields only; no command line."
+      "description": "Profile verification (#413): non-Rust scoped_test resolves .rsi/project.toml, legacy .rsi/jobs.toml or a literal local make/just test target; all verification commands must complete successfully. result.profile_verification is daemon-written source/profile/tool evidence, never parsed from project output, with generic_command_exit warning applicability and completed command counts (not individual test counts). Rust projects retain scoped-test baseline/warning gates. test: {recipe: declared name in the resolved project profile or legacy .rsi/jobs.toml (version 1; recipes.NAME: runner just|make, target, timeout_minutes cap 5-180, cpu_quota_percent 1-1600); uses local justfile/Makefile; no arguments; request timeout must fit the declaration; scoped-test/scoped-test-tmpfs names and targets are retired (job_recipe_use_scoped_test); use scoped_test instead} or {scoped_test:{base,head?,rolling_tool?}: run the rolling-tip scripts/scoped-test --base <ref> [--head <ref>] in your sandbox (candidate tool changes run their own copy; rolling_tool:true forces the rolling copy for trusted verification and refuses scoped_test_rolling_tool_unavailable if it cannot run; result.scoped_tool holds daemon-written source (rolling|candidate|sandbox), path, rev and file blobs independently of receipt.tool; candidate_tool_untrusted requires a rolling-tool rerun at the same head; bare branch, origin/<branch> or 40-hex refs only, no other arguments; submit with wake none, arm ONE AgentScheduleWake mode when, end your turn; result.exit_code and the job log_path are set, result.receipt is the scoped-test receipt {ok,exit_code,base,head,filters,log_dir,packages[{package,status,completed}]}, refusal scoped_test_receipt_missing when none was printed)} or {shard,filterset?: one or more nextest atoms test(NAME), test(=NAME) or test(/REGEX/) joined by ` | `, at most 32 atoms and 1024 bytes} or {package,filters[],lib_only?,test_target?:integration test name (ASCII letters, digits, underscore or hyphen; no leading hyphen, path or shell syntax; passes cargo --test <name>; requires exact:true and nonempty filters; mutually exclusive with lib_only), bin?:binary target name (same token rules; passes cargo --bin <name>, e.g. rsid rsi-rolling-land unit tests; requires exact:true and nonempty filters; mutually exclusive with lib_only and test_target),features?:[dev feature of the package from the daemon allowlist, today rsid e2e-seed; passes cargo --features; package only; any other feature is refused job_invalid_params naming the allowed ones, like a check or build job; still bounded by rsi-build.slice, the sandbox target and the job timeout],exact?:boolean (default false; true passes libtest --exact for whole test names; package only; empty filters still run every test; with filters, a run whose whole log proves libtest executed no test, 0 passed and 0 failed in every test binary, settles failed refusal job_filter_matched_no_tests with exit_code 0 kept, so a mistyped name is never green; log evidence you cannot read, such as a custom harness, keeps the ordinary result; optional early feedback for a new runtime or schema assertion, never acceptance: only the committed scoped_test is)} or {package,filters[],exact:true,lib_only|test_target|bin,at_commit: 40-hex commit id of this repository: run those exact tests at that past commit in a scratch worktree the job creates and removes, so your sandbox, branch and index are untouched (confirm which commit broke a test, or run a reviewed source's new tests from a sandbox at rolling); open to any session with a sandbox; never acceptance evidence, only the committed scoped_test is; refusal job_invalid_params names the missing field, and a commit the repository lacks exits 2 with `not in this repository`} or {candidate_receipt: branch or 40-hex sha; manager/Epic lead only; result.receipt is the typed candidate receipt}; every package, shard or scoped_test job (not recipe or candidate_receipt) and every build job also takes cpu_quota_percent? (100-1600, percent of one CPU; omitted keeps the daemon-derived budget; the daemon applies the smaller of it and its own ceiling, so a request only lowers the operator/hub budget, before the unit starts: the unit CPUQuota, a scoped_test --cpu-quota, and the build and test thread counts, a scoped_test receipt records the effective cpu_quota); every test job also takes timeout_minutes? (a worker omits it: the default fits an exact-name package run, and a larger value from anyone but the manager or an Epic lead is refused job_timeout_not_authorized; 5-180; default the operator job_test_timeout_mins, 20, except a scoped_test job whose default is 60 or job_test_timeout_mins if larger (its tool budgets each package up to the timeout minus 2 minutes, total minus 1; the stamped params and the receipt's job_timeout_minutes show the effective timeout); above the default needs the manager or an Epic lead, except qa_lane:{sha:40-lowercase-hex} on a known shard: current live unsuperseded AgentManagerLaunchIssueWorker binding with explicit manager qa_lane:true delegation or manager/Epic lead, timeout 5-90, default capped at 90, SHA labels submission-time HEAD only; no dirtiness check or exact-tested-bytes proof; use a manager pinned detached worktree plus worktree on an ordinary test for an exact pin, at most two outstanding QA lanes per owner (queued or running); QA never supports recipe, scoped_test, package or candidate_receipt; past timeout the unit is stopped and the job fails job_timed_out); build: {command:check|build, one of package:<workspace-member-name> or workspace:true, all_targets?,release?,features?:[FEATURE,...] (package only, never with release; only the dev features allowed for that package: rsid allows e2e-seed, which compiles the isolated-state seeder binary rsi-e2e-seed; any other feature is refused job_invalid_params naming the allowed ones),bins?:[BIN,...] (package only; passes --bin NAME, at most 8; build rsid with features:[e2e-seed] and bins:[rsid,rsi-e2e-seed] for the desktop e2e smoke),cpu_quota_percent?,sha?:40-lowercase-hex (pins the commit the build compiles; refused job_source_sha_mismatch when the job worktree HEAD differs at submit)} (hub #2954: every build job compiles exactly one commit; the daemon records the job worktree HEAD and whether it has uncommitted changes at submit and rechecks at start, while it runs (slot grant included) and at finish; a moved HEAD, or a clean tree that became dirty, stops the unit and settles it failed refusal job_source_moved naming both SHAs; result.source_head and result.source_dirty carry the HEAD and dirtiness observed at the end so a deploy can compare them with the SHA it installs; a dirty tree at submit is built as is and only a HEAD move fails it) or {command:test_no_run (#2692), package, no_default_features?, then either features?:[test-shard-NAME,...] (one build of the lib test harness, cargo test --lib --no-run) or shards?:[NAME,...] (a shard-feature sweep: each shard built with --no-default-features --features test-shard-NAME one after another, the package cleaned after each so the target holds one harness at a time; at most 32); runs in rsi-build.slice under the hub CPU budget; result.receipt is the SHARD_SWEEP_RECEIPT {ok,package,shards[{shard,features,exit_code,warnings{package:count},warning_keys},...],warnings:<warning-baseline gate verdict>}, settled failed when any shard build fails or the baseline gate reports new_warnings; this is the way to verify shard features, never a self-launched cargo unit}; or build {command:build,release:true,sha:40-lowercase-hex,release_members:[{package,bins},...]}: up to 16 distinct packages and 64 globally distinct bins, each package compiled in a separate Cargo invocation under one build slot, daemon-selected target and clean pinned source fence; omit single-build flags; first failure stops the job; successful result.release_members proves complete staging coverage; package names are checked against cargo metadata at submission and unknown names are refused as invalid_input field=params.package; landing/cloud_gate: {accepted:40-hex sha,test_filters?:[PACKAGE=FILTER]}; cloud_sweep: {sha:40-hex current rolling tip, lane?:build or qa (default qa, the full-library QA sweep; build runs cargo build --workspace --locked plus a small test set under the same spend net, no Python)}; bench (#3181, manager or Epic lead only): {config:eval/bench/tb2/runs/NAME.toml committed and clean at HEAD,budget_usd:number}: one pinned Terminal-Bench run on the laptop; needs bench.enabled, the config host in bench.docker_hosts, allowed_launches, an armed OpenRouter spend cap with headroom for budget_usd (a config that launches no model runs with the cap off), pin_check and the laptop preflight; result.bench is the run summary and record_path the BenchRunRecord. Typed fields only; no command line."
     },
     "name": {
       "type": "string",
@@ -3872,7 +4082,13 @@ const GET_JOB_SCHEMA: &str = r##"{
     "job_id": {
       "type": "string",
       "pattern": "^[0-9a-fA-F-]{8,36}$",
-      "description": "One of your jobs: its UUID, or the unique prefix of at least 8 hex characters that notices print"
+      "description": "A job in your current read scope: its UUID, or the unique prefix of at least 8 hex characters that notices print. A copied UUID alone grants no access."
+    },
+    "fields": {
+      "type": "string",
+      "enum": ["compact", "full"],
+      "default": "full",
+      "description": "full (default): the whole stored job. compact (hub #3852): a bounded view of at most about 20k characters for a finished scoped_test (verdict, base, head, merges_cleanly_onto_rolling, new_failures, baseline_reds, failures and failing_tests capped with *_omitted counts, per-package package/status/completed, the warnings verdict, a short log tail; params, cwd and tool blobs are left out and result.dropped names the result keys cut). Use compact after a scoped_test; full when you need the complete receipt."
     }
   }
 }"##;
@@ -3899,6 +4115,12 @@ const LIST_JOBS_SCHEMA: &str = r##"{
       "type": "integer",
       "minimum": 1,
       "maximum": 100
+    },
+    "fields": {
+      "type": "string",
+      "enum": ["compact", "full"],
+      "default": "compact",
+      "description": "compact (default, hub #3889): one bounded row per job (id, name, kind, state, exit_code, refusal, receipt_head when present, held, created_at/started_at/finished_at, log_path, wake) and no result payload; read a job whole with AgentGetJob. full: every job with its complete typed result (a scoped_test receipt is tens of thousands of characters)."
     }
   }
 }"##;
@@ -3920,11 +4142,15 @@ const REPORT_TO_HUB_SCHEMA: &str = r##"{
       ],
       "description": "Report line type (ENQUEUE, DEPLOY-READY, RESULT)"
     },
+    "binaries_dir": {
+      "type": "string",
+      "description": "Required for deploy_ready only: existing directory under the satellite staging root. The satellite expands ~/ using its own home and sends the resolved absolute path to the hub."
+    },
     "text": {
       "type": "string",
       "minLength": 1,
       "maxLength": 1024,
-      "description": "Short report line; informational and untrusted on the hub"
+      "description": "Short report line, at most 1024 UTF-8 bytes; informational and untrusted on the hub. The hub manager reads the whole text in every AgentManagerInbox form, the summary form included (#195)"
     }
   }
 }"##;
@@ -3992,6 +4218,12 @@ const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r##"{
     "idempotency_key"
   ],
   "properties": {
+    "issue": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "default": null,
+      "description": "Issue display number in the source project, stored on the entry and returned by AgentListRollingQueue. AgentTopologyExecute on that Issue warns about queued/admitted/gating entries; this is tracking metadata, separate from fixes_issue test claims"
+    },
     "supersedes": {
       "type": [
         "string",
@@ -3999,7 +4231,7 @@ const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r##"{
       ],
       "format": "uuid",
       "default": null,
-      "description": "Replace this queued entry id from the same enqueuer with a descendant source, preserving its queue position and single wake. An admitted/gating entry is queue_entry_in_flight: enqueue normally without supersedes"
+      "description": "Replace a queued entry id in your cancellation scope (including a predecessor manager seat) with a descendant source, preserving its queue position and single wake. An admitted/gating entry is queue_entry_in_flight: enqueue normally without supersedes"
     },
     "project_id": {
       "type": [
@@ -4034,12 +4266,27 @@ const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r##"{
         "description": "PACKAGE=FILTER, at most 256 UTF-8 bytes; the gate is a compile check plus the named tests"
       },
       "default": [],
-      "description": "Explicit filters, at most 32 of at most 256 bytes each (queue_filter_invalid otherwise). Prefer derive_filters; never copy, prune or split check-touched-shards output by hand"
+      "description": "Explicit filters, at most 32 of at most 256 bytes each (queue_filter_invalid otherwise). Prefer derive_filters; never copy, prune or split check-touched-shards output by hand. With derive_filters these are extra filters: the queue gates the derived set plus these"
     },
     "derive_filters": {
       "type": "boolean",
       "default": false,
-      "description": "Let the queue derive the filters: the daemon runs scripts/check-touched-shards on the source diff against the rolling tip, dedupes focused rsid/rsid-store filters naming the same expression across shards, and splits any filter over 256 bytes into equivalent filters. A derived set over 32 filters is not refused. Mutually exclusive with test_filters. One call is enough: a derivation still running at the call's budget records the entry queued with filters_state deriving (the lander admits it only once its filters land) and returns it; never sleep or call again"
+      "description": "Let the queue derive the filters: the daemon runs scripts/check-touched-shards on the source diff against the rolling tip, dedupes focused rsid/rsid-store filters naming the same expression across shards, and splits any filter over 256 bytes into equivalent filters. A derived set over 32 filters is not refused. Combines with test_filters (the derived set plus those). One call is enough: a derivation still running at the call's budget records the entry queued with filters_state deriving (the lander admits it only once its filters land) and returns it; never sleep or call again. A derivation that exceeds its budget (it times out, or the diff changes too many files to trace in time) is not refused: the entry is kept with filters_state lander_selects and only the filters you named, and the lander selects the tests itself (its bounded closure selection plus the automatic full-library QA)"
+    },
+    "expedite": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["reason"],
+      "default": null,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Why this landing jumps the queue, 1 to 256 UTF-8 bytes, no control character; recorded on the entry and shown by AgentListRollingQueue"
+        }
+      },
+      "description": "Appointed manager only (an Epic lead is refused queue_expedite_not_authorized): admit this entry into the next batch ahead of ordinary queued entries, in enqueue order among expedited ones. A gating batch is never preempted and the batch keeps every other policy (one change per gate, filters, migrations). At most 2 live (queued, admitted or gating) expedited entries per project; one more is refused queue_expedite_cap_reached, which lists them. Use it for an incident or a red-QA fix that cannot wait behind the queue, never to reorder routine work. A fixes_issue naming an open Issue labelled qa expedites with no flag (past the cap it stays ordinary and the receipt carries expedite_warning)"
     },
     "fixes_issue": {
       "type": [
@@ -4061,7 +4308,7 @@ const ENQUEUE_LANDING_SOURCE_SCHEMA: &str = r##"{
         "description": "A test name as the gate and the QA run report it, for example module::tests::name"
       },
       "default": [],
-      "description": "Tests this landing claims to turn green. The gate must run each on the candidate and see it pass, or the landing is refused claimed_fix_still_red (even when the base is red on it too); a test the gate's selection does not run is refused the same way, so add a test filter that selects it. Combines with derive_filters or test_filters"
+      "description": "Tests this landing claims to turn green. The gate must run each on the candidate and see it pass, or the landing is refused claimed_fix_still_red (even when the base is red on it too); a test the gate's selection does not run is refused the same way, but the queue adds the filter that selects the tests a fixes_issue Issue names itself, from its Shard command: line (cargo test -p PKG --test|--bin NAME selects PKG=test:NAME or PKG=bin:NAME) and from its Failing outcomes: line (FAIL PKG PATH selects PKG=test(=PATH)); for a fixes_tests name outside such an Issue, add a test_filters entry that selects it. A Python unittest id (scripts.tests.<module>.<Class>.<method> or tools.tests.<module>...) needs no filter: the gate runs that test module itself. Combines with derive_filters or test_filters"
     },
     "idempotency_key": {
       "type": "string",
@@ -4076,6 +4323,12 @@ const LIST_ROLLING_QUEUE_SCHEMA: &str = r##"{
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "fields": {
+      "type": ["string", "null"],
+      "enum": ["summary", "full", null],
+      "default": null,
+      "description": "Default summary: live entries plus refused/failed entries finished in the last hour, with compact outcomes; full restores all history and existing detail. An explicit state also restores complete output"
+    },
     "project_id": {
       "type": [
         "string",
@@ -4101,7 +4354,7 @@ const LIST_ROLLING_QUEUE_SCHEMA: &str = r##"{
         null
       ],
       "default": null,
-      "description": "Only entries in this state"
+      "description": "Only entries in this state, with complete history and existing outcome detail"
     },
     "limit": {
       "type": [
@@ -4617,7 +4870,7 @@ const TOPOLOGY_RESOLVE_ATTEMPT_SCHEMA: &str = r##"{
   }
 }"##;
 
-static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = LazyLock::new(|| {
+static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 81]> = LazyLock::new(|| {
     [
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetAuthorityCatalog,
@@ -4664,7 +4917,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::Halt,
             method: "AgentHalt",
-            description: "Halt a running child or a scoped leaf with manager SessionControl Execute authority.",
+            description: "Halt a child or a scoped leaf with manager SessionControl Execute authority. Halting another session atomically records halt intent and disables its own unprotected resume/when wakes (disabled_by_halt in AgentListWakes with include_disabled); self-halt preserves wakes. Detached jobs keep running; cancel eligible jobs separately with AgentCancelJob. A later explicit AgentContinueChild still works.",
             parameters_json: TARGET_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlHalt),
         },
@@ -4678,7 +4931,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
             // off `SessionManager`; advertising a `rsi_control_continue_child` name
             // that resolves to no registered tool would be worse than declaring the
             // gap. Tracked as a follow-up.
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlContinueChild),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ArchiveChild,
@@ -4690,7 +4943,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ScheduleWake,
             method: "AgentScheduleWake",
-            description: "Schedule a future wake/callback; explicit mode is required: fresh, resume, on_terminal, program_guard, or when (use resume for same-session continuation; when is a daemon-evaluated predicate wake: jobs_terminal, sha_on_rolling, issue_closed, todo_closed (an operator to-do item done or dismissed) or topology_execution_settled (a topology execution succeeded, failed, cancelled or blocked) or settlement_run_settled (a source-worktree settlement run finished) or health_anomaly (a manager seat only: the daemon checks its health conditions every minute with no model turn and resumes you once, naming each), one resume wake, optional timeout_seconds). The current manager may watch subjects in its live scope.",
+            description: "Schedule a future wake/callback; explicit mode is required: fresh, resume, on_terminal, program_guard, or when (use resume for same-session continuation; when is a daemon-evaluated predicate wake: jobs_terminal, sha_on_rolling, shas_on_rolling (all listed commits; with fire each, once per landing), issue_closed, todo_closed (an operator to-do item done or dismissed) or topology_execution_settled (a topology execution succeeded, failed, cancelled or blocked) or settlement_run_settled (a source-worktree settlement run finished) or health_anomaly (a manager seat only: the daemon checks its health conditions every minute with no model turn and resumes you once, naming each), one resume wake, optional timeout_seconds). The current manager may watch subjects in its live scope.",
             parameters_json: WAKE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::ScheduleWake),
         },
@@ -4699,7 +4952,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
             method: "AgentCancelWake",
             description: "Disable your own scheduled wake(s) by job_id or name so a stale safety net cannot block succession, pause or lead replacement; refuses other sessions' jobs and the daemon-owned program guard. Rows are disabled, not deleted. RPC-only.",
             parameters_json: CANCEL_WAKE_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlCancelWake),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListWakes,
@@ -4718,21 +4971,21 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListIssues,
             method: "AgentListIssues",
-            description: "List a bounded page of project Issues. `fields` is `summary` (display_number, id, title, status, labels, priority, created_at, updated_at; no body) or `full` (whole records); omitted, a title_contains search returns summary rows and any other list keeps full records, so dedupe searches stay small (read one body with AgentGetIssue). A live Issue-bound worker must set title_contains and omit project_id; it always receives summary rows from its bound project for deduplication. A live topology session node follows the same rule for its execution's project. Filters: title_contains (case-insensitive), labels (all exact matches), status, ready, archive, order and cursor.",
+            description: "List a bounded page of project Issues. `fields` is `summary` (display_number, id, row_version, title, status, labels, priority, created_at, updated_at; no body) or `full` (whole records); omitted, a title_contains search returns summary rows and any other list keeps full records, so dedupe searches stay small (read one body with AgentGetIssue). A live Issue-bound worker must set at least one of title_contains, labels or status and omit project_id; it always receives summary rows from its bound project for deduplication. A live topology session node follows the same rule for its execution's project. Filters: title_contains (case-insensitive), labels (all exact matches), status, ready, archive, order and cursor.",
             parameters_json: LIST_ISSUES_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlListIssues),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetIssue,
             method: "AgentGetIssue",
-            description: "Read one Issue by issue_id or display_number (exactly one) with up to 256 blocked_by and blocks entries (each list has a *_truncated flag) in the project owned by the Epic you currently lead, or by an appointed manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) reads, while that binding is live, its own Issue, its review Issues and the same-project Issues it references with a `#N` or `#A-#B` selector in that Issue's body or handoffs or in its launch brief, or that the launch attached (`related`); read-only, and a foreign project, a missing number or an unreferenced Issue is refused agent_issue_authority_denied.",
+            description: "Read one Issue by issue_id or display_number (exactly one) with up to 256 blocked_by and blocks entries (each list has a *_truncated flag) in the project owned by the Epic you currently lead, or by an appointed manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) reads, while that binding is live, its own Issue, its review Issues and the same-project Issues it references with a `#N` or `#A-#B` selector in that Issue's body or handoffs or in the manager's admitted request.brief field, or that the launch attached (`related`). The whole compiled query is not scanned: references only in daemon-copied records grant no additional live Issue reads. review_of alone grants no reverse live read of the reviewed Issue; explicit selection can independently grant it. Reads are read-only, and a foreign project, a missing number or an unreferenced Issue is refused agent_issue_authority_denied.",
             parameters_json: GET_ISSUE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlGetIssue),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::UpdateIssue,
             method: "AgentUpdateIssue",
-            description: "CAS-update active Issue content (target by issue_id or display_number, exactly one) as the current owning-Epic lead or manager with issue-coordinate authority. A worker launched for one Issue (AgentManagerLaunchIssueWorker) may, while that binding is live, publish to that Issue only: send just handoff (your complete handoff, stored as its own record; no body copy, any positive expected_row_version) or, as the non-default alternative, body holding the current body unchanged as its prefix plus your section; any other field, Issue or status change is refused.",
+            description: "CAS-update active Issue content (target by issue_id or display_number, exactly one) as the current owning-Epic lead or manager with issue-coordinate authority. To add a note without resending the body, send handoff alone (a lead or manager appends a record; closed Issues accept it); a body that drops the end of the current body is refused body_would_drop_tail unless replace_body is true. A worker launched for one Issue (AgentManagerLaunchIssueWorker) may, while that binding is live, publish to that Issue only: send just handoff (your complete handoff, stored as its own record; no body copy, any positive expected_row_version) or, as the non-default alternative, body holding the current body unchanged as its prefix plus your section; any other field, Issue or status change is refused.",
             parameters_json: UPDATE_ISSUE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlUpdateIssue),
         },
@@ -4774,7 +5027,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerInbox,
             method: "AgentManagerInbox",
-            description: "Retrieve incoming manager mail; include_sent:true, request_id or fields:\"full\" also returns outbound sends for audits. A notice_kind other than message suppresses messages. Page notices with after_notice_sequence and notice_kind, or settle_notice_ids belonging to your seat; fields:\"summary\" returns each notice without its state payload (a short state_summary instead) to drain a routine backlog cheaply. Returned notices settle automatically, in either form, and stay retained: read_notice_ids re-reads settled notices by id with their full payload; retrieval does not reply, answer a decision, clear a question, grant approval, or prove provider acceptance.",
+            description: "Retrieve incoming manager mail. Leads read fields:\"full\" for full bodies in notices[].state.message as well as messages[].message, even when historical mail leaves a message page empty; pass next_after_sequence as after_sequence to continue. include_sent:true, request_id or fields:\"full\" also returns outbound sends for audits. A notice_kind other than message suppresses messages. Page notices with after_notice_sequence and notice_kind, or settle_notice_ids belonging to your seat; fields:\"summary\" returns each notice without its state payload (a short state_summary instead) to drain a routine backlog cheaply. Returned notices settle automatically and stay retained: read_notice_ids:[<notice_id>], fields:\"full\" re-reads settled notices with their full payload, including live lead mail bodies; retrieval does not reply, answer a decision, clear a question, grant approval, or prove provider acceptance.",
             parameters_json: MANAGER_INBOX_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerInbox),
         },
@@ -4823,7 +5076,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerControl,
             method: "AgentManagerControl",
-            description: "Request a scoped lead, container, session or lead-assignment operation under an explicit grant and current fences; a queued receipt is not an effected action.",
+            description: "Request a scoped lead, container, session or lead-assignment operation under an explicit grant and current fences; a queued receipt is not an effected action. Withdraw a still-queued create with withdraw_queued_create {operation_id, expected_row_version} under SessionCreate. Once claimed or started, use AgentHalt on its target_session_id.",
             parameters_json: manager_v2::CONTROL.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerControl),
         },
@@ -4844,14 +5097,14 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerGetAction,
             method: "AgentManagerGetAction",
-            description: "Read one manager action receipt within the authenticated current manager's project and logical manager scope. A queued action that a waiting deploy holds also carries held {reason: deploy_draining, deploy_id, release_by}. A queued create_session (Issue-worker launches included) that the daemon holds while the host's 1-minute load is above the operator's host_load_admission_threshold carries held {reason: host_load, load, threshold, recent_admissions}: it stays queued, never refused, and starts on its own when the load drops, held creates released oldest-first across projects. The same hold applies while the host CPU is at or above job_thermal_ceiling_c (held {reason: thermal, temperature_c, ceiling_c}) or free disk is below the governor min_free_disk_gb floor (held {reason: disk_pressure, free_disk_gb, min_free_disk_gb}). A create the sandbox allocator refused for free space (the operator-configured sandbox floor) is held the same way (held {reason: sandbox_free_space, free_disk_gb, min_free_disk_gb}) and retried on its own; a refusal at the sandbox root-count cap ends blocked manager_v2_sandbox_source_root_limit.",
+            description: "Read one manager action receipt within the authenticated current manager's project and logical manager scope. A queued action that a waiting deploy holds also carries held {reason: deploy_draining, deploy_id, release_by}. A queued create_session (Issue-worker launches included) that the daemon holds while the host's 1-minute load is above the operator's host_load_admission_threshold carries held {reason: host_load, load, threshold, recent_admissions}: it stays queued, never refused, and starts on its own when the load drops, held creates released oldest-first across projects. The same hold applies while the host CPU is at or above job_thermal_ceiling_c (held {reason: thermal, temperature_c, ceiling_c}) or free disk is below the governor min_free_disk_gb floor plus worker_build_reserve_gb (held {reason: disk_pressure, free_disk_gb, min_free_disk_gb, reserve_gb, needed_free_gb}, needed = floor + reserve). Build/test jobs keep the governor floor alone. A create the sandbox allocator refused for free space (the operator-configured sandbox floor) is held the same way (held {reason: sandbox_free_space, free_disk_gb, min_free_disk_gb}) and retried on its own; a refusal at the sandbox root-count cap ends blocked manager_v2_sandbox_source_root_limit.",
             parameters_json: manager_v2::GET_ACTION.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerGetAction),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerLaunchIssueWorker,
             method: "AgentManagerLaunchIssueWorker",
-            description: "Manager seat (#1100): launch one worker bound to one Issue in a single idempotent call. The daemon runs the create_session action (same authority, allowlist, capacity and Epic scope as AgentManagerControl; refused before any effect), appends an Issue note naming the worker, sets the Issue InProgress and arms your on_terminal watch on the worker once it exists. Needs the SessionCreate and IssueCoordinate grants. The bound worker reads its own Issue, the review Issues launched with review_of = it and the same-project Issues it references (a `#N` or `#A-#B` selector in the Issue's body or handoffs or in this brief, or listed in `related`) with AgentGetIssue, all read-only (#218); it publishes to its own Issue only, and the compiled brief names that Issue as the only publication target whatever the brief says. Do not paste Issue text into the brief: pass `related` to attach complete texts; a launch of an Issue that has review Issues appends the latest review of each (complete, never cut mid-finding; one too large is named for the worker to read) to the brief (#1845); it also includes up to five recent commits from the bounded origin/rolling history whose messages name the Issue, in the receipt and worker brief (#1988); Git discovery failure returns an empty list and never blocks launch. While it is live it may also publish its handoff to that Issue with AgentUpdateIssue {handoff} (no other field, status or Issue). One worker per Issue (#2212): a launch is refused manager_issue_worker_already_live, naming the worker, while another launch is running or queued or its worker is running, or has ended its turn but is parked on a wake or daemon job it owns and has not written its final PIPELINE HANDOFF; continue_from that worker is the explicit way to replace it. A replay under the same idempotency_key returns the same worker. Poll the returned action with AgentManagerGetAction. The worker's sandbox branches from the freshly fetched origin/rolling tip by default; pass sandbox_source {\"path\": \"<your sandbox_root>\"} to build on your unlanded commits, or {\"commit\": \"<40-hex>\"} for an exact commit. For either explicit source, the returned action receipt has the frozen pin in `action.sandbox_source.commit`; include that commit as the worker brief's scoped-test base so verification covers only work after launch. For the default rolling source, use `origin/rolling`. The merge-queue gate still compares the full candidate against rolling. For a review Issue pass review_of: <implementer Issue number>: the daemon copies that Issue's text and complete latest handoff into the reviewer's brief (a bound reviewer cannot read it; never paste a truncated copy). When a worker passed the baton (its context filled; you got a worker_context_cap notice) and has ended its turn, pass continue_from: <that worker's session id> to relaunch from its committed HEAD with its lineage and handoff in one call.",
+            description: "Manager seat (#1100): launch one worker bound to one Issue in a single idempotent call. The daemon runs the create_session action (same authority, allowlist, capacity and Epic scope as AgentManagerControl; refused before any effect), appends an Issue note naming the worker, sets the Issue InProgress and arms your on_terminal watch on the worker once it exists. Needs the SessionCreate and IssueCoordinate grants. The bound worker reads its own Issue, the review Issues launched with review_of = it and the same-project Issues it references (a `#N` or `#A-#B` selector in the Issue's body or handoffs or in the admitted request.brief field, or listed in `related`) with AgentGetIssue, all read-only (#218); it publishes to its own Issue only, and the compiled brief names that Issue as the only publication target whatever the brief says. References only in daemon-copied records grant no additional live Issue reads: the whole compiled query is not scanned. Explicitly select required same-project dependencies in request.brief (a valid #N) or related. Do not paste Issue text into the brief: pass `related` to attach complete texts; a launch of an Issue that has review Issues appends the latest review of each (complete, never cut mid-finding; one too large is named for the worker to read) to the brief (#1845); it also includes up to five recent commits from the bounded origin/rolling history whose messages name the Issue, in the receipt and worker brief (#1988); Git discovery failure returns an empty list and never blocks launch. While it is live it may also publish its handoff to that Issue with AgentUpdateIssue {handoff} (no other field, status or Issue). One worker per Issue (#2212): a launch is refused manager_issue_worker_already_live, naming the worker, while another launch is running or queued or its worker is running, or has ended its turn but is parked on a wake or daemon job it owns and has not written its final PIPELINE HANDOFF; continue_from that worker is the explicit way to replace it. A replay under the same idempotency_key returns the same worker. Poll the returned action with AgentManagerGetAction. The worker's sandbox branches from the freshly fetched origin/rolling tip by default, except review_of uses the latest implementer handoff's declared commit when available locally (an explicit sandbox_source always wins); pass sandbox_source {\"path\": \"<your sandbox_root>\"} to build on your unlanded commits, or {\"commit\": \"<40-hex>\"} for an exact commit. For either explicit source, the returned action receipt has the frozen pin in `action.sandbox_source.commit`; include that commit as the worker brief's scoped-test base so verification covers only work after launch. For the default rolling source, use `origin/rolling`. The merge-queue gate still compares the full candidate against rolling. For a review Issue pass review_of: <implementer Issue number>: the daemon copies that Issue's text and complete latest handoff into the reviewer's brief (review_of alone grants no reverse live read of that Issue; explicit selection can independently grant it; never paste a truncated copy). With no declared source commit, or one unavailable locally, the reviewer stays on rolling and its brief disallows test jobs for source tests that may be missing from that tree. Bundled pre-merge and post-land review nodes pin to their accepted source commit. When a worker passed the baton (its context filled; you got a worker_context_cap notice) and has ended its turn, pass continue_from: <that worker's session id> to relaunch from its committed HEAD with its lineage and handoff in one call. Explicit unknown sandbox_source commits are refused. review_of and continue_from are mutually exclusive; omit continue_from to launch a fresh review with the latest implementer handoff.",
             parameters_json: MANAGER_LAUNCH_ISSUE_WORKER_SCHEMA.as_str(),
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerLaunchIssueWorker),
         },
@@ -4867,28 +5120,28 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
             method: "AgentManagerDelegateNode",
             description: "Create or replace one direct child node with a strictly narrower live grant; the caller must execute the current parent seat.",
             parameters_json: MANAGER_DELEGATE_NODE_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlManagerDelegateNode),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerEscalate,
             method: "AgentManagerEscalate",
             description: "Escalate one subject to the parent node or the nearest common ancestor of two Epic owners, with exact source and target fences.",
             parameters_json: MANAGER_ESCALATE_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlManagerEscalate),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerListEscalations,
             method: "AgentManagerListEscalations",
             description: "List escalations addressed to or sent by your live manager node; rulings stay on the logical node across seat succession.",
             parameters_json: MANAGER_LIST_ESCALATIONS_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlManagerListEscalations),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerResolveEscalation,
             method: "AgentManagerResolveEscalation",
             description: "Rule on an addressed escalation or forward it to your parent with exact custody and version fences; human approvals remain operator-owned.",
             parameters_json: MANAGER_RESOLVE_ESCALATION_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlManagerResolveEscalation),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::TopologyUpsert,
@@ -4914,7 +5167,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::TopologyExecute,
             method: "AgentTopologyExecute",
-            description: "Start one daemon-run execution of a visible topology on an Epic in your scope, fenced by its definition digest; policy is rechecked and created sessions are charged. Idempotent on the key. Arms one topology_execution_settled resume wake to you by default (a replay arms none; wake:\"none\" opts out), so the settle wakes you without a separate AgentScheduleWake.",
+            description: "Returns advisory warnings naming live queue entries linked to inputs.issue (queued/admitted/gating); execution remains accepted. Start one daemon-run execution of a visible topology on an Epic in your scope, fenced by its definition digest; policy is rechecked and created sessions are charged. Idempotent on the key. Arms one topology_execution_settled resume wake to you by default (a replay arms none; wake:\"none\" opts out), so the settle wakes you without a separate AgentScheduleWake.",
             parameters_json: TOPOLOGY_EXECUTE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlTopologyExecute),
         },
@@ -4942,14 +5195,14 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::EnqueueLandingSource,
             method: "AgentEnqueueLandingSource",
-            description: "Enqueue one accepted source commit on the daemon-owned rolling merge queue (current appointed manager or current Epic lead). Pass derive_filters:true so the queue derives the test filters itself (no hand-copied, pruned or split check-touched-shards output; explicit test_filters are capped at 32 filters of 256 bytes). The queue gates and publishes it; the outcome wakes you once. One call is enough: when the filter derivation outlasts the call (a Rust diff takes 10-45 s) the entry is recorded queued with filters_state deriving, is admitted only after its filters land, and a derivation that fails settles it refused (queue_filter_derivation_failed) with that same single wake; end your turn, never sleep, retry or poll. A fix for known-red tests passes fixes_issue (the red Issue) and/or fixes_tests: the gate then requires those tests green and refuses claimed_fix_still_red otherwise. Optional supersedes names your own queued entry to replace with a descendant commit at the same queue position; admitted/gating entries return queue_entry_in_flight: enqueue normally without supersedes. Refused with queue_disabled while the operator has the queue off.",
+            description: "Enqueue one accepted source commit on the daemon-owned rolling merge queue (current appointed manager or current Epic lead). Pass derive_filters:true so the queue derives the test filters itself (no hand-copied, pruned or split check-touched-shards output; explicit test_filters are capped at 32 filters of 256 bytes). The queue gates and publishes it; the outcome wakes you once. One call is enough: when the filter derivation outlasts the call (a Rust diff takes 10-45 s) the entry is recorded queued with filters_state deriving, is admitted only after its filters land; a derivation that fails settles it refused (queue_filter_derivation_failed) with that same single wake, while one that exceeds its budget (a very wide diff) is admitted with filters_state lander_selects and no derived filters, the lander selecting the tests itself; end your turn, never sleep, retry or poll. A fix for known-red tests passes fixes_issue (the red Issue) and/or fixes_tests: the gate then requires those tests green and refuses claimed_fix_still_red otherwise. A manager may pass expedite {reason} to admit the entry into the next batch ahead of ordinary queued entries (at most 2 live per project; a fixes_issue naming an open qa Issue expedites automatically). Optional issue records the source project’s Issue display number on the entry and in AgentListRollingQueue; AgentTopologyExecute on it warns about a live landing without refusing. Optional supersedes names a queued entry you may cancel (including a predecessor manager seat) to replace with a descendant commit at the same queue position; admitted/gating entries return queue_entry_in_flight: enqueue normally without supersedes. Refused with queue_disabled while the operator has the queue off.",
             parameters_json: ENQUEUE_LANDING_SOURCE_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlEnqueueLandingSource),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListRollingQueue,
             method: "AgentListRollingQueue",
-            description: "List rolling merge queue entries in your scope, newest first (#1964; the current appointed manager of the project, a portfolio seat inside its grant, or the session an entry's outcome would wake). Each row: sequence, state, source commit, enqueuer, wake target, batch id and a bounded outcome summary, plus qa_green: the latest rolling SHA a full-library QA run proved green (sha, passed_at, job_id; null before any pass). Filter by state or project; page with before_sequence. Read-only; the operator-wide view stays operator-only.",
+            description: "Each entry includes its optional source-project Issue display number. List rolling merge queue entries in your scope, newest first. Default: queued/admitted/gating plus refused/failed entries finished in the last hour; outcomes retain landed_sha, refusal code and a one-line summary (160 bytes). fields:\"full\" or an explicit state restores all matching history and the existing outcome detail (#1964; the current appointed manager of the project, a portfolio seat inside its grant, or the session an entry's outcome would wake). Each row: sequence, state, source commit, enqueuer, wake target, batch id and a bounded outcome summary, plus qa_green: the latest rolling SHA a full-library QA run proved green (sha, passed_at, job_id; null before any pass), and held_for_deploy {deploy_id, release_by} while a staged hub deploy holds queue admission (the gating batch finishes, nothing new is admitted until the deploy settles or its deadline passes; #3885). Filter by state or project; page with before_sequence. Read-only; the operator-wide view stays operator-only.",
             parameters_json: LIST_ROLLING_QUEUE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlListRollingQueue),
         },
@@ -4963,58 +5216,58 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::CheckLandingCandidate,
             method: "AgentCheckLandingCandidate",
-            description: "Check, before AgentEnqueueLandingSource, whether a worker's scoped_test job verifies source_commit (#2310; the worker's appointed manager, a portfolio seat over its project, or the Epic lead; read-only). Name the job (full id or a unique prefix of at least 8 hex) or the worker's source_session_id. Returns ok, a verdict refusal (candidate_no_verification_job, candidate_job_not_terminal, candidate_admission_timeout, candidate_receipt_missing, candidate_job_not_green, candidate_new_failures, candidate_head_mismatch, candidate_conflicts_with_rolling), the job id, kind, state, exit code and own refusal, the receipt head and whether it equals source_commit, new_failures, baseline_reds, tests_completed, the plan (precise or targeted_subset, gate_covers_rest), and, for a head mismatch, whether the delta between the receipt head and source_commit touches documentation only. The receipt's merges_cleanly_onto_rolling and conflict_paths (#348) and a fresh, fetch-free trial merge of source_commit onto the local origin/rolling (merges_cleanly_onto_rolling_now, conflict_paths_now) are reported; a conflict is the last verdict refusal, candidate_conflicts_with_rolling, and its detail names the paths. Baseline reds alone do not block: the landing gate is no new failures relative to rolling. A caller outside those seats is refused candidate_not_authorized; an unknown or out-of-scope job or session is refused candidate_not_found.",
+            description: "Check, before AgentEnqueueLandingSource, whether a worker's scoped_test job verifies source_commit (#2310; the worker's appointed manager, a portfolio seat over its project, or the Epic lead; read-only). Name the job (full id or a unique prefix of at least 8 hex) or the worker's source_session_id. Returns ok, a verdict refusal (candidate_no_verification_job, candidate_job_not_terminal, candidate_admission_timeout, candidate_receipt_missing, candidate_tool_untrusted, candidate_job_not_green, candidate_new_failures, candidate_head_mismatch, candidate_conflicts_with_rolling), the job id, kind, state, exit code and own refusal, the receipt head and whether it equals source_commit, new_failures, baseline_reds, tests_completed, the plan (precise or targeted_subset, gate_covers_rest), and, for a head mismatch, whether the delta between the receipt head and source_commit touches documentation only. The receipt's merges_cleanly_onto_rolling and conflict_paths (#348) and a fresh, fetch-free trial merge of source_commit onto the local origin/rolling (merges_cleanly_onto_rolling_now, conflict_paths_now) are reported; a conflict is the last verdict refusal, candidate_conflicts_with_rolling, and its detail names the paths. Daemon-written scoped_tool exposes source, path, rev and tool file blobs. Candidate/sandbox tools and legacy jobs without provenance require a rolling-tool rerun (params.scoped_test.rolling_tool:true); another acceptable rolling-tool job from the same owner at source_commit supplies verification and tool_under_test retains the original job and provenance. Baseline reds alone do not block: the landing gate is no new failures relative to rolling. A caller outside those seats is refused candidate_not_authorized; an unknown or out-of-scope job or session is refused candidate_not_found.",
             parameters_json: CHECK_LANDING_CANDIDATE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlCheckLandingCandidate),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ReadSessionEvents,
             method: "AgentReadSessionEvents",
-            description: "Read a bounded page of a session's conversation events (tail or after_sequence), with final_message and terminal_reason, for your own child, a child of an Epic you lead, or a session in your manager scope. Set final_message_full to return up to 32768 characters of the final message.",
+            description: "Read a bounded page of a session's conversation events (tail or after_sequence), with final_message and terminal_reason, for your own child, a child of an Epic you lead, a session in your manager scope, or (Issue-bound worker, while the binding is live) a same-project non-manager session that created your bound Issue or whose full lowercase UUID is cited in its body, launch brief or newest 64 handoffs authored outside your continuation lineage. Manager seats, including former seats and their continuations, are excluded. Set final_message_full to return up to 32768 characters of the final message; set full_fields to raise the per-event content, tool_input and metadata clip from 2000 to 262144 characters.",
             parameters_json: READ_SESSION_EVENTS_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlReadSessionEvents),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetProviderStatus,
             method: "AgentGetProviderStatus",
-            description: "Read bounded, secret-free provider health for the current appointed manager or Epic lead: configured, reachable, remaining credit where the provider API exposes it (OpenRouter), last 402/429 time, recent launch failure rate, and whether a launch would be refused. The daemon calls provider APIs with its own credentials (cached 60 s) and never returns a key. RPC-only.",
+            description: "Read bounded, secret-free provider health for the current appointed manager or Epic lead: configured, reachable, remaining credit where the provider API exposes it (OpenRouter), last 402/429 time, recent launch failure rate, and whether a launch would be refused. The openrouter entry also carries spend_cap (#3154: the operator cap, its baseline, spend since arming, the remainder, the warn percent and the state off/ok/warn/reached/probe_stale; check it before every paid run) and, when you name models with provider openrouter, model_prices from the daemon's own model discovery, and, with run_budget_usd (and run_sessions), run_budget: whether a benchmark run may launch its next task. The daemon calls provider APIs with its own credentials (cached 60 s) and never returns a key. RPC-only.",
             parameters_json: GET_PROVIDER_STATUS_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlGetProviderStatus),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SubmitJob,
             method: "AgentSubmitJob",
-            description: "Run a long test (including a declared just/make recipe), build, landing or cloud-gate operation as a daemon-owned durable job in your sandbox. Linux uses systemd; macOS uses launchd for package test/build and recipe jobs (shard, candidate-receipt, landing and cloud workflows, and other operating systems, are refused job_platform_unsupported). Package test params accept exact:true for whole test-name matching (libtest --exact; default false keeps substring filters), and test_target for one integration test target (requires exact:true and nonempty filters; mutually exclusive with lib_only). It survives your turn ending, your session and a daemon restart; one resume wake carries the typed result (wake none suppresses that per-job wake: submit a batch with wake none, then arm one AgentScheduleWake mode when with when.jobs_terminal for a single wake). The timeout (timeout_minutes, default job_test_timeout_mins) starts at the wrapper's job-start. Ordinary jobs exclude build-slot and sandbox/artifact-lock waits; scoped_test jobs include waits in their wall budget and reserve 120 seconds for runtime after admission. A scoped_test diff selecting no Rust package takes no governor slot. Local test/build peers from the same owner and sandbox queue in submission order before unit launch, without spending build admission or execution time. Unit start has a separate ten-minute cap (job_start_timed_out); build admission lasts the job's own timeout (at least ten minutes) for an ordinary test job, one hour for a build job, or the remaining wall budget minus the runtime reserve for scoped_test jobs (job_admission_timed_out), so a job queued behind others on the governor is not failed after a fixed ten minutes. Receipts retain the last phase. While a hub deploy is draining, or a staged interrupt_workers deploy would stop a test job after its grace, a new test or build job is accepted but held (held=held_for_deploy, receipt release_by): no unit starts and no timeout clock runs; it starts in submission order once the deploy settles or is abandoned, and its one wake fires at its real terminal state. The receipt carries the id as job_id; if a reply is cut off, list yours with AgentListJobs. Dispatch it and end your turn.",
+            description: "Run a long test (including a declared just/make recipe), build, landing or cloud-gate operation as a daemon-owned durable job in your sandbox. Linux uses systemd; macOS uses launchd for package test/build and recipe jobs (shard, candidate-receipt, landing and cloud workflows, and other operating systems, are refused job_platform_unsupported). Package test params accept exact:true for whole test-name matching (libtest --exact; default false keeps substring filters), and test_target for one integration test target (requires exact:true and nonempty filters; mutually exclusive with lib_only). It survives your turn ending, your session and a daemon restart; one resume wake carries the typed result (wake none suppresses that per-job wake: submit a batch with wake none, then arm one AgentScheduleWake mode when with when.jobs_terminal for a single wake). The timeout (timeout_minutes, default job_test_timeout_mins) starts at the wrapper's job-start. Test jobs, including scoped_test, exclude build-slot and sandbox/artifact-lock waits from execution. Scoped receipts report the separate queue and admission waits. A scoped_test diff selecting no Rust package takes no governor slot. Local test/build peers from the same owner and sandbox queue in submission order before unit launch, without spending build admission or execution time. Unit start has a separate ten-minute cap (job_start_timed_out); build admission lasts the job's own timeout (at least ten minutes) for test jobs including scoped_test, or one hour for a build job (job_admission_timed_out), so a job queued behind others on the governor is not failed after a fixed ten minutes. Scoped jobs also have a finite pre-launch admission allowance equal to their build admission allowance, even during a deploy hold; deploy reruns start a new queue allowance. Receipts retain the last phase. While a hub deploy is draining, or a staged interrupt_workers deploy is pending (a running test job keeps running across its restart), a new test or build job is accepted but held (held=held_for_deploy, receipt release_by): no unit starts and no execution clock runs; the scoped pre-launch admission cap still applies. It starts in submission order once the deploy settles or is abandoned, and its one wake fires at its real terminal state. The receipt carries the id as job_id; if a reply is cut off, list yours with AgentListJobs. Dispatch it and end your turn.",
             parameters_json: &SUBMIT_JOB_DETAILED_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlSubmitJob),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::GetJob,
             method: "AgentGetJob",
-            description: "Read one of your daemon-owned jobs: state, exit code, log path and typed result.",
+            description: "Read a daemon-owned job in your scope: state, exit code, log path and typed result. Scope includes your jobs, manager-scope and published manager-seat predecessor jobs, and Issue-worker predecessor test/build jobs proven by the same Issue, project and frozen source/custody chain (#584). A published Issue-worker continuation may also watch those proven predecessor jobs; ownership, cancellation and receipt acceptance rules stay unchanged. A review_of launch may Get scoped_test jobs from the reviewed Issue's newest four eligible implementer sessions: each owner's newest, or an older one whose full UUID appears in that Issue's body or newest 64 handoffs (#604). Recipe jobs and copied IDs alone do not qualify. This review exception grants no List, watch, cancel or ownership authority. job_not_found means absent or inaccessible; it does not reveal which. Reading a receipt does not prove it verifies the reviewed SHA. A finished scoped_test job stores a receipt of about 130k characters; pass fields:\"compact\" for the bounded view (verdict, head, merge state, failures, per-package status, warnings verdict) and fields:\"full\" (the default) for the whole job.",
             parameters_json: GET_JOB_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlGetJob),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ListJobs,
             method: "AgentListJobs",
-            description: "List the jobs you submitted, newest first (limit 1-100, default 20): recover a job id a truncated AgentSubmitJob reply lost. Another session's jobs stay unlisted; a manager seat also lists its rotation predecessors' jobs (#2470).",
+            description: "List the jobs you submitted, newest first (limit 1-100, default 20): recover a job id a truncated AgentSubmitJob reply lost. Rows are compact by default (id, name, kind, state, exit_code, refusal, receipt_head, held, times, log_path, wake; no result payload): read one job with AgentGetJob, or pass fields:\"full\" for every job with its whole result. A manager seat also lists its rotation predecessors' jobs (#2470); a published Issue-worker continuation lists its scoped predecessor test/build jobs (#584). Unrelated jobs stay unlisted.",
             parameters_json: LIST_JOBS_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlListJobs),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::CancelJob,
             method: "AgentCancelJob",
             description: "Stop one of your own running daemon-owned jobs (a mistaken or over-broad run) through its platform service label: the service is stopped and the job settles failed with refusal job_cancelled. Cancelling a job that already settled changes nothing. The current appointed manager (or a portfolio seat inside its grant) may also cancel an ordinary test or build job owned by a session in its live scope (#2213); the result names it as cancelled_by_manager and the job detail names it and the owner. A landing, cloud gate or sweep, release build or automatic full-library QA run is never cancelled by a manager (#2232). Every other job, and every refusal that would show a caller a job it has no authority over, is job_not_found (#2233).",
             parameters_json: CANCEL_JOB_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlCancelJob),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::SendSatelliteMessage,
             method: "AgentSendSatelliteMessage",
             description: "Queue one message for an idle session on a paired satellite host (current appointed manager only; the operator must enable dispatch and declare the target in scope). Delivery waits until the remote session is idle and never interrupts; `queued` is acceptance, not delivery. `issue_refs` expands up to 8 of your own project's Issues, whole and read-only, into the message (the satellite cannot read hub Issues itself; this is the one way their body and acceptance reach it). Every peer or target refusal is the same target_not_authorized; an unreadable Issue ref is one satellite_issue_ref_unavailable, raised only after the target was authorized.",
             parameters_json: SEND_SATELLITE_MESSAGE_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlSendSatelliteMessage),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ReportToHub,
@@ -5028,7 +5281,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
             method: "AgentGetDaemonInfo",
             description: "Read the running hub daemon's identity and health for the current appointed manager or Epic lead: embedded build SHA, sha256 of the running binary, start time, schema version, disk free for the data dir and sandbox base, 1/5/15 load average, and supervisor mode. `host_load` reports the host-load admission (threshold, supported, load, recent_admissions, holding and the held manager creates and topology nodes, oldest first); its `build_disk` {min_free_gb, free_gb, open} is the governor disk floor every build/test job waits on in admission (separate from a launch floor), so read it before promising verification. `target_pool` is the warm target pool status: the newest pool and, when no pool was built, the typed reason (`last_skip` pool_skipped_disk_headroom with free/floor/expected GiB; a failed build with reason pool_aborted_disk_floor) and `last_reclaim` (idle pools evicted for a worker waiting on the disk floor). The appointed manager also gets `satellites`: each enabled paired satellite read over the link now (build_sha, binary_sha256, started_at, schema_version, supervisor_mode, last_deploy, launches (`none` when a manager seat has no launch choices: the hub must push a list), or reachable:false). Secret-free: never returns an environment value. RPC-only.",
             parameters_json: GET_DAEMON_INFO_SCHEMA,
-            native_tool: None,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlGetDaemonInfo),
         },
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::PushSatelliteManagerPolicy,
@@ -5047,8 +5300,15 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::RequestDeploy,
             method: "AgentRequestDeploy",
-            description: "Ask the daemon to deploy already-built binaries (current appointed manager holding the operator-granted Deploy capability, Execute mode, not paused). The daemon stages and verifies them, waits for a quiet point (no lander, job or scoped worker mid-turn; bounded by max_wait_secs), swaps them in, restarts under rsid-supervisor.sh with its environment intact and wakes you once with the outcome. A restart interrupts any worker still mid-turn (provider processes are not re-adopted; the interrupted turn is resumed), so the deploy waits for workers. While it waits it holds new worker starts, your own creates included, for at most the operator's deploy_drain_hold_secs (default 600); past that it waits for a lull without holding anything (AgentGetDaemonInfo deploy_drain shows waiting, release_by and blockers; AgentManagerGetAction shows a held action's reason). If a busy fleet never reaches a quiet point (a worker is always mid-turn), send the same request with interrupt_workers: true (keep max_wait_secs above the hold): past that hold a worker mid-turn no longer blocks, the restart interrupts it, the existing post-restart path resumes its turn with a continue prompt, the outcome wake lists the interrupted worker session ids and each is an andon friction event; a landing and a local test/build/landing job still block. To withdraw a waiting deploy, send its sha and idempotency_key with cancel: true and omit interrupt_workers. With peer_id, interrupt_workers is forwarded too and the satellite interrupts its own mid-turn workers after its own hold (#2587; a satellite build without the deploy_interrupt capability is refused satellite_deploy_interrupt_unsupported, nothing sent), and the cancellation is forwarded over the paired satellite link (#1017; the operator must enable dispatch and declare the satellite's scope); the satellite applies its own owner and idempotency checks and refuses deploy_cancel_too_late once restart has begun or the deploy settled. The hub stores no deploy state; confirm through AgentGetDaemonInfo satellites (build_sha, last_deploy) and your own resume wake. RPC-only.",
+            description: "Ask the daemon to deploy already-built binaries (appointed manager with Deploy, Execute, not paused). Stages and verifies binaries, waits for a quiet point bounded by max_wait_secs, swaps them and restarts under the supervisor; one outcome wake. With peer_id, omitted interrupt_workers defaults to true: after the satellite's deploy_drain_hold_secs (default 600), mid-turn workers stop blocking and restart interrupts and resumes them through the journal. Explicit false waits for a lull. Local hub deploys keep default false; explicit true opts in. Keep max_wait_secs above the hold. Ordinary test/scoped_test jobs are never stopped or rerun: their units keep running across the restart and the new daemon re-adopts them (one wake each, when the job ends); landing, build and protected jobs still block. Receipts name expected_interrupted_workers and expected_surviving_jobs while staged, actual interrupted_workers and surviving_jobs after effects; the outcome wake names actual sessions and the jobs that kept running. A peer without deploy_interrupt is refused satellite_deploy_interrupt_unsupported; explicit false is compatible. Cancel your waiting deploy with its sha, idempotency_key and cancel:true, omitting interrupt_workers; cancellation has no interrupt default. Peer cancellation applies satellite ownership checks; deploy_cancel_too_late once restart began or settled. The hub stores no peer deploy state: confirm via AgentGetDaemonInfo satellites build_sha/last_deploy and the outcome wake. RPC-only.",
             parameters_json: REQUEST_DEPLOY_SCHEMA,
+            native_tool: Some(NativeAgentControlToolV1::RsiControlRequestDeploy),
+        },
+        AgentControlDescriptorV1 {
+            verb: AgentControlVerbV1::SwitchHostPreset,
+            method: "AgentSwitchHostPreset",
+            description: "Switch this host to an operator-saved resource preset, or undo its last switch. Current appointed project/area/portfolio manager seat only, Execute and unpaused. Accepts only action:apply with name, or action:undo; never raw values or preset edits. Operator tuning bounds and explicit manager per-key bounds bind apply and undo. Re-applying matching values is idempotent. Returns actual settings, apply classes, probe and saved undo state; complete:false retains undo on a partial failure. RPC-only. Refusals: host_tuning_manager_required, host_tuning_preset_unknown, host_tuning_manager_bound, host_tuning_pending.",
+            parameters_json: r#"{"type":"object","properties":{"action":{"type":"string","enum":["apply","undo"]},"name":{"type":"string","minLength":1,"maxLength":64}},"required":["action"],"additionalProperties":false}"#,
             native_tool: None,
         },
         AgentControlDescriptorV1 {
@@ -5061,7 +5321,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::WorkerRoster,
             method: "AgentWorkerRoster",
-            description: "Read each worker's real state in one call (#2311): session id, bound Issue number, provider/model/effort, derived state (running, parked_on_job, parked_on_wake, stranded, final_handoff, failed), its newest daemon job (id, kind, state, exit_code, refusal, receipt_head), its open job count, its armed wakes (mode, when-predicate, next_fire_at), last activity time and whether the latest turn carries a final PIPELINE HANDOFF. A `Completed` session is parked on its job or wake, stranded (nothing will resume it) or finished: the roster tells them apart. Scope: the workers you launched yourself; a project's appointed manager gets its whole project by default, and project_id names a project you manage (a portfolio seat: one inside its grant). Filter with `states`; `counts` and `truncated` describe the page. Read-only; no receipt check (read the job's receipt_head and compare it yourself).",
+            description: "Read worker states in your scope; default summary omits finished history older than one hour. A completed reviewer with a submitted receipt or a completed node of a settled topology execution is final_handoff once no wake is owed. Each row (#2311): session id, bound Issue number, provider/model/effort, derived state (running, parked_on_job, parked_on_wake, stranded, final_handoff, failed), its newest daemon job (id, kind, state, exit_code, refusal, receipt_head), its open job count, its armed wakes (mode, when-predicate, next_fire_at), last activity time and whether the latest turn carries a final PIPELINE HANDOFF. A `Completed` session is parked on its job or wake, stranded (nothing will resume it) or finished: the roster tells them apart. Scope: the workers you launched yourself; a project's appointed manager gets its whole project by default, and project_id names a project you manage (a portfolio seat: one inside its grant). Default summary: live workers (strands idle over seven days stay hidden in stale_stranded_hidden) plus final_handoff/failed active within the last hour; older finished history is counted in hidden_finished. Nonempty `states` or fields:\"full\" restores matching history. `count` and `counts` cover returned workers only; hidden counts cover examined candidates before the page/512-candidate bound, and `truncated` signals more matching or unexamined workers or queued launches. Read-only; no receipt check (read the job's receipt_head and compare it yourself).",
             parameters_json: WORKER_ROSTER_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlWorkerRoster),
         },
@@ -5124,7 +5384,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::ManagerOverview,
             method: "AgentManagerOverview",
-            description: "Any manager seat (area, project or portfolio of any tier; #1240): one bounded read of your own manager node: its grant and seat, parent_of it, each child (child portfolio nodes, the project managers you manage directly, child areas) as a digest with its seat status, model, context fill %, grant version, coverage, summed Issue and session counts and pending escalations, the projects you manage directly (project manager seat and policy, Issue counts, Running and WaitingApproval counts, pending questions and approvals), the escalations waiting on you and a fleet rollup of your coverage. `fleet` picks its detail: `summary` (default: active agents, 1h and 24h totals and one row per model with invocations, errors and cost), `none` (fleet null) or `full` (usage over 5m/1h/24h by project, provider and model). A child node's own projects and inbox are never included: send down to that child to ask. Refused for a caller that holds no manager node seat (manager_tier_not_node_seat). Read-only. AgentGlobalOverview is its v0-shaped alias.",
+            description: "Any manager seat (area, project or portfolio of any tier; #1240): one bounded read of your own manager node: its grant and seat, parent_of it, each child (child portfolio nodes, the project managers you manage directly, child areas) as a digest with its seat status, model, context fill %, grant version, coverage, summed Issue and session counts and pending escalations, the projects you manage directly (project manager seat and policy, Issue counts, Running and WaitingApproval counts, pending questions and approvals), the escalations waiting on you and a fleet rollup of your coverage. `fleet` picks its detail: `summary` (default: active agents, 1h and 24h totals and one row per model with invocations, errors and cost), `none` (fleet null) or `full` (usage over 5m/1h/24h by project, provider and model). `detail` defaults to `compact` (#3531: each project manager's seat appears once, in `projects[].overview.manager`; standing directives as id, scope, title and updated_at; `coordinator_budget` as a key into `coordinator_budgets`; predecessors as `predecessor_count` plus `newest_predecessor`; launches only as `grant.allowed_launches`); `directives:true` adds the full directive text and `detail: full` returns everything. A child node's own projects and inbox are never included: send down to that child to ask. Refused for a caller that holds no manager node seat (manager_tier_not_node_seat). Read-only. AgentGlobalOverview is its v0-shaped alias.",
             parameters_json: MANAGER_OVERVIEW_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlManagerOverview),
         },
@@ -5159,7 +5419,7 @@ static AGENT_CONTROL_CATALOG_V1: LazyLock<[AgentControlDescriptorV1; 80]> = Lazy
         AgentControlDescriptorV1 {
             verb: AgentControlVerbV1::StandingDirective,
             method: "AgentStandingDirective",
-            description: "Any manager seat (#2649): relay an operator's standing instruction to a manager scope strictly below your own so it survives every seat rotation without a hand-copied handoff, or clear one a manager relayed. The daemon holds the directive on the scope (project:<uuid>, area:<uuid> or portfolio:<uuid>), not on a session, and puts it verbatim in the authority catalog of every seat of that scope, in a context-cap successor's launch prompt, and in AgentManagerOverview / AgentGlobalOverview. action set needs scope, text (the operator's words, at most 2048 bytes), provenance (where and when the operator said it: a relay without it is refused), idempotency_key, and may carry expires_in_secs (for a while-away directive; absent means until cleared); at most 8 active per scope. action clear needs only directive_id. You cannot write your own scope, and a directive the operator wrote only the operator clears. The author is derived from your seat, never read from the request. Refused: standing_directive_not_authorized, standing_directive_invalid_request, standing_directive_not_found, standing_directive_limit, standing_directive_idempotency_conflict, manager_tier_target_unknown.",
+            description: "Any manager seat (#2649): relay an operator's standing instruction to a manager scope strictly below your own so it survives every seat rotation without a hand-copied handoff, or, with kind manager (#3736), your own standing ruling for it (a capacity throttle, a review-route rule), stored with your seat as author and shown to every seat as manager-authored, never as operator words; or clear one a manager relayed or ruled. The daemon holds the directive on the scope (project:<uuid>, area:<uuid> or portfolio:<uuid>), not on a session, and puts it verbatim in the authority catalog of every seat of that scope, in a context-cap successor's launch prompt, and in AgentManagerOverview / AgentGlobalOverview. action set needs scope, text (the operator's words, at most 2048 bytes), provenance (where and when the operator said it: a relay without it is refused; with kind manager it is an optional note), idempotency_key, and may carry expires_in_secs (for a while-away directive; absent means until cleared); at most 8 active per scope. action clear needs only directive_id. You cannot write your own scope, and a directive the operator wrote only the operator clears, and a manager ruling only the manager scope that wrote it clears. The author is derived from your seat, never read from the request. Refused: standing_directive_not_authorized, standing_directive_invalid_request, standing_directive_not_found, standing_directive_limit, standing_directive_idempotency_conflict, manager_tier_target_unknown.",
             parameters_json: STANDING_DIRECTIVE_SCHEMA,
             native_tool: Some(NativeAgentControlToolV1::RsiControlStandingDirective),
         },
@@ -5193,9 +5453,88 @@ pub fn agent_control_catalog_v1() -> &'static [AgentControlDescriptorV1] {
     &*AGENT_CONTROL_CATALOG_V1
 }
 
+/// #3565: the native tools a manager seat uses on nearly every wake. Claude
+/// Code defers MCP tools behind `ToolSearch`, so each seat re-loaded the same
+/// schemas (17-20k tokens per seat). The `rsi-agent-mcp` gateway marks exactly
+/// these tools `_meta["anthropic/alwaysLoad"] = true` for a manager seat, so
+/// they are in the prompt from the first turn; every other tool stays
+/// deferred, and a worker preloads none.
+pub const MANAGER_PRELOADED_NATIVE_TOOLS: &[&str] = &[
+    "rsi_control_authority_catalog",
+    "rsi_control_manager_inbox",
+    "rsi_control_manager_overview",
+    "rsi_control_list_wakes",
+    "schedule_wake",
+    "rsi_control_list_issues",
+    "rsi_control_get_issue",
+    "rsi_control_update_issue",
+    "rsi_control_create_issue",
+    "rsi_control_list_rolling_queue",
+    "rsi_control_check_landing_candidate",
+    "rsi_control_topology_execute",
+    "rsi_control_topology_get_execution",
+    "rsi_control_manager_send",
+    "rsi_control_report_up",
+    "rsi_control_read_session_events",
+    "rsi_control_worker_roster",
+    "rsi_control_status",
+    "rsi_control_enqueue_landing_source",
+    "rsi_control_send_satellite_message",
+    "rsi_control_request_deploy",
+    "rsi_control_get_daemon_info",
+    "rsi_control_operator_todo_upsert",
+];
+
+/// Catalog roles (`AgentAuthorityCatalogV1.roles`) of a manager seat: the
+/// project manager and the portfolio/global manager.
+pub const MANAGER_PRELOAD_ROLES: &[&str] = &["manager", "global_manager"];
+
+/// The MCP tool `_meta` key Claude Code reads to load a tool without
+/// `ToolSearch` (`true`) or to defer it.
+pub const MCP_ALWAYS_LOAD_META_KEY: &str = "anthropic/alwaysLoad";
+
+/// Whether `roles` (from the live authority catalog) name a manager seat.
+#[must_use]
+pub fn roles_preload_manager_tools<S: AsRef<str>>(roles: &[S]) -> bool {
+    roles
+        .iter()
+        .any(|role| MANAGER_PRELOAD_ROLES.contains(&role.as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3565: every preloaded manager tool is a real native tool, once.
+    #[test]
+    fn manager_preloaded_tools_are_native_tools_without_repeats() {
+        let native = crate::rpc_verb_registry::native_tool_names();
+        let mut seen = std::collections::BTreeSet::new();
+        for name in MANAGER_PRELOADED_NATIVE_TOOLS {
+            assert!(native.contains(name), "{name} is not a native tool");
+            assert!(seen.insert(*name), "{name} listed twice");
+        }
+        assert!(roles_preload_manager_tools(&["worker", "manager"]));
+        assert!(roles_preload_manager_tools(&["worker", "global_manager"]));
+        assert!(!roles_preload_manager_tools(&["worker", "epic_lead"]));
+        assert!(!roles_preload_manager_tools::<&str>(&[]));
+    }
+
+    #[test]
+    fn delegation_reports_the_grant_field_for_invalid_direct_report_cap() {
+        let verb = AgentControlVerbV1::ManagerDelegateNode;
+        let mut params = verb.example();
+        for cap in [0, 65] {
+            params["grant"]["max_direct_reports"] = serde_json::json!(cap);
+            let error = verb.validate_params(&params).unwrap_err();
+            assert_eq!(
+                error.path.as_deref(),
+                Some("params.grant.max_direct_reports")
+            );
+            assert!(error.constraint.is_some());
+        }
+    }
+
     #[test]
     fn allowed_launches_schema_caps_match_daemon_limit() {
         let cap = crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES as u64;
@@ -5457,6 +5796,9 @@ mod tests {
                 serde_json::from_value::<crate::agent_deploy::AgentRequestDeployRequestV1>(value)
                     .map(drop)
             }
+            AgentControlVerbV1::SwitchHostPreset => {
+                serde_json::from_value::<crate::host_tuning::SwitchHostPreset>(value).map(drop)
+            }
             AgentControlVerbV1::GlobalOverview => {
                 serde_json::from_value::<crate::global_manager::AgentGlobalOverviewRequestV1>(value)
                     .map(drop)
@@ -5552,25 +5894,11 @@ mod tests {
         assert_eq!(
             rpc_only,
             BTreeSet::from([
-                "AgentContinueChild",
                 "AgentArchiveChild",
-                "AgentCancelWake",
-                "AgentManagerDelegateNode",
-                "AgentManagerEscalate",
-                "AgentManagerListEscalations",
-                "AgentManagerResolveEscalation",
-                "AgentEnqueueLandingSource",
-                "AgentGetProviderStatus",
-                "AgentSubmitJob",
-                "AgentGetJob",
-                "AgentListJobs",
-                "AgentCancelJob",
-                "AgentSendSatelliteMessage",
                 "AgentReportToHub",
-                "AgentGetDaemonInfo",
-                "AgentRequestDeploy",
                 "AgentPushSatelliteManagerPolicy",
                 "AgentReseatSatelliteManager",
+                "AgentSwitchHostPreset",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
@@ -5607,6 +5935,98 @@ mod tests {
         assert_eq!(AgentControlVerbV1::from_method_name("GetSession"), None);
     }
 
+    /// #3774: the manager verbs that used to be reachable only through
+    /// `rsi-rpc` each have exactly one native tool, named for the verb, and
+    /// the tool is served by the MCP gateway (no in-process handler).
+    #[test]
+    fn rpc_layer_verbs_have_gateway_native_tools_named_for_their_verb() {
+        let expected = [
+            ("AgentContinueChild", "rsi_control_continue_child"),
+            ("AgentCancelWake", "rsi_control_cancel_wake"),
+            (
+                "AgentManagerDelegateNode",
+                "rsi_control_manager_delegate_node",
+            ),
+            ("AgentManagerEscalate", "rsi_control_manager_escalate"),
+            (
+                "AgentManagerListEscalations",
+                "rsi_control_manager_list_escalations",
+            ),
+            (
+                "AgentManagerResolveEscalation",
+                "rsi_control_manager_resolve_escalation",
+            ),
+            (
+                "AgentEnqueueLandingSource",
+                "rsi_control_enqueue_landing_source",
+            ),
+            ("AgentGetProviderStatus", "rsi_control_get_provider_status"),
+            ("AgentSubmitJob", "rsi_control_submit_job"),
+            ("AgentGetJob", "rsi_control_get_job"),
+            ("AgentListJobs", "rsi_control_list_jobs"),
+            ("AgentCancelJob", "rsi_control_cancel_job"),
+            (
+                "AgentSendSatelliteMessage",
+                "rsi_control_send_satellite_message",
+            ),
+            ("AgentGetDaemonInfo", "rsi_control_get_daemon_info"),
+            ("AgentRequestDeploy", "rsi_control_request_deploy"),
+        ];
+        let catalog = agent_control_catalog_v1();
+        for (method, tool_name) in expected {
+            let descriptor = catalog
+                .iter()
+                .find(|entry| entry.method == method)
+                .unwrap_or_else(|| panic!("{method} is not catalogued"));
+            let native = descriptor
+                .native_tool
+                .unwrap_or_else(|| panic!("{method} has no native tool"));
+            assert_eq!(native.name(), tool_name);
+            assert_eq!(native.verb(), descriptor.verb, "{tool_name}");
+            assert!(native.mcp_gateway_only(), "{tool_name}");
+        }
+        let gateway_only = catalog
+            .iter()
+            .filter_map(|entry| entry.native_tool)
+            .filter(|native| native.mcp_gateway_only())
+            .count();
+        assert_eq!(gateway_only, expected.len());
+        // The same tool name resolves back to exactly one catalog verb.
+        for descriptor in catalog {
+            if let Some(native) = descriptor.native_tool {
+                let owners = catalog
+                    .iter()
+                    .filter(|entry| entry.native_tool.map(|t| t.name()) == Some(native.name()))
+                    .count();
+                assert_eq!(owners, 1, "{}", native.name());
+            }
+        }
+    }
+
+    #[test]
+    fn review_continuation_refusal_names_both_fields_and_the_fix() {
+        let verb = AgentControlVerbV1::ManagerLaunchIssueWorker;
+        let mut params = fixture(verb);
+        params["sandbox_source"] = Value::Null;
+        params["review_of"] = serde_json::json!(99);
+        params["continue_from"] = serde_json::json!("00000000-0000-0000-0000-000000000001");
+        let error = verb.validate_params(&params).unwrap_err();
+        let mut envelope = serde_json::json!({});
+        error.enrich(&mut envelope);
+        assert_eq!(envelope["code"], "invalid_input");
+        assert_eq!(envelope["path"], "params.continue_from");
+        let constraint = envelope["constraint"].as_str().unwrap();
+        assert!(constraint.contains("review_of and continue_from are mutually exclusive"));
+        assert!(constraint.contains("omit continue_from"));
+
+        // Each launch mode remains valid on its own, including explicit nulls.
+        params["continue_from"] = Value::Null;
+        assert_eq!(verb.validate_params(&params), Ok(()));
+        params["continue_from"] = serde_json::json!("00000000-0000-0000-0000-000000000001");
+        params["review_of"] = Value::Null;
+        assert_eq!(verb.validate_params(&params), Ok(()));
+    }
+
     #[test]
     fn submit_job_catalog_documents_and_validates_integration_test_targets() {
         let descriptor = agent_control_catalog_v1()
@@ -5641,6 +6061,22 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn submit_job_catalog_exposes_the_rolling_tool_policy() {
+        let descriptor = agent_control_catalog_v1()
+            .into_iter()
+            .find(|entry| entry.method == "AgentSubmitJob")
+            .unwrap();
+        let params = serde_json::json!({"kind":"test","params":{"scoped_test":{"base":"origin/rolling","rolling_tool":true}}});
+        assert!(descriptor.verb.validate_params(&params).is_ok());
+        let wire = descriptor.parameters().to_string();
+        assert!(wire.contains("rolling_tool"));
+        assert!(wire.contains("daemon-written"));
+        let mut invalid = params;
+        invalid["params"]["scoped_test"]["rolling_tool"] = serde_json::json!("true");
+        assert!(descriptor.verb.validate_params(&invalid).is_err());
     }
 
     #[test]
@@ -5928,6 +6364,7 @@ mod tests {
                     "issue_id",
                     "labels",
                     "priority",
+                    "replace_body",
                     "title",
                 ],
                 &["expected_row_version", "idempotency_key"],
@@ -6008,7 +6445,7 @@ mod tests {
             (
                 AgentControlVerbV1::SubmitReviewReceipt,
                 &["assignment_id", "findings", "idempotency_key", "verdict"],
-                &["assignment_id", "verdict", "findings", "idempotency_key"],
+                &["verdict", "findings", "idempotency_key"],
             ),
             (
                 AgentControlVerbV1::ManagerControl,
@@ -6201,16 +6638,22 @@ mod tests {
                 ],
                 &["kind", "params"],
             ),
-            (AgentControlVerbV1::GetJob, &["job_id"], &["job_id"]),
-            (AgentControlVerbV1::ListJobs, &["limit"], &[]),
+            (
+                AgentControlVerbV1::GetJob,
+                &["fields", "job_id"],
+                &["job_id"],
+            ),
+            (AgentControlVerbV1::ListJobs, &["fields", "limit"], &[]),
             (AgentControlVerbV1::CancelJob, &["job_id"], &["job_id"]),
             (
                 AgentControlVerbV1::EnqueueLandingSource,
                 &[
                     "derive_filters",
+                    "expedite",
                     "fixes_issue",
                     "fixes_tests",
                     "idempotency_key",
+                    "issue",
                     "source_commit",
                     "source_session_id",
                     "supersedes",
@@ -6220,7 +6663,7 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ListRollingQueue,
-                &["before_sequence", "limit", "state"],
+                &["before_sequence", "fields", "limit", "state"],
                 &[],
             ),
             (
@@ -6233,16 +6676,28 @@ mod tests {
                 &["job_id", "source_commit", "source_session_id"],
                 &["source_commit"],
             ),
-            (AgentControlVerbV1::GetProviderStatus, &["provider"], &[]),
+            (
+                AgentControlVerbV1::GetProviderStatus,
+                &["models", "provider", "run_budget_usd", "run_sessions"],
+                &[],
+            ),
             (AgentControlVerbV1::GetDaemonInfo, &[], &[]),
             (
                 AgentControlVerbV1::QueryFailureSignatures,
                 &["digest", "test_id"],
                 &[],
             ),
-            (AgentControlVerbV1::WorkerRoster, &["limit", "states"], &[]),
+            (
+                AgentControlVerbV1::WorkerRoster,
+                &["fields", "limit", "states"],
+                &[],
+            ),
             (AgentControlVerbV1::GlobalOverview, &[], &[]),
-            (AgentControlVerbV1::ManagerOverview, &["fleet"], &[]),
+            (
+                AgentControlVerbV1::ManagerOverview,
+                &["detail", "directives", "fleet"],
+                &[],
+            ),
             (
                 AgentControlVerbV1::CreateProject,
                 &["color", "description", "name", "path"],
@@ -6284,6 +6739,7 @@ mod tests {
                     "directive_id",
                     "expires_in_secs",
                     "idempotency_key",
+                    "kind",
                     "provenance",
                     "scope",
                     "text",
@@ -6386,8 +6842,13 @@ mod tests {
             ),
             (
                 AgentControlVerbV1::ReportToHub,
+                &["binaries_dir", "kind", "text"],
                 &["kind", "text"],
-                &["kind", "text"],
+            ),
+            (
+                AgentControlVerbV1::SwitchHostPreset,
+                &["action", "name"],
+                &["action"],
             ),
             (
                 AgentControlVerbV1::SendSatelliteMessage,
@@ -6423,12 +6884,13 @@ mod tests {
             (AgentControlVerbV1::ListSourceWorktreeCohorts, &[], &[]),
             (
                 AgentControlVerbV1::AuditSourceWorktreeCohort,
-                &["fields", "repository_identity"],
+                &["after_custody_id", "fields", "repository_identity"],
                 &["repository_identity"],
             ),
             (
                 AgentControlVerbV1::ApplySourceWorktreeCohort,
                 &[
+                    "after_custody_id",
                     "authorization",
                     "idempotency_key",
                     "plan_digest",
@@ -6447,6 +6909,7 @@ mod tests {
                     "after_sequence",
                     "event_types",
                     "final_message_full",
+                    "full_fields",
                     "limit",
                     "max_bytes",
                     "session_id",
@@ -6578,6 +7041,7 @@ mod tests {
         for name in [
             "jobs_terminal",
             "sha_on_rolling",
+            "shas_on_rolling",
             "issue_closed",
             "todo_closed",
             "topology_execution_settled",
@@ -6586,6 +7050,23 @@ mod tests {
         ] {
             assert!(predicates.contains_key(name), "{name}");
         }
+        assert_eq!(predicates["shas_on_rolling"]["minItems"], 1);
+        assert_eq!(
+            predicates["shas_on_rolling"]["maxItems"],
+            crate::wake_predicate::WAKE_WHEN_MAX_SHAS
+        );
+        assert_eq!(predicates["shas_on_rolling"]["uniqueItems"], true);
+        // #217: the per-landing firing mode and the predicate-wake cap.
+        assert_eq!(
+            predicates["fire"]["enum"],
+            serde_json::json!(["all", "each"])
+        );
+        let when_description = wake["properties"]["when"]["description"].as_str().unwrap();
+        assert!(when_description.contains(crate::wake_predicate::WAKE_WHEN_CAP_REACHED));
+        assert!(when_description.contains(&format!(
+            "at most {} enabled when wakes",
+            crate::wake_predicate::WAKE_WHEN_MAX_PER_SESSION
+        )));
         assert_eq!(predicates["topology_execution_settled"]["format"], "uuid");
         assert_eq!(predicates["settlement_run_settled"]["format"], "uuid");
         assert!(

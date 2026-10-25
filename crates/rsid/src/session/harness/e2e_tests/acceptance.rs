@@ -44,8 +44,8 @@ const RETRY_LINE: usize = 42;
 /// Names of the ambient variables the daemon process holds during the run.
 /// They carry the two fake keys and are scoped to this test; neither may reach
 /// the model's shell.
-const AMBIENT_MODEL_KEY_VAR: &str = "RSI_E2E_ACCEPTANCE_MODEL_KEY";
-const AMBIENT_SEARCH_KEY_VAR: &str = "RSI_E2E_ACCEPTANCE_SEARCH_KEY";
+const AMBIENT_MODEL_KEY_VAR: &str = "RSI_E2E_ACCEPTANCE_TEST_MODEL_KEY";
+const AMBIENT_SEARCH_KEY_VAR: &str = "RSI_E2E_ACCEPTANCE_TEST_SEARCH_KEY";
 
 const PATCH: &str = "*** Begin Patch\n\
     *** Add File: docs/NOTES.md\n\

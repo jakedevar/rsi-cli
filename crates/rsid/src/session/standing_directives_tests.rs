@@ -15,13 +15,14 @@ use rsi_common::harness_manager_v2::{ManagerLaunchChoiceV2, ManagerPolicyV2};
 use rsi_common::manager_node_workspace::AgentManagerOverviewRequestV1;
 use rsi_common::manager_tier_routing::ManagerNodeRefV1;
 use rsi_common::standing_directives::{
-    STANDING_DIRECTIVE_NOT_AUTHORIZED, StandingDirectiveActionV1,
+    STANDING_DIRECTIVE_NOT_AUTHORIZED, StandingDirectiveActionV1, StandingDirectiveKindV1,
+    StandingDirectiveSourceV1,
 };
 use rsi_common::types::{Project, SessionKind, SessionProvider, SessionStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 const OVERNIGHT: &str = "Overnight: keep the hub and the laptop busy; resolve blocked runs on the wake that reports them; many small landings, reds first; escalate only real gates via the operator to-do list; send ONE morning summary.";
 
@@ -127,6 +128,7 @@ fn set(scope: ManagerNodeRefV1, text: &str, key: &str) -> AgentStandingDirective
         expires_in_secs: Some(8 * 3600),
         idempotency_key: Some(key.into()),
         directive_id: None,
+        kind: None,
     }
 }
 
@@ -164,7 +166,7 @@ async fn a_relayed_directive_is_in_the_pm_catalog_and_overview_not_in_a_worker_o
     let pm_guidance = guidance(&f, f.pm).await;
     assert!(pm_guidance.contains(OVERNIGHT), "{pm_guidance}");
     assert!(
-        pm_guidance.contains("## Standing operator directives"),
+        pm_guidance.contains("## Standing directives"),
         "{pm_guidance}"
     );
     assert!(
@@ -268,6 +270,7 @@ async fn the_write_path_is_operator_attributed_and_bounded_to_scopes_below_the_s
         expires_in_secs: None,
         idempotency_key: None,
         directive_id: Some(relayed.directive.id),
+        kind: None,
     };
     let cleared = f
         .control
@@ -295,6 +298,7 @@ async fn the_write_path_is_operator_attributed_and_bounded_to_scopes_below_the_s
                 scope: project,
                 text: "Operator's own.",
                 provenance: None,
+                kind: Default::default(),
                 expires_in_secs: None,
                 idempotency_key: "op",
             },
@@ -314,6 +318,195 @@ async fn the_write_path_is_operator_attributed_and_bounded_to_scopes_below_the_s
                 expires_in_secs: None,
                 idempotency_key: None,
                 directive_id: Some(operator.id),
+                kind: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), STANDING_DIRECTIVE_NOT_AUTHORIZED);
+    assert!(guidance(&f, f.pm).await.contains("Operator's own."));
+}
+
+fn manager_set(scope: ManagerNodeRefV1, text: &str, key: &str) -> AgentStandingDirectiveRequestV1 {
+    AgentStandingDirectiveRequestV1 {
+        provenance: Some("capacity throttle".into()),
+        kind: Some(StandingDirectiveKindV1::Manager),
+        ..set(scope, text, key)
+    }
+}
+
+/// #3736: a portfolio manager's own standing ruling survives the rotation of
+/// the child PM seat: the successor's catalog guidance carries it labelled
+/// manager-authored, never as operator words, and the overview lists it as a
+/// manager source.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn a_manager_ruling_survives_the_child_seat_rotation_labelled_manager_authored_3736() {
+    const THROTTLE: &str = "No new Codex implementers fleet-wide, reviews only.";
+    let f = fixture().await;
+    let project = ManagerNodeRefV1::Project {
+        project_id: f.project,
+    };
+    let ruled = f
+        .control
+        .agent_standing_directive(f.seat, manager_set(project, THROTTLE, "throttle-1"))
+        .await
+        .unwrap();
+    assert_eq!(ruled.directive.source, StandingDirectiveSourceV1::Manager);
+    assert_eq!(ruled.directive.author, format!("session:{}", f.seat));
+
+    let before = guidance(&f, f.pm).await;
+    assert!(before.contains(THROTTLE), "{before}");
+
+    // Rotate the child seat: a successor is appointed to the same project scope.
+    let successor = {
+        let store = f.store.lock().await;
+        let successor = add_session(&store, Some(f.project));
+        let version = store
+            .get_harness_manager(f.project)
+            .unwrap()
+            .unwrap()
+            .row_version;
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: f.project,
+                session_id: successor,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: version,
+            })
+            .unwrap();
+        successor
+    };
+    let after = guidance(&f, successor).await;
+    assert!(
+        after.contains(THROTTLE),
+        "no handoff text involved: {after}"
+    );
+    assert!(
+        after.contains("MANAGER-AUTHORED ruling (not operator words)"),
+        "{after}"
+    );
+    assert!(after.contains(&format!("session:{}", f.seat)), "{after}");
+    assert!(
+        !after.contains("by operator"),
+        "never presented as the operator's: {after}"
+    );
+    let overview = f
+        .control
+        .agent_manager_overview(successor, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    assert_eq!(overview.standing_directives, vec![ruled.directive.clone()]);
+    assert_eq!(
+        overview.standing_directives[0].source,
+        StandingDirectiveSourceV1::Manager
+    );
+    // An operator relay by the same seat keeps its relay source.
+    let relay = f
+        .control
+        .agent_standing_directive(f.seat, set(project, OVERNIGHT, "relay-1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        relay.directive.source,
+        StandingDirectiveSourceV1::OperatorRelay
+    );
+}
+
+/// #3736 refusals: a scope outside the grant, a manager editing an operator
+/// directive and a ruling written to the seat's own scope.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn manager_rulings_are_refused_outside_the_grant_and_never_edit_operator_directives_3736() {
+    let f = fixture().await;
+    let project = ManagerNodeRefV1::Project {
+        project_id: f.project,
+    };
+    // The PM holds the project; it cannot rule on its own scope or a sibling's.
+    for (caller, scope) in [
+        (f.pm, project),
+        (
+            f.pm,
+            ManagerNodeRefV1::Project {
+                project_id: f.other_project,
+            },
+        ),
+        (f.worker, project),
+    ] {
+        let error = f
+            .control
+            .agent_standing_directive(caller, manager_set(scope, "x", "k"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(error), STANDING_DIRECTIVE_NOT_AUTHORIZED, "{caller}");
+    }
+    // A scope the seat does not cover (a project outside its grant).
+    let foreign = {
+        let store = f.store.lock().await;
+        add_project(&store, "Gamma")
+    };
+    let error = f
+        .control
+        .agent_standing_directive(
+            f.seat,
+            manager_set(
+                ManagerNodeRefV1::Project {
+                    project_id: foreign,
+                },
+                "x",
+                "k",
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), STANDING_DIRECTIVE_NOT_AUTHORIZED);
+    // An operator relay cannot carry the manager mark.
+    let mut forged = set(project, "x", "forge");
+    forged.provenance = Some(format!(
+        "manager:{} operator said so",
+        project.as_ref_text()
+    ));
+    let error = f
+        .control
+        .agent_standing_directive(f.seat, forged)
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "standing_directive_invalid_request");
+    // A manager ruling needs a manager seat to carry it; the operator
+    // directive stays out of the manager's reach.
+    let operator = f
+        .store
+        .lock()
+        .await
+        .standing_directive_set(
+            &crate::store::standing_directives::StandingDirectiveActor::Operator,
+            &crate::store::standing_directives::StandingDirectiveSetInput {
+                scope: project,
+                text: "Operator's own.",
+                provenance: None,
+                kind: Default::default(),
+                expires_in_secs: None,
+                idempotency_key: "op-3736",
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap()
+        .directive;
+    assert_eq!(operator.source, StandingDirectiveSourceV1::Operator);
+    let error = f
+        .control
+        .agent_standing_directive(
+            f.seat,
+            AgentStandingDirectiveRequestV1 {
+                action: StandingDirectiveActionV1::Clear,
+                scope: None,
+                text: None,
+                provenance: None,
+                expires_in_secs: None,
+                idempotency_key: None,
+                directive_id: Some(operator.id),
+                kind: None,
             },
         )
         .await

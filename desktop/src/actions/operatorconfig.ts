@@ -16,6 +16,7 @@ import {
   removeHook, replaceHook, routeOf, routeText, supportsMatcher, validateBridgeForm, validateHookDraft, validateProviderForm,
 } from '../operator-config-model.js';
 import { openForm, openPicker } from '../pickers.js';
+import { loadView } from '../view-load.js';
 import { registerRowOverlay } from '../settings.js';
 import { isVimKeysOn } from '../vimkeys.js';
 import { type OperatorConfigActionId, SLICE } from './operatorconfig-spec.js';
@@ -53,9 +54,10 @@ async function saveHooks(view: ClaudeHooksView, put: (revision: string) => Promi
 function hookDialog(view: ClaudeHooksView, row?: HookRow): void {
   openForm({
     title: row ? `Edit the ${row.event} hook` : 'Add a Claude hook',
+    keyTable: 'Hook Form',
     submit: row ? 'Save' : 'Add',
     fields: [
-      { name: 'event', label: `Event (${HOOK_EVENTS.join(', ')})`, value: row?.event ?? 'PreToolUse', type: 'text' },
+      { name: 'event', label: `Event (${HOOK_EVENTS.join(', ')})`, value: row?.event ?? 'PreToolUse', type: 'text', cycle: HOOK_EVENTS },
       { name: 'matcher', label: 'Tool matcher (regex; PreToolUse and PostToolUse only)', value: row?.matcher ?? '', type: 'text', placeholder: 'optional, e.g. Bash' },
       { name: 'command', label: 'Shell command', value: row?.command.command ?? '', type: 'text' },
       { name: 'timeout', label: 'Timeout (seconds)', value: row?.command.timeout ? String(row.command.timeout) : '', type: 'text', placeholder: String(DEFAULT_HOOK_TIMEOUT) },
@@ -86,9 +88,15 @@ async function clearHooksFlow(view: ClaudeHooksView): Promise<void> {
   void openHooks();
 }
 
-async function openHooks(opts: { add?: boolean } = {}): Promise<void> {
-  let view: ClaudeHooksView;
-  try { view = await api.listHooks(); } catch (e) { toast(`Hooks unavailable: ${msg(e)}`); return; }
+function openHooks(opts: { add?: boolean } = {}): Promise<void> {
+  return loadView({
+    key: 'open-hooks', title: 'Claude hooks', failed: 'Hooks unavailable',
+    read: () => api.listHooks(),
+    open: (view) => showHooks(view, opts),
+  });
+}
+
+function showHooks(view: ClaudeHooksView, opts: { add?: boolean }): void {
   if (opts.add) { hookDialog(view); return; }
   const rows = hookRows(view.hooks);
   openPicker({
@@ -117,6 +125,7 @@ async function openHooks(opts: { add?: boolean } = {}): Promise<void> {
 function providerForm(existing: CustomProvider | null): void {
   openForm({
     title: existing ? `Edit ${existing.name}` : 'New custom provider',
+    keyTable: 'Provider Form',
     submit: 'Save',
     fields: [
       { name: 'name', label: 'Name', value: existing?.name ?? '', type: 'text' },
@@ -202,9 +211,15 @@ async function openRoute(role: { id: string; label: string }): Promise<void> {
   routeProviderDialog(providers, role, await currentRoutes());
 }
 
-async function openProviders(opts: { add?: boolean } = {}): Promise<void> {
-  let providers: CustomProvider[];
-  try { providers = await api.listProviders(); } catch (e) { toast(`Providers unavailable: ${msg(e)}`); return; }
+function openProviders(opts: { add?: boolean } = {}): Promise<void> {
+  return loadView({
+    key: 'open-providers', title: 'Custom providers', failed: 'Providers unavailable',
+    read: () => api.listProviders(),
+    open: (providers) => showProviders(providers, opts),
+  });
+}
+
+function showProviders(providers: CustomProvider[], opts: { add?: boolean }): void {
   if (opts.add) { providerForm(null); return; }
   openPicker({
     title: 'Custom providers',
@@ -230,6 +245,7 @@ function bridgeForm(b: MessageBridge): void {
   const c = b.config;
   openForm({
     title: `${bridgeLabel(b.kind)} bridge`,
+    keyTable: 'Message Bridge Form',
     submit: 'Save',
     fields: [
       { name: 'enabled', label: 'Enabled', value: String(c?.enabled ?? false), type: 'checkbox' },
@@ -271,9 +287,15 @@ async function openBridge(kind: BridgeKind): Promise<void> {
   } catch (e) { toast(`Bridges unavailable: ${msg(e)}`); }
 }
 
-async function openBridges(): Promise<void> {
-  let bridges: MessageBridge[];
-  try { bridges = await api.listBridges(); } catch (e) { toast(`Bridges unavailable: ${msg(e)}`); return; }
+function openBridges(): Promise<void> {
+  return loadView({
+    key: 'open-bridges', title: 'Message bridges', failed: 'Bridges unavailable',
+    read: () => api.listBridges(),
+    open: showBridges,
+  });
+}
+
+function showBridges(bridges: MessageBridge[]): void {
   // Both kinds are always listed, configured or not.
   const all = BRIDGE_KINDS.map(({ kind }) => bridges.find((b) => b.kind === kind) ?? { kind, path: '', config: null });
   openPicker({
@@ -302,27 +324,27 @@ const ROLE_ROWS: ReadonlyArray<{ row: string; role: string; label: string }> = [
 function registerSettingsRows(): void {
   registerRowOverlay('claude_hooks', {
     enter: 'Opens the hooks list (Ctrl-N adds, Enter edits, Ctrl-D deletes)',
-    stored: "the daemon host's ~/.claude/settings.json, through ListClaudeHooks / PutClaudeHooks",
+    stored: "the daemon host's Claude settings file",
     keys: { a: 'Add hook' },
     run: (key) => void openHooks({ add: key === 'a' }),
   });
   registerRowOverlay('api_providers', {
     enter: 'Opens the custom providers (Ctrl-N adds, Enter edits, Ctrl-D deletes, Ctrl-R routes)',
-    stored: 'the daemon store; keys in the daemon vault (write-only)',
+    stored: 'the daemon; keys are write-only',
     keys: { a: 'Add provider' },
     run: (key) => void openProviders({ add: key === 'a' }),
   });
   for (const kind of ['signal', 'imessage'] as const) {
     registerRowOverlay(`${kind}_bridge`, {
       enter: 'Opens the bridge form',
-      stored: `${kind}.toml in the daemon data dir, through ListMessageBridges / PutMessageBridge`,
+      stored: `the ${kind} bridge file in the daemon's data folder`,
       run: () => void openBridge(kind),
     });
   }
   for (const r of ROLE_ROWS) {
     registerRowOverlay(r.row, {
-      enter: 'Routes the role to a custom provider, or detaches it (SetCustomProviderRoute); the other model fields stay read-only here',
-      stored: 'the daemon config; the key comes from the provider in the daemon vault',
+      enter: 'Choose which provider this model uses, or go back to the default',
+      stored: 'the daemon; the key comes from the provider',
       run: () => void openRoute({ id: r.role, label: r.label }),
     });
   }

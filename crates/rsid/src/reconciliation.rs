@@ -282,7 +282,7 @@ pub(crate) async fn signal_finalization(
 /// Compare active map against SQLite to detect state drift.
 pub(crate) async fn reconcile_store_consistency(
     active: &RwLock<HashMap<Uuid, TrackedSession>>,
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     event_bus: &EventBus,
     control: Option<&crate::session::agent_verbs::AgentControlHandle>,
 ) {
@@ -474,7 +474,10 @@ pub(crate) async fn reconcile_store_consistency(
 /// (`record_terminal_sandbox_worktree`); an orphan skipped that, so its
 /// uncommitted sandbox work was invisible. The probe is read-only: every byte
 /// stays in place, and sandbox cleanup already refuses a dirty worktree.
-async fn record_orphaned_sandbox_observation(store: &tokio::sync::Mutex<Store>, sid: Uuid) {
+async fn record_orphaned_sandbox_observation(
+    store: &rsid_core::store_lock::Mutex<Store>,
+    sid: Uuid,
+) {
     let sandbox = match store.lock().await.get_session(sid) {
         Ok(Some(row)) => match (row.sandbox_kind, row.sandbox_root) {
             (Some(rsi_common::types::SandboxKind::GitWorktree), Some(root)) => Some(root),
@@ -514,7 +517,7 @@ async fn record_orphaned_sandbox_observation(store: &tokio::sync::Mutex<Store>, 
 /// 2. Compares active map against SQLite for state drift (every `consistency_interval_secs`).
 pub fn spawn_reconciliation_loop(
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     config: ReconciliationConfig,
 ) -> tokio::task::JoinHandle<()> {
@@ -526,7 +529,7 @@ pub fn spawn_reconciliation_loop(
 /// policy choke so store-desync failures settle immediately after persistence.
 pub fn spawn_reconciliation_loop_with_control(
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     config: ReconciliationConfig,
     control: Option<crate::session::agent_verbs::AgentControlHandle>,
@@ -537,7 +540,7 @@ pub fn spawn_reconciliation_loop_with_control(
 /// Production entrypoint with a completed-pass marker for the independent watchdog.
 pub fn spawn_reconciliation_loop_with_heartbeat(
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     config: ReconciliationConfig,
     control: Option<crate::session::agent_verbs::AgentControlHandle>,
@@ -552,7 +555,7 @@ pub fn spawn_reconciliation_loop_with_heartbeat(
 /// liveness to the watchdog without reconciling or mutating session state.
 pub fn spawn_reconciliation_loop_with_runtime(
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     config: ReconciliationConfig,
     control: Option<crate::session::agent_verbs::AgentControlHandle>,
@@ -745,7 +748,9 @@ mod tests {
         let mut events = bus.subscribe();
         let handle = spawn_reconciliation_loop_with_runtime(
             active,
-            Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap())),
+            Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().unwrap(),
+            )),
             bus,
             ReconciliationConfig::default(),
             None,
@@ -857,7 +862,9 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn reaps_orphan_before_marking_failed() {
             let sid = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             store
                 .lock()
                 .await
@@ -923,7 +930,9 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn spawn_in_flight_session_is_not_failed_as_store_desync() {
             let sid = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             let mut row = active_session_row(sid);
             row.status = SessionStatus::Starting;
             store.lock().await.insert_session(&row).expect("insert");
@@ -993,7 +1002,9 @@ mod tests {
             let mut row = active_session_row(sid);
             row.sandbox_kind = Some(rsi_common::types::SandboxKind::GitWorktree);
             row.sandbox_root = Some(repo.path().to_path_buf());
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             store.lock().await.insert_session(&row).expect("insert");
 
             let active = RwLock::new(HashMap::new());
@@ -1025,7 +1036,9 @@ mod tests {
         async fn does_not_reap_unrelated_stamped_process() {
             let failing = Uuid::new_v4();
             let bystander = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             store
                 .lock()
                 .await
@@ -1075,7 +1088,9 @@ mod tests {
         async fn does_not_reap_tracked_live_session() {
             use crate::session::types::TrackedSession;
             let sid = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             let row = active_session_row(sid);
             store
                 .lock()
@@ -1125,7 +1140,9 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn orphan_proof_failure_retains_active_like_row_for_retry() {
             let sid = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().expect("in-memory store"));
+            let store = rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("in-memory store"),
+            );
             store
                 .lock()
                 .await
@@ -1159,7 +1176,7 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn settling_turn_keeps_terminal_status_during_reconciliation() {
             let sid = Uuid::new_v4();
-            let store = tokio::sync::Mutex::new(Store::open_in_memory().unwrap());
+            let store = rsid_core::store_lock::Mutex::new(Store::open_in_memory().unwrap());
             store
                 .lock()
                 .await

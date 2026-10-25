@@ -28,7 +28,6 @@
 
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
@@ -45,7 +44,7 @@ use crate::store::Store;
 /// when it is re-enabled).
 pub fn spawn_terminal_watch_service(
     bus: Arc<EventBus>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     scheduler: SchedulerHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -94,7 +93,11 @@ pub fn spawn_terminal_watch_service(
 /// delivers queued wakes now instead of next tick. Manager-notice routes
 /// whose recipient just went idle are also triggered by exact job id, so a
 /// notice held back only by a busy recipient is delivered immediately.
-async fn handle_event(event: &DaemonEvent, store: &Arc<Mutex<Store>>, scheduler: &SchedulerHandle) {
+async fn handle_event(
+    event: &DaemonEvent,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    scheduler: &SchedulerHandle,
+) {
     if let DaemonEvent::ManagerNoticeQueued { job_id } = event {
         let _ = scheduler.trigger_now(*job_id).await;
         return;
@@ -245,14 +248,14 @@ mod tests {
 
     struct Fixture {
         bus: Arc<EventBus>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         rx: mpsc::Receiver<SchedulerCommand>,
         _task: tokio::task::JoinHandle<()>,
     }
 
     async fn fixture() -> Fixture {
         let bus = Arc::new(EventBus::new(64));
-        let store = Arc::new(Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open_in_memory().expect("in-memory store"),
         ));
         let (tx, rx) = mpsc::channel::<SchedulerCommand>(64);

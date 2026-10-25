@@ -2,30 +2,118 @@
 //! agent-facing side of daemon-owned durable jobs.
 //!
 //! Any live leaf session may submit `test` and `build`; `landing`,
-//! `cloud_gate` and `cloud_sweep` (publish to rolling / spend the operator's
-//! cloud grant) need the current appointed manager or current Epic lead, the
+//! `cloud_gate`, `cloud_sweep` (publish to rolling / spend the operator's
+//! cloud grant) and `bench` (spend the operator's model grant on a benchmark run) need the current appointed manager or current Epic lead, the
 //! `AgentEnqueueLandingSource` rule. The job is always owned by the
 //! token-bound caller and runs in the caller's own sandbox (an appointed
 //! manager may instead name another worktree of its repository). Reads are
-//! scoped to the owner.
+//! scoped to the owner, manager seat and explicitly published Issue-worker continuation.
 
 use super::agent_verbs::AgentControlHandle;
+use crate::agent_jobs::job_refusal;
 use crate::agent_jobs::{JobRuntime, JobTools, SubmitContext};
 use crate::error::{DaemonError, Result};
 use rsi_common::agent_jobs::{
     AgentCancelJobRequestV1, AgentCancelJobResultV1, AgentGetJobRequestV1, AgentJobV1,
     AgentListJobsRequestV1, AgentListJobsResultV1, AgentSubmitJobReceiptV1,
-    AgentSubmitJobRequestV1, JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_KIND_NOT_AUTHORIZED,
-    JOB_NOT_FOUND, JOB_QA_LANE_SHA_MISMATCH, JOB_QA_LANE_TIMEOUT_MAX_MINS,
-    JOB_SANDBOX_SESSION_LIVE, JOB_SCOPED_TEST_TIMEOUT_DEFAULT_MINS, JOB_TEST_TIMEOUT_DEFAULT_MINS,
-    JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMINGS_TIMEOUT_DEFAULT_MINS, JOB_TIMEOUT_NOT_AUTHORIZED,
-    JobKind, JobParams,
+    AgentSubmitJobRequestV1, JOB_DIR_NOT_ALLOWED, JOB_KIND_NOT_AUTHORIZED, JOB_NOT_FOUND,
+    JOB_QA_LANE_SHA_MISMATCH, JOB_QA_LANE_TIMEOUT_MAX_MINS, JOB_SANDBOX_SESSION_LIVE,
+    JOB_SCOPED_TEST_TIMEOUT_DEFAULT_MINS, JOB_TEST_TIMEOUT_DEFAULT_MINS, JOB_TEST_TIMEOUT_MAX_MINS,
+    JOB_TEST_TIMINGS_TIMEOUT_DEFAULT_MINS, JOB_TIMEOUT_NOT_AUTHORIZED, JobKind, JobParams,
+    JobRefusal,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 const DEFAULT_LIST: usize = 20;
 const MAX_LIST: usize = 100;
+
+/// Scoped jobs have no agent token and may run before any landing has exported
+/// the legacy shared snapshot. Publish the admitted job's own project instead;
+/// the runner reads this sandbox-local sidecar without a classifier binary.
+fn write_scoped_failure_snapshot(
+    store: &crate::store::Store,
+    params: &JobParams,
+    project_id: Option<Uuid>,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    if !matches!(params, JobParams::Test(test) if test.is_scoped_test()) {
+        return Ok(());
+    }
+    let project_id = project_id.ok_or_else(|| {
+        DaemonError::InvalidParam("scoped_test known-failure snapshot requires a project".into())
+    })?;
+    let issues = store
+        .open_failure_signature_issues(project_id)?
+        .into_iter()
+        .map(|issue| (issue.display_number, issue.status, issue.body))
+        .collect::<Vec<_>>();
+    let built = rsi_common::failure_signature::build_snapshot(&issues, None);
+    // Advisory identity only: use the QA filer's exact Test:/Failing tests:
+    // parser, plus the existing last-word identity extraction for QA titles.
+    // Never turn these mentions into signature records or copy Issue prose.
+    let mut qa_advisories =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<i64>>::new();
+    for status in [
+        rsi_common::types::IssueStatus::Open,
+        rsi_common::types::IssueStatus::InProgress,
+    ] {
+        for issue in store.list_issues(&rsi_common::types::IssueFilter {
+            project_id: Some(project_id),
+            status: Some(status),
+            archive: Some(rsi_common::types::IssueArchiveFilterV1::Active),
+            ..Default::default()
+        })? {
+            if !issue.labels.iter().any(|label| label == "qa") {
+                continue;
+            }
+            let mut tests = rsi_common::rolling_queue::failing_tests_listed(&issue.body);
+            let titles = issue
+                .title
+                .split(',')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            tests.extend(rsi_common::rolling_queue::failing_test_paths(&titles));
+            for test in tests {
+                let test = test.trim_matches('`');
+                if rsi_common::rolling_queue::valid_test_name(test) {
+                    qa_advisories
+                        .entry(test.to_owned())
+                        .or_default()
+                        .insert(issue.display_number);
+                }
+            }
+        }
+    }
+    // Keep admission scratch under an already reclaimable target entry (#1429).
+    // Job TMPDIR cleanup is separate; it must not remove this export before use.
+    let parent = cwd.join("target/.rsi-tmp/scoped-test");
+    let path = parent.join("known-failures.v1.json");
+    let write = || -> std::result::Result<(), Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(&parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(&parent)?;
+        serde_json::to_writer(
+            &mut temp,
+            &serde_json::json!({
+                "schema_version": 1,
+                "project_id": project_id,
+                "snapshot": built.snapshot,
+                "malformed_issues": built.errors,
+                "qa_advisories": qa_advisories,
+            }),
+        )?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path)?;
+        Ok(())
+    };
+    write().map_err(|error| {
+        DaemonError::Process(format!(
+            "cannot publish scoped_test known-failure snapshot {}: {error}",
+            path.display()
+        ))
+    })
+}
 
 fn validate_build_package(
     package: &str,
@@ -138,13 +226,15 @@ async fn observe_qa_head(root: &std::path::Path) -> Result<String> {
     }
 }
 
-/// `test` and `build` are open to any leaf; `landing`, `cloud_gate` and
-/// `cloud_sweep` need the
+/// `test` and `build` are open to any leaf; `landing`, `cloud_gate`,
+/// `cloud_sweep` and `bench` need the
 /// current appointed manager or current Epic lead.
 pub(crate) fn job_kind_permitted(kind: JobKind, is_manager: bool, is_lead: bool) -> bool {
     match kind {
         JobKind::Test | JobKind::Build => true,
-        JobKind::Landing | JobKind::CloudGate | JobKind::CloudSweep => is_manager || is_lead,
+        JobKind::Landing | JobKind::CloudGate | JobKind::CloudSweep | JobKind::Bench => {
+            is_manager || is_lead
+        }
     }
 }
 
@@ -312,6 +402,9 @@ struct JobAdmission {
     fence: Option<String>,
     /// #1520: exact live (project, Issue, launch) binding, rechecked at effect.
     qa_binding: Option<(Uuid, Uuid, Uuid)>,
+    /// Hub #33: the registered path of the caller's own project, read only
+    /// for a declared recipe job from a session with no sandbox.
+    registered_root: Option<PathBuf>,
 }
 
 impl JobAdmission {
@@ -348,7 +441,7 @@ fn admit_job(
             if !matches!(params.kind(), JobKind::Landing | JobKind::CloudGate)
                 || request.has_worktree
             {
-                return Err(DaemonError::InvalidParam(JOB_INVALID_PARAMS.into()));
+                return Err(job_refusal(JobRefusal::source_session_scope()));
             }
             let target = manager_reached_sandbox(
                 store,
@@ -381,7 +474,7 @@ fn admit_job(
     let qa = matches!(params, JobParams::Test(test) if test.qa_lane.is_some());
     let qa_binding = if qa {
         if request.has_worktree || request.sandbox_session_id.is_some() {
-            return Err(DaemonError::InvalidParam(JOB_INVALID_PARAMS.into()));
+            return Err(job_refusal(JobRefusal::qa_lane_scope()));
         }
         store
             .live_qa_lane_binding(caller)?
@@ -394,6 +487,23 @@ fn admit_job(
     {
         return Err(job_timeout_not_authorized_error(qa));
     }
+    // Hub #33: a session that owns no sandbox may run a declared recipe job
+    // from its working directory when that is its project's registered path
+    // (the directory is verified at resolution, `resolve_unsandboxed_recipe_cwd`).
+    let registered_root = if sandbox.is_none()
+        && session.sandbox_root.is_none()
+        && !request.has_worktree
+        && crate::agent_jobs::is_declared_recipe_job(params)
+    {
+        session
+            .project_id
+            .map(|project| store.get_project(project))
+            .transpose()?
+            .flatten()
+            .and_then(|project| project.path)
+    } else {
+        None
+    };
     let needs_authority =
         sandbox.is_some() || !job_permitted(params, false, false) || request.raises_timeout || qa;
     let fence = needs_authority
@@ -407,6 +517,7 @@ fn admit_job(
         sandbox,
         fence,
         qa_binding,
+        registered_root,
     })
 }
 
@@ -438,6 +549,26 @@ fn job_timeout_not_authorized_error(qa_lane: bool) -> DaemonError {
 }
 
 impl AgentControlHandle {
+    /// #3181: the ports the `bench` gates read.
+    fn bench_job_ports(&self) -> Result<Arc<dyn crate::agent_jobs::bench::BenchJobPorts>> {
+        if let Some(ports) = &self.bench_ports {
+            return Ok(Arc::clone(ports));
+        }
+        if let Some(ports) = crate::agent_jobs::bench::installed_ports() {
+            return Ok(ports);
+        }
+        let config = self.runtime_config.as_ref().ok_or_else(|| {
+            DaemonError::PolicyDenied(format!(
+                "{}: benchmark jobs are not available on this daemon",
+                rsi_common::agent_jobs::BENCH_DISABLED
+            ))
+        })?;
+        Ok(Arc::new(crate::agent_jobs::bench::DaemonBenchPorts::new(
+            Arc::clone(config),
+            Arc::clone(&self.store),
+        )))
+    }
+
     /// # Errors
     /// A stable `job_*` refusal, or a persistence/launch error.
     pub async fn agent_submit_job(
@@ -446,6 +577,40 @@ impl AgentControlHandle {
         request: AgentSubmitJobRequestV1,
         runtime: std::sync::Arc<dyn JobRuntime>,
         tools: JobTools,
+    ) -> Result<AgentSubmitJobReceiptV1> {
+        self.submit_job_impl(
+            caller,
+            request,
+            runtime,
+            tools,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// Keep fixture job artifacts outside the operator's data directory while
+    /// exercising the same admission, effect fence, insertion and launch.
+    #[cfg(test)]
+    pub(in crate::session) async fn submit_job_in_directory(
+        &self,
+        caller: Uuid,
+        request: AgentSubmitJobRequestV1,
+        runtime: std::sync::Arc<dyn JobRuntime>,
+        tools: JobTools,
+        jobs_directory: Option<PathBuf>,
+    ) -> Result<AgentSubmitJobReceiptV1> {
+        self.submit_job_impl(caller, request, runtime, tools, jobs_directory)
+            .await
+    }
+
+    async fn submit_job_impl(
+        &self,
+        caller: Uuid,
+        request: AgentSubmitJobRequestV1,
+        runtime: std::sync::Arc<dyn JobRuntime>,
+        tools: JobTools,
+        #[cfg(test)] jobs_directory: Option<PathBuf>,
     ) -> Result<AgentSubmitJobReceiptV1> {
         let params = request
             .typed_params()
@@ -498,7 +663,7 @@ impl AgentControlHandle {
         let recheck = JobTarget::of(&request, raises_timeout);
         let requested = request.worktree.as_deref().map(PathBuf::from);
         if requested.as_deref().is_some_and(|p| !p.is_absolute()) {
-            return Err(DaemonError::InvalidParam(JOB_INVALID_PARAMS.into()));
+            return Err(job_refusal(JobRefusal::worktree_not_absolute()));
         }
         let project_id = sandbox
             .as_ref()
@@ -508,19 +673,33 @@ impl AgentControlHandle {
             None => (session.sandbox_root.clone(), session.working_dir.clone()),
         };
         let is_manager = is_manager && sandbox.is_none();
+        // #3993: the per-package release route cannot stage a deploy.
+        crate::release_target::refuse_per_member_release(&params, is_manager)
+            .map_err(|reason| job_refusal(JobRefusal::invalid_params_text(reason)))?;
         let qa_sha = match &params {
             JobParams::Test(test) => test.qa_lane.as_ref().map(|qa| qa.sha.clone()),
             _ => None,
         };
         // Repository observation is bounded and runs without the shared Store
         // mutex. The pin audits submission HEAD, not the bytes later tested.
+        let registered_root = admission.registered_root.clone();
+        let scoped_params = params.clone();
         let cwd = tokio::task::spawn_blocking(move || {
-            let cwd = crate::agent_jobs::resolve_cwd(
-                sandbox_root.as_deref(),
-                &working_dir,
-                is_manager,
-                requested.as_deref(),
-            )?;
+            let cwd = if sandbox_root.is_none() && requested.is_none() && registered_root.is_some()
+            {
+                crate::agent_jobs::resolve_unsandboxed_recipe_cwd(
+                    registered_root.as_deref(),
+                    &working_dir,
+                )?
+            } else {
+                crate::agent_jobs::resolve_cwd(
+                    sandbox_root.as_deref(),
+                    &working_dir,
+                    is_manager,
+                    requested.as_deref(),
+                )?
+            };
+            crate::agent_jobs::validate_scoped_test_refs(&cwd, &scoped_params)?;
             Ok::<_, DaemonError>(cwd)
         })
         .await
@@ -541,6 +720,18 @@ impl AgentControlHandle {
             let members = crate::topology::catalog::workspace_members(&cwd).await?;
             validate_build_package(package, &members)?;
         }
+        if let JobParams::Build(build) = &params
+            && !build.release_members.is_empty()
+        {
+            let members = crate::topology::catalog::workspace_members(&cwd).await?;
+            for (index, member) in build.release_members.iter().enumerate() {
+                validate_build_package(&member.package, &members).map_err(|_| {
+                    DaemonError::InvalidParam(format!(
+                        "invalid_input field=params.release_members[{index}].package"
+                    ))
+                })?;
+            }
+        }
         if let Some(expected) = qa_sha {
             // QA admission forbids requested worktrees; resolve_cwd returned
             // the canonical owner sandbox, never a working_dir fallback.
@@ -548,6 +739,26 @@ impl AgentControlHandle {
                 return Err(DaemonError::InvalidParam(JOB_QA_LANE_SHA_MISMATCH.into()));
             }
         }
+        // #3181: a benchmark run passes its gates (operator switch, docker host,
+        // launch grant, armed spend cap, pin check, laptop preflight) before any
+        // row exists; the same gates run again when the queued job starts.
+        let bench_admitted = match &params {
+            JobParams::Bench(bench) => {
+                let ports = self.bench_job_ports()?;
+                Some(
+                    crate::agent_jobs::bench::admit(
+                        &*ports,
+                        &self.store,
+                        project_id,
+                        &cwd,
+                        bench,
+                        crate::agent_jobs::bench::Stage::Submit,
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
         let ctx = SubmitContext {
             owner: caller,
             project_id,
@@ -561,7 +772,11 @@ impl AgentControlHandle {
         super::effect_fence::seam::run(&self.store, caller, "submit_job").await;
         let store = std::sync::Arc::clone(&self.store);
         let (row, replayed) = tokio::task::spawn_blocking(move || {
-            let jobs_dir = crate::agent_jobs::jobs_dir()
+            #[cfg(not(test))]
+            let jobs_dir = crate::agent_jobs::jobs_dir();
+            #[cfg(test)]
+            let jobs_dir = jobs_directory.map_or_else(crate::agent_jobs::jobs_dir, Ok);
+            let jobs_dir = jobs_dir
                 .map_err(|error| DaemonError::Process(format!("job directory: {error}")))?;
             // #1278: the lock was released for the directory probe. Re-resolve
             // the same admission under the lock that stays held through the
@@ -574,12 +789,24 @@ impl AgentControlHandle {
                 || current.is_manager != admission.is_manager
                 || current.is_lead != admission.is_lead
                 || current.sandbox_dirs() != admission.sandbox_dirs()
+                || current.registered_root != admission.registered_root
             {
                 return Err(DaemonError::PolicyDenied(JOB_KIND_NOT_AUTHORIZED.into()));
             }
             // Binding/delegation recheck and insert share this daemon's Store
             // mutex. Only the capacity check is inside insert's IMMEDIATE
             // transaction; independent SQL writers are outside this fence.
+            write_scoped_failure_snapshot(&store, &ctx.params, ctx.project_id, &ctx.cwd)?;
+            if let Some(admitted) = &bench_admitted {
+                return crate::agent_jobs::bench::submit_queued(
+                    &store,
+                    &*runtime,
+                    &jobs_dir,
+                    ctx,
+                    admitted,
+                    chrono::Utc::now(),
+                );
+            }
             crate::agent_jobs::submit_with_hold(
                 &store,
                 &*runtime,
@@ -607,21 +834,35 @@ impl AgentControlHandle {
     /// rotation predecessors owned in the project and the jobs of sessions in
     /// its live scope (a worker's receipt); read only, ownership and the cancel
     /// rule do not change.
+    /// #584: a published Issue-worker continuation also reads test/build jobs
+    /// of its proven predecessor chain in the same Issue, project and source
+    /// sandbox. This grants read/watch authority only.
     ///
     /// # Errors
     /// `job_not_found` for an unknown job or one owned by another session
-    /// outside the caller's seat lineage and manager scope.
+    /// outside the caller's seat lineage, manager scope and worker continuation.
     pub async fn agent_get_job(
         &self,
         caller: Uuid,
         request: AgentGetJobRequestV1,
     ) -> Result<AgentJobV1> {
-        self.store
-            .lock()
-            .await
+        let store = self.store.lock().await;
+        let mut jobs: Vec<AgentJobV1> = store
             .get_agent_job_for_reader(caller, request.job_id)?
             .map(|row| row.job)
+            .into_iter()
+            .collect();
+        self.project_disk_holds(&store, &mut jobs);
+        jobs.pop()
             .ok_or_else(|| DaemonError::InvalidParam(JOB_NOT_FOUND.into()))
+    }
+
+    /// #582: overlay the live disk-floor hold on the jobs one read returns.
+    fn project_disk_holds(&self, store: &crate::store::Store, jobs: &mut [AgentJobV1]) {
+        let Some(config) = &self.runtime_config else {
+            return;
+        };
+        crate::agent_jobs::project_disk_holds(store, &config.governor_policy(), jobs);
     }
 
     /// `AgentCancelJob` (#1106): the owner stops a running job. #2213: the
@@ -693,14 +934,13 @@ impl AgentControlHandle {
         let limit = request
             .limit
             .map_or(DEFAULT_LIST, |n| (n as usize).clamp(1, MAX_LIST));
-        let jobs = self
-            .store
-            .lock()
-            .await
+        let store = self.store.lock().await;
+        let mut jobs: Vec<AgentJobV1> = store
             .list_agent_jobs_for_reader(caller, limit)?
             .into_iter()
             .map(|row| row.job)
             .collect();
+        self.project_disk_holds(&store, &mut jobs);
         Ok(AgentListJobsResultV1 { jobs })
     }
 }
@@ -783,10 +1023,21 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[derive(Default)]
-    struct QaRecorder(std::sync::Mutex<Vec<crate::agent_jobs::LaunchSpec>>);
+    struct QaRecorder(
+        std::sync::Mutex<Vec<crate::agent_jobs::LaunchSpec>>,
+        std::sync::atomic::AtomicUsize,
+    );
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     impl crate::agent_jobs::JobRuntime for QaRecorder {
+        fn check_toolchain(
+            &self,
+            _: &JobParams,
+            _: &std::path::Path,
+        ) -> std::result::Result<(), String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
         fn launch(&self, spec: &crate::agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
             self.0.lock().unwrap().push(spec.clone());
             Ok(())
@@ -867,6 +1118,100 @@ mod tests {
                 0
             );
         }
+
+        async fn submit_scoped(
+            &self,
+            base: &str,
+            head: Option<&str>,
+        ) -> crate::error::Result<rsi_common::agent_jobs::AgentSubmitJobReceiptV1> {
+            let mut request = self.request();
+            request.params = serde_json::json!({"scoped_test": {"base": base}});
+            if let Some(head) = head {
+                request.params["scoped_test"]["head"] = head.into();
+            }
+            self.control
+                .agent_submit_job(
+                    self.worker,
+                    request,
+                    self.recorder.clone(),
+                    crate::agent_jobs::JobTools {
+                        cargo_slot: "/x/slot".into(),
+                        lander: "/x/lander".into(),
+                    },
+                )
+                .await
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn scoped_test_unresolved_head_is_refused_before_job_effects() {
+        let f = qa_fixture(false);
+        let reference = "missing-scoped-head";
+        let error = f
+            .submit_scoped(&f.sha, Some(reference))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("job_scoped_test_ref_unresolved"), "{error}");
+        assert!(error.contains("params.scoped_test.head"), "{error}");
+        assert!(error.contains(reference), "{error}");
+        assert!(
+            error.contains("full 40-hex SHA or a fetched ref"),
+            "{error}"
+        );
+        f.assert_no_effects().await;
+        assert_eq!(f.recorder.1.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn scoped_test_unresolved_base_is_refused_before_job_effects() {
+        let f = qa_fixture(false);
+        let reference = "missing-scoped-base";
+        let error = f
+            .submit_scoped(reference, Some(&f.sha))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("job_scoped_test_ref_unresolved"), "{error}");
+        assert!(error.contains("params.scoped_test.base"), "{error}");
+        assert!(error.contains(reference), "{error}");
+        assert!(
+            error.contains("full 40-hex SHA or a fetched ref"),
+            "{error}"
+        );
+        f.assert_no_effects().await;
+        assert_eq!(f.recorder.1.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn scoped_test_full_sha_and_default_head_are_accepted() {
+        for explicit_head in [true, false] {
+            let f = qa_fixture(false);
+            let head = explicit_head.then_some(f.sha.as_str());
+            let receipt = f.submit_scoped(&f.sha, head).await.unwrap();
+            assert_eq!(receipt.job.params.kind(), JobKind::Test);
+            let JobParams::Test(test) = receipt.job.params else {
+                panic!("test job")
+            };
+            let scoped = test.scoped_test.unwrap();
+            assert_eq!(scoped.base, f.sha);
+            assert_eq!(scoped.head.as_deref(), head);
+            assert_eq!(f.recorder.0.lock().unwrap().len(), 1);
+            assert_eq!(f.recorder.1.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(
+                f.control
+                    .store
+                    .lock()
+                    .await
+                    .list_agent_jobs(f.worker, 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -930,7 +1275,7 @@ mod tests {
         let control = super::AgentControlHandle::new(
             Default::default(),
             Default::default(),
-            Arc::new(tokio::sync::Mutex::new(store)),
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
             Arc::new(crate::bus::EventBus::new(16)),
             Arc::new(crate::session::spawn_coordinator::SpawnCoordinator::new(tx)),
         );
@@ -944,7 +1289,8 @@ mod tests {
         };
         f.git(&["init", "-q"]);
         std::fs::write(f.dir.path().join("tracked"), "baseline\n").unwrap();
-        f.git(&["add", "tracked"]);
+        std::fs::write(f.dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        f.git(&["add", "tracked", "Cargo.toml"]);
         f.git(&[
             "-c",
             "user.name=Fixture",
@@ -977,6 +1323,300 @@ mod tests {
             "{err}"
         );
         reviewer.assert_no_effects().await;
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn scoped_submit_publishes_current_project_snapshot_before_launch() {
+        use crate::agent_jobs::{JobRuntime, LaunchSpec};
+        use rsi_common::failure_signature::{FENCE_INFO, Snapshot};
+        use rsi_common::types::{IssueStatus, IssueUpdate, NewIssue};
+        struct SnapshotRecorder(std::sync::Arc<QaRecorder>);
+        impl JobRuntime for SnapshotRecorder {
+            fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+                let path = spec
+                    .cwd
+                    .join("target/.rsi-tmp/scoped-test/known-failures.v1.json");
+                let export: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                assert_eq!(
+                    export["snapshot"]["records"][0]["record"]["test_id"],
+                    "demo::red"
+                );
+                self.0.launch(spec)
+            }
+            fn unit_active(&self, unit_name: &str) -> bool {
+                self.0.unit_active(unit_name)
+            }
+        }
+        let f = qa_fixture(false);
+        let project = f
+            .control
+            .store
+            .lock()
+            .await
+            .get_session(f.worker)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        let issue = {
+            let store = f.control.store.lock().await;
+            let issue = store
+                .create_issue(&NewIssue {
+                    project_id: project,
+                    title: "known scoped failure".into(),
+                    body: String::new(),
+                    priority: None,
+                    labels: vec![],
+                    created_by_session_id: None,
+                    assignee: None,
+                    idea_id: None,
+                    source_event_id: None,
+                    source_finding_ref: None,
+                })
+                .unwrap();
+            let record = serde_json::json!({"test_id":"demo::red", "issue":issue.display_number,
+                "class":"regression", "matcher":{"contains":["boom"]}});
+            store
+                .update_issue(
+                    issue.id,
+                    &IssueUpdate {
+                        body: Some(format!("```{FENCE_INFO}\n{record}\n```")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            issue.id
+        };
+        let path = f
+            .dir
+            .path()
+            .join("target/.rsi-tmp/scoped-test/known-failures.v1.json");
+        // The missing case is a real submission, with a fake unit launcher.
+        let mut request = f.request();
+        request.params = serde_json::json!({"scoped_test":{"base":"HEAD"}});
+        let tools = crate::agent_jobs::JobTools {
+            cargo_slot: "/x/cargo-slot".into(),
+            lander: "/x/lander".into(),
+        };
+        f.control
+            .agent_submit_job(
+                f.worker,
+                request,
+                std::sync::Arc::new(SnapshotRecorder(f.recorder.clone())),
+                tools,
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.recorder.0.lock().unwrap().len(), 1);
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let first = read();
+        assert_eq!(first["project_id"], project.to_string());
+        let snapshot: Snapshot = serde_json::from_value(first["snapshot"].clone()).unwrap();
+        assert_eq!(snapshot.records.len(), 1);
+        assert_eq!(snapshot.records[0].record.test_id, "demo::red");
+        assert_eq!(snapshot.stale_warning(chrono::Utc::now()), None);
+        assert_eq!(first["malformed_issues"], serde_json::json!([]));
+
+        // Query a different project while this owner is still live: its
+        // signature must not cross project boundaries in a job snapshot.
+        {
+            let store = f.control.store.lock().await;
+            let params = JobParams::Test(
+                serde_json::from_value(serde_json::json!({"scoped_test":{"base":"HEAD"}})).unwrap(),
+            );
+            super::write_scoped_failure_snapshot(
+                &store,
+                &params,
+                Some(uuid::Uuid::new_v4()),
+                f.dir.path(),
+            )
+            .unwrap();
+            assert_eq!(read()["snapshot"]["records"], serde_json::json!([]));
+        }
+
+        // Always rebuild from live project state: fresh caches can also have
+        // a closed owner, and malformed/old caches must not survive admission.
+        let params = JobParams::Test(
+            serde_json::from_value(serde_json::json!({"scoped_test":{"base":"HEAD"}})).unwrap(),
+        );
+        let store = f.control.store.lock().await;
+        store
+            .update_issue_status(issue, IssueStatus::Closed)
+            .unwrap();
+        for previous in [
+            serde_json::to_string(&first).unwrap(),
+            "invalid JSON".into(),
+            serde_json::to_string(
+                &serde_json::json!({"snapshot":{"exported_at":"2000-01-01T00:00:00Z"}}),
+            )
+            .unwrap(),
+        ] {
+            std::fs::write(&path, previous).unwrap();
+            super::write_scoped_failure_snapshot(&store, &params, Some(project), f.dir.path())
+                .unwrap();
+            let current = read();
+            let snapshot: Snapshot = serde_json::from_value(current["snapshot"].clone()).unwrap();
+            assert_eq!(snapshot.records.len(), 0);
+            assert_eq!(snapshot.stale_warning(chrono::Utc::now()), None);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_snapshot_qa_advisories_keep_exact_identities_and_live_project_boundaries() {
+        use rsi_common::issue_workspace::ArchiveIssueRequestV1;
+        use rsi_common::types::{IssueStatus, NewIssue};
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let worker = rsid_store::test_support::make_test_session();
+        let project = worker.project_id.unwrap();
+        store.insert_session(&worker).unwrap();
+        let create = |project_id, title: &str, body: &str, labels: Vec<String>| {
+            store
+                .create_issue(&NewIssue {
+                    project_id,
+                    title: title.into(),
+                    body: body.into(),
+                    labels,
+                    priority: None,
+                    created_by_session_id: None,
+                    assignee: None,
+                    idea_id: None,
+                    source_event_id: None,
+                    source_finding_ref: None,
+                })
+                .unwrap()
+        };
+        let open = create(
+            project,
+            "QA failure (observed)",
+            "Test: `demo::red`",
+            vec!["qa".into()],
+        );
+        let progress = create(
+            project,
+            "QA red: `demo::title`",
+            "Failing tests: demo::red_extended, demo::other",
+            vec!["qa".into()],
+        );
+        store
+            .update_issue_status(progress.id, IssueStatus::InProgress)
+            .unwrap();
+        for status in [IssueStatus::Closed, IssueStatus::Cancelled] {
+            let issue = create(
+                project,
+                "QA red: demo::red",
+                "Failing tests: demo::red",
+                vec!["qa".into()],
+            );
+            store.update_issue_status(issue.id, status).unwrap();
+        }
+        let archived = create(
+            project,
+            "QA red: demo::red",
+            "Failing tests: demo::red",
+            vec!["qa".into()],
+        );
+        let archived = store
+            .update_issue_status(archived.id, IssueStatus::Closed)
+            .unwrap();
+        store
+            .archive_issue_workspace(&ArchiveIssueRequestV1 {
+                project_id: project,
+                issue_id: archived.id,
+                expected_row_version: archived.row_version,
+                idempotency_key: "archive-advisory-fixture".into(),
+            })
+            .unwrap();
+        let mut foreign_project = store.get_project(project).unwrap().unwrap();
+        foreign_project.id = uuid::Uuid::new_v4();
+        foreign_project.name = "foreign advisory project".into();
+        foreign_project.path = None;
+        store.insert_project(&foreign_project).unwrap();
+        create(
+            foreign_project.id,
+            "QA red: demo::red",
+            "Failing tests: demo::red",
+            vec!["qa".into()],
+        );
+        create(
+            project,
+            "Other red: demo::red",
+            "Failing tests: demo::red",
+            vec!["bug".into()],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let params = JobParams::Test(
+            serde_json::from_value(serde_json::json!({"scoped_test":{"base":"HEAD"}})).unwrap(),
+        );
+        super::write_scoped_failure_snapshot(&store, &params, Some(project), dir.path()).unwrap();
+        let export: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                dir.path()
+                    .join("target/.rsi-tmp/scoped-test/known-failures.v1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            export["qa_advisories"],
+            serde_json::json!({
+                "demo::red": [open.display_number],
+                "demo::red_extended": [progress.display_number],
+                "demo::other": [progress.display_number],
+                "demo::title": [progress.display_number],
+            })
+        );
+        assert_eq!(export["snapshot"]["records"], serde_json::json!([]));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_snapshot_keeps_malformed_issue_diagnostics_and_reports_write_errors() {
+        use rsi_common::types::NewIssue;
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let worker = rsid_store::test_support::make_test_session();
+        let project = worker.project_id.unwrap();
+        store.insert_session(&worker).unwrap();
+        store
+            .create_issue(&NewIssue {
+                project_id: project,
+                title: "broken signature".into(),
+                body: format!(
+                    "```{}\ninvalid JSON\n```",
+                    rsi_common::failure_signature::FENCE_INFO
+                ),
+                priority: None,
+                labels: vec![],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let params = JobParams::Test(
+            serde_json::from_value(serde_json::json!({"scoped_test":{"base":"HEAD"}})).unwrap(),
+        );
+        super::write_scoped_failure_snapshot(&store, &params, Some(project), dir.path()).unwrap();
+        let path = dir
+            .path()
+            .join("target/.rsi-tmp/scoped-test/known-failures.v1.json");
+        let export: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(export["malformed_issues"].as_array().unwrap().len(), 1);
+        let error = super::write_scoped_failure_snapshot(&store, &params, Some(project), &path)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot publish scoped_test known-failure snapshot")
+        );
+        assert!(error.to_string().contains(&path.display().to_string()));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1246,7 +1886,7 @@ mod tests {
             })
             .unwrap();
         let operation = Uuid::new_v4();
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let control = AgentControlHandle::new(
             Default::default(),
@@ -1463,11 +2103,16 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn only_the_manager_or_lead_may_submit_landing_cloud_gate_and_cloud_sweep() {
+    fn only_the_manager_or_lead_may_submit_landing_cloud_gate_cloud_sweep_and_bench() {
         for kind in [JobKind::Test, JobKind::Build] {
             assert!(job_kind_permitted(kind, false, false), "{kind:?}");
         }
-        for kind in [JobKind::Landing, JobKind::CloudGate, JobKind::CloudSweep] {
+        for kind in [
+            JobKind::Landing,
+            JobKind::CloudGate,
+            JobKind::CloudSweep,
+            JobKind::Bench,
+        ] {
             assert!(!job_kind_permitted(kind, false, false), "{kind:?}");
             assert!(job_kind_permitted(kind, true, false), "{kind:?}");
             assert!(job_kind_permitted(kind, false, true), "{kind:?}");
@@ -1498,6 +2143,13 @@ mod tests {
         assert!(job_permitted(&receipt, false, true));
         let plain = params(serde_json::json!({"package":"rsid","lib_only":true}));
         assert!(job_permitted(&plain, false, false));
+        // #3410: a commit-pinned exact test is open to any session with a
+        // sandbox (a QA-red fixer, a reviewer), not a manager-only job.
+        let pinned = params(serde_json::json!({
+            "at_commit": "a".repeat(40), "package":"rsid", "lib_only":true,
+            "exact":true, "filters":["a::b"]
+        }));
+        assert!(job_permitted(&pinned, false, false));
     }
 
     /// #1337: the default is stamped on a plain test job, a candidate receipt

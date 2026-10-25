@@ -15,11 +15,12 @@ use crate::store::Store;
 use crate::store::agent_jobs::{AgentJobRow, NewAgentJob};
 use chrono::{DateTime, Utc};
 use rsi_common::agent_jobs::{
-    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1, JOB_ADMISSION_TIMED_OUT,
-    JOB_CANCELLED, JOB_DIR_NOT_ALLOWED, JOB_FILTER_MATCHED_NO_TESTS, JOB_HELD_FOR_CAPACITY,
-    JOB_HELD_FOR_THERMAL, JOB_INTERRUPTED_BY_DEPLOY, JOB_LAUNCH_FAILED, JOB_NOT_FOUND,
-    JOB_START_TIMED_OUT, JOB_TEST_TIMEOUT_DEFAULT_MINS, JOB_TIMED_OUT, JobKind, JobParams,
-    JobState, JobWake, LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict, TestJobParams,
+    AgentJobResultV1, AgentJobV1, BuildJobParams, CloudSweepResultV1,
+    FAILURE_CLASS_ADMISSION_TIMEOUT, JOB_ADMISSION_TIMED_OUT, JOB_CANCELLED, JOB_DIR_NOT_ALLOWED,
+    JOB_FILTER_MATCHED_NO_TESTS, JOB_HELD_FOR_CAPACITY, JOB_HELD_FOR_THERMAL,
+    JOB_INTERRUPTED_BY_DEPLOY, JOB_LAUNCH_FAILED, JOB_NOT_FOUND, JOB_START_TIMED_OUT,
+    JOB_TEST_TIMEOUT_DEFAULT_MINS, JOB_TIMED_OUT, JobKind, JobParams, JobState, JobWake,
+    LandingJobParams, SWEEP_MAX_FAILURES, SweepVerdict, TestJobParams,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,12 +28,58 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+/// Every `job_invalid_params` the daemon raises itself goes through here, so the
+/// refusal text names the offending field and the fix (the code is unchanged).
+pub(crate) fn job_refusal(refusal: rsi_common::agent_jobs::JobRefusal) -> DaemonError {
+    DaemonError::InvalidParam(refusal.detail())
+}
+
 #[cfg(any(target_os = "macos", test))]
 mod launchd;
 
+pub(crate) mod bench;
+
+/// #3191: resolve a bench run config and its overlay in `cwd` without opening a run
+/// or calling a model, for the `rsi-bench-resolve` tool: the effective prompt digest,
+/// tool list and knobs a run would launch with.
+///
+/// # Errors
+/// The config's or overlay's typed refusal text.
+pub fn bench_dry_run(
+    cwd: &std::path::Path,
+    config: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    bench::dry_run_config(cwd, config)
+}
+mod cloud_build;
+mod disk_hold;
+pub use disk_hold::run_disk_hold_watch_loop;
+
+/// #582: overlay the live disk-floor hold on the jobs one read returns.
+pub(crate) fn project_disk_holds(
+    store: &Store,
+    policy: &crate::governor::GovernorPolicy,
+    jobs: &mut [AgentJobV1],
+) {
+    disk_hold::project(store, policy, jobs);
+}
+
+/// #582: overlay the live disk-floor hold on the roster's latest-job summaries.
+pub(crate) fn project_roster_disk_holds(
+    store: &Store,
+    policy: &crate::governor::GovernorPolicy,
+    roster: &mut rsi_common::agent_worker_roster::AgentWorkerRosterResultV1,
+) {
+    disk_hold::project_roster(store, policy, roster);
+}
+pub(crate) mod profile_verification;
+pub mod project_profile;
 mod recipe;
 mod scoped_tool;
+pub(crate) use scoped_tool::validate_refs as validate_scoped_test_refs;
 mod source;
+#[cfg(any(target_os = "macos", test))]
+mod test_containment;
 mod toolchain;
 
 const TICK: Duration = Duration::from_secs(5);
@@ -47,6 +94,9 @@ const JOB_SCRATCH_QUOTA_BYTES: u64 = 32 * 1024 * MIB;
 /// Typed refusal recorded when a job's scratch outgrew the quota.
 pub(crate) const JOB_SCRATCH_QUOTA_EXCEEDED: &str = "job_scratch_quota_exceeded";
 const LOG_TAIL_READ_BYTES: u64 = 256 * 1024;
+/// Receipt evidence has its own bounded suffix, independent of diagnostic tails.
+/// Real receipts before #546 reached 1.77 MB (and progress reached 6.48 MB).
+const SCOPED_RECEIPT_READ_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_FAILING_TESTS: usize = 32;
 const STRIP_NAMESPACE_ENV: &str = "RSI_PROCESS_OWNERSHIP_NAMESPACE";
 /// #1337: a timed test job's unit keeps running this long past its timeout
@@ -63,8 +113,11 @@ const JOB_START_WAIT_MAX_SECS: u64 = 10 * 60;
 /// The recipe the merge queue's async full-library QA run submits (#2092,
 /// #2112, #2120), on the hub and on a satellite alike.
 pub(crate) const LIBRARY_QA_RECIPE: &str = "rolling-library-qa";
-/// Scoped jobs include admission in their wall budget, retaining two minutes to run.
+/// Leave time for scoped-test receipt publication and teardown after a package.
 const SCOPED_JOB_RUNTIME_RESERVE_SECS: u64 = 120;
+/// #3284: the daemon's backstop lets the script end its own wait first, so a
+/// wait that overruns its cap by detection delay is settled by the script.
+const SCOPED_SLOT_WAIT_GRACE_SECS: u64 = 60;
 const SANDBOX_JOB_QUEUED: &str = "sandbox_job_queued";
 const JOB_SANDBOX_HOLDER_DEAD: &str = "job_sandbox_holder_dead";
 const JOB_SANDBOX_HOLDER_STALLED: &str = "job_sandbox_holder_stalled";
@@ -100,13 +153,111 @@ fn admission_expired(
     })
 }
 
-/// The typed `job_admission_timed_out` settlement of a job that never launched.
-fn admission_timed_out_result(cap_secs: i64) -> AgentJobResultV1 {
+/// #618: the governor's last words to a job that waited for admission, from its
+/// `slot-wait:` phase lines (the slot holders, or the disk, memory or load floor
+/// that held it), at most 600 characters.
+fn last_slot_wait_reason(log: &str) -> Option<String> {
+    let text = log.lines().rev().find_map(|line| {
+        line.trim_end()
+            .strip_prefix("rsi-phase ")?
+            .split_once(' ')?
+            .1
+            .strip_prefix("slot-wait: ")
+    })?;
+    // "still waiting 3569s: governor wait: <reason>" and "governor wait: <reason>"
+    let reason = text
+        .split_once("governor wait: ")
+        .map_or(text, |(_, rest)| rest);
+    Some(reason.chars().take(600).collect())
+}
+
+/// #618: mark a scoped receipt of a job that never got admission as an
+/// infrastructure failure (`failure_class`, `ok: false`) and name what blocked
+/// it under `admission.blocked_by`. Anything but a JSON object is left alone.
+fn stamp_admission_timeout(
+    mut receipt: serde_json::Value,
+    blocked_by: Option<&str>,
+) -> serde_json::Value {
+    let Some(object) = receipt.as_object_mut() else {
+        return receipt;
+    };
+    object.insert("ok".into(), false.into());
+    object.insert(
+        "failure_class".into(),
+        FAILURE_CLASS_ADMISSION_TIMEOUT.into(),
+    );
+    let Some(reason) = blocked_by else {
+        return receipt;
+    };
+    let admission = object
+        .entry("admission")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(admission) = admission.as_object_mut() {
+        admission.insert("blocked_by".into(), reason.into());
+    }
+    receipt
+}
+
+/// The typed `job_admission_timed_out` settlement of a job that never launched
+/// although no deploy or thermal hold is in force: it names the hold it was
+/// queued under (`held`) and the bound it outlived, the deploy drain's hold cap
+/// plus margin (#177). A scoped or capacity-held job is bounded by its
+/// pre-launch admission allowance instead ([`queue_allowance_timed_out_result`]).
+fn admission_timed_out_result(cap_secs: i64, held: Option<&str>) -> AgentJobResultV1 {
+    let held = held.unwrap_or(rsi_common::agent_jobs::JOB_HELD_FOR_DEPLOY);
     AgentJobResultV1 {
         refusal: Some(JOB_ADMISSION_TIMED_OUT.into()),
+        failure_class: Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into()),
         detail: Some(format!(
-            "the job was held for more than {} minutes before its unit launched (deploy drain hold cap plus margin) and was failed without running; its execution timeout never started. Resubmit it",
+            "the job was queued ({held}) for more than {} minutes before its unit launched (the deploy drain hold cap plus margin, counted from the later of its submission and the last deploy or thermal hold); no deploy or thermal hold is in force now, so it was stuck, not waiting, and was failed without running; its execution timeout never started. Resubmit it",
             cap_secs / 60
+        )),
+        ..AgentJobResultV1::default()
+    }
+}
+
+/// #431, #177: whether a job bounded by its one pre-launch admission allowance
+/// ([`admission_allowance_secs`], the wait a scoped receipt reports as
+/// `queue_wait_sec`) has waited past it, counted from its current queue start.
+/// No hold pauses it, so even a renewed hold ends visibly.
+fn queue_allowance_expired(job: &AgentJobV1, now: DateTime<Utc>) -> bool {
+    queue_started_at(job).is_some_and(|queued| {
+        now.timestamp().saturating_sub(queued)
+            > i64::try_from(admission_allowance_secs(&job.params)).unwrap_or(i64::MAX)
+    })
+}
+
+/// #431, #177: the `job_admission_timed_out` settlement of a job past its
+/// pre-launch admission allowance. It names the hold kind (a live capacity hold
+/// first, else the job's `held` tag), the observed value (the capacity reading
+/// and the minutes queued) and the bound.
+fn queue_allowance_timed_out_result(
+    job: &AgentJobV1,
+    now: DateTime<Utc>,
+    capacity: Option<crate::host_memory::JobCapacityHold>,
+) -> AgentJobResultV1 {
+    let waited = queue_started_at(job).map_or(0, |queued| {
+        now.timestamp().saturating_sub(queued).max(0) / 60
+    });
+    let hold = match capacity {
+        // The hold kind once: the reading already says "held for capacity".
+        Some(full) => format!(
+            "{JOB_HELD_FOR_CAPACITY}: {}",
+            full.detail().trim_start_matches("held for capacity: ")
+        ),
+        None => job.held.clone().unwrap_or_else(|| "not held".into()),
+    };
+    AgentJobResultV1 {
+        refusal: Some(JOB_ADMISSION_TIMED_OUT.into()),
+        failure_class: Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into()),
+        detail: Some(format!(
+            "the job was queued ({hold}) for {waited} minutes before its unit launched, past its {}-minute pre-launch admission allowance (its one admission bound, reported as queue_wait_sec; the deploy drain cap does not apply); its execution budget never started and it was failed without running. Resubmit it{}",
+            admission_allowance_secs(&job.params) / 60,
+            if capacity.is_some() {
+                " once build slots or memory free"
+            } else {
+                ""
+            }
         )),
         ..AgentJobResultV1::default()
     }
@@ -127,15 +278,17 @@ pub(crate) const BUILD_ADMISSION_WAIT_SECS: u64 = 60 * 60;
 /// whose caller does not need an answer inside ten minutes waits for capacity
 /// up to its own timeout instead of the ordinary ten-minute cap: the async
 /// full-library QA run (#2149) and every ordinary test job (#2211), whose
-/// execution budget never counts the wait. A build job waits
-/// [`BUILD_ADMISSION_WAIT_SECS`]. A scoped test keeps the wait inside its wall
-/// budget (it bounds its own slot wait) and keeps the ordinary cap here.
+/// execution budget never counts the wait. A test job waits its own timeout or
+/// [`BUILD_ADMISSION_WAIT_SECS`], whichever is longer (#3575), as a build does.
 #[must_use]
 pub(crate) fn admission_allowance_secs(params: &JobParams) -> u64 {
     match params {
-        JobParams::Test(test) if !test.is_scoped_test() => job_timeout_secs(params)
+        // #3575: a worker cannot raise its test timeout, so a timeout-sized wait
+        // (20 minutes) failed over half the jobs on a busy hub without a
+        // compile. A test job waits at least as long as a build.
+        JobParams::Test(_) => job_timeout_secs(params)
             .unwrap_or(0)
-            .max(JOB_SLOT_WAIT_ALLOWANCE_SECS),
+            .max(BUILD_ADMISSION_WAIT_SECS),
         JobParams::Build(_) => BUILD_ADMISSION_WAIT_SECS,
         _ => JOB_SLOT_WAIT_ALLOWANCE_SECS,
     }
@@ -172,6 +325,8 @@ pub(crate) fn job_timeout_secs(params: &JobParams) -> Option<u64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobCommand {
     pub argv: Vec<String>,
+    /// Selected tool identity carried directly from resolution to persistence.
+    pub scoped_tool: Option<rsi_common::agent_jobs::ScopedToolProvenanceV1>,
     /// `RuntimeMaxSec` for the unit.
     pub runtime_max_secs: u64,
     /// `TimeoutStopSec`: how long a stop waits before SIGKILL (the cloud
@@ -242,14 +397,19 @@ fn s(value: &str) -> String {
 }
 
 fn slot_cargo(tools: &JobTools, cargo_args: Vec<String>) -> Vec<String> {
+    let mut command = vec![s("cargo")];
+    command.extend(cargo_args);
+    slot_command(tools, command)
+}
+
+fn slot_command(tools: &JobTools, command: Vec<String>) -> Vec<String> {
     let mut argv = vec![
         tools.cargo_slot.display().to_string(),
         s("env"),
         s("-u"),
         s(STRIP_NAMESPACE_ENV),
-        s("cargo"),
     ];
-    argv.extend(cargo_args);
+    argv.extend(command);
     argv
 }
 
@@ -378,6 +538,8 @@ fn scoped_test_command(
         timeout_secs.saturating_sub(60).max(1).to_string(),
         s("--job-max-sec"),
         timeout_secs.to_string(),
+        s("--slot-wait-max-sec"),
+        timeout_secs.max(JOB_SLOT_WAIT_ALLOWANCE_SECS).to_string(),
         s("--cargo-slot"),
         tools.cargo_slot.display().to_string(),
         s("--cpu-quota"),
@@ -385,13 +547,17 @@ fn scoped_test_command(
     ]);
     JobCommand {
         argv,
-        runtime_max_secs: timeout_secs + JOB_TIMEOUT_UNIT_GRACE_SECS,
+        runtime_max_secs: timeout_secs
+            + timeout_secs.max(JOB_SLOT_WAIT_ALLOWANCE_SECS)
+            + JOB_TIMEOUT_UNIT_GRACE_SECS
+            + SCOPED_SLOT_WAIT_GRACE_SECS,
         stop_timeout_secs: 60,
         log_max_bytes: 64 * MIB,
         memory_max_gib: 24,
         cpu_quota_percent,
         background: false,
-        admission_max_secs: None,
+        admission_max_secs: Some(timeout_secs.max(JOB_SLOT_WAIT_ALLOWANCE_SECS)),
+        scoped_tool: None,
     }
 }
 
@@ -423,6 +589,14 @@ fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
     if let Some(target) = &p.test_target {
         args.extend([s("--test"), target.clone()]);
     }
+    if let Some(bin) = &p.bin {
+        args.extend([s("--bin"), bin.clone()]);
+    }
+    // #171: validated against the per-package allowlist at submit, like a
+    // build job's; one `--features` list.
+    if !p.features.is_empty() {
+        args.extend([s("--features"), p.features.join(",")]);
+    }
     // #1106: one failing binary must not hide the others; every binary runs.
     args.push(s("--no-fail-fast"));
     // No filters runs every test; exact matching is a libtest option.
@@ -433,7 +607,44 @@ fn test_command(tools: &JobTools, p: &TestJobParams) -> Vec<String> {
             args.push(s("--exact"));
         }
     }
-    slot_cargo(tools, args)
+    // #3410: one exact test at a past commit. The script checks the commit out
+    // into a scratch worktree, runs cargo there and removes it, all inside the
+    // build slot and the caller's own target. The sandbox is not touched.
+    if let Some(commit) = &p.at_commit {
+        let mut argv = vec![
+            tools.cargo_slot.display().to_string(),
+            s("env"),
+            s("-u"),
+            s(STRIP_NAMESPACE_ENV),
+            s("scripts/at-commit-test.sh"),
+            commit.clone(),
+        ];
+        argv.extend(args);
+        return argv;
+    }
+    // A package run without --lib/another --test includes the gated e2e_tui
+    // harness even when its filters look like unit-test names. Do not guess
+    // membership from a name: enable E2E for that whole Cargo target selection.
+    // Reuse the QA recipe's shared prebuild and environment setup (#3370).
+    if p.package.as_deref() == Some("rsi")
+        && !p.lib_only
+        && p.bin.is_none()
+        && p.test_target
+            .as_deref()
+            .is_none_or(|target| target == "e2e_tui")
+    {
+        if !args.iter().any(|arg| arg == "--") {
+            args.push(s("--"));
+        }
+        args.push(s("--test-threads=1"));
+        let mut argv = slot_cargo(tools, Vec::new());
+        argv.pop(); // Replace Cargo with the existing E2E setup script.
+        argv.extend([s("bash"), s("scripts/e2e.sh"), s("--cargo-test")]);
+        argv.extend(args);
+        argv
+    } else {
+        slot_cargo(tools, args)
+    }
 }
 
 /// #2692: the shard-feature sweep for a `test_no_run` build job. The script
@@ -470,6 +681,33 @@ fn shard_sweep_runtime_max_secs(p: &BuildJobParams) -> u64 {
 }
 
 fn build_command(tools: &JobTools, p: &BuildJobParams) -> Vec<String> {
+    if !p.release_members.is_empty() {
+        // One slot, target and source fence for the entire job. Separate Cargo
+        // processes prevent feature unification between package members. Quote
+        // even validated bare tokens, and stop at the first unsuccessful member.
+        let mut script = s("set -eu\n");
+        for member in &p.release_members {
+            let mut args = vec![
+                s("cargo"),
+                s("build"),
+                s("--release"),
+                s("-p"),
+                member.package.clone(),
+            ];
+            for bin in &member.bins {
+                args.extend([s("--bin"), bin.clone()]);
+            }
+            script.push_str(
+                &args
+                    .iter()
+                    .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            script.push('\n');
+        }
+        return slot_command(tools, vec![s("sh"), s("-c"), script]);
+    }
     if p.command == rsi_common::agent_jobs::BuildCommand::TestNoRun {
         return shard_sweep_command(tools, p);
     }
@@ -489,6 +727,14 @@ fn build_command(tools: &JobTools, p: &BuildJobParams) -> Vec<String> {
     }
     if p.release {
         args.push(s("--release"));
+    }
+    // Validated against the per-package allowlist at submit; one `--features`
+    // list, then one `--bin` per binary.
+    if !p.features.is_empty() {
+        args.extend([s("--features"), p.features.join(",")]);
+    }
+    for bin in &p.bins {
+        args.extend([s("--bin"), bin.clone()]);
     }
     slot_cargo(tools, args)
 }
@@ -513,6 +759,12 @@ fn lander_args(cwd: &Path, p: &LandingJobParams) -> Vec<String> {
 /// `job_launch_failed`.
 fn launch_refusal_code(error: &DaemonError) -> String {
     let message = error.to_string();
+    if message.contains(rsi_common::agent_jobs::JOB_TEST_SOURCE_UNCONTAINED) {
+        return rsi_common::agent_jobs::JOB_TEST_SOURCE_UNCONTAINED.into();
+    }
+    if message.contains(rsi_common::agent_jobs::JOB_SCOPED_TEST_ROLLING_TOOL_UNAVAILABLE) {
+        return rsi_common::agent_jobs::JOB_SCOPED_TEST_ROLLING_TOOL_UNAVAILABLE.into();
+    }
     if message.contains(rsi_common::agent_jobs::JOB_SCOPED_TEST_TOOL_HELPER_MISSING) {
         return rsi_common::agent_jobs::JOB_SCOPED_TEST_TOOL_HELPER_MISSING.into();
     }
@@ -529,6 +781,19 @@ pub(crate) fn job_command(
     cwd: &Path,
     gate_script: Option<&Path>,
 ) -> Result<JobCommand> {
+    #[cfg(target_os = "macos")]
+    test_containment::check(
+        params.kind(),
+        Path::new(test_containment::SANDBOX_EXEC).is_file(),
+    )?;
+    if let Some(mut command) = profile_verification::profile_command(params, cwd)? {
+        command.cpu_quota_percent =
+            rsid_core::build_slice::current_job_ceiling_percent(command.cpu_quota_percent);
+        if let Some(requested) = requested_cpu_quota_percent(params) {
+            command.cpu_quota_percent = command.cpu_quota_percent.min(requested);
+        }
+        return Ok(command);
+    }
     let mut command = widen_admission(
         unbudgeted_job_command(tools, params, cwd, gate_script)?,
         params,
@@ -655,20 +920,29 @@ fn unbudgeted_job_command(
         // naming the file, rather than run with another copy of the tool.
         let tool = match jobs_dir() {
             Err(_) => scoped_tool::ScopedTool::Worktree,
-            Ok(dir) => scoped_tool::resolve(
-                cwd,
-                &scoped.base,
-                scoped.head.as_deref(),
-                &dir.join("scoped-test-tools"),
-            )
-            .map_err(DaemonError::InvalidParam)?,
+            Ok(dir) => {
+                let resolve = if scoped.rolling_tool {
+                    scoped_tool::resolve_rolling
+                } else {
+                    scoped_tool::resolve
+                };
+                resolve(
+                    cwd,
+                    &scoped.base,
+                    scoped.head.as_deref(),
+                    &dir.join("scoped-test-tools"),
+                )
+                .map_err(DaemonError::InvalidParam)?
+            }
         };
-        return Ok(scoped_test_command(
-            tools,
-            scoped,
-            test.timeout_minutes,
-            &tool,
-        ));
+        if scoped.rolling_tool && !matches!(tool, scoped_tool::ScopedTool::Rolling { .. }) {
+            return Err(DaemonError::InvalidParam(
+                "scoped_test_rolling_tool_unavailable: cannot resolve the rolling tool copy; fetch origin/rolling and rerun scoped_test with rolling_tool:true".into(),
+            ));
+        }
+        let mut command = scoped_test_command(tools, scoped, test.timeout_minutes, &tool);
+        command.scoped_tool = Some(tool.provenance(cwd).map_err(DaemonError::InvalidParam)?);
+        return Ok(command);
     }
     let (argv, runtime_max_secs, stop_timeout_secs) = match params {
         JobParams::Test(p) => (
@@ -705,12 +979,22 @@ fn unbudgeted_job_command(
             argv.extend(lander_args(cwd, p));
             (argv, 6 * 3600, 20 * 60)
         }
+        // A bench job is launched by `bench::start_queued`, which runs its gates
+        // first and builds its own command; it never reaches this builder.
+        JobParams::Bench(_) => return Err(DaemonError::InvalidParam(JOB_LAUNCH_FAILED.into())),
         JobParams::CloudSweep(p) => {
             // The sweep script is a sibling of the embedded gate script, in
             // the daemon-owned trusted tree; never the caller's checkout. The
             // caller's repository is only where the rolling tip is read from.
+            // The `build` lane (#3844) runs the sibling `cloud-build.sh`, which
+            // shares everything else: the gate script, mirror, spend net and
+            // stop timeout.
+            let script_name = match p.lane {
+                rsi_common::agent_jobs::SweepLane::Qa => "cloud-sweep.sh",
+                rsi_common::agent_jobs::SweepLane::Build => "cloud-build.sh",
+            };
             let script = gate_script
-                .map(|gate| gate.with_file_name("cloud-sweep.sh"))
+                .map(|gate| gate.with_file_name(script_name))
                 .filter(|script| script.is_file())
                 .ok_or_else(|| DaemonError::InvalidParam(JOB_LAUNCH_FAILED.into()))?;
             // The fetch happens in a daemon-owned bare mirror beside the trusted
@@ -731,9 +1015,10 @@ fn unbudgeted_job_command(
                 s("--mirror"),
                 mirror.display().to_string(),
             ];
-            // The script's own lifetime cap is 420 minutes; the stop timeout
-            // lets its EXIT trap destroy the host.
-            (argv, 8 * 3600, 20 * 60)
+            // The script's host lives 120 minutes (the reservation covers
+            // exactly that); the extra hour is bootstrap and collect slack, and
+            // the stop timeout lets its EXIT trap destroy the host.
+            (argv, 3 * 3600, 20 * 60)
         }
     };
     // Conservative per-kind resource caps: cargo kinds get a large share of the
@@ -745,6 +1030,7 @@ fn unbudgeted_job_command(
         JobParams::CloudGate(_) => (32 * MIB, 2, 100),
         // The sweep also bundles the rolling history for the host.
         JobParams::CloudSweep(_) => (32 * MIB, 4, 200),
+        JobParams::Bench(_) => unreachable!("returned above"),
     };
     Ok(JobCommand {
         argv,
@@ -755,6 +1041,7 @@ fn unbudgeted_job_command(
         cpu_quota_percent,
         background: false,
         admission_max_secs: None,
+        scoped_tool: None,
     })
 }
 
@@ -769,11 +1056,6 @@ const TRUSTED_GATE_FILES: &[(&str, &str, u32)] = &[
         0o755,
     ),
     (
-        "scripts/cloud-spend.py",
-        include_str!("../../../scripts/cloud-spend.py"),
-        0o755,
-    ),
-    (
         "scripts/cloud-sweep.sh",
         include_str!("../../../scripts/cloud-sweep.sh"),
         0o755,
@@ -783,9 +1065,15 @@ const TRUSTED_GATE_FILES: &[(&str, &str, u32)] = &[
         include_str!("../../../scripts/cloud-sweep-excerpts.sh"),
         0o755,
     ),
+    // #3844: the Python-free build lane (hub side and the part piped to the host).
     (
-        "scripts/cloud-sweep-verdict.py",
-        include_str!("../../../scripts/cloud-sweep-verdict.py"),
+        "scripts/cloud-build.sh",
+        include_str!("../../../scripts/cloud-build.sh"),
+        0o755,
+    ),
+    (
+        "scripts/cloud-build-remote.sh",
+        include_str!("../../../scripts/cloud-build-remote.sh"),
         0o755,
     ),
     (
@@ -814,6 +1102,55 @@ const TRUSTED_GATE_FILES: &[(&str, &str, u32)] = &[
         0o644,
     ),
 ];
+
+/// The `rsi-cloud` installed beside the running daemon (#3767): the spend guard
+/// the gate and sweep scripts call. It is a compiled program, so unlike the
+/// scripts it cannot be embedded as text; `make release-install` puts it next
+/// to `rsid`.
+fn rsi_cloud_beside_daemon() -> Option<PathBuf> {
+    let name = if cfg!(windows) {
+        "rsi-cloud.exe"
+    } else {
+        "rsi-cloud"
+    };
+    let beside = std::env::current_exe().ok()?.parent()?.join(name);
+    beside.is_file().then_some(beside)
+}
+
+/// Place the spend guard at `<root>/bin/rsi-cloud` in the daemon-owned trusted
+/// tree (rewritten only when its bytes differ, through an exclusive temp file and
+/// a rename). With no `source` the tree keeps what it has and a gate without a
+/// guard refuses to start (exit 2, before any AWS call).
+fn materialize_spend_guard(root: &Path, source: Option<&Path>) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let dir = root.join("bin");
+    ensure_private_dir(&dir)?;
+    let path = dir.join("rsi-cloud");
+    let bytes = std::fs::read(source)?;
+    let unchanged = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_file())
+        && std::fs::read(&path).is_ok_and(|have| have == bytes);
+    if unchanged {
+        return Ok(());
+    }
+    let tmp = path.with_extension("rsi-tmp");
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(_) => std::fs::remove_file(&tmp)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&tmp)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    drop(file);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, &path)
+}
 
 /// A real directory at `path`, mode 0700. A symlink or file planted there is
 /// removed and replaced; a symlink is never followed.
@@ -884,6 +1221,7 @@ pub(crate) fn materialize_trusted_gate(jobs_dir: &Path) -> std::io::Result<PathB
             std::fs::rename(&tmp, &path)?;
         }
     }
+    materialize_spend_guard(&root, rsi_cloud_beside_daemon().as_deref())?;
     let script = root.join("scripts/cloud-gate.sh");
     let base = std::fs::canonicalize(jobs_dir)?;
     for checked in [script.clone(), root.join("infra/aws/gate")] {
@@ -897,6 +1235,8 @@ pub(crate) fn materialize_trusted_gate(jobs_dir: &Path) -> std::io::Result<PathB
 /// Everything the launcher needs to start one unit.
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
+    /// Selected by the daemon's typed job row, never by payload argv or env.
+    pub kind: JobKind,
     pub unit_name: String,
     pub cwd: PathBuf,
     pub log_path: PathBuf,
@@ -909,7 +1249,7 @@ pub struct LaunchSpec {
 /// gets `GIT_CEILING_DIRECTORIES=<that TMPDIR>` (#2612): the jobs directory lives
 /// under the operator's home directory, which is itself a repository, so without
 /// it a plain `git` in a test's temporary directory that is not (yet) a repository
-/// discovers the home repository, and `scripts/scratch_git.py` takes that enclosing
+/// discovers the home repository, and the shared scratch Git policy (`rsi_repo_guards::scratch_git`) takes that enclosing
 /// repository for the assigned sandbox and refuses every fixture. Git does not
 /// look at the ceiling directory or above it, and only for a working directory
 /// below it: the job's source checkout and every repository created inside the
@@ -1005,7 +1345,8 @@ fn enclosing_sandbox_root(cwd: &Path, owner_sandbox: &Path, data_dir: &Path) -> 
 /// root or subdirectory, or another worker's sandbox) builds in that sandbox's
 /// daemon-designated target, keeping the warm-pool seed and the sandbox's
 /// reclaim. Only a worktree outside every sandbox root (an appointed manager's
-/// integration worktree) gets a registered per-worktree target (#1900).
+/// integration worktree) gets a registered per-worktree target (#1900), except
+/// a manager QA worktree, which shares its seat's one warm target (hub #3870 b).
 fn job_target_dir(cwd: &Path, sandbox: Option<&Path>, data_dir: &Path) -> std::io::Result<PathBuf> {
     let Some(sandbox) = sandbox else {
         return Ok(cargo_target_dir(cwd));
@@ -1015,8 +1356,35 @@ fn job_target_dir(cwd: &Path, sandbox: Option<&Path>, data_dir: &Path) -> std::i
     match enclosing_sandbox_root(&canonical_cwd, &owner, data_dir) {
         Some(root) if root == owner && canonical_cwd == owner => Ok(cargo_target_dir(cwd)),
         Some(root) => Ok(cargo_target_dir(&root)),
+        None if is_manager_qa_worktree(&canonical_cwd, data_dir) => {
+            let target = crate::agent_scratch_reclaim::seat_qa_target(&owner)?;
+            // Heads add workspace artifacts nothing reuses; the operator cap
+            // empties an over-cap target under its admission lock (a busy or
+            // held one is kept), like the shared library-QA target.
+            crate::qa_target_trim::enforce_cap(&target, rsid_core::qa_target_cap::current_bytes());
+            Ok(target)
+        }
         None => crate::agent_scratch_reclaim::manager_target(cwd),
     }
+}
+
+/// Directory under the data dir that holds a manager's QA worktrees and the
+/// name prefix of each (`~/.rsi/deploy/qa-<sha>`).
+const QA_WORKTREE_DIR: &str = "deploy";
+const QA_WORKTREE_PREFIX: &str = "qa-";
+
+/// Whether `canonical_cwd` is a manager QA worktree: a direct child of
+/// `<data_dir>/deploy` named `qa-*`. Each head's worktree is a new path, which
+/// gave it a fresh 15-30 GB target that reclaim kept for 72 h (hub #3870).
+fn is_manager_qa_worktree(canonical_cwd: &Path, data_dir: &Path) -> bool {
+    let named = canonical_cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(QA_WORKTREE_PREFIX));
+    let Ok(deploy) = data_dir.join(QA_WORKTREE_DIR).canonicalize() else {
+        return false;
+    };
+    named && canonical_cwd.parent() == Some(deploy.as_path())
 }
 
 fn prepare_build_environment(
@@ -1128,8 +1496,7 @@ fn prepare_build_environment_in(
         // flock(1) creates the lock file but not its directory.
         std::fs::create_dir_all(&target_dir)?;
     }
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(0o700).create(&tmp_dir)?;
+    create_job_tmp_dir(&tmp_dir)?;
     let checked = (|| {
         // These filesystem magic numbers and nix's numeric type API are Linux-only.
         #[cfg(target_os = "linux")]
@@ -1156,6 +1523,76 @@ fn prepare_build_environment_in(
         cleanup_job_tmp(log);
     }
     checked
+}
+
+/// #284: create a job's private TMPDIR (`<id>.tmp`, mode 0700) fresh, even when
+/// an earlier attempt of the same job id left one behind. A deploy requeue
+/// (#2278) reruns a job under its own id; the stopped run's scratch is removed,
+/// but a process of that run outside the stopped unit (on macOS launchd stops
+/// only the unit's process group, and `scripts/scoped-test` starts its cargo in
+/// its own session) can write under the path again. The leftover is replaced,
+/// never reused: its contents and mode belong to the old run.
+fn create_job_tmp_dir(tmp_dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    // A writer still alive can recreate the path between the removal and the
+    // create; a few rounds cover that, after which the error is reported.
+    for _ in 0..3 {
+        match builder.create(tmp_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                remove_leftover_job_tmp(tmp_dir)?;
+            }
+            result => return result,
+        }
+    }
+    builder.create(tmp_dir)
+}
+
+/// Remove a leftover job TMPDIR (a directory, file or symlink, never followed).
+/// A directory that cannot be removed in place (a live writer races the walk)
+/// is moved aside to a unique sibling first, so the job's own path is free.
+fn remove_leftover_job_tmp(tmp_dir: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(tmp_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    tracing::warn!(
+        path = %tmp_dir.display(),
+        "agent job TMPDIR left by an earlier attempt of this job; replacing it"
+    );
+    let removed = if metadata.is_dir() {
+        std::fs::remove_dir_all(tmp_dir)
+    } else {
+        std::fs::remove_file(tmp_dir)
+    };
+    match removed {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) if metadata.is_dir() => {
+            let mut aside = tmp_dir.as_os_str().to_owned();
+            aside.push(format!(".stale-{}", Uuid::new_v4()));
+            let aside = PathBuf::from(aside);
+            match std::fs::rename(tmp_dir, &aside) {
+                Ok(()) => {}
+                Err(rename) if rename.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(_) => return Err(error),
+            }
+            if let Err(error) = std::fs::remove_dir_all(&aside) {
+                tracing::warn!(
+                    path = %aside.display(),
+                    %error,
+                    "cannot remove a moved-aside agent job TMPDIR"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn cleanup_job_tmp(log: &Path) {
@@ -1203,6 +1640,11 @@ pub trait JobRuntime: Send + Sync {
     fn stop_unit(&self, _unit_name: &str) -> std::result::Result<(), String> {
         Ok(())
     }
+    /// #286: end any process a unit that finished on its own left running.
+    /// systemd stops a unit's whole cgroup, so only launchd, whose bootout
+    /// ends just the service's process group, has anything to do. Failures
+    /// are logged, never a settlement error.
+    fn reap_unit_leftovers(&self, _unit_name: &str) {}
     /// #1832: a one-line account of the unit's state (load/active/sub state,
     /// result), recorded when a job never starts its command. `None` when the
     /// backend has nothing to say.
@@ -1257,8 +1699,32 @@ impl JobRuntime for UnsupportedJobRuntime {
 /// stdout, so every `job-start`/`slot-wait` line and all test output stayed in
 /// head's buffer until 4 KiB or EOF, and a unit stopped at its timeout lost
 /// them. `stdbuf -o0` makes head write each chunk as it reads it.
+///
+/// #464: that does not hold everywhere. macOS ships a `stdbuf` that cannot
+/// interpose on the system `head` (and many macOS hosts have none), and BSD
+/// `head -c` buffers its whole output until EOF, so a long job's `job-start`
+/// never reached the log and the ten-minute start admission killed a running
+/// job. Only Linux with `stdbuf` keeps the `head` writer. Everywhere else
+/// (or with `RSI_JOB_BOUND=portable`, the test seam) the writer is unbuffered
+/// `cat` under `ulimit -f`: the kernel stops the file at the cap with
+/// SIGXFSZ, so the bound needs no buffering tool. `ulimit -f` counts 512- or
+/// 1024-byte blocks depending on the shell, so the block size is measured once
+/// and the limit is rounded up to a whole block (the log may pass the cap by
+/// under one block; the size check below still fails it).
 const WRAPPER: &str = r#"log=$1; status=$2; cap=$3; shift 3
-if command -v stdbuf >/dev/null 2>&1; then bound() { stdbuf -o0 head -c "$cap"; }; else bound() { head -c "$cap"; }; fi
+if [ "${RSI_JOB_BOUND:-}" != portable ] && [ "$(uname -s 2>/dev/null)" = Linux ] && command -v stdbuf >/dev/null 2>&1; then
+  bound() { stdbuf -o0 head -c "$cap"; }
+else
+  bound() {
+    cal="$status.cal"
+    { ( ulimit -f 1 && head -c 8192 /dev/zero | cat >"$cal" ); } 2>/dev/null
+    unit=$(wc -c <"$cal" 2>/dev/null | tr -d ' '); rm -f "$cal"
+    case "$unit" in ''|0|*[!0-9]*) unit=1024;; esac
+    blocks=$(( (cap + $(wc -c <"$log") + unit - 1) / unit ))
+    ulimit -f "$blocks" 2>/dev/null
+    exec cat
+  }
+fi
 ( PYTHONUNBUFFERED=1; RSI_JOB_STARTED_AT=$(date +%s); export PYTHONUNBUFFERED RSI_JOB_STARTED_AT; printf 'rsi-phase %s job-start\n' "$RSI_JOB_STARTED_AT"; "$@" 2>&1 </dev/null; printf '%s\n' "$?" >"$status.code" ) | bound >>"$log"
 code=$(cat "$status.code" 2>/dev/null || echo 1)
 rm -f "$status.code"
@@ -1390,6 +1856,8 @@ pub(crate) fn systemd_run_args(spec: &LaunchSpec, path_env: Option<&str>) -> Vec
         s("--no-block"),
         s("--collect"),
         format!("--unit={}", spec.unit_name),
+        // Keep caller-derived argv out of systemd's Started description.
+        s("--description=rsi job"),
         format!("--working-directory={}", spec.cwd.display()),
         format!(
             "--property=TimeoutStopSec={}",
@@ -1413,6 +1881,12 @@ pub(crate) fn systemd_run_args(spec: &LaunchSpec, path_env: Option<&str>) -> Vec
     // the units with a build environment (see `runs_in_build_slice`).
     if spec.build_environment.is_some() {
         args.push(format!("--slice={}", rsid_core::build_slice::SLICE));
+        // Also set the unit weight: preserve the policy if the shared slice
+        // could not be configured, and among siblings in that slice.
+        args.push(format!(
+            "--property=IOWeight={}",
+            rsid_core::build_slice::IO_WEIGHT
+        ));
     }
     if let Some(path) = path_env {
         args.push(format!("--setenv={}={path}", job_env::PATH));
@@ -1650,6 +2124,54 @@ pub(crate) fn resolve_cwd(
     }
 }
 
+/// Hub #33: a declared `.rsi/jobs.toml` recipe job, the only job a session
+/// with no sandbox may run (a manager seat on a non-Rust project whose
+/// `working_dir` is its registered project root).
+#[must_use]
+pub(crate) fn is_declared_recipe_job(params: &JobParams) -> bool {
+    matches!(
+        params,
+        JobParams::Test(test)
+            if test.recipe.is_some()
+                && test.qa_lane.is_none()
+                && test.scoped_test.is_none()
+                && test.candidate_receipt.is_none()
+    )
+}
+
+/// Resolve the job directory of a session with no sandbox (hub #33): its
+/// `working_dir`, only when that directory canonicalizes (symlinks and `..`
+/// resolved) to exactly the canonical path its own project is registered at.
+/// Any other directory, a registered path that is a filesystem root, or a
+/// missing path is `job_directory_not_allowed`. The caller grants this only
+/// for a declared recipe job, never to a session that owns a sandbox.
+///
+/// # Errors
+/// `job_directory_not_allowed`.
+pub(crate) fn resolve_unsandboxed_recipe_cwd(
+    registered_root: Option<&Path>,
+    working_dir: &Path,
+) -> Result<PathBuf> {
+    let denied = || DaemonError::PolicyDenied(JOB_DIR_NOT_ALLOWED.into());
+    let registered = registered_root
+        .and_then(|root| root.canonicalize().ok())
+        .filter(|p| p.is_dir() && p.parent().is_some())
+        .ok_or_else(denied)?;
+    let own = working_dir.canonicalize().map_err(|_| denied())?;
+    if own != registered {
+        return Err(denied());
+    }
+    // Keyed on the predicate every sandbox allocation passes: where a sandbox
+    // can be allocated, this root is a shared worktree agents reach only through
+    // sandboxes (hard rule 2), so a recipe job never runs in it.
+    if crate::sandbox::git_worktree::origin_admits_sandbox(&own) {
+        return Err(DaemonError::PolicyDenied(
+            rsi_common::agent_jobs::JOB_PROJECT_ROOT_SANDBOXED.into(),
+        ));
+    }
+    Ok(own)
+}
+
 /// Inputs the submit verb resolved from the token-bound caller.
 #[derive(Debug, Clone)]
 pub(crate) struct SubmitContext {
@@ -1689,6 +2211,7 @@ pub(crate) fn submit_with_hold(
     now: DateTime<Utc>,
 ) -> Result<(AgentJobRow, bool)> {
     recipe::fit_timeout(&mut ctx.params, &ctx.cwd)?;
+    profile_verification::fit_profile_timeout(&mut ctx.params, &ctx.cwd)?;
     runtime
         .validate(&ctx.params)
         .map_err(|code| DaemonError::InvalidParam(code.into()))?;
@@ -1700,6 +2223,15 @@ pub(crate) fn submit_with_hold(
     .transpose()
     .map_err(|error| DaemonError::Process(format!("{JOB_LAUNCH_FAILED}: {error}")))?;
     let command = job_command(tools, &ctx.params, &ctx.cwd, gate_script.as_deref())?;
+    let profile_binding = profile_verification::resolve_binding(&ctx.params, &ctx.cwd)?;
+    if profile_binding
+        .as_ref()
+        .is_some_and(|binding| binding.argv != command.argv)
+    {
+        return Err(DaemonError::InvalidParam(
+            "project_verification_source_changed: selected command changed before submit".into(),
+        ));
+    }
     // Hub #2954: a build compiles one commit. Pin check up front, then the
     // worktree state is recorded for the start, running and finish checks.
     let source = source::at_submit(&ctx.params, &ctx.cwd)?;
@@ -1754,7 +2286,7 @@ pub(crate) fn submit_with_hold(
             .or(thermal.is_some().then_some(JOB_HELD_FOR_THERMAL))
             .or(capacity.is_some().then_some(JOB_HELD_FOR_CAPACITY)),
     );
-    let (row, replayed) = match inserted {
+    let (mut row, replayed) = match inserted {
         Ok(inserted) => inserted,
         Err(error) => {
             source::discard(&new.log_path);
@@ -1765,6 +2297,20 @@ pub(crate) fn submit_with_hold(
         // The replay's own job keeps its record; this fresh id has no job.
         source::discard(&new.log_path);
         return Ok((row, replayed));
+    }
+    if let Some(binding) = profile_binding {
+        if let Err(error) = store.record_agent_job_profile_verification(new.id, &binding) {
+            let result = AgentJobResultV1 {
+                refusal: Some("project_verification_record_failed".into()),
+                detail: Some(error.to_string()),
+                ..AgentJobResultV1::default()
+            };
+            store.settle_agent_job(new.id, JobState::Failed, &result, false, now)?;
+            return Err(error);
+        }
+        row = store
+            .get_agent_job(new.id)?
+            .ok_or_else(|| DaemonError::Process("profile verification job disappeared".into()))?;
     }
     if let Some(hot) = thermal {
         append_phase(
@@ -1929,6 +2475,28 @@ fn launch_recorded(
         &format!("unit-launch: requesting service {}", new.unit_name),
     );
     let launch = (|| {
+        let job = store
+            .get_agent_job(id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "job disappeared before launch".to_string())?
+            .job;
+        profile_verification::check_profile_binding(&job)
+            .map_err(|result| result.detail.unwrap_or_default())?;
+        if profile_verification::recorded_profile_binding(&job)
+            .is_some_and(|binding| binding.argv != command.argv)
+        {
+            return Err(
+                "project_verification_source_changed: selected command changed before launch"
+                    .into(),
+            );
+        }
+        // A held/requeued job resolves again at its actual launch. Persist
+        // before any process can print a receipt; the stamp survives restart.
+        if let Some(provenance) = &command.scoped_tool {
+            store
+                .record_agent_job_scoped_tool(id, provenance)
+                .map_err(|error| format!("cannot record scoped-test tool provenance: {error}"))?;
+        }
         let cwd = PathBuf::from(&new.cwd);
         let owner = store
             .get_session(new.owner_session_id)
@@ -1940,16 +2508,22 @@ fn launch_recorded(
         let owner_is_manager = store
             .agent_authority_projection(new.owner_session_id)
             .is_ok_and(|projection| projection.is_manager);
-        let build_environment = prepare_build_environment(
-            &new.params,
-            &cwd,
-            Path::new(&new.log_path),
-            owner_is_manager,
-            sandbox,
-        )
-        .map_err(|error| format!("cannot prepare job build environment: {error}"))?;
+        let build_environment = if profile_verification::recorded_profile_binding(&job).is_some() {
+            // Generic jobs do not need Cargo targets or Rust build markers.
+            None
+        } else {
+            prepare_build_environment(
+                &new.params,
+                &cwd,
+                Path::new(&new.log_path),
+                owner_is_manager,
+                sandbox,
+            )
+            .map_err(|error| format!("cannot prepare job build environment: {error}"))?
+        };
 
         let spec = LaunchSpec {
+            kind: new.params.kind(),
             unit_name: new.unit_name.clone(),
             cwd,
             log_path: PathBuf::from(&new.log_path),
@@ -1979,7 +2553,7 @@ fn launch_recorded(
         }
         let result = AgentJobResultV1 {
             detail: Some(tail(&message)),
-            refusal: Some(JOB_LAUNCH_FAILED.into()),
+            refusal: Some(launch_refusal_code(&DaemonError::Process(message.clone()))),
             ..AgentJobResultV1::default()
         };
         store.settle_agent_job(id, JobState::Failed, &result, wake_on_failure, Utc::now())?;
@@ -1998,7 +2572,7 @@ fn launch_recorded(
 /// A launch failure settles the job `failed` and wakes its owner as usual.
 /// Returns the number of jobs launched.
 pub(crate) async fn start_queued_jobs(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: &Arc<dyn JobRuntime>,
     tools: &JobTools,
     drain: &crate::deploy_drain::DeployDrain,
@@ -2015,37 +2589,66 @@ pub(crate) async fn start_queued_jobs(
     let mut started = 0;
     let admission_cap = admission_cap_secs(drain);
     for row in queued {
+        // A bench job runs its own gates and opens its run before it launches.
+        if row.job.kind == JobKind::Bench {
+            continue;
+        }
         let owner = row.job.owner_session_id;
+        // #431: a scoped job's execution clock is independent of all holds,
+        // but even a continuously renewed deploy/thermal hold must be finite.
+        let scoped_queue_expired =
+            scoped_job(&row.job) && queue_allowance_expired(&row.job, Utc::now());
         let has_parent = {
             let store = crate::store_lock::lock(&store, "agent_jobs::start_queued_jobs").await;
             store
                 .get_session(owner)?
                 .is_none_or(|session| session.parent_id.is_some())
         };
-        // #2190: a queued job waits for a staged `interrupt_workers` deploy
-        // too, and a held job's admission clock does not run.
-        if drain.holds_job_start(Some(owner), has_parent) {
+        // #2190: holds suspend ordinary jobs' admission clocks. Scoped jobs
+        // retain a finite pre-launch allowance even while a hold is active.
+        if !scoped_queue_expired && drain.holds_job_start(Some(owner), has_parent) {
             continue;
         }
         // #2524: a hot host starts no cargo unit; the admission clock restarts
         // when it cools, as it does after a deploy hold.
-        if runs_in_build_slice(&row.job.params) && thermal_hold().is_some() {
+        if !scoped_queue_expired && runs_in_build_slice(&row.job.params) && thermal_hold().is_some()
+        {
             drain.note_job_hold_engaged(Utc::now());
             continue;
         }
-        if row.job.held.as_deref() != Some(SANDBOX_JOB_QUEUED)
-            && admission_expired(
-                &row.job,
-                Utc::now(),
-                admission_cap,
-                drain.job_hold_last_engaged(),
-            )
+        // #2937: with no governor client (macOS) the daemon holds a cargo unit
+        // while the platform build slots are full or memory is low. Unlike the
+        // thermal hold, the admission clock keeps running, as cargo-slot's own
+        // wait does, so a wedged host fails the job visibly; #177: a capacity
+        // wait is no drain, so like a scoped job (#431) it is bounded by the
+        // job's one pre-launch admission allowance, never the drain's cap.
+        let capacity = if runs_in_build_slice(&row.job.params) {
+            capacity_hold(&*crate::store_lock::lock(&store, "agent_jobs::start_queued_jobs").await)
+        } else {
+            None
+        };
+        let peer_queued = row.job.held.as_deref() == Some(SANDBOX_JOB_QUEUED);
+        let capacity_held =
+            capacity.is_some() || row.job.held.as_deref() == Some(JOB_HELD_FOR_CAPACITY);
+        let allowance_bound = scoped_job(&row.job) || (!peer_queued && capacity_held);
+        let now = Utc::now();
+        let allowance_expired = scoped_queue_expired
+            || (!scoped_job(&row.job) && allowance_bound && queue_allowance_expired(&row.job, now));
+        if allowance_expired
+            || (!allowance_bound
+                && !peer_queued
+                && admission_expired(&row.job, now, admission_cap, drain.job_hold_last_engaged()))
         {
+            let result = if allowance_expired {
+                queue_allowance_timed_out_result(&row.job, now, capacity)
+            } else {
+                admission_timed_out_result(admission_cap, row.job.held.as_deref())
+            };
             let store = crate::store_lock::lock(&store, "agent_jobs::start_queued_jobs").await;
             let settled = store.settle_agent_job_outcome(
                 row.job.id,
                 JobState::Failed,
-                &admission_timed_out_result(admission_cap),
+                &result,
                 row.job.wake == JobWake::Owner,
                 Utc::now(),
             )?;
@@ -2054,16 +2657,7 @@ pub(crate) async fn start_queued_jobs(
             }
             continue;
         }
-        // #2937: with no governor client the daemon holds a cargo unit while
-        // the platform build slots are full or memory is low. Unlike the
-        // thermal hold, the admission clock keeps running, as cargo-slot's
-        // own wait does, so a wedged host fails the job visibly.
-        if runs_in_build_slice(&row.job.params)
-            && capacity_hold(
-                &*crate::store_lock::lock(&store, "agent_jobs::start_queued_jobs").await,
-            )
-            .is_some()
-        {
+        if capacity.is_some() {
             continue;
         }
         let runtime = Arc::clone(runtime);
@@ -2109,7 +2703,9 @@ pub(crate) async fn start_queued_jobs(
                 }
                 return Ok(false);
             }
-            if let Err(result) = source::check(job, "when the held job was about to start") {
+            if let Err(result) = profile_verification::check_profile_binding(job).and_then(|()| {
+                source::check(job, "when the held job was about to start").map(|_| ())
+            }) {
                 let settled = store.settle_agent_job_outcome(
                     job.id,
                     JobState::Failed,
@@ -2395,39 +2991,17 @@ fn sweep_failure_class(after_name: &str) -> Option<&'static str> {
 /// silently: the verdict is INCOMPLETE.
 const SWEEP_REPORT_MAX_BYTES: u64 = 2 * MIB;
 
-/// Lanes `scripts/cloud-sweep.sh remote` runs besides the 16 rsid library
-/// shards (`rsid-<shard>`); a complete report has a row for each.
-const SWEEP_FIXED_LANES: [&str; 7] = [
-    "rsid-integrations",
-    "rsid-bins",
-    "rsi",
-    "rsi-common",
-    "other-workspace",
-    "rsid-doctests",
-    "other-doctests",
-];
-/// Every lane the sweep runs, by label: `rsid-<shard>` for each library shard
-/// (the union of the `test-shard-*` features of the `rsid` and `rsid-store`
-/// manifests, the same list `check-rsid-test-shards.py --list-shards` gives the
-/// sweep script) plus the fixed lanes. A GREEN report has each exactly once and
-/// no other lane.
+/// The one lane `scripts/cloud-sweep.sh remote` runs (#3460): the full-library
+/// QA recipe, `make rolling-library-qa`, the same run the merge queue's QA does
+/// on the hub. A complete report has exactly one row for it.
+const SWEEP_FIXED_LANES: [&str; 1] = ["rolling-library-qa"];
+/// Every lane the sweep runs, by label. A GREEN report has each exactly once
+/// and no other lane.
 fn sweep_expected_lanes() -> Vec<String> {
-    let shards: std::collections::BTreeSet<String> = [
-        include_str!("../Cargo.toml"),
-        include_str!("../../rsid-store/Cargo.toml"),
-    ]
-    .into_iter()
-    .flat_map(str::lines)
-    .filter_map(|line| {
-        let shard = line.trim().strip_prefix("test-shard-")?;
-        let (name, _) = shard.split_once(" = ")?;
-        (name != "mode").then(|| format!("rsid-{name}"))
-    })
-    .collect();
-    let mut lanes: Vec<String> = shards.into_iter().collect();
-    lanes.extend(SWEEP_FIXED_LANES.iter().map(|lane| lane.to_string()));
-    lanes.sort_unstable();
-    lanes
+    SWEEP_FIXED_LANES
+        .iter()
+        .map(|lane| lane.to_string())
+        .collect()
 }
 
 /// The one anchored `Tip SHA: `<40-hex>`` header value on `line`, if it is one.
@@ -2444,7 +3018,7 @@ fn tip_sha_header(line: &str) -> Option<&str> {
 }
 
 /// Structural check of the report body, mirroring what the QA.md writer
-/// (`cloud-sweep-report.py` plus `cloud-sweep-verdict.py`) emits for a GREEN:
+/// (`rsi-cloud sweep-report` plus `rsi-cloud sweep-verdict`) emits for a GREEN:
 /// exactly one anchored Tip SHA header equal to `sha`, one `Lanes: N` header,
 /// a table of N complete rows (label plus four numeric cells) naming exactly
 /// the expected lanes once each, exactly one `## Verdict` section after the
@@ -2672,6 +3246,8 @@ pub(crate) fn classify_cloud_sweep_timed(
             ("refusing to start a remote run", "cloud_spend_refused"),
             ("another gate host is running", "cloud_gate_busy"),
             ("another cloud sweep is active", "cloud_gate_busy"),
+            // AWS took the spot host back: no verdict, safe to rerun.
+            ("cloud-gate: spot_interrupted", "spot_interrupted"),
             (
                 "requested SHA is not the current rolling tip",
                 "sweep_sha_not_rolling_tip",
@@ -2706,6 +3282,7 @@ pub(crate) fn classify_cloud_sweep_timed(
         results_dir: results_dir.display().to_string(),
         new_failures,
         known_failures,
+        build: None,
     });
     let state = if verdict == SweepVerdict::Green {
         JobState::Succeeded
@@ -2733,13 +3310,43 @@ pub(crate) fn parse_receipt_line(log: &str) -> Option<serde_json::Value> {
 }
 
 /// The receipt a `scoped_test` job printed (#1638): the last
-/// `SCOPED_TEST_RECEIPT ` line of the log, when it is a JSON object.
+/// complete `SCOPED_TEST_RECEIPT ` line containing a JSON object. An interrupted
+/// final write must not hide the preceding complete receipt.
 pub(crate) fn parse_scoped_receipt_line(log: &str) -> Option<serde_json::Value> {
-    log.lines()
+    log.rsplit_once('\n')?
+        .0
+        .lines()
         .rev()
-        .find_map(|line| line.trim_end().strip_prefix(SCOPED_RECEIPT_LINE_PREFIX))
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .filter(serde_json::Value::is_object)
+        .filter_map(|line| line.trim_end().strip_prefix(SCOPED_RECEIPT_LINE_PREFIX))
+        .find_map(|json| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .filter(serde_json::Value::is_object)
+        })
+}
+
+/// Seek from the end so a large final receipt survives the diagnostic read
+/// limit. Bound memory and I/O even for malformed logs; discard any leading
+/// fragment and let the parser ignore an unfinished final line.
+fn read_scoped_receipt(path: &str) -> Option<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let start = file
+        .metadata()
+        .ok()?
+        .len()
+        .saturating_sub(SCOPED_RECEIPT_READ_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(SCOPED_RECEIPT_READ_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let complete = if start == 0 {
+        bytes.as_slice()
+    } else {
+        &bytes[bytes.iter().position(|byte| *byte == b'\n')? + 1..]
+    };
+    parse_scoped_receipt_line(&String::from_utf8_lossy(complete))
 }
 
 /// The receipt a `test_no_run` sweep printed (#2692): the last
@@ -2856,17 +3463,17 @@ fn external_stop_status(diagnostics: &str) -> Option<(String, i32)> {
 
 fn stopped_scoped_test_result(
     log: &str,
-    unit: &str,
+    job: &AgentJobV1,
     result: &str,
     status: i32,
 ) -> AgentJobResultV1 {
-    let mut receipt = parse_scoped_receipt_line(log);
+    let mut receipt = read_scoped_receipt(&job.log_path).or_else(|| parse_scoped_receipt_line(log));
     if let Some(receipt) = receipt.as_mut().and_then(serde_json::Value::as_object_mut) {
         receipt.insert("ok".into(), false.into());
         receipt.insert("partial".into(), true.into());
         receipt.insert(
             "termination".into(),
-            serde_json::json!({"unit": unit, "result": result, "exec_main_status": status}),
+            serde_json::json!({"unit": job.unit_name, "result": result, "exec_main_status": status}),
         );
     }
     AgentJobResultV1 {
@@ -2930,11 +3537,12 @@ fn scoped_receipt_failing_tests(receipt: &serde_json::Value) -> Vec<String> {
 /// `scoped_test_receipt_missing`. `exit_code` and the log path are already on
 /// the result and the job.
 fn classify_scoped_test(
+    job: &AgentJobV1,
     exit_code: Option<i32>,
     log: &str,
     mut result: AgentJobResultV1,
 ) -> (JobState, AgentJobResultV1) {
-    let receipt = parse_scoped_receipt_line(log);
+    let receipt = read_scoped_receipt(&job.log_path).or_else(|| parse_scoped_receipt_line(log));
     let ok = receipt
         .as_ref()
         .and_then(|r| r.get("ok"))
@@ -3055,6 +3663,14 @@ pub(crate) fn classify(
         detail: Some(tail(log)).filter(|t| !t.is_empty()),
         ..AgentJobResultV1::default()
     };
+    #[cfg(any(target_os = "macos", test))]
+    if matches!(&job.params, JobParams::Test(_))
+        && (job.unit_name.starts_with("gui/") || job.unit_name.starts_with("user/"))
+        && test_containment::setup_failed(exit_code, log)
+    {
+        result.refusal = Some(rsi_common::agent_jobs::JOB_TEST_SOURCE_UNCONTAINED.into());
+        return (JobState::Failed, result);
+    }
     // cargo-slot may stop admission itself before the next daemon poll. Keep
     // that typed cause even for scoped tests that never reached their runner.
     if exit_code == Some(124)
@@ -3062,12 +3678,32 @@ pub(crate) fn classify(
         && phase.text.starts_with("admission-timeout:")
     {
         result.refusal = Some(JOB_ADMISSION_TIMED_OUT.into());
-        result.detail = Some(phase.text);
-        result.receipt = parse_scoped_receipt_line(log);
+        // #618: an infrastructure failure, not the worker's: name the class and
+        // what the governor said last (slot holders, or the disk/memory floor).
+        result.failure_class = Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into());
+        let blocked_by = last_slot_wait_reason(log);
+        result.detail = Some(match &blocked_by {
+            Some(reason) => format!("{}; last blocked by: {reason}", phase.text),
+            None => phase.text,
+        });
+        result.receipt = read_scoped_receipt(&job.log_path)
+            .or_else(|| parse_scoped_receipt_line(log))
+            .map(|receipt| stamp_admission_timeout(receipt, blocked_by.as_deref()));
         return (JobState::Failed, result);
     }
     if let JobParams::CloudSweep(p) = &job.params {
         let wall = job_wall_secs(job, Utc::now());
+        if p.lane == rsi_common::agent_jobs::SweepLane::Build {
+            return cloud_build::classify(
+                &p.sha,
+                exit_code,
+                log,
+                cloud_build::read_ledger().as_deref(),
+                result,
+                &cloud_build::results_dir(&p.sha),
+                wall,
+            );
+        }
         return classify_cloud_sweep_timed(
             &p.sha,
             exit_code,
@@ -3088,15 +3724,41 @@ pub(crate) fn classify(
         return classify_candidate_receipt(exit_code, log, result);
     }
     if let JobParams::Test(p) = &job.params
+        && profile_verification::recorded_profile_binding(job).is_some()
+    {
+        // The process status is the only completion input for profile jobs.
+        // No project-authored scoped/candidate receipt is parsed as evidence.
+        let _ = p;
+        return (
+            if exit_code == Some(0) {
+                JobState::Succeeded
+            } else {
+                JobState::Failed
+            },
+            result,
+        );
+    }
+    if let JobParams::Test(p) = &job.params
         && (p.is_scoped_test() || is_scoped_recipe(p, log))
     {
-        let (state, mut result) = classify_scoped_test(exit_code, log, result);
+        let (state, mut result) = classify_scoped_test(job, exit_code, log, result);
         // #1979: the receipt states the job timeout the run was held to.
         if let (Some(receipt), Some(minutes)) = (
             result.receipt.as_mut().and_then(|r| r.as_object_mut()),
             p.timeout_minutes,
         ) {
             receipt.insert("job_timeout_minutes".into(), minutes.into());
+            // Deploy/capacity holds precede the wrapper and are not in its
+            // slot/lock accounting. Preserve this wait in the durable receipt.
+            if let (Some(queued), Some(Ok(started))) = (
+                queue_started_at(job),
+                job.started_at.as_deref().map(DateTime::parse_from_rfc3339),
+            ) {
+                receipt.insert(
+                    "queue_wait_sec".into(),
+                    started.timestamp().saturating_sub(queued).max(0).into(),
+                );
+            }
         }
         return (state, result);
     }
@@ -3123,6 +3785,10 @@ pub(crate) fn classify(
             },
             result,
         );
+    }
+    if matches!(job.params, JobParams::Bench(_)) {
+        let state = bench::classify_exit(exit_code, &mut result);
+        return (state, result);
     }
     let state = if exit_code == Some(0) {
         JobState::Succeeded
@@ -3194,30 +3860,44 @@ fn scoped_job(job: &AgentJobV1) -> bool {
     matches!(&job.params, JobParams::Test(p) if p.is_scoped_test())
 }
 
-fn scoped_admission_expired(job: &AgentJobV1, wall: u64, limit: u64) -> bool {
-    wall > limit.saturating_sub(SCOPED_JOB_RUNTIME_RESERVE_SECS)
-        && read_log_phases(&job.log_path).last().is_some_and(|phase| {
-            phase.text.starts_with("slot-wait:")
-                || phase.text.starts_with("artifact-lock-wait:")
-                || phase.text.starts_with("sandbox-lock-wait:")
-        })
+/// The current attempt's queue starts at its durable marker. Deploy reruns
+/// clear the old log before writing a new marker, retaining the original job id.
+/// Legacy/unreadable logs fall back to the job's creation time.
+fn queue_started_at(job: &AgentJobV1) -> Option<i64> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(&job.log_path)
+        && file.take(16 * 1024).read_to_end(&mut head).is_ok()
+        && let Some(phase) = String::from_utf8_lossy(&head)
+            .lines()
+            .filter_map(parse_phase)
+            .find(|phase| phase.text.starts_with("queue-wait:"))
+    {
+        return Some(phase.at);
+    }
+    DateTime::parse_from_rfc3339(&job.created_at)
+        .ok()
+        .map(|at| at.timestamp())
 }
 
-/// Scoped jobs count waits in their wall budget; other jobs keep separate admission.
+/// Let scoped-test publish its own capacity refusal before the daemon backstop.
+fn admission_timeout_allowance_secs(job: &AgentJobV1) -> u64 {
+    admission_allowance_secs(&job.params)
+        + if scoped_job(job) {
+            SCOPED_SLOT_WAIT_GRACE_SECS
+        } else {
+            0
+        }
+}
+
+/// Admission waits are bounded separately and leave the execution budget intact.
 fn timed_out(job: &AgentJobV1, now: DateTime<Utc>) -> bool {
     job_timeout_secs(&job.params).is_some_and(|limit| {
         // Execution and wait durations cannot exceed total wall time. Avoid
         // scanning a potentially large log while all budgets are still safe.
         let allowance = admission_allowance_secs(&job.params);
-        let safe_wall = if scoped_job(job) {
-            limit
-                .saturating_sub(SCOPED_JOB_RUNTIME_RESERVE_SECS)
-                .min(JOB_START_WAIT_MAX_SECS)
-        } else {
-            // The start check below applies at the start cap, whatever the
-            // admission allowance (#2149).
-            limit.min(allowance).min(JOB_START_WAIT_MAX_SECS)
-        };
+        // The start check applies at the start cap, whatever the admission allowance.
+        let safe_wall = limit.min(allowance).min(JOB_START_WAIT_MAX_SECS);
         if job_wall_secs(job, now).is_some_and(|wall| wall <= safe_wall as i64) {
             return false;
         }
@@ -3232,12 +3912,31 @@ fn timed_out(job: &AgentJobV1, now: DateTime<Utc>) -> bool {
             .or_else(|| job_wall_secs(job, now))
             .unwrap_or(0)
             .max(0) as u64;
-        if scoped_job(job) {
-            return wall > limit || scoped_admission_expired(job, wall, limit);
-        }
         let waited = log_wait_secs(&job.log_path, now).unwrap_or(0);
-        waited > allowance || wall.saturating_sub(waited) > limit
+        waited > admission_timeout_allowance_secs(job) || wall.saturating_sub(waited) > limit
     })
+}
+
+/// #282: the target directory the daemon chose for the job, from the
+/// `rsi-build-target <dir>` line it wrote to the log before the unit launched.
+/// Only the first such line counts: a later one could be build output.
+fn log_build_target(path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    // The daemon writes it right after the launch phase line; bound the scan.
+    for _ in 0..16 {
+        line.clear();
+        if !reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix(b"rsi-build-target ") {
+            let dir = String::from_utf8_lossy(rest).trim_end().to_string();
+            return (!dir.is_empty()).then_some(dir);
+        }
+    }
+    None
 }
 
 /// #1756: seconds a job log spent waiting for a governor build slot
@@ -3577,38 +4276,11 @@ fn timed_out_result(job: &AgentJobV1, now: DateTime<Utc>, unit: Option<&str>) ->
     let log = read_log_tail(&job.log_path);
     let minutes = job_timeout_secs(&job.params).unwrap_or(0) / 60;
     let waited = log_wait_secs(&job.log_path, now);
-    if scoped_job(job) {
-        let wall = log_job_start(&job.log_path)
-            .flatten()
-            .map(|at| now.timestamp().saturating_sub(at).max(0) as u64)
-            .unwrap_or_else(|| job_wall_secs(job, now).unwrap_or(0).max(0) as u64);
-        let admission = scoped_admission_expired(job, wall, minutes * 60);
-        return AgentJobResultV1 {
-            refusal: Some(
-                if admission {
-                    JOB_ADMISSION_TIMED_OUT
-                } else {
-                    JOB_TIMED_OUT
-                }
-                .into(),
-            ),
-            detail: Some(format!(
-                "scoped-test exhausted its {minutes}-minute wall budget{}; waits count against it; the unit was stopped\n{}",
-                if admission {
-                    " minus the 120s runtime reserve while waiting for admission"
-                } else {
-                    ""
-                },
-                phase_summary(&read_log_phases(&job.log_path), now)
-            )),
-            slot_wait_secs: waited,
-            ..AgentJobResultV1::default()
-        };
-    }
     let allowance = admission_allowance_secs(&job.params);
-    if waited.is_some_and(|secs| secs > allowance) {
+    if waited.is_some_and(|secs| secs > admission_timeout_allowance_secs(job)) {
         return AgentJobResultV1 {
             refusal: Some(JOB_ADMISSION_TIMED_OUT.into()),
+            failure_class: Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into()),
             detail: Some(format!(
                 "the job exhausted its separate {}-minute build admission limit; execution excludes this wait; the unit was stopped\n{}",
                 allowance / 60,
@@ -3626,8 +4298,19 @@ fn timed_out_result(job: &AgentJobV1, now: DateTime<Utc>, unit: Option<&str>) ->
         phase_summary(&read_log_phases(&job.log_path), now)
     );
     let failing = failing_test_report(&log);
+    let mut receipt = match &job.params {
+        JobParams::Test(p) if p.is_scoped_test() || is_scoped_recipe(p, &log) => {
+            read_scoped_receipt(&job.log_path)
+        }
+        _ => None,
+    };
+    if let Some(receipt) = receipt.as_mut().and_then(serde_json::Value::as_object_mut) {
+        receipt.insert("ok".into(), false.into());
+        receipt.insert("partial".into(), true.into());
+    }
     AgentJobResultV1 {
         refusal: Some(JOB_TIMED_OUT.into()),
+        receipt,
         failing_tests: failing.names,
         failing_tests_omitted: failing.omitted,
         detail: Some(if log.is_empty() {
@@ -3669,6 +4352,93 @@ fn timeout_breach(
     ))
 }
 
+/// #625: how long the host disk floor alone may hold a job's governor wait, with
+/// no slot holder, before the daemon settles it early. cargo-slot's one-time idle
+/// target-pool reclaim (bounded at 300 s) has finished by then, so what remains is
+/// host state nothing else will free; a wait with slot holders keeps the full
+/// admission allowance.
+pub(crate) const DISK_FLOOR_FAIL_FAST_SECS: u64 = 10 * 60;
+
+/// #625: how long the governor has held `job` on the disk floor alone, from the
+/// stalled waiters (matched by the job's unit); `None` when it is not one.
+fn disk_floor_stall_secs(
+    job: &AgentJobV1,
+    stalls: &[crate::governor::DiskStalledWaiter],
+) -> Option<u64> {
+    let unit = job.unit_name.trim_end_matches(".service");
+    stalls
+        .iter()
+        .find(|w| {
+            w.unit
+                .as_deref()
+                .is_some_and(|u| u.trim_end_matches(".service") == unit)
+        })
+        .map(|w| w.stalled_secs)
+}
+
+/// #625: the `job_admission_timed_out` settlement of a job the host disk floor
+/// alone held for `stalled_secs` with no slot holder. It names the free space
+/// from the job's last wait line and what to do; the class is infrastructure.
+fn disk_floor_stalled_result(job: &AgentJobV1, stalled_secs: u64) -> AgentJobResultV1 {
+    let log = read_log_tail(&job.log_path);
+    let blocked_by = last_slot_wait_reason(&log);
+    let seen = blocked_by.as_deref().map_or(String::new(), |reason| {
+        format!(" (last governor reason: {reason})")
+    });
+    AgentJobResultV1 {
+        refusal: Some(JOB_ADMISSION_TIMED_OUT.into()),
+        failure_class: Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into()),
+        detail: Some(format!(
+            "the host disk floor held the job for {} minutes with no build slot holder and nothing reclaiming space{seen}; waiting longer cannot help, so its unit was stopped before it compiled (an infrastructure failure, not charged to the retry limit). Free disk (`scripts/clean-target` on a finished sandbox, or the sandbox build-cache reclaim) and resubmit once at the same head\n{}",
+            stalled_secs / 60,
+            phase_summary(&read_log_phases(&job.log_path), Utc::now())
+        )),
+        receipt: read_scoped_receipt(&job.log_path)
+            .map(|receipt| stamp_admission_timeout(receipt, blocked_by.as_deref())),
+        slot_wait_secs: Some(stalled_secs),
+        ..AgentJobResultV1::default()
+    }
+}
+
+/// #625: a running test or build job the host disk floor alone has held past
+/// [`DISK_FLOOR_FAIL_FAST_SECS`] with no slot holder: stop its unit and settle it
+/// `job_admission_timed_out` after confirming it is inactive. `None` when it is
+/// not so held or stopping is uncertain (the next poll retries).
+fn disk_floor_breach(
+    job: &AgentJobV1,
+    runtime: &dyn JobRuntime,
+    stalls: impl FnOnce() -> Vec<crate::governor::DiskStalledWaiter>,
+) -> Option<(JobState, AgentJobResultV1)> {
+    if !matches!(job.kind, JobKind::Test | JobKind::Build) {
+        return None;
+    }
+    let stalled = disk_floor_stall_secs(job, &stalls())?;
+    if stalled < DISK_FLOOR_FAIL_FAST_SECS {
+        return None;
+    }
+    // The waiter's pid is the client's claim: stop the unit only when its own log
+    // also shows it waiting in the governor queue now.
+    let waiting = read_log_phases(&job.log_path)
+        .last()
+        .is_some_and(|phase| phase.text.starts_with("slot-wait:"));
+    if !waiting {
+        return None;
+    }
+    log_unit_stop(
+        &job.unit_name,
+        "host disk floor held the job with no slot holder",
+    );
+    if let Err(error) = runtime.stop_unit(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, %error, "cannot stop disk-stalled agent job unit");
+        return None;
+    }
+    if runtime.unit_active(&job.unit_name) {
+        tracing::warn!(unit = %job.unit_name, "disk-stalled agent job unit is still active after stop");
+        return None;
+    }
+    Some((JobState::Failed, disk_floor_stalled_result(job, stalled)))
+}
+
 /// Hub #2954: a running `build` job whose worktree HEAD moved, or whose clean
 /// tree became dirty, since submit is stopped and settled `job_source_moved`
 /// (the poll runs every few seconds, so this covers the slot wait, the slot
@@ -3678,7 +4448,9 @@ fn source_breach(
     job: &AgentJobV1,
     runtime: &dyn JobRuntime,
 ) -> Option<(JobState, AgentJobResultV1)> {
-    let result = source::check(job, "while the job ran").err()?;
+    let result = profile_verification::check_profile_binding(job)
+        .and_then(|()| source::check(job, "while the job ran").map(|_| ()))
+        .err()?;
     log_unit_stop(&job.unit_name, "build job worktree moved since submit");
     if let Err(error) = runtime.stop_unit(&job.unit_name) {
         tracing::warn!(unit = %job.unit_name, %error, "cannot stop moved-source agent job unit");
@@ -3705,7 +4477,7 @@ fn timed_out_friction(job: &AgentJobV1) -> rsi_common::friction::NewFrictionEven
 /// vanished). Returns the number of jobs settled. Each settle CASes in the
 /// store, so overlapping polls or a restart reconcile never wake twice.
 pub(crate) async fn poll_once(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: &Arc<dyn JobRuntime>,
     now: DateTime<Utc>,
 ) -> Result<usize> {
@@ -3714,7 +4486,7 @@ pub(crate) async fn poll_once(
 
 /// [`poll_once`] with an explicit per-job scratch quota.
 async fn poll_with_scratch_quota(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: &Arc<dyn JobRuntime>,
     now: DateTime<Utc>,
     scratch_quota: u64,
@@ -3752,6 +4524,11 @@ async fn poll_with_scratch_quota(
                     note_start_wait(job, &*runtime, now);
                     match source_breach(job, &*runtime)
                         .or_else(|| timeout_breach(job, &*runtime, now))
+                        .or_else(|| {
+                            disk_floor_breach(job, &*runtime, || {
+                                crate::governor::Governor::global().disk_stalled_waiters()
+                            })
+                        })
                         .or_else(|| scratch_quota_breach(job, &*runtime, scratch_quota))
                     {
                         Some(settlement) => settlement,
@@ -3803,8 +4580,7 @@ async fn poll_with_scratch_quota(
                         && let Some(diagnostics) = runtime.unit_diagnostics(&job.unit_name)
                         && let Some((result, status)) = external_stop_status(&diagnostics)
                     {
-                        let result =
-                            stopped_scoped_test_result(&log, &job.unit_name, &result, status);
+                        let result = stopped_scoped_test_result(&log, job, &result, status);
                         let settled =
                             crate::store_lock::blocking_lock(&store, "agent_jobs::settle")
                                 .settle_agent_job_outcome(
@@ -3847,9 +4623,19 @@ async fn poll_with_scratch_quota(
                             JobParams::CloudSweep(p) => Some(CloudSweepResultV1 {
                                 verdict: SweepVerdict::Incomplete,
                                 sha: p.sha.clone(),
-                                results_dir: sweep_results_dir(&p.sha).display().to_string(),
+                                results_dir: match p.lane {
+                                    rsi_common::agent_jobs::SweepLane::Qa => {
+                                        sweep_results_dir(&p.sha)
+                                    }
+                                    rsi_common::agent_jobs::SweepLane::Build => {
+                                        cloud_build::results_dir(&p.sha)
+                                    }
+                                }
+                                .display()
+                                .to_string(),
                                 new_failures: Vec::new(),
                                 known_failures: Vec::new(),
+                                build: None,
                             }),
                             _ => None,
                         },
@@ -3860,6 +4646,26 @@ async fn poll_with_scratch_quota(
             };
             let mut result = result;
             source::stamp_finish(job, &mut state, &mut result);
+            profile_verification::finish_profile_verification(job, &mut state, &mut result);
+            if job.kind == JobKind::Build && result.target_dir.is_none() {
+                result.target_dir = log_build_target(&job.log_path);
+            }
+            if state == JobState::Succeeded
+                && let JobParams::Build(build) = &job.params
+            {
+                result.release_members = build.release_members.clone();
+            }
+            if job.kind == JobKind::Bench {
+                // #3181: join Harbor's results with the daemon's rows into the record.
+                let guard = crate::store_lock::blocking_lock(&store, "agent_jobs::bench_finalize");
+                bench::finalize(
+                    &guard,
+                    job,
+                    &read_log_tail(&job.log_path),
+                    &mut state,
+                    &mut result,
+                );
+            }
             if matches!(
                 job.kind,
                 rsi_common::agent_jobs::JobKind::Test | rsi_common::agent_jobs::JobKind::Build
@@ -3882,6 +4688,7 @@ async fn poll_with_scratch_quota(
                 }
                 settled
             };
+            runtime.reap_unit_leftovers(&job.unit_name);
             if matches!(
                 job.kind,
                 rsi_common::agent_jobs::JobKind::Test | rsi_common::agent_jobs::JobKind::Build
@@ -3934,7 +4741,10 @@ pub(crate) fn manager_may_cancel(store: &Store, job: &AgentJobV1) -> Result<bool
     let ordinary = match &job.params {
         JobParams::Test(_) => !is_library_qa(&job.params),
         JobParams::Build(build) => !build.release,
-        JobParams::Landing(_) | JobParams::CloudGate(_) | JobParams::CloudSweep(_) => false,
+        JobParams::Landing(_)
+        | JobParams::CloudGate(_)
+        | JobParams::CloudSweep(_)
+        | JobParams::Bench(_) => false,
     };
     Ok(ordinary && !store.bounded_qa_job_bound(job.id)?)
 }
@@ -4015,15 +4825,124 @@ enum StopReason {
     /// #2213: the owner's current manager cancelled it; the detail names the
     /// manager and the owner. Silent like `OwnerCancel`.
     ManagerCancel(Uuid),
-    /// #2048: a staged `interrupt_workers` deploy past its grace:
+    /// #2048: a staged deploy stops the hub's QA guest run on this satellite:
     /// `interrupted_by_deploy` with the deploy id, and the owner's normal
-    /// job-terminal wake.
+    /// job-terminal wake. An ordinary test job is never stopped by a deploy
+    /// (#3554): its unit outlives the restart and the new daemon re-adopts it.
     Deploy(Uuid),
-    /// #2278: a staged `interrupt_workers` deploy past its grace stops an
-    /// ordinary test job and puts it back in the queue under the same id, owner,
-    /// params and wake policy. It is held until the deploy settles and reruns on
-    /// the new daemon; the owner's wake fires once, when the rerun ends.
-    DeployRequeue(Uuid),
+}
+
+/// Largest serialized size of the partial receipt a cancelled job keeps (#594).
+/// The wake and `AgentGetJob` carry it, so a bigger receipt is cut down to its
+/// scalar fields and a bounded per-package and failure summary.
+const CANCELLED_RECEIPT_MAX_BYTES: usize = 32 * 1024;
+/// Most failures and packages a cut-down cancelled receipt still names.
+const CANCELLED_RECEIPT_MAX_ITEMS: usize = 20;
+
+/// Who stopped a running job and why, as the cancelled receipt records it.
+struct CancelAttribution {
+    kind: &'static str,
+    by: Option<Uuid>,
+    owner: Uuid,
+    reason: String,
+}
+
+impl StopReason {
+    fn attribution(&self, owner: Uuid) -> CancelAttribution {
+        match self {
+            Self::OwnerCancel => CancelAttribution {
+                kind: "owner",
+                by: Some(owner),
+                owner,
+                reason: "AgentCancelJob by the job owner".into(),
+            },
+            Self::ManagerCancel(manager) => CancelAttribution {
+                kind: "manager",
+                by: Some(*manager),
+                owner,
+                reason: "AgentCancelJob by the owner's current manager".into(),
+            },
+            // #3554: a deploy stops only the hub's QA guest run; ordinary test
+            // jobs survive the restart, so there is no deploy requeue any more.
+            Self::Deploy(deploy) => CancelAttribution {
+                kind: "deploy",
+                by: Some(*deploy),
+                owner,
+                reason: "stopped by a staged deploy (the hub's QA guest run)".into(),
+            },
+        }
+    }
+}
+
+/// Cut an oversized receipt to a bounded form: scalar fields stay, `shards` is
+/// dropped, and the `failures` and `packages` lists keep their first items with
+/// an `*_omitted` count.
+fn bound_cancelled_receipt(mut receipt: serde_json::Value) -> serde_json::Value {
+    let size =
+        |value: &serde_json::Value| serde_json::to_string(value).map_or(0, |text| text.len());
+    if size(&receipt) <= CANCELLED_RECEIPT_MAX_BYTES {
+        return receipt;
+    }
+    let Some(map) = receipt.as_object_mut() else {
+        return receipt;
+    };
+    map.remove("shards");
+    for key in ["failures", "packages"] {
+        let Some(items) = map.get_mut(key).and_then(serde_json::Value::as_array_mut) else {
+            continue;
+        };
+        let omitted = items.len().saturating_sub(CANCELLED_RECEIPT_MAX_ITEMS);
+        items.truncate(CANCELLED_RECEIPT_MAX_ITEMS);
+        if omitted > 0 {
+            map.insert(format!("{key}_omitted"), omitted.into());
+        }
+    }
+    if size(&receipt) <= CANCELLED_RECEIPT_MAX_BYTES {
+        return receipt;
+    }
+    // Still too large: keep only small scalar fields.
+    let Some(map) = receipt.as_object() else {
+        return receipt;
+    };
+    let kept: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .filter(|(_, value)| match value {
+            serde_json::Value::String(text) => text.len() <= 512,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => false,
+            _ => true,
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let mut kept = serde_json::Value::Object(kept);
+    kept["truncated"] = true.into();
+    kept
+}
+
+/// The last `SCOPED_TEST_RECEIPT` of a stopped job's log (#594), marked as an
+/// explicit cancelled/incomplete verdict: `ok` and `acceptance` are false,
+/// `partial` is true, and `cancellation` names who stopped the run, the owner
+/// and why. `None` when the log holds no complete receipt line.
+fn cancelled_partial_receipt(
+    job: &AgentJobV1,
+    who: &CancelAttribution,
+) -> Option<serde_json::Value> {
+    let mut receipt = bound_cancelled_receipt(read_scoped_receipt(&job.log_path)?);
+    let map = receipt.as_object_mut()?;
+    map.insert("ok".into(), false.into());
+    map.insert("acceptance".into(), false.into());
+    map.insert("partial".into(), true.into());
+    map.insert("verdict".into(), "cancelled_incomplete".into());
+    map.insert(
+        "cancellation".into(),
+        serde_json::json!({
+            "kind": who.kind,
+            "by": who.by,
+            "owner": who.owner,
+            "reason": who.reason,
+            "unit": job.unit_name,
+        }),
+    );
+    Some(receipt)
 }
 
 fn stop_running_job(
@@ -4047,33 +4966,12 @@ fn stop_running_job(
         &row.job.unit_name,
         match reason {
             StopReason::OwnerCancel | StopReason::ManagerCancel(_) => "job cancelled",
-            StopReason::Deploy(_) | StopReason::DeployRequeue(_) => "job interrupted by deploy",
+            StopReason::Deploy(_) => "job interrupted by deploy",
         },
     );
     runtime.stop_unit(&row.job.unit_name).map_err(unstopped)?;
     if runtime.unit_active(&row.job.unit_name) {
         return Err(unstopped("the unit is still active".into()));
-    }
-    if let StopReason::DeployRequeue(deploy) = reason {
-        if !store.requeue_agent_job_for_deploy(job_id, *deploy)? {
-            // Settled while it was being stopped: nothing to put back.
-            let current = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
-            return Ok((current.job, false));
-        }
-        // The stopped run left no outcome: drop its stale status and log so the
-        // rerun's classification reads only its own output.
-        let _ = std::fs::remove_file(&row.status_path);
-        let _ = std::fs::write(&row.job.log_path, "");
-        append_phase(
-            &row.job.log_path,
-            now,
-            &format!(
-                "queue-wait: stopped by deploy {deploy} after its grace; requeued, the unit reruns after the restart"
-            ),
-        );
-        cleanup_job_tmp(Path::new(&row.job.log_path));
-        let current = store.get_agent_job(job_id)?.ok_or_else(not_found)?;
-        return Ok((current.job, true));
     }
     let log = read_log_tail(&row.job.log_path);
     let (refusal, note, deploy_id, wake) = match reason {
@@ -4092,25 +4990,39 @@ fn stop_running_job(
             None,
             false,
         ),
-        StopReason::Deploy(deploy) | StopReason::DeployRequeue(deploy) => (
+        StopReason::Deploy(deploy) => (
             JOB_INTERRUPTED_BY_DEPLOY,
-            "stopped by a staged deploy after its grace (interrupt_workers); resubmit once on the new daemon"
+            "stopped by a staged deploy (the hub's QA guest run); resubmit once on the new daemon"
                 .to_string(),
             Some(*deploy),
             row.job.wake == JobWake::Owner,
         ),
     };
     let failing = failing_test_report(&log);
+    // #594: keep the run's last partial scoped_test receipt, marked cancelled
+    // and incomplete with who stopped it and why, instead of a log tail that
+    // cuts the receipt line mid-JSON.
+    let receipt = if row.job.kind == JobKind::Test {
+        cancelled_partial_receipt(&row.job, &reason.attribution(row.job.owner_session_id))
+    } else {
+        None
+    };
+    let shown_log = if receipt.is_some() {
+        log_without_receipt_lines(&log)
+    } else {
+        log.clone()
+    };
     let result = AgentJobResultV1 {
         refusal: Some(refusal.into()),
         failing_tests: failing.names,
         failing_tests_omitted: failing.omitted,
-        detail: Some(if log.is_empty() {
+        detail: Some(if shown_log.is_empty() {
             note
         } else {
-            format!("{note}\n{}", tail(&log))
+            format!("{note}\n{}", tail(&shown_log))
         }),
         deploy_id,
+        receipt,
         ..AgentJobResultV1::default()
     };
     let settled = store.settle_agent_job_outcome(job_id, JobState::Failed, &result, wake, now)?;
@@ -4121,29 +5033,72 @@ fn stop_running_job(
     Ok((current.job, settled.is_some()))
 }
 
-/// #2048: once a staged `interrupt_workers` deploy has waited
-/// `DEPLOY_JOB_GRACE_SECS` since its request, stop every running `test` job
-/// (`scoped_test` included) with `interrupted_by_deploy`, so the deploy stops
-/// idling behind re-runnable verification and each owner's job-terminal wake
-/// fires. `build`, `landing` and cloud jobs (and the queue's lander) are never
-/// touched and keep blocking the quiet point. Returns the stopped job ids.
+/// #3554: the running jobs a staged `interrupt_workers` deploy lets run across
+/// its restart: every ordinary `test` job (`scoped_test` included) that a
+/// manager may cancel. Its unit is a transient `systemd-run --user` service
+/// outside rsid's process tree and its wrapper writes the status file itself, so
+/// a restart neither kills it nor loses its outcome; the new daemon's startup
+/// poll ([`poll_once`]) finds the `running` row, sees the unit active and
+/// settles it later exactly once (one owner wake, by CAS). Such a job therefore
+/// no longer blocks the quiet point and is neither stopped nor requeued, so a
+/// deploy never makes a test run twice.
 ///
-/// #2190: stopping test jobs gains nothing while the deploy is still blocked
-/// by something it cannot preempt (an admitted or gating queue landing, a
-/// running build), so none is stopped meanwhile and the grace runs from the
-/// latest tick that saw such a blocker (from the request when none was seen).
-/// New `test`/`build` jobs are held for the deploy meanwhile, so a job is only
-/// ever stopped if it was already running when the deploy was staged.
+/// Not survivors, and so unchanged: `build`, `landing` and cloud jobs, the
+/// queue's lander and every protected test (a daemon-owned obligation that
+/// `manager_may_cancel` refuses) keep blocking the quiet point as before, and the
+/// hub's QA guest run is stopped at once ([`stop_hub_qa_for_deploy`]). Empty for
+/// a deploy that does not interrupt workers: that one waits for jobs to drain.
 ///
+/// # Errors
+/// A persistence error.
+pub(crate) fn deploy_surviving_jobs(
+    store: &Store,
+    deploy: &crate::store::agent_deploys::DeployRow,
+) -> Result<Vec<Uuid>> {
+    if deploy.state != rsi_common::agent_deploy::DeployState::Staged
+        || deploy.owner_session_id.is_none()
+        || !store.agent_deploy_interrupt(deploy.id)?.requested
+    {
+        return Ok(Vec::new());
+    }
+    let mut surviving = Vec::new();
+    for row in store.list_running_agent_jobs()? {
+        if row.job.kind == JobKind::Test
+            && !crate::rolling_queue::satellite_qa::is_hub_run(&row.job)
+            && manager_may_cancel(store, &row.job)?
+        {
+            surviving.push(row.job.id);
+        }
+    }
+    Ok(surviving)
+}
+
+/// [`deploy_surviving_jobs`] for the deploy poll and its receipts: a job row the
+/// daemon cannot read must not stall a deploy, so a failure means no survivors
+/// (the deploy waits for running jobs as it does without `interrupt_workers`).
+pub(crate) fn deploy_surviving_jobs_or_none(
+    store: &Store,
+    deploy: &crate::store::agent_deploys::DeployRow,
+) -> Vec<Uuid> {
+    deploy_surviving_jobs(store, deploy).unwrap_or_else(|error| {
+        tracing::warn!(%error, deploy = %deploy.id, "deploy survivors not derived; waiting for running jobs");
+        Vec::new()
+    })
+}
+
 /// #2176: a hub's full-library QA run on this satellite is a guest. Any staged
-/// deploy stops it at once (no grace, no `interrupt_workers` needed, and even
-/// while a landing blocks the deploy: QA is preemptible, only ordinary test
-/// jobs are spared by #2190), and the hub defers that attempt as
-/// `deploy_preempted` instead of the deploy timing out behind it.
-pub(crate) fn cancel_test_jobs_for_deploy(
+/// deploy stops it at once (no `interrupt_workers` needed, and even while a
+/// landing blocks the deploy: QA is preemptible), and the hub defers that
+/// attempt as `deploy_preempted` instead of the deploy timing out behind it.
+/// It settles `interrupted_by_deploy` and wakes its owner. Returns the stopped
+/// job ids.
+///
+/// Ordinary test jobs are not touched (#3554): see [`deploy_surviving_jobs`].
+/// `build`, `landing` and cloud jobs (and the queue's lander) are never touched
+/// and keep blocking the quiet point.
+pub(crate) fn stop_hub_qa_for_deploy(
     store: &Store,
     runtime: &dyn JobRuntime,
-    drain: &crate::deploy_drain::DeployDrain,
     now: DateTime<Utc>,
 ) -> Result<Vec<Uuid>> {
     let Some(deploy) = store.live_agent_deploy()? else {
@@ -4152,44 +5107,14 @@ pub(crate) fn cancel_test_jobs_for_deploy(
     if deploy.state != rsi_common::agent_deploy::DeployState::Staged {
         return Ok(Vec::new());
     }
-    let grace = chrono::Duration::seconds(
-        i64::try_from(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS).unwrap_or(i64::MAX),
-    );
-    let grace_over = if deploy.owner_session_id.is_some()
-        && store.agent_deploy_interrupt(deploy.id)?.requested
-    {
-        if store.deploy_unpreemptible_blockers()?.is_empty() {
-            store
-                .agent_deploy_created_at(deploy.id)?
-                .is_some_and(|created| {
-                    let grace_from = drain
-                        .unpreemptible_blocked_at(deploy.id)
-                        .map_or(created, |seen| seen.max(created));
-                    now >= grace_from + grace
-                })
-        } else {
-            drain.note_unpreemptible_blocked(deploy.id, now);
-            false
-        }
-    } else {
-        false
-    };
     let mut stopped = Vec::new();
     for row in store.list_running_agent_jobs()? {
         if row.job.kind != JobKind::Test
-            || !(grace_over || crate::rolling_queue::satellite_qa::is_hub_run(&row.job))
+            || !crate::rolling_queue::satellite_qa::is_hub_run(&row.job)
         {
             continue;
         }
-        // #2278: only the hub's QA guest run settles failed (the hub defers it);
-        // an ordinary test job is requeued so its owner's wake fires once, on the
-        // rerun.
-        let reason = if crate::rolling_queue::satellite_qa::is_hub_run(&row.job) {
-            StopReason::Deploy(deploy.id)
-        } else {
-            StopReason::DeployRequeue(deploy.id)
-        };
-        match stop_running_job(store, runtime, &row, now, &reason) {
+        match stop_running_job(store, runtime, &row, now, &StopReason::Deploy(deploy.id)) {
             Ok((_, true)) => stopped.push(row.job.id),
             Ok((_, false)) => {}
             Err(error) => {
@@ -4201,7 +5126,7 @@ pub(crate) fn cancel_test_jobs_for_deploy(
 }
 
 pub(crate) async fn sweep_terminal_scratch(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     jobs_dir: &Path,
 ) -> Result<usize> {
     let jobs_dir = jobs_dir.to_path_buf();
@@ -4246,10 +5171,19 @@ pub(crate) async fn sweep_terminal_scratch(
     .map_err(|error| DaemonError::Process(format!("agent job scratch sweep join: {error}")))?
 }
 
+/// #3181: install the ports the `bench` job gates read (startup, beside the bench
+/// service). Until it runs, queued bench jobs wait and a submit builds its own.
+pub fn install_bench_job_ports(
+    config: Arc<crate::config::RuntimeConfig>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
+) {
+    bench::install_ports(Arc::new(bench::DaemonBenchPorts::new(config, store)));
+}
+
 /// The daemon task: reconcile once (the same poll settles jobs that finished
 /// while rsid was down), then keep polling.
 pub async fn run_agent_jobs_loop(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: Arc<dyn JobRuntime>,
     drain: Arc<crate::deploy_drain::DeployDrain>,
 ) {
@@ -4268,15 +5202,12 @@ pub async fn run_agent_jobs_loop(
         }
         {
             let guard = store.lock().await;
-            match cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, Utc::now()) {
+            match stop_hub_qa_for_deploy(&guard, &*runtime, Utc::now()) {
                 Ok(stopped) if !stopped.is_empty() => {
-                    tracing::info!(
-                        ?stopped,
-                        "test jobs stopped by a staged deploy after its grace"
-                    );
+                    tracing::info!(?stopped, "hub QA runs stopped by a staged deploy");
                 }
                 Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "deploy job grace check deferred"),
+                Err(error) => tracing::warn!(%error, "deploy hub QA stop deferred"),
             }
         }
         match start_queued_jobs(&store, &runtime, &tools, &drain).await {
@@ -4285,6 +5216,21 @@ pub async fn run_agent_jobs_loop(
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(%error, "held agent job start deferred"),
+        }
+        // #3181: benchmark runs start behind their own gates, are watched against
+        // their budget while they run, and close their adapter socket when done.
+        if let Some(ports) = bench::installed_ports() {
+            match bench::start_queued(&store, &runtime, &drain, &ports).await {
+                Ok(started) if started > 0 => tracing::info!(started, "bench jobs started"),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "bench job start deferred"),
+            }
+        }
+        if let Err(error) = bench::tick(&store, Utc::now()).await {
+            tracing::warn!(%error, "bench budget watch deferred");
+        }
+        if let Err(error) = bench::reap_runs(&store).await {
+            tracing::warn!(%error, "bench run reap deferred");
         }
         match jobs_dir() {
             Ok(dir) => {
@@ -4416,20 +5362,33 @@ mod tests {
         }
     }
 
-    fn open() -> (Arc<tokio::sync::Mutex<Store>>, tempfile::TempDir) {
+    fn open() -> (Arc<rsid_core::store_lock::Mutex<Store>>, tempfile::TempDir) {
         let store = Store::open_in_memory().expect("store");
-        (Arc::new(tokio::sync::Mutex::new(store)), disk_fixture())
+        (
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
+            disk_fixture(),
+        )
     }
 
     fn disk_fixture() -> tempfile::TempDir {
+        // Every test starts with the capacity gate open: on macOS the real gate
+        // (live `governor_build_slots`, `vm_stat`) would hold a test that
+        // submits more cargo jobs than the host's slots. A test of the gate
+        // sets its own hold after this (see
+        // `a_full_host_holds_cargo_jobs_until_capacity_frees`).
+        crate::host_memory::TEST_CAPACITY_HOLD.with(|hold| hold.set(Some(None)));
         let base = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(rsi_common::manifest_dir!()).join("../../target"));
         std::fs::create_dir_all(&base).unwrap();
-        tempfile::Builder::new()
+        let fixture = tempfile::Builder::new()
             .prefix("agent-jobs-")
             .tempdir_in(base.canonicalize().unwrap())
-            .unwrap()
+            .unwrap();
+        // Lifecycle fixtures model the existing Rust adapter. Generic-profile
+        // tests use their own Makefile-only repositories outside this root.
+        std::fs::write(fixture.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        fixture
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4605,7 +5564,7 @@ mod tests {
         drop(runtime);
         let runtime = platform_job_runtime();
         wait_for_launchd_completion(&*runtime, &row).await;
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&db).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&db).unwrap()));
         assert_eq!(poll_once(&store, &runtime, Utc::now()).await.unwrap(), 1);
         assert_eq!(poll_once(&store, &runtime, Utc::now()).await.unwrap(), 0);
         let guard = store.lock().await;
@@ -4625,6 +5584,7 @@ mod tests {
         let dir = disk_fixture();
         let runtime = platform_job_runtime();
         let make_spec = |timeout| LaunchSpec {
+            kind: JobKind::Test,
             unit_name: runtime.unit_name(Uuid::new_v4()),
             cwd: dir.path().to_path_buf(),
             log_path: dir.path().join(format!("{}.log", Uuid::new_v4())),
@@ -4647,6 +5607,7 @@ mod tests {
                 cpu_quota_percent: 100,
                 background: false,
                 admission_max_secs: None,
+                scoped_tool: None,
             },
             build_environment: None,
         };
@@ -4696,6 +5657,8 @@ mod tests {
         }
     }
 
+    // Asserts the Linux systemd launch details; macOS launches through launchd.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn package_test_and_build_units_hold_the_shard_runner_artifact_lock_shared() {
@@ -4761,6 +5724,8 @@ mod tests {
         }
     }
 
+    // Asserts the Linux systemd launch details; macOS launches through launchd.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_manager_release_build_runs_in_the_shared_release_target() {
@@ -4802,6 +5767,58 @@ mod tests {
         );
         assert_eq!(prepare(&release, false, "b").target_dir, cwd.join("target"));
         assert_eq!(prepare(&dev, true, "c").target_dir, cwd.join("target"));
+    }
+
+    /// #284: preparing the same job id twice (a deploy requeue reruns the job
+    /// under its own id) replaces whatever the first attempt left at the job's
+    /// TMPDIR with a fresh private directory, never failing on EEXIST.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn preparing_the_same_job_id_twice_replaces_its_leftover_tmpdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let jobs = disk_fixture();
+        let data = jobs.path().join("rsi-home");
+        let cwd = jobs.path().join("sandbox");
+        std::fs::create_dir_all(cwd.join("target")).unwrap();
+        let test = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","filters":[]}),
+        );
+        let log = jobs.path().join(format!("{}.log", Uuid::new_v4()));
+        let prepare = || {
+            prepare_build_environment_in(&test, &cwd, &log, false, &data, Some(&cwd))
+                .unwrap()
+                .unwrap()
+        };
+        let fresh = |env: &BuildEnvironment| {
+            assert_eq!(env.tmp_dir, job_tmp_dir(&log).canonicalize().unwrap());
+            let metadata = std::fs::symlink_metadata(&env.tmp_dir).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::read_dir(&env.tmp_dir).unwrap().count(), 0);
+        };
+        fresh(&prepare());
+
+        // The first attempt's scratch is still there (a survivor of the stopped
+        // run wrote into it, with its own mode): the rerun gets an empty one.
+        let tmp = job_tmp_dir(&log);
+        std::fs::create_dir_all(tmp.join("target/debug")).unwrap();
+        std::fs::write(tmp.join("target/debug/stale"), b"old run").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fresh(&prepare());
+
+        // A leftover file or symlink is replaced too, and a symlink is never
+        // followed: the directory it names keeps its contents.
+        std::fs::remove_dir(&tmp).unwrap();
+        std::fs::write(&tmp, b"not a directory").unwrap();
+        fresh(&prepare());
+        let elsewhere = jobs.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        std::fs::remove_dir(&tmp).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &tmp).unwrap();
+        fresh(&prepare());
+        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -4875,7 +5892,9 @@ mod tests {
         let marker = scratch.target().join("disposable-build-output");
         std::fs::write(&marker, "fixture artifact").unwrap();
 
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runtime = Arc::new(FakeRuntime::default());
         let dynamic: Arc<dyn JobRuntime> = runtime.clone();
         let owner = Uuid::new_v4();
@@ -5057,6 +6076,8 @@ mod tests {
         );
     }
 
+    // Asserts the Linux systemd launch details; macOS launches through launchd.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn build_and_gate_units_receive_only_the_required_build_environment() {
@@ -5177,6 +6198,45 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn only_direct_qa_children_of_the_deploy_dir_are_manager_qa_worktrees() {
+        let root = disk_fixture();
+        let data = root.path().join("data");
+        let deploy = data.join("deploy");
+        for dir in [
+            deploy.join("qa-893eb12dd/crates"),
+            deploy.join("bin-abc"),
+            data.join("qa-elsewhere"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let canon = |path: PathBuf| path.canonicalize().unwrap();
+        assert!(is_manager_qa_worktree(
+            &canon(deploy.join("qa-893eb12dd")),
+            &data
+        ));
+        // A subdirectory, another deploy child and a qa-* name elsewhere are not.
+        for cwd in [
+            deploy.join("qa-893eb12dd/crates"),
+            deploy.join("bin-abc"),
+            data.join("qa-elsewhere"),
+        ] {
+            assert!(
+                !is_manager_qa_worktree(&canon(cwd.clone()), &data),
+                "{}",
+                cwd.display()
+            );
+        }
+        // No deploy directory: nothing is a QA worktree.
+        let bare = root.path().join("bare");
+        std::fs::create_dir_all(bare.join("deploy_missing/qa-x")).unwrap();
+        assert!(!is_manager_qa_worktree(
+            &canon(bare.join("deploy_missing/qa-x")),
+            &bare
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn sandbox_subdirectories_and_sibling_sandboxes_reuse_their_sandbox_target() {
         let root = disk_fixture();
         let data = root.path().join("data");
@@ -5229,6 +6289,8 @@ mod tests {
         );
     }
 
+    // Asserts the Linux systemd launch details; macOS launches through launchd.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn test_and_build_jobs_from_two_worktrees_build_in_their_own_targets() {
@@ -5308,6 +6370,150 @@ mod tests {
             .into_iter()
             .filter(|job| job.wake_session_id == Some(owner))
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn makefile_only_verification_is_durable_and_ignores_forged_receipt_output() {
+        use rsi_common::agent_landing_candidate::assess_candidate;
+        let repo = profile_verification::tests::repo();
+        let (store, jobs) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        for (index, value) in [
+            serde_json::json!({"scoped_test":{"base":"HEAD"},"cpu_quota_percent":100}),
+            serde_json::json!({"recipe":"test"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let context = SubmitContext {
+                params: params(JobKind::Test, value),
+                wake: JobWake::None,
+                ..ctx(owner, repo.path(), Some(&format!("profile-{index}")))
+            };
+            let (submitted, _) = submit(
+                &*store.lock().await,
+                &*runtime,
+                &tools(),
+                jobs.path(),
+                context,
+                Utc::now(),
+            )
+            .unwrap();
+            let spec = runtime.launched.lock().unwrap().last().unwrap().clone();
+            assert!(spec.build_environment.is_none());
+            let output = Command::new(&spec.command.argv[0])
+                .args(&spec.command.argv[1..])
+                .current_dir(repo.path())
+                .env_remove("RSI_SESSION_TOKEN")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let forged = "SCOPED_TEST_RECEIPT {\"ok\":true,\"head\":\"forged\",\"packages\":[{\"completed\":999999}]}\n";
+            std::fs::write(
+                &submitted.job.log_path,
+                format!("{}{forged}", String::from_utf8_lossy(&output.stdout)),
+            )
+            .unwrap();
+            std::fs::write(&submitted.status_path, "0\n").unwrap();
+            *runtime.active.lock().unwrap() = false;
+            assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 1);
+            assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 0);
+            let job = store
+                .lock()
+                .await
+                .get_agent_job(submitted.job.id)
+                .unwrap()
+                .unwrap()
+                .job;
+            let binding = profile_verification::recorded_profile_binding(&job).unwrap();
+            assert!(profile_verification::check_profile_binding(&job).is_ok());
+            let verdict = assess_candidate(&job, &binding.head);
+            assert!(verdict.ok, "{verdict:?}");
+            assert_eq!(
+                verdict.tests_completed, 0,
+                "opaque recipes do not invent a test count"
+            );
+            let evidence = verdict.profile_verification.unwrap();
+            assert_eq!(evidence.completed_commands, 1);
+            assert_eq!(evidence.warning_verdict, "generic_command_exit");
+            assert!(job.result.as_ref().unwrap().receipt.is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn profile_jobs_fail_closed_on_failed_exit_and_changed_queued_source() {
+        use rsi_common::agent_landing_candidate::assess_candidate;
+        let repo = profile_verification::tests::repo();
+        let (store, jobs) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let context = || SubmitContext {
+            params: params(
+                JobKind::Test,
+                serde_json::json!({"scoped_test":{"base":"HEAD"}}),
+            ),
+            wake: JobWake::None,
+            ..ctx(Uuid::new_v4(), repo.path(), None)
+        };
+        let (submitted, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            jobs.path(),
+            context(),
+            Utc::now(),
+        )
+        .unwrap();
+        std::fs::write(&submitted.status_path, "1\n").unwrap();
+        *runtime.active.lock().unwrap() = false;
+        poll_once(&store, &dynamic, Utc::now()).await.unwrap();
+        let job = store
+            .lock()
+            .await
+            .get_agent_job(submitted.job.id)
+            .unwrap()
+            .unwrap()
+            .job;
+        assert_eq!(job.state, JobState::Failed);
+        assert!(
+            !assess_candidate(
+                &job,
+                &profile_verification::recorded_profile_binding(&job)
+                    .unwrap()
+                    .head
+            )
+            .ok
+        );
+        let (queued, _) = submit_with_hold(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            jobs.path(),
+            context(),
+            true,
+            Utc::now(),
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("Makefile"), "test:\n\t@echo moved\n").unwrap();
+        profile_verification::tests::commit(repo.path());
+        assert!(profile_verification::check_profile_binding(&queued.job).is_err());
+        let mut state = JobState::Succeeded;
+        let mut result = AgentJobResultV1 {
+            exit_code: Some(0),
+            ..AgentJobResultV1::default()
+        };
+        profile_verification::finish_profile_verification(&queued.job, &mut state, &mut result);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(
+            result.refusal.as_deref(),
+            Some("project_verification_source_changed")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5551,8 +6757,7 @@ mod tests {
             serde_json::json!(["module::tests::one", "module::tests::two"]),
         ] {
             for lib_only in [false, true] {
-                let mut value =
-                    serde_json::json!({"package":"rsi","filters":filters,"lib_only":lib_only});
+                let mut value = serde_json::json!({"package":"rsi-common","filters":filters,"lib_only":lib_only});
                 let default = command(value.clone());
                 value["exact"] = serde_json::json!(false);
                 assert_eq!(command(value.clone()), default);
@@ -5571,6 +6776,160 @@ mod tests {
                 assert_eq!(exact[separator + 1..], libtest_args);
             }
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn e2e_package_jobs_reuse_the_shared_setup_for_every_matching_target_selection() {
+        for target in [None, Some("e2e_tui"), Some("another_target")] {
+            for lib_only in [false, true] {
+                if lib_only && target.is_some() {
+                    continue;
+                }
+                let mut value = serde_json::json!({
+                    "package":"rsi", "filters":["fresh_install::test_e2e_fresh_install_appoint_project_manager"],
+                    "exact":true, "lib_only":lib_only
+                });
+                if let Some(target) = target {
+                    value["test_target"] = serde_json::json!(target);
+                }
+                let command = test_command(
+                    &tools(),
+                    &match params(JobKind::Test, value) {
+                        JobParams::Test(test) => test,
+                        _ => unreachable!(),
+                    },
+                );
+                let e2e = !lib_only && target != Some("another_target");
+                assert_eq!(command[4], if e2e { "bash" } else { "cargo" });
+                if e2e {
+                    assert_eq!(&command[5..8], ["scripts/e2e.sh", "--cargo-test", "test"]);
+                    assert_eq!(
+                        &command[command.len() - 3..],
+                        [
+                            "fresh_install::test_e2e_fresh_install_appoint_project_manager",
+                            "--exact",
+                            "--test-threads=1"
+                        ]
+                    );
+                }
+            }
+        }
+        let all = test_command(
+            &tools(),
+            &match params(JobKind::Test, serde_json::json!({"package":"rsi"})) {
+                JobParams::Test(test) => test,
+                _ => unreachable!(),
+            },
+        );
+        assert_eq!(&all[all.len() - 2..], ["--", "--test-threads=1"]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn e2e_package_job_panicking_fixture() {
+        // Only the isolated child process exercises this gated panic. Without
+        // RSI_E2E the same libtest binary exits successfully, like e2e_tui did.
+        if std::env::var_os("RSI_E2E_JOB_PANIC_FIXTURE").is_some()
+            && std::env::var("RSI_E2E").as_deref() == Ok("1")
+        {
+            panic!("e2e package job fixture executed its body");
+        }
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn e2e_package_job_runs_a_gated_panicking_body_and_settles_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::disk_backed_tempdir("e2e-package-job");
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("e2e.sh"),
+            include_str!("../../../scripts/e2e.sh"),
+        )
+        .unwrap();
+        std::fs::write(
+            scripts.join("e2e-prebuild-bins.txt"),
+            include_str!("../../../scripts/e2e-prebuild-bins.txt"),
+        )
+        .unwrap();
+        // Fake only Cargo's build/dispatch layer, then run a real libtest body
+        // with the exact argv/environment emitted for the package test job.
+        let cargo = dir.path().join("cargo");
+        std::fs::write(
+            &cargo,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = build ]; then
+  echo "fixture prebuild $*"
+  exit "${RSI_E2E_JOB_BUILD_EXIT:-0}"
+fi
+while [ "$1" != -- ]; do shift; done
+shift
+exec "$RSI_E2E_JOB_TEST_BIN" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let job_tools = JobTools {
+            cargo_slot: PathBuf::from("env"),
+            ..tools()
+        };
+        let fixture = "agent_jobs::tests::e2e_package_job_panicking_fixture";
+        let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let run = |lib_only, build_exit: &str| {
+            let params = params(
+                JobKind::Test,
+                serde_json::json!({
+                    "package":"rsi", "test_target": if lib_only { None } else { Some("e2e_tui") },
+                    "lib_only":lib_only, "filters":[fixture], "exact":true
+                }),
+            );
+            let command = job_command(&job_tools, &params, dir.path(), None).unwrap();
+            let output = Command::new(&command.argv[0])
+                .args(&command.argv[1..])
+                .current_dir(dir.path())
+                .env("PATH", &path)
+                .env_remove("RSI_E2E")
+                .env("RSI_E2E_JOB_PANIC_FIXTURE", "1")
+                .env("RSI_E2E_JOB_BUILD_EXIT", build_exit)
+                .env("RSI_E2E_JOB_TEST_BIN", std::env::current_exe().unwrap())
+                .output()
+                .unwrap();
+            let log = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let job = filtered_job(params, &dir.path().join("job.log"));
+            (
+                settle_logged(&job, output.status.code().unwrap(), &log),
+                log,
+            )
+        };
+        let ((state, result), log) = run(false, "0");
+        assert_eq!(state, JobState::Failed, "{log}");
+        assert_eq!(result.exit_code, Some(101));
+        assert!(log.contains("1 failed"), "{log}");
+        assert!(
+            log.contains("e2e package job fixture executed its body"),
+            "{log}"
+        );
+
+        let ((state, result), log) = run(true, "0");
+        assert_eq!(state, JobState::Succeeded, "{log}");
+        assert_eq!(result.exit_code, Some(0));
+        assert!(log.contains("1 passed"), "{log}");
+
+        let ((state, result), log) = run(false, "42");
+        assert_eq!(state, JobState::Failed, "{log}");
+        assert_eq!(result.exit_code, Some(42));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5787,14 +7146,6 @@ mod tests {
             (
                 "scripts/cloud-gate.sh",
                 include_str!("../../../scripts/cloud-gate.sh"),
-            ),
-            (
-                "scripts/cloud-spend.py",
-                include_str!("../../../scripts/cloud-spend.py"),
-            ),
-            (
-                "scripts/cloud-sweep-verdict.py",
-                include_str!("../../../scripts/cloud-sweep-verdict.py"),
             ),
             (
                 "scripts/cloud-sweep-excerpts.sh",
@@ -6060,6 +7411,7 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 held: None,
+                hold: None,
                 wake: JobWake::Owner,
             };
             crate::store::agent_jobs::wake_message(&job, JobState::Failed, result)
@@ -6069,14 +7421,14 @@ mod tests {
                 "GREEN",
                 format!("VERDICT GREEN {sha} new=0"),
                 "Known only: #1016\n- KNOWN #1016 `rsid a::known`\n".to_string(),
-                "new=0; known=1; lanes=23; wall=12m05s",
+                "new=0; known=1; lanes=1; wall=12m05s",
             ),
             (
                 "RED",
                 format!("VERDICT RED {sha} new=2"),
                 "- KNOWN #1016 `rsid a::known`\n- NEW `rsid b::new_one`\n- NEW `rsid c::new_two`\n"
                     .to_string(),
-                "new=2; known=1; lanes=23; wall=12m05s",
+                "new=2; known=1; lanes=1; wall=12m05s",
             ),
         ];
         for (label, line, verdict_lines, expect_detail) in fixtures {
@@ -6480,11 +7832,11 @@ mod tests {
             sweep_lane_table(&fewer)
         );
         let mut missing_fixed = sweep_lane_labels();
-        missing_fixed.retain(|label| label != "rsi-common");
+        missing_fixed.retain(|label| label != "rolling-library-qa");
         missing_fixed.push("rsid-other-17".into());
         let swapped = good.replace(
-            "rsid-other-05 | 10 | 0 | 1 | 0 |",
-            "rsid-other-05 | 10 | 0 | 1 |",
+            "rolling-library-qa | 10 | 0 | 1 | 0 |",
+            "rolling-library-qa | 10 | 0 | 1 |",
         );
         let cases: Vec<(&str, String)> = vec![
             (
@@ -6507,7 +7859,7 @@ mod tests {
             ("a lane count below the expected lanes", short_table),
             (
                 "Lanes: header above the rows present",
-                good.replacen("Lanes: 23", "Lanes: 99", 1),
+                good.replacen("Lanes: 1", "Lanes: 99", 1),
             ),
             (
                 "a fixed lane replaced by an extra shard",
@@ -6551,16 +7903,15 @@ mod tests {
             verdict == SweepVerdict::Green
         };
         let labels = sweep_lane_labels();
-        // The lane list is the crate manifest's shards plus the fixed lanes.
-        assert_eq!(labels.len(), 16 + SWEEP_FIXED_LANES.len());
-        assert!(labels.contains(&"rsid-store-04".to_string()));
+        // The cloud sweep runs the QA recipe as one lane (#3460).
+        assert_eq!(labels, ["rolling-library-qa"]);
 
         // Positive: a report shaped like the real writer's for a sweep whose
         // one nonzero lane has only KNOWN reds (real lane table and layout).
         let mut table = sweep_lane_table(&labels);
         table = table.replace(
-            "| rsid-bins | 10 | 0 | 1 | 0 |",
-            "| rsid-bins | 152 | 1 | 2 | 100 |",
+            "| rolling-library-qa | 10 | 0 | 1 | 0 |",
+            "| rolling-library-qa | 152 | 1 | 2 | 100 |",
         );
         let real_shape = format!(
             "# Cloud QA sweep \u{2014} {sha}\n\nTip SHA: `{sha}`  \nStarted: 2026-09-30T11:39:41Z  \nFinished: 2026-09-30T12:18:59Z  \nWall: 39.3 min  \nLanes: {}  \nFailing names needing signature review: 1\n\n{table}\nSeed set: absent; classification unavailable\nUnclassified failing names (seed names alone do not verify failure signatures):\n- `tests::a_known_red`\nFLAKE lines:\n- none observed\n\n## Verdict\n\n- KNOWN #1079 `tests::a_known_red`\nKnown only: #1079\n\n{green}\n",
@@ -6585,7 +7936,7 @@ mod tests {
         let mut extra = labels.clone();
         extra.push("rsid-extra-99".into());
         let mut duplicated = labels.clone();
-        duplicated[0] = duplicated[1].clone();
+        duplicated.push(duplicated[0].clone());
         let good = sweep_qa_with_labels(sha, &labels, &green);
         assert!(is_green(&good), "the plain complete report");
         let two_verdicts = good.replace(
@@ -6614,7 +7965,7 @@ mod tests {
                 "a harness failure",
                 good.replace(
                     "## Verdict\n",
-                    "## Verdict\n\n- `rsid-bins:build_or_harness_failure`\n",
+                    "## Verdict\n\n- `rolling-library-qa:build_or_harness_failure`\n",
                 ),
             ),
             (
@@ -6624,8 +7975,8 @@ mod tests {
             (
                 "a nonzero lane exit with no KNOWN entry",
                 good.replace(
-                    "| rsid-bins | 10 | 0 | 1 | 0 |",
-                    "| rsid-bins | 10 | 1 | 1 | 100 |",
+                    "| rolling-library-qa | 10 | 0 | 1 | 0 |",
+                    "| rolling-library-qa | 10 | 1 | 1 | 100 |",
                 ),
             ),
         ];
@@ -6634,15 +7985,13 @@ mod tests {
         }
     }
 
-    /// The report the cloud host's real writers produce (`cloud-sweep-report.py`
-    /// then `cloud-sweep-verdict.py`) for a clean sweep is GREEN, and the same
+    /// The report the cloud host's real writers produce (`rsi-cloud sweep-report`
+    /// then `rsi-cloud sweep-verdict`) for a clean sweep is GREEN, and the same
     /// sweep with a lane that exited nonzero and no named failure is not.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_report_from_the_real_writers_is_green_when_clean() {
-        use std::process::Command;
         let sha = "0123456789abcdef0123456789abcdef01234567";
-        let scripts = Path::new(rsi_common::manifest_dir!()).join("../../scripts");
         let write_report = |bad_lane: bool| -> String {
             let dir = tempfile::tempdir().unwrap();
             let result = dir.path().join(sha);
@@ -6650,7 +7999,11 @@ mod tests {
                 std::fs::create_dir_all(result.join(sub)).unwrap();
             }
             for lane in sweep_expected_lanes() {
-                let code = if bad_lane && lane == "rsi" { 101 } else { 0 };
+                let code = if bad_lane && lane == "rolling-library-qa" {
+                    101
+                } else {
+                    0
+                };
                 std::fs::write(
                     result.join(format!("status/{lane}.tsv")),
                     format!("{lane}\t{code}\n"),
@@ -6662,23 +8015,21 @@ mod tests {
                 )
                 .unwrap();
             }
-            let report = Command::new("python3")
-                .arg(scripts.join("cloud-sweep-report.py"))
-                .args([sha, "2026-09-30T00:00:00Z", "2026-09-30T00:10:00Z"])
-                .arg(&result)
-                .arg(dir.path().join("no-seeds"))
-                .output()
-                .unwrap();
-            assert!(report.status.success(), "{report:?}");
-            std::fs::write(result.join("QA.md"), &report.stdout).unwrap();
-            let verdict = Command::new("python3")
-                .arg(scripts.join("cloud-sweep-verdict.py"))
-                .arg(&result)
-                .args(["--classifier", "/nonexistent-classifier"])
-                .env("HOME", dir.path())
-                .output()
-                .unwrap();
-            assert!(verdict.status.success(), "{verdict:?}");
+            let report = rsi_cloud::sweep::report(
+                sha,
+                "2026-09-30T00:00:00Z",
+                "2026-09-30T00:10:00Z",
+                &result,
+                &dir.path().join("no-seeds"),
+            )
+            .unwrap();
+            std::fs::write(result.join("QA.md"), format!("{report}\n")).unwrap();
+            rsi_cloud::sweep::verdict(
+                &result,
+                &dir.path().join("no-snapshot"),
+                Some(&dir.path().join("no-classifier")),
+            )
+            .unwrap();
             std::fs::read_to_string(result.join("QA.md")).unwrap()
         };
         let clean = write_report(false);
@@ -6811,6 +8162,10 @@ mod tests {
                 "cloud_gate_busy",
             ),
             (
+                "cloud-gate: spot_interrupted: AWS reclaimed i-0abc (Server.SpotInstanceTermination); the run is incomplete and safe to retry\n",
+                "spot_interrupted",
+            ),
+            (
                 "requested SHA is not the current rolling tip\n",
                 "sweep_sha_not_rolling_tip",
             ),
@@ -6869,6 +8224,115 @@ mod tests {
         assert_eq!(
             job.result.unwrap().sweep.unwrap().verdict,
             SweepVerdict::Incomplete
+        );
+    }
+
+    /// #3844: `lane: "build"` is the same `cloud_sweep` job (same authority,
+    /// admission, wake and stop timeout) that runs the sibling `cloud-build.sh`
+    /// from the daemon-owned tree and settles from its exit-code lines.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_build_lane_job_runs_cloud_build_and_settles_red_from_the_failing_step() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+        let owner = Uuid::new_v4();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut c = ctx(owner, dir.path(), None);
+        c.params = params(
+            JobKind::CloudSweep,
+            serde_json::json!({"sha":sha,"lane":"build"}),
+        );
+        let (row, _) = submit(
+            &*store.lock().await,
+            &*runtime,
+            &tools(),
+            dir.path(),
+            c,
+            Utc::now(),
+        )
+        .unwrap();
+        let launched = runtime.launched.lock().unwrap()[0].clone();
+        let argv = &launched.command.argv;
+        let script = PathBuf::from(&argv[0]);
+        assert_eq!(script.file_name().unwrap(), "cloud-build.sh");
+        assert!(script.starts_with(dir.path()), "the daemon-owned tree");
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            include_str!("../../../scripts/cloud-build.sh")
+        );
+        assert_eq!(argv[1], "cloud");
+        assert_eq!(argv[2], sha);
+        assert!(
+            launched.command.stop_timeout_secs >= 20 * 60,
+            "the gate's EXIT trap destroys the host inside the stop timeout"
+        );
+        // The part piped to the host sits beside it, from the same embedded bytes.
+        assert_eq!(
+            std::fs::read_to_string(script.with_file_name("cloud-build-remote.sh")).unwrap(),
+            include_str!("../../../scripts/cloud-build-remote.sh")
+        );
+
+        std::fs::write(&row.status_path, "101\n").unwrap();
+        std::fs::write(
+            &row.job.log_path,
+            format!(
+                "BUILD_HOST instance=i-0nosuchhost sha={sha}\nBUILD_STEP checkout 0\nBUILD_STEP toolchain 0\n\
+BUILD_STEP build 101\nBUILD_STEP test skipped\nBUILD_TAIL_BEGIN build\n| error[E0425]\nBUILD_TAIL_END build\n\
+BUILD_STEPS_DONE {sha}\n"
+            ),
+        )
+        .unwrap();
+        *runtime.active.lock().unwrap() = false;
+        assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 1);
+        let guard = store.lock().await;
+        let wakes = wakes_for(&guard, owner);
+        assert_eq!(wakes.len(), 1);
+        assert!(
+            wakes[0].message.contains("verdict=RED"),
+            "{}",
+            wakes[0].message
+        );
+        assert!(
+            wakes[0].message.contains("failing_step=build"),
+            "{}",
+            wakes[0].message
+        );
+        let job = guard.get_agent_job(row.job.id).unwrap().unwrap().job;
+        assert_eq!(job.state, JobState::Failed);
+        let sweep = job.result.unwrap().sweep.unwrap();
+        assert_eq!(sweep.verdict, SweepVerdict::Red);
+        assert_eq!(sweep.build.unwrap().failing_step.as_deref(), Some("build"));
+    }
+
+    /// The default lane is untouched: no `lane` is stored or printed for it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_default_sweep_lane_still_runs_cloud_sweep_and_stores_no_lane() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let jobs = tempfile::tempdir().unwrap();
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let sweep = params(JobKind::CloudSweep, serde_json::json!({"sha":sha}));
+        assert_eq!(
+            serde_json::to_value(&sweep).unwrap(),
+            serde_json::json!({"kind":"cloud_sweep","sha":sha}),
+            "an absent lane is stored absent"
+        );
+        let gate = materialize_trusted_gate(jobs.path()).unwrap();
+        let command = job_command(&tools(), &sweep, sandbox.path(), Some(&gate)).unwrap();
+        assert_eq!(
+            Path::new(&command.argv[0]).file_name().unwrap(),
+            "cloud-sweep.sh"
+        );
+        let explicit = params(
+            JobKind::CloudSweep,
+            serde_json::json!({"sha":sha,"lane":"qa"}),
+        );
+        assert_eq!(
+            job_command(&tools(), &explicit, sandbox.path(), Some(&gate))
+                .unwrap()
+                .argv,
+            command.argv
         );
     }
 
@@ -6977,8 +8441,38 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn the_spend_guard_is_copied_into_the_trusted_tree_and_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let jobs = tempfile::tempdir().unwrap();
+        let installed = tempfile::tempdir().unwrap();
+        let source = installed.path().join("rsi-cloud");
+        std::fs::write(&source, b"guard v1").unwrap();
+        let root = jobs.path().join("trusted-gate");
+        std::fs::create_dir_all(&root).unwrap();
+        // Without an installed guard the tree gets none (the gate then refuses).
+        materialize_spend_guard(&root, None).unwrap();
+        assert!(!root.join("bin/rsi-cloud").exists());
+        materialize_spend_guard(&root, Some(&source)).unwrap();
+        let placed = root.join("bin/rsi-cloud");
+        assert_eq!(std::fs::read(&placed).unwrap(), b"guard v1");
+        assert_eq!(
+            std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        // A tampered copy is replaced, and a new installed build is picked up.
+        std::fs::write(&placed, b"evil").unwrap();
+        materialize_spend_guard(&root, Some(&source)).unwrap();
+        assert_eq!(std::fs::read(&placed).unwrap(), b"guard v1");
+        std::fs::write(&source, b"guard v2").unwrap();
+        materialize_spend_guard(&root, Some(&source)).unwrap();
+        assert_eq!(std::fs::read(&placed).unwrap(), b"guard v2");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn the_unit_is_a_user_service_with_the_fixed_wrapper_and_no_agent_shell() {
         let spec = LaunchSpec {
+            kind: JobKind::Test,
             unit_name: "rsi-job-1".into(),
             cwd: PathBuf::from("/w/sandbox"),
             log_path: PathBuf::from("/j/1.log"),
@@ -6992,6 +8486,7 @@ mod tests {
                 cpu_quota_percent: 250,
                 background: false,
                 admission_max_secs: None,
+                scoped_tool: None,
             },
             build_environment: None,
         };
@@ -7000,6 +8495,12 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.starts_with("--slice")));
         assert_eq!(args[0], "--user");
         assert!(args.contains(&"--unit=rsi-job-1".to_string()));
+        let description = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--description="))
+            .unwrap();
+        assert_eq!(description, "rsi job");
+        assert!(description.len() <= 64);
         // #2127: nested units name their job through this variable.
         assert!(args.contains(&"--setenv=RSI_JOB_ID=1".to_string()));
         // Only background work changes the default CPU weight (#2112).
@@ -7032,38 +8533,43 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn an_oversized_log_is_capped_and_fails_visibly_even_when_the_job_exits_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let (log, status) = (dir.path().join("j.log"), dir.path().join("j.status"));
-        let out = Command::new("/bin/sh")
-            .args(["-c", WRAPPER, "rsi-job"])
-            .arg(&log)
-            .arg(&status)
-            .arg("100")
-            .args(["sh", "-c", "yes | head -c 100000; exit 0"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert_eq!(read_status(status.to_str().unwrap()), Some(153));
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.len() < 300, "log stayed bounded: {}", text.len());
-        assert!(text.contains("log reached the 100-byte cap"));
-        // Under the cap a zero exit stays zero and the log is untouched. Each
-        // job has a fresh log (the wrapper appends), so start from none.
-        std::fs::remove_file(&log).unwrap();
-        let out = Command::new("/bin/sh")
-            .args(["-c", WRAPPER, "rsi-job"])
-            .arg(&log)
-            .arg(&status)
-            .arg("100")
-            .args(["sh", "-c", "echo fine"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert_eq!(read_status(status.to_str().unwrap()), Some(0));
-        let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.starts_with("rsi-phase "), "{text}");
-        assert!(text.contains(" job-start\n"), "{text}");
-        assert_eq!(text.lines().last(), Some("fine"));
+        // The default writer for this platform, then the portable one (#464).
+        for bound in ["", "portable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (log, status) = (dir.path().join("j.log"), dir.path().join("j.status"));
+            let wrapper = |job: &str| {
+                Command::new("/bin/sh")
+                    .env("RSI_JOB_BOUND", bound)
+                    .args(["-c", WRAPPER, "rsi-job"])
+                    .arg(&log)
+                    .arg(&status)
+                    .arg("4096")
+                    .args(["sh", "-c", job])
+                    .output()
+                    .unwrap()
+            };
+            let out = wrapper("yes | head -c 100000; exit 0");
+            assert!(out.status.success(), "{bound}");
+            assert_eq!(read_status(status.to_str().unwrap()), Some(153), "{bound}");
+            let text = std::fs::read_to_string(&log).unwrap();
+            // The cap, one `ulimit -f` block of rounding and the marker.
+            assert!(
+                text.len() < 4096 + 1024 + 300,
+                "{bound}: log stayed bounded: {}",
+                text.len()
+            );
+            assert!(text.contains("log reached the 4096-byte cap"), "{bound}");
+            // Under the cap a zero exit stays zero and the log is untouched.
+            // Each job has a fresh log (the wrapper appends), so start from none.
+            std::fs::remove_file(&log).unwrap();
+            let out = wrapper("echo fine");
+            assert!(out.status.success(), "{bound}");
+            assert_eq!(read_status(status.to_str().unwrap()), Some(0), "{bound}");
+            let text = std::fs::read_to_string(&log).unwrap();
+            assert!(text.starts_with("rsi-phase "), "{bound}: {text}");
+            assert!(text.contains(" job-start\n"), "{bound}: {text}");
+            assert_eq!(text.lines().last(), Some("fine"), "{bound}");
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -7145,6 +8651,8 @@ mod tests {
 
     /// #1591: a contended artifact lock is logged before the unit blocks, and
     /// the held line says how long it waited; the job then runs normally.
+    // Asserts the Linux systemd launch details; macOS launches through launchd.
+    #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_contended_artifact_lock_wait_is_logged_with_its_duration() {
@@ -7563,7 +9071,9 @@ mod tests {
         mutate: impl FnOnce(&Path),
         extra: serde_json::Value,
     ) -> AgentJobV1 {
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runtime = Arc::new(FakeRuntime::default());
         let dynamic: Arc<dyn JobRuntime> = runtime.clone();
         let (row, _) = submit(
@@ -7600,6 +9110,32 @@ mod tests {
         assert_eq!(result.source_head.as_deref(), Some(second.as_str()));
         assert_eq!(result.source_dirty, Some(false));
         assert_eq!(result.refusal, None);
+        // #282: the receipt names the target the unit really built in, which is
+        // the daemon's own `rsi-build-target` log line.
+        assert_eq!(result.target_dir, log_build_target(&job.log_path));
+    }
+
+    /// #282: the receipt's `target_dir` is the first `rsi-build-target` line
+    /// of the job log, never a later line, an empty one or a different prefix.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn log_build_target_reads_the_daemon_line_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("j.log");
+        let read = |text: &str| {
+            std::fs::write(&log, text).unwrap();
+            log_build_target(log.to_str().unwrap())
+        };
+        assert_eq!(
+            read(
+                "rsi-phase 1 unit-launch: x\nrsi-build-target /a/release-target\nrsi-build-target /b\n"
+            ),
+            Some("/a/release-target".to_string())
+        );
+        assert_eq!(read("rsi-build-target \n"), None);
+        assert_eq!(read("rsi-build-targets /a\n"), None);
+        assert_eq!(read("Compiling x\n"), None);
+        assert_eq!(log_build_target("/nonexistent/none.log"), None);
     }
 
     /// Hub #2954: HEAD moving between submit and finish fails the job and
@@ -7668,7 +9204,9 @@ mod tests {
     async fn a_running_build_whose_head_moves_is_stopped_and_settled() {
         let (repo, _first, second) = source::tests::repo();
         let jobs = disk_fixture();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runtime = Arc::new(FakeRuntime::default());
         let dynamic: Arc<dyn JobRuntime> = runtime.clone();
         let (row, _) = submit(
@@ -7721,7 +9259,9 @@ mod tests {
     async fn a_held_build_whose_head_moved_fails_at_start_without_launching() {
         let (repo, _first, second) = source::tests::repo();
         let jobs = disk_fixture();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runtime = Arc::new(FakeRuntime::default());
         let dynamic: Arc<dyn JobRuntime> = runtime.clone();
         let (row, _) = submit_with_hold(
@@ -8115,6 +9655,137 @@ error: test run failed
         assert_eq!(poll_once(&store, &dynamic, Utc::now()).await.unwrap(), 0);
     }
 
+    /// #594: submit a running `scoped_test` job whose log already holds `log`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn running_scoped_job_with_log(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        runtime: &FakeRuntime,
+        dir: &Path,
+        owner: Uuid,
+        log: &str,
+    ) -> AgentJobRow {
+        let mut request = ctx(owner, dir, None);
+        request.params = params(
+            JobKind::Test,
+            serde_json::json!({"scoped_test":{"base":"origin/rolling"}}),
+        );
+        let (row, _) = submit(
+            &*store.blocking_lock(),
+            runtime,
+            &tools(),
+            dir,
+            request,
+            Utc::now(),
+        )
+        .unwrap();
+        append_job_log(&row.job.log_path, log);
+        row
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_owner_cancelled_scoped_test_keeps_its_partial_receipt_as_cancelled_incomplete() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let owner = Uuid::new_v4();
+        let receipt = serde_json::json!({
+            "schema": 1, "head": "2cadb5d", "ok": false, "partial": true,
+            "packages": [
+                {"package": "rsid-store", "status": "passed", "completed": 199},
+                {"package": "rsid", "status": "passed", "completed": 813},
+                {"package": "rsi", "status": "incomplete"},
+            ],
+        });
+        let row = running_scoped_job_with_log(
+            &store,
+            &runtime,
+            dir.path(),
+            owner,
+            &format!("compiler noise\nSCOPED_TEST_RECEIPT {receipt}\n"),
+        );
+        let guard = store.blocking_lock();
+        let (job, cancelled) = cancel_job(&guard, &*runtime, row.job.id, Utc::now()).unwrap();
+        assert!(cancelled);
+        let result = job.result.unwrap();
+        assert_eq!(result.refusal.as_deref(), Some(JOB_CANCELLED));
+        let kept = result.receipt.expect("the partial receipt is preserved");
+        assert_eq!(kept["ok"], false);
+        assert_eq!(kept["acceptance"], false);
+        assert_eq!(kept["partial"], true);
+        assert_eq!(kept["verdict"], "cancelled_incomplete");
+        assert_eq!(kept["packages"][1]["completed"], 813);
+        assert_eq!(kept["cancellation"]["kind"], "owner");
+        assert_eq!(kept["cancellation"]["by"], owner.to_string());
+        assert_eq!(kept["cancellation"]["owner"], owner.to_string());
+        assert!(
+            kept["cancellation"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("AgentCancelJob")
+        );
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("compiler noise"), "{detail}");
+        assert!(!detail.contains("SCOPED_TEST_RECEIPT"), "{detail}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_manager_cancelled_scoped_test_names_the_manager_and_the_owner() {
+        let (store, dir) = open();
+        let runtime = Arc::new(FakeRuntime::default());
+        let owner = Uuid::new_v4();
+        let manager = Uuid::new_v4();
+        let row = running_scoped_job_with_log(
+            &store,
+            &runtime,
+            dir.path(),
+            owner,
+            "SCOPED_TEST_RECEIPT {\"ok\":true,\"packages\":[{\"package\":\"rsid\",\"status\":\"passed\",\"completed\":3}]}\n",
+        );
+        let guard = store.blocking_lock();
+        let (job, cancelled) =
+            cancel_job_as(&guard, &*runtime, row.job.id, Utc::now(), Some(manager)).unwrap();
+        assert!(cancelled);
+        let result = job.result.unwrap();
+        let kept = result.receipt.expect("the receipt is preserved");
+        // A green-looking partial receipt never reads as acceptance.
+        assert_eq!(kept["ok"], false);
+        assert_eq!(kept["acceptance"], false);
+        assert_eq!(kept["verdict"], "cancelled_incomplete");
+        assert_eq!(kept["cancellation"]["kind"], "manager");
+        assert_eq!(kept["cancellation"]["by"], manager.to_string());
+        assert_eq!(kept["cancellation"]["owner"], owner.to_string());
+        assert_eq!(kept["packages"][0]["completed"], 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_oversized_cancelled_receipt_is_cut_to_a_bounded_summary() {
+        let failures: Vec<_> = (0..500)
+            .map(|n| serde_json::json!({"package": "rsid", "test": format!("t{n}"), "kind": "lib"}))
+            .collect();
+        let receipt = serde_json::json!({
+            "schema": 1, "head": "abc", "ok": false,
+            "shards": {"map": {"a": "x".repeat(CANCELLED_RECEIPT_MAX_BYTES)}},
+            "failures": failures,
+            "packages": [{"package": "rsid", "status": "failed", "completed": 7}],
+        });
+        let bounded = bound_cancelled_receipt(receipt);
+        assert!(serde_json::to_string(&bounded).unwrap().len() <= CANCELLED_RECEIPT_MAX_BYTES);
+        assert_eq!(bounded["head"], "abc");
+        assert_eq!(bounded["failures"].as_array().unwrap().len(), 20);
+        assert_eq!(bounded["failures_omitted"], 480);
+        assert_eq!(bounded["packages"][0]["completed"], 7);
+        assert!(bounded.get("shards").is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_small_cancelled_receipt_is_kept_whole() {
+        let receipt = serde_json::json!({"ok": false, "packages": [{"package": "rsid"}]});
+        assert_eq!(bound_cancelled_receipt(receipt.clone()), receipt);
+    }
+
     /// #3038: a cancelling topology execution stops the node session's open
     /// jobs, and only that session's.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -8212,12 +9883,15 @@ error: test run failed
         id
     }
 
+    /// #3554: a staged `interrupt_workers` deploy never stops a running ordinary
+    /// test job. The job is a survivor from the first poll: it is no blocker
+    /// (its unit outlives the restart), while a running build, which the deploy
+    /// cannot preempt, still holds the quiet point until it ends.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_staged_interrupt_deploy_stops_test_jobs_after_its_grace_once_no_build_blocks_it() {
+    async fn a_staged_interrupt_deploy_lets_a_test_job_survive_but_still_waits_for_a_build() {
         let (store, dir) = open();
         let runtime = Arc::new(FakeRuntime::default());
-        let drain = crate::deploy_drain::DeployDrain::new();
         let (tester, builder) = (Uuid::new_v4(), Uuid::new_v4());
         let mut test_ctx = ctx(tester, dir.path(), None);
         test_ctx.params = params(
@@ -8239,22 +9913,47 @@ error: test run failed
         assert_eq!(test_job.job.state, JobState::Running);
         assert_eq!(build_job.job.state, JobState::Running);
         let deploy = stage_deploy(&guard, true, t0);
-        let grace = i64::try_from(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS).unwrap();
         let state_of = |id: Uuid| guard.get_agent_job(id).unwrap().unwrap().job.state;
+        let row = guard.live_agent_deploy().unwrap().unwrap();
 
-        // #2190: the build job is something the deploy cannot preempt, so
-        // stopping the test job gains nothing: it is left alone, past the
-        // grace as well.
-        let early = t0 + chrono::Duration::seconds(grace - 1);
-        let late = t0 + chrono::Duration::seconds(grace + 1);
-        for at in [early, late] {
+        // The test job survives from the request; the build still blocks.
+        let surviving = deploy_surviving_jobs(&guard, &row).unwrap();
+        assert_eq!(surviving, [test_job.job.id]);
+        assert_eq!(
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                .unwrap(),
+            ["job_running"]
+        );
+        // The jobs loop stops nothing, however late.
+        for late in [60, 301, 3000] {
             assert!(
-                cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, at)
+                stop_hub_qa_for_deploy(&guard, &*runtime, t0 + chrono::Duration::seconds(late))
                     .unwrap()
                     .is_empty()
             );
-            assert_eq!(state_of(test_job.job.id), JobState::Running);
         }
+        assert_eq!(state_of(test_job.job.id), JobState::Running);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+
+        // The build ends on its own: nothing blocks, so the deploy restarts
+        // over the running test job.
+        guard
+            .settle_agent_job(
+                build_job.job.id,
+                JobState::Succeeded,
+                &AgentJobResultV1::default(),
+                false,
+                t0,
+            )
+            .unwrap();
+        assert!(
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                .unwrap()
+                .is_empty()
+        );
+        // Without the survivor list the same job would hold the quiet point.
         assert_eq!(
             guard
                 .deploy_quiet_blockers_with(Uuid::new_v4(), false)
@@ -8262,61 +9961,37 @@ error: test run failed
             ["job_running"]
         );
 
-        // The build ends. The grace restarts from the last tick that saw it
-        // blocked, so the test job still gets a full grace.
-        guard
-            .settle_agent_job(
-                build_job.job.id,
-                JobState::Succeeded,
-                &AgentJobResultV1::default(),
-                false,
-                late,
-            )
-            .unwrap();
-        let inside = late + chrono::Duration::seconds(grace - 1);
-        assert!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, inside)
-                .unwrap()
-                .is_empty()
-        );
+        // Nothing was stopped, requeued or woken; the receipt source names no
+        // cancelled job, and the owner's wake is still the job's own.
         assert_eq!(state_of(test_job.job.id), JobState::Running);
-
-        // Past that grace the test job is stopped and requeued under its own id
-        // (#2278): held for the deploy, no wake yet, rerun on the new daemon.
-        let after = late + chrono::Duration::seconds(grace + 1);
-        let stopped = cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, after).unwrap();
-        assert_eq!(stopped, [test_job.job.id]);
-        let requeued = guard.get_agent_job(test_job.job.id).unwrap().unwrap().job;
-        assert_eq!(requeued.state, JobState::Queued);
-        assert_eq!(requeued.held.as_deref(), Some("held_for_deploy"));
-        assert_eq!(requeued.owner_session_id, tester);
-        assert_eq!(requeued.wake, JobWake::Owner);
-        assert_eq!(requeued.params, test_job.job.params);
-        assert!(requeued.result.is_none());
-        assert!(
-            wakes_for(&guard, tester).is_empty(),
-            "the owner's wake waits for the rerun"
-        );
-        assert_eq!(
-            *runtime.stopped.lock().unwrap(),
-            [test_job.job.unit_name.clone()]
-        );
-        // The build job was never stopped: it ran to its own end.
-        assert_eq!(state_of(build_job.job.id), JobState::Succeeded);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
         assert!(
             guard
-                .deploy_quiet_blockers_with(Uuid::new_v4(), false)
+                .agent_deploy_interrupt(deploy)
+                .unwrap()
+                .cancelled_jobs
+                .is_empty()
+        );
+        assert!(wakes_for(&guard, tester).is_empty());
+        // The restart marks the survivor under the deploy; only a `restarting`
+        // deploy marks, and a job that already ended is not listed.
+        assert!(
+            guard
+                .record_agent_deploy_surviving_jobs(deploy, &surviving)
                 .unwrap()
                 .is_empty()
         );
-
-        // The receipt source names the stopped job; a repeat stops nothing more.
+        assert!(guard.mark_agent_deploy_restarting(deploy, t0).unwrap());
         assert_eq!(
-            guard.agent_deploy_interrupt(deploy).unwrap().cancelled_jobs,
+            guard
+                .record_agent_deploy_surviving_jobs(deploy, &surviving)
+                .unwrap(),
             [test_job.job.id]
         );
+        assert_eq!(guard.deploy_surviving_jobs(deploy).unwrap(), surviving);
         assert!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, after)
+            guard
+                .deploy_surviving_jobs(Uuid::new_v4())
                 .unwrap()
                 .is_empty()
         );
@@ -8365,14 +10040,109 @@ error: test run failed
         c
     }
 
-    /// #2278: a staged `interrupt_workers` deploy on a busy hub (a running test
-    /// job, a new submission every few seconds) restarts inside its bound. The
-    /// stream is held, never started or lost; the running job is stopped after
-    /// its grace and requeued under its own id, so its owner's single wake
-    /// fires when the rerun ends on the new daemon.
+    /// Landing, release builds and daemon-owned test obligations keep running
+    /// past a peer's hold; ordinary verification must not be stopped behind them.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
-    async fn a_deploy_with_a_running_job_and_a_stream_of_submissions_restarts_within_its_bound() {
+    async fn interrupt_deploy_preserves_protected_jobs_past_the_hold() {
+        for (kind, raw) in [
+            (
+                "landing",
+                serde_json::json!({"kind":"landing", "accepted": "a".repeat(40)}),
+            ),
+            (
+                "build",
+                serde_json::json!({"kind":"build", "command":"build", "release": true}),
+            ),
+            (
+                "test",
+                serde_json::json!({"kind":"test", "recipe": "rolling-library-qa"}),
+            ),
+        ] {
+            let (store, dir) = open();
+            let runtime = FakeRuntime::default();
+            let drain = crate::deploy_drain::DeployDrain::new();
+            drain.set_hold_cap_secs(60);
+            let guard = store.lock().await;
+            let now = Utc::now();
+            let (ordinary, _) = submit(
+                &guard,
+                &runtime,
+                &tools(),
+                dir.path(),
+                test_ctx(Uuid::new_v4(), dir.path()),
+                now,
+            )
+            .unwrap();
+            let (protected, _) = submit(
+                &guard,
+                &runtime,
+                &tools(),
+                dir.path(),
+                test_ctx(Uuid::new_v4(), dir.path()),
+                now,
+            )
+            .unwrap();
+            // Model the daemon-owned obligation without starting a real unit.
+            guard
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET kind=?1, params_json=?2 WHERE id=?3",
+                    rusqlite::params![kind, raw.to_string(), protected.job.id.to_string()],
+                )
+                .unwrap();
+            stage_deploy(&guard, true, now);
+            assert!(
+                stop_hub_qa_for_deploy(&guard, &runtime, now + chrono::Duration::seconds(600))
+                    .unwrap()
+                    .is_empty()
+            );
+            // #3554: the ordinary test is the only survivor; the protected job
+            // keeps blocking the quiet point and is never stopped.
+            let row = guard.live_agent_deploy().unwrap().unwrap();
+            let surviving = deploy_surviving_jobs(&guard, &row).unwrap();
+            assert_eq!(surviving, [ordinary.job.id], "{kind}");
+            assert_eq!(
+                guard
+                    .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                    .unwrap(),
+                ["job_running"],
+                "{kind}"
+            );
+            assert_eq!(
+                guard
+                    .get_agent_job(protected.job.id)
+                    .unwrap()
+                    .unwrap()
+                    .job
+                    .state,
+                JobState::Running,
+                "{kind}"
+            );
+            assert_eq!(
+                guard
+                    .get_agent_job(ordinary.job.id)
+                    .unwrap()
+                    .unwrap()
+                    .job
+                    .state,
+                JobState::Running,
+                "{kind}"
+            );
+            assert!(runtime.stopped.lock().unwrap().is_empty());
+        }
+    }
+
+    /// #3554: a staged `interrupt_workers` deploy on a busy hub (a running test
+    /// job, a new submission every few seconds) restarts at its first quiet
+    /// polls without waiting for, stopping or requeuing the running job. The
+    /// stream is held, never started or lost. The new daemon's startup poll
+    /// re-adopts the still-active unit by its row, and the job's end settles it
+    /// once with one owner wake: a deploy never makes a test run twice.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_deploy_restarts_over_a_running_job_and_the_new_daemon_readopts_and_settles_it_once()
+    {
         use crate::deploy::{GateState, PollOutcome, poll_once};
         const BOUND_SECS: i64 = 900;
         const STEP_SECS: i64 = 20;
@@ -8403,7 +10173,23 @@ error: test run failed
             deploy,
             &manifest,
         );
-        let grace = i64::try_from(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS).unwrap();
+        let receipt_at = |guard: &Store| {
+            let row = guard.get_agent_deploy(deploy).unwrap().unwrap();
+            crate::session::deploy_verb::receipt_with_blockers(
+                guard,
+                &row,
+                guard.agent_deploy_interrupt(deploy).unwrap(),
+                true,
+            )
+            .unwrap()
+        };
+        // The receipt names the job as a survivor, not as a requeue, and it
+        // is no blocker.
+        let staged = receipt_at(&*store.lock().await);
+        assert_eq!(staged.expected_surviving_jobs, [running.job.id]);
+        assert!(staged.expected_requeued_jobs.is_empty());
+        assert_eq!(staged.job_grace_secs, None);
+        assert!(staged.blockers.is_empty(), "{:?}", staged.blockers);
 
         let mut gate = GateState::default();
         let mut streamed = Vec::new();
@@ -8422,7 +10208,7 @@ error: test run failed
             }
             {
                 let guard = store.lock().await;
-                cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, at).unwrap();
+                stop_hub_qa_for_deploy(&guard, &*runtime, at).unwrap();
                 // A new submission, held by the drain exactly as the verb does.
                 let owner = Uuid::new_v4();
                 let hold = drain.holds_job_start(Some(owner), true);
@@ -8449,23 +10235,22 @@ error: test run failed
             );
         }
 
-        // Restarted just after the grace and the confirming quiet polls, well
-        // inside the bound, with one restart fired.
+        // Restarted on the confirming quiet polls, with one restart fired: no
+        // grace is waited out for the running job.
         let restarted_at = restarted_at.expect("the deploy reached its restart");
-        assert!(restarted_at > grace, "not before the grace: {restarted_at}");
         assert!(
-            restarted_at <= grace + 60 && restarted_at < BOUND_SECS,
+            restarted_at <= STEP_SECS * i64::from(crate::deploy::QUIET_POLLS_REQUIRED),
             "restarted at {restarted_at}s"
         );
         assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!streamed.is_empty());
 
         let guard = store.lock().await;
-        // Nothing was lost: the running job and the whole stream are queued.
-        let requeued = guard.get_agent_job(running.job.id).unwrap().unwrap().job;
-        assert_eq!(requeued.state, JobState::Queued);
-        assert_eq!(requeued.owner_session_id, tester);
-        assert_eq!(requeued.wake, JobWake::Owner);
+        // The running job was left alone: still running on its unit, never
+        // stopped, requeued or woken. The whole stream is queued and held.
+        let job = guard.get_agent_job(running.job.id).unwrap().unwrap().job;
+        assert_eq!(job.state, JobState::Running);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
         for id in &streamed {
             let job = guard.get_agent_job(*id).unwrap().unwrap().job;
             assert_eq!(job.state, JobState::Queued);
@@ -8476,34 +10261,50 @@ error: test run failed
             1,
             "only the first run"
         );
-        // The outcome names the requeued job; the owner is not woken yet.
-        assert_eq!(
-            guard.agent_deploy_interrupt(deploy).unwrap().cancelled_jobs,
-            [running.job.id]
+        // The outcome names the surviving job, not a requeue or a stop.
+        assert!(
+            guard
+                .agent_deploy_interrupt(deploy)
+                .unwrap()
+                .cancelled_jobs
+                .is_empty()
         );
+        let restarting = receipt_at(&guard);
+        assert_eq!(restarting.surviving_jobs, [running.job.id]);
+        assert!(restarting.requeued_jobs.is_empty());
         assert!(wakes_for(&guard, tester).is_empty());
         drop(guard);
 
-        // The new daemon: a fresh drain (the retry window of the old process
-        // does not survive a restart; startup restores it only for a timed-out
-        // row, #2552), so the hold is gone and the held jobs start. The rerun's
-        // end wakes the owner exactly once.
+        // The new daemon: a fresh drain, so the hold is gone. Its startup poll
+        // finds the `running` row with its unit still active: re-adopted, not
+        // settled, no wake. Then the held jobs start.
         let drain = crate::deploy_drain::DeployDrain::new();
         drain.sync(None, true, Utc::now());
+        poll_once_jobs(&store, &job_runtime).await;
+        {
+            let guard = store.lock().await;
+            let adopted = guard.get_agent_job(running.job.id).unwrap().unwrap().job;
+            assert_eq!(adopted.state, JobState::Running);
+            assert!(wakes_for(&guard, tester).is_empty());
+        }
         let started = start_queued_jobs(&store, &job_runtime, &tools(), &drain)
             .await
             .unwrap();
         assert!(started >= 1, "the held jobs start once the hold is gone");
-        let rerun = store
+
+        // The job ends: the unit's wrapper wrote its status. It settles once,
+        // and a repeat poll wakes nobody again.
+        let adopted = store
             .lock()
             .await
             .get_agent_job(running.job.id)
             .unwrap()
             .unwrap();
-        assert_eq!(rerun.job.state, JobState::Running);
-        std::fs::write(&rerun.status_path, "0\n").unwrap();
+        std::fs::write(&adopted.status_path, "0\n").unwrap();
         *runtime.active.lock().unwrap() = false;
-        poll_once_jobs(&store, &job_runtime).await;
+        for _ in 0..2 {
+            poll_once_jobs(&store, &job_runtime).await;
+        }
         let guard = store.lock().await;
         assert!(
             guard
@@ -8514,15 +10315,37 @@ error: test run failed
                 .state
                 .is_terminal()
         );
-        assert_eq!(
-            wakes_for(&guard, tester).len(),
-            1,
-            "one wake, from the rerun"
+        assert_eq!(wakes_for(&guard, tester).len(), 1, "one wake, when it ends");
+
+        // The deploy's outcome wake names the job that kept running.
+        guard
+            .settle_agent_deploy(
+                deploy,
+                rsi_common::agent_deploy::DeployState::Succeeded,
+                None,
+                Utc::now(),
+            )
+            .unwrap()
+            .expect("the deploy settles");
+        let outcome = guard
+            .list_scheduled_jobs()
+            .unwrap()
+            .into_iter()
+            .find(|wake| wake.name == format!("deploy-{deploy}"))
+            .expect("the deploy outcome wake");
+        assert!(
+            outcome.message.contains(&running.job.id.to_string())
+                && outcome.message.contains("re-adopted"),
+            "{}",
+            outcome.message
         );
     }
 
     /// The jobs loop's settle pass, over the fake runtime.
-    async fn poll_once_jobs(store: &Arc<tokio::sync::Mutex<Store>>, runtime: &Arc<dyn JobRuntime>) {
+    async fn poll_once_jobs(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        runtime: &Arc<dyn JobRuntime>,
+    ) {
         poll_once(store, runtime, Utc::now()).await.unwrap();
     }
 
@@ -8614,10 +10437,11 @@ error: test run failed
         let _ = retry;
     }
 
-    /// #2190: a staged deploy blocked by an admitted or gating queue landing
-    /// (which it cannot preempt) leaves running test jobs alone, however long
-    /// that lasts; only once the landing settles do they get their grace and
-    /// are then stopped `interrupted_by_deploy`.
+    /// #2190/#3554: a staged `interrupt_workers` deploy blocked by an admitted
+    /// or gating queue landing (which it cannot preempt) waits for it however
+    /// long that lasts. The running test job is a survivor: it is never
+    /// stopped, requeued or woken early, and it is no blocker once the landing
+    /// settles, so the restart does not wait for it.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_deploy_blocked_by_a_gating_landing_leaves_running_test_jobs_alone_until_it_settles()
@@ -8628,7 +10452,6 @@ error: test run failed
         };
         let (store, dir) = open();
         let runtime = Arc::new(FakeRuntime::default());
-        let drain = crate::deploy_drain::DeployDrain::new();
         let tester = Uuid::new_v4();
         let mut test_ctx = ctx(tester, dir.path(), None);
         test_ctx.params = params(
@@ -8638,8 +10461,7 @@ error: test run failed
         let guard = store.lock().await;
         let t0 = Utc::now();
         let (job, _) = submit(&guard, &*runtime, &tools(), dir.path(), test_ctx, t0).unwrap();
-        let deploy = stage_deploy(&guard, true, t0);
-        let grace = i64::try_from(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS).unwrap();
+        stage_deploy(&guard, true, t0);
         let landing = {
             guard
                 .enqueue_rolling_queue_source(
@@ -8667,22 +10489,25 @@ error: test run failed
                 .entry
                 .id
         };
-        assert_eq!(
-            guard.deploy_unpreemptible_blockers().unwrap(),
-            ["landing_in_progress"]
-        );
-
-        // Ticks across an hour: the landing gates, the test job is untouched.
+        let row = guard.live_agent_deploy().unwrap().unwrap();
+        let surviving = deploy_surviving_jobs(&guard, &row).unwrap();
+        assert_eq!(surviving, [job.job.id]);
+        let blockers = |surviving: &[Uuid]| {
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, surviving)
+                .unwrap()
+        };
+        // Only the landing holds the quiet point, however long it gates; the
+        // test job is untouched.
+        assert_eq!(blockers(&surviving), ["landing_in_progress"]);
         for minutes in [1, 6, 30, 59] {
             let at = t0 + chrono::Duration::minutes(minutes);
             assert!(
-                cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, at)
+                stop_hub_qa_for_deploy(&guard, &*runtime, at)
                     .unwrap()
                     .is_empty()
             );
         }
-        let last_blocked = t0 + chrono::Duration::minutes(59);
-        assert_eq!(drain.unpreemptible_blocked_at(deploy), Some(last_blocked));
         assert_eq!(
             guard.get_agent_job(job.job.id).unwrap().unwrap().job.state,
             JobState::Running
@@ -8690,36 +10515,26 @@ error: test run failed
         assert!(runtime.stopped.lock().unwrap().is_empty());
         assert!(wakes_for(&guard, tester).is_empty());
 
-        // The landing settles. The job still gets its grace from there.
+        // The landing settles: nothing blocks, and still no job was stopped.
         guard
             .settle_rolling_queue_entry(
                 landing,
                 RollingQueueEntryState::Failed,
                 &RollingQueueOutcome::default(),
-                last_blocked,
+                t0 + chrono::Duration::minutes(59),
             )
             .unwrap();
-        assert!(guard.deploy_unpreemptible_blockers().unwrap().is_empty());
-        let inside = last_blocked + chrono::Duration::seconds(grace - 1);
-        assert!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, inside)
-                .unwrap()
-                .is_empty()
-        );
-        let after = last_blocked + chrono::Duration::seconds(grace + 1);
+        assert!(blockers(&surviving).is_empty());
         assert_eq!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, after).unwrap(),
-            [job.job.id]
+            guard.get_agent_job(job.job.id).unwrap().unwrap().job.state,
+            JobState::Running
         );
-        // #2278: the stopped job is back in the queue under its own id, and its
-        // owner is not woken until the rerun ends.
-        let requeued = guard.get_agent_job(job.job.id).unwrap().unwrap().job;
-        assert_eq!(requeued.state, JobState::Queued);
+        assert!(runtime.stopped.lock().unwrap().is_empty());
         let job_wakes = wakes_for(&guard, tester)
             .into_iter()
             .filter(|wake| wake.message.contains(&job.job.id.to_string()))
             .count();
-        assert_eq!(job_wakes, 0, "no wake until the rerun ends");
+        assert_eq!(job_wakes, 0, "no wake until the job ends");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -8734,14 +10549,23 @@ error: test run failed
         );
         let guard = store.lock().await;
         let t0 = Utc::now();
-        let drain = crate::deploy_drain::DeployDrain::new();
         let (job, _) = submit(&guard, &*runtime, &tools(), dir.path(), test_ctx, t0).unwrap();
         stage_deploy(&guard, false, t0);
         let late = t0 + chrono::Duration::hours(1);
         assert!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, late)
+            stop_hub_qa_for_deploy(&guard, &*runtime, late)
                 .unwrap()
                 .is_empty()
+        );
+        // #3554: no `interrupt_workers`, so no job is a survivor: a plain deploy
+        // still waits for the running test to drain.
+        let row = guard.live_agent_deploy().unwrap().unwrap();
+        assert!(deploy_surviving_jobs(&guard, &row).unwrap().is_empty());
+        assert_eq!(
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), true, &[])
+                .unwrap(),
+            ["job_running"]
         );
         assert_eq!(
             guard.get_agent_job(job.job.id).unwrap().unwrap().job.state,
@@ -8787,7 +10611,6 @@ error: test run failed
     async fn a_staged_deploy_stops_a_hub_qa_run_at_once_without_interrupt_or_grace() {
         let (store, dir) = open();
         let runtime = Arc::new(FakeRuntime::default());
-        let drain = crate::deploy_drain::DeployDrain::new();
         let mut test_ctx = ctx(Uuid::new_v4(), dir.path(), None);
         test_ctx.params = params(
             JobKind::Test,
@@ -8798,7 +10621,7 @@ error: test run failed
         let (plain, _) = submit(&guard, &*runtime, &tools(), dir.path(), test_ctx, t0).unwrap();
         let hub_run = insert_hub_qa_run(&guard, dir.path(), t0);
         let deploy = stage_deploy(&guard, false, t0);
-        let stopped = cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, t0).unwrap();
+        let stopped = stop_hub_qa_for_deploy(&guard, &*runtime, t0).unwrap();
         assert_eq!(stopped, [hub_run]);
         let settled = guard.get_agent_job(hub_run).unwrap().unwrap().job;
         assert_eq!(settled.state, JobState::Failed);
@@ -8813,18 +10636,18 @@ error: test run failed
                 .job
                 .state,
             JobState::Running,
-            "an ordinary test job keeps the #2048 rule"
+            "an ordinary test job is never stopped by a deploy"
         );
         assert!(
-            cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, t0)
+            stop_hub_qa_for_deploy(&guard, &*runtime, t0)
                 .unwrap()
                 .is_empty()
         );
     }
 
-    /// #2176 with #2190: QA is preemptible, so a hub QA run is stopped at once
-    /// even while a gating landing blocks the deploy; only the ordinary test
-    /// job is spared until the landing settles and its grace passes.
+    /// #2176 with #3554: QA is preemptible, so a hub QA run is stopped at once
+    /// even while a gating landing blocks the deploy; the ordinary test job is
+    /// never stopped and, as a survivor, does not hold the quiet point.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn a_hub_qa_run_is_stopped_at_once_even_while_a_gating_landing_blocks_the_deploy() {
@@ -8834,7 +10657,6 @@ error: test run failed
         };
         let (store, dir) = open();
         let runtime = Arc::new(FakeRuntime::default());
-        let drain = crate::deploy_drain::DeployDrain::new();
         let tester = Uuid::new_v4();
         let mut test_ctx = ctx(tester, dir.path(), None);
         test_ctx.params = params(
@@ -8871,24 +10693,33 @@ error: test run failed
             .unwrap()
             .entry
             .id;
+        let row = guard.live_agent_deploy().unwrap().unwrap();
+        let surviving = deploy_surviving_jobs(&guard, &row).unwrap();
+        assert_eq!(surviving, [plain.job.id]);
         assert_eq!(
-            guard.deploy_unpreemptible_blockers().unwrap(),
-            ["landing_in_progress"]
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                .unwrap(),
+            ["landing_in_progress", "job_running"]
         );
 
         // The landing blocks the deploy: QA goes at once, the test job stays.
         let blocked = t0 + chrono::Duration::hours(1);
-        let stopped = cancel_test_jobs_for_deploy(&guard, &*runtime, &drain, blocked).unwrap();
+        let stopped = stop_hub_qa_for_deploy(&guard, &*runtime, blocked).unwrap();
         assert_eq!(stopped, [hub_run]);
         let state_of = |id: Uuid| guard.get_agent_job(id).unwrap().unwrap().job.state;
         assert_eq!(state_of(hub_run), JobState::Failed);
         assert_eq!(state_of(plain.job.id), JobState::Running);
         assert_eq!(
-            drain.unpreemptible_blocked_at(guard.live_agent_deploy().unwrap().unwrap().id),
-            Some(blocked)
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                .unwrap(),
+            ["landing_in_progress"],
+            "with QA gone only the landing holds the quiet point"
         );
 
-        // The landing settles; the test job then gets its grace and is stopped.
+        // The landing settles; the test job is a survivor and never stopped,
+        // so nothing holds the quiet point.
         guard
             .settle_rolling_queue_entry(
                 landing,
@@ -8897,27 +10728,18 @@ error: test run failed
                 blocked,
             )
             .unwrap();
-        let grace = i64::try_from(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS).unwrap();
         assert!(
-            cancel_test_jobs_for_deploy(
-                &guard,
-                &*runtime,
-                &drain,
-                blocked + chrono::Duration::seconds(grace - 1)
-            )
-            .unwrap()
-            .is_empty()
+            guard
+                .deploy_quiet_blockers_surviving(Uuid::new_v4(), false, &surviving)
+                .unwrap()
+                .is_empty()
         );
-        assert_eq!(
-            cancel_test_jobs_for_deploy(
-                &guard,
-                &*runtime,
-                &drain,
-                blocked + chrono::Duration::seconds(grace + 1)
-            )
-            .unwrap(),
-            [plain.job.id]
+        assert!(
+            stop_hub_qa_for_deploy(&guard, &*runtime, blocked + chrono::Duration::hours(1))
+                .unwrap()
+                .is_empty()
         );
+        assert_eq!(state_of(plain.job.id), JobState::Running);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -9128,6 +10950,100 @@ error: test run failed
         assert_eq!(stored.state, JobState::Running);
         assert_eq!(stored.held, None);
         crate::host_pressure::TEST_THERMAL_HOLD.with(|hot| hot.set(None));
+    }
+
+    /// #177, #431: a cargo job held for capacity on a host with no governor
+    /// client (macOS) is not failed at the deploy drain's hold cap plus margin:
+    /// like a scoped job it waits its one pre-launch admission allowance (an
+    /// hour for a 60-minute test, as cargo-slot's slot wait on Linux), and the
+    /// refusal past it names the capacity hold, the observed slot use and the
+    /// bound. Freed capacity launches a job queued past the drain cap.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_capacity_held_job_waits_its_admission_allowance_not_the_drain_cap() {
+        use crate::host_memory::{JobCapacityHold, TEST_CAPACITY_HOLD};
+        for value in [
+            serde_json::json!({"scoped_test":{"base":"origin/rolling"}, "timeout_minutes":60}),
+            serde_json::json!({"package":"rsid","filters":["agent_jobs"],"lib_only":true,"timeout_minutes":60}),
+        ] {
+            let (store, dir) = open();
+            let runtime = Arc::new(FakeRuntime::default());
+            let job_runtime: Arc<dyn JobRuntime> = runtime.clone();
+            let drain = crate::deploy_drain::DeployDrain::new();
+            drain.set_hold_cap_secs(600);
+            let drain_cap = admission_cap_secs(&drain);
+            assert_eq!(drain_cap, 15 * 60);
+            let job_params = params(JobKind::Test, value);
+            let allowance = i64::try_from(admission_allowance_secs(&job_params)).unwrap();
+            assert_eq!(
+                allowance,
+                60 * 60,
+                "a 60-minute test waits an hour for a slot"
+            );
+            TEST_CAPACITY_HOLD.with(|hold| {
+                hold.set(Some(Some(JobCapacityHold::Slots { running: 2, cap: 2 })));
+            });
+            let now = Utc::now();
+            let past_drain_cap = now - chrono::Duration::seconds(drain_cap + 60);
+            let past_allowance = now - chrono::Duration::seconds(allowance + 60);
+            let submit_at = |store: &Store, at: DateTime<Utc>| {
+                let mut c = ctx(Uuid::new_v4(), dir.path(), None);
+                c.params = job_params.clone();
+                let (row, _) =
+                    submit_with_hold(store, &*runtime, &tools(), dir.path(), c, false, at).unwrap();
+                assert_eq!(row.job.held.as_deref(), Some(JOB_HELD_FOR_CAPACITY));
+                row
+            };
+            let waiting = submit_at(&*store.lock().await, past_drain_cap);
+            let expired = submit_at(&*store.lock().await, past_allowance);
+
+            assert_eq!(
+                start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                    .await
+                    .unwrap(),
+                0
+            );
+            {
+                let guard = store.lock().await;
+                let held = guard.get_agent_job(waiting.job.id).unwrap().unwrap().job;
+                assert_eq!(
+                    held.state,
+                    JobState::Queued,
+                    "past the drain cap, still waiting"
+                );
+                let failed = guard.get_agent_job(expired.job.id).unwrap().unwrap().job;
+                assert_eq!(failed.state, JobState::Failed);
+                let result = failed.result.unwrap();
+                assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
+                let detail = result.detail.unwrap();
+                assert!(
+                    detail
+                        .contains("queued (held_for_capacity: 2 of 2 cargo build slots are in use")
+                        && detail.contains("for 61 minutes")
+                        && detail.contains("past its 60-minute pre-launch admission allowance")
+                        && detail.contains("queue_wait_sec"),
+                    "{detail}"
+                );
+            }
+
+            // Capacity returned: the job queued past the drain cap launches.
+            TEST_CAPACITY_HOLD.with(|hold| hold.set(Some(None)));
+            assert_eq!(
+                start_queued_jobs(&store, &job_runtime, &tools(), &drain)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let started = store
+                .lock()
+                .await
+                .get_agent_job(waiting.job.id)
+                .unwrap()
+                .unwrap()
+                .job;
+            assert_eq!((started.state, started.held), (JobState::Running, None));
+            TEST_CAPACITY_HOLD.with(|hold| hold.set(None));
+        }
     }
 
     /// #2937: a host with no governor client (macOS) holds a cargo job while
@@ -9487,7 +11403,7 @@ error: test run failed
         let first = Uuid::new_v4();
         let (service, _restarts, manifest) = restart_counting_service(dir.path(), first);
         let t0 = Utc::now();
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open_test_fixture(&path).unwrap(),
         ));
         // A running build keeps the deploy from reaching its quiet point.
@@ -9532,7 +11448,9 @@ error: test run failed
         drop(store);
 
         // The unplanned restart: a fresh drain, the same durable database.
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open(&path).unwrap(),
+        ));
         let drain = crate::deploy_drain::DeployDrain::new();
         let config = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
         let started =
@@ -9613,7 +11531,9 @@ error: test run failed
         let row = held_test_job(&store, &*runtime, dir.path(), Uuid::new_v4());
         drop(store);
 
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open(&path).unwrap(),
+        ));
         let drain = crate::deploy_drain::DeployDrain::new();
         engage_drain(&drain);
         let restored = store
@@ -9640,7 +11560,9 @@ error: test run failed
         );
         drop(store);
 
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open(&path).unwrap(),
+        ));
         assert_eq!(
             start_queued_jobs(&store, &job_runtime, &tools(), &drain)
                 .await
@@ -9680,7 +11602,9 @@ error: test run failed
             drop(store);
 
             // The restarted daemon: durable state survives, the drain does not.
-            let store = Arc::new(tokio::sync::Mutex::new(Store::open(&path).unwrap()));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open(&path).unwrap(),
+            ));
             let drain = crate::deploy_drain::DeployDrain::new();
             assert!(
                 !drain.holds_job_start(Some(owner), true),
@@ -9967,7 +11891,7 @@ error: test run failed
         );
         append_job_log(&rows[0].job.log_path, "test progress continues\n");
         drop(store);
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open(&db).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&db).unwrap()));
         let drain = crate::deploy_drain::DeployDrain::new();
         assert_eq!(
             start_queued_jobs(&store, &dynamic, &tools(), &drain)
@@ -10306,9 +12230,19 @@ error: test run failed
             JobKind::Test,
             serde_json::json!({"package":"rsid-core","timeout_minutes":5}),
         );
+        // #3575: a short test timeout never shortens the build-sized wait.
         assert_eq!(
             admission_allowance_secs(&short_params),
-            JOB_SLOT_WAIT_ALLOWANCE_SECS
+            BUILD_ADMISSION_WAIT_SECS
+        );
+        let recipe_20 = params(
+            JobKind::Test,
+            serde_json::json!({"recipe":"check-cpu","timeout_minutes":20}),
+        );
+        assert_eq!(
+            admission_allowance_secs(&recipe_20),
+            BUILD_ADMISSION_WAIT_SECS,
+            "a 20-minute recipe job waits as long as a build for admission"
         );
         assert_eq!(admission_allowance_secs(&ordinary_params), 180 * 60);
         // The budget equals the job timeout.
@@ -10322,12 +12256,14 @@ error: test run failed
         let mut ordinary = job.clone();
         ordinary.params = short_params;
         job.params = qa_params;
-        // 45 minutes queued for a slot: the ordinary job is over its cap, the
-        // QA job is still inside its own.
+        // 45 minutes queued for a slot: the ordinary job is still inside the
+        // build-sized wait (#3575), past it at 61, and the QA job is still
+        // inside its own.
         write(format!(
             "rsi-phase {start} job-start\nrsi-phase {start} slot-wait: queued (build position 2): busy\n"
         ));
-        assert!(timed_out(&ordinary, at(45)));
+        assert!(!timed_out(&ordinary, at(45)));
+        assert!(timed_out(&ordinary, at(61)));
         assert!(!timed_out(&job, at(45)));
         assert!(!timed_out(&job, at(179)));
         // Past its timeout the wait settles as a capacity refusal.
@@ -10370,7 +12306,7 @@ error: test run failed
     /// minutes, and the wait never spends its execution budget.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn an_ordinary_test_job_waits_for_its_slot_up_to_its_own_timeout() {
+    fn an_ordinary_test_job_waits_for_its_slot_as_long_as_a_build() {
         let (store, dir) = open();
         let runtime = FakeRuntime::default();
         let mut job =
@@ -10385,19 +12321,21 @@ error: test run failed
         job.log_path = dir.path().join("queued.log").display().to_string();
         let write = |text: String| std::fs::write(&job.log_path, text).unwrap();
         let start = t0.timestamp();
-        assert_eq!(admission_allowance_secs(&job.params), 20 * 60);
+        // #3575: the wait is the build-sized hour, not the 20-minute timeout.
+        assert_eq!(admission_allowance_secs(&job.params), 60 * 60);
         // Queued for 15 minutes: the old fixed ten-minute clock would have
-        // failed this job; it is still waiting inside its own timeout.
+        // failed this job; it is still waiting inside its allowance.
         write(format!(
             "rsi-phase {start} job-start\nrsi-phase {start} slot-wait: governor wait: queued (build position 2)\n"
         ));
         assert!(!timed_out(&job, at(11)));
-        assert!(!timed_out(&job, at(19)));
-        // Past its timeout without a slot it settles as a capacity refusal.
-        assert!(timed_out(&job, at(21)));
-        let result = timed_out_result(&job, at(21), None);
+        assert!(!timed_out(&job, at(21)));
+        assert!(!timed_out(&job, at(59)));
+        // Past its allowance without a slot it settles as a capacity refusal.
+        assert!(timed_out(&job, at(61)));
+        let result = timed_out_result(&job, at(61), None);
         assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
-        assert!(result.detail.unwrap().contains("20-minute"));
+        assert!(result.detail.unwrap().contains("60-minute"));
         // A 15-minute wait that was granted leaves the full 20 minutes to run.
         write(format!(
             "rsi-phase {start} job-start\nrsi-phase {start} slot-wait: governor wait: queued\nrsi-phase {} slot-granted: waited 900s (build); running\n",
@@ -10408,6 +12346,28 @@ error: test run failed
         assert_eq!(
             timed_out_result(&job, at(36), None).refusal.as_deref(),
             Some(JOB_TIMED_OUT)
+        );
+    }
+
+    /// #3575: a worker cannot raise a recipe job's 20-minute timeout, so the
+    /// cargo-slot wait and the unit's runtime cap carry the build-sized hour,
+    /// not the timeout, and the job is not failed without compiling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_20_minute_recipe_job_gets_the_build_admission_wait() {
+        let dir = disk_fixture();
+        std::fs::create_dir(dir.path().join(".rsi")).unwrap();
+        std::fs::write(dir.path().join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.check-cpu]\nrunner = 'make'\ntarget = 'check-cpu'\ntimeout_minutes = 20\ncpu_quota_percent = 200\n").unwrap();
+        let recipe = params(
+            JobKind::Test,
+            serde_json::json!({"recipe":"check-cpu","timeout_minutes":20}),
+        );
+        let command = job_command(&tools(), &recipe, dir.path(), None).unwrap();
+        assert_eq!(command.admission_max_secs, Some(BUILD_ADMISSION_WAIT_SECS));
+        assert_eq!(
+            command.runtime_max_secs,
+            20 * 60 + JOB_TIMEOUT_UNIT_GRACE_SECS + BUILD_ADMISSION_WAIT_SECS
         );
     }
 
@@ -10432,6 +12392,7 @@ error: test run failed
             2 * 3600 + BUILD_ADMISSION_WAIT_SECS - JOB_SLOT_WAIT_ALLOWANCE_SECS
         );
         let spec = LaunchSpec {
+            kind: JobKind::Build,
             unit_name: "rsi-job-build".into(),
             cwd: dir.path().to_owned(),
             log_path: dir.path().join("build.log"),
@@ -10444,12 +12405,11 @@ error: test run failed
         )));
     }
 
-    /// #2211: only unscoped test and build jobs widen the slot wait: a scoped
-    /// test counts waits in its wall budget, a short test keeps the ten-minute
-    /// floor and a landing is untouched.
+    /// Test and build jobs carry bounded admission separately from execution;
+    /// short tests get the build-sized hour (#3575).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn only_unscoped_cargo_jobs_widen_the_governor_wait() {
+    fn cargo_jobs_carry_their_separate_governor_wait() {
         let dir = disk_fixture();
         let widened = |value: serde_json::Value| {
             job_command(&tools(), &params(JobKind::Test, value), dir.path(), None)
@@ -10458,18 +12418,25 @@ error: test run failed
         };
         assert_eq!(
             widened(serde_json::json!({"package":"rsid","timeout_minutes":45})),
-            Some(45 * 60)
+            Some(BUILD_ADMISSION_WAIT_SECS)
+        );
+        assert_eq!(
+            widened(serde_json::json!({"package":"rsid","timeout_minutes":90})),
+            Some(90 * 60)
         );
         assert_eq!(
             widened(serde_json::json!({"package":"rsid","timeout_minutes":5})),
-            None
+            Some(BUILD_ADMISSION_WAIT_SECS)
         );
-        assert_eq!(widened(serde_json::json!({"package":"rsid"})), None);
+        assert_eq!(
+            widened(serde_json::json!({"package":"rsid"})),
+            Some(BUILD_ADMISSION_WAIT_SECS)
+        );
         assert_eq!(
             widened(serde_json::json!({
                 "scoped_test":{"base":"origin/rolling"}, "timeout_minutes":60,
             })),
-            None
+            Some(60 * 60)
         );
     }
 
@@ -10514,7 +12481,8 @@ error: test run failed
         assert_eq!(log_wait_secs(&job.log_path, within_admission), Some(599));
         assert!(!timed_out(&job, within_admission));
         assert_eq!(log_wait_secs(&job.log_path, now), Some(35 * 60));
-        assert!(timed_out(&job, now));
+        // 35 minutes queued is still inside the one-hour wait (#3575).
+        assert!(!timed_out(&job, now));
         // The allowance bounds how long a stuck queue can extend the timeout.
         let later = now + chrono::Duration::hours(2);
         assert_eq!(log_wait_secs(&job.log_path, later), Some(155 * 60));
@@ -10577,11 +12545,17 @@ error: test run failed
         let result = stored.result.unwrap();
         assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
         assert_ne!(result.refusal.as_deref(), Some(JOB_TIMED_OUT));
+        // #177: the detail names the hold the job was queued under and the
+        // bound it outlived.
+        let detail = result.detail.unwrap();
         assert!(
-            result
-                .detail
-                .unwrap()
-                .contains("execution timeout never started")
+            detail.contains("execution timeout never started"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("queued (held_for_deploy) for more than 15 minutes")
+                && detail.contains("the deploy drain hold cap plus margin"),
+            "{detail}"
         );
         assert_eq!(wakes_for(&guard, owner).len(), 1, "the owner is told once");
         assert_eq!(
@@ -10818,7 +12792,7 @@ error: test run failed
             command.runtime_max_secs,
             1200 + JOB_TIMEOUT_UNIT_GRACE_SECS + admission_allowance_secs(&timed)
         );
-        assert_eq!(command.admission_max_secs, Some(1200));
+        assert_eq!(command.admission_max_secs, Some(BUILD_ADMISSION_WAIT_SECS));
         // The timeout is a daemon field, never a cargo argument.
         assert!(!command.argv.iter().any(|arg| arg.contains("timeout")));
         let untimed = params(JobKind::Test, serde_json::json!({"package":"rsid"}));
@@ -10827,7 +12801,8 @@ error: test run failed
             job_command(&tools(), &untimed, cwd, None)
                 .unwrap()
                 .runtime_max_secs,
-            3 * 3600
+            // The 3 h cap plus the widened admission wait (#3575).
+            3 * 3600 + BUILD_ADMISSION_WAIT_SECS - JOB_SLOT_WAIT_ALLOWANCE_SECS
         );
     }
 
@@ -11118,11 +13093,11 @@ error: test run failed
             .unwrap();
             append_phase(&row.job.log_path, now, "job-start");
             append_phase(&row.job.log_path, now, phase);
-            // Admission can exceed the execution budget, but never ten minutes.
-            let within = now + chrono::Duration::seconds(599);
+            // Admission can exceed the execution budget, but never the hour.
+            let within = now + chrono::Duration::seconds(3599);
             assert_eq!(poll_once(&store, &dynamic, within).await.unwrap(), 0);
             assert!(*runtime.active.lock().unwrap());
-            let past = now + chrono::Duration::seconds(601);
+            let past = now + chrono::Duration::seconds(3601);
             assert_eq!(poll_once(&store, &dynamic, past).await.unwrap(), 1);
             assert_eq!(poll_once(&store, &dynamic, past).await.unwrap(), 0);
             assert!(!*runtime.active.lock().unwrap());
@@ -11131,10 +13106,10 @@ error: test run failed
             assert_eq!(job.state, JobState::Failed);
             let result = job.result.unwrap();
             assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
-            assert_eq!(result.slot_wait_secs, Some(601));
+            assert_eq!(result.slot_wait_secs, Some(3601));
             let detail = result.detail.unwrap();
             assert!(
-                detail.contains("separate 10-minute build admission limit"),
+                detail.contains("separate 60-minute build admission limit"),
                 "{detail}"
             );
             assert!(
@@ -11147,7 +13122,167 @@ error: test run failed
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn scoped_job_admission_uses_its_wall_budget_and_retains_runtime_reserve() {
+    fn scoped_job_gets_its_full_execution_budget_after_a_long_admission_wait() {
+        for (wait_phase, grant_phase) in [
+            (
+                "slot-wait: build slice or disk floor hold",
+                "slot-granted: running",
+            ),
+            (
+                "sandbox-lock-wait: another job holds the sandbox",
+                "sandbox-lock-held: running",
+            ),
+            (
+                "artifact-lock-wait: another build holds the artifacts",
+                "artifact-lock-held: running",
+            ),
+        ] {
+            let (store, dir) = open();
+            let runtime = FakeRuntime::default();
+            let mut job =
+                held_test_job(&store.blocking_lock(), &runtime, dir.path(), Uuid::new_v4()).job;
+            job.params = params(
+                JobKind::Test,
+                serde_json::json!({
+                    "scoped_test": {"base": "origin/rolling"}, "timeout_minutes": 60,
+                }),
+            );
+            let now = Utc::now();
+            job.started_at = Some(now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
+            job.created_at = (now - chrono::Duration::minutes(35))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            std::fs::write(&job.log_path, "").unwrap();
+            append_phase(
+                &job.log_path,
+                now - chrono::Duration::minutes(35),
+                "queue-wait: waiting for admission",
+            );
+            append_phase(&job.log_path, now, "job-start");
+            append_phase(&job.log_path, now, wait_phase);
+            assert!(!timed_out(&job, now + chrono::Duration::minutes(59)));
+            let expired = now + chrono::Duration::minutes(61) + chrono::Duration::seconds(1);
+            assert!(timed_out(&job, expired));
+            let result = timed_out_result(&job, expired, None);
+            assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
+            assert_eq!(result.slot_wait_secs, Some(61 * 60 + 1));
+
+            let admitted = now + chrono::Duration::minutes(35);
+            append_phase(&job.log_path, admitted, grant_phase);
+            // A 35-minute wait still leaves the whole 60-minute execution budget.
+            let completed = admitted + chrono::Duration::minutes(59);
+            assert!(!timed_out(&job, completed));
+            let log = "SCOPED_TEST_RECEIPT {\"ok\":true,\"packages\":[{\"package\":\"rsid\",\"status\":\"passed\",\"completed\":1}]}\n";
+            let (state, result) = classify(&job, Some(0), log);
+            assert_eq!(state, JobState::Succeeded);
+            assert_eq!(result.receipt.unwrap()["queue_wait_sec"], 35 * 60);
+            let expired = admitted + chrono::Duration::minutes(61);
+            assert!(timed_out(&job, expired));
+            assert_eq!(
+                timed_out_result(&job, expired, None).refusal.as_deref(),
+                Some(JOB_TIMED_OUT)
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn scoped_jobs_survive_a_deploy_hold_but_have_a_finite_queue_allowance() {
+        for (age, waited) in [(35, 35), (61, 61), (120, 35)] {
+            let (store, dir) = open();
+            let runtime = Arc::new(FakeRuntime::default());
+            let dynamic: Arc<dyn JobRuntime> = runtime.clone();
+            let now = Utc::now();
+            let mut context = timed_test_ctx(Uuid::new_v4(), dir.path(), Some(60));
+            context.params = params(
+                JobKind::Test,
+                serde_json::json!({
+                    "scoped_test": {"base": "origin/rolling"}, "timeout_minutes": 60,
+                }),
+            );
+            let drain = crate::deploy_drain::DeployDrain::new();
+            let (row, _) = {
+                let guard = store.lock().await;
+                engage_job_hold(&guard, &drain, now);
+                submit_with_hold(
+                    &guard,
+                    &*runtime,
+                    &tools(),
+                    dir.path(),
+                    context,
+                    true,
+                    now - chrono::Duration::minutes(age),
+                )
+                .unwrap()
+            };
+            if age != waited {
+                // A deploy rerun keeps its id/created_at but starts a new queue wait.
+                std::fs::write(&row.job.log_path, "").unwrap();
+                append_phase(
+                    &row.job.log_path,
+                    now - chrono::Duration::minutes(waited),
+                    "queue-wait: stopped by deploy; requeued",
+                );
+            }
+            assert_eq!(row.job.state, JobState::Queued);
+            assert_eq!(
+                start_queued_jobs(&store, &dynamic, &tools(), &drain)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let held = store
+                .lock()
+                .await
+                .get_agent_job(row.job.id)
+                .unwrap()
+                .unwrap();
+            if waited == 61 {
+                assert_eq!(held.job.state, JobState::Failed);
+                assert_eq!(
+                    held.job.result.unwrap().refusal.as_deref(),
+                    Some(JOB_ADMISSION_TIMED_OUT)
+                );
+                continue;
+            }
+            assert_eq!(held.job.state, JobState::Queued);
+            // Release the deploy hold: even after 35 minutes the job launches
+            // and completes successfully near the end of its execution budget.
+            let released = crate::deploy_drain::DeployDrain::new();
+            assert_eq!(
+                start_queued_jobs(&store, &dynamic, &tools(), &released)
+                    .await
+                    .unwrap(),
+                1
+            );
+            append_phase(&row.job.log_path, now, "job-start");
+            let completed = now + chrono::Duration::minutes(59);
+            assert_eq!(poll_once(&store, &dynamic, completed).await.unwrap(), 0);
+            append_job_log(
+                &row.job.log_path,
+                "SCOPED_TEST_RECEIPT {\"ok\":true,\"packages\":[]}\n",
+            );
+            std::fs::write(&row.status_path, "0\n").unwrap();
+            *runtime.active.lock().unwrap() = false;
+            assert_eq!(poll_once(&store, &dynamic, completed).await.unwrap(), 1);
+            let finished = store
+                .lock()
+                .await
+                .get_agent_job(row.job.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(finished.job.state, JobState::Succeeded);
+            let receipt = finished.job.result.unwrap().receipt.unwrap();
+            assert!(receipt["queue_wait_sec"].as_i64().unwrap() >= 35 * 60);
+        }
+    }
+
+    /// #3284: a scoped test's governor-slot wait inside the job is outside its
+    /// execution budget (a 46-minute queue used to leave 13 minutes to build and test),
+    /// bounded apart by its own allowance, and exceeding that is a capacity
+    /// refusal, never a red or a timeout.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_job_slot_wait_is_outside_its_wall_budget_and_capped_apart() {
         let (store, dir) = open();
         let runtime = FakeRuntime::default();
         let mut job =
@@ -11159,40 +13294,80 @@ error: test run failed
             }),
         );
         let now = Utc::now();
+        let at = |secs: i64| now + chrono::Duration::seconds(secs);
         job.started_at = Some(now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
         append_phase(&job.log_path, now, "job-start");
         append_phase(&job.log_path, now, "slot-wait: all 4 build slots busy");
-        assert!(!timed_out(&job, now + chrono::Duration::seconds(601)));
-        assert!(!timed_out(&job, now + chrono::Duration::seconds(3479)));
-        let past = now + chrono::Duration::seconds(3481);
-        assert!(timed_out(&job, past));
-        let result = timed_out_result(&job, past, None);
+        assert_eq!(log_wait_secs(&job.log_path, at(3481)), Some(3481));
+        // The wall budget (3600s) is not spent while the queue is.
+        assert!(!timed_out(&job, at(3481)));
+        assert!(!timed_out(&job, at(3600)));
+        // The separate allowance (an hour) plus the script's grace still holds.
+        let limit = admission_timeout_allowance_secs(&job) as i64;
+        assert!(!timed_out(&job, at(limit)));
+        let starved = at(limit + 1);
+        assert!(timed_out(&job, starved));
+        let result = timed_out_result(&job, starved, None);
         assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
-        assert_eq!(result.slot_wait_secs, Some(3481));
-        assert!(result.detail.unwrap().contains("120s runtime reserve"));
+        assert!(
+            result
+                .detail
+                .unwrap()
+                .contains("separate 60-minute build admission limit"),
+            "a starved job reads as capacity, not as failed tests"
+        );
+        // Granted after the 46-minute queue of the incident: the full hour remains.
         append_phase(
             &job.log_path,
-            now + chrono::Duration::seconds(3479),
-            "slot-granted: running",
+            at(2736),
+            "slot-granted: waited 2736s (build); running",
         );
-        assert!(!timed_out(&job, past));
-        // A granted slot does not extend the job past its overall wall deadline.
-        let expired = now + chrono::Duration::seconds(3601);
+        assert_eq!(log_wait_secs(&job.log_path, at(9000)), Some(2736));
+        assert!(!timed_out(&job, at(2736 + 3599)));
+        let expired = at(2736 + 3601);
         assert!(timed_out(&job, expired));
-        assert_eq!(
-            timed_out_result(&job, expired, None).refusal.as_deref(),
-            Some(JOB_TIMED_OUT)
+        let result = timed_out_result(&job, expired, None);
+        assert_eq!(result.refusal.as_deref(), Some(JOB_TIMED_OUT));
+        assert_eq!(result.slot_wait_secs, Some(2736));
+        assert!(
+            result
+                .detail
+                .unwrap()
+                .contains("not counting 2736s waiting for a build slot or sandbox/artifact lock")
         );
-        // Even a short job's admission ends at the reserve, before its execution cap.
-        job.params = params(
+    }
+
+    /// #3284: the unit's runtime cap carries the slot allowance and the script is
+    /// told the same cap, so neither side stops a run the other still allows.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_unit_carries_the_slot_allowance_the_script_is_told() {
+        let dir = disk_fixture();
+        let scoped = params(
             JobKind::Test,
-            serde_json::json!({
-                "scoped_test": {"base": "origin/rolling"}, "timeout_minutes": 5,
-            }),
+            serde_json::json!({"scoped_test":{"base":"origin/rolling"}, "timeout_minutes":60}),
         );
-        append_phase(&job.log_path, now, "sandbox-lock-wait: busy");
-        assert!(!timed_out(&job, now + chrono::Duration::seconds(179)));
-        assert!(timed_out(&job, now + chrono::Duration::seconds(181)));
+        let command = job_command(&tools(), &scoped, dir.path(), None).unwrap();
+        assert_eq!(admission_allowance_secs(&scoped), 60 * 60);
+        let cap = admission_allowance_secs(&scoped).to_string();
+        assert!(
+            command
+                .argv
+                .windows(2)
+                .any(|w| w == ["--slot-wait-max-sec", cap.as_str()])
+        );
+        // The script's wait cap, then a full execution budget, then the unit grace.
+        assert!(
+            command.runtime_max_secs
+                >= admission_allowance_secs(&scoped)
+                    + 60 * 60
+                    + JOB_TIMEOUT_UNIT_GRACE_SECS
+                    + SCOPED_SLOT_WAIT_GRACE_SECS
+        );
+        assert_eq!(
+            command.admission_max_secs,
+            Some(admission_allowance_secs(&scoped))
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -11227,6 +13402,140 @@ error: test run failed
                 .detail
                 .unwrap()
                 .contains("local load wait after 600s")
+        );
+    }
+
+    /// #618: an admission timeout is an infrastructure failure: the result and
+    /// its receipt carry `infrastructure_admission_timeout` (so the worker's
+    /// two-run limit is not charged) and name what held the job, here the disk
+    /// floor with no slot holder at all.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_admission_timeout_is_an_infrastructure_class_that_names_what_held_the_job() {
+        let (store, dir) = open();
+        let runtime = FakeRuntime::default();
+        let mut ctx = timed_test_ctx(Uuid::new_v4(), dir.path(), Some(20));
+        ctx.params = params(
+            JobKind::Test,
+            serde_json::json!({
+                "scoped_test": {"base": "origin/rolling", "head": "HEAD"},
+                "timeout_minutes": 20,
+            }),
+        );
+        let (row, _) = submit(
+            &*store.blocking_lock(),
+            &runtime,
+            &tools(),
+            dir.path(),
+            ctx,
+            Utc::now(),
+        )
+        .unwrap();
+        let log = concat!(
+            "rsi-phase 1 slot-wait: governor wait: queued (build position 0): only 26.9 GiB free on /, floor 30 GiB; waiting for space\n",
+            "rsi-phase 3600 slot-wait: still waiting 3599s: governor wait: only 26.8 GiB free on /, floor 30 GiB; waiting for space\n",
+            "rsi-phase 3601 admission-timeout: no build slot within separate admission allowance; rsid was not run\n",
+            "SCOPED_TEST_RECEIPT {\"schema\":1,\"ok\":false,\"packages\":[],\"admission\":{\"count\":1,\"waited_sec\":3600.5}}\n",
+        );
+        let (state, result) = classify(&row.job, Some(124), log);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
+        assert_eq!(
+            result.failure_class.as_deref(),
+            Some(FAILURE_CLASS_ADMISSION_TIMEOUT)
+        );
+        let detail = result.detail.unwrap();
+        assert!(
+            detail.contains("last blocked by: only 26.8 GiB free on /, floor 30 GiB"),
+            "{detail}"
+        );
+        let receipt = result.receipt.unwrap();
+        assert_eq!(receipt["failure_class"], "infrastructure_admission_timeout");
+        assert_eq!(receipt["ok"], false);
+        assert_eq!(receipt["admission"]["waited_sec"], 3600.5);
+        assert_eq!(
+            receipt["admission"]["blocked_by"],
+            "only 26.8 GiB free on /, floor 30 GiB; waiting for space"
+        );
+        // The class rides the wire next to the refusal.
+        let wire = serde_json::to_value(AgentJobResultV1 {
+            failure_class: Some(FAILURE_CLASS_ADMISSION_TIMEOUT.into()),
+            ..AgentJobResultV1::default()
+        })
+        .unwrap();
+        assert_eq!(wire["failure_class"], "infrastructure_admission_timeout");
+    }
+
+    /// #625: a job the host disk floor alone has held past the fail-fast bound
+    /// (no slot holder) is stopped and settled as an infrastructure admission
+    /// timeout; a shorter hold, another job's unit or a non-cargo job is left.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_disk_floor_hold_with_no_slot_holder_settles_early_as_infrastructure() {
+        use crate::governor::DiskStalledWaiter;
+        let (store, dir) = open();
+        let runtime = FakeRuntime::default();
+        let mut ctx = timed_test_ctx(Uuid::new_v4(), dir.path(), Some(20));
+        ctx.params = params(
+            JobKind::Test,
+            serde_json::json!({
+                "scoped_test": {"base": "origin/rolling", "head": "HEAD"},
+                "timeout_minutes": 20,
+            }),
+        );
+        let (row, _) = submit(
+            &*store.blocking_lock(),
+            &runtime,
+            &tools(),
+            dir.path(),
+            ctx,
+            Utc::now(),
+        )
+        .unwrap();
+        let job = row.job;
+        std::fs::write(
+            &job.log_path,
+            "rsi-phase 1 slot-wait: governor wait: queued (build position 0): only 26.9 GiB free on /, floor 30 GiB; waiting for space\n",
+        )
+        .unwrap();
+        let stall = |unit: &str, secs: u64| {
+            vec![DiskStalledWaiter {
+                unit: Some(format!("{unit}.service")),
+                stalled_secs: secs,
+            }]
+        };
+        let bound = DISK_FLOOR_FAIL_FAST_SECS;
+        assert!(disk_floor_breach(&job, &runtime, || stall(&job.unit_name, bound - 1)).is_none());
+        assert!(disk_floor_breach(&job, &runtime, || stall("rsi-job-other", bound + 60)).is_none());
+        assert!(disk_floor_breach(&job, &runtime, Vec::new).is_none());
+        // A job whose own log no longer shows a governor wait is left alone.
+        let waiting_log = std::fs::read_to_string(&job.log_path).unwrap();
+        std::fs::write(
+            &job.log_path,
+            format!("{waiting_log}rsi-phase 2 slot-granted: waited 1s (build); running\n"),
+        )
+        .unwrap();
+        assert!(disk_floor_breach(&job, &runtime, || stall(&job.unit_name, bound + 60)).is_none());
+        std::fs::write(&job.log_path, waiting_log).unwrap();
+        assert!(runtime.stopped.lock().unwrap().is_empty());
+
+        let (state, result) =
+            disk_floor_breach(&job, &runtime, || stall(&job.unit_name, bound + 60)).unwrap();
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.refusal.as_deref(), Some(JOB_ADMISSION_TIMED_OUT));
+        assert_eq!(
+            result.failure_class.as_deref(),
+            Some(FAILURE_CLASS_ADMISSION_TIMEOUT)
+        );
+        let detail = result.detail.unwrap();
+        assert!(detail.contains("no build slot holder"), "{detail}");
+        assert!(
+            detail.contains("only 26.9 GiB free on /, floor 30 GiB"),
+            "{detail}"
+        );
+        assert_eq!(
+            *runtime.stopped.lock().unwrap(),
+            vec![job.unit_name.clone()]
         );
     }
 
@@ -11277,12 +13586,31 @@ error: test run failed
     /// #1832/#1830: the wrapper's bounded writer must not hold lines back: a
     /// long-running job's `job-start` and early output are in the log while it
     /// is still running.
+    // Runs on every platform: macOS has no working `stdbuf` and a buffering
+    // BSD `head`, which hid `job-start` for the whole run (#464).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_wrapper_log_shows_lines_while_the_job_is_still_running() {
+        wrapper_log_shows_early_lines_while_running(None);
+    }
+
+    /// #464: the portable bounded writer (used wherever `stdbuf` is not a
+    /// working fix) shows lines while the job runs, on every platform.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_portable_wrapper_log_shows_lines_while_the_job_is_still_running() {
+        wrapper_log_shows_early_lines_while_running(Some("portable"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn wrapper_log_shows_early_lines_while_running(bound: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let (log, status) = (dir.path().join("j.log"), dir.path().join("j.status"));
-        let mut child = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        if let Some(bound) = bound {
+            command.env("RSI_JOB_BOUND", bound);
+        }
+        let mut child = command
             .args(["-c", WRAPPER, "rsi-job"])
             .arg(&log)
             .arg(&status)
@@ -11442,6 +13770,175 @@ error: test run failed
         assert_eq!(runtime.launched.lock().unwrap().len(), 1);
     }
 
+    /// #3410: an `at_commit` job runs the fixed scratch-worktree script inside
+    /// the cargo slot with the commit and the ordinary cargo arguments.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_at_commit_job_runs_the_scratch_worktree_script_with_the_exact_cargo_args() {
+        let sha = "b".repeat(40);
+        let p = params(
+            JobKind::Test,
+            serde_json::json!({
+                "at_commit": sha, "package": "rsid", "lib_only": true,
+                "exact": true, "filters": ["a::b"]
+            }),
+        );
+        let command = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+        assert_eq!(
+            command.argv,
+            [
+                "/x/cargo-slot",
+                "env",
+                "-u",
+                "RSI_PROCESS_OWNERSHIP_NAMESPACE",
+                "scripts/at-commit-test.sh",
+                sha.as_str(),
+                "test",
+                "-p",
+                "rsid",
+                "--lib",
+                "--no-fail-fast",
+                "--",
+                "a::b",
+                "--exact"
+            ]
+        );
+    }
+
+    /// #4019: a `bin` at_commit job builds only that binary target's unit tests,
+    /// so rsi-rolling-land's tests::* can be run at a past commit.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn an_at_commit_bin_job_passes_bin_to_cargo_test_and_not_the_e2e_setup() {
+        let sha = "c".repeat(40);
+        for package in ["rsid", "rsi"] {
+            let p = params(
+                JobKind::Test,
+                serde_json::json!({
+                    "at_commit": sha, "package": package, "bin": "rsi-rolling-land",
+                    "exact": true, "filters": ["tests::lander_derives_the_released_pin"]
+                }),
+            );
+            let command = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+            assert_eq!(
+                command.argv,
+                [
+                    "/x/cargo-slot",
+                    "env",
+                    "-u",
+                    "RSI_PROCESS_OWNERSHIP_NAMESPACE",
+                    "scripts/at-commit-test.sh",
+                    sha.as_str(),
+                    "test",
+                    "-p",
+                    package,
+                    "--bin",
+                    "rsi-rolling-land",
+                    "--no-fail-fast",
+                    "--",
+                    "tests::lander_derives_the_released_pin",
+                    "--exact"
+                ]
+            );
+        }
+    }
+
+    /// #3410: the script runs cargo in a scratch checkout of exactly that
+    /// commit, leaves the caller's checkout, branch and worktree list as they
+    /// were, removes the scratch, passes cargo's exit code through and refuses a
+    /// commit the repository does not have.
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_at_commit_script_tests_a_scratch_checkout_and_leaves_the_sandbox_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("sandbox");
+        let tmp = dir.path().join("tmp");
+        let bin = dir.path().join("bin");
+        for d in [&repo, &tmp, &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let head_of = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(repo.join("marker"), "old\n").unwrap();
+        git(&repo, &["add", "marker"]);
+        git(&repo, &["commit", "--quiet", "-m", "old"]);
+        let old = head_of(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("marker"), "new\n").unwrap();
+        git(&repo, &["commit", "--quiet", "-am", "new"]);
+        let new = head_of(&["rev-parse", "HEAD"]);
+        assert_ne!(old, new);
+        // A stand-in cargo: shows where it ran and what that checkout holds.
+        let cargo = bin.join("cargo");
+        std::fs::write(
+            &cargo,
+            "#!/bin/sh\necho \"CARGO_CWD=$(pwd)\"\necho \"MARKER=$(cat marker)\"\n\
+             echo \"ARGS=$*\"\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = PathBuf::from(rsi_common::manifest_dir!())
+            .join("../../scripts/at-commit-test.sh")
+            .canonicalize()
+            .unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let run = |commit: &str| {
+            Command::new(&script)
+                .arg(commit)
+                .args(["test", "-p", "x"])
+                .current_dir(&repo)
+                .env("PATH", &path)
+                .env("TMPDIR", &tmp)
+                .output()
+                .unwrap()
+        };
+
+        let output = run(&old);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert_eq!(output.status.code(), Some(7), "{stdout}");
+        assert!(stdout.contains("MARKER=old"), "{stdout}");
+        assert!(stdout.contains("ARGS=test -p x"), "{stdout}");
+        assert!(
+            !stdout.contains(&format!("CARGO_CWD={}", repo.display())),
+            "{stdout}"
+        );
+        // The sandbox: same HEAD, same branch, same file, no extra worktree, and
+        // the scratch directory is gone.
+        assert_eq!(head_of(&["rev-parse", "HEAD"]), new);
+        assert_eq!(head_of(&["symbolic-ref", "--short", "HEAD"]), "main");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("marker")).unwrap(),
+            "new\n"
+        );
+        assert_eq!(
+            head_of(&["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+
+        // The commit the job runs at is the one named, whichever it is.
+        let output = run(&new);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("MARKER=new"));
+
+        // A commit the repository lacks is refused before cargo runs.
+        let output = run(&"c".repeat(40));
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("MARKER="));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not in this repository"));
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -11494,6 +13991,7 @@ error: test run failed
             started_at: None,
             finished_at: None,
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         };
         let (state, result) = classify(&job, Some(0), &log);
@@ -11534,6 +14032,7 @@ error: test run failed
             started_at: None,
             finished_at: None,
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         }
     }
@@ -11600,6 +14099,247 @@ error: test run failed
         );
     }
 
+    /// A `build` job with an allowlisted dev feature and named binaries passes
+    /// one `--features` list and one `--bin` each to cargo, still in the build
+    /// slot. The feature comes from the shared allowlist so no daemon source names
+    /// the dev seeder (a source scan in the rsid integration tests pins that).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn release_members_isolate_cargo_features_and_select_only_named_bins() {
+        let dir = disk_fixture();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nresolver = '3'\nmembers = ['core', 'guards', 'json']\n",
+        )
+        .unwrap();
+        for name in ["core", "guards", "json"] {
+            std::fs::create_dir_all(root.join(name).join("src")).unwrap();
+        }
+        // Model the exact Cargo hazard: a shared dependency whose optional
+        // feature changes the API required by the daemon. A combined invocation
+        // must fail, while isolated invocations must compile both consumers.
+        std::fs::write(root.join("json/Cargo.toml"), "[package]\nname = 'release-probe-json'\nversion = '0.0.0'\nedition = '2021'\n[features]\npreserve_order = []\n").unwrap();
+        std::fs::write(
+            root.join("json/src/lib.rs"),
+            "pub const ORDERED: bool = cfg!(feature = \"preserve_order\");\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("core/Cargo.toml"), "[package]\nname = 'release-probe-core'\nversion = '0.0.0'\nedition = '2021'\n[dependencies]\nrelease-probe-json = { path = '../json' }\n[[bin]]\nname = 'release-probe-core'\npath = 'src/main.rs'\n[[bin]]\nname = 'unselected-probe'\npath = 'src/unselected.rs'\n").unwrap();
+        std::fs::write(
+            root.join("core/src/main.rs"),
+            "const _: () = assert!(!release_probe_json::ORDERED);\nfn main() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("core/src/unselected.rs"),
+            "compile_error!(\"only named bins may build\");\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("guards/Cargo.toml"), "[package]\nname = 'release-probe-guards'\nversion = '0.0.0'\nedition = '2021'\n[dependencies]\nrelease-probe-json = { path = '../json', features = ['preserve_order'] }\n[[bin]]\nname = 'release-probe-guard'\npath = 'src/main.rs'\n").unwrap();
+        std::fs::write(
+            root.join("guards/src/main.rs"),
+            "const _: () = assert!(release_probe_json::ORDERED);\nfn main() {}\n",
+        )
+        .unwrap();
+        let build = params(
+            JobKind::Build,
+            serde_json::json!({"command":"build","release":true,
+            "sha":"a".repeat(40),"release_members":[
+                {"package":"release-probe-core","bins":["release-probe-core"]},
+                {"package":"release-probe-guards","bins":["release-probe-guard"]}]}),
+        );
+        let command = job_command(&tools(), &build, root, None).unwrap();
+        assert_eq!(command.argv[0], tools().cargo_slot.display().to_string());
+        assert!(runs_in_build_slice(&build));
+        // Skip only the outer admission wrapper: this test already runs inside
+        // a daemon-owned cargo job. Keep its stamped target and build settings.
+        let run = Command::new(&command.argv[1])
+            .args(&command.argv[2..])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let combined = Command::new("cargo")
+            .args([
+                "check",
+                "--offline",
+                "-p",
+                "release-probe-core",
+                "-p",
+                "release-probe-guards",
+                "--bin",
+                "release-probe-core",
+                "--bin",
+                "release-probe-guard",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(!combined.status.success());
+        assert!(
+            String::from_utf8_lossy(&combined.stderr).contains("E0080"),
+            "{}",
+            String::from_utf8_lossy(&combined.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn release_members_stop_at_a_failed_member_and_keep_bin_arguments_grouped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = disk_fixture();
+        let cargo = dir.path().join("cargo");
+        std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PROBE_LOG\"\ncase \"$*\" in *guards*) exit 17;; esac\n").unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let build = params(
+            JobKind::Build,
+            serde_json::json!({"command":"build","release":true,
+            "sha":"a".repeat(40),"release_members":[
+                {"package":"server","bins":["server","cli"]},
+                {"package":"guards","bins":["guard"]},
+                {"package":"later","bins":["later"]}]}),
+        );
+        let command = job_command(&tools(), &build, dir.path(), None).unwrap();
+        let log = dir.path().join("calls");
+        let path = std::env::join_paths(std::iter::once(dir.path().to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .unwrap();
+        let run = Command::new(&command.argv[1])
+            .args(&command.argv[2..])
+            .env("PATH", path)
+            .env("PROBE_LOG", &log)
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(17));
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "build --release -p server --bin server --bin cli\nbuild --release -p guards --bin guard\n"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn release_members_share_the_source_fence_and_target_receipt() {
+        let (repo, _, head) = source::tests::repo();
+        let extra = serde_json::json!({"command":"build","workspace":false,"release":true,"sha":head,
+            "release_members":[{"package":"server","bins":["server","cli"]},
+                {"package":"guards","bins":["guard"]}]});
+        let build = params(JobKind::Build, extra.clone());
+        let shared = crate::release_target::release_target_dir_in(repo.path());
+        assert_eq!(
+            crate::release_target::select_job_target(
+                &build,
+                true,
+                repo.path().join("target"),
+                repo.path()
+            ),
+            shared
+        );
+        let jobs = disk_fixture();
+        let job = finish_build(repo.path(), jobs.path(), |_| {}, extra.clone()).await;
+        assert_eq!(job.state, JobState::Succeeded);
+        let result = job.result.unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.source_head.as_deref(), Some(head.as_str()));
+        assert_eq!(result.source_dirty, Some(false));
+        assert_eq!(result.target_dir, log_build_target(&job.log_path));
+        assert!(result.target_dir.is_some());
+        let JobParams::Build(expected) = &build else {
+            unreachable!()
+        };
+        assert_eq!(result.release_members, expected.release_members);
+        let jobs = disk_fixture();
+        let changed = finish_build(
+            repo.path(),
+            jobs.path(),
+            |repo| std::fs::write(repo.join("untracked"), "changed").unwrap(),
+            extra,
+        )
+        .await;
+        assert_eq!(changed.state, JobState::Failed);
+        assert_eq!(
+            changed.result.unwrap().refusal.as_deref(),
+            Some("job_source_moved")
+        );
+        let err = source::at_submit(&build, repo.path()).unwrap_err();
+        assert!(err.to_string().contains("requires a clean worktree"));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_build_job_passes_allowlisted_features_and_bins_to_cargo_in_the_build_slot() {
+        let feature = rsi_common::agent_jobs::allowed_build_features("rsid")[0];
+        let build = params(
+            JobKind::Build,
+            serde_json::json!({"command":"build","package":"rsid","features":[feature],
+                "bins":["rsid","other-bin"]}),
+        );
+        let command = job_command(&tools(), &build, Path::new("/tmp"), None).unwrap();
+        assert_eq!(
+            command.argv[1..],
+            [
+                "env",
+                "-u",
+                STRIP_NAMESPACE_ENV,
+                "cargo",
+                "build",
+                "-p",
+                "rsid",
+                "--features",
+                feature,
+                "--bin",
+                "rsid",
+                "--bin",
+                "other-bin"
+            ]
+        );
+        assert!(runs_in_build_slice(&build));
+    }
+
+    /// #171: an exact package `test` job with an allowlisted dev feature passes
+    /// one `--features` list to cargo, still in the build slot, before the
+    /// libtest arguments. The feature comes from the shared allowlist so no
+    /// daemon source names the dev seeder.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_package_test_job_passes_allowlisted_features_to_cargo_in_the_build_slot() {
+        let feature = rsi_common::agent_jobs::allowed_build_features("rsid")[0];
+        let test = params(
+            JobKind::Test,
+            serde_json::json!({"package":"rsid","test_target":"seed_suite","exact":true,
+                "filters":["one::two"],"features":[feature]}),
+        );
+        let command = job_command(&tools(), &test, Path::new("/tmp"), None).unwrap();
+        assert_eq!(
+            command.argv[1..],
+            [
+                "env",
+                "-u",
+                STRIP_NAMESPACE_ENV,
+                "cargo",
+                "test",
+                "-p",
+                "rsid",
+                "--test",
+                "seed_suite",
+                "--features",
+                feature,
+                "--no-fail-fast",
+                "--",
+                "one::two",
+                "--exact"
+            ]
+        );
+        assert!(runs_in_build_slice(&test));
+    }
+
     /// #2692: the sweep settles on its own receipt, which rides in the result
     /// with per-shard exit codes; a missing or red receipt never reads green.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -11657,6 +14397,7 @@ error: test run failed
         let p = rsi_common::agent_jobs::ScopedTestParams {
             base: "origin/rolling".into(),
             head: None,
+            rolling_tool: false,
         };
         let rev = "a".repeat(40);
         let tool = scoped_tool::ScopedTool::Rolling {
@@ -11677,6 +14418,7 @@ error: test run failed
         );
         let candidate = scoped_tool::ScopedTool::Candidate {
             files: vec!["scoped-test".into(), "new-helper.py".into()],
+            why: scoped_tool::CandidateWhy::DiffChangesTool,
         };
         let argv = scoped_test_command(&tools(), &p, Some(20), &candidate).argv;
         assert_eq!(argv[3], "RSI_SCOPED_TEST_TOOL_SOURCE=candidate");
@@ -11693,7 +14435,8 @@ error: test run failed
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_requested_cpu_budget_lowers_unit_quota_and_parallelism_but_never_raises_them() {
-        let cwd = Path::new("/w/sandbox");
+        let fixture = disk_fixture();
+        let cwd = fixture.path();
         let scoped = |extra: serde_json::Value| {
             let mut value = serde_json::json!({"scoped_test":{"base":"origin/rolling"}});
             value
@@ -11760,6 +14503,7 @@ error: test run failed
         );
         // The unit the systemd command starts carries the lowered quota.
         let spec = LaunchSpec {
+            kind: JobKind::Test,
             unit_name: "rsi-job-fixture".into(),
             cwd: cwd.to_owned(),
             log_path: "/tmp/fixture.log".into(),
@@ -11906,6 +14650,7 @@ error: test run failed
                 assert_eq!(threads, (quota / 100).to_string());
             }
             let spec = LaunchSpec {
+                kind: JobKind::Test,
                 unit_name: "rsi-job-budget".into(),
                 cwd: dir.path().to_owned(),
                 log_path: dir.path().join("budget.log"),
@@ -11919,6 +14664,7 @@ error: test run failed
                 "{params:?}: {args:?}"
             );
             assert!(args.contains(&format!("--property=CPUQuota={quota}%")));
+            assert!(args.contains(&"--property=IOWeight=20".to_string()));
         }
     }
 
@@ -11937,6 +14683,7 @@ error: test run failed
             systemctl: PathBuf::from("/usr/bin/true"),
         };
         let spec = LaunchSpec {
+            kind: JobKind::Test,
             unit_name: "rsi-job-slice-gate".into(),
             cwd: dir.path().to_owned(),
             log_path: dir.path().join("slice-gate.log"),
@@ -11950,6 +14697,7 @@ error: test run failed
                 cpu_quota_percent: 250,
                 background: false,
                 admission_max_secs: None,
+                scoped_tool: None,
             },
             build_environment: Some(BuildEnvironment {
                 tmp_dir: dir.path().join("tmp"),
@@ -11998,6 +14746,7 @@ error: test run failed
         );
         assert_eq!(command.argv[7], "make");
         let spec = LaunchSpec {
+            kind: JobKind::Test,
             unit_name: "full-library-qa-fixture".into(),
             cwd: dir.path().to_owned(),
             log_path: dir.path().join("qa.log"),
@@ -12017,6 +14766,8 @@ error: test run failed
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn a_scoped_test_job_runs_the_fixed_script_and_records_its_receipt() {
+        let fixture = crate::test_support::non_repository_tempdir("scoped-argv");
+        std::fs::write(fixture.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         let mut p = params(
             JobKind::Test,
             serde_json::json!({"scoped_test":{"base":"origin/rolling","head":"HEAD"}}),
@@ -12025,7 +14776,7 @@ error: test run failed
             panic!("test");
         };
         test.timeout_minutes = Some(20);
-        let command = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+        let command = job_command(&tools(), &p, fixture.path(), None).unwrap();
         let ceiling = scoped_test_cpu_ceiling_percent(host_threads());
         let expected_quota = ceiling.to_string();
         let tail: Vec<&str> = command.argv.iter().skip(3).map(String::as_str).collect();
@@ -12043,6 +14794,8 @@ error: test run failed
                 "1140",
                 "--job-max-sec",
                 "1200",
+                "--slot-wait-max-sec",
+                "1200",
                 "--cargo-slot",
                 "/x/cargo-slot",
                 "--cpu-quota",
@@ -12050,9 +14803,10 @@ error: test run failed
             ]
         );
         assert_eq!(command.cpu_quota_percent, ceiling);
+        // The unit's cap carries the in-job slot allowance (#3284).
         assert_eq!(
             command.runtime_max_secs,
-            20 * 60 + JOB_TIMEOUT_UNIT_GRACE_SECS
+            2 * 20 * 60 + JOB_TIMEOUT_UNIT_GRACE_SECS + SCOPED_SLOT_WAIT_GRACE_SECS
         );
 
         // #1979: at the 60-minute scoped default two 25-minute packages fit.
@@ -12063,7 +14817,7 @@ error: test run failed
             test.timeout_minutes = Some(minutes);
         };
         set_minutes(&mut p, 60);
-        let long = job_command(&tools(), &p, Path::new("/tmp"), None).unwrap();
+        let long = job_command(&tools(), &p, fixture.path(), None).unwrap();
         assert!(
             long.argv
                 .windows(2)
@@ -12101,6 +14855,7 @@ error: test run failed
             started_at: None,
             finished_at: None,
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         };
         let (state, result) = classify(&job, Some(0), &log);
@@ -12137,6 +14892,23 @@ error: test run failed
         assert!(!detail.contains("SCOPED_TEST_RECEIPT"), "{detail}");
         assert!(!detail.contains("log_dir"), "{detail}");
         assert_eq!(result.receipt.unwrap()["ok"], false);
+        // #516: preserve the runner's signal-only classification in the typed
+        // job result (AgentGetJob and the owner's wake), without accepting it.
+        let mut interrupted = receipt.clone();
+        interrupted["ok"] = false.into();
+        interrupted["failure_class"] = "infrastructure_interrupted".into();
+        let (state, result) = classify(
+            &job,
+            Some(1),
+            &format!("SCOPED_TEST_RECEIPT {interrupted}\n"),
+        );
+        assert_eq!(state, JobState::Failed);
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            wire["receipt"]["failure_class"],
+            "infrastructure_interrupted"
+        );
+        assert_eq!(wire["receipt"]["ok"], false);
         let (state, result) = classify(&job, Some(1), "no receipt\n");
         assert_eq!(state, JobState::Failed);
         assert_eq!(
@@ -12151,6 +14923,96 @@ error: test run failed
         let bytes = serde_json::to_string(&result).unwrap().len();
         let doubled = log.len() + serde_json::to_string(&receipt).unwrap().len();
         assert!(bytes < doubled, "{bytes} >= {doubled}");
+    }
+
+    /// #561: receipt evidence is read separately from the bounded diagnostic tail.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn oversized_scoped_receipts_preserve_build_failures_and_diagnostics() {
+        let dir = crate::test_support::disk_backed_tempdir("scoped-large-receipt");
+        let job = filtered_job(
+            params(
+                JobKind::Test,
+                serde_json::json!({"scoped_test":{"base":"origin/rolling"}}),
+            ),
+            &dir.path().join("job.log"),
+        );
+        let receipt = serde_json::json!({
+            "schema": 1, "ok": false, "exit_code": 1, "failure_class": "build_failed",
+            "packages": [{"package": "rsid", "status": "failed", "completed": 0,
+                          "failure_class": "build_failed", "diagnostic": "expected 6 arguments, found 5"}],
+            "filters": ["x".repeat(2 * 1024 * 1024)],
+            "new_failures": null, "baseline_reds": [],
+        });
+        let log = format!("compiler output\nSCOPED_TEST_RECEIPT {receipt}\n");
+        let (state, result) = settle_logged(&job, 1, &log);
+        assert!(log.len() > LOG_TAIL_READ_BYTES as usize);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.exit_code, Some(1));
+        assert_eq!(result.refusal, None);
+        assert_eq!(result.receipt.as_ref(), Some(&receipt));
+        assert_eq!(
+            result.receipt.as_ref().unwrap()["packages"][0]["diagnostic"],
+            "expected 6 arguments, found 5"
+        );
+
+        // Diagnostic output after the receipt also cannot hide typed evidence.
+        let noisy = format!("{log}{}", "diagnostic output\n".repeat(20_000));
+        let (_, result) = settle_logged(&job, 1, &noisy);
+        assert_eq!(result.receipt.as_ref(), Some(&receipt));
+
+        // A hard timeout retains the last receipt but cannot report success.
+        let timed_out = timed_out_result(&job, Utc::now(), None);
+        assert_eq!(timed_out.refusal.as_deref(), Some(JOB_TIMED_OUT));
+        assert_eq!(
+            timed_out.receipt.as_ref().unwrap()["failure_class"],
+            "build_failed"
+        );
+        assert_eq!(timed_out.receipt.as_ref().unwrap()["partial"], true);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn scoped_receipts_require_complete_lines_and_bound_the_read() {
+        let dir = crate::test_support::disk_backed_tempdir("scoped-truncated-receipt");
+        let job = filtered_job(
+            params(
+                JobKind::Test,
+                serde_json::json!({"scoped_test":{"base":"origin/rolling"}}),
+            ),
+            &dir.path().join("job.log"),
+        );
+        let previous = serde_json::json!({"ok":false,"failure_class":"build_failed"});
+        for last in ["{\"ok\":", "{\"ok\":true}", "{broken}\n"] {
+            let log = format!("SCOPED_TEST_RECEIPT {previous}\nSCOPED_TEST_RECEIPT {last}");
+            let (_, result) = settle_logged(&job, 1, &log);
+            assert_eq!(result.receipt.as_ref(), Some(&previous));
+        }
+        let (_, missing) = settle_logged(&job, 1, "SCOPED_TEST_RECEIPT {\"ok\":false}");
+        assert_eq!(
+            missing.refusal.as_deref(),
+            Some("scoped_test_receipt_missing")
+        );
+
+        // A marker at the beginning of the read window is still a fragment:
+        // its actual line began before the explicit 16 MiB evidence limit.
+        let suffix = format!("SCOPED_TEST_RECEIPT {previous}\n");
+        let log = format!(
+            "{}{}",
+            "x".repeat(SCOPED_RECEIPT_READ_BYTES as usize + 1 - suffix.len()),
+            suffix
+        );
+        std::fs::write(&job.log_path, &log).unwrap();
+        assert_eq!(read_scoped_receipt(&job.log_path), None);
+        let (_, missing) = settle_logged(&job, 1, &log);
+        assert_eq!(
+            missing.refusal.as_deref(),
+            Some("scoped_test_receipt_missing")
+        );
+
+        // With a newline after the window's leading fragment, the next receipt is complete.
+        let (_, result) = settle_logged(&job, 1, &format!("{log}\n{suffix}"));
+        assert_eq!(result.receipt.as_ref(), Some(&previous));
     }
 
     /// #1795/#1770: a durable `scoped-test` recipe settles with the script's
@@ -12175,6 +15037,7 @@ error: test run failed
             started_at: None,
             finished_at: None,
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         };
         let receipt = |ok: bool, failures: serde_json::Value| {
@@ -12272,6 +15135,112 @@ error: test run failed
         assert!(resolve_cwd(Some(&main), &plain, true, Some(&other)).is_err());
         assert!(resolve_cwd(Some(&main), &plain, true, Some(&plain)).is_err());
         assert!(resolve_cwd(Some(&main), &plain, true, Some(&root.path().join("nope"))).is_err());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn unsandboxed_recipe_cwd_is_only_the_canonical_registered_root() {
+        let root = crate::test_support::non_repository_tempdir("nosandbox-cwd");
+        let project = root.path().join("project");
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        let canonical = project.canonicalize().unwrap();
+        // The registered root itself, and a `..` spelling of it.
+        assert_eq!(
+            resolve_unsandboxed_recipe_cwd(Some(&project), &project).unwrap(),
+            canonical
+        );
+        let dotted = project.join("..").join("project");
+        assert_eq!(
+            resolve_unsandboxed_recipe_cwd(Some(&project), &dotted).unwrap(),
+            canonical
+        );
+        // Another directory, a child of the root, a traversal out of it, a
+        // missing path and no registered path are refused.
+        let denied = |registered: Option<&Path>, dir: &Path| {
+            let error = resolve_unsandboxed_recipe_cwd(registered, dir).unwrap_err();
+            assert!(error.to_string().contains(JOB_DIR_NOT_ALLOWED), "{error}");
+        };
+        denied(Some(&project), &foreign);
+        denied(Some(&project), &project.join("..").join("foreign"));
+        std::fs::create_dir_all(project.join("child")).unwrap();
+        denied(Some(&project), &project.join("child"));
+        denied(Some(&project), &root.path().join("nope"));
+        denied(None, &project);
+        denied(Some(&root.path().join("nope")), &project);
+        denied(Some(Path::new("/")), Path::new("/"));
+        #[cfg(unix)]
+        {
+            // A link out of the root is the foreign directory it names.
+            std::os::unix::fs::symlink(&foreign, project.join("escape")).unwrap();
+            denied(Some(&project), &project.join("escape"));
+            // A registered path that is a link is judged by its target.
+            let link = root.path().join("registered-link");
+            std::os::unix::fs::symlink(&project, &link).unwrap();
+            assert_eq!(
+                resolve_unsandboxed_recipe_cwd(Some(&link), &project).unwrap(),
+                canonical
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn unsandboxed_recipe_cwd_refuses_a_project_root_that_admits_a_sandbox() {
+        // Hard rule 2: where the daemon can allocate a sandbox (the registered
+        // root is a git repository), its sessions reach the root only through
+        // sandboxes, so a no-sandbox recipe job is refused with a typed reason.
+        let root = crate::test_support::non_repository_tempdir("nosandbox-repo");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        resolve_unsandboxed_recipe_cwd(Some(&project), &project)
+            .expect("a project root with no sandbox allocation is allowed");
+        git(&project, &["init", "-q", "-b", "rolling"]);
+        let error = resolve_unsandboxed_recipe_cwd(Some(&project), &project).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(rsi_common::agent_jobs::JOB_PROJECT_ROOT_SANDBOXED),
+            "{error}"
+        );
+        // A subdirectory of the repository is still another directory.
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        let error =
+            resolve_unsandboxed_recipe_cwd(Some(&project), &project.join("sub")).unwrap_err();
+        assert!(error.to_string().contains(JOB_DIR_NOT_ALLOWED), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn only_a_declared_recipe_is_a_no_sandbox_job() {
+        let parse = |kind: &str, params: serde_json::Value| {
+            let kind: JobKind = serde_json::from_value(serde_json::json!(kind)).unwrap();
+            rsi_common::agent_jobs::AgentSubmitJobRequestV1 {
+                project_id: None,
+                sandbox_session_id: None,
+                kind,
+                params,
+                name: None,
+                idempotency_key: None,
+                worktree: None,
+                wake: None,
+            }
+            .typed_params()
+            .unwrap()
+        };
+        assert!(is_declared_recipe_job(&parse(
+            "test",
+            serde_json::json!({"recipe": "test"})
+        )));
+        assert!(!is_declared_recipe_job(&parse(
+            "test",
+            serde_json::json!({"scoped_test": {"base": "origin/rolling"}})
+        )));
+        assert!(!is_declared_recipe_job(&parse(
+            "build",
+            serde_json::json!({"command": "check", "workspace": true})
+        )));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -12445,6 +15414,7 @@ error: test run failed
             started_at: None,
             finished_at: None,
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         }
     }
@@ -12495,6 +15465,20 @@ error: test run failed
             detail.contains("test result: ok. 0 passed"),
             "tail kept: {detail}"
         );
+
+        // #171: a feature-gated filtered package job keeps the same refusal.
+        let feature = rsi_common::agent_jobs::allowed_build_features("rsid")[0];
+        let gated = filtered_job(
+            params(
+                JobKind::Test,
+                serde_json::json!({"package":"rsid","exact":true,"filters":["seed::typo"],
+                    "features":[feature]}),
+            ),
+            &log_path,
+        );
+        let (state, result) = settle_logged(&gated, 0, &zero);
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(result.refusal.as_deref(), Some(JOB_FILTER_MATCHED_NO_TESTS));
 
         // One executed test succeeds.
         let (state, result) = settle_logged(&filtered(serde_json::json!({})), 0, &one);

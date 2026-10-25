@@ -2,7 +2,9 @@
 # Build the RSI desktop UI (Tauri) and install it next to rsid/rsi.
 #
 #   scripts/install-desktop.sh                build + install (soft: a missing
-#                                             toolchain only warns and exits 0)
+#                                             toolchain only warns and exits 0);
+#                                             never called by `make release-install`
+#                                             (#3454), use `make desktop-install`
 #   scripts/install-desktop.sh --build-only   build only (`make desktop`)
 #   scripts/install-desktop.sh --required     fail instead of skipping
 #
@@ -77,8 +79,13 @@ npm run build
 # tree's last build there would link that tree's crate. The release-target guard
 # (#938, #2177) records which worktree built `release/` and removes this workspace's
 # members when a different one builds, under one lock per target.
+# json_string <file> <key>: the first string value of a key in a JSON file, read as plain text.
+json_string() {
+    sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
+}
+# `target_directory` is a top-level string of the metadata JSON: plain text, no interpreter (#465).
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps --manifest-path "$TAURI_DIR/Cargo.toml" \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+    | sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
 # shellcheck source=scripts/release-target-guard.sh
 source "$ROOT/scripts/release-target-guard.sh"
 RELEASE_GUARD_MARKER=".rsi-desktop-source"
@@ -100,10 +107,13 @@ BUILT_BIN="$TARGET_DIR/release/rsi-desktop"
 # prompt. Signing for distribution is the operator's step (desktop/README.md).
 BUILT_APP=""
 if [[ "$PLATFORM" == Darwin ]]; then
-    IFS=$'\t' read -r APP_NAME APP_ID APP_VERSION < <(python3 -c '
-import json, sys
-c = json.load(open(sys.argv[1]))
-print(c["productName"], c["identifier"], c["version"], sep="\t")' "$TAURI_DIR/tauri.conf.json")
+    APP_NAME="$(json_string "$TAURI_DIR/tauri.conf.json" productName)"
+    APP_ID="$(json_string "$TAURI_DIR/tauri.conf.json" identifier)"
+    APP_VERSION="$(json_string "$TAURI_DIR/tauri.conf.json" version)"
+    [[ -n "$APP_NAME" && -n "$APP_ID" && -n "$APP_VERSION" ]] || {
+        echo "error: $TAURI_DIR/tauri.conf.json must define productName, identifier and version" >&2
+        exit 1
+    }
     BUNDLE_DIR="$TARGET_DIR/release/bundle/macos"
     BUILT_APP="$BUNDLE_DIR/$APP_NAME.app"
     rm -rf "$BUILT_APP"

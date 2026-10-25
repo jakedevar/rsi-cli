@@ -28,8 +28,59 @@ const ORIGIN_KIND: &str = "resource_launch_origin";
 /// Re-check delay for an exhausted plan window that reports no reset time.
 const USAGE_WINDOW_UNKNOWN_RESET: chrono::Duration = chrono::Duration::minutes(5);
 
+/// The exhausted plan window behind a `manager_v2_provider_usage_limit` hold
+/// and where its record came from (#4023).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderUsageWindowHold {
+    /// The provider's own window key (`seven_day`, `five_hour`, ...).
+    pub window_key: String,
+    /// When the hold ends (the window's reset, or a short re-check).
+    pub until: DateTime<Utc>,
+    /// False when the window reported no reset time (`until` is a re-check).
+    pub reset_known: bool,
+    /// When the daemon recorded this window.
+    pub observed_at: Option<DateTime<Utc>>,
+    /// Which writer recorded it: a session's stream or the plan-window poll.
+    pub source: String,
+    /// Whether an opaque account identity is stored for the provider. Without
+    /// one, an account change cannot invalidate the record on its own.
+    pub account_identity_recorded: bool,
+}
+
+impl ProviderUsageWindowHold {
+    /// One line for the refusal text: the window kind, its reset, its source.
+    #[must_use]
+    pub fn describe(&self, provider: SessionProvider) -> String {
+        let secs = chrono::SecondsFormat::Secs;
+        let reset = if self.reset_known {
+            format!("resets {}", self.until.to_rfc3339_opts(secs, true))
+        } else {
+            format!(
+                "no reset time reported, re-checked {}",
+                self.until.to_rfc3339_opts(secs, true)
+            )
+        };
+        let observed = self
+            .observed_at
+            .map_or_else(|| "unknown".into(), |at| at.to_rfc3339_opts(secs, true));
+        format!(
+            "{provider:?} {} window is at full utilization, {reset}; recorded {observed} by {}; \
+             account identity {}; a stale record is cleared by an account change or a newer \
+             observation, or by the operator's ClearProviderUsageHold (TUI <Space>hu)",
+            self.window_key,
+            self.source,
+            if self.account_identity_recorded {
+                "recorded"
+            } else {
+                "not recorded"
+            },
+        )
+    }
+}
+
 mod charge;
 mod launch_origin;
+mod seat;
 
 /// Daemon-only witness for a new child, never deserialized from an RPC request.
 /// The transaction revalidates the parent and current policy before reserving it.
@@ -50,6 +101,20 @@ struct SpendCheckpoint {
     known_floor_usd: f64,
     /// Only observed before any admitted invocation, with proven zero history.
     zero_origin: bool,
+}
+
+/// #235: what the resources view's `active_sessions` counts against
+/// `max_active_sessions`.
+const ACTIVE_BASIS: &str = "live leaf sessions (Starting, Running, WaitingApproval or a running \
+     admitted model call) and rotation reservations in this manager's cohort; the manager's own \
+     seat lineage (current tip, a rotating-out predecessor, a succession candidate) is listed in \
+     excluded_manager_seat_ids and not counted";
+
+/// The unattributed usage of one cohort ([`Store::manager_v2_plain_usage`]).
+struct PlainUsage {
+    split: seat::SeatSplit,
+    known_spend: f64,
+    unknown_spend: i64,
 }
 
 fn valid_cost(value: Option<f64>) -> Option<f64> {
@@ -179,7 +244,16 @@ impl Store {
             return Err(refused("manager_succession_resource_identity_changed"));
         }
         super::manager_resources::launch_origin::validate_root_choice(&root.frozen.launch)?;
-        self.manager_v2_resource_gate(&config, None, root.frozen.launch.provider, existing)?;
+        // #241: the candidate succeeds the seat, which fills no worker slot
+        // (#235), so the concurrency and provider-count caps never refuse a
+        // handover; the pause, spend and provider usage-window checks still do.
+        self.manager_v2_resource_gate_scoped(
+            &config,
+            None,
+            root.frozen.launch.provider,
+            existing,
+            false,
+        )?;
         Ok(config)
     }
 
@@ -475,7 +549,8 @@ impl Store {
                    LEFT JOIN sessions next ON next.id=e.successor_session_id
                    LEFT JOIN session_lineage_detachments det ON det.session_id=next.id
                    WHERE e.predecessor_session_id=l.id AND
-                     (next.id IS NULL OR p.project_id IS NOT ?2 OR next.project_id IS NOT ?2
+                     (next.id IS NULL OR NOT ((p.project_id IS ?2 AND next.project_id IS ?2)
+                        OR (p.project_id IS ?6 AND next.project_id IS ?6))
                       OR next.session_kind IS NOT p.session_kind
                       OR next.rotation_depth IS NOT p.rotation_depth+1
                       OR (next.continued_from IS NOT p.id AND NOT
@@ -496,7 +571,8 @@ impl Store {
                    LEFT JOIN sessions next ON next.id=e.successor_session_id
                    LEFT JOIN session_lineage_detachments det ON det.session_id=next.id
                    WHERE e.predecessor_session_id=l.id AND
-                     (next.id IS NULL OR p.project_id IS NOT ?2 OR next.project_id IS NOT ?2
+                     (next.id IS NULL OR NOT ((p.project_id IS ?2 AND next.project_id IS ?2)
+                        OR (p.project_id IS ?6 AND next.project_id IS ?6))
                       OR next.session_kind IS NOT p.session_kind
                       OR next.rotation_depth IS NOT p.rotation_depth+1
                       OR (next.continued_from IS NOT p.id AND NOT
@@ -513,7 +589,9 @@ impl Store {
                     config.project_id.to_string(),
                     config.manager_session_id.to_string(),
                     config.row_version,
-                    ROTATION_LIMIT
+                    ROTATION_LIMIT,
+                    // Hub #3315: a home seat rotates within the home project.
+                    rsi_common::types::Project::HOME_ID.to_string()
                 ],
                 |r| {
                     Ok((
@@ -549,7 +627,16 @@ impl Store {
             let Some(session) = self.get_session(id)? else {
                 continue; // An admitted but unpublished launch is a reservation.
             };
-            if session.project_id != Some(config.project_id) {
+            // Hub #3315: a portfolio seat runs in the home project and is
+            // charged to the admission project of the appointment that
+            // launched its lineage; it is a member of that project's cohort.
+            let attributed = session.project_id == Some(config.project_id)
+                || (session
+                    .project_id
+                    .is_some_and(rsi_common::types::Project::is_home_id)
+                    && self.appointment_admission_project_for_lineage(id)?
+                        == Some(config.project_id));
+            if !attributed {
                 return Err(refused("manager_v2_cohort_project_mismatch"));
             }
             if epic == Some(id) {
@@ -680,12 +767,14 @@ impl Store {
                   WHERE l.depth<64
              ), ids AS (
                 SELECT DISTINCT id FROM lineage
+             ), billed AS (
+                SELECT ci.session_id,rsi_billed_usage(ci.provider,ci.model,ci.cost_increment_usd,
+                    (SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex'))) usage
+                FROM ({cost_increment}) ci WHERE ci.admission_status='admitted' GROUP BY ci.session_id
              ), ledger AS (
-                SELECT ci.session_id,COUNT(*) count,
-                  COALESCE(SUM(CASE WHEN ci.cost_increment_usd>=0 THEN ci.cost_increment_usd ELSE 0 END),0) cost,
-                  COALESCE(SUM(ci.cost_increment_usd IS NULL OR ci.cost_increment_usd<0),0) missing
-                FROM ({cost_increment}) ci
-                WHERE ci.admission_status='admitted' GROUP BY ci.session_id
+                SELECT session_id,json_extract(usage,'$[0]') count,json_extract(usage,'$[1]') cost,
+                    json_extract(usage,'$[2]') missing,json_extract(usage,'$[3]') subscription_count
+                FROM billed
              ), checkpoints AS (
                 SELECT c.record_key,
                   json_extract(c.payload_json,'$.zero_origin') zero_origin,
@@ -702,16 +791,17 @@ impl Store {
                         WHERE o.project_id=c.project_id AND o.manager_session_id=c.manager_session_id
                           AND o.scope_version=c.scope_version AND o.record_key=c.record_key
                           AND o.kind='resource_launch_origin')))
-             ), measured AS (
+             ), measured AS MATERIALIZED (
                 SELECT ids.id,s.id session_id,
                   COALESCE(l.count,0) count,COALESCE(l.cost,0) ledger,
-                  COALESCE(l.missing,0) missing,
+                  COALESCE(l.missing,0) missing,COALESCE(l.subscription_count,0) subscription_count,
                   CASE WHEN s.cost_usd>=0 AND s.cost_usd<=1e308 THEN s.cost_usd
                     WHEN s.status='Starting' AND s.cost_usd IS NULL
                       AND NOT EXISTS(SELECT 1 FROM conversation_events ce WHERE ce.session_id=s.id)
                     THEN 0.0 ELSE NULL END legacy,
                   r.zero_origin root_zero,r.known_floor_usd root_floor,
-                  c.zero_origin checkpoint_zero,c.known_floor_usd checkpoint_floor
+                  c.zero_origin checkpoint_zero,c.known_floor_usd checkpoint_floor,
+                  {billing_mode} billing_mode
                 FROM ids LEFT JOIN sessions s ON s.id=ids.id
                   LEFT JOIN ledger l ON l.session_id=ids.id
                   LEFT JOIN manager_root_resource_origins r ON r.session_id=ids.id AND r.project_id=?2
@@ -719,9 +809,9 @@ impl Store {
                 WHERE (s.id IS NULL OR (s.project_id=?2 AND s.session_kind NOT IN ('Epic','Group')))
                   AND (json_array_length(?6)=0 OR ids.id NOT IN (SELECT id FROM foreign_ids))
              )
-             SELECT COALESCE(SUM(MAX(ledger,COALESCE(legacy,0),
-                         COALESCE(root_floor,checkpoint_floor,0))),0),
-                    COALESCE(SUM(CASE WHEN session_id IS NULL THEN
+             SELECT COALESCE(SUM(CASE WHEN billing_mode='subscription' OR subscription_count>0 THEN ledger ELSE MAX(ledger,COALESCE(legacy,0),
+                         COALESCE(root_floor,checkpoint_floor,0)) END),0),
+                    COALESCE(SUM(CASE WHEN billing_mode='subscription' OR subscription_count>0 THEN missing WHEN session_id IS NULL THEN
                        missing + (COALESCE(root_zero,checkpoint_zero,0)=0)
                       WHEN count=0 THEN (legacy IS NULL OR (root_zero IS NOT NULL AND root_zero=0))
                       ELSE missing + (COALESCE(root_zero,checkpoint_zero,0)=0) END),0)
@@ -733,7 +823,8 @@ impl Store {
                 // a second join of `model_invocations` per invocation pushed
                 // the pass over its per-member bound (#3043, #2494).
                 cost_increment =
-                    crate::model_control::cost::cost_increment_for_ids_sql!()
+                    crate::model_control::cost::cost_increment_for_ids_sql!(),
+                billing_mode = "rsi_billing_mode(COALESCE(s.provider,r.provider),s.model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))",
             ), // sql-dynamic-ok: static foreign-origin CTE text
             params![serde_json::to_string(&config.epic_ids)?,config.project_id.to_string(),
                 config.manager_session_id.to_string(),config.row_version,ledgers,
@@ -1323,13 +1414,13 @@ impl Store {
         let members = self.manager_v2_charged_members(config, &charge, false, cohort)?;
         let mut snapshot = self.manager_v2_plain_resource_snapshot_from(
             config,
-            &members.active,
+            &members.split,
             members.known_spend,
             members.unknown_spend,
         )?;
         snapshot["accounting"] = json!("charged");
         snapshot["charged_ledgers"] = json!(members.ledgers);
-        snapshot["cohort_complete"] = json!(members.active.len() <= COHORT_BUDGET);
+        snapshot["cohort_complete"] = json!(members.live() <= COHORT_BUDGET);
         Ok(snapshot)
     }
 
@@ -1347,22 +1438,45 @@ impl Store {
                 &read
             }
         };
-        let rotation = self.manager_v2_resource_reservations(config, cohort)?;
-        let active = self.manager_v2_active_members(cohort, &rotation)?;
-        let (known, unknown) = self.manager_v2_historical_spend(config)?;
-        let mut snapshot =
-            self.manager_v2_plain_resource_snapshot_from(config, &active, known, unknown)?;
+        let usage = self.manager_v2_plain_usage(config, cohort)?;
+        let mut snapshot = self.manager_v2_plain_resource_snapshot_from(
+            config,
+            &usage.split,
+            usage.known_spend,
+            usage.unknown_spend,
+        )?;
         snapshot["accounting"] = json!("plain");
         Ok(snapshot)
+    }
+
+    /// The unattributed live members and spend of `config`'s own cohort and
+    /// ledger: the one computation behind the plain snapshot and the plain
+    /// gate, so a reader sees what the gate enforces.
+    fn manager_v2_plain_usage(
+        &self,
+        config: &HarnessManagerConfigV1,
+        cohort: &[ManagerCohortMemberV2],
+    ) -> Result<PlainUsage> {
+        let rotation = self.manager_v2_resource_reservations(config, cohort)?;
+        let active = self.manager_v2_active_members(cohort, &rotation)?;
+        let split =
+            self.manager_v2_split_seat(config, active, &rotation.keys().copied().collect())?;
+        let (known_spend, unknown_spend) = self.manager_v2_historical_spend(config)?;
+        Ok(PlainUsage {
+            split,
+            known_spend,
+            unknown_spend,
+        })
     }
 
     fn manager_v2_plain_resource_snapshot_from(
         &self,
         config: &HarnessManagerConfigV1,
-        active: &BTreeMap<Uuid, SessionProvider>,
+        split: &seat::SeatSplit,
         known: f64,
         unknown: i64,
     ) -> Result<Value> {
+        let active = &split.counted;
         let mut by_provider = BTreeMap::<String, usize>::new();
         for provider in active.values() {
             *by_provider
@@ -1389,21 +1503,67 @@ impl Store {
             Err(crate::error::DaemonError::InvalidParam(_)) => None,
             Err(error) => return Err(error),
         };
-        // #674 K15b: the lifetime creation count the admission gate charges
-        // against `max_created_sessions` (reviewer launches and uncreated
-        // refusals excluded by K15a).
-        let used = self.manager_v2_created_usage(config, false)?;
+        // #674 K15b / #3416: the creation count the admission gate charges
+        // against `max_created_sessions`: the sessions created in the last
+        // `created_sessions_window_hours` (reviewer launches and uncreated
+        // refusals excluded by K15a), beside the informational lifetime total.
         let limit = policy
             .as_ref()
             .map(|p| i64::from(p.policy.max_created_sessions));
+        let window_hours = policy.as_ref().map_or(
+            rsi_common::harness_manager_v2::DEFAULT_CREATED_SESSIONS_WINDOW_HOURS,
+            |p| p.policy.created_sessions_window_hours,
+        );
+        let window = self.manager_v2_created_window_usage_at(
+            config,
+            window_hours,
+            limit.unwrap_or(i64::MAX),
+            chrono::Utc::now(),
+        )?;
+        let used = window.used;
+        // #3417: each operator provider grant with its live spend, beside the
+        // `bench.enabled` setting its bench work needs.
+        let provider_grants = match &policy {
+            Some(grant) if !grant.policy.provider_grants.is_empty() => {
+                serde_json::to_value(self.provider_grant_statuses(
+                    config.project_id,
+                    &grant.policy.provider_grants,
+                    chrono::Utc::now(),
+                )?)?
+            }
+            _ => json!([]),
+        };
+        let bench_enabled = self
+            .get_daemon_setting("bench.enabled")?
+            .is_some_and(|value| value == "true");
+        let summary = limit.map(|limit| {
+            rsi_common::manager_budget::creation_window_summary(
+                used,
+                limit,
+                window_hours,
+                window.next_free_at.as_deref(),
+            )
+        });
         Ok(
             json!({"type":"resources", "key":"cohort", "active_sessions":active.len(),
-            "active_by_provider":by_provider,"pending_operations":pending,
+            "active_by_provider":by_provider,
+            // #235: what `max_active_sessions` counts, and the live sessions
+            // of this manager's own seat lineage it does not.
+            "counted_session_ids":active.keys().collect::<Vec<_>>(),
+            "excluded_manager_seat_ids":split.seat_active.keys().collect::<Vec<_>>(),
+            "active_basis":ACTIVE_BASIS,
+            "pending_operations":pending,
             "created_sessions":{"used":used,"limit":limit,
-                "remaining":limit.map(|limit| (limit - used).max(0))},
+                "remaining":limit.map(|limit| (limit - used).max(0)),
+                "window_hours":window_hours,
+                "next_free_at":window.next_free_at,
+                "lifetime_total":window.lifetime,
+                "summary":summary},
             "known_spend_usd":valid_cost(Some(known)), "unknown_spend_observations":unknown,
-            "spend_basis":"scoped_invocations_with_preserved_historical_floor",
+            "spend_basis":"metered_and_cloud_only_with_preserved_historical_floor; subscription estimates excluded",
+            "billing_modes":self.billing_modes()?,
             "provider_windows":self.load_provider_rate_limit_snapshots()?,
+            "provider_grants":provider_grants,"bench_enabled":bench_enabled,
             "policy":policy,"cohort_complete":true}),
         )
     }
@@ -1594,11 +1754,20 @@ impl Store {
         Self::manager_v2_check_usage(
             policy,
             provider,
-            enforce_concurrency,
+            // #235: a call of this principal's own seat lineage holds no slot.
+            enforce_concurrency && !usage.existing_holds_seat,
             usage.active,
             usage.provider_active,
             usage.known_spend_usd,
             usage.unknown_spend_observations,
+            &|| {
+                seat::concurrency_refusal(
+                    usage.active,
+                    policy.max_active_sessions,
+                    usage.counted.iter().copied(),
+                    usage.seat_active.iter().copied(),
+                )
+            },
         )
     }
 
@@ -1611,17 +1780,18 @@ impl Store {
         existing_session: Option<Uuid>,
         enforce_concurrency: bool,
     ) -> Result<()> {
-        let snapshot = self.manager_v2_plain_resource_snapshot(config, None)?;
-        let mut active = snapshot["active_sessions"].as_u64().unwrap_or(u64::MAX);
-        let mut provider_active = snapshot["active_by_provider"]
-            [super::row_mappers::session_provider_to_str(provider)]
-        .as_u64()
-        .unwrap_or(0);
+        let cohort = self.manager_v2_cohort(config)?;
+        let usage = self.manager_v2_plain_usage(config, &cohort)?;
+        let split = &usage.split;
+        let mut active = split.counted.len() as u64;
+        let mut provider_active = split.counted.values().filter(|p| **p == provider).count() as u64;
+        // #235: a call of this manager's own seat lineage holds no worker
+        // slot, so the concurrency caps never refuse it.
+        let enforce_concurrency = enforce_concurrency && !split.holds_seat(existing_session);
         // A continuation replaces one live slot rather than consuming two.
         // Under the spawn guard this is only an admission estimate, never a
         // license to bypass the ordinary interruption/custody checks.
         let existing_provider = if let Some(id) = existing_session {
-            let cohort = self.manager_v2_cohort(config)?;
             if let Some(member) = cohort.iter().find(|row| row.session.id == id) {
                 Some(member.session.provider)
             } else {
@@ -1632,6 +1802,7 @@ impl Store {
         } else {
             None
         };
+        let mut replaced = None;
         if let Some(id) = existing_session.filter(|_| existing_provider.is_some()) {
             let counted: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1 AND status IN ('Starting','Running','WaitingApproval'))
@@ -1645,6 +1816,7 @@ impl Store {
                 |r| r.get(0))?;
             if counted {
                 active = active.saturating_sub(1);
+                replaced = Some(id);
                 if existing_provider == Some(provider) {
                     provider_active = provider_active.saturating_sub(1);
                 }
@@ -1656,13 +1828,26 @@ impl Store {
             enforce_concurrency,
             active,
             provider_active,
-            snapshot["known_spend_usd"].as_f64(),
-            snapshot["unknown_spend_observations"]
-                .as_u64()
-                .unwrap_or(u64::MAX),
+            valid_cost(Some(usage.known_spend)),
+            u64::try_from(usage.unknown_spend).unwrap_or(u64::MAX),
+            &|| {
+                seat::concurrency_refusal(
+                    active,
+                    policy.max_active_sessions,
+                    split
+                        .counted
+                        .keys()
+                        .copied()
+                        .filter(|id| Some(*id) != replaced),
+                    split.seat_active.keys().copied(),
+                )
+            },
         )
     }
 
+    /// `capacity_refusal` builds the `manager_v2_concurrency_capacity`
+    /// refusal, naming the sessions that filled the cap (#235).
+    #[allow(clippy::too_many_arguments)] // One check; the arguments are its inputs.
     fn manager_v2_check_usage(
         policy: &ManagerPolicyV2,
         provider: SessionProvider,
@@ -1671,9 +1856,10 @@ impl Store {
         provider_active: u64,
         known_spend_usd: Option<f64>,
         unknown_spend_observations: u64,
+        capacity_refusal: &dyn Fn() -> crate::error::DaemonError,
     ) -> Result<()> {
         if enforce_concurrency && active >= u64::from(policy.max_active_sessions) {
-            return Err(refused("manager_v2_concurrency_capacity"));
+            return Err(capacity_refusal());
         }
         if enforce_concurrency
             && policy
@@ -1695,13 +1881,12 @@ impl Store {
     }
 
     fn manager_v2_provider_usage_gate(&self, provider: SessionProvider) -> Result<()> {
-        if self
-            .provider_usage_window_hold_until(provider, Utc::now())?
-            .is_some()
-        {
-            return Err(refused(
+        if let Some(hold) = self.provider_usage_window_hold(provider, Utc::now())? {
+            return Err(refused(&format!(
+                "{}: {}",
                 crate::provider_exhaustion::PROVIDER_USAGE_WINDOW_REFUSAL_CODE,
-            ));
+                hold.describe(provider)
+            )));
         }
         Ok(())
     }
@@ -1718,8 +1903,23 @@ impl Store {
         provider: SessionProvider,
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>> {
+        Ok(self
+            .provider_usage_window_hold(provider, now)?
+            .map(|hold| hold.until))
+    }
+
+    /// The exhausted window that decides [`Self::provider_usage_window_hold_until`]
+    /// (the one with the latest reset), with where its record came from so a
+    /// refusal can tell a stale record from a real limit (#4023). Windows
+    /// recorded before the provider's last account change are already excluded
+    /// by the snapshot read (`provider_rate_limits.invalidated_at.*`).
+    pub fn provider_usage_window_hold(
+        &self,
+        provider: SessionProvider,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ProviderUsageWindowHold>> {
         let now_epoch = now.timestamp();
-        let mut until: Option<DateTime<Utc>> = None;
+        let mut held: Option<ProviderUsageWindowHold> = None;
         for snapshot in self.load_provider_rate_limit_snapshots()? {
             if snapshot.provider != provider {
                 continue;
@@ -1732,14 +1932,50 @@ impl Store {
                 {
                     continue;
                 }
-                let reset = window
+                let until = window
                     .resets_at_epoch
                     .and_then(|reset| DateTime::from_timestamp(reset, 0))
                     .unwrap_or(now + USAGE_WINDOW_UNKNOWN_RESET);
-                until = Some(until.map_or(reset, |held| held.max(reset)));
+                if held.as_ref().is_some_and(|h| h.until >= until) {
+                    continue;
+                }
+                held = Some(ProviderUsageWindowHold {
+                    window_key: window.window_key.clone(),
+                    until,
+                    reset_known: window.resets_at_epoch.is_some(),
+                    observed_at: None,
+                    source: String::new(),
+                    account_identity_recorded: false,
+                });
             }
         }
-        Ok(until)
+        let Some(mut hold) = held else {
+            return Ok(None);
+        };
+        let provider_key = super::row_mappers::session_provider_to_str(provider);
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT observed_at, observed_session_id FROM provider_rate_limit_windows
+                 WHERE provider = ?1 AND window_key = ?2",
+                params![provider_key, hold.window_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((observed_at, session)) = row {
+            hold.observed_at = DateTime::parse_from_rfc3339(&observed_at)
+                .ok()
+                .map(|at| at.with_timezone(&Utc));
+            hold.source = match (session, provider) {
+                (Some(session), _) => format!("session {session}"),
+                (None, SessionProvider::Codex) => "codex plan-window poll".into(),
+                (None, _) => "daemon plan-window record".into(),
+            };
+        }
+        hold.account_identity_recorded = self
+            .get_daemon_setting(&format!("provider_rate_limits.account.{provider_key}"))?
+            .is_some();
+        Ok(Some(hold))
     }
 
     /// #1274: the caps of every portfolio node covering `project`, for a

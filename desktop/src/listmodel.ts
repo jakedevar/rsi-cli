@@ -253,12 +253,18 @@ export interface ProjectDraft { name: string; path: string; color: string }
 export interface LabelDraft { name: string; description: string; color: string }
 
 const HEX = /^#[0-9a-fA-F]{6}$/;
+/** A folder path an operator can paste: absolute, home-relative or a drive / UNC path. */
+const FULL_PATH = /^(\/|~(\/|\\|$)|[A-Za-z]:[\\/]|\\\\)/;
 
 /** Null when the draft can be saved. The daemon owns uniqueness. */
-export function validateProject(d: ProjectDraft): string | null {
-  if (d.name.trim() === '') return 'Name is required';
-  if (/[\u0000-\u001f]/.test(d.name + d.path)) return 'Name and path cannot contain control characters';
-  if (!HEX.test(d.color)) return 'Pick a color';
+export function validateProject(d: ProjectDraft, existing: readonly string[] = []): string | null {
+  const name = d.name.trim();
+  const path = d.path.trim();
+  if (name === '') return 'Name is required: give the project a short name, for example the name of its folder.';
+  if (/[\u0000-\u001f]/.test(d.name + d.path)) return 'The name and folder cannot contain control characters such as line breaks or tabs.';
+  if (existing.some((n) => n.trim().toLowerCase() === name.toLowerCase())) return `A project named “${name}” already exists: pick another name, or edit that one.`;
+  if (path !== '' && !FULL_PATH.test(path)) return 'The folder must be a full path such as /Users/you/code/app (starting with / or ~/, or a drive letter such as C:\\).';
+  if (!HEX.test(d.color)) return 'Pick a color for the project.';
   return null;
 }
 
@@ -337,4 +343,22 @@ export function sessionInfoRows(
   rows.push(['tags', s.tags && s.tags.length > 0 ? s.tags.join(', ') : 'none']);
   if (s.description) rows.push(['description', s.description]);
   return rows;
+}
+
+/**
+ * The new session list with each session that did not change since `prev` replaced by its previous object, so
+ * rows built from it can be reused (local #275). A session that did change (or is new) keeps its fresh object.
+ * Equal means the same JSON: a field the daemon adds or reorders only costs a rebuild.
+ */
+export function reuseUnchanged<T extends { id: string }>(prev: readonly T[], next: readonly T[]): T[] {
+  if (prev.length === 0) return next.slice();
+  const old = new Map<string, { s: T; json?: string }>();
+  for (const s of prev) old.set(s.id, { s });
+  return next.map((s) => {
+    const o = old.get(s.id);
+    if (!o) return s;
+    if (o.s === s) return s;
+    o.json ??= JSON.stringify(o.s);
+    return JSON.stringify(s) === o.json ? o.s : s;
+  });
 }

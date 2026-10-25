@@ -12,7 +12,27 @@ variable "network_prefix" {
 variable "instance_type" {
   type        = string
   default     = "c7i.8xlarge"
-  description = "Smallest type the operator's rsi-cloud-terraform-scope IAM policy allows (dry-run probes 2026-09-28: c7i.4xlarge denied; c7i.8xlarge and c7i.16xlarge allowed). The lander runs up to RSI_REMOTE_GATE_PARALLEL (default 4) shards at once, each at --jobs 4..6."
+  description = "Smallest type the operator's rsi-cloud-terraform-scope IAM policy allows (dry-run probes 2026-09-28: c7i.4xlarge denied; c7i.8xlarge and c7i.16xlarge allowed; 2026-10-21: c7i.8xlarge allowed as spot, c7i.4xlarge and c7i.2xlarge denied). 32 vCPU; us-west-1 spot has cost $0.58-0.66/h against $1.78/h on demand. The lander runs up to RSI_REMOTE_GATE_PARALLEL (default 4) shards at once, each at --jobs 4..6."
+}
+
+variable "spot_max_price_usd" {
+  type        = number
+  default     = 0.75
+  description = "Spot max price in USD per hour for the instance (the default suits c7i.8xlarge; set it with another type). AWS never bills an hour above it, which is what lets scripts/cloud-gate.sh reserve the run's worst case (this + gp3 + IPv4, $0.7813/h) in the spend ledger before applying."
+  validation {
+    condition     = var.spot_max_price_usd > 0 && var.spot_max_price_usd <= 1.0
+    error_message = "spot_max_price_usd must be greater than 0 and at most 1.0 USD per hour."
+  }
+}
+
+variable "expires_at" {
+  type        = string
+  default     = ""
+  description = "RFC3339 UTC time written to the rsi:expires-at tag; the orphan sweep terminates the host past it. scripts/cloud-gate.sh passes start plus max_lifetime_minutes. Empty uses timestamp() plus max_lifetime_minutes."
+  validation {
+    condition     = var.expires_at == "" || can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", var.expires_at))
+    error_message = "expires_at must be empty or a UTC RFC3339 time such as 2026-10-21T10:00:00Z."
+  }
 }
 
 variable "root_volume_gib" {

@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "version": 187,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v187.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:ba232ce98ca36caca998bc4b64c5dd8c8654241e0bab8c3c1c7759a3ebcc2461",
+      "sites": [
+        {
+          "anchor": "const V187_AGENT_JOBS_TABLE: &str = \"CREATE TABLE agent_jobs (",
+          "replacement": "const V${VERSION}_AGENT_JOBS_TABLE: &str = \"CREATE TABLE agent_jobs (",
+          "scope": "unit"
+        },
+        {
+          "anchor": "fn migrate_v187(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 187 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "{V187_AGENT_JOBS_TABLE}",
+          "replacement": "{V${VERSION}_AGENT_JOBS_TABLE}",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 187)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:cbd7f6b42a9a8afab661f936054eb11ec102165fab851faf851c4ccc7dbf8094",
+      "sites": [
+        {
+          "anchor": "(187, &[\"agent_jobs\", \"agent_jobs_owner_key\", \"agent_jobs_by_state\", \"agent_jobs_by_owner\", \"agent_jobs_no_delete\", \"agent_jobs_terminal_immutable\", \"agent_jobs_rebuild_old\"]),",
+          "replacement": "(${VERSION}, &[\"agent_jobs\", \"agent_jobs_owner_key\", \"agent_jobs_by_state\", \"agent_jobs_by_owner\", \"agent_jobs_no_delete\", \"agent_jobs_terminal_immutable\", \"agent_jobs_rebuild_old\"]),",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/agent_jobs.rs",
+      "path_template": "crates/rsid-store/src/store/agent_jobs.rs",
+      "source_blob": "sha256:15d17c4b420dbbc70a2572fc4cba9b62c599d7d11c461b873a54ac2ce00b2e8f",
+      "sites": [
+        {
+          "anchor": "const BENCH_MIGRATION_VERSION: i32 = 187;",
+          "replacement": "const BENCH_MIGRATION_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        },
+        {
+          "anchor": "store.migrate_v187(BENCH_MIGRATION_VERSION - 1).unwrap();",
+          "replacement": "store.migrate_v${VERSION}(BENCH_MIGRATION_VERSION - 1).unwrap();",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:43660c43ae3493dcc36ed6437337b45caabe99bd4b8f6c9155f54532c202b683",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 187;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 187 && target < 187 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": ".pragma_update(None, \"user_version\", 187 - 1)",
+          "replacement": ".pragma_update(None, \"user_version\", ${VERSION} - 1)",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if target_version >= 187 {",
+          "replacement": "if target_version >= ${VERSION} {",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

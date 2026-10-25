@@ -2,6 +2,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+mod build_paths;
+
 fn collect_store_sources(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -36,25 +38,6 @@ fn package_relative(manifest_directory: &Path, path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
-}
-
-/// `to` relative to the directory `from`; `None` when they share no root (a
-/// different drive on Windows).
-fn relative_to(from: &Path, to: &Path) -> Option<PathBuf> {
-    let from: Vec<_> = from.components().collect();
-    let to: Vec<_> = to.components().collect();
-    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
-    if common == 0 {
-        return None;
-    }
-    let mut relative = PathBuf::new();
-    for _ in common..from.len() {
-        relative.push("..");
-    }
-    for component in &to[common..] {
-        relative.push(component.as_os_str());
-    }
-    Some(relative)
 }
 
 fn store_source_digest(manifest_directory: &Path) -> io::Result<String> {
@@ -135,8 +118,10 @@ fn generate_store_migrations(manifest_directory: &Path, out_directory: &Path) ->
     // the crate as baking its checkout location, so a target seeded from
     // another sandbox (scripts/target-pool) would have to rebuild it and every
     // dependent. The relative path names the same file in every checkout whose
-    // target directory sits at the same place relative to the sources.
-    let relative_directory = relative_to(out_directory, &directory);
+    // target directory sits at the same place relative to the sources. Both
+    // ends are canonicalized first (#373) so a target reached through a symlink
+    // still counts rustc's physical `..` chain; see `build_paths.rs`.
+    let relative_directory = build_paths::include_directory(out_directory, &directory);
     for version in &versions {
         let include = match &relative_directory {
             Some(relative) => format!(

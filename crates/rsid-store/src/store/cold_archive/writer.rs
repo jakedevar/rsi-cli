@@ -454,28 +454,121 @@ pub fn read_chunk(conn: &Connection, chunk_id: i64) -> ColdResult<Option<ChunkRe
                     content_len, raw_bytes, raw_sha256, codec, payload
              FROM chunks WHERE chunk_id = ?1",
             [chunk_id],
-            |row| {
-                Ok(ChunkRecord {
-                    chunk_id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    generation: row.get(2)?,
-                    table_name: row.get(3)?,
-                    source_schema_version: row.get(4)?,
-                    columns_json: row.get(5)?,
-                    row_count: row.get(6)?,
-                    min_id: row.get(7)?,
-                    max_id: row.get(8)?,
-                    min_sequence: row.get(9)?,
-                    max_sequence: row.get(10)?,
-                    content_len: row.get(11)?,
+            |row| chunk_record(row, row.get(15)?),
+        )
+        .optional()?)
+}
+
+/// A chunk read under a size bound ([`read_chunk_bounded`]).
+#[derive(Debug)]
+pub(super) enum BoundedChunk {
+    /// The record's raw size and its stored payload are both within the bound.
+    Within(ChunkRecord),
+    /// Either is over it: only the sizes were read, never the payload.
+    Over { raw_bytes: i64, payload_bytes: i64 },
+}
+
+/// Reads one chunk by id, selecting its payload only when the record's
+/// `raw_bytes` and the stored payload's length are both within `max_bytes`.
+/// `SQLite` computes `length()` of a BLOB from its record header without loading
+/// it, so a payload larger than the bound is never read into memory, whatever
+/// the index or the record claims (hub #3332).
+pub(super) fn read_chunk_bounded(
+    conn: &Connection,
+    chunk_id: i64,
+    max_bytes: i64,
+) -> ColdResult<Option<BoundedChunk>> {
+    Ok(conn
+        .query_row(
+            "SELECT chunk_id, session_id, generation, table_name, source_schema_version,
+                    columns_json, row_count, min_id, max_id, min_sequence, max_sequence,
+                    content_len, raw_bytes, raw_sha256, codec,
+                    CASE WHEN raw_bytes <= ?2 AND LENGTH(payload) <= ?2 THEN payload END,
+                    LENGTH(payload)
+             FROM chunks WHERE chunk_id = ?1",
+            params![chunk_id, max_bytes],
+            |row| match row.get::<_, Option<Vec<u8>>>(15)? {
+                Some(payload) => Ok(BoundedChunk::Within(chunk_record(row, payload)?)),
+                None => Ok(BoundedChunk::Over {
                     raw_bytes: row.get(12)?,
-                    raw_sha256: row.get(13)?,
-                    codec: row.get(14)?,
-                    payload: row.get(15)?,
-                })
+                    payload_bytes: row.get(16)?,
+                }),
             },
         )
         .optional()?)
+}
+
+/// #178: one chunk's record by id with an empty `payload`, and the stored
+/// payload's `LENGTH()`; the payload itself is not read. With
+/// [`open_payload_stream`] a reader takes it a piece at a time instead.
+pub(super) fn read_chunk_header(
+    conn: &Connection,
+    chunk_id: i64,
+) -> ColdResult<Option<(ChunkRecord, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT chunk_id, session_id, generation, table_name, source_schema_version,
+                    columns_json, row_count, min_id, max_id, min_sequence, max_sequence,
+                    content_len, raw_bytes, raw_sha256, codec, LENGTH(payload)
+             FROM chunks WHERE chunk_id = ?1",
+            [chunk_id],
+            |row| Ok((chunk_record(row, Vec::new())?, row.get::<_, i64>(15)?)),
+        )
+        .optional()?)
+}
+
+/// #178: chunk `chunk_id`'s stored payload as a read-only incremental blob
+/// (`chunk_id` is the `chunks` rowid), buffered
+/// [`format::STREAM_BUFFER_BYTES`] at a time: no read takes the whole payload.
+pub(super) fn open_payload_stream(
+    conn: &Connection,
+    chunk_id: i64,
+) -> ColdResult<std::io::BufReader<PayloadReader<'_>>> {
+    let blob = conn.blob_open(
+        rusqlite::DatabaseName::Main,
+        "chunks",
+        "payload",
+        chunk_id,
+        true,
+    )?;
+    Ok(std::io::BufReader::with_capacity(
+        format::STREAM_BUFFER_BYTES,
+        PayloadReader(blob),
+    ))
+}
+
+/// A stored payload read a piece at a time ([`open_payload_stream`]).
+pub(super) struct PayloadReader<'conn>(rusqlite::blob::Blob<'conn>);
+
+impl std::io::Read for PayloadReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(any(test, feature = "test-seam"))]
+        format::stream_stats::note_payload_read(buf.len());
+        self.0.read(buf)
+    }
+}
+
+/// The record of a `chunks` row whose first 15 columns are in [`read_chunk`]'s
+/// order, with `payload` read separately.
+fn chunk_record(row: &rusqlite::Row<'_>, payload: Vec<u8>) -> rusqlite::Result<ChunkRecord> {
+    Ok(ChunkRecord {
+        chunk_id: row.get(0)?,
+        session_id: row.get(1)?,
+        generation: row.get(2)?,
+        table_name: row.get(3)?,
+        source_schema_version: row.get(4)?,
+        columns_json: row.get(5)?,
+        row_count: row.get(6)?,
+        min_id: row.get(7)?,
+        max_id: row.get(8)?,
+        min_sequence: row.get(9)?,
+        max_sequence: row.get(10)?,
+        content_len: row.get(11)?,
+        raw_bytes: row.get(12)?,
+        raw_sha256: row.get(13)?,
+        codec: row.get(14)?,
+        payload,
+    })
 }
 
 /// Every chunk id in the file with its compressed size, for orphan accounting.

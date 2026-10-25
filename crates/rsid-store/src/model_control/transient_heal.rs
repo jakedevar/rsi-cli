@@ -18,7 +18,7 @@ pub const PROVIDER_CAPACITY_HEAL_REASON: &str = "provider_capacity";
 
 /// Labels whose retry only repeats the same failure. Checked first; they win
 /// over any transient label in either position.
-const EXCLUDED_LABELS: [&str; 5] = [
+const EXCLUDED_LABELS: [&str; 10] = [
     "restart_reconciled_failed",
     "codex_resume_tool_history_invalid",
     // Context is full: a resume fails again. Rotation (E04) owns this case.
@@ -28,6 +28,15 @@ const EXCLUDED_LABELS: [&str; 5] = [
     // The run stopped at its operator-set spend cap (#2762): a heal would spend
     // the same budget again.
     crate::store_support::provider_defaults::CLAUDE_BUDGET_EXCEEDED_STOP_REASON,
+    // The run stopped at the operator's OpenRouter spend ceiling (#3154): a heal
+    // would spend past the line again.
+    crate::store_support::provider_defaults::OPENROUTER_SPEND_CAP_STOP_REASON,
+    // A bench task ended by its per-task USD cap or by a refused call (#3178): a
+    // heal would spend past the cap again or resume a task that is over.
+    rsi_common::bench::BENCH_TASK_BUDGET_EXHAUSTED,
+    rsi_common::bench::BENCH_TASK_NOT_RUNNING,
+    rsi_common::bench::BENCH_TASK_COST_UNKNOWN,
+    rsi_common::bench::BENCH_TRACE_WRITE_FAILED,
 ];
 
 /// Terminal-reason / invocation error-class labels that mark a transient,

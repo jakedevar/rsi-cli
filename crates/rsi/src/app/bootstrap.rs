@@ -26,6 +26,21 @@ const BOOTSTRAP_RESULT_CAPACITY: usize = 8;
 const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);
 const OPTIONAL_REFRESH_TIMEOUT: Duration = Duration::from_secs(3);
 
+pub(crate) fn build_skew_warning(tui: &str, daemon: Option<&str>) -> Option<String> {
+    let daemon = daemon?;
+    if [tui, daemon]
+        .iter()
+        .any(|sha| sha.is_empty() || *sha == "unknown")
+        || tui == daemon
+    {
+        return None;
+    }
+    Some(format!(
+        "TUI build {} differs from daemon {}. Restart with rsi.",
+        tui, daemon,
+    ))
+}
+
 fn reconcile_memory_owner(
     settings: &mut crate::settings::UserSettings,
     json: &Value,
@@ -91,6 +106,7 @@ pub(crate) struct HandshakeSuccess {
     client: DaemonClient,
     capabilities: DaemonCapabilities,
     compatibility_fallback: bool,
+    daemon_info: Option<rsi_common::agent_daemon_info::DaemonInfoV1>,
     health: Result<HealthStatusResponse, String>,
     config: Result<Value, String>,
 }
@@ -105,6 +121,10 @@ pub(crate) struct SnapshotMetadata {
 }
 
 pub(crate) enum BootstrapEvent {
+    DaemonBusy {
+        attempt: u64,
+        seconds: u64,
+    },
     TargetPoolStatus(Result<rsi_common::target_pool::TargetPoolStatus, String>),
     Handshake {
         attempt: u64,
@@ -146,6 +166,11 @@ pub(crate) enum BootstrapEvent {
     StorageStatus {
         generation: u64,
         result: Result<SandboxBuildCacheReclaimReport, String>,
+    },
+    /// #3433: the daemon launcher a running TUI started after the socket stayed
+    /// unreachable returned.
+    DaemonLaunch {
+        result: Result<(), String>,
     },
     DaemonConfigRefresh {
         attempt: u64,
@@ -541,6 +566,7 @@ async fn run_handshake(socket_path: PathBuf, attempt: u64, tx: mpsc::Sender<Boot
             Ok(capabilities) => (capabilities, false),
             Err(_) => (compatibility_capabilities(), true),
         };
+        let daemon_info = client.get_daemon_info().await.ok();
         let health = client
             .get_health_status()
             .await
@@ -553,6 +579,7 @@ async fn run_handshake(socket_path: PathBuf, attempt: u64, tx: mpsc::Sender<Boot
             client,
             capabilities,
             compatibility_fallback,
+            daemon_info,
             health,
             config,
         })
@@ -752,7 +779,15 @@ async fn run_daemon_config_refresh(
     .await
     {
         Ok(result) => result,
-        Err(_) => Err("daemon configuration refresh timed out".to_string()),
+        Err(_) => {
+            let _ = tx
+                .send(BootstrapEvent::DaemonBusy {
+                    attempt,
+                    seconds: OPTIONAL_REFRESH_TIMEOUT.as_secs(),
+                })
+                .await;
+            Err(crate::client::ClientError::Timeout(OPTIONAL_REFRESH_TIMEOUT.as_secs()).to_string())
+        }
     };
     let _ = tx
         .send(BootstrapEvent::DaemonConfigRefresh {
@@ -792,11 +827,14 @@ async fn run_usage_refresh(
     let (usage, model_control, efficiency) = match result {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => (Err(error.clone()), Err(error.clone()), Err(error)),
-        Err(_) => (
-            Err("usage refresh timed out".to_string()),
-            Err("usage refresh timed out".to_string()),
-            Err("usage refresh timed out".to_string()),
-        ),
+        Err(_) => {
+            let seconds = OPTIONAL_REFRESH_TIMEOUT.as_secs();
+            let _ = tx
+                .send(BootstrapEvent::DaemonBusy { attempt, seconds })
+                .await;
+            let error = crate::client::ClientError::Timeout(seconds).to_string();
+            (Err(error.clone()), Err(error.clone()), Err(error))
+        }
     };
     let _ = tx
         .send(BootstrapEvent::UsageRefresh {
@@ -825,6 +863,57 @@ impl App {
         self.bootstrap.handshake_handle =
             Some(tokio::spawn(run_handshake(socket_path, attempt, tx)));
         self.mark_dirty();
+    }
+
+    /// #3433: the socket failed to answer. Past the grace, start the daemon the
+    /// way a fresh TUI does (off the event loop), or leave the banner.
+    pub(crate) fn recover_daemon_if_unreachable(&mut self) {
+        // #3492: a supervisor waiting out an exhausted restart budget keeps the
+        // daemon down on purpose; say so rather than "start it with ...".
+        self.daemon_recovery.note_supervisor_backoff(
+            rsi_common::supervisor_restarts::SupervisorRestarts::read(
+                &rsi_common::supervisor_restarts::default_path(),
+            )
+            .and_then(|published| published.backoff_notice(chrono::Utc::now().timestamp())),
+        );
+        if !self.daemon_recovery.note_unreachable(Instant::now()) {
+            self.mark_dirty();
+            return;
+        }
+        let Some(launcher) = self.daemon_recovery.launcher() else {
+            return;
+        };
+        let tx = self.bootstrap.tx.clone();
+        tracing::warn!("daemon socket unreachable past the grace; starting the daemon");
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || launcher.start())
+                .await
+                .unwrap_or_else(|error| Err(format!("daemon launcher panicked: {error}")));
+            let _ = tx.send(BootstrapEvent::DaemonLaunch { result }).await;
+        });
+        self.mark_dirty();
+    }
+
+    pub(crate) fn apply_daemon_info(
+        &mut self,
+        info: Option<rsi_common::agent_daemon_info::DaemonInfoV1>,
+    ) {
+        self.local_build_warning = info.as_ref().and_then(|info| info.local_build_warning());
+        self.daemon_build_sha = info.map(|info| info.build_sha);
+        self.mark_dirty();
+    }
+
+    /// Persistent outage, version skew and local-build guidance above the main area.
+    pub(crate) fn persistent_banner_text(&self) -> Option<String> {
+        let lines: Vec<String> = [
+            self.daemon_recovery.banner(Instant::now()),
+            build_skew_warning(env!("RSI_BUILD_SHA"), self.daemon_build_sha.as_deref()),
+            self.local_build_warning.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     pub(crate) fn bootstrap_should_start(&self) -> bool {
@@ -881,6 +970,7 @@ impl App {
     }
 
     pub(crate) fn apply_authoritative_daemon_config(&mut self, json: &Value) {
+        crate::provider_billing_view::sync(json);
         self.coordinator_context_budgets = json
             .get("coordinator_context_budgets")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -1231,6 +1321,14 @@ impl App {
 
     pub(crate) fn apply_bootstrap_event(&mut self, event: BootstrapEvent) -> bool {
         match event {
+            BootstrapEvent::DaemonBusy { attempt, seconds } => {
+                if attempt != self.bootstrap.attempt() {
+                    return false;
+                }
+                self.notify(crate::client::ClientError::Timeout(seconds).to_string());
+                self.mark_dirty();
+                true
+            }
             BootstrapEvent::Handshake { attempt, result } => {
                 if !self.bootstrap.finish_handshake(attempt) {
                     return false;
@@ -1245,18 +1343,22 @@ impl App {
                         self.bootstrap.config = BootstrapComponentState::Pending;
                         self.bootstrap.schedule_retry();
                         tracing::warn!(attempt, %error, "TUI bootstrap connection failed");
+                        self.recover_daemon_if_unreachable();
                     }
                     Ok(success) => {
                         let HandshakeSuccess {
                             client,
                             capabilities,
                             compatibility_fallback,
+                            daemon_info,
                             health,
                             config,
                         } = success;
+                        self.apply_daemon_info(daemon_info);
                         self.client = client;
                         self.poll.connected = true;
                         self.bootstrap.connection_error = None;
+                        self.daemon_recovery.note_connected();
                         self.poll.batch_fetch_supported = capabilities.batch_fetch;
                         self.poll.push_supported = capabilities.push_notifications;
                         self.poll.memory_search_supported = capabilities.memory_search;
@@ -1550,6 +1652,17 @@ impl App {
                 self.bootstrap.finish_snapshot(attempt);
                 false
             }
+            BootstrapEvent::DaemonLaunch { result } => {
+                match &result {
+                    Ok(()) => tracing::info!("TUI started the daemon after its socket stayed down"),
+                    Err(error) => tracing::warn!(%error, "TUI daemon auto-start failed"),
+                }
+                self.daemon_recovery.launch_finished(result);
+                // Reconnect at once instead of waiting out the retry delay.
+                self.bootstrap.retry_at = Some(Instant::now());
+                self.mark_dirty();
+                true
+            }
             BootstrapEvent::StorageStatus { generation, result } => {
                 self.finish_direct_storage_refresh(generation, result);
                 true
@@ -1654,6 +1767,20 @@ mod tests {
             .count();
         assert_eq!(notices, 0);
         assert!(settings.memory_owner_migrated);
+    }
+
+    #[test]
+    fn build_skew_compares_full_ids_and_handles_missing_build_metadata() {
+        let sha = "a".repeat(40);
+        assert_eq!(build_skew_warning(&sha, Some(&sha)), None);
+        assert_eq!(build_skew_warning(&sha, None), None);
+        assert_eq!(build_skew_warning("unknown", Some(&sha)), None);
+        assert_eq!(build_skew_warning(&sha, Some("unknown")), None);
+        assert_eq!(build_skew_warning(&sha, Some("")), None);
+        let other = format!("{}b", "a".repeat(39));
+        let warning = build_skew_warning(&sha, Some(&other)).unwrap();
+        assert!(warning.contains("TUI build"));
+        assert!(warning.contains("Restart with rsi"));
     }
 
     #[test]
@@ -2005,7 +2132,7 @@ mod tests {
         use crate::settings::DaemonFeatureEntry;
         use rsi_common::editing_mode::EditingMode;
 
-        let Ok(dir) = tempfile::tempdir() else {
+        let Ok(dir) = crate::test_support::socket_tempdir() else {
             panic!("tempdir");
         };
         let socket = dir.path().join("daemon.sock");
@@ -2060,6 +2187,115 @@ mod tests {
         let Ok(()) = server.await else {
             panic!("server");
         };
+    }
+
+    struct FakeLauncher {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    impl crate::app::daemon_recovery::DaemonLauncher for FakeLauncher {
+        fn start(&self) -> Result<(), String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                Err("no rsid binary".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn unreachable_app(launcher: Option<std::sync::Arc<FakeLauncher>>) -> App {
+        let mut app = crate::app::app_test_helpers::with_session_list(0);
+        app.client = crate::client::DaemonClient::new(PathBuf::from("/nonexistent/daemon.sock"));
+        app.daemon_recovery.configure(
+            launcher.map(|launcher| {
+                launcher as std::sync::Arc<dyn crate::app::daemon_recovery::DaemonLauncher>
+            }),
+            "systemctl --user start rsid.service".into(),
+        );
+        app
+    }
+
+    fn fail_handshake(app: &mut App) {
+        app.bootstrap.retry_at = None;
+        let _ = app.bootstrap.prepare_handshake();
+        let attempt = app.bootstrap.attempt();
+        app.apply_bootstrap_event(BootstrapEvent::Handshake {
+            attempt,
+            result: Err("No such file or directory".into()),
+        });
+    }
+
+    #[tokio::test]
+    async fn a_running_tui_starts_the_daemon_after_the_socket_stays_missing() {
+        let launcher = std::sync::Arc::new(FakeLauncher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let mut app = unreachable_app(Some(launcher.clone()));
+        // Inside the grace: retries only, no launch, no banner.
+        fail_handshake(&mut app);
+        assert_eq!(launcher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(app.persistent_banner_text(), None);
+
+        // Past the grace the next failure starts the daemon exactly once.
+        app.daemon_recovery
+            .set_timing(Duration::ZERO, Duration::from_secs(30));
+        fail_handshake(&mut app);
+        fail_handshake(&mut app);
+        let event = tokio::time::timeout(Duration::from_secs(5), app.bootstrap.recv())
+            .await
+            .expect("launcher reports back")
+            .expect("channel open");
+        assert!(matches!(
+            event,
+            BootstrapEvent::DaemonLaunch { result: Ok(()) }
+        ));
+        assert!(app.apply_bootstrap_event(event));
+        assert_eq!(launcher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            app.bootstrap.retry_due(),
+            "the TUI reconnects at once after starting the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_or_disabled_auto_start_leaves_a_persistent_banner_with_the_command() {
+        let launcher = std::sync::Arc::new(FakeLauncher {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: true,
+        });
+        let mut app = unreachable_app(Some(launcher));
+        app.daemon_recovery
+            .set_timing(Duration::ZERO, Duration::from_secs(30));
+        fail_handshake(&mut app);
+        let event = tokio::time::timeout(Duration::from_secs(5), app.bootstrap.recv())
+            .await
+            .expect("launcher reports back")
+            .expect("channel open");
+        app.apply_bootstrap_event(event);
+        let banner = app
+            .persistent_banner_text()
+            .expect("banner after failed start");
+        assert!(banner.contains("no rsid binary"), "{banner}");
+        assert!(
+            banner.contains("systemctl --user start rsid.service"),
+            "{banner}"
+        );
+
+        let mut off = unreachable_app(None);
+        off.daemon_recovery
+            .set_timing(Duration::ZERO, Duration::from_secs(30));
+        fail_handshake(&mut off);
+        let banner = off
+            .persistent_banner_text()
+            .expect("banner with auto-start off");
+        assert!(banner.contains("auto-start is off"), "{banner}");
+        assert!(
+            banner.contains("systemctl --user start rsid.service"),
+            "{banner}"
+        );
     }
 
     #[test]

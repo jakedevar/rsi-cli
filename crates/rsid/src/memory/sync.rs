@@ -337,8 +337,23 @@ impl MemorySyncEngine {
         // sync is pure cost: each iteration `load_events`-es the full event
         // stream just to hash it and hit the unchanged short-circuit below.
         // With thousands of archived sessions that dominated daemon RSS.
+        // Observations already extracted from a benchmark (`is_eval`) session
+        // before the exclusion existed (or before the session was marked) are
+        // soft-deleted from the memory store, so list and search never return
+        // held-out task content (#3325). Indexed UPDATE; a no-op once clean.
+        for session in sessions.iter().filter(|s| s.is_eval) {
+            self.ensure_enabled()?;
+            if let Err(error) = self
+                .memory_store
+                .delete_observations_by_session(&session.id.to_string())
+            {
+                warn!(%error, session_id = %session.id, "memory sync: eval observation prune failed");
+            }
+        }
+
         let sessions_to_index: Vec<_> = sessions
             .iter()
+            .filter(|s| !s.is_eval)
             .filter(|s| matches!(s.status, rsi_common::types::SessionStatus::Completed))
             .collect();
 
@@ -347,8 +362,14 @@ impl MemorySyncEngine {
         // Dropping them from `active_paths` would make the prune loop below
         // delete those entries. Sessions purged from the DB entirely are absent
         // here and so are still correctly pruned.
+        //
+        // Benchmark (`is_eval`) sessions are never retained: their transcripts
+        // hold held-out task content that no later session may retrieve, so
+        // leaving them out of `active_paths` makes the prune loop below delete
+        // any chunks indexed before the exclusion existed.
         let active_paths: HashSet<String> = sessions
             .iter()
+            .filter(|s| !s.is_eval)
             .filter(|s| {
                 matches!(
                     s.status,
@@ -488,7 +509,8 @@ impl MemorySyncEngine {
         // 4. Embed chunks (if provider available)
         let embeddings = match self.embedding_provider.provider.as_ref() {
             Some(_) => {
-                let control_store = Arc::new(tokio::sync::Mutex::new(self.open_main_store()?));
+                let control_store =
+                    Arc::new(rsid_core::store_lock::Mutex::new(self.open_main_store()?));
                 let control = EmbeddingControl {
                     store: control_store,
                     event_bus: Arc::clone(&self.event_bus),
@@ -581,7 +603,7 @@ impl MemorySyncEngine {
         let search_control = provider
             .map(|_| {
                 Ok::<EmbeddingControl, crate::error::DaemonError>(EmbeddingControl {
-                    store: Arc::new(tokio::sync::Mutex::new(self.open_main_store()?)),
+                    store: Arc::new(rsid_core::store_lock::Mutex::new(self.open_main_store()?)),
                     event_bus: Arc::clone(&self.event_bus),
                     owner: InvocationOwner {
                         project_id,
@@ -608,14 +630,110 @@ impl MemorySyncEngine {
             pid_string.as_deref(),
             search_control.as_ref(),
         );
-        match self.runtime_config.clone() {
+        let results = match self.runtime_config.clone() {
             Some(runtime) => {
                 MemoryWorkContext::new(runtime, self.shutdown.clone())
                     .scope(search)
                     .await
             }
             None => search.await,
+        }?;
+        Ok(self.drop_eval_session_results(results))
+    }
+
+    /// Drop observation rows whose originating session is `is_eval`.
+    ///
+    /// Sync soft-deletes those rows, but one can be extracted between a
+    /// session being marked eval and the next sync pass, so the list/search
+    /// path re-checks against the session store. Fails closed: when the store
+    /// cannot be read, every row is dropped rather than returned.
+    pub(crate) fn drop_eval_observation_rows(
+        &self,
+        mut rows: Vec<crate::memory::store::ObservationRow>,
+    ) -> Vec<crate::memory::store::ObservationRow> {
+        if rows.is_empty() {
+            return rows;
         }
+        let main_store = match self.open_main_store() {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(%error, "memory observations: cannot read session store; dropping rows");
+                rows.clear();
+                return rows;
+            }
+        };
+        let mut eval_cache: std::collections::HashMap<uuid::Uuid, bool> =
+            std::collections::HashMap::new();
+        rows.retain(|row| {
+            // A row with no parseable or known session is not eval content.
+            let Ok(id) = uuid::Uuid::parse_str(&row.session_id) else {
+                return true;
+            };
+            let is_eval = *eval_cache.entry(id).or_insert_with(|| {
+                match main_store.get_session(id) {
+                    Ok(Some(session)) => session.is_eval,
+                    Ok(None) => false,
+                    Err(error) => {
+                        warn!(%error, session_id = %id, "memory observations: session lookup failed; dropping row");
+                        true
+                    }
+                }
+            });
+            !is_eval
+        });
+        rows
+    }
+
+    /// Remove session-transcript hits that belong to an `is_eval` session.
+    ///
+    /// Sync prunes those chunks, but a transcript can be indexed between a
+    /// session being marked eval and the next sync pass, so the search path
+    /// re-checks against the session store. Fails closed: when the store
+    /// cannot be read, session hits are dropped rather than returned.
+    fn drop_eval_session_results(
+        &self,
+        mut results: Vec<MemorySearchResult>,
+    ) -> Vec<MemorySearchResult> {
+        let session_id_of = |r: &MemorySearchResult| -> Option<uuid::Uuid> {
+            if r.source != MemorySource::Sessions {
+                return None;
+            }
+            r.path
+                .strip_prefix("sessions/")
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        };
+        if !results.iter().any(|r| session_id_of(r).is_some()) {
+            return results;
+        }
+        let main_store = match self.open_main_store() {
+            Ok(store) => store,
+            Err(error) => {
+                warn!(%error, "memory search: cannot read session store; dropping session hits");
+                results.retain(|r| r.source != MemorySource::Sessions);
+                return results;
+            }
+        };
+        let mut eval_cache: std::collections::HashMap<uuid::Uuid, bool> =
+            std::collections::HashMap::new();
+        results.retain(|r| {
+            let Some(id) = session_id_of(r) else {
+                return r.source != MemorySource::Sessions;
+            };
+            let is_eval = *eval_cache.entry(id).or_insert_with(|| {
+                match main_store.get_session(id) {
+                    Ok(Some(session)) => session.is_eval,
+                    // A chunk with no session row is a stale index entry the
+                    // next sync prunes; it is not eval content.
+                    Ok(None) => false,
+                    Err(error) => {
+                        warn!(%error, session_id = %id, "memory search: session lookup failed; dropping hit");
+                        true
+                    }
+                }
+            });
+            !is_eval
+        });
+        results
     }
 
     /// Build a status report of the memory system.
@@ -748,8 +866,8 @@ impl MemorySyncEngine {
     /// # Errors
     ///
     /// Returns an error if the main daemon database cannot be opened.
-    pub fn main_store_handle(&self) -> Result<Arc<tokio::sync::Mutex<Store>>> {
-        Ok(Arc::new(tokio::sync::Mutex::new(Store::open(
+    pub fn main_store_handle(&self) -> Result<Arc<rsid_core::store_lock::Mutex<Store>>> {
+        Ok(Arc::new(rsid_core::store_lock::Mutex::new(Store::open(
             self.main_db_path.as_path(),
         )?)))
     }
@@ -1167,5 +1285,225 @@ mod tests {
         let engine = setup_engine(&dir);
         let results = engine.search("test query", None, None, None).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    const EVAL_MARKER: &str = "zorblaxianheldoutmarker";
+
+    /// Insert a `Completed` session whose transcript carries `EVAL_MARKER`.
+    fn seed_completed_session(dir: &TempDir, is_eval: bool) -> uuid::Uuid {
+        use rsi_common::types::{ConversationEvent, EventType, Role, SessionStatus};
+        let main_store = Store::open(&dir.path().join("flywheel.db")).unwrap();
+        let mut session = rsid_store::test_support::make_test_session();
+        session.status = SessionStatus::Completed;
+        session.is_eval = is_eval;
+        main_store.insert_session(&session).unwrap();
+        for (sequence, role, content) in [
+            (
+                1,
+                Role::User,
+                format!("please inspect {EVAL_MARKER} carefully"),
+            ),
+            (
+                2,
+                Role::Assistant,
+                format!("the {EVAL_MARKER} answer is forty two"),
+            ),
+        ] {
+            main_store
+                .insert_event(&ConversationEvent {
+                    id: 0,
+                    session_id: session.id,
+                    sequence,
+                    event_type: EventType::Message,
+                    role: Some(role),
+                    content,
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: chrono::Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: None,
+                })
+                .unwrap();
+        }
+        session.id
+    }
+
+    fn set_session_eval(dir: &TempDir, id: uuid::Uuid, is_eval: bool) {
+        let conn = rusqlite::Connection::open(dir.path().join("flywheel.db")).unwrap();
+        // The sessions triggers call store-registered SQL functions.
+        Store::register_sql_functions(&conn).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET is_eval = ?1 WHERE id = ?2",
+                rusqlite::params![i64::from(is_eval), id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn test_sync_indexes_normal_session_but_not_eval_session() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let normal = seed_completed_session(&dir, false);
+        let eval = seed_completed_session(&dir, true);
+
+        engine.run_sync("test", true).await.unwrap();
+
+        let paths: Vec<String> = engine
+            .memory_store
+            .list_files()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths, vec![format!("sessions/{normal}")]);
+        assert!(!paths.contains(&format!("sessions/{eval}")));
+
+        let hits = engine.search(EVAL_MARKER, None, None, None).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>(),
+            vec![format!("sessions/{normal}")],
+            "only the normal session is found"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn test_sync_prunes_chunks_indexed_before_session_was_eval() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let id = seed_completed_session(&dir, false);
+        engine.run_sync("test", true).await.unwrap();
+        let path = format!("sessions/{id}");
+        assert!(engine.memory_store.get_file(&path).unwrap().is_some());
+        assert!(
+            !engine
+                .search(EVAL_MARKER, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        set_session_eval(&dir, id, true);
+        engine.run_sync("test", true).await.unwrap();
+
+        assert!(engine.memory_store.get_file(&path).unwrap().is_none());
+        assert!(
+            engine
+                .memory_store
+                .get_chunks_for_file(&path, MemorySource::Sessions)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            engine
+                .search(EVAL_MARKER, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn test_search_drops_eval_hits_indexed_before_next_sync() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let id = seed_completed_session(&dir, false);
+        engine.run_sync("test", true).await.unwrap();
+
+        // Marked eval, but the sync that prunes it has not run yet.
+        set_session_eval(&dir, id, true);
+        assert!(
+            engine
+                .search(EVAL_MARKER, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    fn observation_row_for(session: uuid::Uuid) -> crate::memory::store::ObservationRow {
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::memory::store::ObservationRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session.to_string(),
+            project_id: None,
+            level: "explicit".to_string(),
+            content: format!("learned that {EVAL_MARKER} matters"),
+            source_ids: "[]".to_string(),
+            confidence: None,
+            times_derived: 1,
+            embedding: String::new(),
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// #3325: an observation extracted from a session before it was `is_eval`
+    /// is dropped by the read path at once and soft-deleted by the next sync;
+    /// a normal session's observation is untouched.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
+    #[tokio::test]
+    async fn test_eval_session_observations_are_not_retrievable_3325() {
+        let dir = TempDir::new().unwrap();
+        let mut engine = setup_engine(&dir);
+        let normal = seed_completed_session(&dir, false);
+        let later_eval = seed_completed_session(&dir, false);
+        // A forced sync swaps in a fresh index; settle it first so the
+        // incremental pass below is the one that prunes.
+        engine.run_sync("test", true).await.unwrap();
+        let normal_row = observation_row_for(normal);
+        let eval_row = observation_row_for(later_eval);
+        engine
+            .memory_store
+            .insert_observations(&[normal_row.clone(), eval_row.clone()])
+            .unwrap();
+
+        // Read path, before any sync: the session store is the authority.
+        set_session_eval(&dir, later_eval, true);
+        let kept = engine.drop_eval_observation_rows(
+            engine
+                .memory_store
+                .list_observations(None, None, None)
+                .unwrap(),
+        );
+        assert_eq!(
+            kept.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![normal_row.id.clone()]
+        );
+        assert!(kept.iter().all(|r| r.session_id != later_eval.to_string()));
+
+        // Next sync soft-deletes the eval session's observations.
+        engine.run_sync("test", false).await.unwrap();
+        assert!(
+            engine
+                .memory_store
+                .get_observation(&eval_row.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            engine
+                .memory_store
+                .search_observations_by_keyword(EVAL_MARKER, 10, None)
+                .unwrap()
+                .iter()
+                .all(|(id, _)| engine
+                    .memory_store
+                    .get_observation(id)
+                    .unwrap()
+                    .is_none_or(|row| row.id != eval_row.id))
+        );
+        assert!(
+            engine
+                .memory_store
+                .get_observation(&normal_row.id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(engine.memory_store.count_observations().unwrap(), 1);
     }
 }

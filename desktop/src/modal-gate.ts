@@ -1,15 +1,36 @@
 // The Vim keys switch for pane key handlers (hub #3101). With the switch off,
 // the modal letter keys stop: a pane's own window keydown handler keeps only
-// the standard desktop keys (arrows, Enter, Escape, Tab, paging) and lets every
+// the standard desktop keys (arrows, Enter, Escape, paging, F6) and lets every
 // other key through untouched, so the pane stays usable with the mouse and the
-// ordinary navigation keys. Every pane capture handler calls paneKeyAllowed
+// ordinary navigation keys. Tab is not one of them (local #243): with the switch
+// off Tab and Shift-Tab are the browser's focus order in every pane and dialog,
+// so a keyboard user reaches every button; F6 and Shift-F6 are the pane-cycle
+// key that does what Tab does with the switch on (see paneKeyName). Every pane capture handler calls paneKeyAllowed
 // first; tests/modal-gate.test.mjs fails when a new one does not.
 
 export const STANDARD_KEYS: ReadonlySet<string> = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
-  'Enter', 'Escape', 'Tab',
+  'Enter', 'Escape', 'F6',
   'PageUp', 'PageDown', 'Home', 'End',
 ]);
+
+/**
+ * The key a pane or picker acts on: F6 is the pane-cycle key and reads as Tab (Shift-F6 as
+ * Shift-Tab), so the section and pane switch has a non-Tab key with Vim keys off (local #243).
+ * Every other key is itself. Pass the result, not ev.key, to the pane's key logic.
+ */
+export function paneKeyName(ev: { readonly key: string }): string {
+  return ev.key === 'F6' ? 'Tab' : ev.key;
+}
+
+/**
+ * Whether Tab or Shift-Tab is the browser's focus order, never a pane or dialog key (local #243).
+ * True with Vim keys off; the Help view and the model picker, which are dialogs and so not under
+ * paneKeyAllowed, ask this first. Vim keys on keeps Tab switching sections as the TUI does.
+ */
+export function tabIsNative(vimKeysOn: boolean, ev: { readonly key: string }): boolean {
+  return !vimKeysOn && ev.key === 'Tab';
+}
 
 /** Whether a pane's own handler may act on this key, given the Vim keys switch. */
 export function paneKeyAllowed(vimKeysOn: boolean, ev: { readonly key: string }): boolean {
@@ -47,13 +68,14 @@ function typingTarget(target: EditableLike | null): boolean {
  * The overlay dialogs are a separate layer from the panes: they list single-letter
  * keys (a/d/j/k/q/y/n...) in a hint line and act on them with no field focused.
  * With the Vim keys switch off those letters do nothing, the same rule as the
- * panes: Enter, Escape, arrows, Tab and paging stay, every action is still on its
+ * panes: Enter, Escape, arrows, Tab, F6 and paging stay, every action is still on its
  * button, and typing into a text field is untouched. `dialogOpen` says a dialog is
  * open while the key is aimed at the page body (a click on dialog text can leave
  * focus there). Modifier chords (Ctrl+K and the like) are not letter keys.
  */
 export function dialogKeyBlocked(vimKeysOn: boolean, ev: DialogKeyEvent, dialogOpen = false): boolean {
-  if (vimKeysOn || STANDARD_KEYS.has(ev.key)) return false;
+  // Tab is native with the switch off (tabIsNative); the dialog gate leaves it to the dialog.
+  if (vimKeysOn || STANDARD_KEYS.has(ev.key) || ev.key === 'Tab') return false;
   if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) return false;
   const target = ev.target as EditableLike | null;
   if (typingTarget(target)) return false;
@@ -73,13 +95,26 @@ export const ACTIVATABLE_SELECTOR = [
   '[role="button"]',
 ].join(', ');
 
+let commandLineOpen: () => boolean = () => false;
+
+/**
+ * Tell the Enter/Space gates whether the `:` command line is open (local #280). While it is, the key
+ * engine owns Enter (run the line) and Space (part of the line) even when a mouse click left a
+ * button or checkbox focused: otherwise `:term` + Enter after ticking Show completed activated the
+ * checkbox and never ran the command. Called once by initVimKeys.
+ */
+export function bindCommandLineOpen(open: () => boolean): void {
+  commandLineOpen = open;
+}
+
 /**
  * Whether Enter or Space must be left to the focused control (hub #3112). A mouse
  * click focuses a button; the next Enter or Space activates that button, never
- * the dialog's or pane's row action (which can write trust or delete).
+ * the dialog's or pane's row action (which can write trust or delete). An open
+ * command line takes the key first (local #280).
  */
 export function focusOwnsKey(key: string, target: KeyTarget | null): boolean {
-  return (key === 'Enter' || key === ' ') && !!target?.closest?.(ACTIVATABLE_SELECTOR);
+  return (key === 'Enter' || key === ' ') && !commandLineOpen() && !!target?.closest?.(ACTIVATABLE_SELECTOR);
 }
 
 /** The parts of a keydown event the activation guard touches. */
@@ -117,6 +152,7 @@ function nativelyActivated(control: Activatable): boolean {
  */
 export function activationGuard(ev: GuardEvent): 'native' | 'emulated' | null {
   if (ev.key !== 'Enter' && ev.key !== ' ') return null;
+  if (commandLineOpen()) return null;
   const target = ev.target as Activatable | null;
   const control = target?.closest?.(ACTIVATABLE_SELECTOR) as Activatable | null | undefined;
   if (!control) return null;

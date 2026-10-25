@@ -4,4 +4,4 @@
 set -eu
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT"
-exec python3 tools/check_theme_test_guards.py "$@"
+exec "$ROOT/scripts/repo-guard" theme-test-guards "$@"

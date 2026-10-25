@@ -1,0 +1,221 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadEc2AndMetricsInRegion",
+      "Effect": "Allow",
+      "Action": ["ec2:Describe*", "cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics"],
+      "Resource": "*",
+      "Condition": { "StringEquals": { "aws:RequestedRegion": "us-west-1" } }
+    },
+    {
+      "Sid": "ReadPublicAmiParameter",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Resource": "arn:aws:ssm:us-west-1::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "LaunchSpotTaggedInstance",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:us-west-1:625527221604:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "ec2:InstanceMarketType": "spot",
+          "ec2:InstanceType": ["c7i.2xlarge", "c7i.4xlarge", "c7i.8xlarge"],
+          "aws:RequestTag/Service": ["rsi-remote-gate", "rsi-bench", "rsi-pool"]
+        },
+        "ForAllValues:StringEquals": { "aws:TagKeys": ["Name", "Owner", "Service", "rsi:expires-at"] },
+        "Null": { "aws:RequestTag/rsi:expires-at": "false" }
+      }
+    },
+    {
+      "Sid": "LaunchEncryptedBoundedVolume",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:us-west-1:625527221604:volume/*",
+      "Condition": {
+        "Bool": { "ec2:Encrypted": "true" },
+        "NumericLessThanEquals": { "ec2:VolumeSize": "300" }
+      }
+    },
+    {
+      "Sid": "LaunchAmazonImage",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:us-west-1::image/*",
+      "Condition": { "StringEquals": { "ec2:Owner": "amazon" } }
+    },
+    {
+      "Sid": "LaunchRsiNetworkAndSupport",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances"],
+      "Resource": [
+        "arn:aws:ec2:us-west-1:625527221604:subnet/subnet-0227c7c61c84a9dc1",
+        "arn:aws:ec2:us-west-1:625527221604:security-group/sg-0aedeb3f66034e92f",
+        "arn:aws:ec2:us-west-1:625527221604:key-pair/*",
+        "arn:aws:ec2:us-west-1:625527221604:spot-instances-request/*"
+      ]
+    },
+    {
+      "Sid": "LaunchNewEniInRsiSubnet",
+      "Effect": "Allow",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:us-west-1:625527221604:network-interface/*",
+      "Condition": {
+        "StringEquals": { "ec2:Subnet": "arn:aws:ec2:us-west-1:625527221604:subnet/subnet-0227c7c61c84a9dc1" },
+        "Bool": { "ec2:AssociatePublicIpAddress": "true" }
+      }
+    },
+    {
+      "Sid": "TagAtLaunchOnly",
+      "Effect": "Allow",
+      "Action": ["ec2:CreateTags"],
+      "Resource": [
+        "arn:aws:ec2:us-west-1:625527221604:instance/*",
+        "arn:aws:ec2:us-west-1:625527221604:volume/*",
+        "arn:aws:ec2:us-west-1:625527221604:network-interface/*",
+        "arn:aws:ec2:us-west-1:625527221604:spot-instances-request/*"
+      ],
+      "Condition": { "StringEquals": { "ec2:CreateAction": "RunInstances" } }
+    },
+    {
+      "Sid": "ManageOnlyRsiInstances",
+      "Effect": "Allow",
+      "Action": ["ec2:TerminateInstances", "ec2:StopInstances", "ec2:RebootInstances", "ec2:GetConsoleOutput"],
+      "Resource": "arn:aws:ec2:us-west-1:625527221604:instance/*",
+      "Condition": { "StringEquals": { "aws:ResourceTag/Service": ["rsi-remote-gate", "rsi-bench", "rsi-pool"] } }
+    },
+    {
+      "Sid": "CreateSpotServiceLinkedRoleOnce",
+      "Effect": "Allow",
+      "Action": ["iam:CreateServiceLinkedRole"],
+      "Resource": "arn:aws:iam::625527221604:role/aws-service-role/spot.amazonaws.com/AWSServiceRoleForEC2Spot",
+      "Condition": { "StringEquals": { "iam:AWSServiceName": "spot.amazonaws.com" } }
+    },
+    {
+      "Sid": "PassSccacheRoleToEc2",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": "arn:aws:iam::625527221604:role/rsi-gate-sccache",
+      "Condition": { "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" } }
+    },
+    {
+      "Sid": "ReadSccacheRole",
+      "Effect": "Allow",
+      "Action": ["iam:GetRole", "iam:GetInstanceProfile", "iam:ListRolePolicies", "iam:GetRolePolicy"],
+      "Resource": [
+        "arn:aws:iam::625527221604:role/rsi-gate-sccache",
+        "arn:aws:iam::625527221604:instance-profile/rsi-gate-sccache"
+      ]
+    },
+    {
+      "Sid": "SccacheBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::rsi-gate-sccache-625527221604-us-west-1"
+    },
+    {
+      "Sid": "SccacheObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::rsi-gate-sccache-625527221604-us-west-1/sccache/*"
+    },
+    {
+      "Sid": "ReadOwnPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetUser",
+        "iam:ListAttachedUserPolicies",
+        "iam:ListUserPolicies",
+        "iam:GetUserPolicy",
+        "iam:ListGroupsForUser",
+        "iam:SimulatePrincipalPolicy"
+      ],
+      "Resource": "arn:aws:iam::625527221604:user/${aws:username}"
+    },
+    {
+      "Sid": "ReadRsiManagedPolicies",
+      "Effect": "Allow",
+      "Action": ["iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListPolicyVersions"],
+      "Resource": "arn:aws:iam::625527221604:policy/rsi-cloud-*"
+    },
+    {
+      "Sid": "ReadSpendPricesAndLint",
+      "Effect": "Allow",
+      "Action": [
+        "budgets:ViewBudget",
+        "ce:GetCostAndUsage",
+        "ce:GetCostForecast",
+        "pricing:GetProducts",
+        "pricing:DescribeServices",
+        "pricing:GetAttributeValues",
+        "access-analyzer:ValidatePolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyOnDemandLaunch",
+      "Effect": "Deny",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringNotEquals": { "ec2:InstanceMarketType": "spot" } }
+    },
+    {
+      "Sid": "DenyUnapprovedService",
+      "Effect": "Deny",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "StringNotEquals": { "aws:RequestTag/Service": ["rsi-remote-gate", "rsi-bench", "rsi-pool"] } }
+    },
+    {
+      "Sid": "DenyMissingExpiry",
+      "Effect": "Deny",
+      "Action": ["ec2:RunInstances"],
+      "Resource": "arn:aws:ec2:*:*:instance/*",
+      "Condition": { "Null": { "aws:RequestTag/rsi:expires-at": "true" } }
+    },
+    {
+      "Sid": "DenyOffListTagKeys",
+      "Effect": "Deny",
+      "Action": ["ec2:CreateTags"],
+      "Resource": "*",
+      "Condition": { "ForAnyValue:StringNotEquals": { "aws:TagKeys": ["Name", "Owner", "Service", "rsi:expires-at"] } }
+    },
+    {
+      "Sid": "DenyPostLaunchTagChange",
+      "Effect": "Deny",
+      "Action": ["ec2:CreateTags", "ec2:DeleteTags"],
+      "Resource": "*",
+      "Condition": { "Null": { "ec2:CreateAction": "true" } }
+    },
+    {
+      "Sid": "DenyNetworkAndIamMutation",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:CreateSecurityGroup",
+        "ec2:ModifySecurityGroupRules",
+        "ec2:CreateVpc",
+        "ec2:CreateSubnet",
+        "ec2:CreateInternetGateway",
+        "ec2:CreateRoute",
+        "ec2:AssociateIamInstanceProfile",
+        "ec2:ReplaceIamInstanceProfileAssociation",
+        "ec2:CreateNetworkInterface",
+        "ec2:AttachNetworkInterface",
+        "iam:CreateUser",
+        "iam:CreateAccessKey",
+        "iam:CreateRole",
+        "iam:AttachUserPolicy",
+        "iam:AttachRolePolicy",
+        "iam:PutUserPolicy",
+        "iam:PutRolePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:SetDefaultPolicyVersion"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

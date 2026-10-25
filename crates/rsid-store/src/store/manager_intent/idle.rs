@@ -78,13 +78,30 @@ pub(crate) struct ObservationVersion {
 }
 
 /// Row writes of this connection the update hook counted (#2939).
-#[derive(Default)]
 pub(crate) struct InputWrites {
     /// Writes to [`INTENT_INPUT_TABLES`], and deletes of conversation events.
     relevant: AtomicU64,
     /// Inserted conversation events.
     events: AtomicU64,
+    /// #3486: `relevant`, split by table (index into [`INTENT_INPUT_TABLES`]),
+    /// so a rejected observation can name the tables that moved.
+    by_table: [AtomicU64; INPUT_TABLE_COUNT],
+    /// Deleted conversation events (part of `relevant`).
+    event_deletes: AtomicU64,
 }
+
+impl Default for InputWrites {
+    fn default() -> Self {
+        Self {
+            relevant: AtomicU64::new(0),
+            events: AtomicU64::new(0),
+            by_table: std::array::from_fn(|_| AtomicU64::new(0)),
+            event_deletes: AtomicU64::new(0),
+        }
+    }
+}
+
+const INPUT_TABLE_COUNT: usize = INTENT_INPUT_TABLES.len();
 
 /// The intent pass's inputs as of one instant on this connection (#2939).
 /// Equal versions mean no input table changed in between, except by inserted
@@ -101,6 +118,9 @@ pub struct IntentInputPin {
     version: IntentInputVersion,
     event_inserts: u64,
     events_high_water: i64,
+    /// #3486: per-table write counts at the pin ([`InputWrites::by_table`]).
+    table_writes: [u64; INPUT_TABLE_COUNT],
+    event_deletes: u64,
 }
 
 struct Observation {
@@ -132,6 +152,10 @@ pub(crate) struct IdleIntentCache {
     /// Installed with the update hook on the first version read.
     input_writes: Option<Arc<InputWrites>>,
     held_claim: Option<HeldClaim>,
+    /// #3486: when each project's intent pass last ran to completion on this
+    /// connection (or was answered by its memo). Bounds how long a pass whose
+    /// off-lock observation was rejected may be deferred.
+    last_applied: std::collections::HashMap<Uuid, DateTime<Utc>>,
     /// Claim scans skipped by [`HeldClaim`] (observability and tests).
     pub(crate) held_claim_reuses: u64,
     // Incremented only by the test seam at the actual snapshot entry point.
@@ -247,10 +271,13 @@ impl Store {
             .conn
             .prepare_cached("SELECT COALESCE(MAX(id),0) FROM conversation_events")?
             .query_row([], |row| row.get(0))?;
+        let writes = self.manager_intent_input_writes();
         Ok(Some(IntentInputPin {
             version,
             event_inserts,
             events_high_water,
+            table_writes: std::array::from_fn(|i| writes.by_table[i].load(Ordering::Relaxed)),
+            event_deletes: writes.event_deletes.load(Ordering::Relaxed),
         }))
     }
 
@@ -261,16 +288,68 @@ impl Store {
         pin: &IntentInputPin,
         watch: &[Uuid],
     ) -> Result<bool> {
+        Ok(self.manager_intent_input_change(pin, watch)?.is_none())
+    }
+
+    /// #3486: why the inputs no longer equal `pin`, or `None` while they do.
+    /// The reason names what moved: `external_commit` (another connection
+    /// committed), `tables:<a>,<b>` (this connection wrote those input tables)
+    /// or `conversation_events` (an event that matters was inserted).
+    pub(crate) fn manager_intent_input_change(
+        &self,
+        pin: &IntentInputPin,
+        watch: &[Uuid],
+    ) -> Result<Option<String>> {
         let writes = self.manager_intent_input_writes();
-        if writes.relevant.load(Ordering::Relaxed) != pin.version.relevant_writes
-            || self.data_version()? != pin.version.external_changes
-        {
-            return Ok(false);
+        let external = self.data_version()? != pin.version.external_changes;
+        if writes.relevant.load(Ordering::Relaxed) != pin.version.relevant_writes || external {
+            let mut moved: Vec<&str> = INTENT_INPUT_TABLES
+                .iter()
+                .zip(&pin.table_writes)
+                .zip(&writes.by_table)
+                .filter(|((_, at_pin), now)| now.load(Ordering::Relaxed) != **at_pin)
+                .map(|((table, _), _)| *table)
+                .collect();
+            if writes.event_deletes.load(Ordering::Relaxed) != pin.event_deletes {
+                moved.push(EVENTS_TABLE);
+            }
+            let mut reason = Vec::new();
+            if external {
+                reason.push("external_commit".to_owned());
+            }
+            if !moved.is_empty() {
+                reason.push(format!("tables:{}", moved.join(",")));
+            }
+            return Ok(Some(reason.join(";")));
         }
         if writes.events.load(Ordering::Relaxed) == pin.event_inserts {
-            return Ok(true);
+            return Ok(None);
         }
-        Ok(!self.manager_intent_events_matter(pin.events_high_water, watch)?)
+        Ok(self
+            .manager_intent_events_matter(pin.events_high_water, watch)?
+            .then(|| EVENTS_TABLE.to_owned()))
+    }
+
+    /// #3486: record that `project`'s intent pass completed now.
+    pub(super) fn manager_intent_note_applied(&self, project: Uuid, at: DateTime<Utc>) {
+        self.manager_intent_idle
+            .borrow_mut()
+            .last_applied
+            .insert(project, at);
+    }
+
+    /// #3486: whether `project`'s intent pass completed within `window` of `at`.
+    pub(super) fn manager_intent_applied_within(
+        &self,
+        project: Uuid,
+        at: DateTime<Utc>,
+        window: Duration,
+    ) -> bool {
+        self.manager_intent_idle
+            .borrow()
+            .last_applied
+            .get(&project)
+            .is_some_and(|last| at >= *last && at - *last < window)
     }
 
     /// An event inserted after `high_water` for a session that is `Starting`
@@ -323,11 +402,14 @@ impl Store {
             };
             self.manager_intent_idle.borrow_mut().entries[index].pin = advanced;
         }
-        Ok(Some(
-            self.manager_intent_idle.borrow().entries[index]
-                .result
-                .clone(),
-        ))
+        let mut result = self.manager_intent_idle.borrow().entries[index]
+            .result
+            .clone();
+        // The memo reuses decisions, not the previous pass's read activity.
+        // A full pass may have populated it under the lock; this hit reads
+        // none of the cohort/work/request/resource snapshot again (#3047).
+        result.read_under_lock = false;
+        Ok(Some(result))
     }
 
     fn manager_intent_input_writes(&self) -> Arc<InputWrites> {
@@ -343,10 +425,14 @@ impl Store {
                     // `metadata`, which the pass never reads (pinned by a test).
                     match action {
                         Action::SQLITE_INSERT => counter.events.fetch_add(1, Ordering::Relaxed),
-                        Action::SQLITE_DELETE => counter.relevant.fetch_add(1, Ordering::Relaxed),
+                        Action::SQLITE_DELETE => {
+                            counter.event_deletes.fetch_add(1, Ordering::Relaxed);
+                            counter.relevant.fetch_add(1, Ordering::Relaxed)
+                        }
                         _ => 0,
                     };
-                } else if INTENT_INPUT_TABLES.binary_search(&table).is_ok() {
+                } else if let Ok(index) = INTENT_INPUT_TABLES.binary_search(&table) {
+                    counter.by_table[index].fetch_add(1, Ordering::Relaxed);
                     counter.relevant.fetch_add(1, Ordering::Relaxed);
                 }
             },

@@ -762,6 +762,7 @@ mod tests {
             attribution: None,
             items,
             retained_roots: Vec::new(),
+            unproven_survivors: Vec::new(),
             created_at: "2026-10-14T00:00:00.000000000Z".into(),
             updated_at: "2026-10-14T00:00:00.000000000Z".into(),
             finished_at: None,

@@ -8,7 +8,7 @@
 import type { Session } from '../api.js';
 import { type Invocation, type SliceRuntime, dispatch } from '../commands.js';
 import { closeDag, configureDag, initDag, isDagOpen, openDag, refreshDag, toggleGates } from '../dag.js';
-import { el, toast } from '../dom.js';
+import { el, errorText, toast } from '../dom.js';
 import { closeEsp, initEsp, isEspOpen, openEsp } from '../esp.js';
 import { parseTopologyResolve } from '../graph-model.js';
 import { issuesSnapshot } from '../issues.js';
@@ -44,7 +44,7 @@ export function graphsSnapshot(): GraphsSnapshot {
 /** A full-window pane replaces the session layout: close the others first. */
 function opening(except: 'graph' | 'dag'): void {
   if (document.getElementById('issues-view')?.hidden === false) dispatch('issues-close', { source: 'button' });
-  if (isSettingsOpen()) closeSettings();
+  if (isSettingsOpen()) closeSettings({ keepStaged: true });
   if (except !== 'graph') closeGraphReview();
   if (except !== 'dag') closeDag();
 }
@@ -63,13 +63,16 @@ async function previewDialog(topologyId: string, epic: TopoSession): Promise<boo
     name = t.name;
     lines = topologyPreview(t.definition).map(previewText);
   } catch (e) {
-    lines = [`[topology preview unavailable — ${String(e)}]`];
+    lines = [`[topology preview unavailable — ${errorText(String(e))}]`];
   }
   return new Promise((resolve) => {
     const dlg = el('dialog', 'confirm topo-confirm');
     const form = el('form', 'launch-form');
     form.method = 'dialog';
-    form.append(el('h2', '', `Run topology ${name}?`));
+    const heading = el('h2', '', `Run topology ${name}?`);
+    heading.id = 'topo-confirm-title';
+    dlg.setAttribute('aria-labelledby', heading.id);
+    form.append(heading);
     form.append(el('p', 'meta', `Under Epic ${epic.title?.trim() || epic.id.slice(0, 8)}: its executor sessions spawn as the Epic's children.`));
     const pre = el('pre', 'topo-preview');
     pre.textContent = lines.join('\n');

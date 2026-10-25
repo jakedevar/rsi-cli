@@ -257,7 +257,6 @@ mod tests {
     use crate::memory::types::MemoryConfig;
     use crate::store::Store;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     struct MockEmbeddingProvider {
         query_embedding: Vec<f32>,
@@ -307,7 +306,7 @@ mod tests {
 
     fn embedding_control() -> EmbeddingControl {
         EmbeddingControl {
-            store: Arc::new(Mutex::new(
+            store: Arc::new(rsid_core::store_lock::Mutex::new(
                 Store::open_in_memory().expect("model-control store"),
             )),
             event_bus: Arc::new(EventBus::new(8)),

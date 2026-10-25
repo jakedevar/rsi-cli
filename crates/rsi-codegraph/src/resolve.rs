@@ -39,41 +39,54 @@ pub fn resolve_workspace(files: &mut [PerFileFacts], cargo: Option<&CargoWorkspa
     resolve_findings(files);
 }
 
-fn resolve_findings(files: &mut [PerFileFacts]) {
-    let mut findings: HashMap<String, Vec<FactKey>> = HashMap::new();
-    for file in files.iter() {
-        if file.diagnostic != crate::FileDiagnostic::Parsed {
-            continue;
-        }
-        for node in &file.nodes {
-            if node.kind == NodeKind::ResearchFinding
-                && let Some(id) = node.name.get(..5).filter(|id| {
-                    id.starts_with("F-") && id[2..].bytes().all(|byte| byte.is_ascii_digit())
-                })
-            {
-                findings
-                    .entry(id.to_owned())
-                    .or_default()
-                    .push(node.key.clone());
-            }
+/// Research-finding ids (`F-123`) to the nodes that declare them.
+pub(crate) type FindingIndex = HashMap<String, Vec<FactKey>>;
+
+/// Add the finding nodes one parsed file declares to `findings`.
+pub(crate) fn collect_findings(file: &PerFileFacts, findings: &mut FindingIndex) {
+    if file.diagnostic != crate::FileDiagnostic::Parsed {
+        return;
+    }
+    for node in &file.nodes {
+        if node.kind == NodeKind::ResearchFinding
+            && let Some(id) = node.name.get(..5).filter(|id| {
+                id.starts_with("F-") && id[2..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+        {
+            findings
+                .entry(id.to_owned())
+                .or_default()
+                .push(node.key.clone());
         }
     }
-    for file in files.iter_mut() {
-        if file.diagnostic != crate::FileDiagnostic::Parsed {
+}
+
+/// Resolve the finding references of one parsed file against `findings`.
+pub(crate) fn apply_findings(file: &mut PerFileFacts, findings: &FindingIndex) {
+    if file.diagnostic != crate::FileDiagnostic::Parsed {
+        return;
+    }
+    let mut remaining = Vec::with_capacity(file.unresolved_references.len());
+    for reference in std::mem::take(&mut file.unresolved_references) {
+        if reference.kind == UnresolvedReferenceKind::Finding
+            && let Some(target) = unique(findings.get(&reference.raw_target))
+            && target != reference.owner
+        {
+            file.relations.push(resolved_relation(&reference, &target));
             continue;
         }
-        let mut remaining = Vec::with_capacity(file.unresolved_references.len());
-        for reference in std::mem::take(&mut file.unresolved_references) {
-            if reference.kind == UnresolvedReferenceKind::Finding
-                && let Some(target) = unique(findings.get(&reference.raw_target))
-                && target != reference.owner
-            {
-                file.relations.push(resolved_relation(&reference, &target));
-                continue;
-            }
-            remaining.push(reference);
-        }
-        file.unresolved_references = remaining;
+        remaining.push(reference);
+    }
+    file.unresolved_references = remaining;
+}
+
+fn resolve_findings(files: &mut [PerFileFacts]) {
+    let mut findings = FindingIndex::new();
+    for file in files.iter() {
+        collect_findings(file, &mut findings);
+    }
+    for file in files.iter_mut() {
+        apply_findings(file, &findings);
     }
 }
 

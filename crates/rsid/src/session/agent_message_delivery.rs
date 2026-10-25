@@ -80,7 +80,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rsi_common::agent_coordination::{
@@ -175,7 +175,7 @@ struct DeliveryFacts {
 /// a harmless bookkeeping retry into a terminal session.
 async fn settle_pre_effect(
     settlement: crate::model_control::call_control::ModelCallSettlement,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     error_class: &'static str,
 ) {
@@ -320,7 +320,7 @@ pub(crate) fn build_claim_request(
 /// conservative answer, so a loud log is the right response rather than tearing
 /// down a session whose turn is genuinely running.
 async fn record_admission(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     fence: &MessageAttemptFenceV1,
     admission: &BoundaryAdmissionV1,
     disposition: NoEffectDisposition,
@@ -373,7 +373,7 @@ async fn record_admission(
 /// running system rather than only of the registry. On every other outcome the
 /// caller releases it.
 pub(crate) async fn deliver_at_idle_boundary(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     settlements: &ModelCallSettlementHandle,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
@@ -999,7 +999,7 @@ pub(crate) mod tests {
     /// note there for why that distinction is load-bearing.
     struct FakeProvider {
         probe: Arc<ProviderProbe>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         message_id: Uuid,
     }
 
@@ -1092,7 +1092,7 @@ pub(crate) mod tests {
     }
 
     struct Fixture {
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         owner_id: Uuid,
         event_bus: Arc<EventBus>,
         settlements: ModelCallSettlementHandle,
@@ -1139,7 +1139,7 @@ pub(crate) mod tests {
             .receipt()
             .message_id;
 
-        let store = Arc::new(Mutex::new(raw));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(raw));
         let event_bus = Arc::new(EventBus::new(16));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");

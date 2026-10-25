@@ -23,8 +23,8 @@
     },
     "key:/": {
       "status": "done",
-      "location": "src/keybindings.ts, src/commands.ts, src/actions/sessionlist-run.ts",
-      "note": "focuses the incremental session filter (Enter keeps it, Esc clears it); with a session open, n / N jump to the conversation events that contain it, the TUI's detail search"
+      "location": "src/keybindings.ts, src/commands.ts, src/actions/find-run.ts, src/find-model.ts",
+      "note": "with the keys in the transcript it opens the find bar for the open conversation (the TUI's detail search; Cmd-F does the same with Vim keys off), covering every event including those behind Show earlier and never touching the session list; with the keys in the list it focuses the incremental session filter (Enter keeps it, Esc clears it)"
     },
     "key:ga": {
       "status": "done",

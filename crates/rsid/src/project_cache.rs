@@ -28,6 +28,9 @@ impl ProjectIndex {
     pub fn new(projects: Vec<Project>) -> Self {
         let mut entries: Vec<(PathBuf, Uuid)> = projects
             .into_iter()
+            // Hub #3315: the home project (at `$HOME`) is only ever named by
+            // id; by path it would claim every unregistered directory there.
+            .filter(|p| !Project::is_home_id(p.id))
             .filter_map(|p| {
                 p.path.and_then(|path| {
                     match path.canonicalize() {
@@ -337,5 +340,29 @@ mod tests {
         );
         let index = ProjectIndex::new(vec![p]);
         assert!(index.is_empty());
+    }
+
+    /// Hub #3315: the home project is never a path match; a project nested
+    /// under `$HOME` still is.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_home_project_is_never_matched_by_path() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let nested = home_path.join("work");
+        fs::create_dir_all(&nested).unwrap();
+        let mut home_project = make_project("RSI home", Some(home_path.clone()));
+        home_project.id = Project::HOME_ID;
+        let work = make_project("work", Some(nested.clone()));
+        let work_id = work.id;
+        let index = ProjectIndex::new(vec![home_project, work]);
+        assert_eq!(
+            index.find_project_for_path(&home_path.join("scratch")),
+            None
+        );
+        assert_eq!(
+            index.find_project_for_path(&nested.join("src")),
+            Some(work_id)
+        );
     }
 }

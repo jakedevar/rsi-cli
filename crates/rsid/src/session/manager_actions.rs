@@ -13,7 +13,7 @@ use crate::store::manager_actions::{
     action_fence,
 };
 use rsi_common::harness_manager_v2::*;
-use rsi_common::types::{Session, SessionProvider, SessionStatus};
+use rsi_common::types::{Session, SessionKind, SessionProvider, SessionStatus};
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
@@ -22,7 +22,8 @@ mod recovery;
 const BATCH: usize = 4;
 /// #1118: actions in flight at once within one reconcile pass. The store's
 /// claim query decides which actions may overlap (independent create_session
-/// launches); everything else stays one active command per project.
+/// launches and build-cache reclaim bypassing creates); everything else stays
+/// one active command per project.
 const MAX_PARALLEL_ACTIONS: usize =
     crate::store::manager_actions::MANAGER_CREATE_PARALLELISM as usize;
 /// While a launch is slow, re-attempt claims this often so a later independent
@@ -243,7 +244,38 @@ impl AgentControlHandle {
                 held = Some(admission_held_view(hold));
             }
         }
-        Ok(ManagerActionViewV2 { receipt, held })
+        if receipt.state == ManagerActionStateV2::Queued
+            && let Some(retry_at) = crate::store_lock::lock(
+                &self.store,
+                "manager_actions::sandbox_git_timeout_retry_at",
+            )
+            .await
+            .sandbox_git_timeout_retry_at(receipt.operation_id)?
+        {
+            held = Some(ManagerActionHeldV1 {
+                reason: "sandbox_git_timeout".into(),
+                release_by: Some(retry_at),
+                ..ManagerActionHeldV1::default()
+            });
+        }
+        let next_step = if receipt.state == ManagerActionStateV2::Blocked {
+            match receipt.outcome.as_deref() {
+                Some("sandbox_git_timeout") => Some(
+                    "Relaunch under a new idempotency key; the sandbox Git timeout retry limit was reached.".into(),
+                ),
+                Some("sandbox_git_timeout_cleanup_required") => Some(
+                    "Inspect and clean the retained sandbox allocation before relaunching under a new key.".into(),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok(ManagerActionViewV2 {
+            receipt,
+            held,
+            next_step,
+        })
     }
 
     pub async fn agent_manager_control(
@@ -284,9 +316,15 @@ fn admission_held_view(hold: crate::host_load::AdmissionHold) -> ManagerActionHe
             held.temperature_c = Some(hot.temperature_c);
             held.ceiling_c = Some(hot.ceiling_c);
         }
-        AdmissionHold::Pressure(PressureHold::DiskPressure { free_gb, min_gb }) => {
+        AdmissionHold::Pressure(PressureHold::DiskPressure {
+            free_gb,
+            min_gb,
+            reserve_gb,
+        }) => {
             held.free_disk_gb = Some(free_gb);
             held.min_free_disk_gb = Some(min_gb);
+            held.reserve_gb = Some(reserve_gb);
+            held.needed_free_gb = Some(min_gb.saturating_add(reserve_gb));
         }
         // #2920: the sandbox floor rides the same two fields.
         AdmissionHold::Pressure(PressureHold::SandboxFreeSpace { free_gb, min_gb }) => {
@@ -326,7 +364,12 @@ impl SessionManager {
         };
         // #1166: the coordinator breadcrumb lives exactly as long as this
         // single-flight pass; every exit (success, error, cancellation) clears it.
-        let _phase = crate::launch_breadcrumbs::PhaseGuard::new(Uuid::nil(), "manager_actions");
+        // There is no claimed operation yet: give this pass its own identity.
+        // Each claimed action below records its durable operation id separately.
+        let phase = crate::launch_breadcrumbs::PhaseGuard::new(
+            Uuid::new_v4(),
+            "manager_actions:recover_claims",
+        );
         let mut count = crate::store_lock::lock(
             &self.store,
             "manager_actions::reconcile_manager_actions_once",
@@ -336,14 +379,17 @@ impl SessionManager {
         // RME-S2A-003: Reconcile uncertain integrate claims against actual
         // refs so a crash after publish can be settled and the singleton
         // unblocked without duplicate publication.
+        phase.enter("manager_actions:recover_integrates");
         count += self.reconcile_uncertain_integrate_claims().await?;
         // K2 (#380): settle uncertain pause/assign actions whose exact
         // predecessor is terminal and process-absent before claiming, so an
         // exact queued resume/repair is no longer fenced by a visible effect.
+        phase.enter("manager_actions:recover_leads");
         count += self.reconcile_uncertain_lead_actions().await?;
         // Reserved DB reviews journal their CreateSession before the claim
         // loop. After restart, they then compete for the same last slot as
         // already-queued children, ahead of automatic lead recovery.
+        phase.enter("manager_actions:reserve_reviews");
         let (reviews_changed, review_notice_jobs) = crate::store_lock::lock(
             &self.store,
             "manager_actions::reconcile_manager_actions_once",
@@ -357,6 +403,7 @@ impl SessionManager {
         }
         // #1930: relaunch capacity-failed Issue workers so the claim loop
         // below picks the admitted `create_session` up in this pass.
+        phase.enter("manager_actions:capacity_retries");
         count += self.reconcile_issue_worker_capacity_retries().await;
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut completed = 0usize;
@@ -365,9 +412,18 @@ impl SessionManager {
         loop {
             // #1118: independent launches proceed while another is slow or
             // stuck. The store's claim query enforces which actions may be
-            // `running` together (create_session pairs, bounded); this loop
-            // just keeps up to MAX_PARALLEL_ACTIONS in flight.
-            while !drained && completed < BATCH && inflight.len() < MAX_PARALLEL_ACTIONS {
+            // `running` together (create_session pairs and reclaim); this loop
+            // bounds ordinary work and reserves one extra reclaim slot.
+            while !drained
+                && first_error.is_none()
+                && (completed < BATCH || !inflight.is_empty())
+                && inflight.len() < MAX_PARALLEL_ACTIONS + 1
+            {
+                // #434: a full launch pool must not fence the reclaim that
+                // can release it. The extra slot admits only reclaim, even
+                // after the ordinary batch budget is spent while launches
+                // remain in flight.
+                let reclaim_only = completed >= BATCH || inflight.len() >= MAX_PARALLEL_ACTIONS;
                 // #1166: the in-flight launches are polled only by the `select!`
                 // below, never while this loop awaits. Awaiting the Store here
                 // queues behind (or behind a grant to) an in-flight launch that
@@ -375,35 +431,36 @@ impl SessionManager {
                 // run until this await returns, so the pass and the Store wedge
                 // together. With launches in flight, take the Store only if it
                 // is free and otherwise retry after the refill interval.
-                crate::launch_breadcrumbs::note_phase(Uuid::nil(), "manager_actions:claim");
+                phase.enter("manager_actions:claim_wait");
                 // Admit the oldest eligible create through the shared queue.
                 // The synchronous callback never accesses the Store; a held
                 // create leaves recovery and continuations claimable.
                 let admit = |key, since, target| self.admit_manager_create(key, since, target);
+                let claim_from = |store: &crate::store::Store| {
+                    if reclaim_only {
+                        store.claim_manager_build_cache_reclaim(self.program_run_boot_id)
+                    } else {
+                        store.claim_manager_action_with_create_admission(
+                            self.program_run_boot_id,
+                            self.deploy_drain.is_draining(),
+                            &admit,
+                        )
+                    }
+                };
                 let claim = if inflight.is_empty() {
-                    crate::store_lock::lock(
-                        &self.store,
-                        "manager_actions::reconcile_manager_actions_once",
-                    )
-                    .await
-                    .claim_manager_action_with_create_admission(
-                        self.program_run_boot_id,
-                        self.deploy_drain.is_draining(),
-                        &admit,
-                    )?
+                    let store =
+                        crate::store_lock::lock(&self.store, "manager_actions::claim").await;
+                    phase.enter("manager_actions:claim_store");
+                    claim_from(&store)?
                 } else {
-                    let Some(store) = crate::store_lock::try_lock(
-                        &self.store,
-                        "manager_actions::reconcile_manager_actions_once",
-                    ) else {
+                    let Some(store) =
+                        crate::store_lock::try_lock(&self.store, "manager_actions::claim")
+                    else {
                         drained = true;
                         break;
                     };
-                    store.claim_manager_action_with_create_admission(
-                        self.program_run_boot_id,
-                        self.deploy_drain.is_draining(),
-                        &admit,
-                    )?
+                    phase.enter("manager_actions:claim_store");
+                    claim_from(&store)?
                 };
                 match claim {
                     None => drained = true,
@@ -415,7 +472,7 @@ impl SessionManager {
             if inflight.is_empty() {
                 break;
             }
-            crate::launch_breadcrumbs::note_phase(Uuid::nil(), "manager_actions:select");
+            phase.enter("manager_actions:select");
             tokio::select! {
                 done = futures::StreamExt::next(&mut inflight) => {
                     match done {
@@ -442,6 +499,7 @@ impl SessionManager {
         if let Some(error) = first_error {
             return Err(error);
         }
+        phase.enter("manager_actions:reconcile_reviews");
         let (reviews_changed, review_notice_jobs) = crate::store_lock::lock(
             &self.store,
             "manager_actions::reconcile_manager_actions_once",
@@ -456,10 +514,15 @@ impl SessionManager {
         // #985: the halt awaits stop_manager_candidate. Build it in a
         // non-async helper so neither its state nor a poll-frame temporary
         // grows this reconcile future (debug test threads have 2 MiB stacks).
+        phase.enter("manager_actions:boxed_halt_orphaned_manager_reviewers");
         count += self.boxed_halt_orphaned_manager_reviewers().await?;
+        phase.enter("manager_actions:reconcile_manager_launch_drain_debt");
         count += self.reconcile_manager_launch_drain_debt().await;
+        phase.enter("manager_actions:reconcile_failed_manager_launch_cleanup");
         count += self.reconcile_failed_manager_launch_cleanup().await;
+        phase.enter("manager_actions:reconcile_issue_worker_watches");
         count += self.reconcile_issue_worker_watches().await;
+        phase.enter("manager_actions:reconcile_manager_succession_cleanup");
         count += self.reconcile_manager_succession_cleanup().await?;
         Ok(count)
     }
@@ -472,7 +535,11 @@ impl SessionManager {
         &self,
         claim: ManagerActionClaimV2,
     ) -> Result<bool> {
-        if let Err(error) = self.execute_manager_action_bounded(&claim).await {
+        let phase =
+            crate::launch_breadcrumbs::PhaseGuard::new(claim.id(), "manager_action:execute");
+        let result = self.execute_manager_action_bounded(&claim).await;
+        phase.enter("manager_action:settle");
+        if let Err(error) = result {
             // #1143: the deadline dropped the launch future, so its in-band
             // candidate cleanup never ran. Cancel and drain here, before the
             // action settles.
@@ -481,8 +548,9 @@ impl SessionManager {
             // #1073: the deploy drain engaged after the claim and before
             // any provider effect. Hand the action back to the queue so it
             // runs after the deploy settles (or is re-admitted by a
-            // restart); it is never blocked or made uncertain.
-            if crate::deploy_drain::is_draining_error(&error)
+            // restart); it is never blocked or made uncertain. #3426: the
+            // restart drain refusal is the same hold.
+            if crate::deploy_drain::is_held_for_restart(&error)
                 && crate::store_lock::lock(
                     &self.store,
                     "manager_actions::run_claimed_manager_action",
@@ -511,11 +579,25 @@ impl SessionManager {
                 }
                 return Ok(false);
             }
+            if safe_action_error(&error) == "sandbox_git_timeout"
+                && crate::store_lock::lock(
+                    &self.store,
+                    "manager_actions::requeue_sandbox_git_timeout",
+                )
+                .await
+                .requeue_sandbox_git_timeout(&claim)?
+            {
+                return Ok(false);
+            }
             let code = if drain_pending {
                 MANAGER_LAUNCH_DRAIN_PENDING
             } else {
                 safe_action_error(&error)
             };
+            // #3640: the catch-all class names no cause, so the receipt keeps the
+            // original error text (bounded, redacted) beside it.
+            let detail =
+                (code == MANAGER_LIFECYCLE_UNCONFIRMED).then(|| bounded_error_detail(&error));
             let is_integrate = matches!(claim.action(), ManagerActionV2::Integrate { .. });
             // RME-S2A-003: For integrate actions with effect_started,
             // reconcile against actual refs after dropping the store
@@ -561,7 +643,15 @@ impl SessionManager {
                         } else {
                             ManagerActionStateV2::Blocked
                         };
-                        store.finish_manager_action(&claim, state, code)?;
+                        store.finish_manager_action_detailed(
+                            &claim,
+                            state,
+                            code,
+                            detail.as_deref(),
+                        )?;
+                        if let Some(detail) = detail.as_deref() {
+                            note_unconfirmed_lifecycle(&store, &claim, state, detail);
+                        }
                         ended_launch = true;
                     }
                 }
@@ -612,6 +702,7 @@ impl SessionManager {
             }
             tracing::warn!(operation_id=%claim.id(),error=%error,"manager lifecycle action did not establish a confirmed result");
         }
+        phase.enter("manager_action:notice");
         match crate::store_lock::lock(&self.store, "manager_actions::run_claimed_manager_action")
             .await
             .reconcile_manager_action_notice(claim.id())
@@ -714,13 +805,23 @@ impl SessionManager {
                 .source
                 .as_ref()
                 .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
-            let source = crate::store_lock::lock(
+            let store = crate::store_lock::lock(
                 &self.store,
                 "manager_actions::boxed_execute_manager_launch_action",
             )
-            .await
-            .get_session(frozen.session_id)?
-            .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            .await;
+            let source = store
+                .get_session(frozen.session_id)?
+                .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            let source = if let Some(parent_dir) = &frozen.parent_working_dir {
+                if &source.working_dir != parent_dir {
+                    return Err(refused("manager_v2_source_changed"));
+                }
+                store.manager_action_project_source(&source)?
+            } else {
+                source
+            };
+            drop(store);
             note_launch_step("prepare_fork");
             let runtime = self.custody_execution_runtime();
             // #1195: an explicit or default create source names its
@@ -822,7 +923,7 @@ impl SessionManager {
                 .await;
                 self.confirm_manager_candidate(claim, target, generation)
                     .await?;
-                if predecessor.is_some() {
+                if matches!(claim.action(), ReplaceLead { .. } | RetryLead { .. }) {
                     self.commit_manager_assignment(claim, Some(generation))
                         .await
                 } else {
@@ -867,6 +968,13 @@ impl SessionManager {
             SucceedManager { .. } => unreachable!("root succession dispatched above"),
             Integrate { .. } => unreachable!("integrate dispatched above"),
             OperatorCall { .. } => unreachable!("operator call dispatched above"),
+            WithdrawQueuedCreate { operation_id, .. } => {
+                crate::store_lock::lock(&self.store, "manager_actions::withdraw_queued_create")
+                    .await
+                    .apply_manager_withdraw_create(claim)?;
+                self.host_load.forget_waiter(*operation_id);
+                self.publish_manager_action_notice(*operation_id).await;
+            }
             SettleUncertainAction { operation_id, .. } => {
                 self.execute_manager_settle(claim, *operation_id).await?;
             }
@@ -2136,16 +2244,26 @@ impl SessionManager {
 /// the effect. Same-session resume has no fork source and keeps dirty custody.
 pub(super) async fn manager_action_source_gate(
     runtime: &crate::sandbox::custody::CustodyExecutionRuntime,
-    store: &std::sync::Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &std::sync::Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     claim: &ManagerActionClaimV2,
 ) -> Result<()> {
     let Some(frozen) = claim.operation.context.source.as_ref() else {
         return Ok(());
     };
-    let source = crate::store_lock::lock(&store, "manager_actions::manager_action_source_gate")
-        .await
+    let guard =
+        crate::store_lock::lock(&store, "manager_actions::manager_action_source_gate").await;
+    let source = guard
         .get_session(frozen.session_id)?
         .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+    let source = if let Some(parent_dir) = &frozen.parent_working_dir {
+        if &source.working_dir != parent_dir {
+            return Err(refused("manager_v2_source_changed"));
+        }
+        guard.manager_action_project_source(&source)?
+    } else {
+        source
+    };
+    drop(guard);
     let fork = if frozen.historical_commit {
         runtime
             .prepare_manager_review_fork_at(&source, &frozen.commit)
@@ -2254,6 +2372,10 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_succession_unresolved",
     "manager_succession_unsettled_predecessor",
     "manager_review_assignment_terminal",
+    "manager_issue_worker_issue_unavailable",
+    "manager_v2_action_started_use_agent_halt",
+    "manager_v2_action_not_queued_create",
+    "manager_v2_action_changed",
     "manager_review_reclaimed_source_unavailable",
     "manager_v2_actor_seat_retired",
     // #1716: the queuing seat was replaced by another appointment while its
@@ -2283,6 +2405,7 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_v2_manager_paused",
     "manager_v2_pause_malformed",
     "manager_v2_pending_operator_decision",
+    "manager_v2_pending_manager_decision",
     "manager_v2_decision_hold",
     "manager_v2_no_ready_work",
     "manager_v2_human_or_recovery_owner",
@@ -2297,7 +2420,7 @@ const MANAGER_ACTION_ERROR_CODES: &[&str] = &[
     "manager_v2_launch_not_granted",
     "manager_v2_source_changed",
     "manager_v2_source_worktree_dirty",
-    "manager_v2_replace_lead_requires_lead_use_create_session",
+    "manager_v2_replace_lead_source_unavailable",
     "manager_v2_predecessor_unsettled",
     "manager_v2_candidate_unconfirmed",
     "manager_v2_candidate_cancelled",
@@ -2348,6 +2471,15 @@ fn launch_refusal_code(error: &DaemonError) -> Option<&'static str> {
             Some("source_root_limit") => "manager_v2_sandbox_source_root_limit",
             _ => "manager_v2_sandbox_free_space_limit",
         }),
+        DaemonError::StructuredRpc { data, .. } if data["kind"] == "sandbox_allocation" => {
+            match data["code"].as_str() {
+                Some("sandbox_git_timeout") => Some("sandbox_git_timeout"),
+                Some("sandbox_git_timeout_cleanup_required") => {
+                    Some("sandbox_git_timeout_cleanup_required")
+                }
+                _ => None,
+            }
+        }
         DaemonError::ClaudeBinaryNotFound => Some("manager_v2_claude_binary_not_found"),
         DaemonError::CodexBinaryNotFound => Some("manager_v2_codex_binary_not_found"),
         DaemonError::AgyBinaryNotFound => Some("manager_v2_agy_binary_not_found"),
@@ -2420,7 +2552,54 @@ pub(super) fn safe_action_error(error: &DaemonError) -> &'static str {
             return code;
         }
     }
-    "manager_v2_lifecycle_unconfirmed"
+    MANAGER_LIFECYCLE_UNCONFIRMED
+}
+
+/// The catch-all receipt outcome for an error no specific class matched.
+pub(crate) const MANAGER_LIFECYCLE_UNCONFIRMED: &str = "manager_v2_lifecycle_unconfirmed";
+
+/// Longest error text kept as a receipt's `outcome_detail` (#3640).
+const ERROR_DETAIL_MAX_CHARS: usize = 300;
+
+/// The text of `error` for a receipt or a failed session's explanation (#3640):
+/// secrets redacted, control characters flattened and bounded to
+/// [`ERROR_DETAIL_MAX_CHARS`] characters. `safe_action_error` drops the message
+/// by design; this is the one bounded, secret-free copy that survives.
+pub(crate) fn bounded_error_detail(error: &DaemonError) -> String {
+    let text = rsi_common::daemon_handoff::redact_secrets(
+        &rsi_common::daemon_handoff::redact_multiline_secret_spans(&error.to_string()),
+    );
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(ERROR_DETAIL_MAX_CHARS)
+        .collect()
+}
+
+/// One `manager_launch` friction event (and a warn line) for an action that
+/// ended `manager_v2_lifecycle_unconfirmed` (#3640). The event carries only
+/// codes and the action id; the error text is on the receipt's `outcome_detail`.
+fn note_unconfirmed_lifecycle(
+    store: &crate::store::Store,
+    claim: &ManagerActionClaimV2,
+    state: ManagerActionStateV2,
+    detail: &str,
+) {
+    use rsi_common::friction::{FrictionKind, NewFrictionEventV1};
+    tracing::warn!(operation_id=%claim.id(), ?state, %detail,
+        "manager action ended manager_v2_lifecycle_unconfirmed");
+    let kind = serde_json::to_value(claim.action().action_kind())
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let mut event = NewFrictionEventV1::new(
+        FrictionKind::ManagerLaunch,
+        &[&kind, MANAGER_LIFECYCLE_UNCONFIRMED],
+    )
+    .session(claim.operation.context.target_session_id)
+    .evidence("manager_action", claim.id());
+    // The target session may never have been created; the project is known.
+    event.project_id = Some(claim.operation.project_id);
+    crate::friction::note_locked(store, &event);
 }
 
 /// Resolve a Git ref to its commit OID using the hardened engine git helper.
@@ -2457,9 +2636,13 @@ fn manager_launch_config(
         } => (query.clone(), *kind, *parent_id, None),
         ManagerActionV2::ReplaceLead { query, epic_id, .. } => (
             query.clone(),
-            source.session_kind,
+            if rsi_common::is_leaf_kind(source.session_kind) {
+                source.session_kind
+            } else {
+                SessionKind::Task
+            },
             *epic_id,
-            Some(source.id),
+            rsi_common::is_leaf_kind(source.session_kind).then_some(source.id),
         ),
         ManagerActionV2::RetryLead {
             message, epic_id, ..
@@ -2535,5 +2718,8 @@ fn manager_launch_config(
         topology_iteration: 0,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     })
 }

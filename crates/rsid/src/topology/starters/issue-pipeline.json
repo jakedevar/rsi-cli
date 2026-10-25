@@ -5,7 +5,7 @@
       "kind": "Task",
       "label": "Implement and verify the Issue",
       "params": {
-        "instructions": "You are a short-lived worker implementing the Issue in the upstream context ('issue': its number, title and body). The Issue states the intent and acceptance criteria; the principle is the ground truth, not the existing code. Follow AGENTS.md and the worker contract in your checkout: read the code you change, keep the diff focused, and cover what you change with tests that assert the Issue's intent. Format only the files you changed (scripts/fmt-changed.sh origin/rolling), stage explicit paths and commit on your sandbox branch. Do not push and do not touch rolling or main. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. If the receipt is red, check each failing test with AgentQueryFailureSignatures: fix every new failure, commit and verify again; failures that match an open known-failure record are accepted as baseline reds. Never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record each decision and its assumption in the handoff. Broken tooling, a stale tool copy, build/test infrastructure failures and a daemon redeploy needed to restore tooling are technical_impasse, answerable by the manager. Use resource for a real spending request only, and name the amount and currency in blocker_evidence and blocker_question. Resource defaults to an operator spend gate; only explicit tooling with no money signal may be answered by the manager, and unknown resource phrasing stays operator-owned; real spending, credentials, main or release, and deleting user data require the operator. End with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope) or a red you cannot attribute. If the Issue's acceptance already holds on your base (a stale red, a duplicate, a sibling landing fixed it), make no commit and prove it: find the commit that satisfies it, run the Issue's tests on your base, leave the worktree clean and finish with a PIPELINE HANDOFF — IMPLEMENTATION: block with doc_path: inline, manifest_path: inline, status: already_satisfied, evidence_commit: <the lowercase 40-hex commit, an ancestor of your base, that satisfies it> and the tests you ran with their results; the daemon then closes the Issue citing that commit and lands nothing, and refuses a missing or non-ancestor evidence_commit. The evidence commit must also already be on origin/rolling: when your base_commit is supplied work that is not on origin/rolling (for example a satellite fix), the fix is not landed yet, so never answer already_satisfied for it; verify the supplied head with your own scoped_test and hand off complete with the commit equal to that base. Otherwise, when you implemented the change and committed it, finish with a PIPELINE HANDOFF — IMPLEMENTATION: block whose fields are doc_path: inline, manifest_path: inline, status: complete, a short summary, the commit SHA (the exact head your scoped_test receipt verified), the scoped_test job id and its actual numeric exit code, and the tests you added. For a BLOCKED handoff use status: blocked with blocker, blocker_class (technical_impasse unless it is production, destructive, resource, authority or forbidden_scope), blocker_evidence and blocker_question (the single question that unblocks you).",
+        "instructions": "You are a short-lived worker implementing the Issue in the upstream context ('issue': its number, title and body). The Issue states the intent and acceptance criteria; the principle is the ground truth, not the existing code. Follow AGENTS.md and the worker contract in your checkout: read the code you change, keep the diff focused, and cover what you change with tests that assert the Issue's intent. Format only the files you changed (scripts/fmt-changed.sh origin/rolling), stage explicit paths and commit on your sandbox branch. Do not push and do not touch rolling or main. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. If the receipt is red, check each failing test with AgentQueryFailureSignatures: fix every new failure, commit and verify again; failures that match an open known-failure record are accepted as baseline reds. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. Never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record each decision and its assumption in the handoff. Broken tooling, a stale tool copy, build/test infrastructure failures and a daemon redeploy needed to restore tooling are technical_impasse, answerable by the manager. Use resource for a real spending request only, and name the amount and currency in blocker_evidence and blocker_question. Resource defaults to an operator spend gate; only explicit tooling with no money signal may be answered by the manager, and unknown resource phrasing stays operator-owned; real spending, credentials, main or release, and deleting user data require the operator. End with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope) or a red you cannot attribute. If the Issue's acceptance already holds on your base (a stale red, a duplicate, a sibling landing fixed it), make no commit and prove it: find the commit that satisfies it, run the Issue's tests on your base, leave the worktree clean and finish with a PIPELINE HANDOFF — IMPLEMENTATION: block with doc_path: inline, manifest_path: inline, status: already_satisfied, evidence_commit: <the lowercase 40-hex commit, an ancestor of your base, that satisfies it> and the tests you ran with their results; the handoff must also carry `summary:` as an indented or bulleted block with one `AC<n>: <evidence>` line for each of the Issue acceptance criteria, numbered AC1, AC2, ... in the order the Issue lists them (evidence is a test result, file:line or measurement, never a bare word such as ok), and `tests:` as a block of `<command>: <result>` lines (for example `cargo test -p x --lib -- --exact a::b: ok`), or the daemon refuses it as already_satisfied_unproven. The daemon then closes the Issue citing that commit and lands nothing (an operator-request Issue stays open for the manager to acknowledge), and refuses a missing or non-ancestor evidence_commit. The evidence commit must also already be on origin/rolling: when your base_commit is supplied work that is not on origin/rolling (for example a satellite fix), the fix is not landed yet, so never answer already_satisfied for it; verify the supplied head with your own scoped_test and hand off complete with the commit equal to that base. Otherwise, when you implemented the change and committed it, finish with a PIPELINE HANDOFF — IMPLEMENTATION: block whose fields are doc_path: inline, manifest_path: inline, status: complete, a short summary, the commit SHA (the exact head your scoped_test receipt verified), the scoped_test job id and its actual numeric exit code, and the tests you added. For a BLOCKED handoff use status: blocked with blocker, blocker_class (technical_impasse unless it is production, destructive, resource, authority or forbidden_scope), blocker_evidence and blocker_question (the single question that unblocks you).",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -41,7 +41,7 @@
         "land"
       ],
       "params": {
-        "instructions": "Repair attempt 1 of 3. The rolling merge queue refused to land the accepted commit this sandbox starts from. The upstream 'land' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run python3 tools/check-released-migrations.py --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff, blocker_class technical_impasse, naming the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
+        "instructions": "Repair attempt 1 of 3. The rolling merge queue refused to land the accepted commit this sandbox starts from. The upstream 'land' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -80,7 +80,7 @@
         "land_repair"
       ],
       "params": {
-        "instructions": "Repair attempt 2 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'land_repair' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run python3 tools/check-released-migrations.py --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff, blocker_class technical_impasse, naming the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
+        "instructions": "Repair attempt 2 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'land_repair' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -119,7 +119,7 @@
         "land_repair_2"
       ],
       "params": {
-        "instructions": "Repair attempt 3 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'land_repair_2' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run python3 tools/check-released-migrations.py --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff, blocker_class technical_impasse, naming the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
+        "instructions": "Repair attempt 3 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'land_repair_2' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -181,7 +181,7 @@
         "pre_review"
       ],
       "params": {
-        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in this sandbox: fix the cause, add or adjust tests that assert the Issue's intent, format only changed files (scripts/fmt-changed.sh origin/rolling) and commit. Do not widen scope. The daemon sends your work back to the independent reviewer and lands it only after the reviewer accepts exactly your final commit and only if a scoped_test job you own verified that commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. Fix new failures (AgentQueryFailureSignatures tells you which are known; a failure that matches an open known-failure record is an accepted baseline red) and never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record the decision and its assumption in the handoff; end with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope). Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, how each finding was addressed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
+        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in this sandbox: fix the cause, add or adjust tests that assert the Issue's intent, format only changed files (scripts/fmt-changed.sh origin/rolling) and commit. Do not widen scope. The daemon sends your work back to the independent reviewer and lands it only after the reviewer accepts exactly your final commit and only if a scoped_test job you own verified that commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. Fix new failures (AgentQueryFailureSignatures tells you which are known; a failure that matches an open known-failure record is an accepted baseline red) and never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record the decision and its assumption in the handoff; end with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope); that BLOCKED handoff needs status: blocked with blocker, blocker_class, blocker_evidence and blocker_question (a handoff missing any of them is refused). Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, how each finding was addressed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -246,7 +246,7 @@
         "repair_review"
       ],
       "params": {
-        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in this sandbox: fix the cause, add or adjust tests that assert the Issue's intent, format only changed files (scripts/fmt-changed.sh origin/rolling) and commit. Do not widen scope. The daemon sends your work back to the independent reviewer and lands it only after the reviewer accepts exactly your final commit and only if a scoped_test job you own verified that commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. Fix new failures (AgentQueryFailureSignatures tells you which are known; a failure that matches an open known-failure record is an accepted baseline red) and never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record the decision and its assumption in the handoff; end with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope). Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, how each finding was addressed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
+        "instructions": "A reviewer asked for changes to the implementation. The upstream context carries the review findings in full. Address every finding in this sandbox: fix the cause, add or adjust tests that assert the Issue's intent, format only changed files (scripts/fmt-changed.sh origin/rolling) and commit. Do not widen scope. The daemon sends your work back to the independent reviewer and lands it only after the reviewer accepts exactly your final commit and only if a scoped_test job you own verified that commit: after your last commit submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, then arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; you are resumed with the receipt. Never use the default job wake and never poll. Fix new failures (AgentQueryFailureSignatures tells you which are known; a failure that matches an open known-failure record is an accepted baseline red) and never commit after your last verification. If the daemon continues you because your commit is unverified, do what its message says. Decide engineering questions yourself and record the decision and its assumption in the handoff; end with a BLOCKED handoff carrying blocker_question only for a real gate (production, destructive, resource, authority, forbidden_scope); that BLOCKED handoff needs status: blocked with blocker, blocker_class, blocker_evidence and blocker_question (a handoff missing any of them is refused). Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, how each finding was addressed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code.",
         "provider": "claude",
         "model": "claude-sonnet-5-5",
         "effort": "high",
@@ -275,6 +275,195 @@
         "step": {
           "kind": "land",
           "accepted": "repair_review",
+          "test_filters": [],
+          "close_issue": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_repair_1",
+      "kind": "Task",
+      "label": "Repair refused or cancelled pre-land entry (attempt 1 of 3)",
+      "prereqs": [
+        "pre_land"
+      ],
+      "params": {
+        "instructions": "Repair attempt 1 of 3. The rolling merge queue refused to land the accepted commit this sandbox starts from. The upstream 'pre_land' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code. This is a repair of an already reviewed pre_land source. The upstream land output includes entry_id, state and refusal/cancellation reason; address that reason. An independent reviewer checks only your repair delta; clean rolling merges need no new review.",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "high",
+        "when": {
+          "pre_land": "failure"
+        },
+        "step": {
+          "kind": "session",
+          "expects_commit": true,
+          "pass_content": true,
+          "require_verified": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_review_1",
+      "kind": "Task",
+      "label": "Review only pre-land repair delta (attempt 1)",
+      "prereqs": [
+        "pre_land_repair_1"
+      ],
+      "params": {
+        "step": {
+          "kind": "review",
+          "of": "pre_land_repair_1",
+          "reviewer": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "high"
+          },
+          "max_rounds": 1
+        },
+        "review_repair_delta": true
+      }
+    },
+    {
+      "id": "pre_land_1",
+      "kind": "Task",
+      "label": "Land repaired pre-land source (attempt 1 of 3)",
+      "prereqs": [
+        "pre_land_review_1"
+      ],
+      "params": {
+        "when": {
+          "pre_land_review_1": "verdict_accepted"
+        },
+        "step": {
+          "kind": "land",
+          "accepted": "pre_land_review_1",
+          "test_filters": [],
+          "close_issue": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_repair_2",
+      "kind": "Task",
+      "label": "Repair refused or cancelled pre-land entry (attempt 2 of 3)",
+      "prereqs": [
+        "pre_land_1"
+      ],
+      "params": {
+        "instructions": "Repair attempt 2 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'pre_land_1' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code. This is a repair of an already reviewed pre_land source. The upstream land output includes entry_id, state and refusal/cancellation reason; address that reason. An independent reviewer checks only your repair delta; clean rolling merges need no new review.",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "high",
+        "when": {
+          "pre_land_1": "failure"
+        },
+        "step": {
+          "kind": "session",
+          "expects_commit": true,
+          "pass_content": true,
+          "require_verified": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_review_2",
+      "kind": "Task",
+      "label": "Review only pre-land repair delta (attempt 2)",
+      "prereqs": [
+        "pre_land_repair_2"
+      ],
+      "params": {
+        "step": {
+          "kind": "review",
+          "of": "pre_land_repair_2",
+          "reviewer": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "high"
+          },
+          "max_rounds": 1
+        },
+        "review_repair_delta": true
+      }
+    },
+    {
+      "id": "pre_land_2",
+      "kind": "Task",
+      "label": "Land repaired pre-land source (attempt 2 of 3)",
+      "prereqs": [
+        "pre_land_review_2"
+      ],
+      "params": {
+        "when": {
+          "pre_land_review_2": "verdict_accepted"
+        },
+        "step": {
+          "kind": "land",
+          "accepted": "pre_land_review_2",
+          "test_filters": [],
+          "close_issue": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_repair_3",
+      "kind": "Task",
+      "label": "Repair refused or cancelled pre-land entry (attempt 3 of 3)",
+      "prereqs": [
+        "pre_land_2"
+      ],
+      "params": {
+        "instructions": "Repair attempt 3 of 3. The rolling merge queue refused to land the previous repair's verified commit, which this sandbox starts from; rolling most likely advanced again while that commit waited in the queue. The upstream 'pre_land_2' section carries the queue entry's state, reason and error. Recover the change's intent from git log and git diff origin/rolling...HEAD (its Issue is named in the commit message; the earlier repairs are in git log). If the reason is queue_batch_merge_conflict or the tip moved, run git fetch origin rolling and merge origin/rolling into your branch; resolve every conflict keeping this change's intent and preferring rolling's version of work that already landed (for tools/released-migrations.json run scripts/repo-guard released-migrations --refresh over the markers). Rolling keeps moving while a verification runs and a repair waits in the queue, so merge the CURRENT origin/rolling as your last step before you submit the scoped_test job (run git fetch origin rolling again right then, not only at the start); when the receipt returns green, fetch once more and, if rolling advanced in a file this change also touches (compare git diff --name-only HEAD...origin/rolling with git diff --name-only origin/rolling...HEAD), merge again and verify that final commit again instead of handing off a head that will conflict. If the gate was red, fix the failing tests the error names when this change caused them. Do not widen scope. The daemon lands your work only if a scoped_test job you own verified exactly your final commit: submit ONE job, AgentSubmitJob {\"kind\":\"test\",\"wake\":\"none\",\"params\":{\"scoped_test\":{\"base\":\"origin/rolling\"}}}, arm ONE AgentScheduleWake {\"mode\":\"when\",\"when\":{\"jobs_terminal\":[\"<job id>\"]},\"timeout_seconds\":4200} and end your turn without a handoff; fix new failures (AgentQueryFailureSignatures tells you which are known) and never commit after your last verification. A scoped_test receipt with a non-zero exit_code whose new_failures is an empty list and whose every red is listed in baseline_reds (or named by AgentQueryFailureSignatures) is verified: the landing gate is no new failures relative to rolling, so hand off complete, as the handoff format above says, naming the baseline reds and their Issues; do not end BLOCKED and do not ask the manager. Block only when new_failures is non-empty or null (the run failed before the baseline comparison) or the run was interrupted, timed out or failed to build. If there is nothing to merge and nothing this change broke (for example a gate timeout), do not invent a commit: end with a BLOCKED handoff (status: blocked with blocker, blocker_class technical_impasse, blocker_evidence and blocker_question; a handoff missing any of them is refused) and name the refusal in blocker_question. If a conflict needs a judgement you cannot make from the Issue and the code (two landed changes contradict this change's intent, not a mechanical re-merge), end with a BLOCKED handoff the same way and name the decision in blocker_question; the daemon repairs a mechanical conflict again automatically, up to three repair attempts in all, and parks the run for a manager only when that budget is spent or you report a decision. Finish with a PIPELINE HANDOFF — FIX: block with doc_path: inline, manifest_path: inline, status: complete, what you merged or fixed, the commit SHA (the exact head your scoped_test receipt verified) and the scoped_test job id and its actual numeric exit code. This is a repair of an already reviewed pre_land source. The upstream land output includes entry_id, state and refusal/cancellation reason; address that reason. An independent reviewer checks only your repair delta; clean rolling merges need no new review.",
+        "provider": "claude",
+        "model": "claude-sonnet-5-5",
+        "effort": "high",
+        "when": {
+          "pre_land_2": "failure"
+        },
+        "step": {
+          "kind": "session",
+          "expects_commit": true,
+          "pass_content": true,
+          "require_verified": true
+        }
+      }
+    },
+    {
+      "id": "pre_land_review_3",
+      "kind": "Task",
+      "label": "Review only pre-land repair delta (attempt 3)",
+      "prereqs": [
+        "pre_land_repair_3"
+      ],
+      "params": {
+        "step": {
+          "kind": "review",
+          "of": "pre_land_repair_3",
+          "reviewer": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "high"
+          },
+          "max_rounds": 1
+        },
+        "review_repair_delta": true
+      }
+    },
+    {
+      "id": "pre_land_3",
+      "kind": "Task",
+      "label": "Land repaired pre-land source (attempt 3 of 3)",
+      "prereqs": [
+        "pre_land_review_3"
+      ],
+      "params": {
+        "when": {
+          "pre_land_review_3": "verdict_accepted"
+        },
+        "step": {
+          "kind": "land",
+          "accepted": "pre_land_review_3",
           "test_filters": [],
           "close_issue": true
         }
@@ -356,6 +545,51 @@
       "from": "repair_fix",
       "to": "repair_review",
       "loop_edge": true
+    },
+    {
+      "from": "pre_land",
+      "to": "pre_land_repair_1",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_repair_1",
+      "to": "pre_land_review_1",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_review_1",
+      "to": "pre_land_1",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_1",
+      "to": "pre_land_repair_2",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_repair_2",
+      "to": "pre_land_review_2",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_review_2",
+      "to": "pre_land_2",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_2",
+      "to": "pre_land_repair_3",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_repair_3",
+      "to": "pre_land_review_3",
+      "loop_edge": false
+    },
+    {
+      "from": "pre_land_review_3",
+      "to": "pre_land_3",
+      "loop_edge": false
     }
   ],
   "until": {

@@ -1,9 +1,9 @@
 [Unit]
-Description=Check tonight's AWS spend every 15 minutes
+Description=Run the RSI AWS orphan sweep every 5 minutes
 
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=15min
+OnUnitActiveSec=5min
 Persistent=true
 Unit=cloud-watchdog.service
 

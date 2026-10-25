@@ -1094,6 +1094,40 @@ impl Store {
     /// # Errors
     /// `manager_tier_not_node_seat`, `manager_tier_target_vacant`, an
     /// idempotency conflict, a full mailbox or a persistence error.
+    pub(crate) fn error_disposition_manager_seat(&self, session: Uuid) -> Result<bool> {
+        Ok(self.tier_caller_node(session)?.is_some())
+    }
+
+    /// Daemon-owned recovery notice to the covering portfolio, in the caller's transaction.
+    pub(crate) fn error_disposition_report_up(
+        &self,
+        session: Uuid,
+        facts: &serde_json::Value,
+    ) -> Result<bool> {
+        let Some(node) = self.tier_caller_node(session)? else {
+            return Ok(false);
+        };
+        let source = self.tier_endpoint(node)?;
+        let target = match self.tier_parent_endpoint(node) {
+            Ok(target) => target,
+            Err(_) => return Ok(false),
+        };
+        let body = format!("Errored manager session requires a disposition rule: {facts}");
+        self.queue_tier_message(&TierMessage {
+            direction: "up",
+            kind: "report",
+            source: &source,
+            target: &target,
+            sender: None,
+            project: source.project,
+            body: &body,
+            idempotency_key: &format!("error_disposition:{session}"),
+            delivery: body.clone(),
+            capped: false,
+        })?;
+        Ok(true)
+    }
+
     pub fn tier_report_up(
         &self,
         caller: Uuid,

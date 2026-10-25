@@ -1,11 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
-  braceBody, parseDaemonDefaults, parseRegistry, parseRoles, parseThemes, rustString, settingsIsFresh,
+  braceBody, checkSettings, parseDaemonDefaults, parseRegistry, parseRoles, parseThemes, rustString,
 } from '../scripts/settings.mjs';
 
-test('src/settings.generated.ts matches the TUI sources (run `node scripts/settings.mjs` if not)', () => {
-  assert.equal(settingsIsFresh(), true);
+test('src/settings.generated.ts matches the TUI sources', () => {
+  checkSettings();
+});
+
+test('stale or missing settings output names both regeneration and row mapping repairs', (t) => {
+  const scratch = mkdtempSync(join(tmpdir(), 'settings-gen-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const out = join(scratch, 'settings.generated.ts');
+  const expected = {
+    message: 'desktop/src/settings.generated.ts is stale. '
+      + 'From the repository root, run `node desktop/scripts/settings.mjs` to regenerate desktop/src/settings.generated.ts. '
+      + 'Map new rows in `widgetFor` / `OVERLAY_ROW_IDS` in desktop/src/settings-model.ts; intentional TUI-only rows also need '
+      + '`TUI_ONLY` in desktop/tests/settings-state.test.mjs and `tuiOnlyRows` in desktop/parity-audit.json.',
+  };
+  assert.throws(() => checkSettings(undefined, out), expected);
+  writeFileSync(out, '// stale settings\n');
+  assert.throws(() => checkSettings(undefined, out), expected);
 });
 
 test('Rust helpers: balanced bodies skip strings and comments; string escapes decode', () => {

@@ -208,6 +208,39 @@ pub struct Project {
 impl Project {
     /// Default Catppuccin blue color for new projects.
     pub const DEFAULT_COLOR: &'static str = "#89b4fa";
+
+    /// Hub #3315: the fixed id of the built-in, permanent "RSI home" project
+    /// at the daemon's `$HOME`, registered idempotently at every daemon start.
+    /// Global and portfolio manager seats are launched there, without a
+    /// sandbox. It is never matched by path (a launch in an unregistered
+    /// directory under `$HOME` stays unscoped) and never indexed by codegraph.
+    pub const HOME_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_7273_6968_6f6d);
+    /// Display name of the home project (a numbered suffix if an operator
+    /// project already has this name).
+    pub const HOME_NAME: &'static str = "RSI home";
+    /// Refusal: the home project cannot be deleted. (Projects have no archive
+    /// state, so there is no archive path to refuse.)
+    pub const HOME_DELETE_REFUSED: &'static str = "home_project_delete_refused";
+    /// Refusal: the home project's path is always the daemon's `$HOME`.
+    pub const HOME_REPATH_REFUSED: &'static str = "home_project_repath_refused";
+    /// Refusal: a session of the home project never gets a sandbox, because
+    /// the operator's home directory is itself a git repository and a
+    /// worktree of it is never wanted.
+    pub const HOME_SANDBOX_REFUSED: &'static str = "home_project_sandbox_refused";
+    /// Refusal: the home project holds no Issues. A home seat's
+    /// `AgentCreateIssue` without `project_id` files into its admission
+    /// project; naming the home project is refused.
+    pub const HOME_ISSUE_REFUSED: &'static str = "home_project_issue_refused";
+    /// Refusal: a home seat is a portfolio seat with no project manager
+    /// configuration, so `succeed_manager` does not apply; it hands its seat on
+    /// with `AgentManagerAppointChild` on its own node. The daemon never runs
+    /// git in `$HOME` for it.
+    pub const HOME_SUCCESSION_REFUSED: &'static str = "home_project_succession_refused";
+
+    /// Whether `id` is the built-in home project.
+    pub fn is_home_id(id: Uuid) -> bool {
+        id == Self::HOME_ID
+    }
 }
 
 /// Label for organizing related sessions (lightweight convoy/issue tracking).
@@ -5906,6 +5939,8 @@ pub struct AgentIssueSummaryV1 {
     pub display_number: i64,
     /// #2052: lets a caller follow up with `AgentGetIssue {issue_id}`.
     pub id: Uuid,
+    /// CAS version accepted as `expected_row_version` by Issue mutations.
+    pub row_version: i64,
     pub title: String,
     pub labels: Vec<String>,
     pub status: IssueStatus,

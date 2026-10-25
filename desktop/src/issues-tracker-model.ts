@@ -8,6 +8,12 @@ import { type Filters, defaultFilters, listRequest, parseIssueNumber } from './i
 export type IssuesTab = 'local' | 'dispatched' | 'sync';
 export const ISSUE_TABS: readonly IssuesTab[] = ['local', 'dispatched', 'sync'];
 export const TAB_TITLES: Readonly<Record<IssuesTab, string>> = { local: 'Local', dispatched: 'Dispatched', sync: 'Sync' };
+/** What each tab holds, in plain words (the tab buttons' tooltips). */
+export const TAB_TIPS: Readonly<Record<IssuesTab, string>> = {
+  local: 'Local: Issues in this project',
+  dispatched: 'Dispatched: Issues handed to agents to work on',
+  sync: 'Sync: links to an external tracker',
+};
 
 /** `[` / `]`: the previous / next tab, wrapping (switch_issue_tab). */
 export function stepTab(tab: IssuesTab, dir: 1 | -1): IssuesTab {

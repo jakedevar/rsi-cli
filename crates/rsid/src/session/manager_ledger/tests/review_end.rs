@@ -206,6 +206,20 @@ async fn review_with_submitted_receipt_keeps_success_path_at_terminal() {
         )
         .unwrap();
     assert_eq!((state.as_str(), verdict.as_str()), ("submitted", "blocked"));
+    // #475: the receipt itself completes the reviewer, without a transcript marker.
+    let roster = store
+        .agent_worker_roster(f.manager, &Default::default())
+        .unwrap();
+    let reviewer = roster
+        .workers
+        .iter()
+        .find(|worker| worker.session_id == f.reviewer)
+        .unwrap();
+    assert_eq!(
+        reviewer.state,
+        rsi_common::agent_worker_roster::WorkerRosterStateV1::FinalHandoff
+    );
+    assert!(reviewer.final_handoff);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

@@ -722,26 +722,40 @@ pub fn target_reclaim_slot_name(custody_id: Uuid, generation: u64) -> String {
 }
 
 impl Store {
-    /// Record an incomplete staged cache as friction and queue a durable
-    /// owning-manager notice. A completed removal is expected reclamation, not
-    /// friction. No paths or process command lines enter friction telemetry.
+    /// Queue a durable owning-manager notice for a staged cache and record an
+    /// incomplete one as friction. `pending` is `None` for a completed removal
+    /// and the reason the removal stopped otherwise. A completed removal is
+    /// expected reclamation, not friction, and so is a removal that stopped on
+    /// a per-pass budget (`resumes_next_pass`): its intent stays durable and
+    /// the next pass's intent sweep finishes it (#222; a sweep that never
+    /// does is reported as a stuck intent after an hour). No paths or process
+    /// command lines enter friction telemetry.
     pub fn record_target_reclaim_notice(
         &self,
         session_id: Uuid,
         custody_id: Uuid,
         generation: u64,
         bytes: u64,
-        pending: bool,
+        pending: Option<rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason>,
     ) -> Result<Option<Uuid>> {
         use rsi_common::friction::{FrictionKind, NewFrictionEventV1};
         let session = self.get_session(session_id)?;
         let project = session.and_then(|session| session.project_id);
-        let outcome = if pending { "pending" } else { "removed" };
-        if pending {
+        let outcome = if pending.is_some() {
+            "pending"
+        } else {
+            "removed"
+        };
+        if let Some(reason) = pending
+            && !reason.resumes_next_pass()
+        {
             self.record_friction_event(
-                &NewFrictionEventV1::new(FrictionKind::SandboxTargetReclaim, &["pending"])
-                    .session(Some(session_id))
-                    .evidence("custody", custody_id),
+                &NewFrictionEventV1::new(
+                    FrictionKind::SandboxTargetReclaim,
+                    &["pending", reason.as_str()],
+                )
+                .session(Some(session_id))
+                .evidence("custody", custody_id),
             )?;
         }
         let Some(project) = project else {
@@ -777,6 +791,7 @@ impl Store {
                     "record_kind": "sandbox_target_reclaim", "session_id": session_id,
                     "custody_id": custody_id, "generation": generation,
                     "bytes": bytes, "outcome": outcome,
+                    "pending_reason": pending.map(|reason| reason.as_str()),
                 }))?
             ],
         )?;
@@ -1928,6 +1943,9 @@ fn select_page(
     // Their own durable descending cursor prevents refused keys from spending
     // the same slots on every pass. It resets with the next fair cycle.
     let mut absent_sessions = std::collections::HashSet::new();
+    // Rows the scans walked past for a live consumer (#3364): reported, but
+    // they spent none of the candidate budget.
+    let mut fenced_keys: Vec<TerminalReclaimSweepKey> = Vec::new();
     let mut recent_head = None;
     let (recent_keys, recent_last, recent_scanned) = if recent_first {
         let recent_state = store
@@ -1960,8 +1978,9 @@ fn select_page(
             .map(|recent| &recent.after);
         let want = (limit / 2).min(RECENT_FIRST_LIMIT);
         if skip_absent {
-            let scan = select_recent_present_keys(connection, after, want)?;
+            let scan = select_recent_present_keys(connection, Some(store), after, want)?;
             absent_sessions.extend(scan.absent.iter().copied());
+            fenced_keys.extend(scan.fenced);
             (scan.accepted, scan.last_scanned, scan.scanned)
         } else {
             let keys = select_recent_terminal_keys(connection, after, want)?;
@@ -1975,9 +1994,15 @@ fn select_page(
     let walk_limit = limit - recent_keys.len() as u32;
     let (terminal_keys, walk_last, walk_scanned) = match &upper {
         Some(upper) if skip_absent => {
-            let scan =
-                select_present_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
+            let scan = select_present_terminal_keys(
+                connection,
+                Some(store),
+                state.after.as_ref(),
+                upper,
+                walk_limit,
+            )?;
             absent_sessions.extend(scan.absent.iter().copied());
+            fenced_keys.extend(scan.fenced);
             (scan.accepted, scan.last_scanned, scan.scanned)
         }
         // Rows with no live verified custody can never become candidates, so
@@ -1987,8 +2012,14 @@ fn select_page(
         // (#1933). Rows that do have custody keep their budget, including
         // those whose target is absent.
         Some(upper) => {
-            let scan =
-                select_custody_terminal_keys(connection, state.after.as_ref(), upper, walk_limit)?;
+            let scan = select_custody_terminal_keys(
+                connection,
+                Some(store),
+                state.after.as_ref(),
+                upper,
+                walk_limit,
+            )?;
+            fenced_keys.extend(scan.fenced);
             (scan.accepted, scan.last_scanned, scan.scanned)
         }
         None => (Vec::new(), None, 0),
@@ -1997,6 +2028,7 @@ fn select_page(
     let selected = recent_keys
         .iter()
         .chain(terminal_keys.iter())
+        .chain(fenced_keys.iter())
         .filter(|key| seen.insert(key.session_id))
         .map(|key| select_candidate_for_key(connection, key))
         .collect::<Result<Vec<_>>>()?
@@ -2062,6 +2094,7 @@ fn select_page(
                     &terminal_keys
                         .iter()
                         .chain(recent_keys.iter())
+                        .chain(fenced_keys.iter())
                         .cloned()
                         .collect::<Vec<_>>(),
                 ),
@@ -2230,6 +2263,33 @@ struct PresentScan {
     scanned: u32,
     /// Sessions whose target was absent; a row both lanes see counts once.
     absent: Vec<Uuid>,
+    /// Rows with a live consumer fence (#3364). They were walked past, so the
+    /// cursor moves beyond them, but they spent none of the page's candidate
+    /// budget: a pass under pressure reaches the reclaimable rows behind a
+    /// run of fenced ones. They are still reported, never dropped.
+    fenced: Vec<TerminalReclaimSweepKey>,
+}
+
+/// Most fenced rows one lane walks past in a page. The scan stops there, so
+/// the report stays bounded and a fence-heavy store cannot make one page
+/// unbounded work.
+const FENCED_SCAN_CAP: usize = 128;
+
+/// Whether `key`'s custody row is held by a live consumer right now.
+fn key_is_fenced(
+    connection: &Connection,
+    fence: Option<&Store>,
+    key: &TerminalReclaimSweepKey,
+) -> Result<bool> {
+    let Some(store) = fence else {
+        return Ok(false);
+    };
+    let Some(candidate) = select_candidate_for_key(connection, key)? else {
+        return Ok(false);
+    };
+    Ok(store
+        .target_reclaim_live_consumer(candidate.custody_id, candidate.generation)?
+        .is_some())
 }
 
 /// `<sandbox_root>/target` for the live custody row owned by `key`'s session;
@@ -2257,6 +2317,7 @@ fn target_present(sandbox_root: &str) -> bool {
 /// present rows were found or [`ABSENT_SCAN_CAP`] rows were examined.
 fn select_present_terminal_keys(
     connection: &Connection,
+    fence: Option<&Store>,
     after: Option<&TerminalReclaimSweepKey>,
     upper: &TerminalReclaimSweepKey,
     want: u32,
@@ -2266,6 +2327,7 @@ fn select_present_terminal_keys(
         last_scanned: None,
         scanned: 0,
         absent: Vec::new(),
+        fenced: Vec::new(),
     };
     let mut cursor = after.cloned();
     'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
@@ -2278,11 +2340,17 @@ fn select_present_terminal_keys(
             scan.last_scanned = Some(key.clone());
             cursor = Some(key.clone());
             match sandbox_root_of(connection, &key) {
-                Some(root) if target_present(&root) => scan.accepted.push(key),
+                Some(root) if target_present(&root) => {
+                    if key_is_fenced(connection, fence, &key)? {
+                        scan.fenced.push(key);
+                    } else {
+                        scan.accepted.push(key);
+                    }
+                }
                 Some(_) => scan.absent.push(key.session_id),
                 None => {}
             }
-            if scan.accepted.len() as u32 >= want {
+            if scan.accepted.len() as u32 >= want || scan.fenced.len() >= FENCED_SCAN_CAP {
                 break 'chunks;
             }
         }
@@ -2295,6 +2363,7 @@ fn select_present_terminal_keys(
 /// walked past for free; the cursor moves past every row examined.
 fn select_custody_terminal_keys(
     connection: &Connection,
+    fence: Option<&Store>,
     after: Option<&TerminalReclaimSweepKey>,
     upper: &TerminalReclaimSweepKey,
     want: u32,
@@ -2304,6 +2373,7 @@ fn select_custody_terminal_keys(
         last_scanned: None,
         scanned: 0,
         absent: Vec::new(),
+        fenced: Vec::new(),
     };
     let mut cursor = after.cloned();
     'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
@@ -2316,9 +2386,13 @@ fn select_custody_terminal_keys(
             scan.last_scanned = Some(key.clone());
             cursor = Some(key.clone());
             if select_candidate_for_key(connection, &key)?.is_some() {
-                scan.accepted.push(key);
+                if key_is_fenced(connection, fence, &key)? {
+                    scan.fenced.push(key);
+                } else {
+                    scan.accepted.push(key);
+                }
             }
-            if scan.accepted.len() as u32 >= want {
+            if scan.accepted.len() as u32 >= want || scan.fenced.len() >= FENCED_SCAN_CAP {
                 break 'chunks;
             }
         }
@@ -2329,6 +2403,7 @@ fn select_custody_terminal_keys(
 /// Newest-first recent lane, skipping rows whose target is gone.
 fn select_recent_present_keys(
     connection: &Connection,
+    fence: Option<&Store>,
     after: Option<&TerminalReclaimSweepKey>,
     want: u32,
 ) -> Result<PresentScan> {
@@ -2337,6 +2412,7 @@ fn select_recent_present_keys(
         last_scanned: None,
         scanned: 0,
         absent: Vec::new(),
+        fenced: Vec::new(),
     };
     let mut cursor = after.cloned();
     'chunks: while scan.scanned < ABSENT_SCAN_CAP && (scan.accepted.len() as u32) < want {
@@ -2362,12 +2438,14 @@ fn select_recent_present_keys(
             scan.scanned += 1;
             scan.last_scanned = Some(key.clone());
             cursor = Some(key.clone());
-            if target_present(&root) {
-                scan.accepted.push(key);
-            } else {
+            if !target_present(&root) {
                 scan.absent.push(key.session_id);
+            } else if key_is_fenced(connection, fence, &key)? {
+                scan.fenced.push(key);
+            } else {
+                scan.accepted.push(key);
             }
-            if scan.accepted.len() as u32 >= want {
+            if scan.accepted.len() as u32 >= want || scan.fenced.len() >= FENCED_SCAN_CAP {
                 break 'chunks;
             }
         }
@@ -3288,15 +3366,18 @@ mod tests {
                             predicate: WakePredicate {
                                 jobs_terminal: None,
                                 sha_on_rolling: Some("a".repeat(40)),
+                                shas_on_rolling: None,
                                 issue_closed: None,
                                 todo_closed: None,
                                 topology_execution_settled: None,
                                 health_anomaly: None,
                                 settlement_run_settled: None,
+                                fire: None,
                             },
                             armed_at: now,
                             deadline: None,
                             repo_dir: Some(fixture.path().display().to_string()),
+                            delivered_shas: Vec::new(),
                         },
                         false,
                     )
@@ -3323,6 +3404,488 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    fn arm_enabled_resume_wake(store: &Store, owner: Uuid) {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
+        let now = Utc::now();
+        store
+            .insert_scheduled_job(&ScheduledJob {
+                id: Uuid::new_v4(),
+                name: "continuation".into(),
+                message: "continue after work settles".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: WakeMode::Resume,
+                wake_session_id: Some(owner),
+            })
+            .unwrap();
+    }
+
+    /// Arm an enabled wake of `owner` firing `fires_in` from now.
+    fn arm_wake_in(
+        store: &Store,
+        owner: Uuid,
+        mode: rsi_common::types::WakeMode,
+        fires_in: chrono::Duration,
+        predicate: bool,
+    ) -> Uuid {
+        use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob};
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+        let now = Utc::now();
+        let job = ScheduledJob {
+            id: Uuid::new_v4(),
+            name: "parked".into(),
+            message: "continue".into(),
+            schedule: ScheduleSpec {
+                recurrence: Recurrence::Once,
+                anchor: now,
+            },
+            last_fired_at: None,
+            next_fire_at: now + fires_in,
+            enabled: true,
+            working_dir: None,
+            provider: None,
+            model: None,
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+            wake_mode: mode,
+            wake_session_id: Some(owner),
+        };
+        if predicate {
+            store
+                .insert_wake_when(
+                    &job,
+                    &WakeWhenState {
+                        predicate: WakePredicate {
+                            jobs_terminal: None,
+                            sha_on_rolling: Some("a".repeat(40)),
+                            shas_on_rolling: None,
+                            issue_closed: None,
+                            todo_closed: None,
+                            topology_execution_settled: None,
+                            health_anomaly: None,
+                            settlement_run_settled: None,
+                            fire: None,
+                        },
+                        armed_at: now,
+                        deadline: None,
+                        repo_dir: None,
+                        delivered_shas: Vec::new(),
+                    },
+                    false,
+                )
+                .unwrap();
+        } else {
+            store.insert_scheduled_job(&job).unwrap();
+        }
+        job.id
+    }
+
+    /// #4047: a session parked on a wake (plain or deferred predicate) further
+    /// away than the horizon is reclaimable (it rebuilds on resume); a near
+    /// wake and a terminal watch still fence, and a running job blocks it even
+    /// behind a far wake.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_wake_beyond_the_horizon_does_not_fence_the_target_4047() {
+        use chrono::Duration;
+        use rsi_common::types::WakeMode;
+        let fixture = FixtureDirectory::create("target-parked-wake-4047");
+        let mut store = Store::open_in_memory().unwrap();
+        let owner = seed_candidate(&mut store, fixture.path(), 0);
+        let custody = Uuid::from_u128(10_000);
+        let beyond =
+            Duration::hours(crate::store::sandbox_custody::PARKED_WAKE_RECLAIM_HORIZON_HOURS)
+                + Duration::hours(1);
+        let inside =
+            Duration::hours(crate::store::sandbox_custody::PARKED_WAKE_RECLAIM_HORIZON_HOURS)
+                - Duration::hours(1);
+        let fenced = |expected: Option<&'static str>, label: &str| {
+            assert_eq!(
+                store.target_reclaim_live_consumer(custody, 1).unwrap(),
+                expected,
+                "{label}"
+            );
+        };
+
+        // Eligible: only a plain resume wake days away.
+        arm_wake_in(&store, owner, WakeMode::Resume, Duration::days(5), false);
+        fenced(None, "a wake five days away");
+        let page = store.preview_terminal_reclaim_page_with(4, true).unwrap();
+        assert!(
+            page.candidates.iter().any(|c| c.session_id == owner),
+            "{page:?}"
+        );
+
+        // Still blocked: a nearer wake (plain or predicate), a terminal watch.
+        let near = arm_wake_in(&store, owner, WakeMode::Resume, inside, false);
+        fenced(Some("enabled_wake"), "a wake inside the horizon");
+        store
+            .cancel_owned_scheduled_jobs(owner, Some(near), None)
+            .unwrap();
+        fenced(None, "the near wake is cancelled");
+        let near_predicate = arm_wake_in(&store, owner, WakeMode::Resume, inside, true);
+        fenced(Some("enabled_wake"), "a predicate wake inside the horizon");
+        store
+            .cancel_owned_scheduled_jobs(owner, Some(near_predicate), None)
+            .unwrap();
+        // A deferred predicate wake (provider hold: far next_fire_at) does not
+        // fence, with the far plain wake still armed or alone.
+        let deferred = arm_wake_in(&store, owner, WakeMode::Resume, beyond, true);
+        fenced(None, "a predicate wake deferred beyond the horizon");
+        store
+            .cancel_owned_scheduled_jobs(owner, Some(deferred), None)
+            .unwrap();
+        let watch = arm_wake_in(
+            &store,
+            owner,
+            WakeMode::OnTerminal(Uuid::new_v4()),
+            beyond,
+            false,
+        );
+        fenced(Some("enabled_wake"), "a terminal watch");
+        store
+            .cancel_owned_scheduled_jobs(owner, Some(watch), None)
+            .unwrap();
+        fenced(None, "back to the far wake alone");
+
+        // A far wake never hides a running job of the owner.
+        store
+            .conn
+            .execute(
+                "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                    log_path,status_path,state,created_at,row_version)
+                 VALUES(?1,?2,'test','{\"wake\":\"none\"}','/tmp',?3,'/tmp/l','/tmp/s','running',
+                    '2026-10-01T00:00:00.000000000Z',1)",
+                params![Uuid::new_v4().to_string(), owner.to_string(), "unit-4047"],
+            )
+            .unwrap();
+        fenced(Some("running_job"), "a running job behind the far wake");
+    }
+
+    /// #3364: rows with a live consumer are walked past without spending the
+    /// page's candidate budget, in the unfiltered and the pressure lane, and
+    /// every one is still reported with its named consumer.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn fenced_rows_spend_no_candidate_budget_and_are_all_named_3364() {
+        let fixture = FixtureDirectory::create("target-reclaim-fenced-budget");
+        let mut store = Store::open_in_memory().unwrap();
+        let ids = (0..8)
+            .map(|ordinal| seed_candidate(&mut store, fixture.path(), ordinal))
+            .collect::<Vec<_>>();
+        for ordinal in 0..8 {
+            std::fs::create_dir_all(fixture.path().join(format!("sandbox-{ordinal}/target")))
+                .unwrap();
+        }
+        // The four oldest rows are held by an enabled continuation wake.
+        for owner in &ids[..4] {
+            arm_enabled_resume_wake(&store, *owner);
+        }
+        for pressure in [false, true] {
+            let page = store
+                .preview_terminal_reclaim_page_with(2, pressure)
+                .unwrap();
+            let reached = page
+                .candidates
+                .iter()
+                .map(|candidate| candidate.session_id)
+                .collect::<Vec<_>>();
+            assert!(
+                !reached.is_empty() && reached.iter().all(|id| !ids[..4].contains(id)),
+                "pressure={pressure}: eligible rows are reached behind the fenced ones: {page:?}"
+            );
+            let mut fenced = page
+                .fenced
+                .iter()
+                .map(|fenced| {
+                    assert_eq!(fenced.consumer, "enabled_wake");
+                    fenced.candidate.session_id
+                })
+                .collect::<Vec<_>>();
+            fenced.sort();
+            assert_eq!(fenced, ids[..4].to_vec(), "pressure={pressure}");
+        }
+    }
+
+    /// #3364: a finished worker's moot message-delivery watch does not pin its
+    /// build cache; the same watch on a worker that has not reported still does.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn finished_workers_message_watch_does_not_fence_its_target_3364() {
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+        let fixture = FixtureDirectory::create("target-reclaim-moot-watch");
+        let mut store = Store::open_in_memory().unwrap();
+        let reviewer = seed_candidate(&mut store, fixture.path(), 0);
+        let parent = seed_candidate(&mut store, fixture.path(), 1);
+        let watched = Uuid::new_v4();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![reviewer.to_string(), parent.to_string()],
+            )
+            .unwrap();
+        let custody = Uuid::from_u128(10_000);
+        {
+            let tx =
+                Transaction::new_unchecked(&store.conn, TransactionBehavior::Immediate).unwrap();
+            assert!(
+                super::super::agent_coordination::arm_agent_message_watch_in_tx(
+                    &tx,
+                    reviewer,
+                    watched,
+                    Utc::now(),
+                )
+                .unwrap()
+            );
+            tx.commit().unwrap();
+        }
+        let say = |sequence: i32, role: Role, content: &str| {
+            store
+                .insert_event(&ConversationEvent {
+                    id: 0,
+                    session_id: reviewer,
+                    sequence,
+                    event_type: EventType::Message,
+                    role: Some(role),
+                    content: content.into(),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: None,
+                })
+                .unwrap();
+        };
+        // Not reported: the watch can still resume the worker, so it fences.
+        say(1, Role::Assistant, "still reviewing");
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            Some("enabled_wake")
+        );
+        // Reported: the watch is retired on fire without a resume, so the
+        // finished reviewer's target is eligible.
+        say(2, Role::Assistant, "PIPELINE HANDOFF — REVIEW:");
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            None
+        );
+        let page = store.preview_terminal_reclaim_page_with(4, true).unwrap();
+        assert!(
+            page.candidates
+                .iter()
+                .any(|candidate| candidate.session_id == reviewer),
+            "{page:?}"
+        );
+        // Any other enabled wake of the finished worker still fences.
+        arm_enabled_resume_wake(&store, reviewer);
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            Some("enabled_wake")
+        );
+    }
+
+    /// #582: a finished worker's terminal watch on its launcher (a session in
+    /// its parent chain) does not pin its build cache once its final handoff is
+    /// on record; a watch on anything else still does.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn finished_workers_watch_on_its_manager_does_not_fence_its_target_582() {
+        use rsi_common::types::{
+            ConversationEvent, EventType, Recurrence, Role, ScheduleSpec, ScheduledJob, WakeMode,
+        };
+        let fixture = FixtureDirectory::create("target-reclaim-manager-watch");
+        let mut store = Store::open_in_memory().unwrap();
+        let worker = seed_candidate(&mut store, fixture.path(), 0);
+        let manager = seed_candidate(&mut store, fixture.path(), 1);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![worker.to_string(), manager.to_string()],
+            )
+            .unwrap();
+        let custody = Uuid::from_u128(10_000);
+        let arm_watch = |watched: Uuid| {
+            let now = Utc::now();
+            store
+                .insert_scheduled_job(&ScheduledJob {
+                    id: Uuid::new_v4(),
+                    name: format!("terminal-watch-{watched}"),
+                    message: "watched session ended".into(),
+                    schedule: ScheduleSpec {
+                        recurrence: Recurrence::Once,
+                        anchor: now,
+                    },
+                    last_fired_at: None,
+                    next_fire_at: now,
+                    enabled: true,
+                    working_dir: None,
+                    provider: None,
+                    model: None,
+                    project_id: None,
+                    created_at: now,
+                    updated_at: now,
+                    wake_mode: WakeMode::OnTerminal(watched),
+                    wake_session_id: Some(worker),
+                })
+                .unwrap();
+        };
+        let say = |sequence: i32, content: &str| {
+            store
+                .insert_event(&ConversationEvent {
+                    id: 0,
+                    session_id: worker,
+                    sequence,
+                    event_type: EventType::Message,
+                    role: Some(Role::Assistant),
+                    content: content.into(),
+                    tool_name: None,
+                    tool_input: None,
+                    created_at: Utc::now(),
+                    offload_id: None,
+                    tool_use_id: None,
+                    metadata: None,
+                })
+                .unwrap();
+        };
+        arm_watch(manager);
+        // Not reported: the watch can still resume the worker, so it fences.
+        say(1, "still working");
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            Some("enabled_wake")
+        );
+        // Reported: the manager watch is moot, so the finished worker's target
+        // is no longer fenced and the sweep reaches it.
+        say(2, "PIPELINE HANDOFF — IMPLEMENTATION:");
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            None
+        );
+        let page = store.preview_terminal_reclaim_page_with(4, true).unwrap();
+        assert!(
+            page.candidates
+                .iter()
+                .any(|candidate| candidate.session_id == worker),
+            "{page:?}"
+        );
+        // A watch on something outside its parent chain still fences.
+        arm_watch(Uuid::new_v4());
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            Some("enabled_wake")
+        );
+    }
+
+    /// #650 (review of #582): the manager-watch rule only lifts the watch's own
+    /// fence. A reported worker whose manager watch is moot still keeps its
+    /// target while another enabled wake is armed, and a `continue_from`
+    /// successor that is `Starting` and unbound still refuses the prepared
+    /// reclaim, so a continued worker never loses a target it is about to reuse.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn moot_manager_watch_does_not_expose_a_continued_or_woken_worker_650() {
+        use rsi_common::types::{
+            ConversationEvent, EventType, Recurrence, Role, ScheduleSpec, ScheduledJob, WakeMode,
+        };
+        let fixture = FixtureDirectory::create("target-reclaim-moot-watch-continued");
+        let mut store = Store::open_in_memory().unwrap();
+        let worker = seed_candidate(&mut store, fixture.path(), 0);
+        let manager = seed_candidate(&mut store, fixture.path(), 1);
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![worker.to_string(), manager.to_string()],
+            )
+            .unwrap();
+        let custody = Uuid::from_u128(10_000);
+        let now = Utc::now();
+        store
+            .insert_scheduled_job(&ScheduledJob {
+                id: Uuid::new_v4(),
+                name: format!("terminal-watch-{manager}"),
+                message: "watched session ended".into(),
+                schedule: ScheduleSpec {
+                    recurrence: Recurrence::Once,
+                    anchor: now,
+                },
+                last_fired_at: None,
+                next_fire_at: now,
+                enabled: true,
+                working_dir: None,
+                provider: None,
+                model: None,
+                project_id: None,
+                created_at: now,
+                updated_at: now,
+                wake_mode: WakeMode::OnTerminal(manager),
+                wake_session_id: Some(worker),
+            })
+            .unwrap();
+        store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: worker,
+                sequence: 1,
+                event_type: EventType::Message,
+                role: Some(Role::Assistant),
+                content: "PIPELINE HANDOFF — IMPLEMENTATION:".into(),
+                tool_name: None,
+                tool_input: None,
+                created_at: Utc::now(),
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            None
+        );
+
+        // The worker is continued: its unbound Starting successor blocks the
+        // prepared reclaim although the manager watch no longer fences.
+        let mut child = make_test_session();
+        child.id = Uuid::new_v4();
+        child.status = SessionStatus::Starting;
+        child.continued_from = Some(worker);
+        child.working_dir = fixture.path().join("repository");
+        child.sandbox_kind = Some(SandboxKind::GitWorktree);
+        child.sandbox_root = Some(fixture.path().join("sandbox-0"));
+        child.sandbox_branch = Some("rsi/v119-0".into());
+        child.sandbox_cleanup_state = Some(SandboxCleanupState::Live);
+        store.insert_session(&child).unwrap();
+        assert_eq!(
+            store
+                .prepare_target_reclaim_intent(custody, 1, 1, 1)
+                .unwrap(),
+            PrepareTargetReclaimIntentResult::SuccessorReservationPending
+        );
+        assert!(store.target_reclaim_intent(custody, 1).unwrap().is_none());
+
+        // A second enabled wake of the reported worker keeps fencing.
+        arm_enabled_resume_wake(&store, worker);
+        assert_eq!(
+            store.target_reclaim_live_consumer(custody, 1).unwrap(),
+            Some("enabled_wake")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3400,6 +3963,7 @@ mod tests {
                     project_id: None,
                     name: None,
                     params: JobParams::Build(BuildJobParams {
+                        release_members: Vec::new(),
                         command: BuildCommand::Check,
                         package: None,
                         workspace: false,
@@ -3408,6 +3972,7 @@ mod tests {
                         no_default_features: false,
                         features: Vec::new(),
                         shards: Vec::new(),
+                        bins: Vec::new(),
                         cpu_quota_percent: None,
                         sha: None,
                     }),
@@ -3478,54 +4043,112 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn target_reclaim_records_friction_only_when_removal_is_pending() {
+        use rsi_common::sandbox_storage::SandboxBuildCacheReclaimSkipReason as Reason;
         let store = Store::open_in_memory().unwrap();
         let (config, lead) = crate::store::manager_coordinator::tests::fixture(
             &store,
             rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
         );
+        let friction = |signature: &str| -> u32 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM friction_events WHERE session_id=?1 AND project_id=?2
+                     AND signature=?3",
+                    params![
+                        lead.id.to_string(),
+                        config.project_id.to_string(),
+                        signature
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let notice_state = |job: Uuid, custody: Uuid| -> serde_json::Value {
+            let state: String = store
+                .conn
+                .query_row(
+                    "SELECT state_json FROM harness_manager_notices
+                     WHERE job_id=?1 AND subject_id=?2",
+                    params![job.to_string(), format!("sandbox_target_reclaim:{custody}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&state).unwrap()
+        };
+        let all_friction = || -> u32 {
+            store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM friction_events
+                     WHERE signature LIKE 'sandbox_target_reclaim:%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
         let custody = Uuid::new_v4();
         let job = store
-            .record_target_reclaim_notice(lead.id, custody, 3, 4096, false)
+            .record_target_reclaim_notice(lead.id, custody, 3, 4096, None)
             .unwrap()
             .unwrap();
-        let state: String = store.conn.query_row(
-            "SELECT state_json FROM harness_manager_notices WHERE job_id=?1 AND source_session_id=?2",
-            params![job.to_string(), lead.id.to_string()], |row| row.get(0)).unwrap();
-        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        let state = notice_state(job, custody);
         assert_eq!(state["record_kind"], "sandbox_target_reclaim");
         assert_eq!(state["generation"], 3);
         assert_eq!(state["bytes"], 4096);
         assert_eq!(state["outcome"], "removed");
-        let removed_friction: u32 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM friction_events WHERE session_id=?1 AND project_id=?2
-             AND signature='sandbox_target_reclaim:removed'",
-                params![lead.id.to_string(), config.project_id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(removed_friction, 0);
+        assert_eq!(state["pending_reason"], serde_json::Value::Null);
+        assert_eq!(all_friction(), 0);
         assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 1);
 
-        let pending_job = store
-            .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 4, 2048, true)
-            .unwrap()
-            .unwrap();
-        let pending_friction: u32 = store
-            .conn
-            .query_row(
-                "SELECT count(*) FROM friction_events WHERE session_id=?1 AND project_id=?2
-             AND signature='sandbox_target_reclaim:pending'",
-                params![lead.id.to_string(), config.project_id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending_friction, 1);
-        assert_eq!(
-            store.manager_notice_undelivered_count(pending_job).unwrap(),
-            2
-        );
+        // #222: a removal that stopped on a per-pass budget is resumed by the
+        // next pass's intent sweep. The manager still gets the notice, with
+        // the reason, but the andon counts nothing.
+        let mut queued = 1;
+        for reason in [
+            Reason::ByteBudget,
+            Reason::DurationBudget,
+            Reason::FilesystemEntryBudget,
+            Reason::RecoveryEntryBudget,
+        ] {
+            let custody = Uuid::new_v4();
+            let job = store
+                .record_target_reclaim_notice(lead.id, custody, 4, 0, Some(reason))
+                .unwrap()
+                .unwrap();
+            queued += 1;
+            let state = notice_state(job, custody);
+            assert_eq!(state["outcome"], "pending");
+            assert_eq!(state["pending_reason"], reason.as_str());
+            assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), queued);
+        }
+        assert_eq!(all_friction(), 0);
+
+        // A removal that stopped for a reason a later pass does not clear is
+        // friction, and the signature names the reason.
+        for (reason, signature) in [
+            (
+                Reason::StagedDeletionIncomplete,
+                "sandbox_target_reclaim:pending:staged_deletion_incomplete",
+            ),
+            (
+                Reason::DepthBudget,
+                "sandbox_target_reclaim:pending:depth_budget",
+            ),
+        ] {
+            let pending_job = store
+                .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 4, 2048, Some(reason))
+                .unwrap()
+                .unwrap();
+            queued += 1;
+            assert_eq!(friction(signature), 1, "{signature}");
+            assert_eq!(
+                store.manager_notice_undelivered_count(pending_job).unwrap(),
+                queued
+            );
+        }
+        assert_eq!(all_friction(), 2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3539,7 +4162,7 @@ mod tests {
         // #1675: a routine reclaim notice is queued and readable, but it
         // owes the manager no wake (the transport is quiet: NotReady).
         let job = store
-            .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 1, 1024, false)
+            .record_target_reclaim_notice(lead.id, Uuid::new_v4(), 1, 1024, None)
             .unwrap()
             .unwrap();
         assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 1);

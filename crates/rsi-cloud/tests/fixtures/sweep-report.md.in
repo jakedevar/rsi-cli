@@ -1,0 +1,20 @@
+# Cloud QA sweep — aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+Tip SHA: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`$BR
+Started: 2026-09-27T00:00:00Z$BR
+Finished: 2026-09-27T00:01:00Z$BR
+Wall: 1.0 min$BR
+Lanes: 1$BR
+Failing names needing signature review: 1
+
+| Lane | Pass | Fail | Skip | Exit |
+| --- | ---: | ---: | ---: | ---: |
+| other-workspace | 0 | 0 | 0 | 100 |
+
+Seed set: absent; classification unavailable
+Unclassified failing names (seed names alone do not verify failure signatures):
+- `other::fails`
+FLAKE lines:
+- none observed
+Crash and timeout classes:
+- none

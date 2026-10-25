@@ -87,9 +87,12 @@ async fn ctrl_c_copies_a_field_selection_instead_of_quitting() {
     assert_eq!(palette_query(&app), "abc");
     press(&mut app, KeyCode::Right, KeyModifiers::NONE).await;
     press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
+    assert!(!app.quit, "Ctrl-C never quits");
     assert!(
-        app.quit,
-        "with no selection Ctrl-C keeps its global meaning"
+        app.notifications
+            .iter()
+            .any(|n| n.message.contains("Ctrl-C does not quit rsi")),
+        "with no selection Ctrl-C shows the exit hint"
     );
 }
 

@@ -5349,7 +5349,7 @@ mod tests {
             .set_model_control_mode(ModelControlMode::StopAll)
             .unwrap();
         let request = capacity_resume_request(controller, wake, due);
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+        let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(store));
         let bus = std::sync::Arc::new(crate::bus::EventBus::new(8));
         let mut events = bus.subscribe();
         let error = crate::model_control::admit_capacity_invocation(&store, request, &bus)

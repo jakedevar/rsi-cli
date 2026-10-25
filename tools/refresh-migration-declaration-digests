@@ -1,0 +1,5 @@
+#!/bin/sh
+# Author-side byte-preserving digest repair (#361).
+set -eu
+root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
+exec "$root/scripts/repo-guard" refresh-migration-declaration-digests "$@"

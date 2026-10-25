@@ -14,7 +14,6 @@ use rsi_codegraph::{
 };
 use rsi_common::codegraph::*;
 use thiserror::Error;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::{
@@ -72,7 +71,7 @@ impl BoundCodegraphScope {
 
 pub struct CodegraphReadService<'a> {
     handle: &'a IndexHandle,
-    store: Option<Arc<Mutex<Store>>>,
+    store: Option<Arc<rsid_core::store_lock::Mutex<Store>>>,
     project_roots: OnceCell<Vec<(Uuid, PathBuf, IndexWorkspaceBinding)>>,
 }
 
@@ -105,7 +104,10 @@ impl<'a> CodegraphReadService<'a> {
         }
     }
 
-    pub fn with_store(handle: &'a IndexHandle, store: Arc<Mutex<Store>>) -> Self {
+    pub fn with_store(
+        handle: &'a IndexHandle,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> Self {
         Self {
             handle,
             store: Some(store),

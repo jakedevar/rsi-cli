@@ -1,7 +1,10 @@
 //! Hermetic engine tests. Every repository here is a throwaway under a temp
 //! directory; the host repository and live worktrees are never fixtures.
 
-use super::engine::{abort_cleanup_record, ensure_active_lock, file_identity, recovery_proof};
+use super::engine::{
+    HOOK_FILE_IDENTITY, REFERENCE_TRANSACTION_HOOK_PRELUDE, abort_cleanup_record,
+    ensure_active_lock, file_identity, recovery_proof,
+};
 use super::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -200,6 +203,34 @@ fn refusal<T: std::fmt::Debug>(result: Result<T>) -> Refusal {
         Err(IntegrationError::Refused(refusal)) => refusal,
         other => panic!("expected a typed refusal, got {other:?}"),
     }
+}
+
+/// #198: the reference-transaction hook's `file_identity` runs the `stat` on
+/// its pinned `PATH`, so its output must equal the Rust identity the daemon
+/// passes in `RSI_CUSTODY_*_IDENTITY` on this platform (BSD `stat` on macOS
+/// rejects GNU `-c`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[test]
+fn hook_file_identity_matches_the_rust_file_identity() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("artifact");
+    std::fs::write(&path, b"x").unwrap();
+    let expected = file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+    let script =
+        format!("{REFERENCE_TRANSACTION_HOOK_PRELUDE}{HOOK_FILE_IDENTITY}file_identity \"$1\"\n");
+    let output = StdCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .arg("hook")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -654,6 +685,65 @@ async fn guard_passes_only_when_every_command_passes() {
     );
 }
 
+/// #192: `run_guard_with_env` starts each command from the given base
+/// environment alone, withholds the same daemon, repository and credential
+/// names as `run_guard`, and lets the spec's own values win.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[tokio::test]
+async fn guard_with_env_starts_from_the_explicit_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let credential = crate::vault::slots::scrubbed_env_var_names()
+        .next()
+        .expect("a credential name");
+    let base: BTreeMap<std::ffi::OsString, std::ffi::OsString> = [
+        ("PATH", "/usr/bin:/bin"),
+        ("GUARD_BASE_192", "from-base"),
+        ("GUARD_VALUE", "base-value"),
+        ("RSI_SESSION_ID", "daemon-identity"),
+        ("GIT_DIR", "/nonexistent-git-dir"),
+        (credential, "credential-value"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.into(), value.into()))
+    .collect();
+    let report = run_guard_with_env(
+        dir.path(),
+        &spec(vec![shell("env > child.env", Duration::from_secs(30))]),
+        &base,
+    )
+    .await;
+    assert!(report.passed, "{report:?}");
+    let child: BTreeMap<String, String> = std::fs::read_to_string(dir.path().join("child.env"))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
+    assert_eq!(
+        child.get("GUARD_BASE_192").map(String::as_str),
+        Some("from-base")
+    );
+    assert_eq!(child.get("GUARD_VALUE").map(String::as_str), Some("42"));
+    assert_eq!(child.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    // Only the kept base, the spec and what the shell adds itself.
+    let expected = [
+        "PATH",
+        "GUARD_BASE_192",
+        "GUARD_VALUE",
+        "PWD",
+        "OLDPWD",
+        "SHLVL",
+        "_",
+        "__CF_USER_TEXT_ENCODING",
+    ];
+    for key in child.keys() {
+        assert!(
+            expected.contains(&key.as_str()),
+            "unexpected child variable {key}"
+        );
+    }
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
 #[tokio::test]
 async fn guard_failure_carries_status_and_output_and_stops_the_run() {
@@ -697,10 +787,11 @@ async fn guard_timeout_fails_and_reaps_the_process_group() {
             .trim()
             .parse()
             .unwrap();
-        let pid = nix::unistd::Pid::from_raw(pid);
+        // Zombie-aware: under a PID namespace whose init never waits the
+        // killed processes stay zombies, which `kill(pid, 0)` reports alive (#3700).
         let mut gone = false;
         for _ in 0..100 {
-            if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+            if !crate::test_support::process_is_running(pid) {
                 gone = true;
                 break;
             }
@@ -1959,4 +2050,169 @@ fn mirror_hub_origin_reads_only_the_recorded_origin() {
         None
     );
     assert_eq!(super::mirror_hub_origin("x", ""), None);
+}
+
+const LOCK_HEAD: &str = "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n";
+
+fn member_lock(members: &[&str]) -> String {
+    let mut text = LOCK_HEAD.to_string();
+    for member in members {
+        text.push_str(&format!(
+            "\n[[package]]\nname = \"{member}\"\nversion = \"0.1.0\"\n"
+        ));
+    }
+    text
+}
+
+fn member_files(member: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            format!("crates/{member}/Cargo.toml"),
+            format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        ),
+        (format!("crates/{member}/src/lib.rs"), String::new()),
+    ]
+}
+
+impl Fixture {
+    /// Like `commit`, for several files in one commit.
+    fn commit_files(&self, parent: &str, files: &[(String, String)]) -> String {
+        let index = self.builders.fetch_add(1, Ordering::Relaxed);
+        let builder = self.root.path().join(format!("builder-{index}"));
+        let path = builder.to_str().expect("UTF-8 temp path");
+        git(
+            &self.repo,
+            &["worktree", "add", "-q", "--detach", path, parent],
+        );
+        for (file, content) in files {
+            let full = builder.join(file);
+            std::fs::create_dir_all(full.parent().expect("parent")).expect("fixture dir");
+            std::fs::write(&full, content).expect("fixture file");
+            git(&builder, &["add", file]);
+        }
+        git(&builder, &["commit", "-q", "-m", "files"]);
+        let oid = git(&builder, &["rev-parse", "HEAD"]);
+        git(&self.repo, &["worktree", "remove", path]);
+        oid
+    }
+
+    /// A workspace of `crates/*` holding member `a`, as the shared base of the
+    /// `Cargo.lock` conflict tests.
+    fn workspace_base(&self) -> String {
+        let mut files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n".to_string(),
+            ),
+            ("Cargo.lock".to_string(), member_lock(&["a"])),
+        ];
+        files.extend(member_files("a"));
+        self.commit_files(&self.base, &files)
+    }
+
+    /// `parent` plus workspace member `member` and its lock entry.
+    fn add_member(&self, parent: &str, member: &str, members_after: &[&str]) -> String {
+        let mut files = member_files(member);
+        files.push(("Cargo.lock".to_string(), member_lock(members_after)));
+        self.commit_files(parent, &files)
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[tokio::test]
+async fn lock_only_conflict_between_new_members_is_regenerated() {
+    let fixture = Fixture::new(false);
+    let base = fixture.workspace_base();
+    let tip = fixture.add_member(&base, "b", &["a", "b"]);
+    fixture.set_ref(TARGET, &tip);
+    let source = fixture.add_member(&base, "c", &["a", "c"]);
+
+    let built = candidate(fixture.prepare(&tip, &source).await.unwrap());
+    assert_eq!(built.kind, CandidateKind::Merge);
+    let parents = git(
+        &fixture.repo,
+        &["rev-list", "--parents", "-n", "1", &built.oid],
+    );
+    assert_eq!(
+        parents.split_whitespace().collect::<Vec<_>>(),
+        vec![built.oid.as_str(), tip.as_str(), source.as_str()]
+    );
+    let lock = std::fs::read_to_string(built.handle.worktree.join("Cargo.lock")).unwrap();
+    for member in ["a", "b", "c"] {
+        assert!(
+            lock.contains(&format!("name = \"{member}\"")),
+            "merged lock lists {member}: {lock}"
+        );
+    }
+    assert!(
+        !lock.contains("<<<<<<<"),
+        "no conflict markers survive: {lock}"
+    );
+    assert_eq!(
+        git(&built.handle.worktree, &["status", "--porcelain"]),
+        "",
+        "the committed lock is what Cargo wrote"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[tokio::test]
+async fn lock_conflict_beside_a_manifest_conflict_is_still_refused() {
+    let fixture = Fixture::new(false);
+    let base = fixture.workspace_base();
+    let manifest = |extra: &str| {
+        (
+            "Cargo.toml".to_string(),
+            format!("[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n{extra}\n"),
+        )
+    };
+    let mut tip_files = vec![manifest("# tip")];
+    tip_files.extend(member_files("b"));
+    tip_files.push(("Cargo.lock".to_string(), member_lock(&["a", "b"])));
+    let tip = fixture.commit_files(&base, &tip_files);
+    fixture.set_ref(TARGET, &tip);
+    let mut source_files = vec![manifest("# source")];
+    source_files.extend(member_files("c"));
+    source_files.push(("Cargo.lock".to_string(), member_lock(&["a", "c"])));
+    let source = fixture.commit_files(&base, &source_files);
+
+    let Refusal::Conflict { mut paths } = refusal(fixture.prepare(&tip, &source).await) else {
+        panic!("expected a conflict");
+    };
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["Cargo.lock".to_string(), "Cargo.toml".to_string()]
+    );
+    assert_eq!(fixture.resolve(TARGET), tip);
+    assert_eq!(fixture.registered_worktrees(), 1);
+    assert_eq!(fixture.scratch_entries(), 0);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[tokio::test]
+async fn lock_conflict_needing_an_unavailable_package_is_refused() {
+    let fixture = Fixture::new(false);
+    let base = fixture.workspace_base();
+    // The source's new member depends on a registry crate that no offline
+    // index holds, so the lock cannot be derived without the network.
+    let mut files = member_files("c");
+    files[0]
+        .1
+        .push_str("\n[dependencies]\nrsi-fixture-absent-crate = \"=9.9.9\"\n");
+    files.push(("Cargo.lock".to_string(), member_lock(&["a", "c"])));
+    let tip = fixture.add_member(&base, "b", &["a", "b"]);
+    fixture.set_ref(TARGET, &tip);
+    let source = fixture.commit_files(&base, &files);
+
+    let refused = refusal(fixture.prepare(&tip, &source).await);
+    assert_eq!(
+        refused,
+        Refusal::Conflict {
+            paths: vec!["Cargo.lock".to_string()]
+        }
+    );
+    assert_eq!(fixture.resolve(TARGET), tip);
+    assert_eq!(fixture.registered_worktrees(), 1);
+    assert_eq!(fixture.scratch_entries(), 0);
 }

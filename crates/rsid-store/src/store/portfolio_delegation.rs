@@ -234,6 +234,10 @@ pub(crate) struct LaunchedAppointment {
     pub launch_project_id: Uuid,
     /// Already counted as a creation of its grantor (see `APPOINTMENT_CHARGED`).
     pub charged: bool,
+    /// The appointment seats a portfolio node (not a project's PM). Hub
+    /// #3315: such a seat may be launched in the home project instead of
+    /// `launch_project_id`, which stays its admission and charge project.
+    pub portfolio_target: bool,
 }
 
 /// The caller's own node, as resolved for a delegation.
@@ -365,6 +369,31 @@ impl Store {
         Ok(projects.len())
     }
 
+    /// Hub #3315: the admission (charge) project of the appointment that
+    /// launched `session_id` or the nearest earlier session of its rotation
+    /// lineage (`continued_from`), whatever the appointment's state. A seat in
+    /// the home project files its Issues there. `None` when no appointment
+    /// launched the lineage (an operator-seated session).
+    pub fn appointment_admission_project_for_lineage(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        const SQL: &str = "WITH RECURSIVE lineage(id, depth) AS (
+                 SELECT ?1, 0
+                 UNION ALL
+                 SELECT s.continued_from, l.depth + 1 FROM sessions s JOIN lineage l ON s.id = l.id
+                 WHERE s.continued_from IS NOT NULL AND l.depth < 256
+             )
+             SELECT a.launch_project_id FROM lineage l
+             JOIN manager_portfolio_appointments a ON a.session_id = l.id
+             ORDER BY l.depth LIMIT 1";
+        let project: Option<String> = self
+            .conn
+            .query_row(SQL, params![session_id.to_string()], |row| row.get(0))
+            .optional()?;
+        project.as_deref().map(parse_uuid).transpose()
+    }
+
     /// #1314: the launched, unappointed appointment whose reserved seat is
     /// `session_id`, or `manager_appointment_launch_changed`.
     pub(crate) fn launched_appointment_for_session(
@@ -372,24 +401,36 @@ impl Store {
         session_id: Uuid,
     ) -> Result<LaunchedAppointment> {
         let sql = format!(
-            "SELECT a.grantor_node_id,a.grantor_authority_epoch,a.launch_project_id,{APPOINTMENT_CHARGED}
+            "SELECT a.grantor_node_id,a.grantor_authority_epoch,a.launch_project_id,{APPOINTMENT_CHARGED},a.target_ref
              FROM manager_portfolio_appointments a WHERE a.session_id=?2 AND a.state='launched'"
         ); // sql-dynamic-ok: static APPOINTMENT_CHARGED clause
-        let row: Option<(String, i64, String, bool)> = self
+        let row: Option<(String, i64, String, bool, String)> = self
             .conn
             .query_row(
                 &sql,
                 params![grace_cutoff(), session_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let (node, epoch, project, charged) =
+        let (node, epoch, project, charged, target) =
             row.ok_or_else(|| refused("manager_appointment_launch_changed"))?;
         Ok(LaunchedAppointment {
             grantor_node_id: parse_uuid(&node)?,
             grantor_authority_epoch: epoch,
             launch_project_id: parse_uuid(&project)?,
             charged,
+            portfolio_target: matches!(
+                ChildTargetRef::parse(&target)?,
+                ChildTargetRef::Portfolio(_)
+            ),
         })
     }
 
@@ -504,6 +545,13 @@ impl Store {
                 child.clone()
             }
             None => {
+                // #3417: a spend grant is operator-only authority; a node's
+                // own policy never hands one to the PM it appoints.
+                if !grant.project_policy.provider_grants.is_empty() {
+                    return Err(refused(
+                        rsi_common::provider_grant::PROVIDER_GRANT_OPERATOR_ONLY_MESSAGE,
+                    ));
+                }
                 let mut policy = grant.project_policy.clone();
                 policy.allowed_launches = Vec::new();
                 policy

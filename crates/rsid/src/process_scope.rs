@@ -8,7 +8,6 @@
 
 use crate::error::{DaemonError, Result};
 use crate::process_control::WorkerStopHandle;
-#[cfg(any(test, target_os = "linux"))]
 use crate::process_control::{ProcessContainment, configure_tokio_process_group};
 use rsi_common::rpc::WorkerSliceMemoryPressure;
 use std::ffi::OsStr;
@@ -384,8 +383,15 @@ impl ScopedWorkerCommand {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (invocation_id, limits);
+            // #146: there is no scope unit off Linux, but the command still needs
+            // its own process group. Without one the child shares the daemon's
+            // group, `getpgid(child)` names the daemon's own group, and the
+            // group kill of a session end / cancel signals the daemon (and a
+            // test binary's whole runner) itself.
+            let mut command = Command::new(program);
+            configure_tokio_process_group(&mut command, ProcessContainment::Group)?;
             return Ok(Self {
-                command: Command::new(program),
+                command,
                 #[cfg(test)]
                 unit_name: String::new(),
             });
@@ -428,6 +434,9 @@ impl ScopedWorkerCommand {
             .arg("--expand-environment=no")
             .arg(format!("--slice={SCOPE_SLICE}"))
             .arg(format!("--unit={unit_name}"))
+            // Otherwise systemd journals the full provider argv, including
+            // prompts, as the scope's description.
+            .arg(format!("--description=rsi worker {invocation_id}"))
             .arg(format!("--property=MemoryHigh={}M", limits.memory_high_mib))
             .arg(format!("--property=MemoryMax={}M", limits.memory_max_mib))
             .arg(format!(
@@ -642,7 +651,7 @@ mod tests {
         assert!(WorkerScopeLimits::new(512, 1024, MAX_MEMORY_MIB + 1, 50).is_err());
         assert!(WorkerScopeLimits::new(512, 1024, 0, 0).is_err());
         let invocation = Uuid::new_v4();
-        let first = ScopedWorkerCommand::with_runner(
+        let mut first = ScopedWorkerCommand::with_runner(
             Path::new("/fake/systemd-run"),
             OsStr::new("fake-provider"),
             invocation,
@@ -663,6 +672,8 @@ mod tests {
                 .starts_with(&format!("rsi-worker-{invocation}-"))
         );
         assert!(first.unit_name().ends_with(".scope"));
+        let prompt = format!("Issue brief: {} ${{NAME}}", "x".repeat(24_191));
+        first.command_mut().args(["--prompt", &prompt]);
         let args: Vec<OsString> = first
             .command
             .as_std()
@@ -681,11 +692,17 @@ mod tests {
                 "--slice=rsi-workers.slice"
             ]
         );
-        assert_eq!(args[7], "--property=MemoryHigh=512M");
-        assert_eq!(args[8], "--property=MemoryMax=1024M");
-        assert_eq!(args[9], "--property=MemorySwapMax=0M");
-        assert_eq!(args[10], "--property=CPUWeight=50");
-        assert_eq!(&args[11..], ["--", "fake-provider"]);
+        let description = args[7].strip_prefix("--description=").unwrap();
+        assert_eq!(description, format!("rsi worker {invocation}"));
+        assert!(description.len() <= 64);
+        assert_eq!(args[8], "--property=MemoryHigh=512M");
+        assert_eq!(args[9], "--property=MemoryMax=1024M");
+        assert_eq!(args[10], "--property=MemorySwapMax=0M");
+        assert_eq!(args[11], "--property=CPUWeight=50");
+        assert_eq!(
+            &args[12..],
+            ["--", "fake-provider", "--prompt", prompt.as_str()]
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -851,6 +868,25 @@ mod tests {
             rsid_core::process_control::recorded_scope_kills::killed(&other),
             0
         );
+    }
+
+    /// #146: off Linux the command still leads its own process group, so a group
+    /// signal aimed at the child's pgid can never reach the daemon that spawned it.
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn off_linux_scoped_command_leads_its_own_process_group() {
+        let mut scoped =
+            ScopedWorkerCommand::new(std::ffi::OsStr::new("sleep"), Uuid::new_v4(), limits())
+                .unwrap();
+        scoped.command_mut().arg("30");
+        let mut child = scoped.into_command().spawn().unwrap();
+        let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
+        let group = nix::unistd::getpgid(Some(pid)).unwrap();
+        let own = nix::unistd::getpgrp();
+        let _ = child.kill().await;
+        assert_eq!(group, pid, "the child must lead a group of its own");
+        assert_ne!(group, own, "the child must not share the daemon's group");
     }
 
     /// Off Linux there is no worker scope: the launch records none, so a forced

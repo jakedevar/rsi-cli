@@ -352,7 +352,7 @@ pub(crate) static TRIM_PENDING: AtomicBool = AtomicBool::new(true);
 /// # Errors
 /// A store or filesystem error.
 pub(crate) async fn trim_settled_target<T>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     jobs: &Path,
     pending: &AtomicBool,
     target: T,
@@ -627,7 +627,10 @@ mod tests {
                         exact: false,
                         lib_only: false,
                         test_target: None,
+                        bin: None,
+                        features: Vec::new(),
                         candidate_receipt: None,
+                        at_commit: None,
                         timeout_minutes: Some(180),
                         cpu_quota_percent: None,
                     }),
@@ -656,7 +659,9 @@ mod tests {
         unit(&debug, "rsid", OLD, 10, at(base, 50));
         unit(&debug, "rsid", NEW, 10, at(base, 200));
         set_dir_mtime(&debug.join("deps"), at(base, 200));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         insert_qa_job(&*store.lock().await);
         let pending = AtomicBool::new(false);
         let resolve = |dir: &Path| {
@@ -672,7 +677,9 @@ mod tests {
         assert!(exists(&debug, &format!("deps/rsid-{OLD}")));
 
         // The job settled (a fresh store has none queued or running).
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let outcome = trim_settled_target(&store, &jobs, &pending, resolve(&dir))
             .await
             .unwrap();

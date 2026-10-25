@@ -253,6 +253,7 @@ pub struct GlobalManagerWorkspaceState {
     pub focus: WorkspaceFocus,
     /// The instantiate-a-manager form, while open.
     pub launch: Option<LaunchForm>,
+    pub coverage: Option<super::manager_coverage::CoverageForm>,
     /// #1240: the node this console shows; `None` is the global (`gm`).
     pub target: Option<ManagerNodeRefV1>,
     /// #1240: the node snapshot behind `snapshot` when `target` is set.
@@ -1252,6 +1253,7 @@ pub fn open_conversation_session(app: &App) -> Option<Uuid> {
 #[must_use]
 pub fn owns_text_entry(state: &GlobalManagerWorkspaceState) -> bool {
     state.launch.is_some()
+        || state.coverage.is_some()
         || state.focus == WorkspaceFocus::Input
         || state
             .budget
@@ -1473,33 +1475,42 @@ fn start_typing(app: &mut App) {
         ));
         return;
     };
-    let Some(status) = app.sessions.get(&session_id).map(|s| s.session.status) else {
-        if let Some(workspace) = state(app) {
-            workspace.error = Some(format!(
-                "Session {} is still loading; press r to refresh",
-                short(session_id)
-            ));
+    match begin_typing(app, session_id) {
+        Ok(()) => {
+            if let Some(workspace) = state(app) {
+                workspace.focus = WorkspaceFocus::Input;
+                workspace.error = None;
+            }
         }
-        return;
+        Err(error) => {
+            if let Some(workspace) = state(app) {
+                workspace.error = Some(error);
+            }
+        }
+    }
+}
+
+/// Put `session_id`'s input bar into insert mode, or say why not. The one
+/// way a console starts typing to a seat (`gm` and the `gd` dashboard, #3317).
+pub(crate) fn begin_typing(app: &mut App, session_id: Uuid) -> Result<(), String> {
+    let Some(status) = app.sessions.get(&session_id).map(|s| s.session.status) else {
+        return Err(format!(
+            "Session {} is still loading; press r to refresh",
+            short(session_id)
+        ));
     };
     if matches!(status, SessionStatus::Archived | SessionStatus::Deleted) {
-        if let Some(workspace) = state(app) {
-            workspace.error = Some(format!(
-                "Session {} is {status:?} and read-only; {LAUNCH_HINT}",
-                short(session_id)
-            ));
-        }
-        return;
+        return Err(format!(
+            "Session {} is {status:?} and read-only; {LAUNCH_HINT}",
+            short(session_id)
+        ));
     }
     crate::input_bar::enter_insert_mode(
         app,
         session_id,
         crate::modalkit_types::InsertStyle::Insert,
     );
-    if let Some(workspace) = state(app) {
-        workspace.focus = WorkspaceFocus::Input;
-        workspace.error = None;
-    }
+    Ok(())
 }
 
 /// Select the console's own seat (the global, or the node shown) and type
@@ -1689,10 +1700,20 @@ fn open_project_tab(app: &mut App) {
     }
 }
 
-/// Open the instantiate-a-manager form for the selected seat (`n`).
-async fn open_launch_form(app: &mut App) {
+/// #3317: the `gd` dashboard's `n`: open this console on the global seat and
+/// its instantiate-a-manager form, hosted in `host` (the home project) when
+/// given. It is the same appoint flow `n` runs here.
+pub async fn open_appoint(app: &mut App, host: Option<Uuid>) {
+    open(app).await;
+    open_launch_form(app, host).await;
+    app.mark_dirty();
+}
+
+/// Open the instantiate-a-manager form for the selected seat (`n`); `host`
+/// pre-selects the project that hosts a new global seat.
+async fn open_launch_form(app: &mut App, host: Option<Uuid>) {
     let projects = app.projects.clone();
-    let active_project = app.active_project_id();
+    let active_project = host.or_else(|| app.active_project_id());
     let Some(workspace) = state(app) else { return };
     if projects.is_empty() {
         workspace.error =
@@ -1755,6 +1776,159 @@ async fn open_parent(app: &mut App) {
     }
 }
 
+/// `g e`: list navigation selects the root, then edit the whole grant.
+pub async fn open_coverage(app: &mut App) {
+    let Some(workspace) = state(app) else { return };
+    if workspace.target.is_some()
+        || workspace
+            .selected_seat()
+            .is_some_and(|seat| seat.level != SeatLevel::Global)
+    {
+        workspace.error = Some("Coverage and permissions edits the global seat here; select it with g, or use T for other manager kinds.".into());
+        return;
+    }
+    let result = app.client.get_global_manager().await;
+    match result {
+        Ok(Some(grant)) if grant.state == "active" => {
+            let request = rsi_common::global_manager::ConfigureGlobalManagerRequestV1 {
+                session_id: grant.seat_session_id,
+                project_ids: grant.project_ids,
+                allowed_launches: grant.allowed_launches,
+                project_policy: grant.project_policy,
+                expected_grant_version: grant.grant_version,
+                idempotency_key: Uuid::new_v4().to_string(),
+            };
+            open_coverage_request(app, request, None);
+        }
+        Ok(_) => {
+            if let Some(workspace) = state(app) {
+                workspace.error = Some(
+                    "No active global grant to edit; n launches and appoints a manager.".into(),
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(workspace) = state(app) {
+                workspace.error = Some(format!("Could not read the global grant: {error}"));
+            }
+        }
+    }
+}
+
+pub(crate) fn open_coverage_request(
+    app: &mut App,
+    request: rsi_common::global_manager::ConfigureGlobalManagerRequestV1,
+    note: Option<String>,
+) {
+    let mut form = super::manager_coverage::CoverageForm::new(request, &app.projects);
+    form.note = note;
+    if !is_open(app) {
+        app.overlay = OverlayState::GlobalManagerWorkspace(Box::default());
+    }
+    if let Some(workspace) = state(app) {
+        workspace.coverage = Some(form);
+        workspace.focus = WorkspaceFocus::Seats;
+        workspace.error = None;
+    }
+}
+
+async fn handle_coverage_key(app: &mut App, key: KeyEvent) {
+    use super::manager_coverage::Outcome;
+    let (width, height) = app.last_terminal_size;
+    if width > 0 && height > 0 && (width < 34 || height < 12) && key.code != KeyCode::Esc {
+        return;
+    }
+    let Some(form) = state(app).and_then(|workspace| workspace.coverage.as_mut()) else {
+        return;
+    };
+    match form.handle_key(key) {
+        Outcome::Stay => {}
+        Outcome::Cancel => {
+            let launched = form.launched;
+            if let Some(workspace) = state(app) {
+                workspace.coverage = None;
+                if let Some(id) = launched {
+                    workspace.notice = Some(format!(
+                        "Session {} was launched but remains unappointed; use :manager global appoint to appoint it.",
+                        &id.to_string()[..8]
+                    ));
+                    workspace.launch = None;
+                }
+            }
+        }
+        Outcome::Budget => super::gm_budget::open(app).await,
+        Outcome::Save => save_coverage(app).await,
+    }
+}
+
+async fn save_coverage(app: &mut App) {
+    let Some(mut form) = state(app).and_then(|workspace| workspace.coverage.take()) else {
+        return;
+    };
+    let result = async {
+        let mut request = form
+            .prepared
+            .clone()
+            .ok_or_else(|| "Review this draft before saving.".to_string())?;
+        if let Some(launch) = &form.launch {
+            let launch = launch.clone();
+            let session = super::global_manager_workspace_launch::launch_for_appointment(
+                app,
+                &launch,
+                &mut form.launched,
+            )
+            .await?;
+            request.session_id = session;
+            form.prepared = Some(request.clone());
+        }
+        request.validate().map_err(str::to_string)?;
+        app.client
+            .configure_global_manager_confirmed(request, form.cap_confirm)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    match result {
+        Ok(grant) => {
+            if let Some(workspace) = state(app) {
+                workspace.launch = None;
+                workspace.notice = Some(format!(
+                    "Global manager appointed (grant v{}, {} projects); coverage and permissions saved{}",
+                    grant.grant_version,
+                    grant.project_ids.len(),
+                    if form.launch.is_some() && form.original.expected_grant_version > 0 {
+                        "; it replaces the previous seat"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            refresh(app).await;
+            if let Some(workspace) = state(app) {
+                workspace.select_where(|seat| seat.session_id == Some(grant.seat_session_id));
+            }
+            ensure_conversation(app).await;
+        }
+        Err(error) => {
+            form.cap_confirm = error.contains(
+                rsi_common::portfolio_nodes::PORTFOLIO_CAP_REDUCTION_CONFIRMATION_REQUIRED,
+            );
+            form.error = Some(if form.cap_confirm {
+                format!("{error} Review these lower caps; y confirms them.")
+            } else {
+                format!(
+                    "{error} Draft retained; Esc edits. For a stale grant, cancel and reopen to load the current version."
+                )
+            });
+            form.step = 4;
+            form.selected = form.review().len().saturating_sub(1);
+            if let Some(workspace) = state(app) {
+                workspace.coverage = Some(form);
+            }
+        }
+    }
+}
+
 /// Validate, launch and appoint from the open form. Errors stay inline in the
 /// form; success closes it, refreshes and selects the new seat.
 async fn submit_launch(app: &mut App, confirm_cap_reductions: bool) {
@@ -1779,6 +1953,42 @@ async fn submit_launch(app: &mut App, confirm_cap_reductions: bool) {
         form.grant.error = Some(message.clone());
         form.grant_open = true;
         form.error = Some(message);
+        return;
+    }
+    if request.role == LaunchRole::Global && form.launched.is_none() {
+        let current = workspace.grant().cloned();
+        let form = workspace.launch.as_ref().expect("launch form");
+        let choice = form.grant.clone();
+        let fresh = current.as_ref().is_none_or(|grant| grant.state != "active")
+            && form.prefill_note.is_none();
+        let mut coverage = super::manager_coverage::CoverageForm::new(
+            rsi_common::global_manager::ConfigureGlobalManagerRequestV1 {
+                session_id: Uuid::nil(),
+                project_ids: if fresh {
+                    vec![request.home_project]
+                } else {
+                    request.scope.clone()
+                },
+                allowed_launches: if fresh {
+                    vec![request.launch.clone()]
+                } else {
+                    choice.launches().to_vec()
+                },
+                project_policy: choice.finish(),
+                expected_grant_version: current
+                    .as_ref()
+                    .filter(|grant| grant.state == "active")
+                    .map_or(0, |grant| grant.grant_version),
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+            &projects,
+        );
+        if fresh && !form.grant_visited {
+            coverage.new_defaults();
+        }
+        coverage.note = form.prefill_note.clone();
+        coverage.launch = Some(request);
+        workspace.coverage = Some(coverage);
         return;
     }
     let mut launched = form.launched;
@@ -1817,6 +2027,21 @@ async fn submit_launch(app: &mut App, confirm_cap_reductions: bool) {
 }
 
 async fn handle_launch_key(app: &mut App, key: KeyEvent) {
+    let edit_global = state(app)
+        .and_then(|workspace| workspace.launch.as_ref())
+        .is_some_and(|form| {
+            form.role == LaunchRole::Global
+                && !form.grant_open
+                && form.field == super::global_manager_workspace_launch::LaunchField::Grant
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l')
+                )
+        });
+    if edit_global {
+        submit_launch(app, false).await;
+        return;
+    }
     // Standard editing: a real cursor and selection in the launch prompt.
     let editing_prompt = state(app)
         .and_then(|w| w.launch.as_ref())
@@ -1874,6 +2099,10 @@ fn scroll_conversation(app: &mut App, direction: i32, lines: usize) {
     let Some(session_id) = open_conversation_session(app) else {
         return;
     };
+    scroll_session(app, session_id, direction, lines);
+}
+
+pub(crate) fn scroll_session(app: &mut App, session_id: Uuid, direction: i32, lines: usize) {
     if let Some(session) = app.sessions.get_mut(&session_id) {
         crate::event::scroll_detail_lines(session, direction, lines);
     }
@@ -1938,6 +2167,17 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
         }
         return;
     };
+    if typing_key(app, session_id, key).await
+        && let Some(workspace) = state(app)
+    {
+        workspace.focus = WorkspaceFocus::Seats;
+    }
+}
+
+/// One key typed to `session_id`'s input bar through the shared session
+/// surface (Enter sends through the session send path). Returns true when
+/// the key leaves typing (Esc); a send keeps the bar in insert mode.
+pub(crate) async fn typing_key(app: &mut App, session_id: Uuid, key: KeyEvent) -> bool {
     let inserting = app
         .sessions
         .get(&session_id)
@@ -1946,16 +2186,13 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
     let leave = key.code == KeyCode::Esc && (inserting || !consumed);
     if !consumed && key.modifiers.is_empty() {
         match key.code {
-            KeyCode::Up => scroll_conversation(app, -1, 3),
-            KeyCode::Down => scroll_conversation(app, 1, 3),
+            KeyCode::Up => scroll_session(app, session_id, -1, 3),
+            KeyCode::Down => scroll_session(app, session_id, 1, 3),
             _ => {}
         }
     }
     if leave {
-        if let Some(workspace) = state(app) {
-            workspace.focus = WorkspaceFocus::Seats;
-        }
-        return;
+        return true;
     }
     // A send clears the draft and leaves insert mode: keep typing.
     let still_inserting = app
@@ -1969,12 +2206,18 @@ async fn handle_input_key(app: &mut App, key: KeyEvent) {
             crate::modalkit_types::InsertStyle::Insert,
         );
     }
+    false
 }
 
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
     let Some(workspace) = state(app) else { return };
     if workspace.budget.is_some() {
         crate::overlay::gm_budget::handle_key(app, key).await;
+        return;
+    }
+    if workspace.coverage.is_some() {
+        handle_coverage_key(app, key).await;
+        app.mark_dirty();
         return;
     }
     if workspace.launch.is_some() {
@@ -2007,7 +2250,8 @@ pub async fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('x') => halt_seat(app, false).await,
         KeyCode::Char('X') => halt_seat(app, true).await,
         KeyCode::Char('a') => archive_seat(app).await,
-        KeyCode::Char('n') => open_launch_form(app).await,
+        KeyCode::Char('n') => open_launch_form(app, None).await,
+        KeyCode::Char('e') => open_coverage(app).await,
         KeyCode::Char('b') => crate::overlay::gm_budget::open(app).await,
         KeyCode::Tab => {
             if workspace.conversation_session_id().is_some() {

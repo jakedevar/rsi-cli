@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
+use crate::topology::baton;
 use crate::topology::catalog::{CommandPoll, CommandRunner};
 use crate::topology::custody::{
     self, PinSelector, TopologyCustody, TopologyForkSource, node_pin_ref, preserved_ref,
@@ -197,6 +198,10 @@ pub(crate) struct AnswerContinuation {
 /// window is exhausted (#3066).
 pub(crate) const WAITING_ON_PROVIDER: &str = "waiting_on_provider";
 
+/// The `admission_hold` kind of a launch refused by a restart or deploy drain
+/// (#3426).
+pub(crate) const RESTART_DRAIN: &str = "restart_drain";
+
 /// #1641 S4b: the `admission_hold` kind of a launch refused by the sandbox
 /// capacity gate (`launch.rs`, JSON-RPC code -32029), or `None` for any other
 /// error. A direct-root limit is `source_root_limit`; a free-space shortfall is
@@ -208,6 +213,12 @@ pub(crate) fn admission_hold_kind(error: &DaemonError) -> Option<&'static str> {
     // outage never settles a node `launch_refused`.
     if crate::provider_exhaustion::is_usage_window_refusal(error) {
         return Some(WAITING_ON_PROVIDER);
+    }
+    // #3426: a restart or deploy drain refusal is a hold, not a failure: the
+    // launch ran nothing, so the attempt stays `Reserved` (spending no attempt)
+    // and launches after the drain, on this or the next daemon incarnation.
+    if crate::deploy_drain::is_held_for_restart(error) {
+        return Some(RESTART_DRAIN);
     }
     let DaemonError::StructuredRpc {
         rpc_code: -32029,
@@ -562,7 +573,7 @@ pub(crate) enum Step {
 }
 
 pub(crate) struct Executor<E: NodeEffects> {
-    pub(crate) store: Arc<Mutex<Store>>,
+    pub(crate) store: Arc<rsid_core::store_lock::Mutex<Store>>,
     pub(crate) effects: Arc<E>,
     pub(crate) boot_id: Uuid,
     /// Shared by every handle in one daemon incarnation: drivers and the
@@ -695,7 +706,13 @@ fn retry_due(
         // the legacy retry budget; plan §2.5 bounds them at
         // `MAX_ATTEMPTS_PER_NODE` per instance on top of it.
         Some(failure::LOST_BEFORE_SESSION | failure::LOST_AFTER_SESSION | failure::INTERRUPTED) => {
-            count(&failure::INFRASTRUCTURE) < MAX_ATTEMPTS_PER_NODE as usize
+            count(&failure::LOSSES) < MAX_ATTEMPTS_PER_NODE as usize
+        }
+        // #3340: a session that passed the context-cap baton continues from
+        // its commit, on a budget of its own that the losses above neither
+        // use nor are used up by.
+        Some(failure::CONTEXT_CAP_CONTINUED) => {
+            count(&[failure::CONTEXT_CAP_CONTINUED]) <= baton::MAX_CONTEXT_CAP_CONTINUATIONS
         }
         // A reviewer that could not run a check it needed reported
         // infrastructure, not a verdict (#2570): a fresh review, bounded apart
@@ -706,7 +723,9 @@ fn retry_due(
         }
         // A review with no usable verdict earns exactly one new assignment;
         // the second one blocks (settled as `blocked`, never reaching here).
-        Some(failure::REVIEW_UNSETTLED) => count(&[failure::REVIEW_UNSETTLED]) <= 1,
+        Some(failure::REVIEW_UNSETTLED | failure::REVIEW_LAUNCH_REFUSED) => {
+            count(&[failure::REVIEW_UNSETTLED, failure::REVIEW_LAUNCH_REFUSED]) <= 1
+        }
         // "One more round" from the on-call manager reopens the review once.
         Some(failure::REVIEW_REOPENED) => count(&[failure::REVIEW_REOPENED]) <= 1,
         // Node failures keep the legacy `FailurePolicy::Retry` budget
@@ -729,6 +748,35 @@ fn retry_due(
         _ => false,
     }
 }
+
+/// The query of the attempt that retries `latest`. A session that passed the
+/// context-cap baton (#3340) continues with the baton appended to the node's
+/// own query; every other retry repeats the query as it was.
+fn retry_query(index: &AttemptIndex<'_>, latest: &AttemptRow) -> String {
+    if latest.failure_class.as_deref() != Some(failure::CONTEXT_CAP_CONTINUED) {
+        return latest.query().to_owned();
+    }
+    let n = index
+        .instance(&latest.node_id, latest.iteration)
+        .iter()
+        .filter(|attempt| attempt.failure_class.as_deref() == Some(failure::CONTEXT_CAP_CONTINUED))
+        .count();
+    let text = latest
+        .output
+        .as_ref()
+        .and_then(|output| output.pointer(&format!("/fields/{BATON_OUTPUT_KEY}")))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    baton::continuation_query(
+        latest.query(),
+        text,
+        n,
+        baton::MAX_CONTEXT_CAP_CONTINUATIONS,
+    )
+}
+
+/// The output key a `context_cap_continued` attempt records its baton under.
+const BATON_OUTPUT_KEY: &str = "context_cap_baton";
 
 fn instance_state(
     shape: &GraphShape,
@@ -919,7 +967,7 @@ fn output_mentions_halt(repo: &std::path::Path, attempt: &AttemptRow) -> Result<
 
 impl<E: NodeEffects> Executor<E> {
     pub(crate) const fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         effects: Arc<E>,
         boot_id: Uuid,
         registry: Arc<DriverRegistry>,
@@ -1098,7 +1146,7 @@ impl<E: NodeEffects> Executor<E> {
                         .clone()
                         .filter(|_| attempt.status == AttemptStatus::Interrupted)
                         .unwrap_or_else(|| attempt.base_commit.clone()),
-                    query: attempt.query().to_owned(),
+                    query: retry_query(&index, attempt),
                     node_kind,
                     catalog_op,
                     effect_class,
@@ -1826,7 +1874,7 @@ impl<E: NodeEffects> Executor<E> {
                     AttemptStatus::Blocked,
                     Settlement {
                         failure_class: Some(failure::POLICY_REFUSED),
-                        error: Some(code.to_owned()),
+                        error: Some(code.error_text()),
                         ..Settlement::default()
                     },
                 )
@@ -1981,13 +2029,17 @@ impl<E: NodeEffects> Executor<E> {
             project_id: execution.project_id,
             parent_id: execution.parent_session_id,
         };
-        let config = builder.build_attempt(
+        let mut config = builder.build_attempt(
             node,
             attempt.query().to_owned(),
             attempt.iteration,
             attempt.attempt_no,
             attempt.dedup_key.clone(),
         )?;
+        config.title = Some(super::launch::node_session_title(
+            &attempt.node_id,
+            execution.input.as_ref(),
+        ));
         let fork = TopologyForkSource::verified(&execution.repo_root, &attempt.base_commit)?;
         Ok(LaunchRequest {
             session_id: attempt.session_id,
@@ -2007,10 +2059,27 @@ impl<E: NodeEffects> Executor<E> {
                 .await?;
             return Ok(true);
         };
+        let admission_since = if observed.status.is_terminal() {
+            self.build_admission_since(attempt.session_id).await?
+        } else {
+            None
+        };
         // Launched (or last seen alive) by an earlier daemon incarnation.
         let previous_boot = attempt.boot_id != Some(self.boot_id);
-        {
+        let (downtime, clock_update) = {
             let store = self.store.lock().await;
+            let (downtime, update) = rows::checkpoint_node_clock(
+                &store,
+                execution.id,
+                attempt,
+                self.boot_id,
+                observed
+                    .waiting_since
+                    .filter(|_| observed.status == SessionStatus::WaitingApproval)
+                    .into_iter()
+                    .chain(admission_since)
+                    .min(),
+            )?;
             if let Some(root) = &observed.sandbox_root
                 && attempt.sandbox_root.is_none()
             {
@@ -2019,7 +2088,9 @@ impl<E: NodeEffects> Executor<E> {
             if previous_boot && !observed.status.is_terminal() {
                 rows::stamp_boot(&store, attempt.id, self.boot_id)?;
             }
-        }
+            (downtime, update)
+        };
+        self.publish(clock_update);
         let sandbox = observed
             .sandbox_root
             .clone()
@@ -2027,6 +2098,11 @@ impl<E: NodeEffects> Executor<E> {
         // A session that waits on a human answer needs the on-call manager.
         let waiting = observed.status == SessionStatus::WaitingApproval;
         self.reconcile_on_call(execution, attempt, waiting).await?;
+        let (admission_wait, update) = {
+            let store = self.store.lock().await;
+            rows::account_build_admission_wait(&store, execution, attempt, admission_since)?
+        };
+        self.publish(update);
         let paused = self
             .account_node_wait(
                 execution,
@@ -2035,7 +2111,9 @@ impl<E: NodeEffects> Executor<E> {
                 observed.waiting_since,
                 observed.waited_ms,
             )
-            .await?;
+            .await?
+            + downtime
+            + admission_wait;
         // The restart journal owns a session it cut off (deploy drain or
         // graceful restart) and continues it at startup: live, never settled.
         let lost_to_restart = observed.lost_to_restart();
@@ -2388,7 +2466,7 @@ impl<E: NodeEffects> Executor<E> {
     }
 
     /// A live session: interrupt it while cancelling, or bound its wall time
-    /// (less the time it spent waiting on an answer).
+    /// less answer waits, build admission and daemon downtime.
     async fn observe_live(
         &self,
         execution: &ExecutionRow,
@@ -2404,7 +2482,27 @@ impl<E: NodeEffects> Executor<E> {
                 .await?;
             return Ok(false);
         }
-        self.effects.interrupt(attempt.session_id).await;
+        if self.parked_awaiting_resume(attempt.session_id).await? {
+            if !self.withdraw_parked_session(attempt.session_id).await {
+                return Ok(false);
+            }
+        } else {
+            self.effects.interrupt(attempt.session_id).await;
+        }
+        // A timed-out worker may have already committed its result (or still
+        // hold uncommitted work). Preserve that work just as for an interrupted
+        // session, so the owner can resolve the attempt rather than hand-drive it.
+        if let Some(sandbox) = &attempt.sandbox_root {
+            let (status, mut settlement) = Self::preserve(execution, attempt, sandbox);
+            if status != AttemptStatus::Interrupted {
+                settlement.error = Some(format!(
+                    "node session exceeded its wall-time limit; {}",
+                    settlement.error.as_deref().unwrap_or("work preserved")
+                ));
+                self.settle(execution, attempt, status, settlement).await?;
+                return Ok(true);
+            }
+        }
         let settlement = failed(
             failure::TIMEOUT,
             "node session exceeded its wall-time limit",
@@ -2493,14 +2591,45 @@ impl<E: NodeEffects> Executor<E> {
             )?)
     }
 
-    /// #3038: take a cancelled node's parked session out of the daemon's
+    /// A jobs-terminal wake pauses only for a job this node owns and only
+    /// during admission. A running build/test continues to spend node time.
+    async fn build_admission_since(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<Utc>>> {
+        let store = self.store.lock().await;
+        let mut candidates = Vec::new();
+        for (wake, _) in store.list_owned_scheduled_jobs(session_id, false, 100)? {
+            let Some(state) = store.wake_when_state(wake.id)? else {
+                continue;
+            };
+            for id in state.predicate.jobs_terminal.iter().flatten() {
+                let Some(row) = store.get_agent_job(*id)? else {
+                    continue;
+                };
+                if row.job.owner_session_id != session_id {
+                    continue;
+                }
+                candidates.push((row.job, state.armed_at));
+            }
+        }
+        drop(store);
+        Ok(candidates
+            .into_iter()
+            .filter_map(|(job, armed_at)| {
+                build_admission_started(&job).map(|wait| wait.max(armed_at))
+            })
+            .min())
+    }
+
+    /// Take a cancelled or timed-out node's parked session out of the daemon's
     /// resume set: stop its open jobs, then disable every wake it owns. A
     /// session whose result wake already fired and whose resume turn is about
     /// to start cannot be recalled, so it is also interrupted. `false` when a
     /// job could not be stopped (retried on the next pass).
     async fn withdraw_parked_session(&self, session_id: Uuid) -> bool {
         if let Err(error) = self.effects.cancel_open_jobs(session_id).await {
-            tracing::warn!(%session_id, %error, "cancelling execution: parked node job not stopped");
+            tracing::warn!(%session_id, %error, "stopping topology node: parked node job not stopped");
             return false;
         }
         let disabled = {
@@ -2509,11 +2638,11 @@ impl<E: NodeEffects> Executor<E> {
         };
         match disabled {
             Ok(ids) if !ids.is_empty() => {
-                tracing::info!(%session_id, wakes = ids.len(), "cancelling execution: parked node wakes withdrawn");
+                tracing::info!(%session_id, wakes = ids.len(), "stopping topology node: parked node wakes withdrawn");
             }
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(%session_id, %error, "cancelling execution: parked node wakes not withdrawn");
+                tracing::warn!(%session_id, %error, "stopping topology node: parked node wakes not withdrawn");
                 return false;
             }
         }
@@ -2545,7 +2674,87 @@ impl<E: NodeEffects> Executor<E> {
             Some(GraphValue::String(content)) => content.as_str(),
             _ => "",
         };
-        Ok(validate_first_line(content).is_err())
+        // A baton (#3340) is the session's final word, not a turn boundary.
+        Ok(validate_first_line(content).is_err() && baton::parse(content).is_none())
+    }
+
+    /// #3340: the session ended its turn with the context-cap baton instead
+    /// of a stage handoff. The baton is the node's outcome: the session's
+    /// commit (and any uncommitted paths, as a snapshot) is preserved, the
+    /// attempt settles `interrupted` as `context_cap_continued`, and
+    /// `schedule` relaunches the node from that commit with the baton as
+    /// context. A node instance that already continued
+    /// [`baton::MAX_CONTEXT_CAP_CONTINUATIONS`] times blocks for a manager
+    /// instead, its work preserved.
+    async fn settle_context_cap_baton(
+        &self,
+        execution: &ExecutionRow,
+        attempt: &AttemptRow,
+        sandbox: &std::path::Path,
+        baton: &baton::ContextCapBaton,
+    ) -> Result<(AttemptStatus, Settlement)> {
+        let prior = {
+            let store = self.store.lock().await;
+            rows::load_attempts(&store, execution.id)?
+                .iter()
+                .filter(|row| {
+                    row.node_id == attempt.node_id
+                        && row.iteration == attempt.iteration
+                        && row.id != attempt.id
+                        && row.failure_class.as_deref() == Some(failure::CONTEXT_CAP_CONTINUED)
+                })
+                .count()
+        };
+        let (preserved_status, settlement) = Self::preserve(execution, attempt, sandbox);
+        if preserved_status == AttemptStatus::Failed {
+            return Ok((preserved_status, settlement));
+        }
+        let spent = prior >= baton::MAX_CONTEXT_CAP_CONTINUATIONS;
+        if spent && preserved_status == AttemptStatus::Blocked {
+            return Ok((
+                AttemptStatus::Blocked,
+                Settlement {
+                    error: Some(format!(
+                        "node session passed the context-cap baton after {prior} continuation(s); \
+                         work preserved, resolve with ResolveTopologyAttempt"
+                    )),
+                    ..settlement
+                },
+            ));
+        }
+        if spent {
+            return Ok((
+                AttemptStatus::Failed,
+                failed(
+                    failure::CONTEXT_CAP_CONTINUED,
+                    "node session passed the context-cap baton again with no work to continue \
+                     from and its continuations are spent",
+                ),
+            ));
+        }
+        let mut output = NodeData::new();
+        output.insert(BATON_OUTPUT_KEY, GraphValue::String(baton.text.clone()));
+        if let Some(sha) = &baton.sha {
+            output.insert("context_cap_baton_sha", GraphValue::String(sha.clone()));
+        }
+        Ok((
+            AttemptStatus::Interrupted,
+            Settlement {
+                failure_class: Some(failure::CONTEXT_CAP_CONTINUED),
+                error: Some(format!(
+                    "node session filled its context and passed the baton; the node continues \
+                     from {} (continuation {} of {})",
+                    settlement
+                        .preserved_commit
+                        .as_deref()
+                        .unwrap_or(&attempt.base_commit),
+                    prior + 1,
+                    baton::MAX_CONTEXT_CAP_CONTINUATIONS
+                )),
+                output: Some(serde_json::to_value(&output)?),
+                ..settlement
+            },
+        ))
     }
 
     /// Plan §4 rule 3: observe git, never trust a reported SHA.
@@ -2565,6 +2774,17 @@ impl<E: NodeEffects> Executor<E> {
                 },
             ));
         };
+        // #3340: a context-cap baton is a node outcome of its own, judged
+        // before the sandbox state (a baton with uncommitted paths is
+        // snapshotted and continued, not blocked).
+        let last_message = self.effects.output(attempt.session_id).await?;
+        if let Some(GraphValue::String(content)) = last_message.get("content")
+            && let Some(passed) = baton::parse(content)
+        {
+            return self
+                .settle_context_cap_baton(execution, attempt, &sandbox, &passed)
+                .await;
+        }
         let observed = match custody::observe_sandbox(&sandbox) {
             Ok(observed) => observed,
             Err(error) => {
@@ -2955,12 +3175,41 @@ impl<E: NodeEffects> Executor<E> {
                 attempt.base_commit
             )));
         }
+        // #3772: the claim must carry its proof (criterion-to-evidence summary
+        // and the tests run); a bare word is `already_satisfied_unproven`.
+        // #3808: the summary must map each of the Issue's acceptance criteria.
+        // #3881: the Issue row is read, the proof checked against it and the
+        // close fenced on that row's version under one store lock, so an edit
+        // of the criteria cannot slip in between and close on a stale proof.
+        let store = self.store.lock().await;
+        let (criteria, proved_row_version) =
+            match crate::topology::starters::issue_snapshot(execution.input.as_ref()) {
+                Some((project_id, display_number)) => {
+                    match store.get_issue_by_display_number(project_id, display_number)? {
+                        Some(issue) => (
+                            crate::topology::issue_close::issue_acceptance_criteria_count(
+                                &issue.body,
+                            ),
+                            Some(issue.row_version),
+                        ),
+                        None => (1, None),
+                    }
+                }
+                None => (1, None),
+            };
+        if let Some(gap) = crate::topology::issue_close::satisfied_proof_gap(content, criteria) {
+            return Ok(Err(format!(
+                "already_satisfied_unproven: the handoff lacks {gap}"
+            )));
+        }
         let note = crate::topology::issue_close::already_satisfied_note(evidence, content);
-        let close = match IssueCloseRequest::for_already_satisfied(execution, attempt, note) {
-            Ok(request) => {
-                let store = self.store.lock().await;
-                close_input_issue(&store, &request)?
-            }
+        let close = match IssueCloseRequest::for_already_satisfied(
+            execution,
+            attempt,
+            note,
+            proved_row_version,
+        ) {
+            Ok(request) => close_input_issue(&store, &request)?,
             Err(refused) => refused,
         };
         Ok(Ok(AlreadySatisfied {
@@ -3354,6 +3603,8 @@ impl<E: NodeEffects> Executor<E> {
                     && row.id != attempt.id
                     && row.status == AttemptStatus::Interrupted
                     && row.preserved_commit.is_some()
+                    // A context-cap continuation (#3340) is not a restart retry.
+                    && row.failure_class.as_deref() != Some(failure::CONTEXT_CAP_CONTINUED)
             }))
     }
 
@@ -3551,6 +3802,54 @@ fn wall_time_notice(
 /// Whether the attempt outlived its node wall time or the execution deadline.
 pub(crate) fn wall_time_expired(execution: &ExecutionRow, attempt: &AttemptRow) -> bool {
     wall_time_expired_after(execution, attempt, chrono::TimeDelta::zero())
+}
+
+/// The daemon holds some jobs before unit launch; cargo-slot and artifact locks
+/// also wait inside an already-running unit. Both are admission, not test time.
+fn build_admission_started(job: &rsi_common::agent_jobs::AgentJobV1) -> Option<DateTime<Utc>> {
+    use rsi_common::agent_jobs::{JobKind, JobState};
+    use std::io::BufRead;
+
+    if !matches!(job.kind, JobKind::Build | JobKind::Test) {
+        return None;
+    }
+    if job.state == JobState::Queued {
+        return DateTime::parse_from_rfc3339(&job.created_at)
+            .ok()
+            .map(|at| at.with_timezone(&Utc));
+    }
+    if job.state != JobState::Running {
+        return None;
+    }
+    let file = std::fs::File::open(&job.log_path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    let mut pending = None;
+    while reader.read_until(b'\n', &mut line).ok()? > 0 {
+        if let Some(rest) = String::from_utf8_lossy(&line).strip_prefix("rsi-phase ")
+            && let Some((at, phase)) = rest.split_once(' ')
+        {
+            if phase.starts_with("slot-wait:")
+                || phase.starts_with("artifact-lock-wait:")
+                || phase.starts_with("sandbox-lock-wait:")
+            {
+                if let Some(at) = at
+                    .parse()
+                    .ok()
+                    .and_then(|at| DateTime::from_timestamp(at, 0))
+                {
+                    pending.get_or_insert(at);
+                }
+            } else if phase.starts_with("slot-granted:")
+                || phase.starts_with("artifact-lock-held:")
+                || phase.starts_with("sandbox-lock-held:")
+            {
+                pending = None;
+            }
+        }
+        line.clear();
+    }
+    pending
 }
 
 /// `wall_time_expired` with the node's paused (waiting-on-an-answer) time added

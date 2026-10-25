@@ -13,7 +13,6 @@ use crate::store::Store;
 use async_trait::async_trait;
 use rsi_common::types::{Issue, IssueStatus};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// `Tracker` impl over the local single-user store.
@@ -30,17 +29,20 @@ use uuid::Uuid;
 /// (`poller.rs:130`,`:247`) run strictly after `fetch_*`/`update_issue_state`
 /// return, so there is no nesting and no deadlock risk.
 pub struct LocalTracker {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Uuid,
 }
 
 impl LocalTracker {
-    pub const fn new_for_project(store: Arc<Mutex<Store>>, project_id: Uuid) -> Self {
+    pub const fn new_for_project(
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+        project_id: Uuid,
+    ) -> Self {
         Self { store, project_id }
     }
 
     #[cfg(test)]
-    pub fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub fn new(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> Self {
         Self::new_for_project(store, crate::store::d04_test_project_id())
     }
 
@@ -253,8 +255,10 @@ mod tests {
         }
     }
 
-    fn make_store() -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    fn make_store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
+        Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ))
     }
 
     fn local_config() -> IssueTrackerConfig {
@@ -535,7 +539,7 @@ mod tests {
     /// counts launches instead of spawning real sessions.
     struct MockLauncher {
         count: AtomicUsize,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
     }
 
     #[async_trait]

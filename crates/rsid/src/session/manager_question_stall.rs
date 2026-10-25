@@ -12,7 +12,6 @@
 
 use rsi_common::friction::{FrictionKind, NewFrictionEventV1};
 use rsi_common::types::{ConversationEvent, EventType, Role, Session};
-use tokio::sync::Mutex;
 
 use crate::store::Store;
 use crate::store::manager_question_stall::ManagerQuestionArm;
@@ -105,7 +104,7 @@ pub(crate) fn turn_ends_asking(events: &[ConversationEvent]) -> bool {
 /// manager seat that ended its turn asking, record friction and arm the
 /// safety wake. Never fails the finalizer.
 pub(crate) async fn guard_completed_manager(
-    store: &Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     session: &Session,
     events: &[ConversationEvent],
 ) {

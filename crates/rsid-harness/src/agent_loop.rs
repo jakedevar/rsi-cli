@@ -5,8 +5,11 @@
 //! and settlement, the tool registry and its policy, agent mail, worktree digests) is
 //! reached through the traits in [`crate::ports`]; this module only sequences them.
 
-use crate::compaction::{auto_compact, hard_trim};
-use crate::errors::ProviderError;
+use crate::compaction::{
+    CompactionPolicy, CompactionRecord, ContextMeasure, auto_compact_with_policy,
+    compact_after_overflow, hard_trim,
+};
+use crate::errors::{ProviderError, ProviderErrorClass};
 use crate::normalize::normalize_history;
 use crate::ports::{GateDigest, LoopFault, LoopTools, MailBoundary, MailDelivery, ModelPort};
 use crate::retry;
@@ -29,7 +32,8 @@ pub struct LoopParams {
     pub working_dir: PathBuf,
     pub model: String,
     pub reasoning_effort: Option<String>,
-    /// Step budget (default 25).
+    /// Step budget per turn. The daemon passes the operator's
+    /// `harness_max_iterations_per_turn` (default 150) or a clamped per-launch cap.
     pub max_iterations: u32,
     /// Context window size for this model.
     pub token_limit: u64,
@@ -38,6 +42,8 @@ pub struct LoopParams {
     /// Absolute live-context budget (#966): history compacts at
     /// `min(75% of token_limit, compact_budget)`.
     pub compact_budget: Option<u64>,
+    /// Tier 1 compaction policy (#3199); the default is the built-in behaviour.
+    pub compaction: CompactionPolicy,
     pub completion_gates: Option<CompletionGates>,
     pub completion_gates_enabled: bool,
 }
@@ -93,6 +99,20 @@ pub const FINAL_ANSWER_RETRY_STREAM_EVENT: &str = "final_answer_retry";
 /// final response (#1061).
 pub const FINAL_ANSWER_RETRY_PROMPT: &str = "Your last response was empty because it hit the output \
 limit. Make no tool calls; write your final answer now, concisely.";
+
+/// Stream event recording a length-stop recovery (#4028): the truncated turn was
+/// discarded and the step re-requested with a larger output cap.
+pub const LENGTH_ACT_RETRY_STREAM_EVENT: &str = "length_act_retry";
+
+/// Nudge appended when a turn spent its whole output budget reasoning and made
+/// no tool call (#4028). The task is not finished; the model must act.
+pub const LENGTH_ACT_RETRY_PROMPT: &str = "Your last response hit the output limit while \
+reasoning, before any action, and was discarded. The task is not finished. Reason briefly and \
+make your next tool call now.";
+
+/// Consecutive length-stop recoveries before the loop falls back to the
+/// final-answer retry (#4028). A response with a tool call resets the count.
+const LENGTH_ACT_RETRY_LIMIT: u32 = 2;
 
 /// Stream event recording the repeated-failure nudge (#2257).
 pub const REPEAT_FAILURE_STREAM_EVENT: &str = "repeat_failure";
@@ -212,15 +232,43 @@ const DEFAULT_CALL_MAX_OUTPUT_TOKENS: u64 = 8192;
 /// The per-call output-token ceiling for `provider`: the generic ceiling, or
 /// the route's default output budget when that is larger (#2253).
 pub fn call_output_token_cap(provider: &dyn ModelPort) -> u64 {
-    provider
-        .default_max_output_tokens()
-        .map_or(DEFAULT_CALL_MAX_OUTPUT_TOKENS, |route| {
-            u64::from(route).max(DEFAULT_CALL_MAX_OUTPUT_TOKENS)
-        })
+    call_output_token_cap_for(provider.default_max_output_tokens())
+}
+
+fn call_output_token_cap_for(route_default: Option<u32>) -> u64 {
+    route_default.map_or(DEFAULT_CALL_MAX_OUTPUT_TOKENS, |route| {
+        u64::from(route).max(DEFAULT_CALL_MAX_OUTPUT_TOKENS)
+    })
+}
+
+/// The output-token ceiling of a length-stop recovery call (#4028): the launch's
+/// knob, else the final-answer retry's ceiling.
+fn recovery_call_output_cap(recovery_knob: Option<u32>) -> u64 {
+    recovery_knob.map_or(FINAL_ANSWER_RETRY_MAX_TOKENS, u64::from)
+}
+
+/// The most output tokens any one call of the loop may request on a route with
+/// `route_default` output budget: the larger of the normal per-call ceiling, the
+/// final-answer retry's (#3350) and the length-stop recovery's (#4028). A spend
+/// cap sizes its per-call reserve from this.
+#[must_use]
+pub fn max_call_output_tokens(route_default: Option<u32>, recovery_knob: Option<u32>) -> u64 {
+    call_output_token_cap_for(route_default)
+        .max(FINAL_ANSWER_RETRY_MAX_TOKENS)
+        .max(recovery_call_output_cap(recovery_knob))
 }
 
 /// Reasoning effort for the final-answer retry call (#1061).
 pub const FINAL_ANSWER_RETRY_EFFORT: &str = "low";
+
+/// The reasoning effort of a length-stop recovery call (#4028): `low`, unless
+/// the launch already asked for less.
+fn lowered_effort(configured: Option<&str>) -> String {
+    match configured.map(|effort| effort.trim().to_ascii_lowercase()) {
+        Some(effort) if matches!(effort.as_str(), "none" | "minimal" | "low") => effort,
+        _ => FINAL_ANSWER_RETRY_EFFORT.to_string(),
+    }
+}
 
 /// Whether a provider stop reason means the output budget ran out (#1061):
 /// `length` (OpenAI-compatible, OpenRouter), `max_tokens` (Anthropic),
@@ -305,6 +353,22 @@ fn hash_tool_call(name: &str, arguments: &str) -> u64 {
     hasher.finish()
 }
 
+/// The content blocks of the final-answer `assistant` event: the model's
+/// thinking (when it returned any) ahead of its answer text (#3170). The daemon
+/// stores the thinking as its own row, which a resumed session rebuilds.
+fn final_answer_content(response: &ChatResponse) -> serde_json::Value {
+    let mut blocks = Vec::new();
+    if let Some(thinking) = response
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        blocks.push(json!({"type": "thinking", "thinking": thinking}));
+    }
+    blocks.push(json!({"type": "text", "text": response.content}));
+    serde_json::Value::Array(blocks)
+}
+
 fn tool_result_message(call_id: &str, result: ToolResult) -> ChatMessage {
     let is_error = result.is_error();
     let has_typed_blocks = result.has_typed_blocks();
@@ -387,6 +451,55 @@ fn full_prompt_tokens(provider_name: &str, usage: &TokenUsage) -> u64 {
         usage.prompt_tokens
     }
 }
+/// #796: persist the compaction boundary so a continued session rebuilds
+/// summary plus kept tail, not the full raw transcript.
+async fn send_compaction(
+    event_tx: &mpsc::Sender<StreamEvent>,
+    record: &CompactionRecord,
+) -> Result<(), LoopFault> {
+    // #974: a local-truncation fallback stays visible to the operator
+    // instead of silently failing the turn.
+    if let Some(fallback) = record.fallback.as_deref() {
+        tracing::warn!(
+            fallback,
+            messages_before = record.messages_before,
+            "Harness auto-compaction used local truncation"
+        );
+    }
+    event_tx
+        .send(StreamEvent {
+            event_type: COMPACTION_STREAM_EVENT.into(),
+            data: json!({
+                "summary": record.summary,
+                "kept_messages": record.kept_messages,
+                "messages_before": record.messages_before,
+                "tokens_before": record.tokens_before,
+                "fallback": record.fallback,
+            }),
+        })
+        .await
+        .map_err(|_| LoopFault::channel_closed())
+}
+
+/// The output-token cap for one request over `history`.
+fn request_max_tokens_for(
+    history: &[ChatMessage],
+    token_limit: u64,
+    provider: &dyn ModelPort,
+    final_answer_retry_turn: bool,
+    length_act_retry_cap: Option<u64>,
+) -> u64 {
+    let effective_max_tokens = estimate_remaining_tokens(history, token_limit);
+    if final_answer_retry_turn {
+        effective_max_tokens.min(FINAL_ANSWER_RETRY_MAX_TOKENS)
+    } else if let Some(cap) = length_act_retry_cap {
+        // #4028: never below the normal ceiling, so the retry is a real increase.
+        effective_max_tokens.min(cap.max(call_output_token_cap(provider)))
+    } else {
+        effective_max_tokens.min(call_output_token_cap(provider))
+    }
+}
+
 /// Run one harness turn to completion.
 pub async fn run_loop(
     provider: &dyn ModelPort,
@@ -406,6 +519,7 @@ pub async fn run_loop(
         token_limit,
         conversation_history,
         compact_budget,
+        compaction,
         completion_gates,
         completion_gates_enabled,
     } = params;
@@ -451,6 +565,16 @@ pub async fn run_loop(
     // Emitted as "prompt_tokens_total" for the monitor.
     let mut cumulative_prompt_tokens: u64 = 0;
     tools.set_context_usage(0, token_limit);
+    // #3166: what the compaction trigger measures besides message text: the
+    // provider's own count of its last prompt, and the tool specs.
+    let mut context_measure = ContextMeasure {
+        tool_spec_tokens: if provider.supports_native_tools() {
+            estimated_tool_specs_tokens(&tools.specs())
+        } else {
+            0
+        },
+        ..ContextMeasure::default()
+    };
 
     // #1039: why the turn ended without a normal final reply, so the stream
     // never shows a bare `Completed` with no assistant output.
@@ -461,6 +585,12 @@ pub async fn run_loop(
     // iteration, so it is granted one extra loop step.
     let mut final_answer_retry_spent = false;
     let mut final_answer_retry_pending = false;
+    // #4028: a length stop with no tool call discards the turn and re-requests
+    // the step (this counts as an ordinary iteration) with a larger output cap
+    // and a lower reasoning effort.
+    let mut length_act_retries = 0_u32;
+    let mut length_act_retry_pending = false;
+    let recovery_cap = recovery_call_output_cap(tools.recovery_max_output_tokens());
     let mut gate_retry_pending = false;
     let mut completion_gate_attempts = 0_u32;
     let mut last_completion_gate_failure: Option<CompletionGateFailure> = None;
@@ -484,6 +614,7 @@ pub async fn run_loop(
         let iteration = ordinary_iterations;
         let final_answer_retry_turn = std::mem::take(&mut final_answer_retry_pending);
         let gate_retry_turn = std::mem::take(&mut gate_retry_pending);
+        let length_act_retry_turn = std::mem::take(&mut length_act_retry_pending);
         if iteration >= max_iterations && !gate_retry_turn && !final_answer_retry_turn {
             break;
         }
@@ -502,13 +633,15 @@ pub async fn run_loop(
         let compaction_focus = tools.take_compaction_focus().await;
 
         // 2. Auto-compaction check
-        let compacted = auto_compact(
+        let compacted = auto_compact_with_policy(
             &mut history,
             provider,
             &model,
             token_limit,
             compact_budget,
             compaction_focus.as_deref(),
+            &context_measure,
+            &compaction,
             &cancel,
         )
         .await
@@ -516,28 +649,9 @@ pub async fn run_loop(
         // #796: persist the compaction boundary so a continued session
         // rebuilds summary plus kept tail, not the full raw transcript.
         if let Some(record) = compacted {
-            // #974: a local-truncation fallback stays visible to the operator
-            // instead of silently failing the turn.
-            if let Some(fallback) = record.fallback.as_deref() {
-                tracing::warn!(
-                    fallback,
-                    messages_before = record.messages_before,
-                    "Harness auto-compaction used local truncation"
-                );
-            }
-            event_tx
-                .send(StreamEvent {
-                    event_type: COMPACTION_STREAM_EVENT.into(),
-                    data: json!({
-                        "summary": record.summary,
-                        "kept_messages": record.kept_messages,
-                        "messages_before": record.messages_before,
-                        "tokens_before": record.tokens_before,
-                        "fallback": record.fallback,
-                    }),
-                })
-                .await
-                .map_err(|_| LoopFault::channel_closed())?;
+            // The reported count described the history just rewritten.
+            context_measure.forget_report();
+            send_compaction(&event_tx, &record).await?;
         }
         if cancel.is_cancelled() {
             tracing::info!("Agent loop cancelled after compaction at iteration {iteration}");
@@ -567,12 +681,13 @@ pub async fn run_loop(
                 .await
                 .map_err(|_| LoopFault::channel_closed())?;
         }
-        let effective_max_tokens = estimate_remaining_tokens(&history, token_limit);
-        let request_max_tokens = if final_answer_retry_turn {
-            effective_max_tokens.min(FINAL_ANSWER_RETRY_MAX_TOKENS)
-        } else {
-            effective_max_tokens.min(call_output_token_cap(provider))
-        };
+        let request_max_tokens = request_max_tokens_for(
+            &history,
+            token_limit,
+            provider,
+            final_answer_retry_turn,
+            length_act_retry_turn.then_some(recovery_cap),
+        );
         let mut tool_specs = if provider.supports_native_tools() {
             tools.specs()
         } else {
@@ -587,6 +702,7 @@ pub async fn run_loop(
             tool_specs.retain(|spec| !capabilities.names.iter().any(|hosted| *hosted == spec.name));
             tool_specs.extend(tools.filter_hosted_specs(capabilities.specs));
         }
+        context_measure.tool_spec_tokens = estimated_tool_specs_tokens(&tool_specs);
         // The wrap-up and final-answer turns must not call tools. A route that
         // accepts `tool_choice: "none"` keeps `tools` and says so (#2253), so
         // the history's earlier `tool_calls` stay well formed for it; any
@@ -608,6 +724,8 @@ pub async fn run_loop(
             stream: provider.supports_streaming(),
             reasoning_effort: if final_answer_retry_turn {
                 Some(FINAL_ANSWER_RETRY_EFFORT.to_string())
+            } else if length_act_retry_turn {
+                Some(lowered_effort(reasoning_effort.as_deref()))
             } else {
                 reasoning_effort.clone()
             },
@@ -631,18 +749,33 @@ pub async fn run_loop(
         let mut prior_invocation_id = None;
         let mut last_retry_error: Option<ProviderError> = None;
         let mut claimed_mail: Option<Box<dyn MailDelivery>> = None;
+        // #3164: a `context_length_exceeded` costs one compaction and one
+        // retry of this step; a second overflow surfaces as the typed error.
+        let mut context_retry_spent = false;
         let (response, admitted) = loop {
+            let overflow_suffix = if context_retry_spent {
+                ":context_retry"
+            } else {
+                ""
+            };
             let admission = provider
                 .admit_primary(
-                    &format!("turn:{iteration}:attempt:{}", retry_budget.attempts()),
-                    &format!("{fingerprint_hint}:attempt:{}", retry_budget.attempts()),
+                    &format!(
+                        "turn:{iteration}:attempt:{}{overflow_suffix}",
+                        retry_budget.attempts()
+                    ),
+                    &format!(
+                        "{fingerprint_hint}:attempt:{}{overflow_suffix}",
+                        retry_budget.attempts()
+                    ),
                     prior_invocation_id,
                 )
                 .await;
             let mut admitted = match admission {
                 Ok(call) => call,
                 Err(fault)
-                    if retry_budget.attempts() > 0 && fault.policy_denied_reason().is_some() =>
+                    if (retry_budget.attempts() > 0 || context_retry_spent)
+                        && fault.policy_denied_reason().is_some() =>
                 {
                     let reason = fault.policy_denied_reason().unwrap_or_default().to_owned();
                     let Some(error) = last_retry_error else {
@@ -826,10 +959,53 @@ pub async fn run_loop(
                                 .map_or("provider_call_failed", |error| error.detail_code.as_str()),
                         )
                         .await?;
-                    if provider_error
+                    if let Some(error) = provider_error
                         .as_ref()
-                        .is_some_and(|error| error.http_status == Some(400))
-                        && request.tools.iter().any(|tool| tool.kind.is_hosted())
+                        .filter(|error| error.class == ProviderErrorClass::ContextTooLong)
+                        && !context_retry_spent
+                        && !cancel.is_cancelled()
+                    {
+                        context_retry_spent = true;
+                        let record = compact_after_overflow(
+                            &mut history,
+                            provider,
+                            &model,
+                            token_limit,
+                            compact_budget,
+                            &cancel,
+                        )
+                        .await
+                        .map_err(|error| {
+                            LoopFault::process(format!(
+                                "Harness overflow compaction failed: {error}"
+                            ))
+                        })?;
+                        if let Some(record) = record {
+                            context_measure.forget_report();
+                            tracing::warn!(
+                                iteration,
+                                messages_before = record.messages_before,
+                                "provider reported context overflow; compacted and retrying the step once"
+                            );
+                            send_compaction(&event_tx, &record).await?;
+                            normalize_history(&mut history);
+                            request.messages = history.clone();
+                            request.max_tokens = Some(request_max_tokens_for(
+                                &history,
+                                token_limit,
+                                provider,
+                                final_answer_retry_turn,
+                                length_act_retry_turn.then_some(recovery_cap),
+                            ) as u32);
+                            prior_invocation_id = failed_invocation_id;
+                            last_retry_error = Some(error.clone());
+                            continue;
+                        }
+                    }
+                    if provider_error.as_ref().is_some_and(|error| {
+                        error.http_status == Some(400)
+                            && error.class != ProviderErrorClass::ContextTooLong
+                    }) && request.tools.iter().any(|tool| tool.kind.is_hosted())
                     {
                         let spec = request
                             .tools
@@ -965,13 +1141,47 @@ pub async fn run_loop(
             &provider.provider_name(),
             &response.usage,
         ));
-        tools.set_context_usage(
-            full_prompt_tokens(&provider.provider_name(), &response.usage),
-            token_limit,
-        );
+        let reported_prompt_tokens = full_prompt_tokens(&provider.provider_name(), &response.usage);
+        tools.set_context_usage(reported_prompt_tokens, token_limit);
+        // `history` is still the request this response answers: the assistant
+        // message is appended below, and later messages count as appended
+        // since this call.
+        context_measure.reported_prompt_tokens = reported_prompt_tokens;
+        context_measure.reported_history_len = history.len();
 
         // 6. Parse tool calls
+        if !response.tool_calls.is_empty() {
+            length_act_retries = 0;
+        }
         if response.tool_calls.is_empty() {
+            // #4028: a length stop with no text and no tool call is a forced stop
+            // mid-task, not the end of the work. Discard the truncated turn and
+            // re-request the step with a larger cap, a lower effort and a nudge to
+            // act. The tool-less wrap-up and final-answer calls are exempt.
+            if response.content.trim().is_empty()
+                && !wrap_up_turn
+                && !final_answer_retry_turn
+                && length_act_retries < LENGTH_ACT_RETRY_LIMIT
+                && is_output_limit_stop(response.stop_reason.as_deref())
+            {
+                length_act_retries += 1;
+                length_act_retry_pending = true;
+                history.push(ChatMessage::user(LENGTH_ACT_RETRY_PROMPT));
+                event_tx
+                    .send(StreamEvent {
+                        event_type: LENGTH_ACT_RETRY_STREAM_EVENT.into(),
+                        data: json!({
+                            "session_id": session_tag,
+                            "provider_stop_reason": response.stop_reason,
+                            "attempt": length_act_retries,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "reasoning_tokens": response.usage.reasoning_tokens,
+                        }),
+                    })
+                    .await
+                    .map_err(|_| LoopFault::channel_closed())?;
+                continue 'turns;
+            }
             // Compose final reply
             if response.content.trim().is_empty()
                 && !final_answer_retry_spent
@@ -1198,7 +1408,10 @@ pub async fn run_loop(
                             "session_id": session_tag,
                             "message": {
                                 "role": "assistant",
-                                "content": [{"type": "text", "text": response.content}],
+                                "content": final_answer_content(&response),
+                                // #3170: the structured blocks ride beside the
+                                // text so a resumed session can rebuild them.
+                                "reasoning_details": response.reasoning_details,
                                 "usage": {
                                     "prompt_tokens_total": cumulative_prompt_tokens,
                                     "input_tokens": total_usage.prompt_tokens,
@@ -1236,6 +1449,10 @@ pub async fn run_loop(
             tool_call_id: None,
             is_error: false,
             tool_calls: tool_calls.clone(),
+            // #3170: keep the model's own thinking with the step so a route that
+            // wants it back can replay it on the next request of this chain.
+            reasoning: response.reasoning_content.clone(),
+            reasoning_details: response.reasoning_details.clone(),
         };
         history.push(assistant_msg);
 
@@ -1561,7 +1778,11 @@ pub async fn run_loop(
         let process_notices = tools.take_process_notices().await;
         append_process_notices(&event_tx, &mut history, &session_tag, process_notices).await?;
 
+        let len_before_trim = history.len();
         hard_trim(&mut history, 200); // safety backstop
+        if history.len() != len_before_trim {
+            context_measure.forget_report();
+        }
     }
 
     // Every non-error exit other than a reply or a cancellation is the
@@ -1985,6 +2206,7 @@ mod port_tests {
             tool_calls: calls,
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: Some("stop".into()),
         }
     }
@@ -2000,6 +2222,7 @@ mod port_tests {
             token_limit: 100_000,
             conversation_history: None,
             compact_budget: None,
+            compaction: CompactionPolicy::default(),
             completion_gates: None,
             completion_gates_enabled: true,
         }
@@ -2034,6 +2257,14 @@ mod port_tests {
         results: Vec<Result<ChatResponse, LoopFault>>,
         partials: Option<Vec<Vec<String>>>,
     ) -> RunOutput {
+        run_script_with(results, partials, params()).await
+    }
+
+    async fn run_script_with(
+        results: Vec<Result<ChatResponse, LoopFault>>,
+        partials: Option<Vec<Vec<String>>>,
+        params: LoopParams,
+    ) -> RunOutput {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let settled = Arc::new(Mutex::new(Vec::new()));
         let model = ScriptedModel {
@@ -2046,7 +2277,7 @@ mod port_tests {
         let outcome = run_loop(
             &model,
             Arc::new(EchoTools),
-            params(),
+            params,
             tx,
             CancellationToken::new(),
             None,
@@ -2113,6 +2344,182 @@ mod port_tests {
         assert_eq!(result.data["stop_reason"], "iteration_limit");
     }
 
+    fn length_stop(content: &str) -> ChatResponse {
+        ChatResponse {
+            stop_reason: Some("length".into()),
+            reasoning_content: Some("thinking".into()),
+            ..response(content, Vec::new())
+        }
+    }
+
+    /// #4028: a length stop with no tool call is a forced stop mid-task. The
+    /// truncated turn is discarded and the step re-requested with a larger cap,
+    /// a lower effort and a nudge to act; the next call's tool call continues
+    /// the task.
+    #[tokio::test]
+    async fn a_length_stop_with_no_tool_call_continues_the_loop() {
+        let mut first = length_stop("");
+        first.usage.completion_tokens = 8192;
+        first.usage.reasoning_tokens = 8192;
+        let params = LoopParams {
+            reasoning_effort: Some("high".into()),
+            ..params()
+        };
+        let (outcome, events, requests, _settled) = run_script_with(
+            vec![
+                Ok(first),
+                Ok(response("", vec![echo_call(1)])),
+                Ok(response("all done", Vec::new())),
+            ],
+            None,
+            params,
+        )
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 3);
+        // Call 1 is the normal call.
+        assert_eq!(requests[0].max_tokens, Some(8192));
+        assert_eq!(requests[0].reasoning_effort.as_deref(), Some("high"));
+        // Call 2 recovers: larger cap, lower effort, nudge, truncated turn gone.
+        assert_eq!(requests[1].max_tokens, Some(32_768));
+        assert_eq!(requests[1].reasoning_effort.as_deref(), Some("low"));
+        let nudge = requests[1].messages.last().expect("nudge");
+        assert_eq!(nudge.role, MessageRole::User);
+        assert_eq!(nudge.content, LENGTH_ACT_RETRY_PROMPT);
+        assert!(
+            !requests[1]
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant)
+        );
+        // The tool call ran, and the task went on to a normal final answer.
+        assert_eq!(
+            requests[2].messages.last().map(|m| m.role),
+            Some(MessageRole::Tool)
+        );
+        assert_eq!(requests[2].max_tokens, Some(8192));
+        assert_eq!(requests[2].reasoning_effort.as_deref(), Some("high"));
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == LENGTH_ACT_RETRY_STREAM_EVENT)
+            .collect();
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].data["attempt"], 1);
+        assert_eq!(retries[0].data["reasoning_tokens"], 8192);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == FINAL_ANSWER_RETRY_STREAM_EVENT)
+        );
+        let assistant = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "assistant")
+            .expect("final assistant event");
+        assert_eq!(assistant.data["message"]["content"][0]["text"], "all done");
+        let result = events.last().expect("result event");
+        assert_eq!(result.data["stop_reason"], "end_turn");
+    }
+
+    /// #4028: recoveries are bounded; a tool call resets the count, and once the
+    /// act retries are spent the #1061 final-answer retry takes over.
+    #[tokio::test]
+    async fn length_recoveries_are_bounded_then_fall_back_to_the_final_answer_retry() {
+        let (outcome, events, requests, _settled) = run(vec![
+            Ok(response("", vec![echo_call(1)])),
+            Ok(length_stop("")),
+            Ok(length_stop("")),
+            Ok(length_stop("")),
+            Ok(response("the answer", Vec::new())),
+        ])
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 5);
+        let count = |kind: &str| events.iter().filter(|e| e.event_type == kind).count();
+        assert_eq!(count(LENGTH_ACT_RETRY_STREAM_EVENT), 2);
+        assert_eq!(count(FINAL_ANSWER_RETRY_STREAM_EVENT), 1);
+        assert_eq!(
+            requests[4].messages.last().map(|m| m.content.as_str()),
+            Some(FINAL_ANSWER_RETRY_PROMPT)
+        );
+
+        // A tool call between two length stops resets the count.
+        let (outcome, events, requests, _settled) = run_script_with(
+            vec![
+                Ok(length_stop("")),
+                Ok(length_stop("")),
+                Ok(response("", vec![echo_call(1)])),
+                Ok(length_stop("")),
+                Ok(response("", vec![echo_call(2)])),
+                Ok(response("done", Vec::new())),
+            ],
+            None,
+            LoopParams {
+                max_iterations: 10,
+                ..params()
+            },
+        )
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == LENGTH_ACT_RETRY_STREAM_EVENT)
+                .count(),
+            3
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == FINAL_ANSWER_RETRY_STREAM_EVENT)
+        );
+    }
+
+    /// #4028: a length stop that still produced text is a reply, not a lost turn.
+    #[tokio::test]
+    async fn a_length_stop_with_text_still_ends_the_turn() {
+        let (outcome, events, requests, _settled) =
+            run(vec![Ok(length_stop("partial answer"))]).await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.event_type == LENGTH_ACT_RETRY_STREAM_EVENT)
+        );
+    }
+
+    #[test]
+    fn the_recovery_cap_follows_the_knob_and_the_spend_reserve_covers_it() {
+        let history = vec![ChatMessage::user("go")];
+        let model = ScriptedModel {
+            results: Mutex::new(VecDeque::new()),
+            partials: None,
+            requests: Arc::new(Mutex::new(Vec::new())),
+            settled: Arc::new(Mutex::new(Vec::new())),
+        };
+        assert_eq!(
+            request_max_tokens_for(&history, 100_000, &model, false, None),
+            8192
+        );
+        assert_eq!(
+            request_max_tokens_for(&history, 100_000, &model, false, Some(65_536)),
+            65_536
+        );
+        // Never below the normal ceiling, and never past the remaining window.
+        assert_eq!(
+            request_max_tokens_for(&history, 100_000, &model, false, Some(1024)),
+            8192
+        );
+        assert!(request_max_tokens_for(&history, 20_000, &model, false, Some(65_536)) < 20_000);
+        assert_eq!(max_call_output_tokens(None, None), 32_768);
+        assert_eq!(max_call_output_tokens(None, Some(65_536)), 65_536);
+        assert_eq!(max_call_output_tokens(Some(16_384), Some(2048)), 32_768);
+        assert_eq!(lowered_effort(Some("high")), "low");
+        assert_eq!(lowered_effort(None), "low");
+        assert_eq!(lowered_effort(Some("minimal")), "minimal");
+    }
     #[tokio::test]
     async fn a_non_retryable_provider_failure_is_reported_and_returned_unchanged() {
         let error = ProviderError {
@@ -2132,6 +2539,289 @@ mod port_tests {
             .find(|event| event.event_type == "provider_error")
             .expect("provider_error event");
         assert_eq!(reported.data["detail_code"], "invalid_key");
+    }
+
+    fn long_history_params(pairs: usize) -> LoopParams {
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("the task")];
+        for n in 0..pairs {
+            history.push(ChatMessage::assistant(&format!("step {n}")));
+            history.push(ChatMessage::user(&format!("continue {n}")));
+        }
+        LoopParams {
+            conversation_history: Some(history),
+            ..params()
+        }
+    }
+
+    fn compactions(events: &[StreamEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| event.event_type == COMPACTION_STREAM_EVENT)
+            .count()
+    }
+
+    fn echo_call(n: u32) -> ToolCall {
+        ToolCall {
+            id: format!("c{n}"),
+            name: "echo".into(),
+            arguments: format!(r#"{{"n":{n}}}"#),
+            hosted: false,
+            hosted_result: None,
+        }
+    }
+
+    /// #3166: the provider's reported prompt tokens drive the trigger even when
+    /// the text estimate is tiny.
+    #[tokio::test]
+    async fn provider_reported_prompt_tokens_over_the_budget_trigger_compaction() {
+        for (reported, expected) in [(2_000, 0), (12_000, 1)] {
+            let mut first = response("", vec![echo_call(1)]);
+            first.usage.prompt_tokens = reported;
+            let mut params = long_history_params(30);
+            params.compact_budget = Some(10_000);
+            let (outcome, events, requests, _settled) = run_script_with(
+                vec![Ok(first), Ok(response("done", Vec::new()))],
+                None,
+                params,
+            )
+            .await;
+            outcome.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                compactions(&events),
+                expected,
+                "reported {reported} against a 10k budget"
+            );
+            if expected == 1 {
+                assert!(requests[1].messages.len() < requests[0].messages.len());
+            }
+        }
+    }
+
+    /// #3199: the policy on `LoopParams` reaches the loop's trigger and its kept
+    /// tail; the default policy leaves a 62-message history alone.
+    #[tokio::test]
+    async fn the_loop_compacts_under_its_params_policy() {
+        let run = |compaction: CompactionPolicy| async move {
+            let mut params = long_history_params(30);
+            params.compaction = compaction;
+            let (outcome, events, requests, _settled) =
+                run_script_with(vec![Ok(response("done", Vec::new()))], None, params).await;
+            outcome.unwrap();
+            (compactions(&events), requests[0].messages.len())
+        };
+        let (count, full) = run(CompactionPolicy::default()).await;
+        assert_eq!(count, 0);
+        assert!(full >= 62, "{full}");
+        let (count, sent) = run(CompactionPolicy {
+            message_trigger: 40,
+            keep_recent: 6,
+            ..CompactionPolicy::default()
+        })
+        .await;
+        assert_eq!(count, 1);
+        // system, the task, the latest instruction or summary, then the kept tail.
+        assert!(
+            sent <= 3 + 6 + 2,
+            "{sent} of {full} messages sent after compaction"
+        );
+    }
+
+    /// #3166: an edit-heavy history (large tool-call arguments, short content)
+    /// compacts at the budget on the first step, before any provider report.
+    #[tokio::test]
+    async fn an_edit_heavy_history_compacts_at_the_budget() {
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("the task")];
+        for n in 0..30 {
+            let mut assistant = ChatMessage::assistant("");
+            assistant.tool_calls.push(ToolCall {
+                id: format!("h{n}"),
+                name: "apply_patch".into(),
+                arguments: "p".repeat(4_000),
+                hosted: false,
+                hosted_result: None,
+            });
+            history.push(assistant);
+            history.push(ChatMessage::tool_result(format!("h{n}"), "ok"));
+        }
+        let mut params = params();
+        params.conversation_history = Some(history);
+        params.compact_budget = Some(20_000);
+        let (outcome, events, requests, _settled) =
+            run_script_with(vec![Ok(response("done", Vec::new()))], None, params).await;
+        outcome.unwrap();
+        assert_eq!(compactions(&events), 1);
+        assert!(requests[0].messages.len() < 62);
+    }
+
+    fn context_overflow() -> LoopFault {
+        provider_failure(
+            crate::errors::ProviderErrorClass::ContextTooLong,
+            Some(400),
+            None,
+            "context_too_long",
+        )
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_compacts_once_and_retries_the_step() {
+        let (outcome, events, requests, settled) = run_script_with(
+            vec![Err(context_overflow()), Ok(response("done", Vec::new()))],
+            None,
+            long_history_params(30),
+        )
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.len() < requests[0].messages.len());
+        assert_eq!(settled, ["fail:context_too_long", "complete"]);
+        let compactions: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == COMPACTION_STREAM_EVENT)
+            .collect();
+        assert_eq!(compactions.len(), 1, "one persisted compaction record");
+        assert_eq!(compactions[0].data["fallback"], "force_compact");
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content == "the task"),
+            "the original task survives the emergency compaction"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "provider_error")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_context_overflow_in_the_same_step_fails_with_the_typed_reason() {
+        let (outcome, events, requests, settled) = run_script_with(
+            vec![Err(context_overflow()), Err(context_overflow())],
+            None,
+            long_history_params(30),
+        )
+        .await;
+        let fault = outcome.unwrap_err();
+        assert_eq!(
+            fault.provider_error().map(|error| error.class),
+            Some(crate::errors::ProviderErrorClass::ContextTooLong)
+        );
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert_eq!(settled, ["fail:context_too_long", "fail:context_too_long"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == COMPACTION_STREAM_EVENT)
+                .count(),
+            1
+        );
+        let reported = events
+            .iter()
+            .find(|event| event.event_type == "provider_error")
+            .expect("provider_error event");
+        assert_eq!(reported.data["class"], "context_too_long");
+    }
+
+    fn history_with_huge_tool_result(pairs: usize) -> LoopParams {
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("the task")];
+        for n in 0..pairs {
+            history.push(ChatMessage::assistant(&format!("step {n}")));
+            history.push(ChatMessage::user(&format!("continue {n}")));
+        }
+        let mut call_message = ChatMessage::assistant("");
+        call_message.tool_calls.push(ToolCall {
+            id: "big".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+            hosted: false,
+            hosted_result: None,
+        });
+        history.push(call_message);
+        history.push(ChatMessage::tool_result("big", "x".repeat(200_000)));
+        LoopParams {
+            conversation_history: Some(history),
+            ..params()
+        }
+    }
+
+    fn request_chars(request: &ChatRequest) -> usize {
+        request.messages.iter().map(|m| m.content.len()).sum()
+    }
+
+    /// #3357: a short history compacts nothing, but the overflow retry still
+    /// shrinks the huge recent tool result.
+    #[tokio::test]
+    async fn an_overflow_with_a_huge_tool_result_in_a_short_history_retries_smaller() {
+        let (outcome, events, requests, settled) = run_script_with(
+            vec![Err(context_overflow()), Ok(response("done", Vec::new()))],
+            None,
+            history_with_huge_tool_result(0),
+        )
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert!(request_chars(&requests[1]) < request_chars(&requests[0]));
+        assert!(request_chars(&requests[1]) < 50_000);
+        assert_eq!(settled, ["fail:context_too_long", "complete"]);
+        let compactions: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == COMPACTION_STREAM_EVENT)
+            .collect();
+        assert_eq!(compactions.len(), 1);
+        assert_eq!(compactions[0].data["fallback"], "tool_output_truncated");
+    }
+
+    /// #3357: the huge result sits in the verbatim tail of a long history.
+    #[tokio::test]
+    async fn an_overflow_with_a_huge_tool_result_in_the_kept_tail_retries_smaller() {
+        let (outcome, events, requests, settled) = run_script_with(
+            vec![Err(context_overflow()), Ok(response("done", Vec::new()))],
+            None,
+            history_with_huge_tool_result(30),
+        )
+        .await;
+        outcome.unwrap();
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert!(request_chars(&requests[1]) < request_chars(&requests[0]));
+        assert!(request_chars(&requests[1]) < 50_000);
+        assert_eq!(settled, ["fail:context_too_long", "complete"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == COMPACTION_STREAM_EVENT)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_overflow_after_shrinking_a_tool_result_still_fails_typed() {
+        let (outcome, _events, requests, settled) = run_script_with(
+            vec![Err(context_overflow()), Err(context_overflow())],
+            None,
+            history_with_huge_tool_result(0),
+        )
+        .await;
+        let fault = outcome.unwrap_err();
+        assert_eq!(
+            fault.provider_error().map(|error| error.class),
+            Some(crate::errors::ProviderErrorClass::ContextTooLong)
+        );
+        assert_eq!(requests.len(), 2, "exactly one retry");
+        assert_eq!(settled, ["fail:context_too_long", "fail:context_too_long"]);
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_with_nothing_to_compact_is_not_retried() {
+        let (outcome, _events, requests, _settled) = run(vec![
+            Err(context_overflow()),
+            Ok(response("never", Vec::new())),
+        ])
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]

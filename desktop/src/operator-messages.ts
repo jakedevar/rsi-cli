@@ -13,6 +13,7 @@ import {
 } from './input-model.js';
 import { refreshSessions } from './sessions.js';
 import { onUiChange, selected, state } from './state.js';
+import { loadView } from './view-load.js';
 
 /** Pending messages of each session, as last listed. */
 const pending = new Map<string, OperatorMessage[]>();
@@ -88,25 +89,27 @@ async function runOperatorCommand(cmd: PendingCommand): Promise<void> {
       toast(`DRAIN restart requested; ${n} active session(s) finishing current turns`, true);
       return;
     }
-    case 'drain-status': {
-      const status = await invoke<unknown>('get_drain_restart_status').catch((e: unknown) => {
-        throw new Error(`DRAIN status unavailable: ${String(e)}`);
+    case 'drain-status':
+      await loadView({
+        key: 'drain-status', title: 'Drain status', failed: 'DRAIN status unavailable',
+        read: () => invoke<unknown>('get_drain_restart_status'),
+        open: (status) => showText('Drain status', JSON.stringify(status, null, 2)),
       });
-      showText('Drain status', JSON.stringify(status, null, 2));
       return;
-    }
     case 'list':
-      if (!s) { toast('Open a session first (j/k, then Enter)'); return; }
-      openPendingDialog(s, await refreshPending(s.id).catch((e: unknown) => {
-        throw new Error(`Pending messages unavailable: ${String(e)}`);
-      }));
+      if (!s) { toast('Open a session first: click one in the list (j/k, then Enter)'); return; }
+      await loadView({
+        key: 'pending-messages', title: 'Pending messages', failed: 'Pending messages unavailable',
+        read: () => refreshPending(s.id),
+        open: (list) => openPendingDialog(s, list),
+      });
       return;
     case 'edit':
-      if (!s) { toast('Open a session first (j/k, then Enter)'); return; }
+      if (!s) { toast('Open a session first: click one in the list (j/k, then Enter)'); return; }
       await editMessage(s.id, cmd.id, cmd.text);
       return;
     case 'withdraw':
-      if (!s) { toast('Open a session first (j/k, then Enter)'); return; }
+      if (!s) { toast('Open a session first: click one in the list (j/k, then Enter)'); return; }
       await withdrawMessage(s.id, cmd.id);
       return;
   }

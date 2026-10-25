@@ -23,6 +23,7 @@ pub mod resolve;
 mod rust_resolve;
 pub mod scope;
 pub mod staged;
+pub mod stream;
 pub use blocks::StorageSummary;
 pub use staged::{
     FileDiagnostic, PerFileFacts, SourceVersion, StageCompleteness, StageRun, StagedExtraction,

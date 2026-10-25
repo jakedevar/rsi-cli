@@ -36,16 +36,22 @@ export interface SkillToggled {
   path: string;
 }
 
-/** rsid's `DeleteSkill` answer. */
+/** rsid's `DeleteSkill` answer: the skill moved into rsid's skill trash (#91). */
 export interface SkillDeleted {
   name: string;
   enabled: boolean;
   path: string;
+  trash_path: string;
 }
 
 /** The TUI's notice after `e` (settings_keys.rs toggle_skill_at_selected_index). */
 export function skillToggledNotice(s: SkillToggled): string {
   return `${s.enabled ? 'Enabled' : 'Disabled'} skill: ${s.name}`;
+}
+
+/** The TUI's notice after the confirmed `d d` (operator_config.rs delete_skill). */
+export function skillDeletedNotice(s: SkillDeleted): string {
+  return `Deleted skill: ${s.name} (moved to ${s.trash_path})`;
 }
 
 /** The skills list cursor after a delete: clamped to the shorter list (the TUI's clamp). */

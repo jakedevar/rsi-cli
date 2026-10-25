@@ -2,12 +2,13 @@
 // and sanitizes with a strict allowlist; the HTML it returns is the ONLY daemon-
 // derived text in this app that is ever assigned to innerHTML. Everything else
 // uses textContent.
-import { api } from './api.js';
+import { api, invoke } from './api.js';
 import { highlightCodeBlocks } from './codeblocks.js';
-import { $, el, toast } from './dom.js';
+import { el, toast } from './dom.js';
 import { BATCH_TEXTS, MarkdownCache, cacheKey, takeBatch } from './mdmodel.js';
+import { isWebUrl } from './nav-model.js';
 
-interface Job { key: string; src: string; targets: Set<HTMLElement> }
+interface Job { key: string; src: string; targets: Set<HTMLElement>; transcript: boolean }
 
 const cache = new MarkdownCache();
 const queue: Job[] = [];
@@ -37,8 +38,19 @@ function decorateCode(root: HTMLElement): void {
  * plain text until the batched render lands.
  */
 export function markdownBody(sessionId: string, e: { id: number; sequence: number }, part: number, text: string): HTMLElement {
+  return markdownBox(cacheKey(sessionId, e, part), text, true);
+}
+
+/**
+ * Markdown for text that is not a transcript message (the Issue inspector, local #293): the same backend renderer,
+ * sanitizer and cache. `key` names the text (it only hits while the text is unchanged).
+ */
+export function markdownText(key: string, text: string): HTMLElement {
+  return markdownBox(key, text, false);
+}
+
+function markdownBox(key: string, text: string, transcript: boolean): HTMLElement {
   const box = el('div', 'md');
-  const key = cacheKey(sessionId, e, part);
   const hit = cache.get(key, text);
   if (hit !== undefined) {
     setSanitizedHtml(box, hit);
@@ -49,10 +61,11 @@ export function markdownBody(sessionId: string, e: { id: number; sequence: numbe
   if (unavailable) return box;
   let job = queued.get(key);
   if (!job || job.src !== text) {
-    job = { key, src: text, targets: new Set() };
+    job = { key, src: text, targets: new Set(), transcript };
     queued.set(key, job);
     queue.push(job);
   }
+  if (transcript) job.transcript = true;
   job.targets.add(box);
   schedule();
   return box;
@@ -65,12 +78,13 @@ function schedule(): void {
 }
 
 async function flush(): Promise<void> {
-  const pane = $('events');
   try {
     while (queue.length) {
       const batch = takeBatch(queue, BATCH_TEXTS);
       for (const j of batch) if (queued.get(j.key) === j) queued.delete(j.key);
-      const stick = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
+      // Only a batch with transcript text follows the transcript's end.
+      const pane = batch.some((j) => j.transcript) ? document.getElementById('events') : null;
+      const stick = pane !== null && pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80;
       let htmls: string[];
       try {
         htmls = await api.renderMarkdown(batch.map((j) => j.src));
@@ -87,7 +101,7 @@ async function flush(): Promise<void> {
         cache.set(j.key, j.src, html);
         for (const t of j.targets) if (t.isConnected) setSanitizedHtml(t, html);
       });
-      if (stick) pane.scrollTop = pane.scrollHeight;
+      if (stick && pane) pane.scrollTop = pane.scrollHeight;
       // Yield so a 2000-event conversation stays responsive.
       await new Promise<void>((r) => window.setTimeout(r, 0));
     }
@@ -97,8 +111,32 @@ async function flush(): Promise<void> {
   }
 }
 
-/** Delegated clicks inside rendered Markdown: links are inert, code gets a copy button. */
-export function wireMarkdownEvents(pane: HTMLElement): void {
+/**
+ * Open a Markdown link. Only a web link reaches the system browser, through the backend's own check (open_url,
+ * src-tauri/src/nav.rs); the webview never navigates. Anything else, or a failed opener, copies the address.
+ */
+export async function openMarkdownLink(href: string): Promise<void> {
+  const copy = (why: string): void => {
+    void navigator.clipboard?.writeText(href).then(
+      () => toast(`${why}: ${href} (copied)`, true),
+      () => toast(href, true),
+    );
+  };
+  if (!isWebUrl(href)) { copy('Not a web link'); return; }
+  try {
+    await invoke<unknown>('open_url', { url: href });
+    toast(`Opened ${href}`, true);
+  } catch (e) {
+    copy(`No browser opened (${String(e)})`);
+  }
+}
+
+/**
+ * Delegated clicks inside rendered Markdown: code gets a copy button; links never navigate the webview. In the
+ * transcript a link click copies its address (a right-click opens it, nav-run.ts); with `openLinks` (the Issue
+ * inspector) a click opens a web link in the system browser.
+ */
+export function wireMarkdownEvents(pane: HTMLElement, opts: { openLinks?: boolean } = {}): void {
   pane.addEventListener('click', (ev) => {
     const target = ev.target as HTMLElement | null;
     const copy = target?.closest<HTMLElement>('.copy-code');
@@ -113,9 +151,9 @@ export function wireMarkdownEvents(pane: HTMLElement): void {
     }
     const link = target?.closest<HTMLAnchorElement>('.md a');
     if (link) {
-      // Links never navigate the webview; copy the URL instead.
       ev.preventDefault();
       const href = link.getAttribute('href') ?? '';
+      if (opts.openLinks) { void openMarkdownLink(href); return; }
       void navigator.clipboard?.writeText(href).then(
         () => toast(`Link copied: ${href}`, true),
         () => toast(href, true),

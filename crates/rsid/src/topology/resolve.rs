@@ -104,7 +104,11 @@ struct RuledReview {
 fn review_resolvable(class: Option<&str>) -> bool {
     matches!(
         class,
-        Some(failure::REVIEW_UNSETTLED | failure::REVIEW_ROUNDS_EXHAUSTED)
+        Some(
+            failure::REVIEW_UNSETTLED
+                | failure::REVIEW_LAUNCH_REFUSED
+                | failure::REVIEW_ROUNDS_EXHAUSTED
+        )
     )
 }
 
@@ -114,9 +118,10 @@ fn review_resolvable(class: Option<&str>) -> bool {
 /// move.
 const RESOLVABLE_STATES: &str = "Resolvable: a blocked implement or repair attempt with \
     failure_class preserved_work (inspect, accept, retry, discard), a review blocked \
-    review_unsettled or review_rounds_exhausted (retry, accept with a ruling), and a land \
-    blocked land_admission_lost (retry only). For any other blocked cause (for example \
-    policy_refused) read the execution's blocked_reason with AgentTopologyGetExecution, \
+    review_unsettled, review_launch_refused or review_rounds_exhausted (retry, accept with a ruling), and a land \
+    blocked land_admission_lost (retry only), and any attempt blocked policy_refused (retry \
+    only, once the refusing policy has cleared: the retry re-checks it). For any other \
+    blocked cause read the execution's blocked_reason with AgentTopologyGetExecution, \
     clear that cause at its source, or end the execution with AgentTopologyInterrupt";
 
 /// A refusal that names the attempt's node kind, status and failure class
@@ -138,6 +143,19 @@ fn require_resolvable(attempt: &AttemptRow, action: TopologyAttemptAction) -> Re
             "only a blocked attempt can be accepted, retried or discarded; a settled attempt \
              is finished and the executor continues the execution on its own",
         ));
+    }
+    // #3274: a launch refused by live manager policy created no session and
+    // holds no work, so the only recovery is to ask again once the cause
+    // (a moved scope, a pause, a lapsed grant) has cleared; the launch gate
+    // re-checks it live and blocks again with the same evidence.
+    if attempt.failure_class.as_deref() == Some(failure::POLICY_REFUSED) {
+        if action != TopologyAttemptAction::Retry {
+            return Err(precondition(
+                "an attempt blocked by policy holds no preserved work; retry it once the \
+                 refusing policy has cleared, or interrupt the execution",
+            ));
+        }
+        return Ok(());
     }
     if attempt.node_kind == "review" {
         if action == TopologyAttemptAction::Discard {
@@ -656,6 +674,8 @@ impl<E: NodeEffects> Executor<E> {
     ) -> Result<ResolutionWrite<'a>> {
         let review = attempt.node_kind == "review";
         let land = attempt.node_kind == "land";
+        // #3274: a policy-refused attempt created nothing; it re-runs its base.
+        let refused = attempt.failure_class.as_deref() == Some(failure::POLICY_REFUSED);
         let attempts = rows::load_attempts(store, execution.id)?;
         let charged = attempts
             .iter()
@@ -663,14 +683,21 @@ impl<E: NodeEffects> Executor<E> {
             .filter(|row| {
                 !matches!(
                     row.failure_class.as_deref(),
-                    Some(failure::LOST_BEFORE_SESSION | failure::REVIEW_INFRASTRUCTURE)
+                    Some(
+                        failure::LOST_BEFORE_SESSION
+                            | failure::REVIEW_INFRASTRUCTURE
+                            | failure::POLICY_REFUSED
+                    )
                 )
             })
             .count();
         if charged >= MAX_ATTEMPTS_PER_NODE as usize
             || attempts
                 .iter()
-                .filter(|row| !failure::is_infrastructure(row.failure_class.as_deref()))
+                .filter(|row| {
+                    !failure::is_infrastructure(row.failure_class.as_deref())
+                        && row.failure_class.as_deref() != Some(failure::POLICY_REFUSED)
+                })
                 .count()
                 >= crate::topology::graph::GraphShape::from_workflow(&execution.definition)?
                     .attempt_cap(execution.max_node_attempts) as usize
@@ -690,7 +717,7 @@ impl<E: NodeEffects> Executor<E> {
         }
         // A review or land retry re-runs the same commit: neither holds a
         // preservation point to verify.
-        let preserved_commit = if review || land {
+        let preserved_commit = if review || land || refused {
             attempt.base_commit.clone()
         } else {
             let verified = match (&attempt.preserved_ref, &attempt.preserved_commit) {
@@ -743,6 +770,8 @@ impl<E: NodeEffects> Executor<E> {
                 "review_retried"
             } else if land {
                 "land_retried"
+            } else if refused {
+                "policy_refused_retried"
             } else {
                 "preserved_work_retried"
             },

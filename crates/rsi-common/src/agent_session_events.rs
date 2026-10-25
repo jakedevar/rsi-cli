@@ -22,6 +22,10 @@ pub const AGENT_READ_EVENTS_MAX_BYTES_CEILING: u32 = 256 * 1024;
 pub const AGENT_READ_EVENTS_MIN_BYTES: u32 = 1024;
 /// Per-event cap, in characters, for content, tool input and metadata.
 pub const AGENT_READ_EVENT_FIELD_MAX_CHARS: usize = 2_000;
+/// Per-event cap, in characters, for content, tool input and metadata when the
+/// request sets `full_fields` (#3558). The page `max_bytes` still bounds the
+/// response; an event that exceeds even this cap stays `truncated`.
+pub const AGENT_READ_EVENT_FIELD_FULL_MAX_CHARS: usize = 256 * 1024;
 /// Stable refusal returned for an unknown OR out-of-scope target, so a
 /// refusal never reveals whether the session exists.
 pub const AGENT_READ_EVENTS_SCOPE_DENIED: &str = "agent_verb_scope_denied";
@@ -46,6 +50,25 @@ pub struct AgentReadSessionEventsRequestV1 {
     /// Return the final assistant message up to the larger full-message cap.
     #[serde(default)]
     pub final_message_full: bool,
+    /// Raise the per-event cap on `content`, `tool_input` and `metadata` from
+    /// [`AGENT_READ_EVENT_FIELD_MAX_CHARS`] to
+    /// [`AGENT_READ_EVENT_FIELD_FULL_MAX_CHARS`] (#3558), so a long tool call
+    /// (a `Write` over 2 KB) is exported whole. The page `max_bytes` still
+    /// applies.
+    #[serde(default)]
+    pub full_fields: bool,
+}
+
+impl AgentReadSessionEventsRequestV1 {
+    /// The per-event field cap this request asks for.
+    #[must_use]
+    pub fn field_max_chars(&self) -> usize {
+        if self.full_fields {
+            AGENT_READ_EVENT_FIELD_FULL_MAX_CHARS
+        } else {
+            AGENT_READ_EVENT_FIELD_MAX_CHARS
+        }
+    }
 }
 
 impl AgentReadSessionEventsRequestV1 {
@@ -219,6 +242,14 @@ mod tests {
             serde_json::from_value(serde_json::json!({"session_id": id})).unwrap();
         assert_eq!(ok.validate(), Ok(()));
         assert!(!ok.final_message_full);
+        assert!(!ok.full_fields);
+        assert_eq!(ok.field_max_chars(), AGENT_READ_EVENT_FIELD_MAX_CHARS);
+        let mut full = ok.clone();
+        full.full_fields = true;
+        assert_eq!(
+            full.field_max_chars(),
+            AGENT_READ_EVENT_FIELD_FULL_MAX_CHARS
+        );
         assert_eq!(ok.effective_limit(), AGENT_READ_EVENTS_DEFAULT_LIMIT);
         let mut bad = ok.clone();
         bad.limit = Some(0);

@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/rsid-health.sh"
+# The probe is the rsi-repo-guard `rsid-health-probe` subcommand (#465).
+RSI_REPO_GUARD_BIN="$("$ROOT/scripts/repo-guard" --bin)"
+export RSI_REPO_GUARD_BIN
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -35,4 +38,21 @@ if wait_for_rsid_health "$TEMP_DIR/bad-rpc" "$TEMP_DIR/socket" 1 >"$TEMP_DIR/tim
     exit 1
 fi
 grep -q 'within 1s' "$TEMP_DIR/timeout"
+
+# Negative: with no probe binary anywhere the wait fails at once and names the gap;
+# a missing probe is never read as healthy.
+(
+    RSI_REPO_GUARD_BIN="$TEMP_DIR/absent"
+    RSI_GUARD_BIN=""
+    RSI_GUARD_SCRIPT_DIR="$TEMP_DIR"
+    HOME="$TEMP_DIR"
+    RSI_HOME_DIR="$TEMP_DIR/home"
+    started=$SECONDS
+    if wait_for_rsid_health "$TEMP_DIR/rpc" "$TEMP_DIR/socket" 30 >"$TEMP_DIR/noguard" 2>&1; then
+        echo 'health wait passed without a probe binary' >&2
+        exit 1
+    fi
+    ((SECONDS - started < 5)) || { echo 'missing probe binary was retried' >&2; exit 1; }
+    grep -q 'rsi-repo-guard with rsid-health-probe not found' "$TEMP_DIR/noguard"
+)
 echo 'rsid health wait passed'

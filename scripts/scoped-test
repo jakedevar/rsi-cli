@@ -8,13 +8,16 @@ Use --repo PATH to reproduce in an existing base worktree; execution always
 requires --head to match that worktree's HEAD. Filters use the lander's plain
 library names, shard:SHARD:test(ATOM), bin:TARGET and test:TARGET forms. Named
 targets also accept :test(ATOM), e.g. --filter 'rsid=bin:tool:test(=tests::one)'.
+Library tests also accept PACKAGE=test(=exact::name).
 An ATOM is a substring, =exact::name, or /regex/.
 --total-max-sec caps the whole run: each package's budget is the lesser of
 --runtime-max-sec and the time left, and a package with none left is not run
 (`scoped_test_timeout: total budget exhausted`, exit 1). The durable recipes
 use it so their sequential package budgets fit the job's own cap (#1584).
-Daemon scoped_test jobs also pass --job-max-sec: slot/lock waits spend that
-wall budget and admission leaves a 120s runtime reserve (#2025). One admission
+Daemon scoped_test jobs also pass --job-max-sec: slot/lock waits have a separate
+bounded allowance and leave the execution budget intact (#431). The cumulative
+slot-wait cap is --slot-wait-max-sec; exhausting it ends a daemon run with the
+capacity refusal `admission-timeout` (exit 124). One admission
 is held across the selected packages (#2216); each keeps its own bounded unit.
 RSI_SCOPED_TEST_FILTERS (newline-separated PACKAGE=FILTER, set by the daemon's
 recipe `filters` param) acts as --filter when no --filter is given.
@@ -32,9 +35,16 @@ filter is empty. `unmatched_filters` names those filters separately and still ma
 `baseline_reds` requires a named candidate failure observed again in a failing base run;
 a failed build or harness alone never establishes one. `baseline_failure_records` separately
 annotates active known-failure records by name (not a verified signature match), and
-`baseline_reds_without_record` names successful lookups with no record. Durable jobs use the
-shared classifier snapshot without agent credentials; a missing/stale snapshot or failed lookup
-is `unavailable`, never evidence that no record exists. Lookup time is bounded to ten seconds.
+`baseline_reds_without_record` names successful lookups with no record. Exact-test QA Issue
+mentions provide advisory context only when no record exists; they neither establish a
+signature match nor change the verdict. Durable jobs use the
+project snapshot published at job admission without agent credentials; a missing/stale snapshot
+or failed lookup is `unavailable`, never evidence that no record exists. Lookup time is bounded
+to ten seconds. The receipt's `ok` is `exit_code == 0`, or (#183) an exit 1 whose only reds are
+baseline reds of a complete comparison with nothing else wrong, each with an active record
+(`ok_reason: baseline_known_failure`) or an `unavailable` lookup, e.g. a satellite without the
+hub's snapshot (`ok_reason: baseline_confirmed_without_snapshot`); the exit code stays 1. A red
+the loaded snapshot has no record for keeps `ok` false.
 Execution order is fixed (#2647): the selected Python tests (stdlib `python3 -m unittest`
 for the repo suites) run first, fail-fast, and Cargo starts only after they all pass. The run prints the order
 (`execution order: ...`) and records it as the receipt's `phase_order`. `--dry-run` selects the Python
@@ -56,6 +66,32 @@ Planning starts no cargo (#2564): derivation is `check-touched-shards --filters-
 dry run only prints the build it would run. The receipt's `compile` object records
 `planning` (source, `cargo_invoked: false`), `execution` (`pending`, `skipped_dry_run`,
 `executed`, `none_scheduled`) and each package's build as `executed`/`failed`/`incomplete`.
+Every finished package entry carries `completed` (the worker's whole-run `SCOPED_EXECUTED` count when it
+exceeds the streamed `SCOPED_END` count), `failed_tests`, and, once the base comparison settles,
+`new_failures` and `baseline_reds` (the top-level lists, per package; `new_failures` is null when
+failures exist and the comparison did not complete) (#199). The receipt is printed again once packages
+settle and again after the comparison, so a run cut off later never leaves a `running` package last.
+Progress receipts carry counts, digests and live package status. The full filter/downstream selection
+is saved once as `selection.json` in `log_dir`; terminal receipts keep small selections inline and
+replace large ones with counts, digests and that detail path (#546 / hub #3471).
+Opt-in fixture tests use check-touched-shards' TEST_FEATURE_MODULES declaration (#465).
+Selected test identities determine the union of required features per package (receipt
+`features`); both the build and nextest receive it. A module with no tests selects its
+nearest parent's separate behaviour suites. Unmatched filters still fail the run.
+Public library edits also compile all transitive workspace dependents' test targets (#473).
+The pinned manifest graph includes normal, dev, build, optional and target-specific path edges;
+it conservatively keeps every reverse dependency (no per-consumer reachability guess).
+Clear private-function, test-only, comment-only and unmounted-source edits are excluded.
+These builds use `cargo test --tests --no-run`, the existing package/job budgets and admission,
+and the feature union required by all inventoried tests in the dependent package. Already selected
+packages build once with expanded targets and still execute only their selected tests; other
+dependents compile only unless a changed public item's identifier occurs in their modules
+(#3408). The shared check-touched-shards derivation selects exact runnable tests in those
+modules (including descendant tests and imports), retaining shard gates. `downstream_tests`
+records items, dependent modules, exact tests/filters and generic-name skips; common names
+or names referenced in more than 40 files keep compile coverage without extra runtime tests.
+`downstream_compile` records changed libraries, package commands,
+features, execution mode and planned/passed/failed/incomplete status separately from runtime tests.
 By default the selected tests run with the merge-queue lander's tmpfs parity
 (#1182, #1910): a private TMPDIR under /dev/shm (override the parent with
 CHECK_TOUCHED_SHARDS_TMPDIR); the build still uses the host TMPDIR and the same
@@ -92,7 +128,10 @@ executed and never changes the verdict; `unlisted_packages` names packages that 
 The tests of a module whose own source changed run right after the added/changed ones and before
 any unrelated observer, smallest module first (#2182, check-touched-shards `changed_modules`); a
 module that selects more than CHANGED_MODULE_TEST_LIMIT tests is a broad filter and keeps its
-specificity tier. The receipt names `changed_modules` and, in a targeted subset,
+specificity tier. The tests of a changed module are never the time box's to spend (#3252): they run
+unboxed, and a package that owns a changed module still runs them after the box is spent (every other
+tier of it is left to the gate), so a structural test inside a changed module fails in the worker's
+run, never first in the merge-queue gate. The receipt names `changed_modules` and, in a targeted subset,
 `changed_module_tests_selected`/`changed_module_tests_run`. Exit is green when the run subset
 passes. A BROAD observer fallback from check-touched-shards (#2105: a trace over 150 functions
 or 24 tests keeps the module filter) is never refused: it runs boxed the same way and the
@@ -145,17 +184,46 @@ Trial merge (#348): at the end of a run that resolved its head, a fetch-free
 `conflict_paths` (first 32; `conflict_paths_total` is the full count). It is informational: it
 never changes the exit code or verdict. A worker whose receipt says false merges origin/rolling
 (no rebase), resolves, pushes and reruns one scoped_test.
+The same trial tree feeds `reverts_recent_landing`: a bounded, warning-only blame of deleted
+rolling lines, grouped by path and introducing commit. Intended removals can use the source
+commit trailer `Allow-Recent-Landing-Removals: true`; see docs/agents/landing-and-gates.md.
+
+Provisional migration renumber (#3339): a candidate that declares a provisional migration
+(`tools/provisional-migrations/*.json`) whose number rolling has since taken cannot merge or pass
+the numbering check as written, and the lander renumbers it instead. The derived run does the same
+before it derives anything: `rolling-migration-renumber.py --transform` and `--build` (the copy at
+the base tip) make the lander's renumbered merge commit, which is checked out into a private
+worktree and tested in place of the candidate. The receipt's `head` stays the committed source;
+`renumber` names `source`, `target`, `old_version`, `new_version` and the tested `candidate`, and
+the trial merge fields describe that candidate. A declaration whose version is still free is
+validated at latest+1 through the tool's inspection mode (#3397). A refusal
+(`renumber.status: refused`, `reason`) stops the run before building or testing.
+Explicit `--filter` runs and `--dry-run` build no worktree.
+Linux compile lane (#253): on a non-Linux host, after the native lanes and under the same build
+admission, one `cargo check --target x86_64-unknown-linux-gnu --all-targets` covers every touched
+workspace package (plus the downstream compile set), so the Linux side of `cfg(target_os)` code is
+built. The receipt's `linux_check` is `passed`, `failed` (`linux_check_failed`, a rustc error, red,
+`first_error` names it) or `not_covered` with a `reason` (`linux_target_missing` with the operator's
+`rustup target add` remedy, `c_toolchain_missing` with its `brew install zig` remedy,
+`build_script_failed`, `timed_out`, ...), never red. Build scripts' C sources compile with a cross C
+toolchain found on the host (#256): a target compiler the environment names, `x86_64-linux-gnu-gcc`,
+or `zig cc` through wrappers the lane writes under the target directory; those variables are set in
+the lane's process only. The job never installs a target or a toolchain. A Linux host has no lane
+and no `linux_check` key.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
 import math
 import platform
 import os
+import posixpath
 from pathlib import Path
 import queue
 import re
@@ -177,6 +245,41 @@ _python_spec.loader.exec_module(PYTHON_GATE)
 _desktop_spec = importlib.util.spec_from_file_location("desktop_test_gate", SCRIPT.with_name("desktop-test-gate.py"))
 DESKTOP_GATE = importlib.util.module_from_spec(_desktop_spec)
 _desktop_spec.loader.exec_module(DESKTOP_GATE)
+_recent_spec = importlib.util.spec_from_file_location("recent_landing_check", SCRIPT.with_name("recent-landing-check.py"))
+RECENT_LANDING = importlib.util.module_from_spec(_recent_spec)
+_recent_spec.loader.exec_module(RECENT_LANDING)
+_failure_spec = importlib.util.spec_from_file_location("scoped_test_failure", SCRIPT.with_name("scoped-test-failure.py"))
+FAILURE = importlib.util.module_from_spec(_failure_spec)
+_failure_spec.loader.exec_module(FAILURE)
+# #3478: test lanes run in their own PID namespace where the host allows it, so a test's
+# `pgrep`/`kill` cannot reach the hub daemon. `PID_ISOLATION` is the probe result `run()`
+# records in the receipt; None (a unit test, or a caller that never probed) wraps nothing.
+_isolate_spec = importlib.util.spec_from_file_location("pid_isolate", SCRIPT.with_name("pid-isolate.py"))
+PID_ISOLATE = importlib.util.module_from_spec(_isolate_spec)
+_isolate_spec.loader.exec_module(PID_ISOLATE)
+PID_ISOLATION = None
+
+
+def isolated(command):
+    """`command` inside the PID namespace when this run probed one, else unchanged."""
+    return PID_ISOLATE.wrap(command, PID_ISOLATION) if PID_ISOLATION else list(command)
+
+
+def record_pid_isolation():
+    """Probe the PID namespace once and record `pid_isolation` in the receipt (#3478).
+
+    `namespaced`: the Python and desktop lanes and every bounded cargo unit run in a PID
+    namespace that cannot see host processes. `unavailable` (not Linux, no `unshare`, user
+    namespaces refused, `RSI_PID_ISOLATION=off`): the lanes run as before and
+    `pid_isolation_reason` says why."""
+    global PID_ISOLATION
+    found = PID_ISOLATE.probe()
+    RECEIPT.pop("pid_isolation_reason", None)
+    RECEIPT["pid_isolation"] = found["mode"]
+    if found["reason"]:
+        RECEIPT["pid_isolation_reason"] = found["reason"]
+    PID_ISOLATION = found if PID_ISOLATE.is_namespaced(found) else None
+    print("scoped-test: " + PID_ISOLATE.describe(found), flush=True)
 
 
 def command_text(command):
@@ -209,6 +312,34 @@ def signal_group(process, sig):
                                   f"({error.strerror})") from error
 
 
+UNFINISHED_LIMIT = 20
+
+
+def worker_end(code, active):
+    """How a package worker ended and which tests it left unfinished (#146).
+
+    A worker that disappears without a verdict (a signal, e.g. a test that kills its own process
+    group) used to read as a bare `scoped_test_incomplete` after N tests. The tests it had started
+    and not finished are the ones the run did not decide: they are named, never counted as passed
+    or reported as failures. Returns (message suffix, receipt fields)."""
+    fields, parts = {}, []
+    if isinstance(code, int) and code < 0:
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        fields["worker_signal"] = name
+        parts.append(f"the test worker was killed by {name} (a test or the code under test signalled "
+                     "its process group); this is not a time-box expiry")
+    unfinished = sorted(active)
+    if unfinished:
+        fields["unfinished_tests"] = unfinished[:UNFINISHED_LIMIT]
+        fields["unfinished_total"] = len(unfinished)
+        more = f" (+{len(unfinished) - UNFINISHED_LIMIT} more)" if len(unfinished) > UNFINISHED_LIMIT else ""
+        parts.append("started and not finished, not failures: " + ", ".join(unfinished[:UNFINISHED_LIMIT]) + more)
+    return ("; " + "; ".join(parts) if parts else ""), fields
+
+
 def stop_process(process, own_tree=True):
     """Stop only the process tree we created (never search for other processes)."""
     if os.name == "nt":
@@ -231,7 +362,7 @@ class Budget:
     Time queued behind other cargo work never counts: `scripts/cargo-slot` prints
     `rsi-phase <epoch> slot-granted: ...` when the slot is granted, and `grant()`
     starts the clock then. A budget with no slot to wait for starts at once.
-    `wait_cap` bounds the queue; an optional job deadline includes queue time.
+    `wait_cap` bounds the queue; an optional execution deadline excludes queue time.
     `waited` is the seconds spent queued.
     """
 
@@ -246,6 +377,8 @@ class Budget:
     def observe(self, line):
         if self.started is None and self.GRANT.match(line):
             self.started = time.monotonic()
+            if self.deadline is not None:
+                self.deadline += self.waited
 
     @property
     def waited(self):
@@ -257,7 +390,7 @@ class Budget:
             left = self.created + self.wait_cap - time.monotonic()
         else:
             left = self.started + self.seconds + self.grace - time.monotonic()
-        if self.deadline is not None:
+        if self.deadline is not None and self.started is not None:
             left = min(left, self.deadline - time.monotonic())
         return max(0, left)
 
@@ -266,19 +399,43 @@ class Budget:
         return self.started is not None and time.monotonic() - self.started >= self.seconds
 
 
-def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=None, budget=None):
+class PartialLine(str):
+    """An unterminated output tail, told apart from a whole line on the reader queue."""
+
+
+def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=None, budget=None,
+           partial=None):
     """Tee output live; a timeout covers silent commands as well as noisy ones.
 
     `budget` (a Budget) replaces `timeout` and re-reads the deadline as output arrives.
+    `partial` (a callable) is handed the unterminated tail of the output as soon as it is
+    read, before its newline arrives (libtest prints `test NAME ... ` and then runs the test,
+    #196); `emit` still gets each line once, whole, when it ends.
     """
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, errors="replace", start_new_session=own_tree and os.name != "nt", cwd=cwd, env=env)
     lines = queue.Queue()
 
     def read():
+        # Chunks, not `for line in process.stdout`: that blocks until a newline. The decoder
+        # keeps a multi-byte character split across two reads whole.
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        pending = ""
         try:
-            for line in process.stdout:
-                lines.put(line)
+            descriptor = process.stdout.fileno()
+            while True:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    pending += decoder.decode(b"", final=True)
+                    break
+                pending += decoder.decode(chunk)
+                *whole, pending = pending.split("\n")
+                for line in whole:
+                    lines.put(line[:-1] + "\n" if line.endswith("\r") else line + "\n")
+                if pending and partial is not None:
+                    lines.put(PartialLine(pending))
+            if pending:
+                lines.put(pending)
         finally:
             lines.put(None)
             process.stdout.close()
@@ -300,7 +457,13 @@ def stream(command, emit, timeout=None, stop=None, own_tree=True, cwd=None, env=
             except queue.Empty:
                 raise subprocess.TimeoutExpired(command, timeout)
             if line is None:
-                return process.wait(timeout=left())
+                code = process.wait(timeout=left())
+                if code in (-2, -9, -15):
+                    emit(f"SCOPED_PROCESS_SIGNAL {signal.Signals(-code).name}\n")
+                return code
+            if isinstance(line, PartialLine):
+                partial(str(line))
+                continue
             if budget is not None:
                 budget.observe(line)
             emit(line)
@@ -394,6 +557,11 @@ def selection_plan(filters, shard_packages, priority_filters=()):
                 raise ValueError(f"invalid test target: {value}")
             kind, target, atom = match.groups()
             substring = ""
+        elif expression.startswith("test("):
+            match = re.fullmatch(r"test\((.+)\)", expression)
+            if not match:
+                raise ValueError(f"invalid library test atom: {value}")
+            atom = match.group(1)
         elif not re.fullmatch(r"[\w:]+", expression):
             raise ValueError(f"unsupported filter: {value}")
         if atom is not None:
@@ -421,6 +589,8 @@ def selection_plan(filters, shard_packages, priority_filters=()):
 # the derivation's GATE_FILTER_LIMIT; `--filter-budget 0` keeps the precise plan unboxed.
 FILTER_BUDGET = 12
 TEST_TIME_BOX_SEC = 600
+# A package that owns a changed module runs its tests even in a spent box; every later tier expires at once.
+SPENT_BOX_SEC = 1e-3
 THREADS_MIN, THREADS_MAX = 2, 12
 
 
@@ -520,16 +690,39 @@ def e2e_prebuild_command(cargo):
     return [*cargo, *args]
 
 
-def build_command(package, selections, cargo):
+def required_test_features(checker, repo, head, package, selections):
+    """Union the opt-in features of selected library tests, including direct observers."""
+    features = set()
+    for name, required in checker["feature_test_inventory"](repo, head, package):
+        for selection in selections:
+            if selection["kind"] != "lib":
+                continue
+            if (re.search(selection["regex"], name) if selection.get("regex") else
+                    name == selection["exact"] if selection.get("exact") else selection["substring"] in name):
+                features.update(required)
+                break
+    return sorted(features)
+
+
+def feature_args(features):
+    return ["--features", ",".join(features)] if features else []
+
+
+def build_command(package, selections, cargo, features=(), all_tests=False):
     # execute_package removes this variable itself; Windows has no env -u.
     if os.name == "nt" and cargo[:3] == ["env", "-u", "RSI_PROCESS_OWNERSHIP_NAMESPACE"]:
         cargo = cargo[3:]
-    targets = []
+    targets = ["--tests"] if all_tests else []
     if any(s["kind"] == "lib" for s in selections):
         targets.append("--lib")
     for kind, target in sorted({(s["kind"], s["target"]) for s in selections if s["kind"] != "lib"}):
         targets.extend(["--" + kind, target])
-    return [*cargo, "test", "-p", package, *targets, "--no-run", "--message-format=json"]
+    return [*cargo, "test", "-p", package, *targets, *feature_args(features), "--no-run", "--message-format=json"]
+
+
+def downstream_test_plan(checker, repo, base, head):
+    """Use the same public-item and consumer derivation as queue admission."""
+    return checker["downstream_test_plan"](repo, base, head)
 
 
 def execute_package(plan):
@@ -578,6 +771,10 @@ def execute_package(plan):
         print("SCOPED_PHASE build_failed", flush=True)
         return result
     print("SCOPED_WARNINGS " + json.dumps(warnings.payload(), separators=(",", ":")), flush=True)
+    print("SCOPED_PHASE compiled", flush=True)
+    if plan.get("compile_only"):
+        print(f"SCOPED_COMPLETE {plan['package']} 0", flush=True)
+        return 0
     if plan.get("e2e"):
         os.environ["RSI_E2E"] = "1"
         print("scoped-test: e2e_tui selected; RSI_E2E=1 and building rsid for the harness", flush=True)
@@ -726,6 +923,7 @@ class BatchProgress:
         self.extra = set()
         self.failures = set()
         self.failure_summary = False
+        self.panics = FAILURE.PanicEvidence()
 
     @property
     def ran(self):
@@ -748,8 +946,18 @@ class BatchProgress:
 
     def begin(self, name):
         self.active = name
+        self.panics.active = name
         self.seen.add(name)
         self.emit("SCOPED_START " + name + "\n")
+
+    def partial(self, text):
+        """An unterminated tail: libtest prints `test NAME ... ` before it runs NAME, so the
+        start of a test that never finishes is only ever a partial line (#196). Starts the
+        test; the whole line still reaches `line` (a no-op for the active name) when it ends."""
+        found = self.START.match(text)
+        if found and found[1] in self.names and found[1] != self.active and found[1] not in self.done:
+            self.finish_active()
+            self.begin(found[1])
 
     def line(self, text):
         found = self.START.match(text)
@@ -785,6 +993,7 @@ class BatchProgress:
         elif text.startswith("test result: "):
             self.failure_summary = False
             self.finish_active()
+        self.panics.line(text)
         self.emit(text)
 
 
@@ -804,7 +1013,13 @@ def run_batch(binary, names, directory, test_env):
     # before any output still names its test.
     progress.begin(names[0])
     result = stream([binary, *names, "--exact", "--nocapture", "--test-threads=1"], progress.line,
-                    own_tree=False, cwd=directory, env=test_env)
+                    own_tree=False, cwd=directory, env=test_env, partial=progress.partial)
+    if result > 0:
+        emit_line(f"SCOPED_TEST_EXIT {result}\n")
+    if result != 0:
+        # An unwind interrupted before FAILED is still a regression; expected
+        # panics already resolved by an ok verdict leave no pending evidence.
+        progress.failures.update(progress.panics.unresolved)
     progress.finish_active()
     if result == 0:
         # A successful binary may itself print failure-looking diagnostics.
@@ -874,14 +1089,14 @@ def nextest_target_args(target):
     return ["--lib"] if "lib" in kinds else ["--bin", target["name"]] if "bin" in kinds else ["--test", target["name"]]
 
 
-def run_nextest_batch(nextest, package, target, names, directory, test_env, threads):
+def run_nextest_batch(nextest, package, target, names, directory, test_env, threads, features=()):
     """Run exact `names` in one cargo-nextest invocation; returns run_batch's tuple.
 
     `--ignore-default-filter`: the names are explicit and the slow tier (#2270) was already
     decided by `run_selected`, so the profile's default-filter must not drop a named test
     (which `result == 0` below would then report as a pass)."""
     progress = NextestProgress(names, emit_line)
-    command = [*nextest, "run", "-p", package, *nextest_target_args(target), "--no-fail-fast",
+    command = [*nextest, "run", "-p", package, *nextest_target_args(target), *feature_args(features), "--no-fail-fast",
                "--color", "never", "--status-level", "pass", "--final-status-level", "none",
                "--test-threads", str(max(1, threads)), "--ignore-default-filter", "-E", nextest_filterset(names)]
     result = stream(command, progress.line, own_tree=False, cwd=directory, env=test_env)
@@ -940,14 +1155,15 @@ def run_tier(binary, tier, directory, test_env, target, shards, runner=None, dea
                     return
                 settle(batch, run_batch(binary, batch, directory, test_env))
             return
-        nextest, package, threads = runner
+        nextest, package, threads, features = runner
         safe = [name for name in names if NEXTEST_SAFE_NAME.fullmatch(name)]
         for batch in test_batches(
                 safe, BOXED_NEXTEST_BATCH if deadline is not None else NEXTEST_BATCH_MAX_TESTS,
                 NEXTEST_BATCH_MAX_BYTES):
             if out_of_time():
                 return
-            settle(batch, run_nextest_batch(nextest, package, target, batch, directory, test_env, threads))
+            settle(batch, run_nextest_batch(nextest, package, target, batch, directory, test_env, threads,
+                                           features))
         safe_set = set(safe)
         for batch in test_batches([name for name in names if name not in safe_set]):
             if out_of_time():
@@ -977,6 +1193,35 @@ def run_tier(binary, tier, directory, test_env, target, shards, runner=None, dea
     return total[0], failed[0], expired[0]
 
 
+def subset_progress(package, records, expired, test_sec):
+    """Use the same identity accounting for a finished worker and an interrupted one (#448)."""
+    selected_tests = run_tests = changed_selected = changed_run = direct_selected = direct_run = 0
+    coverage, bounded, deferred_tests = {}, {}, 0
+    for record in records:
+        ran_names, selected = set(record["ran"]), set(record["selected"])
+        selected_tests += len(selected)
+        run_tests += len(ran_names & selected) if ran_names else 0
+        changed_selected += len(record["changed"])
+        changed_run += len(ran_names & set(record["changed"]))
+        direct_selected += len(record["direct"])
+        direct_run += len(ran_names & set(record["direct"]))
+        for name, matches in record["by_filter"].items():
+            seen = coverage.setdefault(name, [0, 0])
+            seen[0] += len(matches)
+            seen[1] += len(set(matches) & ran_names)
+        deferred_tests += len(record["deferred"])
+        for name, (kept, left) in record["bounded"].items():
+            seen = bounded.setdefault(name, [0, 0, 0])
+            seen[0] += len(kept)
+            seen[1] += len(set(kept) & ran_names)
+            seen[2] += len(left)
+    return {"package": package, "selected_tests": selected_tests, "run_tests": run_tests,
+            "changed_module_tests": [changed_selected, changed_run],
+            "direct_observer_tests": [direct_selected, direct_run], "box_expired": expired,
+            "filters": dict(sorted(coverage.items())), "bounded": dict(sorted(bounded.items())),
+            "deferred_tests": deferred_tests, "test_sec": round(test_sec, 1)}
+
+
 def run_selected(plan, artifacts, test_env, exact_tests=None):
     failed, count = False, 0
     # #2270: the released-migration tests the diff does not need (check-touched-shards decided).
@@ -985,11 +1230,8 @@ def run_selected(plan, artifacts, test_env, exact_tests=None):
     box = plan.get("time_box_sec")
     started = time.monotonic()
     deadline = started + box if box else None
-    selected_tests, run_tests, expired = 0, 0, False
-    changed_selected, changed_run = 0, 0  # tests of a changed module (#2182)
-    direct_selected, direct_run = 0, 0  # proven direct observers of a stopped broad trace (#2588)
-    coverage = {}  # filter -> [selected test identities, executed ones] in this package (#216)
-    bounded, deferred_tests = {}, 0  # cap-overflow filter -> [kept, executed, deferred]; deferred identities (#2592)
+    expired = False
+    report_progress = bool(box or any(s.get("bounded") for s in plan["selections"]))
     # Every binary is listed and ranked first; the tiers of all of them then run in one rank order,
     # so a binary listed earlier cannot spend the box before another binary's changed-module or
     # direct-observer tests (#2588).
@@ -1059,7 +1301,8 @@ def run_selected(plan, artifacts, test_env, exact_tests=None):
                     selection_sizes[name] = min(selection_sizes.get(name, len(matches)), len(matches))
         runner = None
         if plan.get("runner") == "nextest" and plan.get("nextest"):
-            runner = (plan["nextest"], plan["package"], plan.get("test_threads") or plan.get("test_shards", 1))
+            runner = (plan["nextest"], plan["package"], plan.get("test_threads") or plan.get("test_shards", 1),
+                      plan.get("features", []))
         # Ranks are judged over everything the plan's filters match, bounded matches included, so a
         # restriction can never make a module that selects more than the limit look small (#2592).
         selected |= direct_only
@@ -1082,8 +1325,6 @@ def run_selected(plan, artifacts, test_env, exact_tests=None):
         deferred = set().union(*bounded_matches.values()) - selected if bounded_matches else set()
         changed_ranks = {test: rank for test, rank in changed_ranks.items() if test in selected}
         direct_ranks = {test: rank for test, rank in direct_ranks.items() if test in selected}
-        changed_selected += len(changed_ranks)
-        direct_selected += len(direct_ranks)
         records.append({"binary": binary, "target": target, "directory": directory, "runner": runner,
                         "selected": selected, "by_filter": by_filter, "changed": set(changed_ranks),
                         "bounded": {name: (kept_by_bounded[name], matches - selected)
@@ -1091,49 +1332,44 @@ def run_selected(plan, artifacts, test_env, exact_tests=None):
                         "deferred": deferred,
                         "direct": set(direct_ranks), "ran": set(),
                         "tiers": ranked_tiers(selected, selection_sizes, priority_tests, changed_ranks, direct_ranks)})
+    if report_progress:
+        # Persist the complete listing before any test can hang or kill the worker. The parent
+        # reconciles SCOPED_END verdicts against these binary-scoped identities on interruption.
+        inventory = [{key: record[key] for key in ("binary", "selected", "by_filter", "changed",
+                                                  "direct", "bounded", "deferred", "ran")} for record in records]
+        print("SCOPED_SELECTION " + json.dumps(inventory, default=sorted), flush=True)
     queue = sorted(((key, index, tier) for index, record in enumerate(records) for key, tier in record["tiers"]),
                    key=lambda item: item[:2])
-    for _key, index, tier in queue:
+    for key, index, tier in queue:
         record = records[index]
+        # A changed module's own tests are never the box's to spend (#3252): they are the precise, cheap
+        # tests of the change itself, and the box only bounds what runs after them. A spent box skips the
+        # remaining non-core tiers but still reaches every changed-module tier of the queue.
+        core = not key[1]
+        if expired and not core:
+            continue
+        if report_progress:
+            print("SCOPED_TARGET " + record["binary"], flush=True)
         ran, tier_failed, tier_expired = run_tier(
             record["binary"], tier, record["directory"], test_env, record["target"], plan.get("test_shards", 1),
-            runner=record["runner"], deadline=deadline, ran_names=record["ran"])
+            runner=record["runner"], deadline=None if core else deadline, ran_names=record["ran"])
         count += ran
         failed |= tier_failed
         if tier_expired:
             expired = True
-            break
-    for record in records:
-        ran_names, selected = record["ran"], record["selected"]
-        selected_tests += len(selected)
-        run_tests += len(ran_names & selected) if ran_names else 0
-        changed_run += len(ran_names & record["changed"])
-        direct_run += len(ran_names & record["direct"])
-        for name, matches in record["by_filter"].items():
-            seen = coverage.setdefault(name, [0, 0])
-            seen[0] += len(matches)
-            seen[1] += len(matches & ran_names)
-        deferred_tests += len(record["deferred"])
-        for name, (kept, left) in record["bounded"].items():
-            seen = bounded.setdefault(name, [0, 0, 0])
-            seen[0] += len(kept)
-            seen[1] += len(kept & ran_names)
-            seen[2] += len(left)
     print(f"scoped-test: {plan['package']} executed {count} tests", flush=True)
+    # The whole run's count even when a failure keeps SCOPED_COMPLETE from printing (#199).
+    print(f"SCOPED_EXECUTED {plan['package']} {count}", flush=True)
     for name in sorted(ignored_only):
         print("SCOPED_IGNORED_ONLY " + name, flush=True)
     if slow_skipped:
         print(f"SCOPED_SLOW_TIER_SKIPPED {len(slow_skipped)}", flush=True)
-    if box or bounded or any(s.get("bounded") for s in plan["selections"]):
+    if report_progress:
         # Per filter, the selected and executed test identities: a failed test that ran is
         # executed (the verdict stays the exit code), a test the box never started is not. A
         # cap-overflow filter reports kept/executed/deferred apart: deferred is neither run nor passed.
-        print("SCOPED_SUBSET " + json.dumps({
-            "package": plan["package"], "selected_tests": selected_tests, "run_tests": run_tests,
-            "changed_module_tests": [changed_selected, changed_run],
-            "direct_observer_tests": [direct_selected, direct_run], "box_expired": expired, "filters": {name: seen for name, seen in sorted(coverage.items())},
-            "bounded": {name: seen for name, seen in sorted(bounded.items())}, "deferred_tests": deferred_tests,
-            "test_sec": round(time.monotonic() - started, 1)}), flush=True)
+        print("SCOPED_SUBSET " + json.dumps(subset_progress(
+            plan["package"], records, expired, time.monotonic() - started)), flush=True)
     # Every binary built and listed: only now may a missing filter mean "no tests".
     print("SCOPED_PHASE listed", flush=True)
     if failed:
@@ -1266,6 +1502,10 @@ def bounded_command(plan, plan_path, seconds, cpu_quota, linux, env=None):
     worker = [sys.executable, "-u", str(SCRIPT), "--execute-plan", str(plan_path)]
     if not linux:
         return worker, None
+    # The whole worker (build, tests, baseline rerun) runs in the namespace, inside the unit's
+    # cgroup: the slot lease stays outside it (cargo-slot's queue reads host pids) and
+    # `KillMode=control-group` still reaches every member (#3478).
+    worker = isolated(worker)
     # The daemon's job id (RSI_JOB_ID, a UUID) goes in the name so the CPU
     # andon attributes this separate cgroup to its job (#2127).
     job_id = os.environ.get("RSI_JOB_ID", "")
@@ -1354,22 +1594,37 @@ def static_guards(repo, base, head, audits):
         "shard_gates": [sys.executable, "scripts/check-rsid-test-shards.py", "--require-gates"],
         "released_migrations": [sys.executable, "tools/check-released-migrations.py", base, head],
         # A starter JSON change moves its digest fixture and SHIPPED_BEFORE together (#3070).
-        "starter_pins": [sys.executable, "tools/check_starter_pins.py", base, head],
-        "identity_assertions": [sys.executable, "tools/check_identity_assertions.py"],
-        "portable_shell": [sys.executable, "tools/check_portable_shell.py", "--base", base],
+        "starter_pins": ["scripts/repo-guard", "starter-pins", base, head],
+        "settings_preflight": ["scripts/repo-guard", "settings-preflight", base, head],
+        "identity_assertions": ["scripts/repo-guard", "identity-assertions"],
+        "target_reclaim": [sys.executable, "scripts/check-target-reclaim.py"],
+        "guard_regressions": [sys.executable, "scripts/check-guard-regressions.py", base, head],
+        "store_boundary": [sys.executable, "scripts/check-store-boundary.py"],
+        # A test's raw process-env write must use a test-unique name or temp_env (#190).
+        "test_env_writes": ["scripts/repo-guard", "test-env-writes"],
+        # No personal home path or public IP literal in a tracked file: the public export refuses it (#3269).
+        "personal_paths": ["scripts/repo-guard", "personal-paths"],
+        # A crate AGENTS.md is loaded into every session that reads the crate: keep it under its ceiling (#3450).
+        "agents_md_size": ["scripts/repo-guard", "agents-md-size"],
+        "portable_shell": ["scripts/repo-guard", "portable-shell", "--base", base],
     }
+    # The Rust guards (#360) build from the candidate's crates/rsi-repo-guards through
+    # scripts/repo-guard; a candidate carries a guard when it carries the guard's module.
+    rust_guard_sources = {name: "crates/rsi-repo-guards/src/" + command[1].replace("-", "_") + ".rs"
+                          for name, command in commands.items() if command[0] == "scripts/repo-guard"}
     failed = False
     for name, command in commands.items():
         audit = audits.get(name, {})
         if audit.get("verdict") in ("ok", "fail"):
             status, detail = audit["verdict"], audit.get("detail", "")
-        elif command[0] == sys.executable and not (Path(repo) / command[1]).is_file():
+        elif (required := rust_guard_sources.get(name) or (command[1] if command[0] == sys.executable else None)) \
+                and not (Path(repo) / required).is_file():
             # The tool copy comes from rolling but a guard script comes from the candidate tree. A
             # guard newer than the candidate's merge base is absent there, and failing it would end
             # the run before any test with no evidence (#3126). The merge queue runs every guard on
             # the merged tree, which does carry it.
             status = "skipped"
-            detail = f"{command[1]} not in candidate; merge queue runs it on the merged tree"
+            detail = f"{required} not in candidate; merge queue runs it on the merged tree"
         else:
             print("static guard: " + command_text(command), flush=True)
             try:
@@ -1630,6 +1885,45 @@ def baseline_from_log(lines):
 # The typed receipt the daemon's scoped-test job reads from the log tail (#1638).
 RECEIPT = {"schema": 1, "emit": False, "packages": []}
 RECEIPT_PREFIX = "SCOPED_TEST_RECEIPT "
+SELECTION_FIELDS = ("filters", "downstream_compile", "downstream_tests")
+INLINE_SELECTION_BYTES = 16 * 1024
+
+
+def json_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def detail_summary(value, data=None):
+    data = json_bytes(value) if data is None else data
+    summary = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    if isinstance(value, (dict, list)):
+        summary["count"] = len(value)
+    if isinstance(value, dict):
+        summary["counts"] = {key: len(items) for key, items in value.items() if isinstance(items, list)}
+    return summary
+
+
+def persist_selection(log_dir):
+    """Save the immutable selection once; wire receipts carry its identity and live status.
+
+    This precedes every lane, so even an interrupted run has the full selected graph (#546).
+    Package execution status continues to live in the receipt and per-package detail files.
+    """
+    selection = {key: RECEIPT[key] for key in SELECTION_FIELDS if key in RECEIPT}
+    data = json_bytes(selection) + b"\n"
+    path = log_dir / "selection.json"
+    path.write_bytes(data)
+    RECEIPT["selection"] = {"path": str(path), **detail_summary(selection, data),
+                            "fields": {key: detail_summary(value) for key, value in selection.items()}}
+
+
+def progress_detail(value):
+    """Bound diagnostic lists on progress updates; terminal acceptance evidence stays intact."""
+    if isinstance(value, (list, str)) and len(json_bytes(value)) > 4096:
+        return detail_summary(value)
+    if isinstance(value, dict):
+        return {key: progress_detail(item) for key, item in value.items()}
+    return value
 
 
 def planning_compile(explicit, dry_run):
@@ -1643,9 +1937,311 @@ def package_compile_status(phases):
     """How one package's supervised build went, from its SCOPED_PHASE lines."""
     if "build_failed" in phases:
         return "failed"
-    if phases.intersection({"listed", "list_failed", "test_failed"}):
+    if phases.intersection({"compiled", "listed", "list_failed", "test_failed"}):
         return "executed"
     return "incomplete"
+
+
+# #253: a non-Linux host (a Mac satellite) compiles only its own target natively, so the Linux side of
+# `cfg(target_os = ...)` code is never built there. After the native lanes it cross-checks the touched
+# packages for this target, when the rustup target is installed; the receipt's `linux_check` says how.
+LINUX_CHECK_TARGET = "x86_64-unknown-linux-gnu"
+LINUX_CHECK_REMEDY = f"rustup target add {LINUX_CHECK_TARGET}"
+# A build script that failed only for want of a C cross toolchain or sysroot (cc-rs, pkg-config, a
+# missing `x86_64-linux-gnu-gcc`): coverage the host cannot give, never a Rust compile error.
+LINUX_CHECK_C_TOOLCHAIN = re.compile(
+    r"failed to find tool|ToolNotFound|ToolExecError|error occurred in cc-rs|occurred in cc-rs|"
+    r"is `[\w.+-]*` installed|linker `[^`]+` not found|x86_64-linux-gnu-|cross-compil|"
+    r"cannot find (?:-l|crt)|sysroot", re.I)
+LINUX_CHECK_BUILD_SCRIPT = re.compile(r"failed to run custom build command for `([^`]+)`")
+# #256: the C sources of build scripts (bundled SQLite, ring, zstd, tree-sitter) need a C compiler for
+# the Linux target. The lane takes, in order: one the environment already names for the target, an
+# `x86_64-linux-gnu-gcc` on PATH (cc-rs finds it by its prefix), or `zig cc`, wrapped. Every variable
+# it sets lives in the lane's own process environment; the native lanes never see it.
+LINUX_CHECK_CC_VARS = ("CC_x86_64_unknown_linux_gnu", "CC_x86_64-unknown-linux-gnu", "TARGET_CC")
+LINUX_CHECK_CROSS_GCC = "x86_64-linux-gnu-gcc"
+LINUX_CHECK_ZIG_TARGET = "x86_64-linux-gnu"
+LINUX_CHECK_C_REMEDY = ("brew install zig" if sys.platform == "darwin" else
+                        f"install zig (https://ziglang.org/download/) or {LINUX_CHECK_CROSS_GCC}")
+# cc-rs passes clang `--target=x86_64-unknown-linux-gnu`, which zig's target parser refuses: the
+# wrapper drops any target argument and names zig's own. The zig path is quoted in by Python.
+LINUX_CHECK_ZIG_WRAPPER = """#!/bin/sh
+# Written by scripts/scoped-test for its Linux compile lane (#256); rewritten when it differs.
+skip=0
+for arg do
+  shift
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case $arg in
+    --target=*) continue ;;
+    -target|--target) skip=1; continue ;;
+  esac
+  set -- "$@" "$arg"
+done
+exec {zig} {tool} -target {zig_target} "$@"
+"""
+
+
+def linux_cross_toolchain(environ=None, which=shutil.which, windows=None):
+    """The C cross toolchain the Linux lane's build scripts would use (#256), or None.
+
+    `{"kind": "configured", "cc": ...}` when the environment already names a compiler for the
+    target, `{"kind": "cross_gcc", "cc": ...}` for an `x86_64-linux-gnu-gcc` on PATH, or
+    `{"kind": "zig", "zig": ...}` for a `zig` on PATH (not on Windows: its wrapper is a shell script).
+    """
+    environ = os.environ if environ is None else environ
+    windows = os.name == "nt" if windows is None else windows
+    for name in LINUX_CHECK_CC_VARS:
+        if environ.get(name):
+            return {"kind": "configured", "cc": environ[name], "variable": name}
+    gcc = which(LINUX_CHECK_CROSS_GCC)
+    if gcc:
+        return {"kind": "cross_gcc", "cc": gcc}
+    zig = which("zig")
+    if zig and not windows:
+        return {"kind": "zig", "zig": zig}
+    return None
+
+
+def lane_target_dir(repo, environ=None):
+    """The Cargo target directory the lane builds in (absolute)."""
+    environ = os.environ if environ is None else environ
+    target = Path(environ.get("CARGO_TARGET_DIR") or Path(repo) / "target")
+    return target if target.is_absolute() else Path(repo) / target
+
+
+def linux_cross_env(toolchain, target_dir):
+    """The variables the lane adds to its own environment for `toolchain` (#256).
+
+    A configured compiler or a cross gcc needs none. For zig it writes `cc`, `c++` and `ar`
+    wrappers under `<target>/x86_64-unknown-linux-gnu/rsi-zig-cc/`, rewriting a file only when it
+    differs, so the path cc-rs fingerprints stays the same run after run and no build script reruns.
+    """
+    if not toolchain or toolchain.get("kind") != "zig":
+        return {}
+    root = Path(target_dir) / LINUX_CHECK_TARGET / "rsi-zig-cc"
+    root.mkdir(parents=True, exist_ok=True)
+    tools = {}
+    for name, tool in (("cc", "cc"), ("c++", "c++"), ("ar", "ar")):
+        path = root / name
+        if tool == "ar":
+            text = f'#!/bin/sh\n# Written by scripts/scoped-test (#256).\nexec {shlex.quote(toolchain["zig"])} ar "$@"\n'
+        else:
+            text = LINUX_CHECK_ZIG_WRAPPER.format(zig=shlex.quote(toolchain["zig"]), tool=tool,
+                                                  zig_target=LINUX_CHECK_ZIG_TARGET)
+        if not path.is_file() or path.read_text() != text:
+            path.write_text(text)
+        if path.stat().st_mode & 0o755 != 0o755:
+            path.chmod(0o755)
+        tools[name] = str(path)
+    triple = LINUX_CHECK_TARGET.replace("-", "_")
+    cache = str(root / "zig-cache")
+    return {f"CC_{triple}": tools["cc"], f"CXX_{triple}": tools["c++"], f"AR_{triple}": tools["ar"],
+            "ZIG_GLOBAL_CACHE_DIR": cache, "ZIG_LOCAL_CACHE_DIR": cache}
+
+
+def linux_check_packages(repo, base, head, git_out, extra=()):
+    """Workspace packages under `crates/` with a changed Rust source or manifest, plus `extra`.
+
+    `extra` is the downstream compile set (packages whose test targets a public-API edit reaches):
+    their Linux-only code can call the changed API too. A docs-only file inside a crate does not
+    select its package; a root `Cargo.toml`/`Cargo.lock` change selects none (the native lanes and
+    the merge-queue gate cover a workspace-wide change).
+    """
+    changed = git_out(repo, "diff", "--name-only", "--no-renames", f"{base}..{head}").splitlines()
+    try:
+        root = git_out(repo, "show", f"{head}:Cargo.toml")
+    except (Exception, SystemExit):  # noqa: BLE001 - check-touched-shards' git_out exits; no manifest, no lane
+        return sorted(set(extra))
+    members_block = re.search(r"^\s*members\s*=\s*\[(.*?)\]", root, re.S | re.M)
+    members = set(re.findall(r'"([^"]+)"', members_block[1])) if members_block else set()
+    packages = set(extra)
+    for path in changed:
+        parts = path.split("/")
+        if len(parts) < 3 or parts[0] != "crates" or not (path.endswith(".rs") or parts[-1] == "Cargo.toml"):
+            continue
+        member = "/".join(parts[:2])
+        if member not in members:
+            continue
+        try:
+            manifest = git_out(repo, "show", f"{head}:{member}/Cargo.toml")
+        except (Exception, SystemExit):  # noqa: BLE001 - the member was deleted by this change
+            continue
+        table = re.search(r"^\[package\]\s*$(.*?)(?=^\[|\Z)", manifest, re.S | re.M)
+        name = re.search(r'^\s*name\s*=\s*"([^"]+)"', table[1], re.M) if table else None
+        if name:
+            packages.add(name[1])
+    return sorted(packages)
+
+
+def installed_rust_targets(repo, run=subprocess.run):
+    """`rustup target list --installed` for the repo's pinned toolchain, or None when it cannot say."""
+    try:
+        listed = run(["rustup", "target", "list", "--installed"], cwd=str(repo), capture_output=True,
+                     text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listed.returncode != 0:
+        return None
+    return {line.strip() for line in (listed.stdout or "").splitlines() if line.strip()}
+
+
+def linux_check_choice(linux, packages, installed_targets, toolchain=None):
+    """The Linux compile lane for this host, before it runs (#253, #256).
+
+    None on a Linux host: its native lanes are the Linux build. Otherwise a `linux_check` receipt
+    entry: `pending` (run it, `c_toolchain` names the cross C compiler), `not_applicable` (no touched
+    Rust package) or `not_covered` with the reason. A missing target or C toolchain is never installed
+    from the job; the entry carries the operator's one-line remedy.
+    """
+    if linux:
+        return None
+    entry = {"target": LINUX_CHECK_TARGET, "packages": list(packages)}
+    if not packages:
+        return {**entry, "status": "not_applicable", "reason": "no_touched_rust_package"}
+    if installed_targets is None:
+        return {**entry, "status": "not_covered", "reason": "rustup_unavailable", "remedy": LINUX_CHECK_REMEDY}
+    if LINUX_CHECK_TARGET not in installed_targets:
+        return {**entry, "status": "not_covered", "reason": "linux_target_missing", "remedy": LINUX_CHECK_REMEDY}
+    if toolchain is None:
+        return {**entry, "status": "not_covered", "reason": "c_toolchain_missing", "remedy": LINUX_CHECK_C_REMEDY}
+    return {**entry, "status": "pending", "c_toolchain": dict(toolchain)}
+
+
+def linux_check_command(cargo, packages, features=None):
+    """One `cargo check` for every lane package, with the features their native lanes built."""
+    selected = [f"{package}/{feature}" for package in packages for feature in (features or {}).get(package) or ()]
+    return [*cargo, "check", "--target", LINUX_CHECK_TARGET, "--all-targets", "--keep-going",
+            "--message-format=json", *(arg for package in packages for arg in ("-p", package)),
+            *(["--features", ",".join(selected)] if selected else [])]
+
+
+def classify_linux_check(code, lines, timed_out=False):
+    """The lane's verdict from cargo's exit code and its JSON/plain output lines (#253).
+
+    A rustc error is a red (`linux_check_failed`) naming the first one. A failure with no rustc error
+    is coverage this host could not give, never a red: a build script that failed for want of a C cross
+    toolchain (`c_toolchain_missing`), any other build script (`build_script_failed`), a timeout
+    (`timed_out`) or another Cargo failure (`cargo_failed`).
+    """
+    rust_errors, scripts, plain_errors, c_toolchain = [], [], [], False
+    for line in lines:
+        text = line.rstrip("\n")
+        message = None
+        if text.startswith("{"):
+            try:
+                message = json.loads(text)
+            except ValueError:
+                message = None
+        if isinstance(message, dict):
+            detail = message.get("message") if message.get("reason") == "compiler-message" else None
+            if isinstance(detail, dict) and detail.get("level") == "error" and not WARNING_NOISE.fullmatch(
+                    str(detail.get("message", ""))):
+                spans = [span for span in detail.get("spans") or [] if span.get("is_primary")]
+                where = f" ({spans[0]['file_name']}:{spans[0]['line_start']})" if spans else ""
+                code_name = (detail.get("code") or {}).get("code")
+                rust_errors.append(f"error{f'[{code_name}]' if code_name else ''}: "
+                                   f"{' '.join(str(detail.get('message', '')).split())}{where}")
+            continue
+        found = LINUX_CHECK_BUILD_SCRIPT.search(text)
+        if found:
+            scripts.append(found[1])
+        if LINUX_CHECK_C_TOOLCHAIN.search(text):
+            c_toolchain = True
+        if text.startswith("error") and not found:
+            plain_errors.append(" ".join(text.split())[:400])
+    verdict = {"rust_errors": len(rust_errors)}
+    if code == 0 and not timed_out:
+        return {**verdict, "status": "passed"}
+    if rust_errors:
+        return {**verdict, "status": "failed", "reason": "linux_check_failed", "first_error": rust_errors[0][:400]}
+    if timed_out:
+        return {**verdict, "status": "not_covered", "reason": "timed_out"}
+    if scripts:
+        return {**verdict, "status": "not_covered",
+                "reason": "c_toolchain_missing" if c_toolchain else "build_script_failed",
+                "build_scripts": list(dict.fromkeys(scripts))}
+    return {**verdict, "status": "not_covered", "reason": "cargo_failed",
+            **({"first_error": plain_errors[0]} if plain_errors else {})}
+
+
+def linux_check_label(entry):
+    """`passed`, `failed` or `not_covered(<reason>)`: the receipt's one-word view of the lane."""
+    if not entry:
+        return None
+    return entry["status"] + (f"({entry['reason']})" if entry["status"] in ("not_covered", "not_applicable") else "")
+
+
+def run_linux_check(entry, repo, cargo, features, log_dir, budget, run_stream=None, environ=None):
+    """Run the pending lane inside the caller's admission and fill its verdict into `entry`.
+
+    The lane's cross C toolchain variables (#256) go into this one process's environment only.
+    """
+    run_stream = run_stream or stream
+    environ = dict(os.environ if environ is None else environ)
+    try:
+        lane_env = linux_cross_env(entry.get("c_toolchain"), lane_target_dir(repo, environ))
+    except OSError as error:
+        entry.update(status="not_covered", reason="c_toolchain_setup_failed",
+                     first_error=" ".join(str(error).split())[:400], remedy=LINUX_CHECK_C_REMEDY)
+        return entry
+    if lane_env:
+        entry["c_toolchain"] = dict(entry.get("c_toolchain") or {}, env=sorted(lane_env))
+    command = linux_check_command(cargo, entry["packages"], features)
+    log_path = Path(log_dir) / "linux-check.log"
+    entry.update(command=command, log=str(log_path))
+    print("linux check: " + command_text(command)
+          + (f" (C toolchain: {entry['c_toolchain']['kind']})" if entry.get("c_toolchain") else ""), flush=True)
+    lines, started, timed_out = [], time.monotonic(), False
+    with log_path.open("w") as log:
+        def emit(line):
+            lines.append(line)
+            log.write(line)
+            log.flush()
+            if line.startswith("{"):
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    message = None
+                if isinstance(message, dict):
+                    detail = message.get("message") if message.get("reason") == "compiler-message" else None
+                    if isinstance(detail, dict) and detail.get("level") == "error":
+                        print(detail.get("rendered") or line, end="", flush=True)
+                    return
+            print(line, end="", flush=True)
+
+        try:
+            code = run_stream(command, emit, cwd=str(repo), budget=budget, env={**environ, **lane_env})
+        except subprocess.TimeoutExpired:
+            code, timed_out = 124, True
+        except OSError as error:
+            emit(f"error: unable to run the Linux check: {error}\n")
+            code = 1
+    entry.update(classify_linux_check(code, lines, timed_out), exit_code=code,
+                 elapsed_sec=round(time.monotonic() - started, 3))
+    if entry.get("reason") == "c_toolchain_missing":
+        entry.setdefault("remedy", LINUX_CHECK_C_REMEDY)
+    return entry
+
+
+def report_linux_check(entry):
+    """Print the lane's verdict line; True when it makes the run red."""
+    if not entry:
+        return False
+    line = f"scoped-test: linux_check: {linux_check_label(entry)}"
+    if entry.get("first_error"):
+        line += f": {entry['first_error']}"
+    if entry.get("build_scripts"):
+        line += " (build scripts: " + ", ".join(entry["build_scripts"]) + ")"
+    print(line, flush=True)
+    if entry.get("remedy") and entry.get("reason") in ("linux_target_missing", "rustup_unavailable",
+                                                       "c_toolchain_missing", "c_toolchain_setup_failed"):
+        print(f"scoped-test: linux_check: the Linux side of cfg-gated code was not compiled on this host; "
+              f"the operator can enable the lane with: {entry['remedy']}", flush=True)
+    if entry["status"] == "failed":
+        print(f"linux_check_failed: {entry.get('first_error') or 'see ' + entry.get('log', 'the lane log')}",
+              flush=True)
+        return True
+    return False
 
 
 def slow_tier_plan(checker, repo, head, derived, explicit):
@@ -1893,7 +2489,9 @@ def tool_copy():
     """Which copy of this script ran (#1938): path, git blob SHA and where it came from.
 
     The daemon runs the origin/rolling tip's copy (`rolling`, with its rev) unless the
-    candidate edits the tool (`candidate`); a manual run or a fallback is `worktree`.
+    candidate edits the tool (`candidate`) or its head carries its own unlanded tool change
+    from its base (`candidate_differs_from_rolling`, #279); a manual run or a fallback is
+    `worktree`.
     """
     data = SCRIPT.read_bytes()
     blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
@@ -1930,32 +2528,193 @@ def tool_files_beside_script(names):
 MERGE_CONFLICT_PATH_LIMIT = 32
 
 
-def merge_onto_rolling(repo, head, rolling="origin/rolling"):
+def merge_onto_rolling(repo, head, rolling="origin/rolling", *, include_tree=False):
     """Informational trial merge of `head` onto the already-resolved `rolling` ref (fetch-free).
 
     Returns the receipt fields `merges_cleanly_onto_rolling` (true/false/null), `conflict_paths`
     (first 32, sorted) and, only when null, `merge_check_reason`. Never raises and never
     changes the run's verdict: a green run on a commit that no longer merges stays green."""
     unknown = {"merges_cleanly_onto_rolling": None, "conflict_paths": []}
+    argv = []
+
+    def failed(*, kind="git_exit", exit_code=None, stderr=None):
+        diagnostic = RECENT_LANDING.git_diagnostic(
+            argv, step="trial merge", kind=kind, exit_code=exit_code, stderr=stderr,
+            timeout_seconds=120 if kind == "timeout_budget" else None)
+        return {**unknown, "merge_check_reason": str(RECENT_LANDING.GitStepError(diagnostic)),
+                "merge_check_diagnostic": diagnostic}
+
     try:
         def git(*a):
-            return subprocess.run(["git", "-C", str(repo), *a], text=True, capture_output=True, timeout=120)
+            nonlocal argv
+            argv = ["git", "-C", str(repo), *a]
+            return subprocess.run(argv, text=True, capture_output=True, timeout=120)
+        resolved = []
         for ref in (rolling, head):
-            if git("rev-parse", "--verify", "--quiet", ref + "^{commit}").returncode:
-                return {**unknown, "merge_check_reason": f"{ref} does not resolve to a commit"}
+            commit = git("rev-parse", "--verify", "--quiet", ref + "^{commit}")
+            if commit.returncode:
+                return failed(exit_code=commit.returncode, stderr=commit.stderr)
+            resolved.append(commit.stdout.strip())
+        rolling, head = resolved
         proc = git("merge-tree", "--write-tree", "--name-only", "--no-messages", rolling, head)
+    except subprocess.TimeoutExpired as error:
+        return failed(kind="timeout_budget", stderr=error.stderr)
     except (OSError, subprocess.SubprocessError) as error:
-        return {**unknown, "merge_check_reason": f"git merge-tree could not run: {error}"}
+        return failed(kind="launch_error", stderr=str(error))
     if proc.returncode == 0:
-        return {"merges_cleanly_onto_rolling": True, "conflict_paths": []}
+        tree = {"_rolling": rolling, "_merge_tree": proc.stdout.splitlines()[0]} if include_tree else {}
+        return {"merges_cleanly_onto_rolling": True, "conflict_paths": [], **tree}
     if proc.returncode != 1:
-        detail = (proc.stderr.strip().splitlines() or ["unknown error"])[0]
-        return {**unknown, "merge_check_reason": f"git merge-tree exited {proc.returncode}: {detail}"[:200]}
+        return failed(exit_code=proc.returncode, stderr=proc.stderr)
     # Output: the merged tree id, then the conflicted paths, a blank line and (without --no-messages) messages.
     lines = proc.stdout.splitlines()[1:]
     paths = sorted(set(lines[:lines.index("")] if "" in lines else lines))
     return {"merges_cleanly_onto_rolling": False, "conflict_paths": paths[:MERGE_CONFLICT_PATH_LIMIT],
-            "conflict_paths_total": len(paths)}
+            "conflict_paths_total": len(paths),
+            "merge_check_diagnostic": RECENT_LANDING.git_diagnostic(
+                argv, step="trial merge", kind="merge_conflict", exit_code=proc.returncode,
+                stderr=proc.stderr)}
+
+
+RENUMBER_TOOLS = ("rolling-migration-renumber.py", "check-released-migrations.py")
+RENUMBER_TIMEOUT_SEC = 300
+RENUMBER_CLEANUP = []
+
+
+def renumber_run(argv, *, timeout=None, env=None, cwd=None, check=False, capture_output=True, text=False):
+    """subprocess.run for the renumber step, on Popen like `integrated_base`: the unit tests stub
+    `subprocess.run` to see the derive call first, and this step runs before it."""
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=cwd, text=text)
+    try:
+        out, err = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    done = subprocess.CompletedProcess(argv, process.returncode, out, err)
+    if check and done.returncode:
+        raise subprocess.CalledProcessError(done.returncode, argv, out, err)
+    return done
+
+
+def renumber_env():
+    """The environment the lander gives the renumber tool: no GIT_*, RSI_* or PYTHON* inheritance."""
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith(("GIT_", "RSI_", "PYTHON"))}
+
+
+def stage_renumber_tool(repo, rolling, parent):
+    """Copy the renumber tool and the guard it loads beside itself out of the `rolling` commit
+    (the copy the lander runs), falling back to the tools beside this script; None when neither exists."""
+    staged = Path(tempfile.mkdtemp(prefix="rsi-renumber-tool-", dir=parent))
+    RENUMBER_CLEANUP.append(("dir", None, staged))
+    for name in RENUMBER_TOOLS:
+        shown = renumber_run(["git", "-C", str(repo), "show", f"{rolling}:tools/{name}"],
+                               capture_output=True, env=renumber_env(), check=False)
+        # os.path on purpose: the daemon's helper scan reads sibling-path expressions as files beside this script.
+        fallback = Path(os.path.join(os.path.dirname(os.path.dirname(SCRIPT)), "tools", name))
+        if shown.returncode == 0:
+            (staged / name).write_bytes(shown.stdout)
+        elif fallback.is_file():
+            shutil.copyfile(fallback, staged / name)
+        else:
+            return None
+    return staged
+
+
+def renumber_declared_candidate(repo, head, rolling="origin/rolling", tool_dir=None):
+    """Renumber a declared provisional-migration source onto `rolling` the way the lander does (#3339).
+
+    A candidate whose declared provisional migration number (`tools/provisional-migrations/*.json`)
+    was taken on `rolling` neither merges cleanly nor passes the numbering check, so the run would
+    test nothing. The lander renumbers such a source (`tools/rolling-migration-renumber.py
+    --transform`, then `--build` into a scratch worktree) and gates the result; this does the same
+    and returns the renumbered merge commit to test.
+
+    Returns None when nothing needs renumbering (no declaration, rolling already contained, or the
+    source is already rolling head + 1), else a dict: `status` `renumbered` with `candidate`,
+    `source`, `target`, `base`, `old_version`, `new_version`, or `refused` with `reason` (the run
+    stops before building or testing). Still-free versions are validated before returning None.
+    Never raises."""
+    def git(*args):
+        return renumber_run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                              env=renumber_env(), timeout=120, check=False)
+    try:
+        oids = []
+        for ref in (head, rolling):
+            resolved = git("rev-parse", "--verify", "--quiet", ref + "^{commit}")
+            if resolved.returncode:
+                return None
+            oids.append(resolved.stdout.strip())
+        source, target = oids
+        if git("merge-base", "--is-ancestor", source, target).returncode == 0:
+            return None
+        merge_base = git("merge-base", source, target)
+        if merge_base.returncode or not merge_base.stdout.strip():
+            return None
+        base = merge_base.stdout.strip()
+        added = git("diff", "--name-only", "--diff-filter=A", "--no-renames", base, source,
+                    "--", "tools/provisional-migrations/")
+        if added.returncode or not any(name.endswith(".json") for name in added.stdout.splitlines()):
+            return None
+        refused = {"status": "refused", "source": source, "target": target, "base": base}
+        tools = Path(tool_dir) if tool_dir else stage_renumber_tool(repo, target, tempfile.gettempdir())
+        if tools is None or not (tools / "rolling-migration-renumber.py").is_file():
+            return {**refused, "reason": "the renumber tool is not available"}
+        tool = [sys.executable, "-B", str(tools / "rolling-migration-renumber.py"), "--repo", str(repo)]
+
+        def call(*args):
+            done = renumber_run([*tool, *args], capture_output=True, text=True, env=renumber_env(),
+                                  cwd=str(repo), timeout=RENUMBER_TIMEOUT_SEC, check=False)
+            if done.returncode:
+                raise ValueError((done.stderr or done.stdout).strip() or f"exit {done.returncode}")
+            return json.loads(done.stdout)
+        unit = call("--transform", "--base", base, "--source", source, "--target", target)
+        if unit.get("renumber_noop"):
+            # #3397: --transform returns before the site inventory when the
+            # version is still free. Plain inspection validates at latest+1
+            # with the same tool, without creating a transformed candidate.
+            if not unit.get("migration_already_landed"):
+                call("--base", base, "--source", source, "--target", target)
+            return None
+        scratch = Path(tempfile.mkdtemp(prefix=".rsi-scoped-renumber-", dir=Path(repo).resolve().parent))
+        try:
+            unit_file = scratch / "unit.json"
+            unit_file.write_text(json.dumps(unit))
+            built = call("--build", "--unit-file", str(unit_file), "--scratch", str(scratch))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return {"status": "renumbered", "source": source, "target": target, "base": base,
+                "candidate": built["candidate"], "old_version": unit["old_version"],
+                "new_version": unit["new_version"]}
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        return {"status": "refused", "reason": str(error)[:500]}
+
+
+def checkout_renumbered(repo, candidate):
+    """A detached worktree of the renumbered candidate to build and test in (removed when the run ends)."""
+    tree = Path(tempfile.mkdtemp(prefix="rsi-renumbered-candidate-")) / "tree"
+    RENUMBER_CLEANUP.append(("worktree", Path(repo), tree))
+    renumber_run(["git", "-C", str(repo), "worktree", "add", "--detach", "--quiet", str(tree), candidate],
+                   capture_output=True, text=True, env=renumber_env(), timeout=300, check=True)
+    return tree
+
+
+def cleanup_renumbered():
+    """Remove the worktree and staged tools the renumber step made; never raises."""
+    while RENUMBER_CLEANUP:
+        kind, repo, path = RENUMBER_CLEANUP.pop()
+        try:
+            if kind == "worktree":
+                renumber_run(["git", "-C", str(repo), "worktree", "remove", "--force", str(path)],
+                               capture_output=True, env=renumber_env(), timeout=120, check=False)
+                renumber_run(["git", "-C", str(repo), "worktree", "prune"],
+                               capture_output=True, env=renumber_env(), timeout=120, check=False)
+                shutil.rmtree(path.parent, ignore_errors=True)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def record_merge_onto_rolling():
@@ -1964,15 +2723,58 @@ def record_merge_onto_rolling():
     RECEIPT.pop("candidate_repo", None)
     if not head or not repo or RECEIPT.get("dry_run"):
         return
-    RECEIPT.update(merge_onto_rolling(repo, head))
+    # A renumbered candidate (#3339) already contains rolling: its trial merge is the one that lands.
+    renumbered = (RECEIPT.get("renumber") or {}).get("candidate")
+    merge = merge_onto_rolling(repo, renumbered or head, include_tree=True)
+    rolling, tree = merge.pop("_rolling", None), merge.pop("_merge_tree", None)
+    RECEIPT.update(merge)
+    recent = (RECENT_LANDING.recent_landing_deletions(repo, head, rolling, tree) if tree else
+              {"status": "skipped", "warnings": [],
+               "reason": merge.get("merge_check_reason", "trial merge conflicted; see conflict_paths"),
+               "diagnostic": merge["merge_check_diagnostic"]})
+    if renumbered and tree:
+        recent["note"] = ("blamed against the lander's renumbered candidate: lines the renumber rewrote "
+                          "from rolling's migration numbers show as removals")
+    RECEIPT["reverts_recent_landing"] = recent
+    print("scoped-test: reverts_recent_landing " + json.dumps(recent, separators=(",", ":")), flush=True)
 
 
-def emit_receipt(exit_code):
-    """Print the one-line JSON receipt last, whatever way the run ended."""
+def emit_receipt(exit_code, *, progress=False):
+    """Print compact progress, or terminal evidence with bounded selection details.
+
+    agent_jobs.rs consumes ok, failures and package outcomes. AgentCheckLandingCandidate
+    (rsi-common/src/agent_landing_candidate.rs) also consumes head, failure_class,
+    baseline_reds/new_failures, plan, uncertain, stale_base, gate_covers_rest,
+    selected_tests/run_tests and merge/conflict fields. Keep all terminal evidence inline;
+    none of those consumers reads the three selection fields moved to selection.json.
+    """
     if not RECEIPT["emit"]:
         return
     receipt = {k: v for k, v in RECEIPT.items() if k not in ("emit", "candidate_repo")}
-    receipt.update(exit_code=exit_code, ok=exit_code == 0)
+    # A run red only on baseline reds keeps its exit code but is ok (#183).
+    receipt.update(exit_code=exit_code, ok=exit_code == 0 or (exit_code == 1 and "ok_reason" in receipt))
+    if exit_code == 1 and FAILURE.infrastructure_interrupted(receipt):
+        receipt.update(failure_class="infrastructure_interrupted", ok=False)
+    selection = receipt.get("selection", {})
+    for key, summary in selection.get("fields", {}).items():
+        if progress or summary["bytes"] > INLINE_SELECTION_BYTES:
+            compact = {**summary, "detail_path": selection["path"]}
+            if key == "downstream_compile":
+                compact["packages"] = [{field: item[field] for field in ("package", "status", "execution")
+                                        if field in item} for item in receipt[key].get("packages", [])]
+            receipt[key] = compact
+    if progress:
+        # Do not repeat derivation/baseline diagnostics on every package phase. Small failure
+        # lists stay useful after interruption; large ones have counts and digests instead.
+        fields = {"schema", "base", "head", "dry_run", "tool", "packages", "plan", "compile",
+                  "python", "desktop", "linux_check", "admission", "log_dir", "selection",
+                  "selected_tests", "run_tests", "selected_filters", "run_filters", "gate_covers_rest", "failure_class",
+                  *SELECTION_FIELDS}
+        receipt = {key: (value if key == "packages" else progress_detail(value))
+                   for key, value in receipt.items() if key in fields}
+        receipt["packages"] = [progress_detail(item) for item in receipt.get("packages", [])]
+        # Progress can never stand in for a successful terminal receipt.
+        receipt.update(exit_code=exit_code, ok=False, partial=True)
     print(RECEIPT_PREFIX + json.dumps(receipt, separators=(",", ":")), flush=True)
 
 
@@ -1981,7 +2783,22 @@ def snapshot_package(entry):
     packages = [item for item in RECEIPT["packages"] if item.get("package") != entry["package"]]
     packages.append(entry)
     RECEIPT["packages"] = packages
-    emit_receipt(1)
+    emit_receipt(1, progress=True)
+
+
+def split_package_failures(packages, new_failures, baseline_keys, compared):
+    """Give every package its failing tests split into new and baseline-reproduced (#199).
+
+    Same data as the top-level `new_failures` / `baseline_reds`, so the two agree. Without a
+    complete base comparison nothing is known to be a baseline red and `new_failures` is null.
+    """
+    key = lambda item: (item.get("package"), item.get("kind"), item.get("target"), item.get("test"))
+    new_keys = {key(item) for item in new_failures or []}
+    for entry in packages:
+        failed = entry.get("failed_tests") or []
+        entry["new_failures"] = ([item for item in failed if key(item) in new_keys] if compared or not failed
+                                 else None)
+        entry["baseline_reds"] = [item for item in failed if key(item) in baseline_keys] if compared else []
 
 
 def baseline_target_dir(repo, log_dir):
@@ -2042,6 +2859,80 @@ def failure_records(candidate_failures):
             for kind, target, test in sorted({(x["kind"], x["target"], x["test"]) for x in entries})]
 
 
+def query_job_failure_snapshot(repo, test_id):
+    """Read the project export published by job admission, never agent credentials.
+
+    This path is relative to the admitted cwd, independent of the selected tool
+    copy, the unit's HOME, TMPDIR and its Cargo target. Keeping it beneath
+    .rsi-tmp lets the finished sandbox's target remain reclaimable. A missing
+    export cannot fall back to a shared snapshot for another project's Issues.
+    """
+    path = Path(repo) / "target/.rsi-tmp/scoped-test/known-failures.v1.json"
+    unavailable = {"status": "unavailable", "source": "snapshot", "path": str(path)}
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {**unavailable, "reason": f"known-failure snapshot missing file: {path}"}
+    except (OSError, UnicodeError) as error:
+        return {**unavailable, "reason": f"known-failure snapshot read error: {error}"}
+    try:
+        export = json.loads(text)
+        if not isinstance(export, dict) or export.get("schema_version") != 1:
+            raise ValueError("unsupported export schema_version (expected 1)")
+        uuid.UUID(export["project_id"])
+        snapshot = export["snapshot"]
+        if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 1:
+            raise ValueError("unsupported snapshot schema_version (expected 1)")
+        timestamp = snapshot["exported_at"]
+        if not isinstance(timestamp, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", timestamp):
+            raise ValueError("exported_at must be RFC3339")
+        exported_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if exported_at.tzinfo is None:
+            raise ValueError("exported_at requires an RFC3339 time zone")
+        age = (datetime.now(timezone.utc) - exported_at).total_seconds()
+        if age < 0 or age >= 24 * 3600:
+            return {**unavailable, "reason": f"known-failure snapshot stale: age={age:.3f}s (limit=86400s)",
+                    "age_seconds": round(age, 3)}
+        entries = snapshot["records"]
+        if not isinstance(entries, list) or not isinstance(export["malformed_issues"], list):
+            raise ValueError("records and malformed_issues must be lists")
+        records = []
+        for entry in entries:
+            record = entry["record"]
+            if (not isinstance(record, dict) or not isinstance(record.get("test_id"), str)
+                    or not record["test_id"] or record.get("schema_version", 1) != 1
+                    or not isinstance(record.get("issue"), int) or record["issue"] <= 0
+                    or record.get("class") not in ("regression", "flake", "env", "seed")
+                    or not isinstance(record.get("matcher"), dict)
+                    or entry["issue_status"] not in ("Open", "InProgress", "Closed", "Cancelled")):
+                raise ValueError("invalid snapshot record")
+            if entry["issue_status"] in ("Open", "InProgress") and record["test_id"] == test_id:
+                records.append(record)
+        if not records and export["malformed_issues"]:
+            return {**unavailable, "reason": "known-failure snapshot contains malformed Issues",
+                    "malformed_issues": export["malformed_issues"]}
+        result = {"status": "recorded" if records else "unknown", "source": "snapshot",
+                  "path": str(path), "age_seconds": round(age, 3), "records": records}
+        if not records:
+            result["reason"] = "snapshot loaded; no matching active record"
+            advisories = export.get("qa_advisories", {})
+            issues = advisories.get(test_id, []) if isinstance(advisories, dict) else None
+            if (not isinstance(issues, list)
+                    or any(type(issue) is not int or issue <= 0 for issue in issues)):
+                # Optional context cannot change unknown into unavailable:
+                # baseline-only runs treat those statuses differently.
+                result["qa_advisory_error"] = "invalid QA advisory Issue numbers"
+            elif issues:
+                result["qa_issue_advisories"] = [
+                    {"issue": issue, "message":
+                     f"open qa Issue #{issue} names this test (advisory, not a signature match)"}
+                    for issue in sorted(set(issues))]
+        return result
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        return {**unavailable, "reason": f"known-failure snapshot parse error: {error}"}
+
+
 def query_failure_records(repo, test_id, timeout):
     """Look up active records by exact name; a lookup error never means no record exists.
 
@@ -2050,18 +2941,23 @@ def query_failure_records(repo, test_id, timeout):
     """
     try:
         if not os.environ.get("RSI_SESSION_TOKEN"):
-            # Durable jobs intentionally carry no agent authority. Use the shared
-            # classifier's exported snapshot there, as the rolling QA tools do.
+            if os.environ.get("RSI_JOB_ID"):
+                return query_job_failure_snapshot(repo, test_id)
+            # Direct, non-job invocations retain the legacy shared classifier
+            # export used by the rolling QA tools.
             binary = os.environ.get("RSI_KNOWN_FAILURE_BIN") or shutil.which("rsi-known-failure")
             if not binary:
                 target = Path(os.environ.get("CARGO_TARGET_DIR", str(Path.home() / ".cargo/shared-target")))
                 binary = str(target / "debug/rsi-known-failure")
-            result = subprocess.run([binary, "query", test_id], cwd=repo, text=True,
+            command = [binary, "query", test_id]
+            if os.environ.get("RSI_KNOWN_FAILURES_SNAPSHOT"):
+                command.extend(["--snapshot", os.environ["RSI_KNOWN_FAILURES_SNAPSHOT"]])
+            result = subprocess.run(command, cwd=repo, text=True,
                                     capture_output=True, timeout=timeout)
             # The CLI warns for a stale snapshot. It cannot attest to current absence.
             if result.returncode or result.stderr.strip():
                 return {"status": "unavailable", "source": "snapshot",
-                        "reason": "known-failure snapshot missing, invalid or stale"}
+                        "reason": result.stderr.strip() or f"known-failure snapshot query exited {result.returncode}"}
             records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
             if any(not isinstance(record, dict) or record.get("test_id") != test_id for record in records):
                 return {"status": "unavailable", "source": "snapshot",
@@ -2097,9 +2993,50 @@ def annotate_baseline_reds(repo, reds):
         if record["status"] == "unknown":
             without_record.append(failure)
             print(f"scoped-test: baseline red without known-failure record: {failure['package']} {name}", flush=True)
+            for advisory in record.get("qa_issue_advisories", []):
+                print(f"scoped-test: {failure['package']} {name}: {advisory['message']}", flush=True)
         elif record["status"] == "unavailable":
             print(f"scoped-test: baseline red known-failure lookup unavailable: {failure['package']} {name}", flush=True)
     return {"baseline_failure_records": annotations, "baseline_reds_without_record": without_record}
+
+
+WARNING_GATE_FAILED = ("new_warnings", "baseline_raised", "unavailable")
+
+
+def baseline_only_ok_reason(receipt):
+    """The reason a red run is still `ok`, or None: its only reds are baseline reds (#183).
+
+    The landing gate is "no new failures relative to rolling", which is also what
+    AgentCheckLandingCandidate judges. A run qualifies only when the base comparison
+    completed, every failure reproduced on the base (a stale-base red does not count:
+    it needs a merge), and nothing else went wrong (no timeout, incomplete, build/list
+    failure, unmatched filter, warning gate, desktop lane or Python failure). Each
+    baseline red needs an active known-failure record, or a lookup that could not
+    say (`unavailable`, e.g. a satellite without the hub's snapshot): there the base
+    comparison itself is the evidence. A loaded snapshot with no record for a red
+    (`unknown`) keeps the run red so the untracked rolling red stays visible.
+    """
+    comparison = receipt.get("baseline_comparison") or {}
+    failures, reds = receipt.get("failures") or [], receipt.get("baseline_reds") or []
+    if (receipt.get("dry_run") or comparison.get("status") != "complete" or not failures
+            or receipt.get("new_failures") != [] or receipt.get("unmatched_filters")
+            or (receipt.get("warnings") or {}).get("status") in WARNING_GATE_FAILED
+            or (receipt.get("linux_check") or {}).get("status") == "failed"):
+        return None
+    key = lambda item: (item.get("package"), item.get("kind"), item.get("target"), item.get("test"))
+    if not {key(item) for item in failures} <= {key(item) for item in reds}:
+        return None
+    for entry in receipt.get("packages") or []:
+        if entry.get("status") not in ("passed", "not applicable", "failed") or (
+                entry.get("status") == "failed" and entry.get("phase") != "test_failed"):
+            return None
+    if any(entry.get("status") != "passed" for entry in receipt.get("desktop") or []) or any(
+            entry.get("status") != "passed" for entry in receipt.get("python") or []):
+        return None
+    statuses = {record.get("status") for record in receipt.get("baseline_failure_records") or []}
+    if len(receipt.get("baseline_failure_records") or []) != len(reds) or not statuses <= {"recorded", "unavailable"}:
+        return None
+    return "baseline_confirmed_without_snapshot" if "unavailable" in statuses else "baseline_known_failure"
 
 
 def compare_failures_with_base(repo, base, packages, log_dir, seconds, cpu_quota, linux, cargo, tmpfs=None):
@@ -2122,6 +3059,7 @@ def compare_failures_with_base(repo, base, packages, log_dir, seconds, cpu_quota
         detail = "git worktree did not create the requested directory"
         print(f"scoped-test: base comparison unavailable: {detail}", flush=True)
         return {"status": "unavailable", "base": base, "detail": detail, "baseline_reds": []}
+    checker = runpy.run_path(str(SCRIPT.with_name("check-touched-shards")))
     baseline_reds, checked = [], []
     baseline_target = baseline_target_dir(root, log_dir)
     build_env = {"CARGO_TARGET_DIR": str(baseline_target)}
@@ -2137,9 +3075,15 @@ def compare_failures_with_base(repo, base, packages, log_dir, seconds, cpu_quota
                                    "target": target if kind != "lib" else "", "substring": "",
                                    "exact": None, "regex": None})
             names = sorted({entry["test"] for entry in failed_tests})
+            exact_selections = [{"kind": entry["kind"], "exact": entry["test"]} for entry in failed_tests]
+            features = required_test_features(checker, worktree, base, package, exact_selections)
             plan = {"repo": str(worktree), "package": package, "selections": selections,
                     "exact_tests": names, "test_shards": max(1, int(cpu_quota // 100)),
-                    "build": build_command(package, selections, cargo)}
+                    "features": features, "build": build_command(package, selections, cargo, features)}
+            # The head run sets RSI_E2E=1 and prebuilds rsid for e2e_tui; the base rerun must
+            # too, or those tests return Ok at once and a base red is invisible (#3321).
+            if selects_e2e(selections):
+                plan["e2e"] = {"prebuild": e2e_prebuild_command(cargo)}
             if tmpfs:
                 plan["tmpfs"] = tmpfs
             plan_path = Path(log_dir) / f"baseline-{package}.json"
@@ -2237,8 +3181,9 @@ def filter_coverage(plan, subsets):
                selects nothing runnable in every package that carries it is vacuously run);
       partial  some selected tests ran and some did not;
       not run  none ran, or no package carrying the filter listed its tests, so nothing is claimed.
-    A package that never reported (box spent, timeout, build failure) is named in
-    `unlisted_packages`; its tests are unknown, so they are neither counted nor assumed."""
+    An interrupted package retains its listing and observed verdicts. A package that never
+    listed (box spent, startup timeout, build failure) is named in `unlisted_packages`;
+    its tests are unknown, so they are neither counted nor assumed."""
     carriers, bounded_carriers = {}, {}
     for package, selections in plan.items():
         for selection in selections:
@@ -2395,7 +3340,7 @@ def run_python_tests(python_commands, args, log_dir, run_started, env):
                 if ran and runner == "unittest":
                     result["executed_tests"] = int(ran.group(1))
             try:
-                code = stream(command, emit_python, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
+                code = stream(isolated(command), emit_python, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
             except subprocess.TimeoutExpired:
                 result["status"] = "timed out"
                 print("scoped_test_timeout: " + command_text(command), flush=True)
@@ -2457,7 +3402,7 @@ def run_desktop_lane(desktop_commands, args, log_dir, run_started, env=None):
                                    ("npm_tests", "cargo_tests", "executed_tests", "failed_step") if key in reported})
                     result["lane_status"] = reported.get("status")
             try:
-                code = stream(command, emit_desktop, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
+                code = stream(isolated(command), emit_desktop, timeout=budget, cwd=Path(args.repo).resolve(), env=env)
             except subprocess.TimeoutExpired:
                 result["status"] = "timed out"
                 print("scoped_test_timeout: " + command_text(command), flush=True)
@@ -2516,8 +3461,11 @@ def integrated_base(repo, base, head, rolling="origin/rolling"):
 
 
 def main():
-    with BuildAdmission() as admission:
-        return run(admission)
+    try:
+        with BuildAdmission() as admission:
+            return run(admission)
+    finally:
+        cleanup_renumbered()
 
 
 def run(admission):
@@ -2531,11 +3479,11 @@ def run(admission):
                         help="wall-clock cap per package, including build (default 1800)")
     parser.add_argument("--total-max-sec", type=positive, default=None,
                         help="wall-clock cap for the whole run; later packages get only the time left")
-    parser.add_argument("--slot-wait-max-sec", type=positive, default=600,
+    parser.add_argument("--slot-wait-max-sec", type=positive, default=None,
                         help="longest to queue for a governor build slot; the wait never counts against "
-                             "--runtime-max-sec or --total-max-sec (default 600)")
+                             "--runtime-max-sec or --total-max-sec (default: job budget, at least 600)")
     parser.add_argument("--job-max-sec", type=positive, default=None,
-                        help="daemon job wall budget, including waits; reserve 120s for execution")
+                        help="daemon execution budget, excluding slot/lock waits")
     parser.add_argument("--filter-budget", type=int, default=FILTER_BUDGET, metavar="N",
                         help="a plan with more than N distinct filters is a targeted subset: it runs as named, "
                              "most specific first, inside --test-time-box-sec (receipt `plan: targeted_subset`); "
@@ -2573,18 +3521,29 @@ def run(admission):
         return 0
     if args.execute_plan:
         return execute_package(json.loads(Path(args.execute_plan).read_text()))
+    # Candidate tools also run under older daemons that do not pass the new
+    # admission argument. Derive the same allowance from their job budget.
+    if args.slot_wait_max_sec is None:
+        args.slot_wait_max_sec = max(600, args.job_max_sec or 0)
     RECEIPT.pop("admission", None)
-    RECEIPT.update(emit=True, base=args.base, head=args.head, dry_run=args.dry_run, python=[], desktop=[],
+    RECEIPT.pop("ok_reason", None)  # set only by this run's own baseline verdict (#183)
+    RECEIPT.pop("selection", None)
+    RECEIPT.update(emit=True, base=args.base, head=args.head, dry_run=args.dry_run, python=[], desktop=[], features={},
                    tool=tool_copy())
     print("scoped-test: tool copy " + json.dumps(RECEIPT["tool"], sort_keys=True), flush=True)
+    record_pid_isolation()
     repo = Path(args.repo).resolve()
     run_started = time.monotonic()
     job_deadline = None
+    startup_waited = 0.0
     if args.job_max_sec is not None:
-        # The wrapper starts the wall clock before sandbox/artifact-lock waits.
-        elapsed = max(0, time.time() - float(os.environ.get("RSI_JOB_STARTED_AT", time.time())))
-        run_started -= elapsed
+        # The wrapper starts before sandbox/artifact locks; execution starts here.
+        # Its unit cap and daemon watchdog also bound those pre-script waits.
+        startup_waited = max(0, time.time() - float(os.environ.get("RSI_JOB_STARTED_AT", time.time())))
         job_deadline = run_started + args.job_max_sec - 60
+        RECEIPT["admission"] = {"count": 0, "startup_wait_sec": round(startup_waited, 3),
+                                "waited_sec": round(startup_waited, 3),
+                                "excluded_from_execution": True}
     if args.filters is None and os.environ.get("RSI_SCOPED_TEST_FILTERS"):
         args.filters = [line for line in os.environ["RSI_SCOPED_TEST_FILTERS"].split("\n") if line]
     tmpfs, reason = tmpfs_parent()
@@ -2608,6 +3567,25 @@ def run(admission):
         head = checker["git_out"](repo, "rev-parse", "--verify", args.head + "^{commit}").strip()
         print(f"explicit filters: head={head} repo={repo}", flush=True)
     else:
+        source_repo = repo
+        renumber = renumber_declared_candidate(repo, args.head, args.base)
+        original_head = None
+        if renumber and renumber["status"] == "renumbered":
+            original_head = renumber["source"]
+            RECEIPT["renumber"] = {key: renumber[key] for key in
+                                   ("status", "source", "target", "old_version", "new_version", "candidate")}
+            print(f"scoped-test: declared provisional migration v{renumber['old_version']} was taken on "
+                  f"{args.base}; testing the lander's renumbered candidate {renumber['candidate'][:12]} "
+                  f"(v{renumber['new_version']}) of {original_head[:12]}", flush=True)
+            args.head = renumber["candidate"]
+            if not args.dry_run:
+                repo = checkout_renumbered(repo, args.head)
+                args.repo = str(repo)
+        elif renumber:
+            RECEIPT["renumber"] = {"status": "refused", "reason": renumber.get("reason")}
+            RECEIPT["head"] = renumber.get("source", args.head)
+            print("scoped-test: provisional migration renumber refused: " + str(renumber.get("reason")), flush=True)
+            return 2
         derive_base = integrated_base(repo, args.base, args.head)
         if derive_base != args.base:
             RECEIPT["integrated_base"] = derive_base
@@ -2647,6 +3625,9 @@ def run(admission):
     if not args.dry_run and checker["git_out"](repo, "rev-parse", "HEAD").strip() != head:
         raise ValueError("--head differs from this worktree's HEAD; use --dry-run to inspect another candidate")
     RECEIPT.update(head=head, filters=list(filters), candidate_repo=str(repo))
+    if RECEIPT.get("renumber", {}).get("status") == "renumbered":
+        # The receipt names the commit the worker committed; the renumbered candidate that ran is `renumber`.
+        RECEIPT.update(head=RECEIPT["renumber"]["source"], candidate_repo=str(source_repo))
     slow_tier, slow_tests = slow_tier_plan(checker, repo, head, receipt_data, explicit=args.filters is not None)
     RECEIPT["slow_tier"] = slow_tier
     print("scoped-test: " + slow_tier_summary(slow_tier), flush=True)
@@ -2662,6 +3643,16 @@ def run(admission):
               flush=True)
     plan = selection_plan(filters, checker["shard_packages"](repo), priority_filters)
     direct_plan = direct_observer_plan(receipt_data, checker["shard_packages"](repo))
+    downstream = receipt_data.get("downstream_tests")
+    if downstream is None:
+        downstream = downstream_test_plan(checker, repo, receipt_data.get("merge_base", args.base), head)
+    RECEIPT["downstream_tests"] = {key: downstream.get(key, []) for key in ("items", "selections", "filters", "notes")}
+    RECEIPT["downstream_compile"] = downstream
+    downstream_packages = {item["package"]: item for item in downstream["packages"]}
+    log_dir = Path(tempfile.mkdtemp(prefix="rsi-scoped-test-", dir="/tmp" if Path("/tmp").is_dir() else None))
+    print(f"logs: {log_dir}", flush=True)
+    RECEIPT["log_dir"] = str(log_dir)
+    persist_selection(log_dir)
     if bounded_plan:
         announce_bounded_plan(bounded_plan, plan, head, receipt_data, direct_plan)
     if priority_filters:
@@ -2717,10 +3708,34 @@ def run(admission):
                         if desktop_selected else [])
     if not linux:
         print("scoped-test: systemd unavailable on this platform; no rsi-build.slice available, plain wall-clock timeout, no CPU cap", flush=True)
-    log_dir = Path(tempfile.mkdtemp(prefix="rsi-scoped-test-", dir="/tmp" if Path("/tmp").is_dir() else None))
-    print(f"logs: {log_dir}", flush=True)
-    RECEIPT["log_dir"] = str(log_dir)
-    if not plan and not python_commands and not desktop_commands:
+    linux_lane = None
+    if not linux:
+        # #253: the Linux compile lane runs after the native lanes; decide it now so a dry run shows it.
+        try:
+            lane_packages = linux_check_packages(repo, receipt_data.get("merge_base", args.base), head,
+                                                 checker["git_out"], downstream_packages)
+        except (Exception, SystemExit) as error:  # noqa: BLE001 - the lane never breaks the native run
+            lane_packages, lane_error = None, " ".join(str(error).split())[:200]
+        if lane_packages is None:
+            linux_lane = {"target": LINUX_CHECK_TARGET, "packages": [], "status": "not_covered",
+                          "reason": "package_selection_failed", "first_error": lane_error}
+        else:
+            linux_lane = linux_check_choice(False, lane_packages,
+                                            installed_rust_targets(repo) if lane_packages else set(),
+                                            linux_cross_toolchain() if lane_packages else None)
+        if args.dry_run and linux_lane["status"] == "pending":
+            linux_lane.update(status="planned", command=linux_check_command(
+                split_slot(checker["cargo_prefix"]())[1], linux_lane["packages"]))
+        # A run that stops before the lane (a red Python test, a desktop timeout) never claims it ran.
+        RECEIPT["linux_check"] = (dict(linux_lane, status="not_covered", reason="not_reached")
+                                  if linux_lane["status"] == "pending" else linux_lane)
+        print(f"scoped-test: linux_check lane ({LINUX_CHECK_TARGET}, after the native lanes): "
+              + (linux_check_label(linux_lane) if linux_lane["status"] != "pending" else
+                 "cargo check --all-targets for " + " ".join(linux_lane["packages"])
+                 + f" (C toolchain: {linux_lane['c_toolchain']['kind']})"), flush=True)
+        if args.dry_run and linux_lane.get("remedy"):
+            print(f"scoped-test: linux_check: to enable it, the operator runs: {linux_lane['remedy']}", flush=True)
+    if not plan and not downstream_packages and not python_commands and not desktop_commands:
         print("scoped-test: no test filters derived; no tests run", flush=True)
     matched, failed, summaries, candidate_failures = set(), False, [], {}
     warning_payloads = []
@@ -2733,7 +3748,7 @@ def run(admission):
         python_env = {**os.environ, "TMPDIR": python_scratch, "TMP": python_scratch, "TEMP": python_scratch}
         print(f"TMPFS_PARITY python tests={len(python_commands)} tmpfs={python_scratch}", flush=True)
         RECEIPT["python_tmpfs"] = len(python_commands)
-    announce_execution_order(python_commands, list(plan), args.dry_run, desktop_commands)
+    announce_execution_order(python_commands, list(dict.fromkeys([*plan, *downstream_packages])), args.dry_run, desktop_commands)
     try:
         python_code = run_python_tests(python_commands, args, log_dir, run_started, python_env)
     finally:
@@ -2756,27 +3771,45 @@ def run(admission):
     if not args.dry_run and args.total_max_sec is not None and time.monotonic() - run_started >= args.total_max_sec:
         print("scoped_test_timeout: total budget exhausted before Cargo", flush=True)
         return 1
-    packages = list(plan.items())
+    packages = list(plan.items()) + [(package, []) for package in downstream_packages if package not in plan]
     # Hold one governor admission across the package units (#2216). Foreground
-    # runs exclude the one queue wait; daemon jobs include it (#2025).
+    # and daemon runs both exclude the one queue wait (#431).
     slot, cargo = split_slot(checker["cargo_prefix"]())
     if args.cargo_slot and not os.environ.get("RSI_CARGO_SLOT_HELD"):
         slot = [args.cargo_slot] if Path(args.cargo_slot).name == "cargo-slot" else []
     admission_failed = False
     slot_waited = 0.0
     for package_index, (package, selections) in enumerate(packages):
-        if box_left is not None and box_left <= 0 and not args.dry_run:
+        compile_only = package in downstream_packages and not selections
+        compile_entry = downstream_packages.get(package)
+        owns_changed = any(item.get("package") == package for item in changed_modules)
+        if box_left is not None and box_left <= 0 and owns_changed and not args.dry_run:
+            # The box is spent but this package owns a changed module (#3252): its own tests still run, the
+            # package's box is empty so every other tier is left to the merge-queue gate.
+            box_left = SPENT_BOX_SEC
+            print(f"scoped-test: targeted subset: test time box spent; {package} still runs the tests of its "
+                  "changed modules", flush=True)
+        if box_left is not None and box_left <= 0 and not args.dry_run and compile_entry is None:
             # The box is spent: a later package is left to the merge-queue gate, not failed.
             print(f"scoped-test: targeted subset: test time box spent; {package} left to the merge-queue gate",
                   flush=True)
             skipped_filters.update(s["filter"] for s in selections)
             matched.update(s["filter"] for s in selections)
             continue
-        package_plan = {"repo": str(repo), "package": package, "selections": selections,
-                        "build": build_command(package, selections, cargo), "test_shards": test_shards,
+        feature_selections = ([{"kind": "lib", "substring": ""}] if compile_entry is not None else
+                              [*selections, *direct_plan.get(package, [])])
+        features = required_test_features(checker, repo, head, package, feature_selections)
+        RECEIPT.setdefault("features", {})[package] = features
+        package_plan = {"repo": str(repo), "package": package, "selections": selections, "features": features,
+                        "build": build_command(package, selections, cargo, features, all_tests=compile_entry is not None),
+                        "compile_only": compile_only, "test_shards": test_shards,
                         "test_threads": test_shards, "runner": runner, "time_box_sec": box_left,
                         "changed_modules": [item for item in changed_modules if item.get("package") == package],
                         "direct_selections": direct_plan.get(package, [])}
+        if compile_entry is not None:
+            compile_entry.update(command=package_plan["build"], features=features,
+                                 execution="compile_only" if compile_only else "selected_tests_also_run",
+                                 status="planned" if args.dry_run else "pending")
         if runner == "nextest":
             package_plan["nextest"] = [*cargo, "nextest"]
         if slow_tests and package == slow_tier["package"]:
@@ -2789,7 +3822,7 @@ def run(admission):
         plan_path.write_text(json.dumps(package_plan, indent=2) + "\n")
         budget = args.runtime_max_sec
         if args.total_max_sec is not None:
-            left = args.total_max_sec - (time.monotonic() - run_started - (slot_waited if job_deadline is None else 0))
+            left = args.total_max_sec - (time.monotonic() - run_started)
             if left < 1 and not args.dry_run:
                 print(f"scoped_test_timeout: total budget exhausted before {package}: --total-max-sec "
                       f"{args.total_max_sec:g}; {package} was not run", flush=True)
@@ -2798,14 +3831,14 @@ def run(admission):
                                   {"phases": set(), "diagnostic": None, "terminated": False, "incomplete": True}))
                 continue
             budget = min(budget, max(left, 1))
-        wait_cap = args.slot_wait_max_sec
+        # The slot wait is capped as a whole and is never spent from the run budget (#3284).
+        wait_cap = max(0, args.slot_wait_max_sec - slot_waited)
         if job_deadline is not None:
-            wait_cap = max(0, job_deadline - 60 - time.monotonic())
-            # A granted slot leaves only the job's remaining wall budget.
+            wait_cap = max(0, wait_cap - startup_waited)
             budget = min(budget, max(1, job_deadline - time.monotonic()))
         needs_admission = bool(slot) and admission.process is None
         if needs_admission and wait_cap <= 0 and not args.dry_run:
-            print(f"rsi-phase {int(time.time())} admission-timeout: no job budget left for {package}", flush=True)
+            print(f"rsi-phase {int(time.time())} admission-timeout: no admission allowance left for {package}", flush=True)
             admission_failed = True
             break
         command, unit = bounded_command(package_plan, plan_path, budget, unit_quota, linux)
@@ -2817,11 +3850,13 @@ def run(admission):
             print(f"{package} direct observers selected: {sum(1 for s in selections if s.get('direct_only'))} filters "
                   "(listed in the package plan)", flush=True)
         if needs_admission:
-            print(f"slot: {slot[0]} is held across packages before the budget starts; queue time " +
-                  ("counts against the job wall budget" if job_deadline is not None else "is not counted"), flush=True)
+            print(f"slot: {slot[0]} is held across packages before the budget starts; queue time is not counted", flush=True)
         print("build once: " + command_text(package_plan["build"]), flush=True)
-        print(f"tests: {runner} at {test_shards} thread(s) (host {host_threads} threads, load "
-              f"{'n/a' if load1 is None else f'{load1:.1f}'}, cpu quota {unit_quota:g}%)", flush=True)
+        if compile_only:
+            print(f"{package}: downstream test-target compilation only; no tests executed", flush=True)
+        else:
+            print(f"tests: {runner} at {test_shards} thread(s) (host {host_threads} threads, load "
+                  f"{'n/a' if load1 is None else f'{load1:.1f}'}, cpu quota {unit_quota:g}%)", flush=True)
         if "e2e" in package_plan:
             print("e2e prebuild (RSI_E2E=1): " + command_text(package_plan["e2e"]["prebuild"]), flush=True)
         print("budget: " + command_text(command), flush=True)
@@ -2829,19 +3864,32 @@ def run(admission):
             continue
         active, timed_out, terminated = {}, False, False
         subsets_before = len(subsets)
-        completed, completion = 0, None
+        completed, completion, executed = 0, None, None
         phases, diagnostics = set(), []
+        selection_records, current_binary = {}, None
+        selection_started = None
         with (log_dir / f"{package}.log").open("w") as log:
             def emit(line):
-                nonlocal timed_out, terminated, completed, completion
+                nonlocal timed_out, terminated, completed, completion, executed, current_binary, selection_started
                 print(line, end="", flush=True)
                 log.write(line)
                 log.flush()
-                if line.startswith("SCOPED_START "):
+                if line.startswith("SCOPED_SELECTION "):
+                    try:
+                        inventory = json.loads(line.split(" ", 1)[1])
+                        selection_records.update({record["binary"]: {**record, "ran": set()} for record in inventory})
+                        selection_started = time.monotonic()
+                    except (ValueError, KeyError, TypeError):
+                        pass
+                elif line.startswith("SCOPED_TARGET "):
+                    current_binary = line.strip().split(" ", 1)[1]
+                elif line.startswith("SCOPED_START "):
                     active[line.strip().split(" ", 1)[1]] = time.monotonic()
                 elif line.startswith("SCOPED_END "):
                     if active.pop(line.strip().split(" ", 1)[1], None) is not None:
                         completed += 1
+                        if current_binary in selection_records:
+                            selection_records[current_binary]["ran"].add(line.strip().split(" ", 1)[1])
                         if completed % 10 == 0:
                             snapshot_package({"package": package, "status": "running",
                                               "completed": completed, "phase": "incomplete",
@@ -2884,6 +3932,9 @@ def run(admission):
                     receipt = re.fullmatch(r"SCOPED_COMPLETE " + re.escape(package) + r" ([0-9]+)\n?", line)
                     if receipt:
                         completion = int(receipt[1])
+                    receipt = re.fullmatch(r"SCOPED_EXECUTED " + re.escape(package) + r" ([0-9]+)\n?", line)
+                    if receipt:
+                        executed = int(receipt[1])
                 if re.search(r"(?:result[:= ]+|Result=)['\"]?timeout", line, re.I):
                     timed_out = True
                 if re.search(r"code=(?:killed|dumped)\b", line):
@@ -2900,6 +3951,11 @@ def run(admission):
                 # systemd owns the primary deadline; this watchdog also bounds
                 # a stuck systemd client. Other platforms use the plain timeout.
                 code = admission.acquire(slot, emit, run_budget, wait_cap, job_deadline) if slot else 0
+                if needs_admission:
+                    # Keep later packages and baseline triage on the same execution clock.
+                    run_started += run_budget.waited
+                    if job_deadline is not None:
+                        job_deadline = run_budget.deadline
                 if code == 0:
                     # Admission supplies cargo-slot's build settings and HELD marker to
                     # every unit, including baseline comparison units, without nesting slots.
@@ -2921,34 +3977,51 @@ def run(admission):
                 code = 1
             if job_deadline is not None and code == 124 and run_budget.started is None:
                 admission_failed = True
-                emit(f"rsi-phase {int(time.time())} admission-timeout: no build slot within remaining job budget; {package} was not run\n")
+                emit(f"rsi-phase {int(time.time())} admission-timeout: no build slot within separate admission allowance; {package} was not run\n")
             # systemd-run can exit zero after systemctl stop. Only the worker
             # can attest that every selected test finished successfully.
+            end_fields = {}
             if terminated or active or completion != completed:
+                suffix, end_fields = worker_end(code, active)
                 emit(f"scoped_test_incomplete: missing successful package completion or terminated run; "
-                     f"{completed} completed tests\n")
+                     f"{completed} completed tests{suffix}\n")
                 code = code or 1
             if timed_out:
                 emit("scoped_test_timeout: slowest still-running tests: " +
                      (", ".join(f"{name} ({time.monotonic() - since:.1f}s)" for name, since in
                                 sorted(active.items(), key=lambda item: item[1])) or "none (build/list/startup)") + "\n")
+            if selection_records and len(subsets) == subsets_before:
+                # No final SCOPED_SUBSET survived. Keep every observed verdict, including a
+                # failed test's execution, without changing the incomplete package's red verdict.
+                subsets.append(subset_progress(package, selection_records.values(), timed_out,
+                                               time.monotonic() - selection_started))
             package_waited = run_budget.waited if needs_admission else 0.0
             slot_waited += package_waited
             if slot:
-                RECEIPT["admission"] = {"count": 1, "waited_sec": round(slot_waited, 3)}
+                RECEIPT["admission"] = {"count": 1, "startup_wait_sec": round(startup_waited, 3),
+                                        "waited_sec": round(startup_waited + slot_waited, 3),
+                                        "excluded_from_execution": True}
             if box_left is not None:
                 box_left -= sum(item.get("test_sec", 0) for item in subsets[subsets_before:])
             if slot:
                 emit(f"scoped-test: {package}: waited {package_waited:.0f}s for a build slot "
-                     f"({'counted against the job budget' if job_deadline is not None else 'not counted against the budget'})\n")
-            summaries.append((package, selections, timed_out, code, completed,
+                     "(not counted against the budget)\n")
+            # The streamed SCOPED_END count misses tests whose own output splits their line; the
+            # worker's executed count is the whole run's (#199).
+            whole_run = max(completed, executed or 0)
+            summaries.append((package, selections, timed_out, code, whole_run,
                               {"phases": phases, "diagnostic": diagnostics[0] if diagnostics else None,
-                               "terminated": terminated, "incomplete": bool(active) or (completion != completed and "test_failed" not in phases)}))
+                               "terminated": terminated, "end": end_fields,
+                               "incomplete": bool(active) or (completion != completed and "test_failed" not in phases)}))
             failed |= timed_out or code != 0
+            if compile_entry is not None:
+                compile_entry.update(status="passed" if "compiled" in phases else
+                                     "timed out" if timed_out else "failed" if code else "incomplete",
+                                     log=str(log_dir / f"{package}.log"))
             if not args.dry_run:
                 phase = next((name for name in ("build_failed", "list_failed") if name in phases), None)
-                status = "timed out" if timed_out else "failed" if code else "passed" if completed else "not applicable"
-                entry = {"package": package, "status": status, "completed": completed}
+                status = "timed out" if timed_out else "failed" if code else "passed" if whole_run else "not applicable"
+                entry = {"package": package, "status": status, "completed": whole_run}
                 if slot:
                     entry.update(slot_wait_sec=round(package_waited, 3),
                                  run_sec=round(time.monotonic() - run_budget.started, 3)
@@ -2976,6 +4049,9 @@ def run(admission):
     if boxed or bounded_plan:
         report_subset(plan, subsets, skipped_filters, args.dry_run)
     if not args.dry_run:
+        for entry in downstream["packages"]:
+            if entry["status"] == "pending":
+                entry.update(status="not_run", reason="run stopped before downstream compilation completed")
         # Replace the incremental snapshots with the canonical final package
         # verdicts (which can also include unmatched-filter results).
         package_timings = {entry["package"]: {key: entry[key] for key in ("slot_wait_sec", "run_sec")
@@ -2984,7 +4060,7 @@ def run(admission):
         RECEIPT["compile"]["execution"] = "executed" if summaries else "none_scheduled"
         # "Selected no tests" is a claim about test listings: make it only when
         # every package built and listed its binaries (#1913).
-        unlisted = [item[0] for item in summaries if "listed" not in item[5]["phases"]]
+        unlisted = [item[0] for item in summaries if item[1] and "listed" not in item[5]["phases"]]
         missing = set(filters) - matched if not unlisted else set()
         if unlisted and set(filters) - matched:
             print("scoped-test: filter matching not evaluated; no test listing from: " +
@@ -2998,7 +4074,7 @@ def run(admission):
             # empty observer must not relabel 90 passing tests as no_tests_selected (#397).
             unmatched = completed == 0 and any(s["filter"] in missing for s in selections)
             status = ("timed out" if timed_out else "failed" if code or unmatched else
-                      "passed" if completed else "not applicable")
+                      "passed" if completed or (not selections and "compiled" in detail["phases"]) else "not applicable")
             phase = next((name for name in ("build_failed", "list_failed") if name in detail["phases"]), None)
             if phase is None and (timed_out or detail["terminated"] or detail["incomplete"]):
                 phase = "incomplete"
@@ -3017,13 +4093,52 @@ def run(admission):
                 entry.update(phase=phase, log=str(log_dir / f"{package}.log"))
                 if detail["diagnostic"]:
                     entry["diagnostic"] = detail["diagnostic"]
+                entry.update(detail.get("end") or {})
                 summary += (f"scoped-test: {package}: {phase}" +
                             (f": {detail['diagnostic']}" if detail["diagnostic"] else "") +
                             f" (log {entry['log']})\n")
+            # Final verdict of this package: its failing tests, so the entry stands alone (#199).
+            entry["failed_tests"] = failure_records({package: candidate_failures.get(package, [])})
             RECEIPT["packages"].append(entry)
             print(summary, end="", flush=True)
             with (log_dir / f"{package}.log").open("a") as log:
                 log.write(summary)
+        # Replace the "running" snapshots on the wire now: a run cut off during the warning
+        # gate or the base comparison must not leave the last printed receipt mid-run (#199).
+        emit_receipt(1, progress=True)
+    if not args.dry_run and linux_lane is not None:
+        # #253: the Linux compile lane, after the native lanes, under the same build admission.
+        native_broken = any(detail["phases"].intersection({"build_failed", "list_failed"})
+                            for _, _, _, _, _, detail in summaries)
+        lane_budget_sec = args.runtime_max_sec
+        if args.total_max_sec is not None:
+            lane_budget_sec = min(lane_budget_sec, args.total_max_sec - (time.monotonic() - run_started))
+        if job_deadline is not None:
+            lane_budget_sec = min(lane_budget_sec, job_deadline - time.monotonic())
+        if linux_lane["status"] != "pending":
+            pass
+        elif admission_failed or (slot and admission.process is not None and admission.process.poll() is not None):
+            linux_lane.update(status="not_covered", reason="admission_lost")
+        elif native_broken:
+            linux_lane.update(status="not_covered", reason="native_build_failed")
+        elif lane_budget_sec < 1:
+            linux_lane.update(status="not_covered", reason="budget_exhausted")
+        else:
+            lane_wait_cap = max(0, args.slot_wait_max_sec - slot_waited)
+            lane_queued = bool(slot) and admission.process is None
+            lane_budget = Budget(lane_budget_sec, queued=lane_queued, wait_cap=lane_wait_cap, deadline=job_deadline)
+            try:
+                lane_code = (admission.acquire(slot, lambda line: print(line, end="", flush=True), lane_budget,
+                                               lane_wait_cap, job_deadline) if slot else 0)
+            except (subprocess.TimeoutExpired, OSError):
+                lane_code = None
+            if lane_code != 0:
+                linux_lane.update(status="not_covered", reason="admission_lost")
+            else:
+                run_linux_check(linux_lane, repo, cargo, RECEIPT.get("features"), log_dir, lane_budget)
+        RECEIPT["linux_check"] = linux_lane
+        failed |= report_linux_check(linux_lane)
+        emit_receipt(1, progress=True)
     if not args.dry_run and not any(detail["phases"].intersection({"build_failed", "list_failed"})
                                     for _, _, _, _, _, detail in summaries):
         # Only a build that finished can say which warnings the candidate carries (#1897).
@@ -3068,6 +4183,13 @@ def run(admission):
                                     if (item.get("package"), item.get("kind"), item.get("target"),
                                         item.get("test")) not in baseline_keys]
                                    if comparison.get("status") == "complete" else desktop_failures or None)
+        split_package_failures(RECEIPT["packages"], RECEIPT["new_failures"], baseline_keys,
+                               comparison.get("status") == "complete")
+        emit_receipt(1, progress=True)
+        reason = None if admission_failed or not failed else baseline_only_ok_reason(RECEIPT)
+        if reason:
+            RECEIPT["ok_reason"] = reason
+            print(f"scoped-test: ok: every failure is a baseline red ({reason}); exit code stays 1", flush=True)
     return 124 if admission_failed else 1 if failed else 0
 
 

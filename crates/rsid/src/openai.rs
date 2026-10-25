@@ -1001,7 +1001,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::{Mutex, oneshot};
+    use tokio::sync::oneshot;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[test]
@@ -1205,11 +1205,13 @@ mod tests {
     struct TestControl {
         control: Arc<StoreBackedModelCallControl>,
         worker: ModelCallSettlementWorker,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
     }
 
     async fn test_control(provider: &str) -> TestControl {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let event_bus = Arc::new(EventBus::new(32));
         let worker = ModelCallSettlementWorker::new(Arc::clone(&store), Arc::clone(&event_bus))
             .expect("settlement worker");
@@ -1346,7 +1348,9 @@ mod tests {
         .await
     }
 
-    async fn invocation_states(store: &Arc<Mutex<Store>>) -> Vec<(String, Option<String>)> {
+    async fn invocation_states(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> Vec<(String, Option<String>)> {
         let store = store.lock().await;
         let mut statement = store
             .conn

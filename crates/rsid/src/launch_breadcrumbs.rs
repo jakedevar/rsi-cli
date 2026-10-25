@@ -49,6 +49,11 @@ impl PhaseGuard {
         note_phase(id, first_phase);
         Self(id)
     }
+
+    /// Replace this operation's phase; the guard still clears it on every exit.
+    pub fn enter(&self, phase: &'static str) {
+        note_phase(self.0, phase);
+    }
 }
 
 impl Drop for PhaseGuard {
@@ -98,8 +103,8 @@ mod tests {
     fn a_phase_names_the_await_and_clears_with_its_guard() {
         let id = Uuid::new_v4();
         {
-            let _guard = PhaseGuard::new(id, "catalog_refresh");
-            note_phase(id, "model_admission");
+            let guard = PhaseGuard::new(id, "catalog_refresh");
+            guard.enter("model_admission");
             let lines = snapshot();
             assert!(
                 lines

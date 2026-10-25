@@ -45,6 +45,22 @@ shard_check() {
   return 0
 }
 
+# Rust repository guards (#360): crates/rsi-repo-guards, run through
+# scripts/repo-guard of this hook's own checkout (resolved before any cd). The
+# binary is resolved with the caller's Cargo target only when a pushed commit
+# carries a guard. RSI_REPO_GUARD_NO_BUILD=1 is inherited by every resolution;
+# it requires a matching prebuilt binary rather than compiling. Each requested
+# command is capability-checked, including after an earlier guard resolved it.
+# A pushed commit that predates a guard (no module source) skips it.
+hook_root=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)
+repo_guard_bin=
+ensure_repo_guard() {
+  repo_guard_bin=$("$hook_root/scripts/repo-guard" --bin "$1") && [ -n "$repo_guard_bin" ] && return 0
+  repo_guard_bin=
+  echo "pre-push: cannot resolve the repository guards (scripts/repo-guard, see above); refusing to update refs/heads/rolling" >&2
+  return 1
+}
+
 # Operator identifiers (#1454): a push to refs/heads/rolling must not add a line
 # containing an identifier from the operator's private list
 # (~/.rsi/operator-identifiers). Checked against the commits the push adds.
@@ -54,15 +70,13 @@ operator_identifier_check() {
   remote=$2
   case "$oid" in 0000000000000000000000000000000000000000) return 0 ;; esac
   case "$remote" in 0000000000000000000000000000000000000000) return 0 ;; esac
-  git cat-file -e "$oid:tools/check_operator_identifiers.py" 2>/dev/null || return 0
+  git cat-file -e "$oid:crates/rsi-repo-guards/src/operator_identifiers.rs" 2>/dev/null || return 0
   git cat-file -e "$remote^{commit}" 2>/dev/null || return 0
-  tool=$(mktemp "${TMPDIR:-/tmp}/rsi-pre-push-ids-XXXXXX") || return 0
-  git show "$oid:tools/check_operator_identifiers.py" >"$tool" 2>/dev/null || { rm -f "$tool"; return 0; }
-  python3 "$tool" --range "$remote..$oid" >&2
+  ensure_repo_guard operator-identifiers || return 1
+  "$repo_guard_bin" operator-identifiers --range "$remote..$oid" >&2
   status=$?
-  rm -f "$tool"
   if [ "$status" -ne 0 ]; then
-    echo "pre-push: $oid adds operator personal data (check_operator_identifiers.py); refusing to update refs/heads/rolling" >&2
+    echo "pre-push: $oid adds operator personal data (check-operator-identifiers); refusing to update refs/heads/rolling" >&2
     return 1
   fi
   return 0
@@ -100,10 +114,9 @@ static_guards() {
   esac
   queue_hint
   [ "${RSI_SKIP_STATIC_GUARDS:-}" = "1" ] && return 0
-  py=$(find_python) || {
-    echo "pre-push: python not found; skipping the static guards" >&2
-    return 0
-  }
+  # Rust guards do not depend on the legacy interpreter. Check its availability
+  # separately so its absence cannot turn the Rust checks into a silent pass.
+  py=$(find_python) || py=
   # The history this push adds is measured from the remote tip when this clone
   # has it, else from the merge base with origin/rolling (#2070). With neither,
   # the whole tree is checked rather than none of it.
@@ -115,8 +128,18 @@ static_guards() {
   if [ -z "$base" ] && git rev-parse --verify -q origin/rolling >/dev/null 2>&1; then
     base=$(git merge-base origin/rolling "$oid" 2>/dev/null) || base=
   fi
+  # #407: inspect committed additions before exporting or reaching legacy
+  # checks. A missing comparison base must never become a silent pass.
+  if git cat-file -e "$oid:crates/rsi-repo-guards/src/new_python.rs" 2>/dev/null; then
+    if [ -z "$base" ]; then
+      echo "pre-push: cannot inspect tracked additions without a base; fetch the remote tip or origin/rolling; operator directive #358 forbids new Python; use scripts/repo-guard new-python and crates/rsi-repo-guards/README.md" >&2
+      return 1
+    fi
+    ensure_repo_guard new-python || return 1
+    "$repo_guard_bin" new-python "$base" "$oid" >&2 || return 1
+  fi
   paths=
-  for path in scripts tools crates; do
+  for path in scripts tools crates desktop/scripts; do
     if git cat-file -e "$oid:$path" 2>/dev/null; then paths="$paths $path"; fi
   done
   [ -n "$paths" ] || return 0
@@ -141,7 +164,7 @@ static_guards() {
   else
     (cd "$tmp" && find scripts tools -name '*.py' -print0 2>/dev/null) >"$list"
   fi
-  if [ -s "$list" ]; then
+  if [ -n "$py" ] && [ -s "$list" ]; then
     (cd "$tmp" && "$py" -I -c '
 import sys
 bad = 0
@@ -163,26 +186,94 @@ sys.exit(bad)
       status=1
     }
   fi
-  # 2. The released-migration guard, run from the pushed commit against the
-  # remote tip, only when the Python above compiled.
-  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/tools/check-released-migrations.py" ]; then
-    if ! "$py" "$tmp/tools/check-released-migrations.py" "$base" "$oid" >&2; then
-      echo "pre-push: check-released-migrations.py fails for $oid; refusing to update refs/heads/rolling" >&2
+  # 2. The released-migration guard (the Rust `released-migrations` guard,
+  # built by scripts/repo-guard), measured from the remote tip against the pushed
+  # commit, only when the Python above compiled and the pushed commit carries it.
+  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/crates/rsi-repo-guards/src/released_migrations.rs" ]; then
+    if ! ensure_repo_guard released-migrations; then
+      status=1
+    elif ! "$repo_guard_bin" released-migrations "$base" "$oid" >&2; then
+      echo "pre-push: released-migrations fails for $oid; refusing to update refs/heads/rolling" >&2
       status=1
     fi
   fi
   # 2b. The starter digest guard (#3070): a changed starter JSON moves its digest
   # fixture and SHIPPED_BEFORE together. Needs the base to compare against.
-  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/tools/check_starter_pins.py" ]; then
-    if ! "$py" "$tmp/tools/check_starter_pins.py" "$base" "$oid" >&2; then
-      echo "pre-push: check_starter_pins.py fails for $oid; refusing to update refs/heads/rolling" >&2
+  if [ "$status" -eq 0 ] && [ -n "$base" ] && [ -f "$tmp/crates/rsi-repo-guards/src/starter_pins.rs" ]; then
+    if ! ensure_repo_guard starter-pins; then
+      status=1
+    elif ! "$repo_guard_bin" starter-pins "$base" "$oid" >&2; then
+      echo "pre-push: check_starter_pins fails for $oid; refusing to update refs/heads/rolling" >&2
       status=1
     fi
   fi
   # 3. The identity-assertion guard over the pushed crates.
-  if [ "$status" -eq 0 ] && [ -f "$tmp/tools/check_identity_assertions.py" ] && [ -d "$tmp/crates" ]; then
-    if ! (cd "$tmp" && "$py" tools/check_identity_assertions.py crates) >&2; then
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/identity_assertions.rs" ]; then
+    if ! ensure_repo_guard identity-assertions; then
+      status=1
+    elif ! (cd "$tmp" && "$repo_guard_bin" identity-assertions crates) >&2; then
       echo "pre-push: check-identity-assertions fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # 3b. The public-export privacy guard (#3269): no personal home path or
+  # globally routable IP literal in a tracked file outside thoughts/. It scans
+  # the files this push changes (every file when no base is known) in the pushed
+  # commit's tree (thoughts/ is historical and skipped), when the commit carries
+  # the guard.
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/personal_paths.rs" ] && ! ensure_repo_guard personal-paths; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/personal_paths.rs" ]; then
+    pplist="$tmp/.rsi-pre-push-personal-paths"
+    mkdir "$tmp/.rsi-pre-push-pp" || return 1
+    if [ -n "$base" ] && git diff -z --name-only --diff-filter=ACMR "$base" "$oid" >"$pplist" 2>/dev/null; then
+      :
+    else
+      git ls-tree -r -z --name-only "$oid" >"$pplist" 2>/dev/null
+    fi
+    if [ -s "$pplist" ]; then
+      if git archive "$oid" -- . ':(exclude)thoughts' 2>/dev/null | tar -x -C "$tmp/.rsi-pre-push-pp" 2>/dev/null; then
+        # NUL-separated end to end; xargs splits only for the argument limit.
+        if ! (cd "$tmp/.rsi-pre-push-pp" && xargs -0 "$repo_guard_bin" personal-paths <"$pplist") >&2; then
+          echo "pre-push: check-personal-paths fails for $oid; refusing to update refs/heads/rolling (use \$HOME, ~/, repo-relative paths or documentation addresses such as 203.0.113.10)" >&2
+          status=1
+        fi
+      else
+        echo "pre-push: cannot export $oid for the personal-paths guard; skipping it" >&2
+      fi
+    fi
+  fi
+  # A new top-level target writer must register its reclaim/retention policy.
+  if [ "$status" -eq 0 ] && [ -n "$py" ] && [ -f "$tmp/scripts/check-target-reclaim.py" ]; then
+    if ! (cd "$tmp" && "$py" scripts/check-target-reclaim.py) >&2; then
+      echo "pre-push: check-target-reclaim fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # rsid-store owns rsi.db accessors and runtime settings keys (#453).
+  if [ "$status" -eq 0 ] && [ -n "$py" ] && [ -f "$tmp/scripts/check-store-boundary.py" ]; then
+    if ! (cd "$tmp" && "$py" scripts/check-store-boundary.py) >&2; then
+      echo "pre-push: store boundary rule fails for $oid; add an rsid-store accessor or derive the state from existing records" >&2
+      status=1
+    fi
+  fi
+  # A test's raw process-env write races its parallel neighbours (#190).
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/test_env_writes.rs" ]; then
+    if ! ensure_repo_guard test-env-writes; then
+      status=1
+    elif ! (cd "$tmp" && "$repo_guard_bin" test-env-writes) >&2; then
+      echo "pre-push: check_test_env_writes fails for $oid; use a test-unique name, the code under test's env input or temp_env; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # A crate AGENTS.md is loaded into every session that reads the crate; keep it
+  # under its size ceiling (#3450).
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/agents_md_size.rs" ]; then
+    if ! ensure_repo_guard agents-md-size; then
+      status=1
+    elif ! (cd "$tmp" && "$repo_guard_bin" agents-md-size) >&2; then
+      echo "pre-push: check_agents_md_size fails for $oid; move detail to docs/agents/ and keep one line per fact; refusing to update refs/heads/rolling" >&2
       status=1
     fi
   fi
@@ -193,14 +284,27 @@ sys.exit(bad)
   # count is judged only for the scripts/ files this push changes, so a push of an
   # unrelated change is never blocked by a sibling landing that fixed a use; with no
   # readable base every stale count is judged.
-  if [ "$status" -eq 0 ] && [ -f "$tmp/tools/check_portable_shell.py" ] && [ -d "$tmp/scripts" ]; then
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/portable_shell.rs" ] && [ -d "$tmp/scripts" ] \
+    && ! ensure_repo_guard portable-shell; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -f "$tmp/crates/rsi-repo-guards/src/portable_shell.rs" ] && [ -d "$tmp/scripts" ]; then
     touched="$tmp/.rsi-pre-push-touched-scripts"
     set --
     if [ -n "$base" ] && git diff -z --name-only --no-renames "$base" "$oid" -- scripts >"$touched" 2>/dev/null; then
       set -- --touched-from "$touched"
     fi
-    if ! (cd "$tmp" && "$py" tools/check_portable_shell.py "$@") >&2; then
+    if ! (cd "$tmp" && "$repo_guard_bin" portable-shell "$@") >&2; then
       echo "pre-push: check-portable-shell fails for $oid; refusing to update refs/heads/rolling" >&2
+      status=1
+    fi
+  fi
+  # Keep the remaining legacy checks fail closed too, after the Rust guards
+  # have had the opportunity to report their own findings.
+  if [ "$status" -eq 0 ] && [ -z "$py" ]; then
+    if [ -s "$list" ] \
+      || [ -f "$tmp/scripts/check-target-reclaim.py" ] || [ -f "$tmp/scripts/check-store-boundary.py" ]; then
+      echo "pre-push: Python is required for the remaining legacy guards; refusing to update refs/heads/rolling" >&2
       status=1
     fi
   fi
@@ -209,6 +313,79 @@ sys.exit(bad)
   return "$status"
 }
 
+# The operator-only AuthorizeMainPush RPC writes these records on this host.
+# Claim before transport: an aborted/dry-run push spends consent too. Retain
+# both the original grant and the exclusive use receipt for audit/replay safety.
+main_push_consent() {
+  target=$1
+  previous=$2
+  case "$target" in
+    0000000000000000000000000000000000000000) return 1 ;;
+  esac
+  git cat-file -e "$target^{commit}" 2>/dev/null || return 1
+  case "$previous" in
+    0000000000000000000000000000000000000000) ;;
+    *) git merge-base --is-ancestor "$previous" "$target" 2>/dev/null || {
+      echo "pre-push: main updates must be fast-forward; fetch and integrate first" >&2
+      return 1
+    } ;;
+  esac
+  py=$(find_python) || return 1
+  "$py" -I - "$push_remote_url" "$target" "$previous" <<'PY'
+import datetime
+import json
+import os
+from pathlib import Path
+import sys
+import uuid
+
+root = Path.home() / ".rsi" / "git-push-consents"
+remote, target, previous = sys.argv[1:]
+now = datetime.datetime.now(datetime.timezone.utc)
+try:
+    for path in sorted(root.glob("*.json")):
+        try:
+            grant = json.loads(path.read_text(encoding="utf-8"))
+            grant_id = grant["id"]
+            if str(uuid.UUID(grant_id)) != grant_id or path.name != grant_id + ".json":
+                continue
+            if (grant["version"] != 1 or grant["remote_url"] != remote
+                    or grant["ref"] != "refs/heads/main" or grant["target_sha"] != target):
+                continue
+            expiry = datetime.datetime.fromisoformat(grant["expires_at"].replace("Z", "+00:00"))
+            if expiry <= now:
+                continue
+            # O_EXCL is portable and admits exactly one competing hook. A crash
+            # or short write leaves a spent receipt, never reusable consent.
+            receipt = root / (grant_id + ".used")
+            try:
+                fd = os.open(receipt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                stamp = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}000Z"
+                json.dump({"id": grant_id, "used_at": stamp,
+                           "remote_url": remote, "ref": "refs/heads/main",
+                           "target_sha": target, "previous_sha": previous}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if os.name == "posix":
+                directory_fd = os.open(root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            print("pre-push: consumed operator main-push consent " + grant_id, file=sys.stderr)
+            sys.exit(0)
+        except (KeyError, TypeError, ValueError):
+            continue
+except OSError:
+    pass
+sys.exit(1)
+PY
+}
+
+push_remote_url=$2
 agent_session=0
 if [ -n "${RSI_SESSION_ID:-}" ] || [ -n "${RSI_SESSION_TOKEN:-}" ]; then
   agent_session=1
@@ -218,8 +395,10 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   case "$remote_ref" in
     refs/heads/main)
       if [ "$agent_session" = 1 ]; then
-        echo "pre-push: agent sessions may not update $remote_ref; main is operator-only" >&2
-        exit 1
+        if ! main_push_consent "$local_oid" "$remote_oid"; then
+          echo "pre-push: cannot update $remote_ref; main is operator-only; the operator must grant AuthorizeMainPush for this exact remote URL and SHA on this host (unexpired, unused, fast-forward only)" >&2
+          exit 1
+        fi
       fi
       ;;
     refs/heads/rolling)

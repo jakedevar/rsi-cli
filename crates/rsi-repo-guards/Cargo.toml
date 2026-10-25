@@ -1,0 +1,47 @@
+[package]
+name = "rsi-repo-guards"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Repository static guards for the git hooks, scripts/scoped-test and CI (#360); run through scripts/repo-guard"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsi-repo-guard"
+path = "src/main.rs"
+
+[[bin]]
+name = "rsi-scoped-test"
+path = "src/scoped_main.rs"
+
+# Keep this list short: every hook run builds the crate on demand (scripts/repo-guard).
+[features]
+default = ["preserve-json-order"]
+# Fixture-only consumers must not change serde_json's behavior in their host.
+preserve-json-order = ["serde_json/preserve_order"]
+
+[dependencies]
+chrono = { workspace = true }
+fancy-regex = "0.16"
+libc = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tempfile = "3"
+toml = { version = "0.8", features = ["preserve_order"] }
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
+
+[dev-dependencies]
+rsi-common = { path = "../rsi-common" }
+regex = { workspace = true }
+
+[lints]
+workspace = true

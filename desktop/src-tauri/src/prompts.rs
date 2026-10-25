@@ -5,10 +5,12 @@
 //! `launch_prompt` forwards one `LaunchSession` with the TUI client's params
 //! plus `sandbox`. `appoint_launched_manager` mirrors the TUI's
 //! `appoint_launched_manager`: it reads `GetHarnessManager` and
-//! `GetHarnessManagerPolicy` for the fences, applies the chosen preset to a
-//! fresh policy with the TUI's own code (`rsi_common::harness_manager_presets`,
-//! so the grant is exactly the TUI's), and sends one atomic
-//! `ConfigureHarnessManagerWithPolicy` (#2237). No other daemon method is used.
+//! `GetHarnessManagerPolicy` for the fences, re-grants the project's saved
+//! grant unless the operator stepped the Policy row (#3270, desktop #204), else
+//! applies the chosen preset to a fresh policy with the TUI's own code
+//! (`rsi_common::harness_manager_presets`, so the grant is exactly the TUI's),
+//! and sends one atomic `ConfigureHarnessManagerWithPolicy` (#2237). No other
+//! daemon method is used.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +19,7 @@ use rsi_common::harness_manager::{
 };
 use rsi_common::harness_manager_presets::{
     ManagerPolicyOrigin, ManagerPolicyPreset, ManagerPresetContext, apply_manager_policy_preset,
+    classify_manager_policy,
 };
 use rsi_common::harness_manager_v2::{
     ConfigureHarnessManagerWithPolicyRequestV2, HarnessManagerPolicyConfigV2, ManagerPolicyV2,
@@ -149,12 +152,45 @@ pub fn preset_policy(preset: ManagerPolicyPreset, scope: Scope) -> ManagerPolicy
     .policy
 }
 
+/// The policy the appointment grants (the TUI's `appoint_launched_manager`,
+/// #3270): the project's saved grant when one exists and the operator did not
+/// choose a preset, else the preset's. `true` when it re-grants the saved one.
+pub fn granted_policy(
+    preset: ManagerPolicyPreset,
+    preset_chosen: bool,
+    scope: Scope,
+    stored: Option<&HarnessManagerPolicyConfigV2>,
+) -> (ManagerPolicyV2, bool) {
+    match stored.filter(|_| !preset_chosen) {
+        Some(saved) => (saved.policy.clone(), true),
+        None => (preset_policy(preset, scope), false),
+    }
+}
+
+/// The granted policy's label: the planned preset's when it is that preset's
+/// policy, else the preset the policy classifies as (the TUI's label rule).
+pub fn granted_label(
+    policy: &ManagerPolicyV2,
+    preset: ManagerPolicyPreset,
+    scope: Scope,
+) -> &'static str {
+    if *policy == preset_policy(preset, scope) {
+        preset.label()
+    } else {
+        classify_manager_policy(policy, scope_mode(scope))
+            .preset
+            .label()
+    }
+}
+
 /// The atomic appointment request, fenced on what the daemon holds now.
+#[allow(clippy::too_many_arguments)]
 pub fn appointment_request(
     project_id: Uuid,
     session_id: Uuid,
     scope: Scope,
     preset: ManagerPolicyPreset,
+    preset_chosen: bool,
     previous: Option<&HarnessManagerConfigV1>,
     stored: Option<&HarnessManagerPolicyConfigV2>,
     idempotency_key: String,
@@ -168,7 +204,7 @@ pub fn appointment_request(
         ),
         expected_policy_version: stored.map_or(0, |p| p.row_version),
         idempotency_key,
-        policy: preset_policy(preset, scope),
+        policy: granted_policy(preset, preset_chosen, scope, stored).0,
     };
     request.validate().map_err(str::to_string)?;
     Ok(request)
@@ -193,7 +229,9 @@ pub async fn appoint_launched_manager(
     scope_kind: String,
     scope_id: Option<String>,
     preset: String,
+    preset_chosen: Option<bool>,
 ) -> CmdResult {
+    let preset_chosen = preset_chosen.unwrap_or(false);
     let project =
         Uuid::parse_str(project_id.trim()).map_err(|_| "invalid project_id".to_string())?;
     let session =
@@ -218,11 +256,14 @@ pub async fn appoint_launched_manager(
         session,
         scope,
         preset,
+        preset_chosen,
         previous.as_ref(),
         stored.as_ref(),
         Uuid::new_v4().to_string(),
     )
     .map_err(not_appointed)?;
+    let regrants_saved = granted_policy(preset, preset_chosen, scope, stored.as_ref()).1;
+    let label = granted_label(&request.policy, preset, scope);
     let replaced = replaces(previous.as_ref(), session);
     let result = forward(
         &state,
@@ -236,10 +277,14 @@ pub async fn appoint_launched_manager(
         Scope::Group(_) => "a Group".to_string(),
         Scope::Epic(_) => "an Epic".to_string(),
     };
+    let granted = if regrants_saved {
+        format!("re-granting the saved grant ({label})")
+    } else {
+        format!("with the {label} policy")
+    };
     Ok(json!({
         "message": format!(
-            "Manager appointed for {scope_text} with the {} policy{}",
-            preset.label(),
+            "Manager appointed for {scope_text} {granted}{}",
             if replaced { "; it replaces the previous manager" } else { "" }
         ),
         "replaced": replaced,
@@ -335,6 +380,7 @@ mod tests {
             s,
             Scope::Project,
             ManagerPolicyPreset::Execute,
+            false,
             None,
             None,
             "k".into(),
@@ -357,12 +403,96 @@ mod tests {
                 s,
                 Scope::Project,
                 ManagerPolicyPreset::Execute,
+                false,
                 None,
                 None,
                 String::new()
             )
             .is_err(),
             "an empty idempotency key is refused before any call"
+        );
+    }
+
+    fn saved_grant(project_id: Uuid) -> HarnessManagerPolicyConfigV2 {
+        serde_json::from_value(json!({
+            "project_id": project_id,
+            "manager_session_id": Uuid::new_v4(),
+            "scope_version": 1,
+            "row_version": 4,
+            "policy": preset_policy(ManagerPolicyPreset::Observe, Scope::Project),
+            "updated_at": "2026-10-20T00:00:00.000000000Z",
+            "revoked": false,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_untouched_policy_re_grants_the_saved_grant() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let stored = saved_grant(p);
+        let r = appointment_request(
+            p,
+            s,
+            Scope::Project,
+            ManagerPolicyPreset::Execute,
+            false,
+            None,
+            Some(&stored),
+            "k".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.policy, stored.policy,
+            "the saved grant is sent, not the preset"
+        );
+        assert_eq!(r.expected_policy_version, 4);
+        assert!(
+            granted_policy(
+                ManagerPolicyPreset::Execute,
+                false,
+                Scope::Project,
+                Some(&stored)
+            )
+            .1
+        );
+        assert_eq!(
+            granted_label(&r.policy, ManagerPolicyPreset::Execute, Scope::Project),
+            ManagerPolicyPreset::Observe.label(),
+            "the label names what the saved grant classifies as"
+        );
+    }
+
+    #[test]
+    fn a_chosen_preset_overrides_the_saved_grant() {
+        let (p, s) = (Uuid::new_v4(), Uuid::new_v4());
+        let stored = saved_grant(p);
+        let r = appointment_request(
+            p,
+            s,
+            Scope::Project,
+            ManagerPolicyPreset::FullProjectControl,
+            true,
+            None,
+            Some(&stored),
+            "k".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.policy,
+            preset_policy(ManagerPolicyPreset::FullProjectControl, Scope::Project)
+        );
+        assert_eq!(
+            r.expected_policy_version, 4,
+            "still fenced on the saved row"
+        );
+        assert!(
+            !granted_policy(
+                ManagerPolicyPreset::FullProjectControl,
+                true,
+                Scope::Project,
+                Some(&stored)
+            )
+            .1
         );
     }
 }

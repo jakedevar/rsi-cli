@@ -57,6 +57,25 @@ fn objects(value: &Value, path: String, out: &mut Vec<String>) {
 }
 
 #[test]
+fn request_withdraw_requires_identity_version_and_recorded_reason_668() {
+    let change = json!({"update":"request_withdraw", "request_id":"5d73c05d-1040-49f7-92ab-0123456789ab", "expected_row_version":0, "reason":"Replaced by a revised request"});
+    let value = json!({"fence":{"scope_version":1,"policy_version":1},"idempotency_key":"withdraw","change":change});
+    let valid: AgentManagerUpdateRequestV2 = serde_json::from_value(value.clone()).unwrap();
+    assert!(valid.validate().is_ok());
+    for (field, invalid) in [
+        ("request_id", json!(uuid::Uuid::nil())),
+        ("expected_row_version", json!(-1)),
+        ("reason", json!(" ")),
+        ("reason", json!("r".repeat(2049))),
+    ] {
+        let mut invalid_request = value.clone();
+        invalid_request["change"][field] = invalid;
+        let request: AgentManagerUpdateRequestV2 = serde_json::from_value(invalid_request).unwrap();
+        assert!(request.validate().is_err(), "{field}");
+    }
+}
+
+#[test]
 fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injection() {
     let id = "5d73c05d-1040-49f7-92ab-0123456789ab";
     let expected =
@@ -76,6 +95,7 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"action":"restore_container","container_id":id,"expected_updated_at":"2026-09-07T00:00:00.000000000Z"}),
         json!({"action":"create_session","parent_id":id,"kind":"Task","query":"implement","launch":launch}),
         json!({"action":"assign_lead","epic_id":id,"expected":expected,"session_id":id}),
+        json!({"action":"withdraw_queued_create","operation_id":id,"expected_row_version":3}),
         json!({"action":"settle_uncertain_action","operation_id":id,"expected_row_version":3}),
         json!({"action":"retire_lead_continuations","epic_id":id,"expected":expected}),
         json!({"action":"archive_session","session_id":id,"expected_updated_at":"2026-09-07T00:00:00.000000000Z"}),
@@ -98,6 +118,7 @@ fn every_manager_action_and_update_roundtrips_and_rejects_nested_authority_injec
         json!({"update":"accept","key":"w","expected_row_version":1}),
         json!({"update":"integration","key":"w","expected_row_version":1,"source_commit":"a".repeat(40),"target_commit":"b".repeat(40),"verification":evidence}),
         json!({"update":"request","request_id":id,"expected_row_version":1,"state":"accepted","message":"accepted","work_key":"w"}),
+        json!({"update":"request_withdraw","request_id":id,"expected_row_version":1,"reason":"Superseded by the revised request"}),
         json!({"update":"decision","key":"d","expected_row_version":0,"epic_id":id,"question":"Select destination","request_id":id,"work_key":"w","gate":"spend","options":[{"label":"A","detail":"cheap","recommended":true},{"label":"B"}]}),
         json!({"update":"decision_ruling","key":"d","expected_row_version":1,"target_digest":"sha256:abc","answer":"A","owner_manager_session_id":id}),
         json!({"update":"decision_withdraw","key":"d","expected_row_version":1,"reason":"superseded"}),

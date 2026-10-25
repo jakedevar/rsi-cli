@@ -6,21 +6,25 @@
 import type { IssuesActionId, IssuesSnapshot } from './actions/issues.js';
 import { inTauri, api, invoke, type Session } from './api.js';
 import { type Invocation, copyText, dispatch, snapshot } from './commands.js';
-import { $, el, toast } from './dom.js';
+import { $, el, emptyState, errorBlock, renderMessage, toast } from './dom.js';
+import { keepFocus, rememberOpener, returnFocus, shouldBlurAfterClick } from './focus-return.js';
 import { issuesApi } from './issues-api.js';
+import { issueActionRow } from './issue-actions-row.js';
+import { bodyKey, handoffKey, issueTextBlock, rawToggle } from './issue-markdown.js';
+import { wireMarkdownEvents } from './markdown.js';
 import {
   type DepDirection, type DependencyItem, type Draft, type Filters, type Handoff, type Issue, type IssueEvent,
   type IssuePage, type KeyState, type MutationResult, type PageAnchor, type PendingWrite, type SavedView, type Section,
-  SAVED_VIEW_TITLES, SECTION_TITLES, SECTIONS, SORT_TITLES, STATUSES,
+  SAVED_VIEW_TITLES, SECTION_TITLES, SECTIONS, SORT_TITLES, STATUSES, STATUS_CHOICES,
   applySavedView, canEdit, checkDraft, classifyFailure, defaultFilters, dependencyEdge, depLabel, describeDependency,
-  describeEvent, draftFromIssue, emptyDraft, filterChips, findByNumber, idleKeys, isArchived, issueRef, listRequest,
+  describeEvent, draftFromIssue, emptyDraft, emptyIssuesText, filterChips, findByNumber, idleKeys, isArchived, issueRef, listRequest,
   moveSelection, newWrite, nextSection, nextSort, numberJumpFilters, operatorOnly, parseCsv, parseIssueNumber,
-  parsePriorities, parseProvenance, parseStatuses, patchFrom, priorityLabel, readinessLabel, rebase, reconcileSelection,
-  resolveIssuesKey, rowSummary, rowTone, shortTime, statusTargets, statusTitle, toggleOperatorOnly, writeBlock, writeBody,
+  parsePriorities, parseProvenance, patchFrom, priorityLabel, readinessLabel, rebase, reconcileSelection,
+  resolveIssuesKey, retryBannerText, rowSummary, rowTone, shortTime, statusesFromChecked, statusTargets, statusTitle, toggleOperatorOnly, writeBlock, writeBody,
   createBody,
 } from './issues-model.js';
 import {
-  type DispatchRecord, type IssuesTab, type PollResult, type TrackerStatus, TAB_TITLES, ISSUE_TABS, DEFAULT_ISSUE_TOPOLOGY,
+  type DispatchRecord, type IssuesTab, type PollResult, type TrackerStatus, TAB_TIPS, TAB_TITLES, ISSUE_TABS, DEFAULT_ISSUE_TOPOLOGY,
   associatedSessions, candidateQuery, candidateRequest, dispatchFields, dispatchKey, dispatchLine, moveDispatch,
   parseDispatched, pollSummary, reconcileAssociated, sortDispatched, stepTab, syncRows,
 } from './issues-tracker-model.js';
@@ -28,8 +32,14 @@ import { openPicker } from './pickers.js';
 import { contextMenuModel } from './registry.js';
 import { select as openSessionRow, setView } from './sessions.js';
 import { onUiChange, state, uiChanged } from './state.js';
-import { focusOwnsKey, paneKeyAllowed } from './modal-gate.js';
-import { isVimKeysOn } from './vimkeys.js';
+import { ownProjects } from './project-model.js';
+import { focusOwnsKey, paneKeyAllowed, paneKeyName } from './modal-gate.js';
+import { emptyText } from './empty-states.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
+import { openProjectForm } from './actions/sessionlist-run.js';
+import { syncListbox } from './listbox-a11y.js';
+import { isLineField, lineField, resyncLineField } from './form-field.js';
+import { ISSUE_TITLE_LIMIT } from './form-text.js';
 
 const LS_PROJECT = 'rsi.desktop.issues.project';
 const LS_MINE = 'rsi.desktop.issues.mine';
@@ -76,6 +86,8 @@ const ws = {
   pollError: null as string | null,
   polling: false,
   assocSel: null as string | null,
+  // Local #293: the body and handoffs as raw text instead of Markdown.
+  raw: false,
 };
 
 function storage(): Storage | undefined {
@@ -95,7 +107,7 @@ function selectedIssue(): Issue | null {
 export function issuesSnapshot(): IssuesSnapshot {
   return {
     active: ws.active,
-    hasProject: ws.projectId !== null || state.projects.length > 0,
+    hasProject: ws.projectId !== null || ownProjects(state.projects).length > 0,
     issue: selectedIssue(),
     nextPage: !!ws.page?.next_cursor,
     previousPage: !!ws.page?.previous_cursor,
@@ -210,10 +222,21 @@ function renderTabs(): void {
     const b = el('button', `seg${t === ws.tab ? ' active' : ''}`, TAB_TITLES[t]);
     b.type = 'button';
     b.dataset.tab = t;
+    b.title = TAB_TIPS[t];
     b.setAttribute('role', 'tab');
     b.setAttribute('aria-selected', String(t === ws.tab));
     return b;
   }));
+}
+
+/** A list's load-failure row: the plain error, its Details, and a Retry button (`r` does the same). */
+function loadErrorRow(msg: string): HTMLLIElement {
+  const li = errorBlock('li', 'issues-empty issues-load-error', msg);
+  const retry = el('button', 'btn small', 'Retry (r)');
+  retry.type = 'button';
+  retry.dataset.action = 'issues-refresh';
+  li.append(retry);
+  return li;
 }
 
 function renderTrackerList(): void {
@@ -221,13 +244,16 @@ function renderTrackerList(): void {
   if (ws.tab === 'dispatched') {
     const rows = ws.dispatched;
     if (!rows || rows.length === 0) {
-      ul.replaceChildren(el('li', 'issues-empty', ws.dispatchedError ? 'Could not load dispatched Issues.' : rows ? 'No Issue has been dispatched.' : 'Loading…'));
+      ul.replaceChildren(ws.dispatchedError
+        ? loadErrorRow(`Could not load dispatched Issues: ${ws.dispatchedError}`)
+        : el('li', 'issues-empty', rows ? 'No Issue has been dispatched.' : 'Loading…'));
       return;
     }
     ul.replaceChildren(...rows.map((r) => {
       const key = dispatchKey(r);
       const li = el('li', `issue-item${key === ws.dispatchedSel ? ' selected' : ''}${r.terminal_state ? ' done' : ''}`);
       li.dataset.dispatch = key;
+      li.dataset.key = key;
       li.setAttribute('role', 'option');
       li.setAttribute('aria-selected', String(key === ws.dispatchedSel));
       li.append(el('span', 'ref', r.issue_identifier), el('span', 'ititle', dispatchLine(r)), el('span', 'istatus', shortTime(r.dispatched_at)));
@@ -238,7 +264,9 @@ function renderTrackerList(): void {
   }
   const st = ws.status;
   if (!st) {
-    ul.replaceChildren(el('li', 'issues-empty', ws.statusError ? `Could not load the tracker status: ${ws.statusError}` : 'Loading…'));
+    ul.replaceChildren(ws.statusError
+      ? loadErrorRow(`Could not load the tracker status: ${ws.statusError}`)
+      : el('li', 'issues-empty', 'Loading…'));
     return;
   }
   ul.replaceChildren(...syncRows(st).map(([k, v]) => {
@@ -252,7 +280,7 @@ function renderTrackerInspector(): void {
   const box = $('issues-inspector');
   if (ws.tab === 'dispatched') {
     const r = selectedDispatch();
-    if (!r) { box.replaceChildren(el('div', 'issues-empty', 'Select a dispatched Issue (j / k).')); return; }
+    if (!r) { box.replaceChildren(emptyState('div', 'issues-empty', emptyText('issues-dispatched'))); return; }
     const meta = el('div', 'iv-meta');
     meta.append(...dispatchFields(r).map(([k, v]) => kv(k, v)));
     const open = el('button', 'btn primary', 'Open session');
@@ -267,7 +295,7 @@ function renderTrackerInspector(): void {
   poll.dataset.action = 'issues-poll';
   poll.disabled = ws.polling;
   const out: HTMLElement[] = [el('div', 'iv-head', 'Tracker sync'), poll];
-  if (ws.pollError) out.push(el('div', 'meta err', ws.pollError));
+  if (ws.pollError) out.push(errorBlock('div', 'meta err', ws.pollError));
   if (ws.poll) {
     out.push(el('div', 'meta', pollSummary(ws.poll)));
     const errs = el('ul', 'iv-list');
@@ -302,7 +330,7 @@ function projectName(id: string | null): string {
 
 function fillProjects(): void {
   const sel = $<HTMLSelectElement>('issues-project');
-  sel.replaceChildren(...state.projects.map((p) => {
+  sel.replaceChildren(...ownProjects(state.projects).map((p) => {
     const o = el('option', undefined, p.name);
     o.value = p.id;
     return o;
@@ -311,21 +339,30 @@ function fillProjects(): void {
 }
 
 function chooseProject(): string | null {
-  const known = (id: string | null | undefined) => (id && state.projects.some((p) => p.id === id) ? id : null);
+  // rsid files no Issues in RSI home (home_project_issue_refused), so it is never offered or chosen.
+  const own = ownProjects(state.projects);
+  const known = (id: string | null | undefined) => (id && own.some((p) => p.id === id) ? id : null);
   return known(ws.projectId) ?? known(storage()?.getItem(LS_PROJECT)) ?? known($<HTMLSelectElement>('project-filter').value)
-    ?? state.projects[0]?.id ?? null;
+    ?? own[0]?.id ?? null;
 }
 
 async function openWorkspace(): Promise<void> {
   if (ws.active) { $('issues-list').focus(); return; }
   const pid = chooseProject();
-  if (!pid) { toast('No projects yet: the Issues workspace is per project'); return; }
+  if (!pid) {
+    // Issues belong to a project: offer the next step instead of a dead end.
+    toast('Issues belong to a project. Create one to start.');
+    openProjectForm(null, () => void openWorkspace());
+    return;
+  }
+  rememberOpener('issues');
   ws.active = true;
   ws.projectId = pid;
   fillProjects();
   $('issues-view').hidden = false;
   document.querySelector<HTMLElement>('.layout')!.hidden = true;
   renderAll();
+  $('issues-list').focus({ preventScroll: true });
   uiChanged();
   if (ws.tab !== 'local') void loadTab();
   await loadPage({ kind: 'start' }, 'first', ws.selectedId);
@@ -337,6 +374,7 @@ function closeWorkspace(): void {
   ws.detailEpoch++;
   $('issues-view').hidden = true;
   document.querySelector<HTMLElement>('.layout')!.hidden = false;
+  returnFocus('issues');
   uiChanged();
 }
 
@@ -431,11 +469,13 @@ async function loadSection(more: boolean): Promise<void> {
 // ---------- rendering ----------
 
 function renderAll(): void {
-  renderTabs();
-  renderHeader();
-  renderList();
-  renderInspector();
-  renderStatus();
+  keepFocus($('issues-view'), () => {
+    renderTabs();
+    renderHeader();
+    renderList();
+    renderInspector();
+    renderStatus();
+  });
 }
 
 function renderHeader(): void {
@@ -448,30 +488,39 @@ function renderStatus(): void {
   const s = $('issues-status');
   const rows = ws.page?.rows.length ?? 0;
   s.className = ws.loadError ? 'meta err' : 'meta';
-  if (ws.loadError) s.textContent = ws.loadError;
+  if (ws.loadError) renderMessage(s, ws.loadError);
   else if (ws.loading) s.textContent = 'Loading…';
   else if (ws.tab === 'dispatched') s.textContent = `${ws.dispatched?.length ?? 0} dispatched`;
   else if (ws.tab === 'sync') s.textContent = ws.status ? `${ws.status.tracker || 'tracker'} ${ws.status.enabled ? 'polling' : 'disabled'}` : '';
   else s.textContent = `${rows} Issue${rows === 1 ? '' : 's'} on this page${ws.page?.next_cursor ? ' · more →' : ''}`;
   const retry = $('issues-retry');
   retry.hidden = ws.retry === null;
-  if (ws.retry) retry.textContent = `“${ws.retry.label}” may not have been applied. Retry the identical request (Ctrl-Enter)`;
+  if (ws.retry) retry.textContent = retryBannerText(ws.retry.label, currentPlatform());
   $<HTMLButtonElement>('issues-page-prev').disabled = ws.tab !== 'local' || !ws.page?.previous_cursor;
   $<HTMLButtonElement>('issues-page-next').disabled = ws.tab !== 'local' || !ws.page?.next_cursor;
 }
 
+/** Draw the list, then point the focused list's aria-activedescendant at the selected row (local #318). */
 function renderList(): void {
+  drawList();
+  const ul = $('issues-list');
+  syncListbox(ul, ul);
+}
+
+function drawList(): void {
   if (ws.tab !== 'local') { renderTrackerList(); return; }
   const ul = $('issues-list');
   const rows = ws.page?.rows ?? [];
   if (rows.length === 0) {
-    const empty = el('li', 'issues-empty', ws.loading ? 'Loading…' : ws.loadError ? 'Could not load Issues.' : 'No Issues match these filters.');
-    ul.replaceChildren(empty);
+    ul.replaceChildren(!ws.loading && ws.loadError
+      ? loadErrorRow(`Could not load Issues: ${ws.loadError}`)
+      : el('li', 'issues-empty', ws.loading ? 'Loading…' : emptyIssuesText(ws.filters)));
     return;
   }
   ul.replaceChildren(...rows.map((r) => {
     const li = el('li', `issue-item ${rowTone(r)}${r.issue.id === ws.selectedId ? ' selected' : ''}`);
     li.dataset.id = r.issue.id;
+    li.dataset.key = r.issue.id;
     li.setAttribute('role', 'option');
     li.setAttribute('aria-selected', String(r.issue.id === ws.selectedId));
     li.append(
@@ -495,15 +544,21 @@ function kv(label: string, value: string): HTMLElement {
 }
 
 function renderInspector(): void {
+  // A keyboard user on an action button keeps focus when the pane is redrawn.
+  keepFocus($('issues-inspector'), drawInspector);
+}
+
+function drawInspector(): void {
   if (ws.tab !== 'local') { renderTrackerInspector(); return; }
   const box = $('issues-inspector');
   const issue = selectedIssue();
   if (!issue) {
-    box.replaceChildren(el('div', 'issues-empty', 'Select an Issue (j / k).'));
+    box.replaceChildren(emptyState('div', 'issues-empty', emptyText('issues-inspector')));
     return;
   }
   const head = el('div', 'iv-head');
   head.append(el('h2', undefined, `${issueRef(issue)}  ${issue.title}`));
+  const actions = issueActionRow(issue);
   const meta = el('div', 'iv-meta');
   meta.append(
     kv('Status', `${statusTitle(issue.status)}${isArchived(issue) ? ' (archived)' : ''}`),
@@ -516,7 +571,8 @@ function renderInspector(): void {
   );
   if (issue.closed_at) meta.append(kv('Closed', shortTime(issue.closed_at)));
   if (issue.archived_at) meta.append(kv('Archived', shortTime(issue.archived_at)));
-  const body = el('pre', 'iv-body', issue.body === '' ? '(no description)' : issue.body);
+  const body = el('div', 'iv-bodybox');
+  body.append(...(issue.body === '' ? [] : [rawToggle(ws.raw)]), issueTextBlock(bodyKey(issue.id), issue.body, ws.raw));
 
   const tabs = el('div', 'iv-tabs');
   tabs.setAttribute('role', 'tablist');
@@ -529,14 +585,14 @@ function renderInspector(): void {
     tabs.append(b);
   }
   const assoc = associatedBlock();
-  box.replaceChildren(head, meta, body, ...(assoc ? [assoc] : []), tabs, sectionBody(issue));
+  box.replaceChildren(head, ...(actions ? [actions] : []), meta, body, ...(assoc ? [assoc] : []), tabs, sectionBody(issue));
 }
 
 function sectionBody(issue: Issue): HTMLElement {
   const wrap = el('div', 'iv-section');
   const d = ws.detail?.issueId === issue.id ? ws.detail : null;
   if (!d) { wrap.append(el('div', 'issues-empty', 'Loading…')); return wrap; }
-  if (d.error) wrap.append(el('div', 'meta err', d.error));
+  if (d.error) wrap.append(errorBlock('div', 'meta err', d.error));
   const list = el('ul', 'iv-list');
   const more = (has: boolean) => {
     if (!has) return;
@@ -571,9 +627,10 @@ function sectionBody(issue: Issue): HTMLElement {
     case 'handoffs': {
       if (d.handoffs === null) { wrap.append(el('div', 'issues-empty', 'Loading…')); break; }
       if (d.handoffs.length === 0) wrap.append(el('div', 'issues-empty', 'No handoffs published.'));
+      else wrap.append(rawToggle(ws.raw));
       for (const h of d.handoffs) {
         const det = el('details', 'handoff');
-        det.append(el('summary', undefined, `#${h.sequence} · ${shortTime(h.created_at)} · session ${h.author_session_id.slice(0, 8)}`), el('pre', 'iv-body', h.body));
+        det.append(el('summary', undefined, `#${h.sequence} · ${shortTime(h.created_at)} · session ${h.author_session_id.slice(0, 8)}`), issueTextBlock(handoffKey(issue.id, h.sequence), h.body, ws.raw, '(empty handoff)'));
         list.append(det);
       }
       wrap.append(list);
@@ -611,10 +668,13 @@ function move(delta: number): void {
 interface Field {
   name: string;
   label: string;
-  kind: 'text' | 'textarea' | 'select';
+  /** `checks`: a checkbox group over `options`; `value` is the checked option values joined by commas. */
+  kind: 'text' | 'textarea' | 'select' | 'checks';
   value: string;
   options?: Array<[string, string]>;
   hint?: string;
+  /** `text` only: the most characters the editor accepts (the title's 200, TUI #3421). */
+  max?: number;
 }
 
 interface StaleHelp {
@@ -636,9 +696,27 @@ interface FormSpec {
 }
 
 function fieldNode(f: Field): HTMLElement {
+  if (f.kind === 'checks') {
+    const group = el('fieldset', 'ff checks');
+    group.append(el('legend', undefined, f.label));
+    const on = f.value.split(',');
+    for (const [v, t] of f.options ?? []) {
+      const box = el('label', 'check');
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.name = f.name;
+      cb.value = v;
+      cb.checked = on.includes(v);
+      box.append(cb, el('span', undefined, t));
+      group.append(box);
+    }
+    if (f.hint) group.append(el('small', undefined, f.hint));
+    return group;
+  }
   const label = el('label', 'ff');
   label.append(el('span', undefined, f.label));
   let input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+  let status: HTMLElement | null = null;
   if (f.kind === 'select') {
     const sel = el('select');
     for (const [v, t] of f.options ?? []) {
@@ -654,16 +732,15 @@ function fieldNode(f: Field): HTMLElement {
     ta.value = f.value;
     input = ta;
   } else {
-    const inp = el('input');
-    inp.type = 'text';
-    inp.dataset.vim = 'on';
-    inp.value = f.value;
-    inp.autocomplete = 'off';
-    inp.spellcheck = false;
-    input = inp;
+    // A one-line value that wraps and never takes a newline, and a vim field with Vim keys on (form-field.ts).
+    const lf = lineField({ name: f.name, value: f.value, ...(f.max ? { max: f.max } : {}) });
+    label.classList.add('ff-line');
+    input = lf.field;
+    status = lf.status;
   }
   input.name = f.name;
   label.append(input);
+  if (status) label.append(status);
   if (f.hint) label.append(el('small', undefined, f.hint));
   return label;
 }
@@ -693,7 +770,11 @@ function openForm(spec: FormSpec): void {
   const control = (name: string) => form.elements.namedItem(name) as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null;
   const values = (): Record<string, string> => {
     const out: Record<string, string> = {};
-    for (const f of spec.fields) out[f.name] = control(f.name)?.value ?? '';
+    for (const f of spec.fields) {
+      out[f.name] = f.kind === 'checks'
+        ? Array.from(form.querySelectorAll<HTMLInputElement>('input[type="checkbox"]:checked')).filter((c) => c.name === f.name).map((c) => c.value).join(',')
+        : control(f.name)?.value ?? '';
+    }
     return out;
   };
   const showError = (msg: string) => { error.textContent = msg; error.hidden = false; };
@@ -705,7 +786,12 @@ function openForm(spec: FormSpec): void {
     rebaseBtn.type = 'button';
     reload.addEventListener('click', () => {
       const next = h.reload();
-      for (const [k, v] of Object.entries(next)) { const c = control(k); if (c) c.value = v; }
+      for (const [k, v] of Object.entries(next)) {
+        const c = control(k);
+        if (!c) continue;
+        c.value = v;
+        if (isLineField(c)) resyncLineField(c);
+      }
       dirty = false;
       staleBar.hidden = true;
       error.hidden = true;
@@ -811,7 +897,7 @@ function writeHandler(cfg: WriteForm): (v: Record<string, string>) => Promise<Fo
       if (f.kind === 'uncertain') {
         frozen = w;
         frozenSig = sig;
-        return { done: false, error: `${f.message}. The write may or may not have been applied: submit again to retry the identical request.` };
+        return { done: false, error: `${f.message}. Saving may have failed: submit again to try once more.` };
       }
       frozen = null;
       if (f.kind === 'stale' && w.issueId && ws.projectId) {
@@ -851,7 +937,7 @@ async function directWrite(w: PendingWrite): Promise<void> {
     const f = classifyFailure(String(e));
     if (f.kind === 'uncertain') {
       ws.retry = w;
-      toast(`${f.message}. Not sure it was applied: Ctrl-Enter retries the identical request`);
+      toast(`${f.message}. Saving may have failed: Ctrl-Enter tries again`);
     } else {
       ws.retry = null;
       toast(f.message);
@@ -869,7 +955,7 @@ function retryDirect(): void {
 const PRIORITY_OPTIONS: Array<[string, string]> = [['', 'Unset'], ['1', 'P1 urgent'], ['2', 'P2 high'], ['3', 'P3 normal'], ['4', 'P4 low']];
 
 const DRAFT_FIELDS: Record<keyof Draft, Field> = {
-  title: { name: 'title', label: 'Title', kind: 'text', value: '' },
+  title: { name: 'title', label: 'Title', kind: 'text', value: '', max: ISSUE_TITLE_LIMIT },
   body: { name: 'body', label: 'Description', kind: 'textarea', value: '' },
   priority: { name: 'priority', label: 'Priority', kind: 'select', value: '', options: PRIORITY_OPTIONS },
   labels: { name: 'labels', label: 'Labels', kind: 'text', value: '', hint: 'Comma-separated' },
@@ -1080,7 +1166,7 @@ function filtersForm(): void {
     intro: 'Applying resets to the first page.',
     fields: [
       { name: 'query', label: 'Text', kind: 'text', value: f.query ?? '' },
-      { name: 'statuses', label: 'Status', kind: 'text', value: f.statuses.join(', '), hint: 'Open, InProgress, Closed, Cancelled; empty = active ones' },
+      { name: 'statuses', label: 'Status', kind: 'checks', value: f.statuses.join(','), options: STATUS_CHOICES.map(([v, t]) => [v, t]), hint: 'Tick none to see the active ones' },
       { name: 'priorities', label: 'Priority', kind: 'text', value: f.priorities.join(', '), hint: '1 to 4' },
       { name: 'readiness', label: 'Readiness', kind: 'select', value: f.readiness, options: [view('any', 'Any'), view('ready', 'Ready'), view('blocked', 'Blocked')] },
       { name: 'assignee', label: 'Assignee', kind: 'text', value: f.unassigned ? '-' : f.assignee ?? '', hint: '- means unassigned' },
@@ -1093,7 +1179,7 @@ function filtersForm(): void {
     submit: 'Apply',
     run: (v) => {
       if (v.view) { window.setTimeout(() => savedView(v.view as SavedView), 0); return { done: true }; }
-      const st = parseStatuses(v.statuses ?? '');
+      const st = { value: statusesFromChecked((v.statuses ?? '').split(',')), bad: [] as string[] };
       const pr = parsePriorities(v.priorities ?? '');
       const pv = parseProvenance(v.provenance ?? '');
       const bad = [...st.bad, ...pr.bad, ...pv.bad];
@@ -1329,6 +1415,7 @@ export function initIssues(): void {
   });
   $('issues-inspector').addEventListener('click', (ev) => {
     const t = ev.target as HTMLElement;
+    if (t.closest<HTMLElement>('[data-md-raw]')) { ws.raw = !ws.raw; renderInspector(); return; }
     const tab = t.closest<HTMLElement>('[data-section]');
     if (tab?.dataset.section) {
       ws.section = tab.dataset.section as Section;
@@ -1342,6 +1429,8 @@ export function initIssues(): void {
     const n = dep?.dataset.number ? Number(dep.dataset.number) : NaN;
     if (Number.isInteger(n)) void goToNumber(n);
   });
+  // Rendered Markdown in the inspector: code copy buttons, and links open in the system browser (never the webview).
+  wireMarkdownEvents($('issues-inspector'), { openLinks: true });
   $('issues-retry').addEventListener('click', retryDirect);
   $('issues-project').addEventListener('change', () => {
     const v = $<HTMLSelectElement>('issues-project').value;
@@ -1357,7 +1446,7 @@ export function initIssues(): void {
   // Buttons keep focus after a click, which would swallow j/k.
   $('issues-view').addEventListener('click', (ev) => {
     const b = (ev.target as HTMLElement).closest('button');
-    if (b) window.setTimeout(() => b.blur(), 0);
+    if (b && shouldBlurAfterClick(ev.detail, isVimKeysOn())) window.setTimeout(() => b.blur(), 0);
   });
   // Capture phase: the workspace takes its keys before the global key engine.
   window.addEventListener('keydown', (ev) => {
@@ -1374,7 +1463,7 @@ export function initIssues(): void {
     }
     if (ev.ctrlKey || ev.metaKey || ev.altKey || isTyping(target)) return;
     if (ev.key === 'Enter' && target?.closest('button')) return;
-    const { result, next } = resolveIssuesKey(ws.keys, ev.key, Date.now());
+    const { result, next } = resolveIssuesKey(ws.keys, paneKeyName(ev), Date.now());
     ws.keys = next;
     if (result.kind === 'none') return;
     ev.preventDefault();

@@ -179,7 +179,7 @@ async fn test_e2e_agent_created_project_is_followed_unless_the_setting_is_off() 
     )?;
     fs::set_permissions(h.bin_dir.join("codex"), fs::Permissions::from_mode(0o755))?;
     h.phase = "agent-projects-daemon";
-    h.start_daemon()?;
+    h.start_daemon_with_fixture_scopes()?;
     let mut client = match h.wait_for_daemon().await {
         Ok(client) => client,
         Err(error) => {
@@ -306,7 +306,7 @@ async fn test_e2e_agent_created_project_is_followed_unless_the_setting_is_off() 
 
         // 2. Follow off: the project still appears, the view does not move.
         h.phase = "agent-projects-follow-off";
-        let _ = term.send_key(Key::Ctrl('c')).await;
+        let _ = quit_tui(&term).await;
         client
             .update_daemon_config("follow_agent_created_projects", json!(false))
             .await?;
@@ -359,12 +359,12 @@ async fn test_e2e_agent_created_project_is_followed_unless_the_setting_is_off() 
             Ok::<(), Box<dyn Error + Send + Sync>>(())
         }
         .await;
-        let _ = term_off.send_key(Key::Ctrl('c')).await;
+        let _ = quit_tui(&term_off).await;
         off
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     if manager.status == SessionStatus::Running {
         let _ = client.interrupt_session(manager.id).await;
     }

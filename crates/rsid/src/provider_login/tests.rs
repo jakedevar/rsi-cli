@@ -819,3 +819,101 @@ async fn an_offline_login_probe_starts_no_cli_and_reads_unknown() {
     }
     assert!(!marker.exists(), "an offline probe started a CLI");
 }
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+#[tokio::test]
+async fn claude_probe_switch_clears_hold_but_same_or_unknown_account_preserves_it() {
+    struct Runner(Mutex<std::collections::VecDeque<ProbeRun>>);
+    #[async_trait::async_trait]
+    impl LoginProbeRunner for Runner {
+        async fn run(&self, _: LoginProvider) -> ProbeRun {
+            self.0.lock().unwrap().pop_front().unwrap()
+        }
+    }
+    let reply = |identity: Option<&str>| ProbeRun::Exited {
+        code: Some(0),
+        stdout: serde_json::to_vec(&serde_json::json!({
+            "loggedIn": true, "authMethod": "claude.ai", "email": identity,
+        }))
+        .unwrap(),
+        stderr: Vec::new(),
+    };
+    let runner = Arc::new(Runner(Mutex::new(std::collections::VecDeque::from([
+        reply(Some("account-a@example.test")),
+        reply(Some("account-a@example.test")),
+        ProbeRun::TimedOut,
+        reply(None),
+        reply(Some("account-b@example.test")),
+    ]))));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(
+        crate::store::Store::open_in_memory().unwrap(),
+    ));
+    let service = ProviderLoginService::new(runner, Duration::ZERO);
+    service.attach_rate_limit_store(&store);
+    service.set_billing_store(&store);
+    service.refresh(LoginProvider::Claude).await;
+    {
+        let store = store.lock().await;
+        store
+            .upsert_provider_rate_limit_snapshot(
+                &rsi_common::rpc::ProviderRateLimitSnapshot {
+                    provider: rsi_common::types::SessionProvider::Claude,
+                    status: None,
+                    rate_limit_type: None,
+                    overage_status: None,
+                    is_using_overage: false,
+                    observed_at: Utc::now(),
+                    stale_reason: None,
+                    windows: vec![rsi_common::rpc::ProviderRateLimitWindow {
+                        window_key: "seven_day".into(),
+                        utilization: 1.0,
+                        resets_at_epoch: Some((Utc::now() + chrono::Duration::days(4)).timestamp()),
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+    }
+    for _ in 0..3 {
+        service.refresh(LoginProvider::Claude).await;
+        assert!(
+            store
+                .lock()
+                .await
+                .provider_usage_window_hold_until(
+                    rsi_common::types::SessionProvider::Claude,
+                    Utc::now(),
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+    service.refresh(LoginProvider::Claude).await;
+    assert_eq!(
+        store
+            .lock()
+            .await
+            .provider_usage_window_hold_until(
+                rsi_common::types::SessionProvider::Claude,
+                Utc::now(),
+            )
+            .unwrap(),
+        None
+    );
+    let fingerprint = store
+        .lock()
+        .await
+        .get_daemon_setting("provider_rate_limits.account.Claude")
+        .unwrap()
+        .unwrap();
+    assert_eq!(fingerprint.len(), 64, "only an opaque digest is retained");
+    assert_eq!(
+        store
+            .lock()
+            .await
+            .get_daemon_setting("billing_login.claude")
+            .unwrap()
+            .as_deref(),
+        Some("claude.ai")
+    );
+}

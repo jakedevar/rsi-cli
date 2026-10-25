@@ -2,6 +2,10 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The request is the rsi-repo-guard `rsid-quiet-restart` subcommand (#465).
+RSI_REPO_GUARD_BIN="$("$ROOT/scripts/repo-guard" --bin)"
+export RSI_REPO_GUARD_BIN
+command -v perl >/dev/null 2>&1 || { echo "test_rsid_quiet_restart.sh needs perl for its socket listener" >&2; exit 1; }
 source "$ROOT/scripts/rsid-quiet-restart.sh"
 TEMP_DIR="$(mktemp -d /tmp/rqr.XXXXXX)"
 LISTENER_PID=""
@@ -29,15 +33,9 @@ status_of() {
 
 # A live socket: a unix listener that accepts and holds connections.
 SOCKET="$TEMP_DIR/live.sock"
-python3 - "$SOCKET" <<'PY' &
-import socket, sys, time
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(sys.argv[1])
-server.listen(16)
-while True:
-    time.sleep(1)
-PY
+perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => shift, Listen => 16) or die "bind: $!"; sleep 1 while 1' "$SOCKET" &
 LISTENER_PID=$!
+disown "$LISTENER_PID" 2>/dev/null || true
 for _ in $(seq 50); do [[ -S "$SOCKET" ]] && break; sleep 0.1; done
 [[ -S "$SOCKET" ]]
 
@@ -74,9 +72,8 @@ cat >"$TEMP_DIR/hang" <<'MOCK'
 sleep 30
 MOCK
 chmod +x "$TEMP_DIR/hang"
-SLOW_SCRIPT="$(sed 's/timeout=120/timeout=1/' "$ROOT/scripts/rsid-quiet-restart.sh")"
 (
-    eval "$SLOW_SCRIPT"
+    export RSID_QUIET_RESTART_RPC_TIMEOUT_SECS=1
     [[ "$(status_of request_quiet_restart "$TEMP_DIR/hang" "$SOCKET" /build)" -eq 1 ]]
     grep -q 'NOW=1' "$TEMP_DIR/err"
 )
@@ -96,12 +93,7 @@ RSID_PIDS=""
 [[ ! -e "$TEMP_DIR/never.args" ]]
 
 # A stale socket file that refuses connections is down evidence as well.
-python3 - "$TEMP_DIR/stale.sock" <<'PY'
-import socket, sys
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(sys.argv[1])
-server.close()
-PY
+perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Local => shift, Listen => 1) or die "bind: $!"' "$TEMP_DIR/stale.sock"
 [[ "$(status_of request_quiet_restart "$TEMP_DIR/never" "$TEMP_DIR/stale.sock" /build)" -eq 10 ]]
 
 # Socket down but an rsid process lives: ambiguous, never restart.

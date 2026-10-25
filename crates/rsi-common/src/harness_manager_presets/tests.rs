@@ -78,7 +78,7 @@ fn initial_profiles_have_exact_grants_allowances_and_scope_behavior() {
                         p.max_created_sessions,
                         p.max_recovery_attempts
                     ),
-                    (8, 32, 3)
+                    (8, 256, 3)
                 );
                 for grant in [
                     ManagerCapabilityV2::SelfSuccession,
@@ -191,7 +191,7 @@ fn new_touched_zero_is_explicit_but_untouched_defaults_can_follow_profiles() {
     );
     assert_eq!(
         (full.max_created_sessions, full.max_recovery_attempts),
-        (32, 0)
+        (256, 0)
     );
     let observe = apply(
         &full,
@@ -221,7 +221,7 @@ fn new_touched_zero_is_explicit_but_untouched_defaults_can_follow_profiles() {
             execute.max_created_sessions,
             execute.max_recovery_attempts
         ),
-        (8, 32, 0)
+        (8, 256, 0)
     );
     let observed_saved = apply(
         &full,
@@ -236,7 +236,7 @@ fn new_touched_zero_is_explicit_but_untouched_defaults_can_follow_profiles() {
             observed_saved.max_created_sessions,
             observed_saved.max_recovery_attempts
         ),
-        (8, 32, 0)
+        (8, 256, 0)
     );
 }
 

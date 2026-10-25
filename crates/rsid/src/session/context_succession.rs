@@ -11,20 +11,10 @@
 
 use crate::error::Result;
 use crate::store::Store;
+pub(super) use crate::store::context_settings::{CoordinatorRole, RequestState, SuccessionRequest};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::OptionalExtension;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// A session whose seat passes through authority-preserving succession.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "role", rename_all = "snake_case")]
-pub(super) enum CoordinatorRole {
-    /// The live lineage tip of its project's appointed manager.
-    Manager,
-    /// The current lead of an Epic.
-    Lead { epic_id: Uuid },
-}
 
 /// The coordinator role `session_id` holds now, or `None` for a worker.
 /// A topology node or Issue-bound worker session, or a rotation child of one,
@@ -58,53 +48,20 @@ pub(super) fn coordinator_role(store: &Store, session_id: Uuid) -> Result<Option
     Ok((manager == Some(session_id)).then_some(CoordinatorRole::Manager))
 }
 
-/// `daemon_settings` key prefix of a seat's succession request.
-const MARKER_PREFIX: &str = "context_succession_due:";
 /// An ignored request is delivered again after this long.
 pub(super) const RESEND_AFTER_SECS: i64 = 15 * 60;
 /// Deliveries per request before the daemon escalates instead.
 pub(super) const MAX_DELIVERIES: u32 = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum RequestState {
-    Due,
-    Cleared,
-}
-
-/// One durable succession request per seat and threshold crossing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct SuccessionRequest {
-    pub state: RequestState,
-    pub coordinator: CoordinatorRole,
-    pub context_pct: f64,
-    pub threshold_pct: f64,
-    pub crossed_at: DateTime<Utc>,
-    pub deliveries: u32,
-    pub last_delivered_at: Option<DateTime<Utc>>,
-    pub escalated: bool,
-    pub cleared_reason: Option<String>,
-}
-
-fn marker_key(session_id: Uuid) -> String {
-    format!("{MARKER_PREFIX}{session_id}")
-}
-
 pub(super) fn succession_request(
     store: &Store,
     session_id: Uuid,
 ) -> Result<Option<SuccessionRequest>> {
-    store
-        .get_daemon_setting(&marker_key(session_id))?
-        .map(|raw| {
-            serde_json::from_str(&raw)
-                .map_err(|error| crate::error::DaemonError::Store(error.to_string()))
-        })
-        .transpose()
+    store.get_context_succession_request(session_id)
 }
 
 fn put_request(store: &Store, session_id: Uuid, request: &SuccessionRequest) -> Result<()> {
-    store.set_daemon_setting(&marker_key(session_id), &serde_json::to_string(request)?)
+    store.set_context_succession_request(session_id, request)
 }
 
 /// Record a crossing. Returns `false` when a request is already due for this
@@ -169,23 +126,9 @@ pub(super) fn due_succession_actions(
     now: DateTime<Utc>,
     is_active: impl Fn(Uuid) -> bool,
 ) -> Result<Vec<SuccessionAction>> {
-    let keys: Vec<String> = {
-        let mut statement = store
-            .conn
-            .prepare("SELECT key FROM daemon_settings WHERE key LIKE ?1 ORDER BY key")?;
-        statement
-            .query_map([format!("{MARKER_PREFIX}%")], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?
-    };
     let resend = Duration::seconds(RESEND_AFTER_SECS);
     let mut actions = Vec::new();
-    for key in keys {
-        let Some(session_id) = key
-            .strip_prefix(MARKER_PREFIX)
-            .and_then(|id| Uuid::parse_str(id).ok())
-        else {
-            continue;
-        };
+    for session_id in store.context_succession_session_ids()? {
         let Some(request) = succession_request(store, session_id)? else {
             continue;
         };

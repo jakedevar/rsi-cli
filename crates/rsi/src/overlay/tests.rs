@@ -216,7 +216,8 @@ async fn schedule_browser_requires_dd_before_deleting() {
 async fn schedule_browser_single_space_toggles_selected_job() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary schedule socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary schedule socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("schedule listener");
     let job = scheduled_job("toggle me");
@@ -1683,7 +1684,8 @@ async fn assert_semantic_launch_response_owns_surface_and_placement(
 ) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let temp_dir = tempfile::tempdir().expect("temporary prompt socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary prompt socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("prompt listener");
     let returned_id = Uuid::new_v4();
@@ -1846,7 +1848,8 @@ async fn blank_and_typed_prompts_survive_semantic_launch_rejection() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     for typed in [false, true] {
-        let temp_dir = tempfile::tempdir().expect("temporary typed prompt socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary typed prompt socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("typed prompt listener");
         let server = tokio::spawn(async move {
@@ -2873,7 +2876,8 @@ fn listed_requests(log: &std::sync::Mutex<Vec<serde_json::Value>>) -> Vec<serde_
 #[tokio::test]
 #[allow(clippy::expect_used)]
 async fn schedule_browser_pages_and_toggles_history() {
-    let temp_dir = tempfile::tempdir().expect("temporary schedule socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary schedule socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("schedule listener");
     let first = scheduled_job("active-1");
@@ -2942,7 +2946,8 @@ async fn schedule_browser_pages_and_toggles_history() {
 #[tokio::test]
 #[allow(clippy::expect_used)]
 async fn schedule_form_return_restores_the_history_filter() {
-    let temp_dir = tempfile::tempdir().expect("temporary schedule socket directory");
+    let temp_dir =
+        crate::test_support::socket_tempdir().expect("temporary schedule socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("schedule listener");
     let active = scheduled_job("active-1");

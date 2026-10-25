@@ -54,6 +54,8 @@ pub(crate) struct SettingsSide {
     pub description: &'static str,
     /// #2237: the grant page, when it replaces the launch rows.
     pub grant: Option<GrantEditor>,
+    /// Loading or failed read shown in place of the editor.
+    pub grant_status: Option<String>,
 }
 
 #[derive(Debug)]
@@ -138,6 +140,10 @@ pub(super) fn launch_view(
             selected,
             description,
             grant: launch.grant_open.then(|| launch.grant.clone()).flatten(),
+            grant_status: launch
+                .grant_open
+                .then(|| launch.grant_context.status_message())
+                .flatten(),
         }
     });
     PromptLaunchView {
@@ -277,24 +283,37 @@ fn setting_value(
                 launch
                     .grant
                     .as_ref()
-                    .map_or_else(|| plan.preset.label(), |editor| editor.preset().label())
+                    .map_or_else(
+                        || {
+                            if launch.regrants_saved_grant() {
+                                "Saved grant"
+                            } else {
+                                plan.preset.label()
+                            }
+                        },
+                        |editor| editor.preset().label(),
+                    )
                     .to_string(),
                 Style::default().fg(theme::text()),
             )]
         }),
-        LaunchSettingRow::ManagerGrant => {
-            launch
-                .manager
-                .map_or_else(Vec::new, |_| match &launch.grant {
-                    Some(editor) => vec![
-                        Span::styled(editor.summary(), Style::default().fg(theme::text())),
-                        dim("  p / Enter edits"),
-                    ],
-                    None => vec![dim(
-                        "preset as is  ·  p / Enter edits capabilities, caps, launches",
-                    )],
-                })
-        }
+        LaunchSettingRow::ManagerGrant => launch.manager.map_or_else(Vec::new, |_| {
+            if let Some(message) = launch.grant_context.status_message() {
+                return vec![dim(message)];
+            }
+            match &launch.grant {
+                Some(editor) => vec![
+                    Span::styled(editor.summary(), Style::default().fg(theme::text())),
+                    dim("  p / Enter edits"),
+                ],
+                None if launch.regrants_saved_grant() => vec![dim(
+                    "re-grants the saved grant  ·  p / Enter edits capabilities, caps, launches",
+                )],
+                None => vec![dim(
+                    "preset as is  ·  p / Enter edits capabilities, caps, launches",
+                )],
+            }
+        }),
     }
 }
 
@@ -410,7 +429,7 @@ pub(super) fn render_prompt_popup(
         // additionally guarantees the popup never reaches the absolute screen bottom.
         let max_h = (area.height * 50 / 100).max(9);
         let min_rows = view.settings.as_ref().map_or(3, |side| {
-            if side.grant.is_some() {
+            if side.grant.is_some() || side.grant_status.is_some() {
                 GRANT_PAGE_ROWS
             } else {
                 u16::try_from(side.rows.len() + 2).unwrap_or(3)
@@ -554,7 +573,7 @@ pub(super) fn render_prompt_popup(
         render_mode_row(
             frame,
             hint_area,
-            if side.grant.is_some() {
+            if side.grant.is_some() || side.grant_status.is_some() {
                 " GRANT "
             } else {
                 " SETTINGS "
@@ -842,6 +861,19 @@ fn render_mode_row(
 /// The settings side: one row per setting (selected row marked, cycling
 /// values framed by `‹ ›`), then the selected row's description, wrapped.
 fn render_settings_side(frame: &mut Frame, area: Rect, side: &SettingsSide) {
+    if let Some(message) = &side.grant_status {
+        frame.render_widget(
+            Paragraph::new(vec![Line::from("GRANT"), Line::from(message.clone())])
+                .style(
+                    Style::default()
+                        .fg(theme::subtext1())
+                        .bg(theme::overlay_bg()),
+                )
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
     if let Some(editor) = &side.grant {
         super::grant_editor::render_grant(frame, area, editor, theme::overlay_bg());
         return;

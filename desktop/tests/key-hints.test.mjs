@@ -37,7 +37,7 @@ test('pane hint lines (managers) keep standard keys, Tab and Esc', () => {
   assert.equal(formatKeyHint('j/k · Enter open session · r refresh · Esc close'), 'Enter open session · Esc close');
   assert.equal(formatKeyHint('j/k g/G move · h/l Space H/L fold · Enter open · o project · Esc close'), 'Enter open · Esc close');
   assert.equal(formatKeyHint('1-5 · Tab/Shift-Tab sections · j/k fields · Enter/Space edit · s save · r reload · Esc close'),
-    'Tab/Shift-Tab sections · Enter edit · Esc close');
+    'F6/Shift-F6 sections · Enter edit · Esc close');
   assert.equal(formatKeyHint('Tab / Shift-Tab fields · Up/Down cycle scope kind and model tier · Enter saves · Esc closes'),
     'Tab / Shift-Tab fields · Up/Down cycle scope kind and model tier · Enter saves · Esc closes');
 });
@@ -75,6 +75,8 @@ test('other parentheses and plain tooltips are unchanged', () => {
 
 test('toasts drop key clauses, "Press x" sentences and a trailing key', () => {
   assert.equal(formatKeyTip('Open a session first (j/k, then Enter)'), 'Open a session first (Enter)');
+  assert.equal(formatKeyTip('Open a session first: click one in the list (j/k, then Enter)'), 'Open a session first: click one in the list (Enter)');
+  assert.equal(formatKeyTip('Land b @ c: unmerged? Choose Land session branch again (<Space>gl) within 30s to queue it.'), 'Land b @ c: unmerged? Choose Land session branch again within 30s to queue it.');
   assert.equal(formatKeyTip('Here n launches a project manager; appoint portfolio and area seats from the manager tree (a)'),
     'Appoint portfolio and area seats from the manager tree');
   assert.equal(formatKeyTip('This node has no seat session to open; appoint one from the manager tree (a)'),
@@ -162,7 +164,7 @@ test('admin prose with a key list inside a sentence loses the letter keys', () =
   assert.equal(formatKeyHint('Scratch reclaim is enabled: an adopted directory that is old enough and unheld is deleted automatically later. a / Enter confirms the selected one, A every adoptable one (at most 32); nothing is sent until y. Esc / n / q cancels a confirmation or closes; r refreshes.'),
     'Scratch reclaim is enabled: an adopted directory that is old enough and unheld is deleted automatically later. Enter confirms the selected one; nothing is sent until you confirm. Esc cancels a confirmation or closes.');
   assert.equal(formatKeyHint('Tab cycles peers, links and cached sessions; j/k select; a / e add or edit; d enables or disables; R repairs a quarantined peer; p probes a link; I edits this daemon\'s inbound policy; n / b page cached sessions; r refresh; q/Esc close. Reads only the hub daemon.'),
-    'Tab cycles peers, links and cached sessions; Esc close. Reads only the hub daemon.');
+    'F6 cycles peers, links and cached sessions; Esc close. Reads only the hub daemon.');
   assert.equal(formatKeyHint('j/k (J/K page) select; Enter audits (read-only); A begins authorization after a fresh applyable audit; r refreshes the receipt; Esc / q close; Space N new session, Space ; palette.'),
     'Enter audits (read-only); Esc close.');
   assert.equal(formatKeyHint('j/k move, s or Enter set, r rotate, c check (on a login or contract row: probe now), d twice clears, i imports legacy env keys, R refreshes, q/Esc close. Key values are write-only.'),
@@ -172,4 +174,47 @@ test('admin prose with a key list inside a sentence loses the letter keys', () =
 test('plain sentences that merely start with a letter-like word are left alone', () => {
   for (const t of ['Saved. A fresh audit is required; a project is chosen.', 'Nothing to show. I think it is fine, a bit odd; Enter opens.'])
     assert.equal(formatKeyHint(t), t);
+});
+
+test('Settings info-card facts and generated row summaries drop letter keys with the switch off (local #139)', () => {
+  const cases = [
+    ['Flips the switch (staged; w applies)', 'Flips the switch (staged)'],
+    ['Next choice (staged; + / - step, w applies)', 'Next choice (staged)'],
+    ['Type a value (staged; w applies)', 'Type a value (staged)'],
+    ['Opens the budget policies (a adds, Enter edits, d deletes)', 'Opens the budget policies (Enter edits)'],
+    ['Opens Provider keys (s sets, r rotates, c checks, d clears, i imports; values are never shown)', 'Opens Provider keys (values are never shown)'],
+    ['Daemon model budget policies; a adds, Enter edits, d deletes (an empty list shows the add hint).', 'Daemon model budget policies; Enter edits.'], // the add hint it mentions goes with the key
+    ['Twenty-three masked vault slots; s sets, r rotates, c checks, d clears after confirmation, and i imports from environment.', 'Twenty-three masked vault slots.'],
+    ['Claude Code hooks from settings.json; Enter edits, a adds, d deletes.', 'Claude Code hooks from settings.json; Enter edits.'],
+    ['Daemon-configured MCP server definitions; a adds, Enter edits, t enables or disables.', 'Daemon-configured MCP server definitions; Enter edits.'],
+    ['Claude user skills; Enter previews, e enables or disables.', 'Claude user skills; Enter previews.'],
+    ['Vim is the modal editing. Applies when you apply the page (w), with no restart; `unset` asks again.', 'Vim is the modal editing. Applies when you apply the page, with no restart; `unset` asks again.'],
+    ['Shows sandbox storage usage; R refreshes it.', 'Shows sandbox storage usage.'],
+  ];
+  for (const [on, off] of cases) assert.equal(formatKeyTip(on), off, on);
+  // Prose with no key list, and an Enter-only list, stay as written.
+  for (const same of ['Opens the theme picker', 'Opens the hex editor (#RRGGBB; Delete clears)', 'Next, a creative option is offered', 'Enter edits, Esc cancels']) assert.equal(formatKeyTip(same), same);
+});
+
+test('Settings wiring: the info card, group and section summaries carry the tip rule; row-key facts the hint rule', () => {
+  const settings = readFileSync(fileURLToPath(new URL('../src/settings.ts', import.meta.url)), 'utf8');
+  assert.match(settings, /card\.dataset\.keyTip = ''/);
+  assert.match(settings, /infoShell\.dataset\.keyTip = ''/);
+  assert.match(settings, /sum\.dataset\.keyTip = ''/);
+  assert.match(settings, /sectionSummary\.dataset\.keyTip = ''/);
+  assert.match(settings, /fact\(k, what, true\)/);
+  assert.equal(formatKeyHint('a'), ''); // a row-key label empties; the CSS hides its pair
+  assert.equal(formatKeyHint('Enter'), 'Enter');
+  const css = readFileSync(fileURLToPath(new URL('../src/settings-css.ts', import.meta.url)), 'utf8');
+  assert.match(css, /dt:empty \+ dd \{ display: none; \}/);
+});
+
+test('isVimOnlyHint: chords, F-keys and standard keys work with the switch off; letters, leaders and : commands do not', async () => {
+  const { isVimOnlyHint, formatKeyTip } = await import('../dist/key-hints.js');
+  for (const k of ['Ctrl-K', 'Cmd-K', 'Ctrl-Alt-G', 'Shift-Down', 'F2', 'Enter', 'Esc', 'Tab', 'PageDown', 'Up']) assert.equal(isVimOnlyHint(k), false, k);
+  for (const k of ['j', 'gg', 'DD', 'ZQ', '<Space>a', ':archive', ':', '/', '?', ']a', 'Backspace', 'yy']) assert.equal(isVimOnlyHint(k), true, k);
+  // A "then" step and a `:q!` form are Vim keys in a tip too (local #227).
+  assert.equal(formatKeyTip('Every cap as used / limit (gm, then b)'), 'Every cap as used / limit');
+  assert.equal(formatKeyTip('Closes the viewer (q, <Space>q or :q; :q! discards unsaved changes)'), 'Closes the viewer');
+  assert.equal(formatKeyTip('Open a session first (j/k, then Enter)'), 'Open a session first (Enter)');
 });

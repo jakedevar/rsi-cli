@@ -38,7 +38,9 @@ pub(super) fn render_source_worktree_settlement(
         key("j/k"),
         muted(" select  "),
         key("Enter"),
-        muted(" audit  "),
+        muted(" restart audit  "),
+        key("n"),
+        muted(" next page  "),
         key("A"),
         muted(" apply  "),
         key("r"),
@@ -150,6 +152,21 @@ pub(super) fn render_source_worktree_settlement(
                 ),
             ]));
         }
+        if let Some(page) = &audit.traversal {
+            lines.push(normal(format!(
+                "Page: {} examined of {} Live roots · {} unexamined · {}",
+                audit.counts.observed,
+                page.snapshot_root_count,
+                page.snapshot_root_count
+                    .saturating_sub(audit.counts.observed),
+                if page.has_more {
+                    "n: next page"
+                } else {
+                    "end of traversal"
+                },
+            )));
+            lines.push(normal(format!("Snapshot {}", page.snapshot_digest)));
+        }
         for item in &audit.items {
             let diagnostic = item
                 .diagnostic
@@ -214,6 +231,34 @@ pub(super) fn render_source_worktree_settlement(
                     Style::default().fg(theme::subtext0()),
                 )));
             }
+        }
+        if !receipt.unproven_survivors.is_empty() {
+            // #149: processes the run could not prove and so left running.
+            lines.push(section(
+                "Unproven survivors (left running: settlement never kills an unproven process)",
+            ));
+            for survivor in &receipt.unproven_survivors {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "pid {} · {} · {} · {}",
+                        survivor.pid,
+                        survivor
+                            .executable
+                            .as_deref()
+                            .unwrap_or("<executable unknown>"),
+                        survivor.sandbox_root.as_ref().map_or_else(
+                            || format!("cohort repository {}", receipt.canonical_repo_dir),
+                            |root| format!("root {root}"),
+                        ),
+                        survivor.reason.label()
+                    ),
+                    Style::default().fg(theme::warning_status()),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "    stop these by hand if they belong to the settled work",
+                Style::default().fg(theme::subtext0()),
+            )));
         }
     }
 
@@ -314,7 +359,8 @@ mod tests {
         SourceWorktreeDispositionV1, SourceWorktreeGitOidV1, SourceWorktreeProofV1,
         SourceWorktreeSettlementCountsV1, SourceWorktreeSettlementItemV1,
         SourceWorktreeSettlementPhaseV1, SourceWorktreeSettlementRunStateV1,
-        SourceWorktreeSettlementRunV1,
+        SourceWorktreeSettlementRunV1, SourceWorktreeUnprovenReasonV1,
+        SourceWorktreeUnprovenSurvivorV1,
     };
     use rsi_common::types::Sha256Digest;
 
@@ -405,6 +451,7 @@ mod tests {
     fn historical_run_on_a_live_bound_refusal_is_not_labeled_receipt_recovery() {
         let identity = "/repo/.git".to_string();
         let audit = SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: identity.clone(),
@@ -467,6 +514,7 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         let custody_id = uuid::Uuid::new_v4();
         let audit = SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: identity.clone(),
@@ -543,6 +591,28 @@ mod tests {
                 after_observation: Some("settled".into()),
             }],
             retained_roots: Vec::new(),
+            unproven_survivors: vec![
+                SourceWorktreeUnprovenSurvivorV1 {
+                    sequence: 0,
+                    pid: 4242,
+                    start_time_micros: 1_700_000_000_000_000,
+                    executable: Some("/opt/hardened/bin/claude".into()),
+                    session_id: Some(session_id),
+                    custody_id: Some(custody_id),
+                    sandbox_root: Some("/sandboxes/live".into()),
+                    reason: SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos,
+                },
+                SourceWorktreeUnprovenSurvivorV1 {
+                    sequence: 1,
+                    pid: 4343,
+                    start_time_micros: 1_700_000_000_000_001,
+                    executable: None,
+                    session_id: None,
+                    custody_id: None,
+                    sandbox_root: None,
+                    reason: SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos,
+                },
+            ],
             created_at: "2026-08-24T00:00:00.000000000Z".into(),
             updated_at: "2026-08-24T00:00:01.000000000Z".into(),
             finished_at: Some("2026-08-24T00:00:01.000000000Z".into()),
@@ -588,6 +658,15 @@ mod tests {
         assert!(text.contains(&phrase));
         assert!(text.contains("Durable receipt"));
         assert!(text.contains(&run_id.to_string()));
+        // #149: each unproven survivor shows its pid, executable, root (or
+        // the cohort repository) and why it was left running.
+        assert!(text.contains("Unproven survivors (left running"));
+        assert!(text.contains(
+            "pid 4242 · /opt/hardened/bin/claude · root /sandboxes/live · environment withheld by macOS"
+        ));
+        assert!(text.contains(
+            "pid 4343 · <executable unknown> · cohort repository /repo · environment withheld by macOS"
+        ));
     }
 
     #[test]
@@ -605,6 +684,7 @@ mod tests {
         });
         state.audit = Some(
             SourceWorktreeCohortAuditV1 {
+                traversal: None,
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                 repository_identity: identity,

@@ -68,7 +68,7 @@ async fn connect(
     app: &mut App,
     cases: Vec<RpcCase>,
 ) -> (tempfile::TempDir, tokio::task::JoinHandle<()>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let path = dir.path().join("manager.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let task = tokio::spawn(async move {

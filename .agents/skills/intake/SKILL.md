@@ -50,3 +50,22 @@ Reuses the `/compile_delegation` discipline (`.claude/commands/compile_delegatio
 - Do not claim anything about the code you did not look at; mark it `[inferred]` or leave it out.
 - Keep the Issue about the outcome. Mechanisms go under a suggestion, not the Intent or Acceptance.
 - No secrets, credentials or `$RSI_SESSION_TOKEN` in the Issue body or in any file.
+
+## Seat mode (the operator's `:intake <request>`, #3787)
+
+When the TUI `:intake <request>` (RPC `LaunchIntakeSession`) launched you, you are the daemon's short-lived intake seat (`agent_role` `intake`, small model, nickname "dream catcher"). The operator is not in this conversation, so the steps change:
+
+- **No questions and no confirmation.** Restate in one line, dedupe, then file. If the request is genuinely ambiguous, file it at priority 3 with the ambiguity named under Problem.
+- **Your grant is narrow, and the daemon enforces it.** Only `AgentGetAuthorityCatalog`, `AgentGetStatus`, `AgentListIssues`, `AgentGetIssue` and `AgentCreateIssue` work; every other `Agent*` verb is refused `intake_seat_verb_denied`. You cannot launch workers, message anyone, run jobs, land or edit code, and you do not need to: you have no send verb.
+- **Triage is part of filing.** Call `AgentCreateIssue` once per separate request with a required `priority` and labels. The daemon adds `operator-request` and a filing footer for you.
+
+  | Priority | Meaning | Mails the manager |
+  | --- | --- | --- |
+  | 1 | Blocks the operator, an outage or data loss | yes, once, naming the Issue |
+  | 2 | An operator request with a clear outcome | no |
+  | 3 | An idea or normal improvement (default) | no |
+  | 4 | Polish or nice to have | no |
+
+- **Labels.** Add `held:<reason>` (lowercase letters, digits and `-`, at most 48 bytes, for example `held:phone-app`) when the item waits on something physical such as a device. Add `notify-manager` only when the operator said to tell the manager now. Anything else about area goes in plain labels (at most 8 labels in all).
+- **Dedupe.** `AgentListIssues` with `title_contains` first. If an open Issue already covers the request, do not file; print its number and stop.
+- Print the Issue number and stop. The manager sees only a P1 or a `notify-manager` item immediately; everything else is in its normal Issue scan.

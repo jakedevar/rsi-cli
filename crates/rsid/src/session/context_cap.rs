@@ -30,6 +30,7 @@
 //! redacted before persistence and rendered as quoted untrusted data.
 
 use crate::error::{DaemonError, Result};
+pub(super) use crate::store::context_settings::{CapRotation, CapState, IdleFence};
 use crate::store::{RotationRequestSuccessor, Store};
 use chrono::{DateTime, Utc};
 use rsi_common::daemon_handoff::{
@@ -38,15 +39,11 @@ use rsi_common::daemon_handoff::{
     HandoffRequestV1, HandoffWakeV1, HandoffWorkerParentEpicV1, MAX_EXCERPT_CHARS, MAX_ITEMS,
     MAX_TEXT_CHARS, UNTRUSTED_TEXT_NOTICE, one_line, redact_secrets,
 };
+use rsi_common::harness_manager_v2::ManagerLaunchChoiceV2;
 use rsi_common::types::{Session, SessionStatus};
 use rusqlite::OptionalExtension;
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// `daemon_settings` key prefix of a seat's cap rotation record.
-const MARKER_PREFIX: &str = "context_cap_due:";
-/// `daemon_settings` key prefix of the generated handoff document.
-const HANDOFF_PREFIX: &str = "context_cap_handoff:";
 /// Rotation attempts before the daemon gives up and tells the operator.
 pub(super) const MAX_ATTEMPTS: u32 = 3;
 /// Daemon-message source of the successor's first prompt.
@@ -102,55 +99,6 @@ pub(super) fn capped_seat(store: &Store, session_id: Uuid) -> Result<Option<Coor
         }
     }
     Ok(None)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum CapState {
-    /// Crossed; waiting for the seat's idle boundary.
-    Due,
-    /// The daemon wrote the handoff and requested the rotation.
-    Rotating,
-    /// A successor holds the seat.
-    Rotated,
-    /// The rotation could not run; the operator was told.
-    Failed,
-    /// No longer applicable (seat passed, cap turned off).
-    Cleared,
-}
-
-/// One durable cap rotation per seat crossing. Rows are kept, never deleted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct CapRotation {
-    pub state: CapState,
-    pub seat: CoordinatorSeatV1,
-    pub measured_tokens: u64,
-    pub cap_tokens: u64,
-    pub crossed_at: DateTime<Utc>,
-    pub attempts: u32,
-    pub requested_at: Option<DateTime<Utc>>,
-    pub successor: Option<Uuid>,
-    pub reason: Option<String>,
-    /// Stable operation identity of the one rotation this record requests,
-    /// written with the handoff and the `Rotating` marker (#1142 F2). Every
-    /// dispatch of the request, including a post-restart one, uses it.
-    #[serde(default)]
-    pub rotation_id: Option<String>,
-    /// The idle incarnation the request was planned against (#1142 F1).
-    #[serde(default)]
-    pub fence: Option<IdleFence>,
-    /// The daemon process that last dispatched the request. A request whose
-    /// dispatcher is another process is reconciled once by the next pass.
-    #[serde(default)]
-    pub dispatched_by: Option<String>,
-}
-
-/// The exact idle incarnation of a predecessor: its row version and provider
-/// session. Any continuation, status change or metadata write changes it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct IdleFence {
-    pub row_version: String,
-    pub claude_session_id: Option<String>,
 }
 
 /// The idle fence of `session_id` now, or `None` when its row is not
@@ -229,23 +177,12 @@ pub(super) fn close_superseded_cap_intent(
 const STALE_ROTATING: &str = "rotating_stale";
 const STALE_ROTATING_AFTER_HOURS: i64 = 2;
 
-fn marker_key(session_id: Uuid) -> String {
-    format!("{MARKER_PREFIX}{session_id}")
-}
-
-fn handoff_key(session_id: Uuid) -> String {
-    format!("{HANDOFF_PREFIX}{session_id}")
-}
-
 pub(super) fn cap_rotation(store: &Store, session_id: Uuid) -> Result<Option<CapRotation>> {
-    store
-        .get_daemon_setting(&marker_key(session_id))?
-        .map(|raw| serde_json::from_str(&raw).map_err(|e| DaemonError::Store(e.to_string())))
-        .transpose()
+    store.get_context_cap_rotation(session_id)
 }
 
 fn put_cap_rotation(store: &Store, session_id: Uuid, record: &CapRotation) -> Result<()> {
-    store.set_daemon_setting(&marker_key(session_id), &serde_json::to_string(record)?)
+    store.set_context_cap_rotation(session_id, record)
 }
 
 /// Write the seat's cap record and, in the same transaction, close the open
@@ -416,6 +353,33 @@ fn uuid_of(text: &str) -> Option<Uuid> {
 /// Reports up the handoff names (#2531).
 const REPORT_UP_LIMIT: usize = 5;
 
+/// Decisions pending on a project manager's ledger (#3240), so a successor
+/// seat starts knowing a ruling is owed: neither the mail list nor the inbox
+/// carries one asked before the rotation.
+fn pending_decisions(
+    store: &Store,
+    session: &Session,
+    seat: CoordinatorSeatV1,
+) -> Result<Vec<rsi_common::daemon_handoff::HandoffDecisionV1>> {
+    let (CoordinatorSeatV1::ProjectManager, Some(project)) = (seat, session.project_id) else {
+        return Ok(Vec::new());
+    };
+    let Some(config) = store.get_harness_manager(project)? else {
+        return Ok(Vec::new());
+    };
+    Ok(store
+        .manager_v2_pending_decision_summaries(&config, None, MAX_ITEMS)?
+        .into_iter()
+        .map(|d| rsi_common::daemon_handoff::HandoffDecisionV1 {
+            key: redact_secrets(&d.key),
+            answerable_by: d.answerable_by.to_owned(),
+            question: one_line(&redact_secrets(&d.question), MAX_EXCERPT_CHARS),
+            asked_at: d.created_at,
+            execution_id: d.execution_id,
+        })
+        .collect())
+}
+
 /// Bounded seat history shared by the recovery queries, as a JSON id list.
 fn handoff_seat_lineage(store: &Store, session: &Session) -> Result<String> {
     let mut seats = vec![session.id];
@@ -517,6 +481,7 @@ pub(super) fn build_handoff(
     measured_tokens: u64,
     cap_tokens: u64,
     now: DateTime<Utc>,
+    harness: Option<&std::path::Path>,
 ) -> Result<DaemonHandoffV1> {
     let id = session.id.to_string();
     let project = session.project_id.map(|p| p.to_string());
@@ -613,19 +578,21 @@ pub(super) fn build_handoff(
             )
         },
     )?;
-    // #2511: only a wake the seat change hands over is "armed" for the
-    // successor. The three manager seats transfer their wakes when the
-    // rotation publishes; an Epic lead's handover retires them.
-    let carried: std::collections::HashSet<Uuid> = match seat {
-        CoordinatorSeatV1::EpicLead { .. } => std::collections::HashSet::new(),
-        _ => store
-            .seat_change_carried_wake_ids(session.id)?
-            .into_iter()
-            .collect(),
-    };
-    let (armed_wakes, not_carried_wakes): (Vec<_>, Vec<_>) = all_wakes
+    // Only obligations transferred at publication are armed for the successor.
+    // Epic lead rotations share manager-seat resume/predicate transfer, while
+    // their terminal watches keep the scheduler's existing lineage routing.
+    let carried: std::collections::HashSet<Uuid> = store
+        .seat_change_carried_wake_ids(session.id)?
         .into_iter()
-        .partition(|wake| carried.contains(&wake.job_id));
+        .collect();
+    let program_guard =
+        crate::store_support::schedule_wake_job::deterministic_program_guard_job_id(session.id);
+    let (armed_wakes, not_carried_wakes): (Vec<_>, Vec<_>) =
+        all_wakes.into_iter().partition(|wake| {
+            carried.contains(&wake.job_id)
+                && (!matches!(seat, CoordinatorSeatV1::EpicLead { .. })
+                    || (wake.wake_mode == "resume" && wake.job_id != program_guard))
+        });
     let running_jobs = string_list(
         store,
         "SELECT id, kind, name, log_path FROM agent_jobs
@@ -648,10 +615,13 @@ pub(super) fn build_handoff(
     )?;
     let queue_entries = string_list(
         store,
-        "SELECT id, source_commit, source_session_id, state FROM rolling_queue_entries
-         WHERE state IN ('queued','admitted','gating')
-           AND (source_session_id=?1 OR (?2 IS NOT NULL AND project_id=?2))
-         ORDER BY sequence LIMIT ?3",
+        "SELECT q.id, q.source_commit, q.source_session_id, q.state, q.issue,
+                COALESCE(i.title, s.title) FROM rolling_queue_entries q
+         LEFT JOIN issues i ON i.project_id=q.project_id AND i.display_number=q.issue
+         LEFT JOIN sessions s ON s.id=q.source_session_id
+         WHERE q.state IN ('queued','admitted','gating')
+           AND (q.source_session_id=?1 OR (?2 IS NOT NULL AND q.project_id=?2))
+         ORDER BY q.sequence LIMIT ?3",
         rusqlite::params![id, project, ITEM_LIMIT],
         |row| {
             let entry = uuid_of(&row.get::<_, String>(0)?);
@@ -659,6 +629,12 @@ pub(super) fn build_handoff(
             Ok(entry
                 .zip(source)
                 .map(|(entry_id, source_session_id)| HandoffQueueEntryV1 {
+                    issue: row.get::<_, Option<i64>>(4).ok().flatten(),
+                    title: row
+                        .get::<_, Option<String>>(5)
+                        .ok()
+                        .flatten()
+                        .map(|title| one_line(&redact_secrets(&title), MAX_EXCERPT_CHARS)),
                     entry_id,
                     source_commit: row.get::<_, String>(1).unwrap_or_default(),
                     source_session_id,
@@ -695,6 +671,7 @@ pub(super) fn build_handoff(
             })
         },
     )?;
+    let pending_decisions = pending_decisions(store, session, seat)?;
     let recent_reports_up = recent_reports_up(store, session)?;
     let predecessor_last_message = store
         .last_assistant_message_event(session.id)?
@@ -724,6 +701,7 @@ pub(super) fn build_handoff(
         cap_tokens,
         generated_at: now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
         playbook: seat.playbook().into(),
+        playbook_location: Some(super::role_playbook::resolve(harness, seat)),
         original_task,
         issues_in_progress,
         worker_parent_epics: worker_parent_epics(store, session)?,
@@ -733,6 +711,11 @@ pub(super) fn build_handoff(
         running_jobs,
         queue_entries,
         open_requests,
+        project_state: match session.project_id {
+            Some(project_id) => store.handoff_project_state(project_id).ok(),
+            None => None,
+        },
+        pending_decisions,
         recent_reports_up,
         predecessor_last_message,
     };
@@ -761,16 +744,14 @@ pub(super) fn cap_handoff_prompt(store: &Store, predecessor: Uuid) -> Result<Opt
     if !cap_rotation(store, predecessor)?.is_some_and(|r| r.state == CapState::Rotating) {
         return Ok(None);
     }
-    Ok(store
-        .get_daemon_setting(&handoff_key(predecessor))?
-        .map(|document| {
-            // #2649: the scope's standing operator directives ride in the
-            // successor's launch prompt verbatim, read from the daemon's state
-            // at launch, not from the handoff text.
-            let directives = super::standing_directives::seat_directives_block(store, predecessor);
-            let health = rolling_health_block(store, predecessor);
-            successor_prompt(&document, directives.as_deref(), health.as_deref())
-        }))
+    Ok(store.get_context_cap_handoff(predecessor)?.map(|document| {
+        // #2649: the scope's standing operator directives ride in the
+        // successor's launch prompt verbatim, read from the daemon's state
+        // at launch, not from the handoff text.
+        let directives = super::standing_directives::seat_directives_block(store, predecessor);
+        let health = rolling_health_block(store, predecessor);
+        successor_prompt(&document, directives.as_deref(), health.as_deref())
+    }))
 }
 
 /// #2743: a project manager's successor starts knowing whether `rolling` is
@@ -814,6 +795,43 @@ pub(super) fn cap_handoff_or_task(
         super::rotation::resolve_rotation_task_query(store, predecessor)?
             .map(|(_, task)| (task, false)),
     )
+}
+
+/// #4041: the launch the project manager seat's policy configures for its
+/// cap-rotation successor, or `None` (the successor copies the predecessor).
+/// Only a live, unrevoked grant of the seat the predecessor holds counts; an
+/// unreadable or invalid choice also falls back to the predecessor's launch.
+pub(super) fn seat_succession_launch(
+    store: &Store,
+    predecessor: &Session,
+) -> Option<ManagerLaunchChoiceV2> {
+    let project = predecessor.project_id?;
+    if capped_seat(store, predecessor.id).ok()? != Some(CoordinatorSeatV1::ProjectManager) {
+        return None;
+    }
+    let grant = store.get_harness_manager_policy(project).ok()??;
+    if grant.revoked {
+        return None;
+    }
+    let launch = grant.policy.succession_launch?;
+    launch.validate().ok()?;
+    Some(launch)
+}
+
+/// #4041: apply a seat's configured launch to the cap-rotation successor row.
+/// The provider and model follow the choice. An unset effort keeps the
+/// predecessor's only while the provider and model are unchanged (an effort is
+/// meaningful per model); otherwise the provider default applies.
+pub(super) fn apply_seat_succession_launch(child: &mut Session, launch: &ManagerLaunchChoiceV2) {
+    let same_model =
+        child.provider == launch.provider && child.model.as_deref() == Some(launch.model.as_str());
+    child.provider = launch.provider;
+    child.model = Some(launch.model.clone());
+    if launch.effort.is_some() {
+        child.effort = launch.effort.clone();
+    } else if !same_model {
+        child.effort = None;
+    }
 }
 
 fn successor_prompt(document: &str, directives: Option<&str>, health: Option<&str>) -> String {
@@ -876,7 +894,7 @@ fn persist_rotating(
         &store.conn,
         rusqlite::TransactionBehavior::Immediate,
     )?;
-    store.set_daemon_setting(&handoff_key(session_id), document)?;
+    store.set_context_cap_handoff(session_id, document)?;
     put_cap_rotation(store, session_id, record)?;
     tx.commit()?;
     Ok(())
@@ -901,19 +919,8 @@ fn settle_global_grant(
 }
 
 fn markers(store: &Store) -> Result<Vec<(Uuid, CapRotation)>> {
-    let keys: Vec<String> = {
-        let mut statement = store
-            .conn
-            .prepare("SELECT key FROM daemon_settings WHERE key LIKE ?1 ORDER BY key")?;
-        statement
-            .query_map([format!("{MARKER_PREFIX}%")], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?
-    };
     let mut out = Vec::new();
-    for key in keys {
-        let Some(session_id) = key.strip_prefix(MARKER_PREFIX).and_then(uuid_of) else {
-            continue;
-        };
+    for session_id in store.context_cap_session_ids()? {
         if let Some(record) = cap_rotation(store, session_id)? {
             out.push((session_id, record));
         }
@@ -1002,6 +1009,24 @@ pub(super) fn plan_cap_actions(
     idle: impl Fn(Uuid) -> bool,
     cap_for: impl Fn(&Session) -> Option<u64>,
 ) -> Result<Vec<CapAction>> {
+    plan_cap_actions_with_root(
+        store,
+        now,
+        boot,
+        idle,
+        cap_for,
+        super::preamble::harness_root(),
+    )
+}
+
+fn plan_cap_actions_with_root(
+    store: &Store,
+    now: DateTime<Utc>,
+    boot: &str,
+    idle: impl Fn(Uuid) -> bool,
+    cap_for: impl Fn(&Session) -> Option<u64>,
+    harness: Option<&std::path::Path>,
+) -> Result<Vec<CapAction>> {
     let mut actions = Vec::new();
     for (session_id, record) in markers(store)? {
         if let Err(error) = plan_record(
@@ -1013,6 +1038,7 @@ pub(super) fn plan_cap_actions(
             session_id,
             record,
             &mut actions,
+            harness,
         ) {
             tracing::warn!(%session_id, %error, "Coordinator context cap planning failed for one seat; the others continue");
         }
@@ -1030,6 +1056,7 @@ fn plan_record(
     session_id: Uuid,
     mut record: CapRotation,
     actions: &mut Vec<CapAction>,
+    harness: Option<&std::path::Path>,
 ) -> Result<()> {
     match record.state {
         CapState::Due => {
@@ -1075,6 +1102,7 @@ fn plan_record(
                 record.measured_tokens,
                 cap,
                 now,
+                harness,
             )?;
             let document = render_validated(&handoff)?;
             let rotation_id = Uuid::new_v4().to_string();
@@ -1262,7 +1290,7 @@ fn plan_record(
                     RotationRequestSuccessor::None => {}
                 }
             }
-            let stored = store.get_daemon_setting(&handoff_key(session_id))?;
+            let stored = store.get_context_cap_handoff(session_id)?;
             match (record.rotation_id.clone(), stored) {
                 (Some(rotation_id), Some(document)) => {
                     record.dispatched_by = Some(boot.into());
@@ -1331,6 +1359,16 @@ pub(super) fn rotation_blocked(store: &Store, session: &Session) -> Result<Optio
     if store.get_operator_pause(session.id)? != OperatorPause::None {
         return Ok(Some("operator_paused"));
     }
+    // #3972: a voluntary `succeed_manager` that is reserved, executing,
+    // established or awaiting cleanup for this seat owns the baton. The cap
+    // rotation stands down (the request returns to due, never a failed
+    // attempt) instead of racing it with a second successor that would take
+    // the custody the queued one needs; once the succession settles blocked
+    // or failed the cap rotation resumes, and once it commits the seat has
+    // passed and the cap record clears.
+    if store.session_has_unresolved_manager_succession(session.id)? {
+        return Ok(Some("manager_succession_pending"));
+    }
     store.automatic_rotation_protection(session.id)
 }
 
@@ -1380,7 +1418,7 @@ pub(super) fn defer_to_due(
 /// # Errors
 /// Store failures reading or recording the cap record.
 pub(super) async fn check_execution_fence(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     active: &tokio::sync::RwLock<std::collections::HashMap<Uuid, super::types::TrackedSession>>,
     completed: &tokio::sync::RwLock<
         std::collections::HashMap<Uuid, super::types::CompletedSession>,
@@ -1838,6 +1876,7 @@ mod tests {
                     cap + 1,
                     cap,
                     at(0),
+                    None,
                 )
                 .unwrap();
                 let mut old = handoff.clone();
@@ -1859,7 +1898,14 @@ mod tests {
             let catalog_bytes = serde_json::to_vec(&catalog).unwrap().len();
             let guidance_bytes = catalog.guidance.len();
             let mut overview = control
-                .agent_manager_overview_value(pm.id, AgentManagerOverviewRequestV1::default())
+                .agent_manager_overview_value(
+                    pm.id,
+                    // The widest form: this measures the worst-case wire width.
+                    AgentManagerOverviewRequestV1 {
+                        detail: rsi_common::manager_node_workspace::ManagerOverviewDetailV1::Full,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .unwrap();
             // The default fleet summary timestamps each read with Utc::now().
@@ -1923,7 +1969,19 @@ mod tests {
             assert_eq!(stable_progress.config.row_version, expected_version);
             stable_progress.config.row_version = 1;
             let stable_progress_bytes = serde_json::to_vec(&stable_progress).unwrap().len();
-            let inbox = store.manager_inbox(pm.id, &Default::default()).unwrap();
+            let mut inbox = store.manager_inbox(pm.id, &Default::default()).unwrap();
+            // The notice's retrieval and settlement times fall back to
+            // Utc::now(), and its stored times come from the wall clock. The
+            // AutoSi wire format drops trailing zero groups, so the byte
+            // count varied by 3 per field between runs. Fix them at maximum
+            // wire width like the progress and fleet times above.
+            for notice in &mut inbox.notices {
+                notice.recorded_at = snapshot_time;
+                notice.queued_at = snapshot_time;
+                notice.delivered_at = notice.delivered_at.map(|_| snapshot_time);
+                notice.retrieved_at = snapshot_time;
+                notice.settled_at = snapshot_time;
+            }
             let inbox_bytes = serde_json::to_vec(&inbox).unwrap().len();
             // One current lead-state notice is generated per appointment;
             // its monotonic sequence also gains a digit at the tenth seat.
@@ -2056,6 +2114,11 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let (lead, epic, child) = lead_fixture(&store);
         let seat = CoordinatorSeatV1::EpicLead { epic_id: epic };
+        let harness = crate::test_support::disk_backed_tempdir("cap-role-playbook");
+        let path = harness.path().join(seat.playbook());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"harness worker contract").unwrap();
+        let location = super::super::role_playbook::resolve(Some(harness.path()), seat);
         assert!(record_cap_crossing(&store, lead.id, seat, 210_000, 200_000, at(0)).unwrap());
         let cap = |_: &Session| Some(200_000);
         // Mid-turn: nothing is sent and the rotation stays due.
@@ -2070,7 +2133,9 @@ mod tests {
         );
         assert!(cap_handoff_prompt(&store, lead.id).unwrap().is_none());
         // Idle: one rotation with a strict-valid handoff.
-        let actions = plan_cap_actions(&store, at(2), BOOT, |_| true, cap).unwrap();
+        let actions =
+            plan_cap_actions_with_root(&store, at(2), BOOT, |_| true, cap, Some(harness.path()))
+                .unwrap();
         let [
             CapAction::Rotate {
                 session_id,
@@ -2093,9 +2158,14 @@ mod tests {
         assert_eq!(handoff.live_children.len(), 1);
         assert_eq!(handoff.live_children[0].session_id, child);
         assert_eq!(handoff.original_task, lead.query);
+        assert_eq!(handoff.playbook, "docs/agents/worker-contract.md");
+        assert_eq!(handoff.playbook_location.as_ref(), Some(&location));
+        assert!(document.contains(&location.reference()));
         assert_eq!(
-            handoff.playbook,
-            "thoughts/shared/manager/worker-contract.md"
+            handoff.playbook_location,
+            Some(rsi_common::daemon_handoff::PlaybookLocationV1::Resolved {
+                path: path.canonicalize().unwrap().to_str().unwrap().into(),
+            })
         );
         let record = cap_rotation(&store, lead.id).unwrap().unwrap();
         assert_eq!(record.state, CapState::Rotating);
@@ -2113,6 +2183,113 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn idle_boundary_persists_unavailable_playbook_and_continues_rotation() {
+        use rsi_common::daemon_handoff::{PlaybookLocationV1, PlaybookUnavailableReasonV1};
+        let store = Store::open_in_memory().unwrap();
+        let (lead, epic, _) = lead_fixture(&store);
+        let seat = CoordinatorSeatV1::EpicLead { epic_id: epic };
+        record_cap_crossing(&store, lead.id, seat, 210_000, 200_000, at(0)).unwrap();
+        let actions =
+            plan_cap_actions_with_root(&store, at(2), BOOT, |_| true, |_| Some(200_000), None)
+                .unwrap();
+        let [CapAction::Rotate { document, .. }] = actions.as_slice() else {
+            panic!("rotation expected");
+        };
+        let handoff = rsi_common::daemon_handoff::parse_strict(document).unwrap();
+        assert_eq!(
+            handoff.playbook_location,
+            Some(PlaybookLocationV1::Unavailable {
+                reason: PlaybookUnavailableReasonV1::HarnessUnavailable,
+            })
+        );
+        assert_eq!(
+            cap_rotation(&store, lead.id).unwrap().unwrap().state,
+            CapState::Rotating
+        );
+        assert!(
+            cap_handoff_prompt(&store, lead.id)
+                .unwrap()
+                .unwrap()
+                .contains("Use the binary-shipped role guidance")
+        );
+    }
+
+    /// #3240: a pending decision rides the project manager's cap handoff, so
+    /// the successor seat starts knowing a ruling is owed (it was in neither
+    /// the mail list nor the inbox). Another seat kind carries none.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn pending_decisions_ride_the_project_manager_handoff_3240() {
+        let store = Store::open_in_memory().unwrap();
+        let project = project(&store);
+        let pm = session(&store, Some(project), None);
+        let epic = session(&store, Some(project), None);
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id: pm.id,
+                    epic_ids: None,
+                    group_ids: vec![],
+                    expected_row_version: 0,
+                },
+            )
+            .unwrap();
+        let config = store.get_harness_manager(project).unwrap().unwrap();
+        let key = "topology:8c16ccf5-0000-0000-0000-000000000000:review:1:1";
+        store
+            .manager_v2_put_record(
+                &config,
+                "decision",
+                key,
+                Some(epic.id),
+                0,
+                &serde_json::json!({
+                    "key": key, "epic_id": epic.id, "status": "pending",
+                    "question": "Review ran out of rounds. Accept, round or stop?\nMore.",
+                    "asked_by": {"kind": "topology_executor"},
+                }),
+            )
+            .unwrap();
+
+        let handoff = build_handoff(
+            &store,
+            &pm,
+            CoordinatorSeatV1::ProjectManager,
+            210_000,
+            200_000,
+            at(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(handoff.pending_decisions.len(), 1, "{handoff:?}");
+        let decision = &handoff.pending_decisions[0];
+        assert_eq!(decision.key, key);
+        assert_eq!(decision.answerable_by, "manager");
+        assert_eq!(
+            decision.question,
+            "Review ran out of rounds. Accept, round or stop?"
+        );
+        let document = render_validated(&handoff).unwrap();
+        // The Typed State (what a successor parses) carries it.
+        let parsed = rsi_common::daemon_handoff::parse_strict(&document).unwrap();
+        assert_eq!(parsed.pending_decisions, handoff.pending_decisions);
+
+        let lead_handoff = build_handoff(
+            &store,
+            &epic,
+            CoordinatorSeatV1::EpicLead { epic_id: epic.id },
+            210_000,
+            200_000,
+            at(0),
+            None,
+        )
+        .unwrap();
+        assert!(lead_handoff.pending_decisions.is_empty());
     }
 
     /// #2743: a project manager's cap successor starts knowing that rolling is
@@ -2184,6 +2361,66 @@ mod tests {
         assert!(after.contains("open qa Issues: none"), "{after}");
     }
 
+    /// #3386: a project manager's cap successor starts with its project's
+    /// headline counts, so its first turn needs no overview read. Another
+    /// project's seat sees its own counts.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn project_state_reaches_the_cap_successor_prompt_3386() {
+        let store = Store::open_in_memory().unwrap();
+        let project = project(&store);
+        let other_project = self::project(&store);
+        let pm = session(&store, Some(project), None);
+        let other_pm = session(&store, Some(other_project), None);
+        for (project, seat) in [(project, &pm), (other_project, &other_pm)] {
+            store
+                .configure_harness_manager(
+                    &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                        project_id: project,
+                        session_id: seat.id,
+                        epic_ids: None,
+                        group_ids: vec![],
+                        expected_row_version: 0,
+                    },
+                )
+                .unwrap();
+        }
+        for title in ["first open Issue", "second open Issue"] {
+            store
+                .create_issue(&rsi_common::types::NewIssue {
+                    project_id: project,
+                    title: title.into(),
+                    body: String::new(),
+                    priority: Some(2),
+                    labels: vec![],
+                    created_by_session_id: None,
+                    assignee: None,
+                    idea_id: None,
+                    source_event_id: None,
+                    source_finding_ref: None,
+                })
+                .unwrap();
+        }
+        let seat = CoordinatorSeatV1::ProjectManager;
+        for manager in [&pm, &other_pm] {
+            assert!(
+                record_cap_crossing(&store, manager.id, seat, 210_000, 200_000, at(0)).unwrap()
+            );
+        }
+        plan_cap_actions(&store, at(2), BOOT, |_| true, |_: &Session| Some(200_000)).unwrap();
+
+        let prompt = cap_handoff_prompt(&store, pm.id).unwrap().unwrap();
+        assert!(
+            prompt.contains("Project state at handoff: 2 open and 0 in-progress Issues"),
+            "{prompt}"
+        );
+        let other = cap_handoff_prompt(&store, other_pm.id).unwrap().unwrap();
+        assert!(
+            other.contains("Project state at handoff: 0 open and 0 in-progress Issues"),
+            "{other}"
+        );
+    }
+
     /// #2649: a directive set on the project's manager scope reaches the
     /// successor of a context-cap rotation in its launch prompt, read from the
     /// scope's own state, with no handoff text involved. It outlives the
@@ -2224,6 +2461,7 @@ mod tests {
                     },
                     text,
                     provenance: None,
+                    kind: rsi_common::standing_directives::StandingDirectiveKindV1::OperatorRelay,
                     expires_in_secs: Some(8 * 3600),
                     idempotency_key: "overnight",
                 },
@@ -2258,16 +2496,13 @@ mod tests {
 
         let prompt = cap_handoff_prompt(&store, pm.id).unwrap().unwrap();
         assert!(prompt.contains(text), "verbatim, every term: {prompt}");
-        assert!(
-            prompt.contains("## Standing operator directives"),
-            "{prompt}"
-        );
+        assert!(prompt.contains("## Standing directives"), "{prompt}");
         assert!(prompt.contains(&directive.id.to_string()), "{prompt}");
         assert!(prompt.contains("by operator"), "{prompt}");
         assert!(prompt.contains("expires"), "{prompt}");
         let other = cap_handoff_prompt(&store, other_pm.id).unwrap().unwrap();
         assert!(!other.contains(text), "another scope's seat never gets it");
-        assert!(!other.contains("Standing operator directives"));
+        assert!(!other.contains("## Standing directives"));
 
         // A directive that expired or was cleared is no longer delivered.
         let prompt_after = |when| {
@@ -2278,6 +2513,76 @@ mod tests {
         assert!(
             prompt_after(Utc::now() + Duration::hours(9)).is_none(),
             "expired"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn handoff_queue_lines_include_source_issue_title() {
+        use crate::store::rolling_queue::NewQueueEntry;
+        use rsi_common::rolling_queue::RollingQueueBinding;
+        let store = Store::open_in_memory().unwrap();
+        let project = project(&store);
+        let pm = session(&store, Some(project), None);
+        let issue = store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: project,
+                title: "Compact queue handoff".into(),
+                body: String::new(),
+                priority: None,
+                labels: vec![],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap();
+        let (entry, _) = store
+            .enqueue_rolling_queue_source(
+                &NewQueueEntry {
+                    project_id: Some(project),
+                    repo_path: "/tmp/repo".into(),
+                    source_commit: "a".repeat(40),
+                    source_session_id: pm.id,
+                    owner_epic_id: None,
+                    binding: RollingQueueBinding::Unbound,
+                    work_key: None,
+                    migration_version: None,
+                    hot_files: vec![],
+                    test_filters: vec![],
+                    fixes_tests: vec![],
+                    idempotency_key: "handoff-queue".into(),
+                },
+                at(0),
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE rolling_queue_entries SET issue=?2 WHERE id=?1",
+                rusqlite::params![entry.id.to_string(), issue.display_number],
+            )
+            .unwrap();
+        let handoff = build_handoff(
+            &store,
+            &pm,
+            CoordinatorSeatV1::ProjectManager,
+            210_000,
+            200_000,
+            at(0),
+            None,
+        )
+        .unwrap();
+        let document = render_validated(&handoff).unwrap();
+        assert!(document.contains(&format!(
+            "- {} queued aaaaaaaaaaaa #{} \"Compact queue handoff\"",
+            entry.id, issue.display_number
+        )));
+        assert_eq!(handoff.queue_entries[0].issue, Some(issue.display_number));
+        assert_eq!(
+            handoff.queue_entries[0].title.as_deref(),
+            Some("Compact queue handoff")
         );
     }
 
@@ -2336,6 +2641,7 @@ mod tests {
             210_000,
             200_000,
             at(0),
+            None,
         )
         .unwrap();
         let document = render_validated(&handoff).unwrap();
@@ -2435,7 +2741,8 @@ mod tests {
 
         let session_now = store.get_session(lead.id).unwrap().unwrap();
         let seat = CoordinatorSeatV1::EpicLead { epic_id: epic };
-        let handoff = build_handoff(&store, &session_now, seat, 210_000, 200_000, at(0)).unwrap();
+        let handoff =
+            build_handoff(&store, &session_now, seat, 210_000, 200_000, at(0), None).unwrap();
 
         let keys: Vec<_> = handoff
             .recent_reports_up
@@ -2481,6 +2788,7 @@ mod tests {
             210_000,
             200_000,
             at(0),
+            None,
         )
         .unwrap();
         assert!(quiet.recent_reports_up.is_empty());
@@ -2856,6 +3164,46 @@ mod tests {
         assert_eq!(mail_to(&store, lead.id).len(), 1);
     }
 
+    /// #3340: a topology node session that crosses the worker cap is told its
+    /// execution takes the baton line as the node outcome and continues the
+    /// node, and its launcher is not told to relaunch it by hand.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn topology_node_worker_baton_names_the_node_continuation() {
+        let store = Store::open_in_memory().unwrap();
+        let (lead, _epic, child) = lead_fixture(&store);
+        bind_topology_node(&store, child);
+        let child = store.get_session(child).unwrap().unwrap();
+        assert_eq!(
+            evaluate_cap_crossing(&store, &child, 650_000, None, Some(600_000), at(1)).unwrap(),
+            CapCrossing::WorkerBaton(true)
+        );
+        assert!(store.worker_baton(child.id).unwrap().unwrap().topology_node);
+        let baton = mail_to(&store, child.id);
+        assert_eq!(baton.len(), 1);
+        for expected in [
+            "PIPELINE HANDOFF — BATON <sha>",
+            "You are a topology node",
+            "relaunches this node from it",
+            "whose last line is `Friction: none | #N[, #M] |",
+        ] {
+            assert!(baton[0].1.contains(expected), "{expected}: {}", baton[0].1);
+        }
+        let notice = mail_to(&store, lead.id);
+        assert_eq!(notice.len(), 1);
+        assert!(
+            notice[0].1.contains("\"topology_node\":true"),
+            "{}",
+            notice[0].1
+        );
+        assert!(
+            notice[0].1.contains("topology node session"),
+            "{}",
+            notice[0].1
+        );
+        assert!(!notice[0].1.contains("continue_from"), "{}", notice[0].1);
+    }
+
     /// #1254: the worker cap defaults to 60% of the known window; `1..=100`
     /// is a percentage, larger values are tokens, `0` is off, and overrides
     /// follow the coordinator cap's precedence.
@@ -3167,10 +3515,7 @@ mod tests {
             cap_rotation(&store, lead.id).unwrap().unwrap().state,
             CapState::Due
         );
-        assert_eq!(
-            store.get_daemon_setting(&handoff_key(lead.id)).unwrap(),
-            None
-        );
+        assert_eq!(store.get_context_cap_handoff(lead.id).unwrap(), None);
         store
             .conn
             .execute_batch("DROP TRIGGER crash_before_marker;")
@@ -3194,10 +3539,7 @@ mod tests {
         assert!(record.fence.is_some());
         assert_eq!(record.fence, idle_fence(&store, lead.id).unwrap());
         assert_eq!(
-            store
-                .get_daemon_setting(&handoff_key(lead.id))
-                .unwrap()
-                .as_deref(),
+            store.get_context_cap_handoff(lead.id).unwrap().as_deref(),
             Some(document.as_str())
         );
     }
@@ -3608,10 +3950,7 @@ mod tests {
         record_cap_crossing(&store, lead.id, seat, 210_000, 200_000, at(0)).unwrap();
         plan_cap_actions(&store, at(1), BOOT, |_| true, |_: &Session| Some(200_000)).unwrap();
 
-        let stored = store
-            .get_daemon_setting(&handoff_key(lead.id))
-            .unwrap()
-            .unwrap();
+        let stored = store.get_context_cap_handoff(lead.id).unwrap().unwrap();
         let prompt = cap_handoff_prompt(&store, lead.id).unwrap().unwrap();
         for text in [&stored, &prompt] {
             for secret in [KEY, TOKEN, MAIL_SECRET] {
@@ -3712,6 +4051,93 @@ mod tests {
         );
     }
 
+    /// #3972: a voluntary succession that is queued for the seat owns the
+    /// baton. The cap rotation neither plans nor passes the execution fence
+    /// while it is unresolved (the request returns to due, not a failed
+    /// attempt), and it resumes once the succession settles blocked.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn queued_manager_succession_stands_the_cap_rotation_down_3972() {
+        let cap = |_: &Session| Some(200_000);
+        let store = Store::open_in_memory().unwrap();
+        let (lead, epic, _) = lead_fixture(&store);
+        let seat = CoordinatorSeatV1::EpicLead { epic_id: epic };
+        record_cap_crossing(&store, lead.id, seat, 210_000, 200_000, at(0)).unwrap();
+        // The race: the cap request is already planned (Rotating) when the
+        // seat's own succession is queued.
+        let actions = plan_cap_actions(&store, at(1), BOOT, |_| true, cap).unwrap();
+        assert_eq!(actions.len(), 1);
+        store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let operation = Uuid::new_v4().to_string();
+        let insert = |state: &str| {
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO manager_root_successions(operation_id,project_id,manager_session_id,predecessor_session_id,candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,policy_version,authority_epoch,frozen_json,state,row_version,created_at,updated_at)
+                     VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,'{}',?7,1,'2026-10-24T00:06:21.000000000Z','2026-10-24T00:06:21.000000000Z')",
+                    rusqlite::params![
+                        operation,
+                        lead.project_id.unwrap().to_string(),
+                        lead.id.to_string(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        state
+                    ],
+                )
+                .unwrap();
+        };
+        insert("reserved");
+        let durable = store.get_session(lead.id).unwrap().unwrap();
+        assert_eq!(
+            rotation_blocked(&store, &durable).unwrap(),
+            Some("manager_succession_pending")
+        );
+        // Planning a fresh request waits too.
+        let other = Store::open_in_memory().unwrap();
+        let (other_lead, other_epic, _) = lead_fixture(&other);
+        record_cap_crossing(
+            &other,
+            other_lead.id,
+            CoordinatorSeatV1::EpicLead {
+                epic_id: other_epic,
+            },
+            210_000,
+            200_000,
+            at(0),
+        )
+        .unwrap();
+        other.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        other
+            .conn
+            .execute(
+                "INSERT INTO manager_root_successions(operation_id,project_id,manager_session_id,predecessor_session_id,candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,policy_version,authority_epoch,frozen_json,state,row_version,created_at,updated_at)
+                 VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,'{}','executing',1,'2026-10-24T00:06:21.000000000Z','2026-10-24T00:06:21.000000000Z')",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    other_lead.project_id.unwrap().to_string(),
+                    other_lead.id.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(
+            plan_cap_actions(&other, at(1), BOOT, |_| true, cap)
+                .unwrap()
+                .is_empty(),
+            "no cap request is planned while the seat's succession is in flight"
+        );
+        assert_eq!(
+            cap_rotation(&other, other_lead.id).unwrap().unwrap().state,
+            CapState::Due
+        );
+        // The settled-blocked succession no longer holds the baton.
+        insert("blocked");
+        assert_eq!(rotation_blocked(&store, &durable).unwrap(), None);
+    }
+
     /// One seat's planning failure must not drop another seat's planned
     /// request (the pass used to abort on the first error).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -3776,8 +4202,9 @@ mod tests {
         };
         let net = wake("resume", "gm-safety-net");
         let fresh = wake("fresh", "post-terminal");
-        let build =
-            |seat_kind| build_handoff(&store, &seat, seat_kind, 210_000, 200_000, at(0)).unwrap();
+        let build = |seat_kind| {
+            build_handoff(&store, &seat, seat_kind, 210_000, 200_000, at(0), None).unwrap()
+        };
 
         let manager = build(CoordinatorSeatV1::GlobalManager);
         assert_eq!(
@@ -3802,11 +4229,94 @@ mod tests {
             manager
         );
 
-        // An Epic lead's handover retires its wakes: none is carried.
+        // An Epic lead carries its own resume obligations through the same path.
         let lead = build(CoordinatorSeatV1::EpicLead {
             epic_id: Uuid::new_v4(),
         });
-        assert!(lead.armed_wakes.is_empty());
-        assert_eq!(lead.not_carried_wakes.len(), 2);
+        assert_eq!(lead.armed_wakes, manager.armed_wakes);
+        assert_eq!(lead.not_carried_wakes, manager.not_carried_wakes);
+    }
+
+    /// #4041: the cap rotation's successor takes the seat policy's configured
+    /// launch (provider, model, effort) and otherwise copies the predecessor.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[test]
+    fn cap_successor_takes_the_seats_configured_launch_4041() {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerLaunchChoiceV2, ManagerPolicyV2,
+        };
+        use rsi_common::types::SessionProvider;
+        let store = Store::open_in_memory().unwrap();
+        let project = project(&store);
+        let pm = session_with(&store, Some(project), None, |pm| {
+            pm.provider = SessionProvider::Claude;
+            pm.model = Some("claude-opus-5-5".into());
+            pm.effort = Some("xhigh".into());
+        });
+        let scope = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: project,
+                session_id: pm.id,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: 0,
+            })
+            .unwrap();
+        let save = |version: i64, launch: Option<ManagerLaunchChoiceV2>| {
+            store
+                .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: project,
+                    expected_scope_version: scope.row_version,
+                    expected_policy_version: version,
+                    idempotency_key: format!("succession-launch-{version}"),
+                    policy: ManagerPolicyV2 {
+                        succession_launch: launch,
+                        ..Default::default()
+                    },
+                })
+                .unwrap()
+        };
+        let launch = |effort: Option<&str>| ManagerLaunchChoiceV2 {
+            provider: SessionProvider::Claude,
+            model: "claude-opus-5-5".into(),
+            effort: effort.map(Into::into),
+        };
+
+        // No configured launch: the successor copies the predecessor.
+        let saved = save(0, None);
+        assert_eq!(seat_succession_launch(&store, &pm), None);
+        let mut child = pm.clone();
+        child.effort = pm.effort.clone();
+        assert_eq!(child.effort.as_deref(), Some("xhigh"));
+
+        // A configured launch with an effort overrides the predecessor's.
+        save(saved.row_version, Some(launch(Some("high"))));
+        let configured = seat_succession_launch(&store, &pm).expect("configured launch");
+        apply_seat_succession_launch(&mut child, &configured);
+        assert_eq!(child.provider, SessionProvider::Claude);
+        assert_eq!(child.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(child.effort.as_deref(), Some("high"));
+
+        // An unset effort keeps the predecessor's only for the same model.
+        let mut same = pm.clone();
+        apply_seat_succession_launch(&mut same, &launch(None));
+        assert_eq!(same.effort.as_deref(), Some("xhigh"));
+        let mut other = pm.clone();
+        apply_seat_succession_launch(
+            &mut other,
+            &ManagerLaunchChoiceV2 {
+                provider: SessionProvider::Codex,
+                model: "gpt-6-astra".into(),
+                effort: None,
+            },
+        );
+        assert_eq!(other.provider, SessionProvider::Codex);
+        assert_eq!(other.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(other.effort, None);
+
+        // A session that does not hold the project manager seat is untouched.
+        let stranger = session(&store, Some(project), None);
+        assert_eq!(seat_succession_launch(&store, &stranger), None);
     }
 }

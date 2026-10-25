@@ -2,6 +2,7 @@
 // (crates/rsi/src/overlay/esp_square.rs and ui/overlay/esp_square.rs) as pure
 // state. The random target and the clock are injected so the rules are
 // testable; esp.ts draws it and saves a finished game with SaveEspGame.
+import { type Hex, contrastRatio, readableOn } from './theme-model.js';
 
 export const ROUNDS = 12;
 export const FLASH_MS = 300;
@@ -9,10 +10,33 @@ export const SAME_KEY_DEBOUNCE_MS = 600;
 
 /** Square labels in key position: u i o / j k l / m , . */
 export const SQUARE_KEYS = ['u', 'i', 'o', 'j', 'k', 'l', 'm', ',', '.'] as const;
-/** The TUI's fixed feedback colours (theme-independent on purpose, ui/overlay/esp_square.rs). */
+/**
+ * The TUI's feedback hues (ui/overlay/esp_square.rs). They are the hue families, not the drawn colours: on a light
+ * canvas yellow is 1.08:1, so the desktop draws each through `squareColorsOn` (#301).
+ */
 export const SQUARE_COLORS = ['#538fff', '#b431e6', '#f7ed65', '#28d2ab', '#fca207', '#f6ccf9', '#00ffff', '#268189', '#2d1a77'] as const;
 export const HIT_COLOR = '#32cd32';
 export const MISS_COLOR = '#dc3232';
+/** A glyph is 16px bold text, so it clears the 4.5:1 text bar (its border, the same colour, clears 3:1 with it). */
+export const GLYPH_MIN_CONTRAST = 4.5;
+
+/**
+ * The nine square colours drawn on `surface` (the card): each TUI hue moved toward white on a dark surface or toward
+ * black on a light one by the smallest step that reaches GLYPH_MIN_CONTRAST, so the hue family stays and the legend
+ * still reads. A hue the move cannot save falls back to `text`, the theme's own text colour. The key letter in each
+ * square, not its colour, says which square it is, so colour never carries meaning alone.
+ */
+export function squareColorsOn(surface: Hex, text: Hex): string[] {
+  return SQUARE_COLORS.map((c) => {
+    const lifted = readableOn(c, [surface], GLYPH_MIN_CONTRAST);
+    return contrastRatio(lifted, surface) >= GLYPH_MIN_CONTRAST ? lifted : text;
+  });
+}
+
+/** The text on a hit (green) or miss (red) flash: black and white clear 4.5:1 on their fills (#32cd32, #dc3232). */
+export function flashTextOn(hit: boolean): Hex {
+  return hit ? '#000000' : '#ffffff';
+}
 
 export interface RoundDetail { pick: number; target: number; guessMs: number }
 

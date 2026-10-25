@@ -273,7 +273,16 @@ executor: with `topology_executor_enabled=false` a live run of one is refused
 | Session nodes of an agent execution in parallel | 3 | |
 
 A queued landing is not bounded by the node wall time: the queue has its own
-gate budget and always settles an entry.
+gate budget. `publication_unknown` ("landing interrupted") is infrastructure
+loss: the land node keeps the same waiting attempt and queue entry, without
+running repair or enqueuing a duplicate. The queue fetches rolling and checks
+source ancestry after a restart: a proven ancestor settles as landed; otherwise
+it re-queues that entry at its original FIFO position for another gate. An
+unreadable fetch or ancestry result never counts as landed. Recovery is
+forward-only: legacy terminal rows, including `failed/publication_unknown`,
+remain immutable. Those legacy land attempts resolve landed only after a
+successful fetch proves ancestry; otherwise they follow the existing refusal
+and repair path. Actual test, conflict and policy refusals still route to repair.
 
 Loop termination at run time is the executor's: `until`, per-node
 `max_iterations`, or a lead `/halt`

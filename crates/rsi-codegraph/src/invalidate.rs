@@ -2,6 +2,7 @@
 //! rerun from raw facts on every update so deleted targets cannot leave edges.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 
 use crate::cargo_metadata::{CargoWorkspace, apply_workspace};
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
     extract::extract_file,
     resolve::resolve_workspace,
     staged::{MAX_STAGED_FILE_BYTES, MAX_STAGED_SOURCE_BYTES, PerFileFacts},
+    stream::{PassFacts, StreamedFacts},
     validate_path,
 };
 
@@ -30,11 +32,99 @@ pub struct CorpusUpdate {
     pub invalidated_owners: BTreeSet<String>,
 }
 
-#[derive(Debug, Default)]
+/// Heap one indexing pass holds per byte of Rust source: every file's facts
+/// are alive at once while references resolve. Measured on this repository's
+/// own crates (#3491: 0.8 MB of `.rs` peaked at 11.5x). Rounded up.
+pub const RUST_FACT_HEAP_PER_SOURCE_BYTE: usize = 12;
+
+/// The same for every other indexed file (markdown, TOML): 3.6x measured on
+/// 60 MB of markdown, rounded up.
+pub const OTHER_FACT_HEAP_PER_SOURCE_BYTE: usize = 4;
+
+/// Estimated heap of the facts of one file of `len` bytes at `path`.
+#[must_use]
+pub fn estimated_fact_heap_bytes(path: &str, len: usize) -> usize {
+    let factor = if path.ends_with(".rs") {
+        RUST_FACT_HEAP_PER_SOURCE_BYTE
+    } else {
+        OTHER_FACT_HEAP_PER_SOURCE_BYTE
+    };
+    len.saturating_mul(factor)
+}
+
+/// Estimated heap of one copy of a corpus's facts that the cache may keep
+/// between passes. A larger corpus is re-extracted on the next pass instead, so
+/// a pass holds one copy of its facts rather than the cache, a clone and the
+/// resolved copy at once (#3491: a hub start with a 193 MB checkout reached
+/// 2.8 GB resident). With retention the pass holds two copies, so this is half
+/// the heap a retaining pass may use.
+pub const DEFAULT_RETAIN_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// Heap a streamed pass holds per byte of Rust source (#3491): the resolver's
+/// nodes, syntax scope and working tables, with everything else spilled.
+/// Measured on this repository's own checkout: 65 MB of Rust inside 127 MB of source
+/// peaked at 166 MB live in all (2.6x its Rust bytes), and 3.7x on a small fixture
+/// where one file's extraction transient dominates; rounded up past both.
+pub const STREAMED_RUST_HEAP_PER_SOURCE_BYTE: usize = 4;
+
+/// The same for every other file: only its source bytes, which the caller holds
+/// until the file is extracted.
+pub const STREAMED_OTHER_HEAP_PER_SOURCE_BYTE: usize = 1;
+
+/// Estimated heap of one file in a streamed pass.
+#[must_use]
+pub fn estimated_streamed_heap_bytes(path: &str, len: usize) -> usize {
+    let factor = if path.ends_with(".rs") {
+        STREAMED_RUST_HEAP_PER_SOURCE_BYTE
+    } else {
+        STREAMED_OTHER_HEAP_PER_SOURCE_BYTE
+    };
+    len.saturating_mul(factor)
+}
+
+/// Estimated heap of a whole pass given both per-file sums: a corpus within the
+/// default retention budget is held in memory, a larger one is streamed.
+#[must_use]
+pub const fn estimated_pass_heap_bytes(in_memory: usize, streamed: usize) -> usize {
+    if in_memory <= DEFAULT_RETAIN_BUDGET_BYTES {
+        in_memory
+    } else {
+        streamed
+    }
+}
+
+/// A copy of `facts` that does not clone the source bytes; `bytes` replaces them.
+fn copy_with_bytes(facts: &PerFileFacts, bytes: Vec<u8>) -> PerFileFacts {
+    PerFileFacts {
+        file: SourceFile {
+            relative_path: facts.file.relative_path.clone(),
+            bytes,
+        },
+        nodes: facts.nodes.clone(),
+        relations: facts.relations.clone(),
+        unresolved_references: facts.unresolved_references.clone(),
+        diagnostic: facts.diagnostic.clone(),
+        scope: facts.scope.clone(),
+    }
+}
+
+#[derive(Debug)]
 pub struct ExtractionCache {
+    /// Digest of the exact bytes of every owner in the last complete pass. Always
+    /// kept: it decides which owners changed.
+    digests: BTreeMap<String, String>,
+    /// Unresolved facts per owner, kept only while the estimated heap is within
+    /// `retain_budget_bytes`.
     raw: BTreeMap<String, PerFileFacts>,
+    retain_budget_bytes: usize,
     previous_inventory: Option<SourceInventory>,
     previous_cargo_metadata_digest: Option<String>,
+}
+
+impl Default for ExtractionCache {
+    fn default() -> Self {
+        Self::with_retain_budget(DEFAULT_RETAIN_BUDGET_BYTES)
+    }
 }
 
 impl ExtractionCache {
@@ -43,11 +133,27 @@ impl ExtractionCache {
         Self::default()
     }
 
+    /// A cache that keeps raw facts between passes only while one copy of the
+    /// corpus's facts (see [`estimated_fact_heap_bytes`]) fits in
+    /// `retain_budget_bytes`; zero keeps none.
+    #[must_use]
+    pub fn with_retain_budget(retain_budget_bytes: usize) -> Self {
+        Self {
+            digests: BTreeMap::new(),
+            raw: BTreeMap::new(),
+            retain_budget_bytes,
+            previous_inventory: None,
+            previous_cargo_metadata_digest: None,
+        }
+    }
+
     /// Update from a complete owner inventory. Unchanged byte versions reuse
-    /// raw parser facts; all references are resolved against the new corpus.
+    /// raw parser facts when they are retained; all references are resolved
+    /// against the new corpus.
     ///
     /// # Errors
-    /// Duplicate paths and staged inventory bounds are rejected.
+    /// Duplicate paths and staged inventory bounds are rejected. A rejected
+    /// inventory also empties the retained facts, so the next pass extracts again.
     pub fn update(&mut self, files: Vec<SourceFile>) -> Result<CorpusUpdate> {
         self.update_resolved(files, None)
     }
@@ -63,9 +169,20 @@ impl ExtractionCache {
                 maximum: crate::staged::MAX_STAGED_FILES,
             });
         }
+        let retain = files
+            .iter()
+            .map(|file| estimated_fact_heap_bytes(&file.relative_path, file.bytes.len()))
+            .fold(0usize, usize::saturating_add)
+            <= self.retain_budget_bytes;
+        // Take the retained facts so a reused entry moves instead of being
+        // cloned next to its source.
+        let mut previous_raw = std::mem::take(&mut self.raw);
+        let previous_digests = std::mem::take(&mut self.digests);
+        let mut next_digests = BTreeMap::new();
         let mut next_raw = BTreeMap::new();
         let mut changed = BTreeSet::new();
         let mut source_bytes = 0usize;
+        let mut facts = Vec::with_capacity(files.len());
         for file in files {
             let path = file.relative_path.clone();
             validate_path(&path)?;
@@ -82,30 +199,39 @@ impl ExtractionCache {
                     maximum: MAX_STAGED_SOURCE_BYTES,
                 });
             }
-            if next_raw.contains_key(&path) {
+            if next_digests.contains_key(&path) {
                 return Err(CodegraphError::InvalidInput(format!(
                     "duplicate source owner: {path}"
                 )));
             }
             let digest = blake3::hash(&file.bytes).to_hex().to_string();
-            let previous = self.raw.get(&path);
-            let facts = previous
-                .filter(|previous| blake3::hash(&previous.file.bytes).to_hex().as_str() == digest)
-                .map_or_else(
-                    || {
-                        changed.insert(path.clone());
-                        extract_file(file)
-                    },
-                    Clone::clone,
-                );
-            next_raw.insert(path, facts);
+            let unchanged = previous_digests.get(&path) == Some(&digest);
+            if !unchanged {
+                changed.insert(path.clone());
+            }
+            let cached = previous_raw.remove(&path).filter(|_| unchanged);
+            let resolved_input = if let Some(cached) = cached {
+                let current = copy_with_bytes(&cached, file.bytes);
+                if retain {
+                    next_raw.insert(path.clone(), cached);
+                }
+                current
+            } else {
+                let extracted = extract_file(file);
+                if retain {
+                    next_raw.insert(path.clone(), copy_with_bytes(&extracted, Vec::new()));
+                }
+                extracted
+            };
+            next_digests.insert(path, digest);
+            facts.push(resolved_input);
         }
-        for path in self.raw.keys() {
-            if !next_raw.contains_key(path) {
+        for path in previous_digests.keys() {
+            if !next_digests.contains_key(path) {
                 changed.insert(path.clone());
             }
         }
-        let mut facts = next_raw.values().cloned().collect::<Vec<_>>();
+        drop(previous_raw);
         resolve_workspace(&mut facts, cargo);
         let inventory = SourceInventory::from_facts(&facts);
         let mut invalidated = changed.clone();
@@ -113,6 +239,7 @@ impl ExtractionCache {
             propagate(&previous.dependencies, &mut invalidated);
         }
         propagate(&inventory.dependencies, &mut invalidated);
+        self.digests = next_digests;
         self.raw = next_raw;
         self.previous_inventory = Some(inventory.clone());
         Ok(CorpusUpdate {
@@ -121,6 +248,13 @@ impl ExtractionCache {
             changed_owners: changed,
             invalidated_owners: invalidated,
         })
+    }
+
+    /// Whether the last pass kept raw facts for reuse (false when the corpus
+    /// exceeded the retention budget).
+    #[must_use]
+    pub fn retains_raw_facts(&self) -> bool {
+        !self.raw.is_empty()
     }
 
     /// Resolve and inventory Cargo facts together with source facts. A changed
@@ -158,6 +292,129 @@ impl ExtractionCache {
         self.previous_inventory = Some(update.inventory.clone());
         self.previous_cargo_metadata_digest = Some(metadata.metadata_digest.clone());
         Ok(update)
+    }
+}
+
+/// The result of [`ExtractionCache::update_pass`]: the pass's facts and the
+/// owners whose source bytes changed since the previous pass.
+pub struct PassUpdate {
+    pub facts: PassFacts,
+    pub changed_owners: BTreeSet<String>,
+}
+
+impl ExtractionCache {
+    /// Update from a complete owner inventory for one index pass. A corpus whose
+    /// estimated facts fit the retention budget is held in memory and reused
+    /// incrementally; a larger one is streamed (see [`crate::stream`]): the
+    /// facts spill to an unlinked file in `spill_dir` and flow back one file at
+    /// a time, so the pass holds the resolver's inputs rather than the corpus
+    /// (#3491). Both return the same final facts. A streamed pass keeps only
+    /// digests, so the next pass extracts again, and computes no invalidation
+    /// closure (a pass never read it).
+    ///
+    /// # Errors
+    /// The inventory bounds of [`Self::update`], or a spill failure.
+    pub fn update_pass(
+        &mut self,
+        files: Vec<SourceFile>,
+        cargo: Option<&CargoWorkspace>,
+        spill_dir: &Path,
+    ) -> Result<PassUpdate> {
+        let estimate = files
+            .iter()
+            .map(|file| estimated_fact_heap_bytes(&file.relative_path, file.bytes.len()))
+            .fold(0usize, usize::saturating_add);
+        if estimate <= self.retain_budget_bytes {
+            let mut update = match cargo {
+                Some(metadata) => self.update_with_cargo(files, metadata)?,
+                None => self.update(files)?,
+            };
+            // The resolver's syntax-local scope is never staged; release it.
+            for facts in &mut update.facts {
+                facts.scope = crate::scope::RustScope::default();
+            }
+            return Ok(PassUpdate {
+                facts: PassFacts::Memory(update.facts),
+                changed_owners: update.changed_owners,
+            });
+        }
+        self.update_streamed(files, cargo, spill_dir)
+    }
+
+    fn update_streamed(
+        &mut self,
+        files: Vec<SourceFile>,
+        cargo: Option<&CargoWorkspace>,
+        spill_dir: &Path,
+    ) -> Result<PassUpdate> {
+        if files.len() > crate::staged::MAX_STAGED_FILES {
+            return Err(CodegraphError::LimitExceeded {
+                requested: files.len(),
+                maximum: crate::staged::MAX_STAGED_FILES,
+            });
+        }
+        // Nothing raw is kept: the corpus is over the retention budget.
+        self.raw = BTreeMap::new();
+        let previous_digests = std::mem::take(&mut self.digests);
+        self.previous_inventory = None;
+        let mut digests = Vec::with_capacity(files.len());
+        let mut next = BTreeMap::new();
+        let mut changed = BTreeSet::new();
+        let mut source_bytes = 0usize;
+        for file in &files {
+            validate_path(&file.relative_path)?;
+            if file.bytes.len() > MAX_STAGED_FILE_BYTES {
+                return Err(CodegraphError::LimitExceeded {
+                    requested: file.bytes.len(),
+                    maximum: MAX_STAGED_FILE_BYTES,
+                });
+            }
+            source_bytes = source_bytes.saturating_add(file.bytes.len());
+            if source_bytes > MAX_STAGED_SOURCE_BYTES {
+                return Err(CodegraphError::LimitExceeded {
+                    requested: source_bytes,
+                    maximum: MAX_STAGED_SOURCE_BYTES,
+                });
+            }
+            let digest = blake3::hash(&file.bytes).to_hex().to_string();
+            if next
+                .insert(file.relative_path.clone(), digest.clone())
+                .is_some()
+            {
+                return Err(CodegraphError::InvalidInput(format!(
+                    "duplicate source owner: {}",
+                    file.relative_path
+                )));
+            }
+            if previous_digests.get(&file.relative_path) != Some(&digest) {
+                changed.insert(file.relative_path.clone());
+            }
+            digests.push(digest);
+        }
+        for path in previous_digests.keys() {
+            if !next.contains_key(path) {
+                changed.insert(path.clone());
+            }
+        }
+        if let Some(metadata) = cargo {
+            if self.previous_cargo_metadata_digest.as_deref()
+                != Some(metadata.metadata_digest.as_str())
+            {
+                changed.extend(
+                    metadata
+                        .packages
+                        .iter()
+                        .map(|package| package.manifest_path.clone()),
+                );
+            }
+            self.previous_cargo_metadata_digest = Some(metadata.metadata_digest.clone());
+        }
+        let streamed = StreamedFacts::build(files, digests, cargo, spill_dir)?;
+        self.digests = next;
+        Ok(PassUpdate {
+            facts: PassFacts::Streamed(streamed),
+            changed_owners: changed,
+        })
     }
 }
 

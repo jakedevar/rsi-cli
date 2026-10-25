@@ -56,6 +56,7 @@ fn failed_job_wake(store: &Store, owner: Uuid, project: Uuid) -> ScheduledJob {
         project_id: Some(project),
         name: Some("check".into()),
         params: JobParams::Build(BuildJobParams {
+            release_members: Vec::new(),
             command: BuildCommand::Check,
             package: None,
             workspace: true,
@@ -64,6 +65,7 @@ fn failed_job_wake(store: &Store, owner: Uuid, project: Uuid) -> ScheduledJob {
             no_default_features: false,
             features: Vec::new(),
             shards: Vec::new(),
+            bins: Vec::new(),
             cpu_quota_percent: None,
             sha: None,
         }),
@@ -99,7 +101,7 @@ async fn a_gone_target_wake_escalates_once_to_the_seat_across_restart_and_refire
     let seat = config.current_session_id.unwrap();
     let gone = Uuid::new_v4();
     let wake = failed_job_wake(&store, gone, config.project_id);
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
 
     // Two scheduler lifetimes (fresh bus and launcher each) fire the same
     // due row; the second models a restart before the one-shot settled.
@@ -167,7 +169,7 @@ async fn a_full_operator_todo_list_defers_the_gone_target_wake_until_it_drains()
             .unwrap();
         filler.push(write.todo.id);
     }
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let bus = Arc::new(EventBus::new(16));
     let launcher = Arc::new(GoneLauncher {
         gone,

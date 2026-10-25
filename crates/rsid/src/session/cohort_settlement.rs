@@ -65,7 +65,7 @@ const AGENT_AUDIT_HOLDER_LOOKUP_WAIT: std::time::Duration = std::time::Duration:
 /// Run `read` under the Store lock acquired by a bounded `try_lock` poll;
 /// `None` when the Store stayed contended for `wait` or the read failed.
 fn bounded_store_read<T>(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     wait: std::time::Duration,
     read: impl FnOnce(&crate::store::Store) -> Result<T>,
 ) -> Option<T> {
@@ -269,13 +269,158 @@ async fn await_pending_apply(
     }
 }
 
+/// How long an agent audit holds its caller for the whole proof (#3760). The
+/// per-root proof (git ancestry, custody, dirty checks) of a large cohort can
+/// outlast the 30 s agent RPC limit, so the audit runs in a daemon task that
+/// outlives the call. Past this budget the caller gets the typed
+/// `source_settlement_audit_pending` answer (with an `audit_id`) while the task
+/// keeps going, and the next audit request for the same cohort joins it.
+const AGENT_AUDIT_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Suggested re-ask delay carried by the pending audit answer.
+const SOURCE_SETTLEMENT_AUDIT_PENDING_RETRY_AFTER_SECS: u64 = 10;
+
+type PendingAuditOutcome =
+    Option<std::result::Result<Box<SourceWorktreeCohortAuditV1>, PendingApplyFailure>>;
+
+/// One audit task this process runs for an agent caller and cohort (#3760).
+/// A finished entry is delivered once: the first request that observes its
+/// outcome removes it, so a later request audits afresh and never reads a
+/// stale observation. An entry nobody claimed expires after
+/// [`PENDING_APPLY_FAILURE_TTL`].
+struct PendingAudit {
+    audit_id: Uuid,
+    started: std::time::Instant,
+    outcome: tokio::sync::watch::Receiver<PendingAuditOutcome>,
+}
+
+type PendingAuditKey = (String, Uuid, Option<Uuid>);
+
+fn pending_audits() -> &'static std::sync::Mutex<HashMap<PendingAuditKey, PendingAudit>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<PendingAuditKey, PendingAudit>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn remove_pending_audit(key: &PendingAuditKey, audit_id: Uuid) {
+    let mut pending = pending_audits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if pending
+        .get(key)
+        .is_some_and(|entry| entry.audit_id == audit_id)
+    {
+        pending.remove(key);
+    }
+}
+
+/// Join the audit task already running for this caller and cohort (`None`
+/// sender), or register a new one and hand back the sender its task publishes
+/// through.
+fn join_or_register_pending_audit(
+    key: &PendingAuditKey,
+) -> (
+    Uuid,
+    Option<tokio::sync::watch::Sender<PendingAuditOutcome>>,
+    tokio::sync::watch::Receiver<PendingAuditOutcome>,
+) {
+    let mut pending = pending_audits()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.retain(|_, entry| {
+        !(entry.outcome.borrow().is_some() && entry.started.elapsed() > PENDING_APPLY_FAILURE_TTL)
+    });
+    if let Some(existing) = pending.get(key) {
+        return (existing.audit_id, None, existing.outcome.clone());
+    }
+    let audit_id = Uuid::new_v4();
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    pending.insert(
+        key.clone(),
+        PendingAudit {
+            audit_id,
+            started: std::time::Instant::now(),
+            outcome: receiver.clone(),
+        },
+    );
+    (audit_id, Some(sender), receiver)
+}
+
+/// The typed answer for an agent audit still running after its response
+/// budget. It carries no plan, no digest and no authorization phrase and wrote
+/// nothing; apply needs an audit that has finished.
+fn source_settlement_audit_pending(
+    repository_identity: &str,
+    audit_id: Uuid,
+    waited: std::time::Duration,
+) -> DaemonError {
+    DaemonError::StructuredRpc {
+        rpc_code: rsi_common::rpc::INVALID_PARAMS,
+        message: "source_settlement_audit_pending".into(),
+        data: serde_json::json!({
+            "code": "source_settlement_audit_pending",
+            "disposition": "pending",
+            "reason": format!(
+                "the cohort audit is still proving its roots after {}s and keeps running in the \
+                 daemon (audit_id {audit_id}); nothing was written and no plan exists yet. Re-send \
+                 this exact audit in about {}s to receive it (arm AgentScheduleWake mode \"resume\" \
+                 with in_seconds {} and end the turn instead of polling); do not apply without a \
+                 finished audit",
+                waited.as_secs(),
+                SOURCE_SETTLEMENT_AUDIT_PENDING_RETRY_AFTER_SECS,
+                SOURCE_SETTLEMENT_AUDIT_PENDING_RETRY_AFTER_SECS,
+            ),
+            "repository_identity": repository_identity,
+            "audit_id": audit_id.to_string(),
+            "audit_running": true,
+            "waited_secs": waited.as_secs(),
+            "retry_after_secs": SOURCE_SETTLEMENT_AUDIT_PENDING_RETRY_AFTER_SECS,
+            "writes": 0,
+        }),
+    }
+}
+
+/// Wait up to `budget` for a pending audit. A finished outcome (audit or
+/// failure) is claimed by whoever sees it first and removed from the registry.
+async fn await_pending_audit(
+    key: &PendingAuditKey,
+    audit_id: Uuid,
+    mut receiver: tokio::sync::watch::Receiver<PendingAuditOutcome>,
+    budget: std::time::Duration,
+) -> Result<SourceWorktreeCohortAuditV1> {
+    let waited = tokio::time::timeout(budget, async {
+        receiver
+            .wait_for(Option::is_some)
+            .await
+            .map(|outcome| outcome.clone())
+    })
+    .await;
+    match waited {
+        Err(_) | Ok(Ok(None)) => Err(source_settlement_audit_pending(&key.0, audit_id, budget)),
+        Ok(Err(_)) => {
+            remove_pending_audit(key, audit_id);
+            Err(DaemonError::Process(
+                "detached settlement audit ended without an outcome".into(),
+            ))
+        }
+        Ok(Ok(Some(Ok(audit)))) => {
+            remove_pending_audit(key, audit_id);
+            Ok(*audit)
+        }
+        Ok(Ok(Some(Err(failure)))) => {
+            remove_pending_audit(key, audit_id);
+            Err(failure.into_error())
+        }
+    }
+}
+
 /// The typed answer for an audit that could not take the repository mutex in
 /// time: no plan, no digest, no authorization and no write. Names the holder
 /// the repository guard itself recorded (#2663): the settlement run mutating a
 /// root, or the label of another operation. The holder is never derived from
 /// journal chronology, which orders runs by creation and not by lock ownership.
 fn source_settlement_busy(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     repository_identity: &str,
     holder: Option<git_worktree::RepositoryHolder>,
     waited: std::time::Duration,
@@ -460,7 +605,7 @@ fn check_snapshot_authorizes_apply(
 /// owned so the driver can outlive the RPC future.
 struct SettlementDriver {
     sandbox_base: PathBuf,
-    store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     event_bus: Arc<crate::bus::EventBus>,
@@ -781,6 +926,8 @@ struct CanonicalApplyFingerprint<'a> {
     plan_digest: &'a str,
     authorization_digest: &'a str,
     idempotency_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_custody_id: Option<Uuid>,
 }
 
 impl AgentControlHandle {
@@ -809,14 +956,61 @@ impl AgentControlHandle {
         params: rsi_common::cohort_settlement::AgentAuditSourceWorktreeCohortParams,
     ) -> Result<serde_json::Value> {
         let audit = self
-            .agent_audit_source_worktree_cohort(
+            .agent_audit_source_worktree_cohort_detached(
                 caller,
                 rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                    after_custody_id: params.after_custody_id,
                     repository_identity: params.repository_identity,
                 },
+                AGENT_AUDIT_RESPONSE_BUDGET,
             )
             .await?;
         Ok(audit.into_agent_view(params.fields)?)
+    }
+
+    /// The agent audit as a durable background task (#3760). The proof of a
+    /// large cohort runs in a daemon task that outlives this call; the caller
+    /// waits at most `budget` for it. Past that it gets the typed
+    /// `source_settlement_audit_pending` answer (`audit_id`, `retry_after_secs`)
+    /// and the next request for the same cohort joins the running task, so a
+    /// cohort of any size can be audited by an agent inside the RPC limit.
+    /// Invalid or out-of-scope requests are refused before any task starts.
+    pub(crate) async fn agent_audit_source_worktree_cohort_detached(
+        &self,
+        caller: Uuid,
+        params: rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams,
+        budget: std::time::Duration,
+    ) -> Result<SourceWorktreeCohortAuditV1> {
+        params.validate().map_err(|reason| {
+            agent_settlement_refusal("storage_control_invalid_request", &reason)
+        })?;
+        self.store
+            .lock()
+            .await
+            .authorize_agent_source_worktree_cohort(caller, &params.repository_identity)?;
+        let key = (
+            params.repository_identity.clone(),
+            caller,
+            params.after_custody_id,
+        );
+        let (audit_id, sender, receiver) = join_or_register_pending_audit(&key);
+        if let Some(sender) = sender {
+            let handle = self.clone();
+            tokio::spawn(async move {
+                let outcome = handle
+                    .agent_audit_source_worktree_cohort(caller, params)
+                    .await;
+                let outcome = match outcome {
+                    Ok(audit) => Ok(Box::new(audit)),
+                    Err(error) => {
+                        tracing::info!(%error, "Detached agent settlement audit ended with an error");
+                        Err(PendingApplyFailure::capture(&error))
+                    }
+                };
+                let _ = sender.send(Some(outcome));
+            });
+        }
+        await_pending_audit(&key, audit_id, receiver, budget).await
     }
 
     pub(crate) async fn agent_audit_source_worktree_cohort(
@@ -850,6 +1044,7 @@ impl AgentControlHandle {
                 params.repository_identity.clone(),
                 Some(caller),
                 Some(wait),
+                params.after_custody_id,
             )
             .await
             .map_err(normalize_agent_settlement_error)?;
@@ -1095,7 +1290,16 @@ impl SessionManager {
         &self,
         repository_identity: String,
     ) -> Result<SourceWorktreeCohortAuditV1> {
-        self.audit_source_worktree_cohort_as(repository_identity, None, None)
+        self.audit_source_worktree_cohort_page(repository_identity, None)
+            .await
+    }
+
+    pub async fn audit_source_worktree_cohort_page(
+        &self,
+        repository_identity: String,
+        after_custody_id: Option<Uuid>,
+    ) -> Result<SourceWorktreeCohortAuditV1> {
+        self.audit_source_worktree_cohort_as(repository_identity, None, None, after_custody_id)
             .await
     }
 
@@ -1108,6 +1312,7 @@ impl SessionManager {
         repository_identity: String,
         agent_caller: Option<Uuid>,
         repository_wait: Option<std::time::Duration>,
+        after_custody_id: Option<Uuid>,
     ) -> Result<SourceWorktreeCohortAuditV1> {
         rsi_common::cohort_settlement::validate_identity(&repository_identity)
             .map_err(DaemonError::InvalidParam)?;
@@ -1150,57 +1355,65 @@ impl SessionManager {
         let repository_identity_for_busy = repository_identity.clone();
         tokio::task::spawn_blocking(move || {
             let origin = PathBuf::from(&canonical_repo_dir);
-            let audit_locked = || {
-                let (mut inventory, latest) = {
-                    let store = store.blocking_lock_checked()?;
-                    let mut inventory = store.source_worktree_inventory(
+            // Read Store and runtime inputs before the repository mutex. A
+            // busy Store under that mutex used to surrender `root_busy` for
+            // the entire cohort (#3609). This is an audit snapshot only:
+            // prepare_apply rechecks the exact plan before durable intent and
+            // each root keeps its own custody and dependency fences.
+            let (mut inventory, traversal, latest) = {
+                let store = store.blocking_lock_checked()?;
+                let (mut inventory, traversal) =
+                    store.source_worktree_inventory_page(&repository_identity, after_custody_id)?;
+                if let Some(caller) = agent_caller {
+                    store.scope_agent_source_worktree_inventory(
+                        caller,
                         &repository_identity,
-                        SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
+                        &mut inventory,
                     )?;
-                    if let Some(caller) = agent_caller {
-                        store.scope_agent_source_worktree_inventory(
-                            caller,
-                            &repository_identity,
-                            &mut inventory,
-                        )?;
-                    }
-                    let latest = store
-                        .latest_source_worktree_settlement_run(&repository_identity)?
-                        .map(|receipt| receipt.validate_wire().map_err(DaemonError::Store))
-                        .transpose()?;
-                    (inventory, latest)
-                };
-                if inventory.is_empty() {
-                    let receipt = latest.as_ref().ok_or_else(|| {
-                        DaemonError::InvalidParam(
-                            "repository cohort lost its Live roots and durable receipt during audit"
-                                .into(),
-                        )
-                    })?;
-                    if receipt.canonical_repo_dir != canonical_repo_dir {
-                        return Err(DaemonError::InvalidParam(
-                            "repository cohort path mapping drifted during receipt recovery".into(),
-                        ));
-                    }
-                    return durable_receipt_only_audit(receipt);
                 }
-                let locked_repo_dir = unique_repository_dir(&repository_identity, &inventory)?;
-                if locked_repo_dir != canonical_repo_dir {
+                let latest = store
+                    .latest_source_worktree_settlement_run(&repository_identity)?
+                    .map(|receipt| receipt.validate_wire().map_err(DaemonError::Store))
+                    .transpose()?;
+                (inventory, traversal, latest)
+            };
+            if inventory.is_empty() {
+                let receipt = latest.as_ref().ok_or_else(|| {
+                    DaemonError::InvalidParam(
+                        "repository cohort lost its Live roots and durable receipt during audit"
+                            .into(),
+                    )
+                })?;
+                if receipt.canonical_repo_dir != canonical_repo_dir {
                     return Err(DaemonError::InvalidParam(
-                        "repository cohort path mapping drifted during audit".into(),
+                        "repository cohort path mapping drifted during receipt recovery".into(),
                     ));
                 }
-                with_runtime_completed(&completed, |completed| {
-                    exclude_runtime_completed_drift(&mut inventory, completed);
-                })?;
-                let mut report = build_audit_with_target_fetch_locked(
-                    &repository_identity,
-                    &canonical_repo_dir,
-                    &sandbox_base,
-                    inventory,
-                    &active_ids,
-                    &active_cwds,
-                    true,
+                return durable_receipt_only_audit(receipt);
+            }
+            let locked_repo_dir = unique_repository_dir(&repository_identity, &inventory)?;
+            if locked_repo_dir != canonical_repo_dir {
+                return Err(DaemonError::InvalidParam(
+                    "repository cohort path mapping drifted during audit".into(),
+                ));
+            }
+            with_runtime_completed(&completed, |completed| {
+                exclude_runtime_completed_drift(&mut inventory, completed);
+            })?;
+            let audit_locked = || {
+                #[cfg(test)]
+                pause_audit_inputs_if_requested(&repository_identity);
+                let mut report = bind_audit_traversal(
+                    build_audit_with_target_fetch_locked(
+                        &repository_identity,
+                        &canonical_repo_dir,
+                        &sandbox_base,
+                        inventory,
+                        &active_ids,
+                        &active_cwds,
+                        true,
+                    )?,
+                    traversal,
                 )?
                 .report;
                 report.run_id = latest.as_ref().map(|receipt| receipt.run_id);
@@ -1414,6 +1627,7 @@ impl SessionManager {
                 // cannot advance roots fenced by its earlier intent. Manual
                 // agent/operator plans remain owned by their original flow.
                 let mut params = ApplySourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: run.repository_identity,
                     plan_digest: run.plan_digest,
                     authorization: String::new(),
@@ -1496,6 +1710,7 @@ impl SessionManager {
             };
             self.with_settlement_audit_fence(|fence| fence.forget(&cohort.repository_identity));
             let params = ApplySourceWorktreeCohortParams {
+                after_custody_id: None,
                 repository_identity: audit.repository_identity,
                 plan_digest: audit.plan_digest,
                 authorization,
@@ -1836,6 +2051,7 @@ impl SessionManager {
         }
         let authorization_digest = hash_bytes(params.authorization.as_bytes());
         let request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+            after_custody_id: params.after_custody_id,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: &params.repository_identity,
@@ -1906,7 +2122,12 @@ impl SessionManager {
             ApplyStart::Replay(receipt)
         } else {
             let snapshot = self
-                .source_worktree_audit_snapshot_as(&params.repository_identity, agent_caller, None)
+                .source_worktree_audit_snapshot_as(
+                    &params.repository_identity,
+                    agent_caller,
+                    None,
+                    params.after_custody_id,
+                )
                 .await?;
             check_snapshot_authorizes_apply(&snapshot, &params)?;
             ApplyStart::Fresh(snapshot)
@@ -2243,9 +2464,15 @@ impl SessionManager {
         repository_identity: &str,
         agent_caller: Option<Uuid>,
         repository_wait: Option<std::time::Duration>,
+        after_custody_id: Option<Uuid>,
     ) -> Result<AuditSnapshot> {
         self.audit_context()
-            .snapshot(repository_identity, agent_caller, repository_wait)
+            .snapshot(
+                repository_identity,
+                agent_caller,
+                repository_wait,
+                after_custody_id,
+            )
             .await
     }
 
@@ -2392,6 +2619,7 @@ async fn record_detached_run(
             &params.repository_identity,
             agent_caller,
             Some(AGENT_AUDIT_REPOSITORY_WAIT),
+            params.after_custody_id,
         )
         .await?;
     check_snapshot_authorizes_apply(&snapshot, params)?;
@@ -2494,7 +2722,7 @@ async fn record_and_drive_detached(
 /// The owned handles one cohort audit reads, so a detached apply (#2869) can run
 /// its audit in a task that outlives the RPC future.
 struct AuditContext {
-    store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     sandbox_base: PathBuf,
@@ -2506,9 +2734,10 @@ impl AuditContext {
         repository_identity: &str,
         agent_caller: Option<Uuid>,
         repository_wait: Option<std::time::Duration>,
+        after_custody_id: Option<Uuid>,
     ) -> Result<AuditSnapshot> {
-        let mut inventory = self
-            .load_inventory(repository_identity, agent_caller)
+        let (mut inventory, traversal) = self
+            .load_inventory(repository_identity, agent_caller, after_custody_id)
             .await?;
         exclude_runtime_completed_drift(&mut inventory, &*self.completed.read().await);
         let active = self.active.read().await;
@@ -2520,12 +2749,15 @@ impl AuditContext {
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
             let Some(wait) = repository_wait else {
-                return build_audit(
-                    &identity,
-                    &sandbox_base,
-                    inventory,
-                    &active_ids,
-                    &active_cwds,
+                return bind_audit_traversal(
+                    build_audit(
+                        &identity,
+                        &sandbox_base,
+                        inventory,
+                        &active_ids,
+                        &active_cwds,
+                    )?,
+                    traversal,
                 );
             };
             let canonical_repo_dir = unique_repository_dir(&identity, &inventory)?;
@@ -2535,13 +2767,16 @@ impl AuditContext {
                 wait,
                 git_worktree::RepositoryHolder::Operation("settlement_apply"),
                 || {
-                    build_audit_locked(
-                        &identity,
-                        &canonical_repo_dir,
-                        &sandbox_base,
-                        inventory,
-                        &active_ids,
-                        &active_cwds,
+                    bind_audit_traversal(
+                        build_audit_locked(
+                            &identity,
+                            &canonical_repo_dir,
+                            &sandbox_base,
+                            inventory,
+                            &active_ids,
+                            &active_cwds,
+                        )?,
+                        traversal,
                     )
                 },
             )? {
@@ -2559,19 +2794,21 @@ impl AuditContext {
         &self,
         repository_identity: &str,
         agent_caller: Option<Uuid>,
-    ) -> Result<Vec<SourceWorktreeInventoryRow>> {
+        after_custody_id: Option<Uuid>,
+    ) -> Result<(
+        Vec<SourceWorktreeInventoryRow>,
+        Option<rsi_common::cohort_settlement::SourceWorktreeAuditTraversalV1>,
+    )> {
         let identity = repository_identity.to_string();
         let store = Arc::clone(&self.store);
         tokio::task::spawn_blocking(move || {
             let store = store.blocking_lock_checked()?;
-            let mut inventory = store.source_worktree_inventory(
-                &identity,
-                SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
-            )?;
+            let (mut inventory, traversal) =
+                store.source_worktree_inventory_page(&identity, after_custody_id)?;
             if let Some(caller) = agent_caller {
                 store.scope_agent_source_worktree_inventory(caller, &identity, &mut inventory)?;
             }
-            Ok(inventory)
+            Ok((inventory, traversal))
         })
         .await
         .map_err(|error| DaemonError::Process(error.to_string()))?
@@ -2588,7 +2825,7 @@ fn apply_locked(
     authorization_digest: &str,
     request_fingerprint: &str,
     sandbox_base: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
 ) -> Result<ApplyOutcome> {
@@ -2617,7 +2854,7 @@ fn apply_locked_with_orphan_proof(
     authorization_digest: &str,
     request_fingerprint: &str,
     sandbox_base: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     reap_orphans_after_intent: bool,
@@ -2666,7 +2903,7 @@ fn apply_locked_with_agent_authority(
     authorization_digest: &str,
     request_fingerprint: &str,
     sandbox_base: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     reap_orphans_after_intent: bool,
@@ -2751,7 +2988,7 @@ fn apply_with_root_scheduling(
     authorization_digest: &str,
     request_fingerprint: &str,
     sandbox_base: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     reap_orphans_after_intent: bool,
@@ -2860,7 +3097,7 @@ fn initial_settled_ids(journal: &[SourceWorktreeSettlementJournalItem]) -> Vec<U
 /// One iteration of the per-root loop, shared by both scheduling shapes.
 #[allow(clippy::too_many_arguments)]
 fn apply_journal_item(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
     replaying: bool,
@@ -2902,7 +3139,7 @@ fn apply_journal_item(
 }
 
 fn finish_apply(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     mut settled_ids: Vec<Uuid>,
 ) -> Result<ApplyOutcome> {
@@ -2928,7 +3165,7 @@ fn prepare_apply(
     authorization_digest: &str,
     request_fingerprint: &str,
     sandbox_base: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     reap_orphans_after_intent: bool,
@@ -2954,11 +3191,15 @@ fn prepare_apply(
             let active_ids = active_guard.keys().copied().collect::<HashSet<_>>();
             let active_cwds = collect_runtime_path_inputs(&active_guard);
             drop(active_guard);
-            let mut inventory = {
+            let (mut inventory, traversal) = {
                 let store = store.blocking_lock_checked()?;
-                let mut inventory = store.source_worktree_inventory(
+                let (mut inventory, traversal) = store.source_worktree_inventory_page(
                     repository_identity,
-                    SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
+                    snapshot
+                        .report
+                        .traversal
+                        .as_ref()
+                        .and_then(|page| page.after_custody_id),
                 )?;
                 if let Some(caller) = agent_caller {
                     store.scope_agent_source_worktree_inventory(
@@ -2967,7 +3208,7 @@ fn prepare_apply(
                         &mut inventory,
                     )?;
                 }
-                inventory
+                (inventory, traversal)
             };
             with_runtime_completed(completed, |completed| {
                 exclude_runtime_completed_drift(&mut inventory, completed);
@@ -2978,13 +3219,16 @@ fn prepare_apply(
                     "source-worktree audit path mapping drifted".into(),
                 ));
             }
-            let recomputed = build_audit_locked(
-                repository_identity,
-                &canonical_repo_dir,
-                sandbox_base,
-                inventory,
-                &active_ids,
-                &active_cwds,
+            let recomputed = bind_audit_traversal(
+                build_audit_locked(
+                    repository_identity,
+                    &canonical_repo_dir,
+                    sandbox_base,
+                    inventory,
+                    &active_ids,
+                    &active_cwds,
+                )?,
+                traversal,
             )?;
             if !recomputed.report.applyable
                 || recomputed.report.plan_digest.as_str() != plan_digest
@@ -3091,9 +3335,9 @@ fn prepare_apply(
         false
     };
     if reap_orphans_after_intent && !authority_lost {
-        let candidate_ids = {
+        let candidates = {
             let store = store.blocking_lock_checked()?;
-            let mut ids = Vec::new();
+            let mut candidates = Vec::new();
             for item in journal
                 .iter()
                 .filter(|item| phase_can_still_apply_git_effect(&item.phase))
@@ -3109,16 +3353,35 @@ fn prepare_apply(
                         Err(error) => return Err(error),
                     }
                 }
-                ids.push(item.session_id);
+                candidates.push(item);
             }
-            ids
+            candidates
         };
-        let reaped = super::reaper::reap_startup_settlement_orphans_checked(&candidate_ids)?;
-        if reaped > 0 {
+        let candidate_ids: Vec<Uuid> = candidates.iter().map(|item| item.session_id).collect();
+        let reap = super::reaper::reap_startup_settlement_orphans_reporting(&candidate_ids)?;
+        if reap.reaped > 0 {
             tracing::warn!(
-                reaped,
+                reaped = reap.reaped,
                 run_id = %run_id,
                 "Reaped exact-stamped provider orphan(s) after durable settlement intent"
+            );
+        }
+        // #149: what the scan could not prove stays alive (kill authority is
+        // unchanged); the receipt names it so the operator can stop it.
+        let survivors = attribute_unproven_survivors(
+            &reap.unproven,
+            &candidates,
+            Path::new(&canonical_repo_dir),
+        );
+        if !survivors.is_empty() {
+            let (recorded, over_bound) = store
+                .blocking_lock_checked()?
+                .record_source_worktree_settlement_unproven_survivors(run_id, &survivors)?;
+            tracing::warn!(
+                recorded,
+                over_bound,
+                run_id = %run_id,
+                "Settlement left unproven process(es) alive: macOS withheld their environment"
             );
         }
     }
@@ -3130,6 +3393,70 @@ fn prepare_apply(
         journal,
         authority_lost,
     })
+}
+
+/// The unproven processes of a settlement reap that belong on the run's
+/// receipt (#149), with path evidence only. A process whose working directory
+/// lies in a candidate root names that root (the holder inventory retains a
+/// root its cwd is in, so the root is kept too); one inside the cohort
+/// repository names the repository (no root). Every other withheld process is
+/// left out: macOS withholds the environment of every platform binary the user
+/// runs (hundreds on a desktop login), and nothing ties those to the cohort.
+fn attribute_unproven_survivors(
+    unproven: &[super::reaper::UnprovenProcess],
+    candidates: &[&crate::store::cohort_settlement::SourceWorktreeSettlementJournalItem],
+    repository: &Path,
+) -> Vec<rsi_common::cohort_settlement::SourceWorktreeUnprovenSurvivorV1> {
+    // libproc reports resolved paths (`/private/var/...`), so compare against
+    // each root as recorded and as resolved now (a removed root keeps only
+    // the recorded spelling).
+    let spellings = |path: &Path| {
+        let mut spellings = vec![path.to_path_buf()];
+        if let Ok(resolved) = std::fs::canonicalize(path)
+            && resolved != path
+        {
+            spellings.push(resolved);
+        }
+        spellings
+    };
+    let roots: Vec<_> = candidates
+        .iter()
+        .map(|item| (item, spellings(Path::new(&item.sandbox_root))))
+        .collect();
+    let repository = spellings(repository);
+    let within =
+        |path: &Path, spellings: &[PathBuf]| spellings.iter().any(|root| path.starts_with(root));
+    let text = |path: &Path| {
+        let text = path.to_string_lossy();
+        (!text.is_empty()
+            && text.len()
+                <= rsi_common::cohort_settlement::SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES
+            && !text.contains('\0'))
+        .then(|| text.into_owned())
+    };
+    unproven
+        .iter()
+        .filter_map(|process| {
+            let cwd = process.working_directory.as_deref()?;
+            let root = roots
+                .iter()
+                .find(|(_, spellings)| within(cwd, spellings))
+                .map(|(item, _)| *item);
+            if root.is_none() && !within(cwd, &repository) {
+                return None;
+            }
+            Some(rsi_common::cohort_settlement::SourceWorktreeUnprovenSurvivorV1 {
+                sequence: 0,
+                pid: process.pid,
+                start_time_micros: process.start_time_micros,
+                executable: process.executable.as_deref().and_then(text),
+                session_id: root.map(|item| item.session_id),
+                custody_id: root.map(|item| item.custody_id),
+                sandbox_root: root.map(|item| item.sandbox_root.clone()),
+                reason: rsi_common::cohort_settlement::SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos,
+            })
+        })
+        .collect()
 }
 
 /// The request-bound fields of a freshly recorded settlement intent.
@@ -3150,7 +3477,7 @@ struct AuditedRunRequest<'a> {
 /// the repository. Returns the run id this call chose with the store's outcome
 /// (a concurrent insert of the same idempotency key answers `Replay`).
 fn insert_audited_settlement_run(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     audit: &AuditSnapshot,
     request: &AuditedRunRequest<'_>,
     sandbox_base: &Path,
@@ -3232,7 +3559,7 @@ fn insert_audited_settlement_run(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn settle_one_item_locked(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run_id: Uuid,
@@ -3264,7 +3591,7 @@ fn settle_one_item_locked(
 /// (lock order: cwd exclusion, then mutex).
 #[allow(clippy::too_many_arguments)]
 fn settle_one_item_with_agent_authority(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run_id: Uuid,
@@ -3313,7 +3640,7 @@ const SETTLEMENT_CWD_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// mutex is never held across a wait for the cwd lock (#2081).
 fn settle_root_exclusion_first(
     origin: &Path,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
     settle: impl FnOnce(&CwdExclusion) -> Result<bool>,
@@ -3347,7 +3674,7 @@ const SETTLEMENT_FENCE_REACQUIRE: std::time::Duration = std::time::Duration::fro
 type SettlementFences<'a> = (
     tokio::sync::RwLockReadGuard<'a, HashMap<Uuid, super::types::TrackedSession>>,
     tokio::sync::RwLockReadGuard<'a, HashMap<Uuid, super::types::CompletedSession>>,
-    tokio::sync::MutexGuard<'a, crate::store::Store>,
+    rsid_core::store_lock::LabeledGuard<'a, crate::store::Store>,
 );
 
 /// Retake the fences in the order `settle_one_item_under_exclusion` first
@@ -3355,7 +3682,7 @@ type SettlementFences<'a> = (
 fn reacquire_settlement_fences<'a>(
     active: &'a Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &'a Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
-    store: &'a Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &'a Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
 ) -> Result<SettlementFences<'a>> {
     let busy = || {
         tracing::warn!(
@@ -3528,7 +3855,7 @@ fn with_fixture_cwd_admission<T>(body: impl FnOnce() -> T) -> T {
 #[allow(clippy::too_many_arguments)]
 fn settle_one_item_under_exclusion(
     _cwd_exclusion: &CwdExclusion,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run_id: Uuid,
@@ -5204,6 +5531,26 @@ fn pause_settlement_proof_if_requested(session_id: Uuid) {
     }
 }
 
+/// Pause under the repository mutex after audit inputs are read.
+#[cfg(test)]
+static AUDIT_INPUTS_PAUSE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, SettlementProofPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn pause_audit_inputs_if_requested(repository_identity: &str) {
+    let pause = AUDIT_INPUTS_PAUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(repository_identity);
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause
+            .release
+            .recv_timeout(std::time::Duration::from_secs(60));
+    }
+}
+
 /// Test seam (#2790): runs on the settlement thread while the Store, active
 /// and completed fences are released around a long Git step.
 #[cfg(test)]
@@ -5811,7 +6158,7 @@ pub(super) struct StoreFieldSnapshot {
 
 impl StoreFieldSnapshot {
     async fn read(
-        store: &tokio::sync::Mutex<crate::store::Store>,
+        store: &rsid_core::store_lock::Mutex<crate::store::Store>,
         session_id: Uuid,
     ) -> Result<Option<Self>> {
         let store = store.lock().await;
@@ -5930,7 +6277,7 @@ pub(super) type PublishGap<'a> = &'a (dyn Fn(usize) -> Publication<'a> + Send + 
 /// it reads is current and its fields are reconciled before the insert.
 pub(super) async fn publish_from_store<E>(
     map: &tokio::sync::RwLock<HashMap<Uuid, E>>,
-    store: &tokio::sync::Mutex<crate::store::Store>,
+    store: &rsid_core::store_lock::Mutex<crate::store::Store>,
     session_id: Uuid,
     entry: E,
     reconcile: impl Fn(&StoreFieldSnapshot, &mut E),
@@ -5943,7 +6290,7 @@ pub(super) async fn publish_from_store<E>(
 /// of consecutive failed row reads after each failed serialized read.
 pub(super) async fn publish_from_store_with_gap<E>(
     map: &tokio::sync::RwLock<HashMap<Uuid, E>>,
-    store: &tokio::sync::Mutex<crate::store::Store>,
+    store: &rsid_core::store_lock::Mutex<crate::store::Store>,
     session_id: Uuid,
     mut entry: E,
     reconcile: impl Fn(&StoreFieldSnapshot, &mut E),
@@ -6018,7 +6365,7 @@ pub(super) type Publication<'a> =
 /// [`publish_from_store`] into `completed`.
 pub(super) fn publish_completed_from_store<'a>(
     completed: &'a tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>,
-    store: &'a tokio::sync::Mutex<crate::store::Store>,
+    store: &'a rsid_core::store_lock::Mutex<crate::store::Store>,
     session_id: Uuid,
     entry: super::types::CompletedSession,
 ) -> Publication<'a> {
@@ -6034,7 +6381,7 @@ pub(super) fn publish_completed_from_store<'a>(
 /// [`publish_from_store`] into `active`.
 pub(super) fn publish_active_from_store<'a>(
     active: &'a tokio::sync::RwLock<HashMap<Uuid, super::TrackedSession>>,
-    store: &'a tokio::sync::Mutex<crate::store::Store>,
+    store: &'a rsid_core::store_lock::Mutex<crate::store::Store>,
     session_id: Uuid,
     tracked: super::TrackedSession,
 ) -> Publication<'a> {
@@ -6172,7 +6519,7 @@ fn retained_intent_can_be_reproved(item: &SourceWorktreeSettlementJournalItem) -
 /// fence, this shape has no proof that an effect even began. Prove the retained
 /// root, refs and custody unchanged before appending any superseding intent.
 fn reprove_retained_intent_under_exclusion(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run_id: Uuid,
@@ -6257,9 +6604,9 @@ fn journal_inventory_matches(
         custody_generation: item.custody_generation,
         original_path: original_root.to_path_buf(),
     }];
-    let inventory = store.source_worktree_inventory_with_path_aliases(
+    let inventory = store.source_worktree_inventory_exact_with_path_aliases(
         &item.repository_identity,
-        SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS.saturating_add(1),
+        item.custody_id,
         // A retained no-effect fence has no quarantine yet and is not an
         // effect-capable alias. The normal proof checks both path aliases
         // again after the audited transition to IntentCommitted.
@@ -6316,7 +6663,7 @@ fn root_is_exact_sandbox(root: &Path, sandbox_base: &Path, session_id: Uuid) -> 
 /// replay proof. Persistent database faults stay replayable for startup, never
 /// become an inspection-only RecoveryRequired item merely because SQLite failed.
 fn retry_settlement_database_items(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run: &SourceWorktreeSettlementRunV1,
@@ -6340,7 +6687,7 @@ fn retry_settlement_database_items(
 }
 
 fn retry_settlement_database_items_with(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &SourceWorktreeSettlementRunV1,
     mut settle: impl FnMut(&SourceWorktreeSettlementJournalItem) -> Result<bool>,
 ) -> Result<()> {
@@ -6616,7 +6963,7 @@ fn settlement_run_is_manual(store: &crate::store::Store, run_id: Uuid) -> Result
 /// caller may still hold a root lock or the repository mutex, so its reason is
 /// only noted here and written once the attempt holds the Store (#273).
 fn retain_failed_settlement_item(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     session_id: Uuid,
     error: &DaemonError,
@@ -6684,7 +7031,7 @@ fn retain_failed_settlement_items(
 }
 
 fn mark_item_stopped_blocking(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
     code: SourceWorktreeSettlementRefusalV1,
@@ -6734,7 +7081,7 @@ fn mark_item_stopped_blocking(
 }
 
 fn mark_source_restore_failure_blocking(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
     observation: &'static str,
@@ -6819,7 +7166,7 @@ static SETTLEMENT_RECOVERY_PROBE_FAILURE: std::sync::LazyLock<std::sync::Mutex<H
 #[allow(clippy::too_many_arguments)]
 fn close_item_after_policy_stop_under_exclusion(
     _exclusion: &CwdExclusion,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     completed: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::CompletedSession>>>,
     run_id: Uuid,
@@ -6888,7 +7235,7 @@ fn retain_resumable_before_effect(
 }
 
 fn mark_unattempted_under_root(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
     replaying: bool,
@@ -6960,7 +7307,7 @@ fn settlement_intent_paths_untouched(
 }
 
 fn close_failed_settlement_probe(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run_id: Uuid,
     item: &SourceWorktreeSettlementJournalItem,
 ) -> Result<()> {
@@ -7365,6 +7712,7 @@ fn build_audit_with_target_fetch_locked(
     let authorization_phrase =
         applyable.then(|| format!("APPLY {repository_identity} {}", plan_digest.as_str()));
     let report = SourceWorktreeCohortAuditV1 {
+        traversal: None,
         schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
         policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
         repository_identity: repository_identity.to_string(),
@@ -7392,6 +7740,33 @@ fn build_audit_with_target_fetch_locked(
     .validate_wire()
     .map_err(DaemonError::Store)?;
     Ok(AuditSnapshot { report, eligible })
+}
+
+/// Bind selection evidence as well as the eligible roots. A selection hint
+/// never authorizes effects; apply repeats this entire proof before intent.
+fn bind_audit_traversal(
+    mut snapshot: AuditSnapshot,
+    traversal: Option<rsi_common::cohort_settlement::SourceWorktreeAuditTraversalV1>,
+) -> Result<AuditSnapshot> {
+    if let Some(page) = traversal {
+        snapshot.report.plan_digest = hash_canonical(&(
+            "rsi-source-worktree-audit-page-v1",
+            &snapshot.report.plan_digest,
+            &page,
+        ))?;
+        snapshot.report.authorization_phrase = snapshot.report.applyable.then(|| {
+            format!(
+                "APPLY {} {}",
+                snapshot.report.repository_identity, snapshot.report.plan_digest
+            )
+        });
+        snapshot.report.traversal = Some(page);
+        snapshot.report = snapshot
+            .report
+            .validate_wire()
+            .map_err(DaemonError::Store)?;
+    }
+    Ok(snapshot)
 }
 
 /// Classifies one inventory row and enforces the wire invariant that an item
@@ -7828,6 +8203,7 @@ fn classify_row_by_precedence(
         return D::HeadMismatch;
     }
     if !observation.clean {
+        *diagnostic = observation.dirty_detail;
         return D::DirtyWorktree;
     }
     if cohort_refused || target_oid.is_none() {
@@ -7903,6 +8279,7 @@ fn durable_receipt_only_audit(
         eligible_items: &[],
     })?;
     SourceWorktreeCohortAuditV1 {
+        traversal: None,
         schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
         policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
         repository_identity: receipt.repository_identity.clone(),
@@ -7938,6 +8315,7 @@ fn refused_bound_report(repository_identity: &str, canonical_repo_dir: &str) -> 
     .expect("bounded canonical refusal");
     AuditSnapshot {
         report: SourceWorktreeCohortAuditV1 {
+            traversal: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: repository_identity.to_string(),
@@ -8091,7 +8469,7 @@ mod tests {
     struct IntegratedFixture {
         _directory: tempfile::TempDir,
         quarantine_holder_proc: crate::session::reaper::SyntheticQuarantineHolderProc,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         _fixture_holder_registration: crate::session::reaper::FixtureHolderTestProcGuard,
         repository: PathBuf,
         sandbox_base: PathBuf,
@@ -8168,7 +8546,7 @@ mod tests {
                     }),
                 )
                 .expect("seed custody-backed terminal Session");
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             let fixture_holder_registration =
                 crate::session::reaper::register_fixture_holder_test_proc(
                     directory.path(),
@@ -8177,7 +8555,7 @@ mod tests {
             Self {
                 _directory: directory,
                 quarantine_holder_proc,
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 _fixture_holder_registration: fixture_holder_registration,
                 repository,
                 sandbox_base,
@@ -8209,18 +8587,28 @@ mod tests {
         }
 
         fn audit(&self) -> AuditSnapshot {
-            let inventory = self.inventory();
+            self.audit_page(None)
+        }
+
+        fn audit_page(&self, after: Option<Uuid>) -> AuditSnapshot {
+            let (inventory, traversal) = self
+                .store
+                .source_worktree_inventory_page(&self.target.repository_identity, after)
+                .expect("load bounded fixture page");
             git_worktree::with_repository_mutation(&self.repository, || {
-                build_audit_locked(
-                    &self.target.repository_identity,
-                    self.target
-                        .canonical_repo_dir
-                        .to_str()
-                        .expect("UTF-8 canonical repository"),
-                    &self.sandbox_base,
-                    inventory,
-                    &HashSet::new(),
-                    &[],
+                bind_audit_traversal(
+                    build_audit_locked(
+                        &self.target.repository_identity,
+                        self.target
+                            .canonical_repo_dir
+                            .to_str()
+                            .expect("UTF-8 canonical repository"),
+                        &self.sandbox_base,
+                        inventory,
+                        &HashSet::new(),
+                        &[],
+                    )?,
+                    traversal,
                 )
             })
             .expect("audit integrated settlement fixture")
@@ -8232,8 +8620,22 @@ mod tests {
             repository_identity: String,
             canonical_repo_dir: String,
         ) -> Uuid {
+            self.insert_synthetic_custody_with_id(
+                label,
+                repository_identity,
+                canonical_repo_dir,
+                Uuid::new_v4(),
+            )
+        }
+
+        fn insert_synthetic_custody_with_id(
+            &mut self,
+            label: &str,
+            repository_identity: String,
+            canonical_repo_dir: String,
+            custody_id: Uuid,
+        ) -> Uuid {
             let session_id = Uuid::new_v4();
-            let custody_id = Uuid::new_v4();
             let root = self.sandbox_base.join(session_id.to_string());
             let branch = format!("rsi/{label}/{session_id}");
             let mut session = rsid_store::test_support::make_test_session();
@@ -8432,6 +8834,7 @@ mod tests {
             let audit = self.audit();
             let mut run = self.run_from_audit(&audit, key);
             let params = ApplySourceWorktreeCohortParams {
+                after_custody_id: None,
                 repository_identity: self.target.repository_identity.clone(),
                 plan_digest: audit.report.plan_digest.clone(),
                 authorization: audit
@@ -8443,6 +8846,7 @@ mod tests {
             };
             let authorization_digest = hash_bytes(params.authorization.as_bytes());
             run.request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+                after_custody_id: None,
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                 repository_identity: &params.repository_identity,
@@ -8735,7 +9139,10 @@ mod tests {
         fn replay_run(
             &mut self,
             run_id: Uuid,
-        ) -> (ApplyOutcome, Arc<tokio::sync::Mutex<crate::store::Store>>) {
+        ) -> (
+            ApplyOutcome,
+            Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+        ) {
             self.replay_run_with(run_id, false)
         }
 
@@ -8746,7 +9153,10 @@ mod tests {
         fn replay_run_with_cwd_admission_held(
             &mut self,
             run_id: Uuid,
-        ) -> (ApplyOutcome, Arc<tokio::sync::Mutex<crate::store::Store>>) {
+        ) -> (
+            ApplyOutcome,
+            Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+        ) {
             self.replay_run_with(run_id, true)
         }
 
@@ -8757,7 +9167,10 @@ mod tests {
             &mut self,
             run_id: Uuid,
             hold_cwd_admission: bool,
-        ) -> (ApplyOutcome, Arc<tokio::sync::Mutex<crate::store::Store>>) {
+        ) -> (
+            ApplyOutcome,
+            Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+        ) {
             let receipt = self
                 .store
                 .get_source_worktree_settlement_run(run_id)
@@ -8765,7 +9178,7 @@ mod tests {
                 .expect("fixture replay receipt");
             let idempotency_key = receipt.idempotency_key.clone();
             let plan_digest = receipt.plan_digest.as_str().to_string();
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut self.store,
                 crate::store::Store::open_in_memory().expect("replacement fixture Store"),
             )));
@@ -8858,7 +9271,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let (settled, refused) = (others[0].clone(), others[1].clone());
 
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut self.store,
                 crate::store::Store::open_in_memory().expect("replacement fixture Store"),
             )));
@@ -9059,6 +9472,70 @@ mod tests {
         assert!(audit.items.is_empty());
     }
 
+    /// #3609: Store contention after the snapshot and a busy custody stripe
+    /// cannot fail a whole audit. Apply still decides effects root by root.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn audit_snapshot_does_not_reacquire_store_under_repository() {
+        let mut fixture = IntegratedFixture::new("audit-snapshot-store-busy");
+        fixture.add_second_root_in_other_stripe("audit-snapshot-sibling");
+        let identity = fixture.target.repository_identity.clone();
+        let custody_id = fixture.custody_id;
+        let manager = Arc::new(
+            SessionManager::new(
+                Arc::new(crate::bus::EventBus::new(16)),
+                std::mem::replace(
+                    &mut fixture.store,
+                    crate::store::Store::open_in_memory().unwrap(),
+                ),
+                false,
+                fixture._directory.path().join("daemon.sock"),
+                None,
+                Vec::new(),
+                crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env()),
+                fixture.sandbox_base.clone(),
+            )
+            .unwrap(),
+        );
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        AUDIT_INPUTS_PAUSE.lock().unwrap().insert(
+            identity.clone(),
+            SettlementProofPause {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+        let audit_manager = Arc::clone(&manager);
+        let audit =
+            tokio::spawn(async move { audit_manager.audit_source_worktree_cohort(identity).await });
+        tokio::task::spawn_blocking(move || {
+            reached_rx.recv_timeout(std::time::Duration::from_secs(60))
+        })
+        .await
+        .unwrap()
+        .expect("audit loaded its inputs");
+        let store = manager.store.lock().await;
+        let root = crate::store::sandbox_custody::lock_custody_root(custody_id);
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), audit).await;
+        drop(root);
+        drop(store);
+        let report = result
+            .expect("audit completes without Store or stripe admission")
+            .unwrap()
+            .expect("a busy root does not fail the cohort audit");
+        assert!(report.applyable, "{report:?}");
+        assert_eq!(report.counts.eligible, 2, "{report:?}");
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|item| item.disposition.is_eligible())
+        );
+        assert!(fixture.allocation.root.is_dir());
+    }
+
     /// #2622: an audit that cannot take the repository inside its wait answers
     /// a typed `source_settlement_busy` naming the unfinished run, writes
     /// nothing and returns no plan; the same audit succeeds once the holder
@@ -9109,6 +9586,7 @@ mod tests {
                 repository_identity.clone(),
                 None,
                 Some(std::time::Duration::from_millis(150)),
+                None,
             )
             .await
             .expect_err("a held repository must not be audited");
@@ -9136,6 +9614,7 @@ mod tests {
                 repository_identity,
                 None,
                 Some(std::time::Duration::from_secs(5)),
+                None,
             )
             .await
             .expect("the audit answers once the holder released");
@@ -9166,6 +9645,7 @@ mod tests {
                 repository_identity,
                 None,
                 Some(std::time::Duration::from_millis(150)),
+                None,
             )
             .await
             .expect_err("a held repository must not be audited");
@@ -9372,6 +9852,7 @@ mod tests {
                 repository_identity,
                 None,
                 Some(std::time::Duration::from_millis(1200)),
+                None,
             )
             .await
             .expect_err("a held repository must not be audited");
@@ -9735,7 +10216,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
-    fn list_allows_257_cohorts_while_audit_refuses_257_roots_explicitly() {
+    fn list_allows_257_cohorts_and_audit_pages_257_roots() {
         let mut list_fixture = IntegratedFixture::new("list-257");
         for index in 0..256 {
             list_fixture.insert_synthetic_custody(
@@ -9768,12 +10249,311 @@ mod tests {
             );
         }
         let audit = audit_fixture.audit();
-        assert!(!audit.report.applyable);
-        assert_eq!(audit.report.items.len(), 0);
-        assert_eq!(
-            audit.report.refusal.as_deref(),
-            Some("bound_exceeded: cohort has more than 256 Live roots")
+        assert_eq!(audit.report.items.len(), 256);
+        let page = audit.report.traversal.as_ref().unwrap();
+        assert_eq!(page.snapshot_root_count, 257);
+        assert!(page.has_more);
+        let tail = audit_fixture.audit_page(Some(page.last_custody_id));
+        assert_eq!(tail.report.items.len(), 1);
+        let tail_page = tail.report.traversal.as_ref().unwrap();
+        assert!(!tail_page.has_more);
+        assert_eq!(tail_page.snapshot_digest, page.snapshot_digest);
+        let all: HashSet<_> = audit
+            .report
+            .items
+            .iter()
+            .chain(&tail.report.items)
+            .map(|item| item.custody_id)
+            .collect();
+        assert_eq!(all.len(), 257);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn bounded_audit_traverses_mixed_roots_and_preserves_unexamined_owners() {
+        use SourceWorktreeDispositionV1 as D;
+        let mut fixture = IntegratedFixture::new("mixed-pages");
+        let identity = fixture.target.repository_identity.clone();
+        let repo = fixture
+            .target
+            .canonical_repo_dir
+            .to_str()
+            .unwrap()
+            .to_string();
+        for index in 1..=256 {
+            fixture.insert_synthetic_custody_with_id(
+                "retained-page",
+                identity.clone(),
+                repo.clone(),
+                Uuid::from_u128(index),
+            );
+        }
+        for index in 1..=5 {
+            fixture.add_second_root_with_custody("mixed-tail", Uuid::from_u128(1000 + index));
+        }
+        let (caller, project) = grant_storage_manager(&fixture);
+        fixture
+            .store
+            .conn
+            .execute(
+                "UPDATE sessions SET project_id=?1 WHERE sandbox_custody_id IS NOT NULL",
+                [project.to_string()],
+            )
+            .unwrap();
+        let tail = fixture
+            .store
+            .source_worktree_inventory_page(&identity, Some(Uuid::from_u128(256)))
+            .unwrap()
+            .0;
+        let row = |id| {
+            tail.iter()
+                .find(|row| row.custody_id == Uuid::from_u128(id))
+                .unwrap()
+        };
+        std::fs::write(
+            Path::new(&row(1001).sandbox_root).join("tracked"),
+            "dirty\n",
+        )
+        .unwrap();
+        let active_id = row(1002).session_id.unwrap();
+        // Keep the owner terminal in storage: the independent runtime fence
+        // must still protect it.
+        let unlanded = Path::new(&row(1003).sandbox_root);
+        std::fs::write(unlanded.join("tracked"), "unlanded\n").unwrap();
+        git(unlanded, &["add", "tracked"]);
+        git(unlanded, &["commit", "-qm", "unlanded source"]);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        fixture.store.conn.execute(
+            "INSERT INTO scheduled_jobs(id,name,message,schedule_json,next_fire_at,enabled,working_dir,created_at,updated_at,wake_mode)
+             VALUES(?1,'page-dependency','hold','{}',?2,1,?3,?2,?2,'fresh')",
+            rusqlite::params![Uuid::new_v4().to_string(), now, row(1004).sandbox_root],
+        ).unwrap();
+        // An uncovered terminal owner remains foreign even on the last page.
+        let mut foreign_project = fixture.store.get_project(project).unwrap().unwrap();
+        foreign_project.id = Uuid::new_v4();
+        foreign_project.name = foreign_project.id.to_string();
+        foreign_project.path = None;
+        fixture.store.insert_project(&foreign_project).unwrap();
+        fixture
+            .store
+            .conn
+            .execute(
+                "UPDATE sessions SET project_id=?1 WHERE id=?2",
+                rusqlite::params![
+                    foreign_project.id.to_string(),
+                    row(1005).session_id.unwrap().to_string()
+                ],
+            )
+            .unwrap();
+        let mut after = None;
+        let mut seen = HashSet::new();
+        let mut snapshot_digest = None;
+        let mut dispositions = HashMap::new();
+        let mut eligible = Vec::new();
+        loop {
+            let (mut inventory, traversal) = fixture
+                .store
+                .source_worktree_inventory_page(&identity, after)
+                .unwrap();
+            fixture
+                .store
+                .scope_agent_source_worktree_inventory(caller, &identity, &mut inventory)
+                .unwrap();
+            let audit = git_worktree::with_repository_mutation(&fixture.repository, || {
+                bind_audit_traversal(
+                    build_audit_locked(
+                        &identity,
+                        &repo,
+                        &fixture.sandbox_base,
+                        inventory,
+                        &HashSet::from([active_id]),
+                        &[],
+                    )?,
+                    traversal,
+                )
+            })
+            .unwrap();
+            assert!(audit.report.items.len() <= 256);
+            let page = audit.report.traversal.as_ref().unwrap();
+            assert_eq!(page.snapshot_root_count, 262);
+            if let Some(digest) = &snapshot_digest {
+                assert_eq!(digest, &page.snapshot_digest);
+            }
+            snapshot_digest = Some(page.snapshot_digest.clone());
+            for item in &audit.report.items {
+                assert!(
+                    seen.insert(item.custody_id),
+                    "a root must be examined exactly once"
+                );
+                dispositions.insert(item.custody_id, item.disposition.clone());
+            }
+            eligible.extend(audit.eligible.iter().map(|item| item.inventory.custody_id));
+            if after.is_none() {
+                assert_eq!(audit.report.counts.eligible, 0);
+                assert!(
+                    fixture.allocation.root.is_dir(),
+                    "unexamined eligible root is preserved"
+                );
+            }
+            if !page.has_more {
+                break;
+            }
+            after = Some(page.last_custody_id);
+        }
+        assert_eq!(seen.len(), 262);
+        assert_eq!(eligible, vec![fixture.custody_id]);
+        for (id, expected) in [
+            (1001, D::DirtyWorktree),
+            (1002, D::ActiveOwner),
+            (1003, D::RetainedNonAncestor),
+            (1004, D::ScheduledDependency),
+            (1005, D::RetainedForeignOwner),
+        ] {
+            assert_eq!(dispositions[&Uuid::from_u128(id)], expected);
+            assert!(Path::new(&row(id).sandbox_root).is_dir());
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn paged_apply_binds_snapshot_hint_freshness_and_exact_retry_identity() {
+        let mut fixture = IntegratedFixture::new("page-proof");
+        let identity = fixture.target.repository_identity.clone();
+        let repo = fixture
+            .target
+            .canonical_repo_dir
+            .to_str()
+            .unwrap()
+            .to_string();
+        for index in 1..=256 {
+            fixture.insert_synthetic_custody_with_id(
+                "protected",
+                identity.clone(),
+                repo.clone(),
+                Uuid::from_u128(index),
+            );
+        }
+        let after = Some(Uuid::from_u128(256));
+        let snapshot = fixture.audit_page(after);
+        assert_eq!(snapshot.report.counts.eligible, 1);
+        let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: after,
+            repository_identity: identity.clone(),
+            plan_digest: snapshot.report.plan_digest.clone(),
+            authorization: snapshot.report.authorization_phrase.clone().unwrap(),
+            idempotency_key: "page-proof".into(),
+        };
+        let fingerprint = |hint| {
+            hash_canonical(&CanonicalApplyFingerprint {
+                after_custody_id: hint,
+                schema_version: 1,
+                policy_version: 1,
+                repository_identity: &identity,
+                plan_digest: params.plan_digest.as_str(),
+                authorization_digest: "phrase-digest",
+                idempotency_key: &params.idempotency_key,
+            })
+            .unwrap()
+        };
+        assert_ne!(fingerprint(after), fingerprint(None));
+        assert_ne!(
+            snapshot.report.plan_digest,
+            fixture
+                .audit_page(Some(Uuid::from_u128(255)))
+                .report
+                .plan_digest
         );
+        // Membership drift outside the selected page invalidates its exact
+        // snapshot proof, even though the eligible root itself is unchanged.
+        fixture.insert_synthetic_custody_with_id(
+            "inserted",
+            identity.clone(),
+            repo.clone(),
+            Uuid::from_u128(257),
+        );
+        assert!(check_snapshot_authorizes_apply(&fixture.audit_page(after), &params).is_err());
+        let fresh = fixture.audit_page(after);
+        let mut run = fixture.run_from_audit(&fresh, "page-replay");
+        run.retained = retained_roots_of(&fresh.report);
+        fixture
+            .store
+            .insert_source_worktree_settlement_run(&run)
+            .unwrap();
+        let journal = fixture.journal_item(run.run_id);
+        assert!(
+            journal_inventory_matches(
+                &fixture.store,
+                run.run_id,
+                &journal,
+                &fixture.allocation.root
+            )
+            .unwrap(),
+            "journal reproof must find the exact custody beyond page one"
+        );
+        std::fs::write(fixture.allocation.root.join("tracked"), "became dirty\n").unwrap();
+        assert!(
+            check_snapshot_authorizes_apply(
+                &fixture.audit_page(after),
+                &ApplySourceWorktreeCohortParams {
+                    after_custody_id: after,
+                    repository_identity: identity,
+                    plan_digest: fresh.report.plan_digest,
+                    authorization: fresh.report.authorization_phrase.unwrap(),
+                    idempotency_key: "page-dirty".into(),
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .replay_source_worktree_settlement_run(
+                    &run.repository_identity,
+                    &run.idempotency_key,
+                    &run.request_fingerprint
+                )
+                .unwrap()
+                .unwrap()
+                .run_id,
+            run.run_id
+        );
+        assert!(fixture.allocation.root.is_dir());
+        std::fs::write(fixture.allocation.root.join("tracked"), "base\n").unwrap();
+        let (outcome, store) = fixture.replay_run(run.run_id);
+        assert_eq!(outcome.receipt.counts.settled, 1, "{:#?}", outcome.receipt);
+        assert_eq!(
+            store
+                .blocking_lock()
+                .get_session(fixture.session_id)
+                .unwrap()
+                .unwrap()
+                .sandbox_cleanup_state,
+            Some(SandboxCleanupState::Purged)
+        );
+        let remaining = store
+            .blocking_lock()
+            .source_worktree_inventory_page(&run.repository_identity, None)
+            .unwrap();
+        assert_eq!(remaining.1.unwrap().snapshot_root_count, 257);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn detached_audit_page_retries_join_only_the_same_page() {
+        let identity = format!("page-retry:{}", Uuid::new_v4());
+        let caller = Uuid::new_v4();
+        let first = (identity.clone(), caller, None);
+        let next = (identity, caller, Some(Uuid::from_u128(256)));
+        let (first_id, first_sender, _) = join_or_register_pending_audit(&first);
+        assert!(first_sender.is_some());
+        let (retry_id, retry_sender, _) = join_or_register_pending_audit(&first);
+        assert_eq!(retry_id, first_id);
+        assert!(retry_sender.is_none());
+        let (next_id, next_sender, _) = join_or_register_pending_audit(&next);
+        assert_ne!(first_id, next_id);
+        assert!(next_sender.is_some());
+        remove_pending_audit(&first, first_id);
+        remove_pending_audit(&next, next_id);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -11346,12 +12126,40 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
+    fn non_rust_marker_audit_reads_fresh_paths_401() {
+        let fixture = IntegratedFixture::new("makefile-marker-401");
+        std::fs::write(
+            fixture.allocation.root.join(".rsi-build-env.json"),
+            br#"{"version":1,"env":{"CARGO_BUILD_JOBS":"2"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(fixture.allocation.root.join("target/.rsi-tmp")).unwrap();
+        let clean = fixture.audit();
+        assert_eq!(clean.report.counts.eligible, u32::from(cfg!(unix)));
+        let authored = fixture.allocation.root.join("operator draft.txt");
+        std::fs::write(&authored, "unique work").unwrap();
+        let dirty = fixture.audit();
+        assert_eq!(
+            dirty.report.items[0].disposition,
+            SourceWorktreeDispositionV1::DirtyWorktree
+        );
+        assert_ne!(dirty.report.plan_digest, clean.report.plan_digest);
+        let detail = dirty.report.items[0].diagnostic.as_deref().unwrap();
+        assert!(detail.contains("fresh_git_status_v1"));
+        assert!(detail.contains("operator draft.txt"));
+        std::fs::remove_file(authored).unwrap();
+        assert_eq!(fixture.audit().report.plan_digest, clean.report.plan_digest);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
     fn audit_then_apply_binds_only_material_settlement_changes() {
         for change in [
             "none",
             "retained_activity",
             "caches",
             "dirty",
+            "marker_dirty",
             "target",
             "source",
             "dependency",
@@ -11399,6 +12207,13 @@ mod tests {
                     std::fs::write(path, "regenerable cache").unwrap();
                 }
             }
+            if change == "marker_dirty" {
+                std::fs::write(
+                    fixture.allocation.root.join(".rsi-build-env.json"),
+                    br#"{"version":1,"env":{"CARGO_BUILD_JOBS":"2"}}"#,
+                )
+                .unwrap();
+            }
             #[cfg(target_os = "linux")]
             let _proc = crate::session::reaper::scoped_archive_cleanup_test_proc(
                 fixture.session_id,
@@ -11436,6 +12251,7 @@ mod tests {
                 let identity = fixture.target.repository_identity.clone();
                 let audit = control.agent_audit_source_worktree_cohort(caller,
                     rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                        after_custody_id: None,
                         repository_identity: identity.clone(),
                     }).await.unwrap();
                 assert_eq!(audit.counts.eligible, 1, "{change}: {audit:#?}");
@@ -11447,7 +12263,7 @@ mod tests {
                         // A live worker's unrelated ref moves without changing the plan.
                         git(&fixture.repository, &["update-ref", &format!("refs/heads/{}", retained.sandbox_branch), &fixture.target.target_oid]);
                     }
-                    "dirty" => { std::fs::write(fixture.allocation.root.join("tracked"), "unique work").unwrap(); }
+                    "dirty" | "marker_dirty" => { std::fs::write(fixture.allocation.root.join("tracked"), "unique work").unwrap(); }
                     "target" => {
                         std::fs::write(fixture.repository.join("later"), "later").unwrap();
                         git(&fixture.repository, &["add", "later"]);
@@ -11467,6 +12283,7 @@ mod tests {
                     _ => {}
                 }
                 let result = agent_apply_to_completion(&manager, caller, ApplySourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: identity,
                     plan_digest: audit.plan_digest,
                     authorization: audit.authorization_phrase.unwrap(),
@@ -11608,7 +12425,7 @@ mod tests {
         let root = fixture.allocation.root.clone();
         let quarantine_holder_proc_root = fixture.quarantine_holder_proc.proc_root().to_path_buf();
         let quarantine_holder_proc_uid = fixture.quarantine_holder_proc.uid();
-        let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -11842,6 +12659,7 @@ mod tests {
         let authorization_digest = hash_bytes(authorization.as_bytes());
         let idempotency_key = "fixture:integrated-ancestor";
         let request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+            after_custody_id: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: &target.repository_identity,
@@ -11850,7 +12668,7 @@ mod tests {
             idempotency_key,
         })
         .expect("fixture request fingerprint");
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         // Settlement binds the fetched origin tip, not the local branch (#2040).
@@ -12274,6 +13092,7 @@ mod tests {
             // This test enters the real request replay path. Most fixture
             // tests enter the locked saga directly and use a synthetic hash.
             run.request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+                after_custody_id: None,
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                 repository_identity: &run.repository_identity,
@@ -12388,6 +13207,7 @@ mod tests {
             let audit = fixture.audit();
             let mut run = fixture.run_from_audit(&audit, "fixture:notice-fence");
             run.request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+                after_custody_id: None,
                 schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
                 policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
                 repository_identity: &run.repository_identity,
@@ -12495,6 +13315,7 @@ mod tests {
         let audit = fixture.audit();
         let mut run = fixture.run_from_audit(&audit, "fixture:notice-apply-fence");
         run.request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+            after_custody_id: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: &run.repository_identity,
@@ -12870,7 +13691,7 @@ mod tests {
                             .insert(callback_base, (u64::MAX, 192 * 1024 * 1024 * 1024));
                     }
                 });
-                let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+                let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                     &mut fixture.store,
                     crate::store::Store::open_in_memory().unwrap(),
                 )));
@@ -12986,7 +13807,7 @@ mod tests {
                     .list_source_worktree_settlement_journal_items(run.run_id)
                     .unwrap()
                     .remove(0);
-                let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+                let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                     &mut fixture.store,
                     crate::store::Store::open_in_memory().unwrap(),
                 )));
@@ -13234,7 +14055,7 @@ mod tests {
             .get_source_worktree_settlement_run(run.run_id)
             .unwrap()
             .unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
@@ -13425,6 +14246,7 @@ mod tests {
                     .agent_audit_source_worktree_cohort(
                         caller,
                         rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                            after_custody_id: None,
                             repository_identity: identity.clone(),
                         },
                     )
@@ -13467,6 +14289,7 @@ mod tests {
                     .agent_audit_source_worktree_cohort_view(
                         caller,
                         rsi_common::cohort_settlement::AgentAuditSourceWorktreeCohortParams {
+                            after_custody_id: None,
                             repository_identity: identity.clone(),
                             fields: Some(rsi_common::cohort_settlement::AgentSourceWorktreeAuditFieldsV1::Summary),
                         },
@@ -13478,6 +14301,7 @@ mod tests {
                 assert_eq!(summary["items"].as_array().unwrap().len(), audit.counts.eligible as usize);
                 assert_eq!(summary["plan_digest"], serde_json::json!(audit.plan_digest));
                 let params = ApplySourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: identity.clone(),
                     plan_digest: serde_json::from_value(summary["plan_digest"].clone()).unwrap(),
                     authorization: summary["authorization_phrase"].as_str().unwrap().to_owned(),
@@ -13605,6 +14429,7 @@ mod tests {
             .agent_audit_source_worktree_cohort(
                 caller,
                 rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: identity.clone(),
                 },
             )
@@ -13628,6 +14453,7 @@ mod tests {
             releases.push(release_tx);
         }
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity,
             plan_digest: audit.plan_digest,
             authorization: audit.authorization_phrase.unwrap(),
@@ -13736,6 +14562,7 @@ mod tests {
             .agent_audit_source_worktree_cohort(
                 caller,
                 rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: identity.clone(),
                 },
             )
@@ -13752,6 +14579,7 @@ mod tests {
             .session_id;
         let held_guard = super::super::spawn_single_flight::acquire_spawn_guard(held_session).await;
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity.clone(),
             plan_digest: audit.plan_digest.clone(),
             authorization: audit.authorization_phrase.clone().unwrap(),
@@ -13825,6 +14653,143 @@ mod tests {
             .expect_err("a settled cohort has nothing to apply");
     }
 
+    /// #3760: an agent audit whose per-root proof outlasts the response budget
+    /// answers the typed `source_settlement_audit_pending` (no plan, no write)
+    /// while the audit keeps running in the daemon; a second request joins the
+    /// same task, and a request after it finishes receives the finished audit
+    /// exactly once. The pause stands in for a cohort too large to prove inline.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_audit_beyond_its_budget_runs_in_the_background_and_is_collected() {
+        let mut fixture = IntegratedFixture::new("agent-audit-detached");
+        for index in 1..3 {
+            fixture.add_second_root(&format!("audit-detached-{index}"));
+        }
+        let (caller, project) = grant_storage_manager(&fixture);
+        fixture
+            .store
+            .conn
+            .execute(
+                "UPDATE sessions SET project_id=?1 WHERE sandbox_custody_id IS NOT NULL",
+                [project.to_string()],
+            )
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        let _proc = crate::session::reaper::scoped_archive_cleanup_test_proc(
+            fixture.session_id,
+            &fixture.sandbox_base,
+        );
+        let manager = Arc::new(
+            SessionManager::new(
+                Arc::new(crate::bus::EventBus::new(16)),
+                std::mem::replace(
+                    &mut fixture.store,
+                    crate::store::Store::open_in_memory().unwrap(),
+                ),
+                false,
+                fixture._directory.path().join("daemon.sock"),
+                None,
+                Vec::new(),
+                crate::config::RuntimeConfig::from_config(&crate::config::Config::default()),
+                fixture.sandbox_base.clone(),
+            )
+            .unwrap(),
+        );
+        manager
+            .topology_agent_self
+            .set(Arc::downgrade(&manager))
+            .unwrap();
+        tokio::task::yield_now().await;
+        let control = manager.agent_control();
+        let identity = fixture.target.repository_identity.clone();
+        let params = || rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+            after_custody_id: None,
+            repository_identity: identity.clone(),
+        };
+        let budget = std::time::Duration::from_millis(300);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        AUDIT_INPUTS_PAUSE.lock().unwrap().insert(
+            identity.clone(),
+            SettlementProofPause {
+                reached: reached_tx,
+                release: release_rx,
+            },
+        );
+        let started = std::time::Instant::now();
+        let error = control
+            .agent_audit_source_worktree_cohort_detached(caller, params(), budget)
+            .await
+            .expect_err("an audit past its budget answers pending");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("expected the typed pending answer, got {error:?}");
+        };
+        assert_eq!(data["code"], "source_settlement_audit_pending");
+        assert_eq!(data["disposition"], "pending");
+        assert_eq!(data["writes"], 0);
+        assert_eq!(data["audit_running"], true);
+        assert!(data["retry_after_secs"].as_u64().unwrap() > 0);
+        assert!(data.get("plan_digest").is_none());
+        assert!(data.get("authorization_phrase").is_none());
+        let audit_id = data["audit_id"].as_str().unwrap().to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            reached_rx.recv_timeout(std::time::Duration::from_secs(60))
+        })
+        .await
+        .unwrap()
+        .expect("the background audit loaded its inputs");
+
+        // A retry joins the running task: same audit id, no second audit.
+        let DaemonError::StructuredRpc { data, .. } = control
+            .agent_audit_source_worktree_cohort_detached(caller, params(), budget)
+            .await
+            .expect_err("the audit is still running")
+        else {
+            panic!("expected the typed pending answer");
+        };
+        assert_eq!(data["audit_id"], audit_id);
+
+        release_tx.send(()).unwrap();
+        let audit = control
+            .agent_audit_source_worktree_cohort_detached(
+                caller,
+                params(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("the finished audit is collected");
+        assert!(audit.applyable, "{audit:#?}");
+        assert_eq!(audit.counts.eligible, 3, "{audit:#?}");
+        assert!(audit.authorization_phrase.is_some());
+        assert!(
+            !pending_audits()
+                .lock()
+                .unwrap()
+                .contains_key(&(identity.clone(), caller, None)),
+            "a delivered audit leaves no registry entry"
+        );
+
+        // The next request audits afresh and the agent view answers inline.
+        let summary = control
+            .agent_audit_source_worktree_cohort_view(
+                caller,
+                rsi_common::cohort_settlement::AgentAuditSourceWorktreeCohortParams {
+                    after_custody_id: None,
+                    repository_identity: identity.clone(),
+                    fields: Some(
+                        rsi_common::cohort_settlement::AgentSourceWorktreeAuditFieldsV1::Summary,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary["view"], "summary");
+        assert_eq!(summary["plan_digest"], serde_json::json!(audit.plan_digest));
+    }
+
     /// #2869: a detached apply whose whole-cohort audit outlasts the caller's
     /// budget (the repository is held by another operation) answers the typed
     /// `source_settlement_apply_pending` within the budget and writes nothing,
@@ -13879,6 +14844,7 @@ mod tests {
             .agent_audit_source_worktree_cohort(
                 caller,
                 rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                    after_custody_id: None,
                     repository_identity: identity.clone(),
                 },
             )
@@ -13913,6 +14879,7 @@ mod tests {
         // A stale digest ends the audit task before any effect; the retry
         // receives that refusal, not a run.
         let mut stale = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity.clone(),
             plan_digest: Sha256Digest::parse(format!("sha256:{}", "0".repeat(64))).unwrap(),
             authorization: String::new(),
@@ -13954,6 +14921,7 @@ mod tests {
 
         // A matching digest: the same task records the run once the audit ends.
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: identity.clone(),
             plan_digest: audit.plan_digest.clone(),
             authorization: audit.authorization_phrase.clone().unwrap(),
@@ -14064,7 +15032,7 @@ mod tests {
             fixture.store.conn.execute_batch("CREATE TEMP TRIGGER revoke_storage_after_settled
                 AFTER UPDATE OF phase ON source_worktree_settlement_items WHEN NEW.phase='settled'
                 BEGIN UPDATE harness_manager_v2_policies SET policy_json=json_set(policy_json,'$.paused',json('true')); END;").unwrap();
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut fixture.store,
                 crate::store::Store::open_in_memory().unwrap(),
             )));
@@ -14202,7 +15170,7 @@ mod tests {
         let (caller, _) = grant_storage_manager(&fixture);
         let audit = fixture.audit();
         let run = fixture.run_from_audit(&audit, "agent-apply-replay");
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -14288,7 +15256,7 @@ mod tests {
         assert_eq!(audit.report.counts.eligible, 1);
         assert_eq!(audit.report.counts.retained, 2);
         let run = fixture.run_from_audit(&audit, "retained-snapshot");
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -14392,7 +15360,7 @@ mod tests {
         let audit = fixture.audit();
         let run = fixture.run_from_audit(&audit, "agent-retained-snapshot");
         let identity = fixture.target.repository_identity.clone();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -14462,6 +15430,7 @@ mod tests {
             tokio::task::yield_now().await;
             let control = manager.agent_control();
             let params = || rsi_common::cohort_settlement::AuditSourceWorktreeCohortParams {
+                after_custody_id: None,
                 repository_identity: identity.clone(),
             };
             let audit = control
@@ -14561,7 +15530,7 @@ mod tests {
             assert!(!audit.report.applyable);
             let digest = audit.report.plan_digest.as_str().to_string();
             let identity = fixture.target.repository_identity.clone();
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut fixture.store,
                 crate::store::Store::open_in_memory().unwrap(),
             )));
@@ -14645,7 +15614,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -14947,6 +15916,7 @@ mod tests {
         let authorization_digest = hash_bytes(authorization.as_bytes());
         let idempotency_key = "fixture:fresh-apply-orphan";
         let request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+            after_custody_id: None,
             schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
             policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
             repository_identity: &repository_identity,
@@ -14958,7 +15928,7 @@ mod tests {
         let owner_id = fixture.session_id;
         let repository = fixture.repository.clone();
         let sandbox_base = fixture.sandbox_base.clone();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().expect("replacement fixture Store"),
         )));
@@ -14992,6 +15962,117 @@ mod tests {
             SourceWorktreeSettlementPhaseV1::Settled
         );
         orphan.wait_signalled("fresh apply orphan");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn fresh_apply_records_unproven_survivors_on_the_receipt_without_signalling_them() {
+        // #149: the reap reports processes whose environment macOS withheld
+        // (injected here: fake pids, never a real process or signal). The
+        // receipt names the one in the run root with that root, the one in
+        // the cohort repository with no root, and leaves an unrelated one out.
+        let mut fixture = IntegratedFixture::new("fresh-apply-unproven");
+        let audit = fixture.audit();
+        let repository_identity = fixture.target.repository_identity.clone();
+        let plan_digest = audit.report.plan_digest.as_str().to_string();
+        let authorization = audit
+            .report
+            .authorization_phrase
+            .as_deref()
+            .expect("fresh apply authorization");
+        let authorization_digest = hash_bytes(authorization.as_bytes());
+        let idempotency_key = "fixture:fresh-apply-unproven";
+        let request_fingerprint = hash_canonical(&CanonicalApplyFingerprint {
+            after_custody_id: None,
+            schema_version: SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+            policy_version: SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
+            repository_identity: &repository_identity,
+            plan_digest: &plan_digest,
+            authorization_digest: authorization_digest.as_str(),
+            idempotency_key,
+        })
+        .expect("fresh apply request fingerprint");
+        let owner_id = fixture.session_id;
+        let custody_id = fixture.custody_id;
+        let root = fixture.allocation.root.clone();
+        let repository = fixture.repository.clone();
+        let sandbox_base = fixture.sandbox_base.clone();
+        let fake = |pid: u32, cwd: PathBuf| crate::session::reaper::UnprovenProcess {
+            // Far above any pid XNU hands out (99 999), so nothing could be
+            // signalled even by mistake.
+            pid,
+            start_time_micros: 1_700_000_000_000_000,
+            executable: Some(PathBuf::from(format!("/opt/hardened/bin/tool-{pid}"))),
+            working_directory: Some(cwd),
+        };
+        crate::session::reaper::inject_unproven_settlement_processes(
+            owner_id,
+            vec![
+                fake(2_000_000_001, root.join("src")),
+                fake(2_000_000_002, repository.clone()),
+                fake(2_000_000_003, PathBuf::from("/Applications/Unrelated.app")),
+                crate::session::reaper::UnprovenProcess {
+                    working_directory: None,
+                    ..fake(2_000_000_004, PathBuf::new())
+                },
+            ],
+        );
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
+            &mut fixture.store,
+            crate::store::Store::open_in_memory().expect("replacement fixture Store"),
+        )));
+        let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+
+        let receipt = fixture
+            .with_quarantine_holder_test_proc(|| {
+                git_worktree::with_repository_mutation(&repository, || {
+                    apply_locked_with_orphan_proof(
+                        ApplyStart::Fresh(audit),
+                        &repository_identity,
+                        idempotency_key,
+                        &plan_digest,
+                        authorization_digest.as_str(),
+                        request_fingerprint.as_str(),
+                        &sandbox_base,
+                        &store,
+                        &active,
+                        &completed,
+                        true,
+                    )
+                })
+            })
+            .expect("fresh apply records its unproven survivors")
+            .receipt;
+        let survivors = &receipt.unproven_survivors;
+        assert_eq!(survivors.len(), 2, "{receipt:#?}");
+        assert_eq!(survivors[0].sequence, 0);
+        assert_eq!(survivors[0].pid, 2_000_000_001);
+        assert_eq!(survivors[0].session_id, Some(owner_id));
+        assert_eq!(survivors[0].custody_id, Some(custody_id));
+        assert_eq!(
+            survivors[0].sandbox_root.as_deref(),
+            Some(root.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            survivors[0].executable.as_deref(),
+            Some("/opt/hardened/bin/tool-2000000001")
+        );
+        assert_eq!(
+            survivors[0].reason,
+            rsi_common::cohort_settlement::SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos
+        );
+        assert_eq!(survivors[1].sequence, 1);
+        assert_eq!(survivors[1].pid, 2_000_000_002);
+        assert_eq!(survivors[1].sandbox_root, None);
+        assert_eq!(survivors[1].session_id, None);
+        // The stored receipt is the one an operator reads back.
+        let reread = store
+            .blocking_lock()
+            .get_source_worktree_settlement_run(receipt.run_id)
+            .expect("reread run")
+            .expect("run exists");
+        assert_eq!(&reread.unproven_survivors, survivors);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -15063,7 +16144,7 @@ mod tests {
 
         let repository = fixture.repository.clone();
         let sandbox_base = fixture.sandbox_base.clone();
-        let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let outcome = git_worktree::with_repository_mutation(&repository, || {
@@ -15113,6 +16194,7 @@ mod tests {
         let fixture = IntegratedFixture::new("fresh-apply-proof-failure");
         let audit = fixture.audit();
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: fixture.target.repository_identity.clone(),
             plan_digest: audit.report.plan_digest.clone(),
             authorization: audit
@@ -15176,6 +16258,7 @@ mod tests {
         let fixture = IntegratedFixture::new("fresh-apply-reap-failure");
         let audit = fixture.audit();
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: fixture.target.repository_identity.clone(),
             plan_digest: audit.report.plan_digest.clone(),
             authorization: audit
@@ -15673,7 +16756,7 @@ mod tests {
             .expect("fixture replay receipt");
         let idempotency_key = receipt.idempotency_key.clone();
         let plan_digest = receipt.plan_digest.as_str().to_string();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().expect("replacement fixture Store"),
         )));
@@ -16486,6 +17569,7 @@ mod tests {
                 assert_eq!(fresh_audit.counts.eligible, if drift { 2 } else { 3 });
                 let fresh = manager
                     .apply_source_worktree_cohort(ApplySourceWorktreeCohortParams {
+                        after_custody_id: None,
                         repository_identity: run.repository_identity.clone(),
                         plan_digest: fresh_audit.plan_digest,
                         authorization: fresh_audit.authorization_phrase.unwrap(),
@@ -18460,7 +19544,7 @@ mod tests {
             .store
             .list_source_worktree_settlement_journal_items(run.run_id)
             .unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -18559,6 +19643,7 @@ mod tests {
         let fixture = IntegratedFixture::new("cancelled-apply");
         let audit = fixture.audit();
         let params = ApplySourceWorktreeCohortParams {
+            after_custody_id: None,
             repository_identity: fixture.target.repository_identity.clone(),
             plan_digest: audit.report.plan_digest.clone(),
             authorization: audit.report.authorization_phrase.clone().unwrap(),
@@ -18672,7 +19757,7 @@ mod tests {
         );
         let idempotency_key = receipt.idempotency_key.clone();
         let plan_digest = receipt.plan_digest.as_str().to_string();
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().expect("replacement fixture Store"),
         )));
@@ -18761,7 +19846,7 @@ mod tests {
             .list_source_worktree_settlement_journal_items(run.run_id)
             .unwrap()
             .remove(0);
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().unwrap(),
         )));
@@ -18851,7 +19936,7 @@ mod tests {
                 .list_source_worktree_settlement_journal_items(run.run_id)
                 .unwrap()
                 .remove(0);
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut fixture.store,
                 crate::store::Store::open_in_memory().unwrap(),
             )));
@@ -19173,7 +20258,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().expect("replacement fixture Store"),
         )));
@@ -19296,7 +20381,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
             &mut fixture.store,
             crate::store::Store::open_in_memory().expect("replacement fixture Store"),
         )));
@@ -20737,7 +21822,7 @@ mod tests {
                 .store
                 .list_source_worktree_settlement_journal_items(run.run_id)
                 .expect("settlement journal");
-            let store = Arc::new(tokio::sync::Mutex::new(std::mem::replace(
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(std::mem::replace(
                 &mut self.store,
                 crate::store::Store::open_in_memory().expect("placeholder Store"),
             )));
@@ -20763,6 +21848,105 @@ mod tests {
                 .into_inner();
             settled
         }
+    }
+
+    /// #3908: a lead waiting only for manager mail owns resumable work even
+    /// with a clean, integrated checkout and no wake/job/queue dependency.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn a_parked_epic_lead_is_retained_until_explicitly_unassigned() {
+        let fixture = IntegratedFixture::new("parked-epic-lead-audit");
+        let mut epic = rsid_store::test_support::make_test_session();
+        epic.session_kind = rsi_common::types::SessionKind::Epic;
+        epic.status = SessionStatus::Completed;
+        fixture.store.insert_session(&epic).unwrap();
+        fixture
+            .store
+            .update_session_parent(fixture.session_id, Some(epic.id))
+            .unwrap();
+        fixture
+            .store
+            .set_lead_session(epic.id, Some(fixture.session_id))
+            .unwrap();
+        for status in [
+            SessionStatus::Completed,
+            SessionStatus::Failed,
+            SessionStatus::Interrupted,
+        ] {
+            fixture
+                .store
+                .update_session_status(fixture.session_id, status)
+                .unwrap();
+            let audit = fixture.audit();
+            assert_eq!(
+                audit.report.items[0].disposition,
+                SourceWorktreeDispositionV1::NonterminalStatus
+            );
+            assert!(
+                audit.report.items[0]
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("live_epic_lead")
+            );
+            assert!(fixture.allocation.root.exists());
+        }
+        fixture.store.set_lead_session(epic.id, None).unwrap();
+        assert_eq!(fixture.audit().eligible.len(), 1);
+    }
+
+    /// A lead assigned after the audit is caught by the existing shared
+    /// pre-effect fence, before either its worktree or branch is removed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn a_lead_assigned_after_settlement_intent_keeps_its_sandbox() {
+        let mut fixture = IntegratedFixture::new("parked-epic-lead-fence");
+        let mut epic = rsid_store::test_support::make_test_session();
+        epic.session_kind = rsi_common::types::SessionKind::Epic;
+        epic.status = SessionStatus::Completed;
+        fixture.store.insert_session(&epic).unwrap();
+        fixture
+            .store
+            .update_session_parent(fixture.session_id, Some(epic.id))
+            .unwrap();
+        let run = fixture.commit_intent("fixture:parked-epic-lead-fence");
+        fixture
+            .store
+            .set_lead_session(epic.id, Some(fixture.session_id))
+            .unwrap();
+        assert!(!fixture.settle_first_item(&run));
+        assert_eq!(
+            fixture.journal_item(run.run_id).phase,
+            SourceWorktreeSettlementPhaseV1::Unattempted
+        );
+        assert!(fixture.allocation.root.exists());
+        assert_eq!(
+            git(
+                &fixture.repository,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("refs/heads/{}", fixture.branch)
+                ]
+            ),
+            fixture.source_oid
+        );
+        let lead = fixture
+            .store
+            .get_session(fixture.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lead.status, SessionStatus::Completed);
+        assert_eq!(lead.sandbox_cleanup_state, Some(SandboxCleanupState::Live));
+        assert_eq!(
+            fixture
+                .store
+                .get_session(epic.id)
+                .unwrap()
+                .unwrap()
+                .lead_session_id,
+            Some(lead.id)
+        );
     }
 
     /// #247: a manager-halted worker bound to an unfinished Issue is paused

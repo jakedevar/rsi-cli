@@ -192,7 +192,7 @@ impl Store {
              SET last_fired_at=COALESCE(?1,last_fired_at),next_fire_at=COALESCE(?2,next_fire_at),
                  enabled=?3,updated_at=?4,
                  schedule_json=CASE WHEN ?7 AND json_valid(schedule_json)
-                     THEN json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention','$.delivery_claim')
+                     THEN json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention','$.delivery_claim','$.busy_target_hold')
                      ELSE schedule_json END
              WHERE id=?5 AND (
                 (?6 IS NOT NULL AND enabled=1 AND EXISTS(

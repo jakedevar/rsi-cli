@@ -1147,6 +1147,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "runner_command",
     ),
     exclusion(
+        "repo_guard_run",
+        "crates/rsid/src/repo_guard_call.rs",
+        "run_guard",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "exe",
+    ),
+    exclusion(
         "deploy_binary_build_info",
         "crates/rsid/src/deploy.rs",
         "probe_binary",
@@ -1173,6 +1180,13 @@ pub const NON_INVOCATIONS: &[NonInvocationContract] = &[
         "run_lander",
         AllowedExclusionOperation::UtilityCliSpawn,
         "--accepted",
+    ),
+    exclusion(
+        "rolling_queue_lander_detached",
+        "crates/rsid/src/rolling_queue.rs",
+        "run_detached_lander",
+        AllowedExclusionOperation::UtilityCliSpawn,
+        "DERIVED_FILTERS_FILE_ENV",
     ),
     exclusion(
         "rolling_queue_candidate_delta",

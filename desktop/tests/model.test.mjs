@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  eventKind, mergeEvents, maxSequence, relativeTime, sessionLabel, visibleSessions,
+  emptyListView, eventKind, mergeEvents, maxSequence, relativeTime, sessionLabel, statusLabel, visibleSessions,
 } from '../dist/model.js';
 
 const base = {
@@ -58,4 +58,16 @@ test('elideBlobs replaces long base64 runs and keeps prose', async () => {
   const blob = 'A'.repeat(4096);
   assert.equal(elideBlobs(`img ${blob} end`), 'img [3 KiB base64 elided] end');
   assert.equal(elideBlobs('short text stays'), 'short text stays');
+});
+
+test('status label says Waiting for you in plain words; other statuses stay', () => {
+  assert.equal(statusLabel('WaitingApproval'), 'Waiting for you');
+  assert.equal(statusLabel('Running'), 'Running');
+  assert.equal(statusLabel('Completed'), 'Completed');
+});
+
+test('empty session list names the next step', () => {
+  const base = { view: 'active', zone: 'main', total: 3, text: '', projectOn: false, finishedHidden: false, hidden: { finished: 0, archived: 0, otherProjects: 0 } };
+  assert.equal(emptyListView({ ...base, total: 0 }).text, 'No sessions yet. Click New session to start one.');
+  assert.equal(emptyListView({ ...base, view: 'archived', total: 0 }).text, 'No archived sessions.');
 });

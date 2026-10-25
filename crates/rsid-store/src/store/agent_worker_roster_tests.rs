@@ -6,7 +6,7 @@ use crate::test_support::test_session;
 use chrono::Utc;
 use rsi_common::agent_jobs::{JobKind, JobState};
 use rsi_common::agent_worker_roster::{
-    WORKER_ROSTER_INVALID_REQUEST, WORKER_ROSTER_NOT_AUTHORIZED,
+    WORKER_ROSTER_INVALID_REQUEST, WORKER_ROSTER_NOT_AUTHORIZED, WorkerRosterFieldsV1,
 };
 use rsi_common::global_manager::{ConfigureGlobalManagerRequestV1, MANAGER_PROJECT_NOT_IN_SCOPE};
 use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
@@ -181,7 +181,7 @@ impl World {
             .execute(
                 "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
                     log_path,status_path,state,exit_code,result_json,created_at,row_version)
-                 VALUES(?1,?2,?3,'{}','/tmp',?4,'/tmp/l','/tmp/s',?5,?6,?7,
+                 VALUES(?1,?2,?3,'{\"wake\":\"none\"}','/tmp',?4,'/tmp/l','/tmp/s',?5,?6,?7,
                     '2026-10-01T00:00:00.000000000Z',1)",
                 params![
                     id.to_string(),
@@ -244,9 +244,16 @@ impl World {
         self.store.agent_worker_roster_at(caller, &request, now())
     }
 
-    fn manager_roster(&self) -> AgentWorkerRosterResultV1 {
-        self.roster(self.manager, AgentWorkerRosterRequestV1::default())
-            .unwrap()
+    /// Classification tests inspect all history independently of summary cutoffs.
+    fn manager_full_roster(&self) -> AgentWorkerRosterResultV1 {
+        self.roster(
+            self.manager,
+            AgentWorkerRosterRequestV1 {
+                fields: Some(WorkerRosterFieldsV1::Full),
+                ..AgentWorkerRosterRequestV1::default()
+            },
+        )
+        .unwrap()
     }
 }
 
@@ -279,6 +286,221 @@ fn job_wake_predicate(job: Uuid) -> serde_json::Value {
     })
 }
 
+impl World {
+    fn finished_worker(&self, status: SessionStatus, activity: &str) -> Uuid {
+        let worker = self.worker(status, None, activity);
+        if status == SessionStatus::Completed {
+            self.say(worker, Role::Assistant, "RESULT: done");
+        }
+        self.store
+            .conn
+            .execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                params![worker.to_string(), activity],
+            )
+            .unwrap();
+        worker
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn default_view_omits_a_final_handoff_older_than_one_hour_and_reports_it_as_hidden() {
+    let world = World::new();
+    world.finished_worker(SessionStatus::Completed, "2026-10-13T12:59:59.999999999Z");
+    world.finished_worker(SessionStatus::Failed, T2);
+    world.finished_worker(SessionStatus::Interrupted, T1);
+    let running = world.worker(SessionStatus::Running, None, T0);
+    let job_worker = world.worker(SessionStatus::Completed, None, T1);
+    let job = world.job(job_worker, "test", "running", None, None);
+    world.wake(job_worker, WakeMode::Resume, Some(job_wake_predicate(job)));
+    let wake_worker = world.worker(SessionStatus::Completed, None, T2);
+    world.wake(wake_worker, WakeMode::Resume, None);
+    let stranded = world.worker(SessionStatus::Completed, None, T3);
+
+    for fields in [None, Some(WorkerRosterFieldsV1::Summary)] {
+        let roster = world
+            .roster(
+                world.manager,
+                AgentWorkerRosterRequestV1 {
+                    fields,
+                    ..AgentWorkerRosterRequestV1::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            roster
+                .workers
+                .iter()
+                .map(|w| w.session_id)
+                .collect::<Vec<_>>(),
+            [stranded, wake_worker, job_worker, running]
+        );
+        assert_eq!(roster.hidden_finished, 3);
+        assert_eq!(roster.stale_stranded_hidden, 0);
+        assert_eq!(roster.count, 4);
+        assert_eq!(
+            roster.counts,
+            BTreeMap::from([
+                (WorkerRosterStateV1::Running, 1),
+                (WorkerRosterStateV1::ParkedOnJob, 1),
+                (WorkerRosterStateV1::ParkedOnWake, 1),
+                (WorkerRosterStateV1::Stranded, 1),
+            ])
+        );
+        assert!(!roster.truncated);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn default_view_includes_a_finished_worker_within_the_hour() {
+    let world = World::new();
+    let boundary = world.finished_worker(SessionStatus::Completed, T3);
+    let recent = world.finished_worker(SessionStatus::Failed, "2026-10-13T13:30:00.000000000Z");
+    let roster = world
+        .roster(world.manager, AgentWorkerRosterRequestV1::default())
+        .unwrap();
+    assert_eq!(
+        roster
+            .workers
+            .iter()
+            .map(|w| w.session_id)
+            .collect::<Vec<_>>(),
+        [recent, boundary]
+    );
+    assert_eq!(roster.count, 2);
+    assert_eq!(
+        roster.counts,
+        BTreeMap::from([
+            (WorkerRosterStateV1::FinalHandoff, 1),
+            (WorkerRosterStateV1::Failed, 1),
+        ])
+    );
+    assert_eq!(roster.hidden_finished, 0);
+    assert!(!roster.truncated);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn explicit_final_handoff_states_returns_the_old_worker() {
+    let world = World::new();
+    let old = world.finished_worker(SessionStatus::Completed, T0);
+    world.finished_worker(SessionStatus::Failed, T1);
+    for fields in [None, Some(WorkerRosterFieldsV1::Summary)] {
+        let roster = world
+            .roster(
+                world.manager,
+                AgentWorkerRosterRequestV1 {
+                    fields,
+                    states: vec![WorkerRosterStateV1::FinalHandoff],
+                    ..AgentWorkerRosterRequestV1::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            roster
+                .workers
+                .iter()
+                .map(|w| w.session_id)
+                .collect::<Vec<_>>(),
+            [old]
+        );
+        assert_eq!(
+            roster.counts,
+            BTreeMap::from([(WorkerRosterStateV1::FinalHandoff, 1)])
+        );
+        assert_eq!(roster.hidden_finished, 0);
+        assert!(!roster.truncated);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn fields_full_returns_everything() {
+    let world = World::new();
+    let old = world.finished_worker(SessionStatus::Completed, T0);
+    let failed = world.finished_worker(SessionStatus::Failed, T1);
+    let recent = world.finished_worker(SessionStatus::Completed, T3);
+    let stale_strand = world.worker(
+        SessionStatus::Completed,
+        None,
+        "2026-10-01T00:00:00.000000000Z",
+    );
+    let roster = world.manager_full_roster();
+    assert_eq!(
+        roster
+            .workers
+            .iter()
+            .map(|w| w.session_id)
+            .collect::<Vec<_>>(),
+        [recent, failed, old, stale_strand]
+    );
+    assert_eq!(roster.count, 4);
+    assert_eq!(
+        roster.counts,
+        BTreeMap::from([
+            (WorkerRosterStateV1::FinalHandoff, 2),
+            (WorkerRosterStateV1::Failed, 1),
+            (WorkerRosterStateV1::Stranded, 1),
+        ])
+    );
+    assert_eq!(roster.hidden_finished, 0);
+    assert_eq!(roster.stale_stranded_hidden, 0);
+    assert!(!roster.truncated);
+}
+
+/// History filtering precedes paging; counts still describe only the page.
+/// Like stale_stranded_hidden, hidden_finished counts the examined prefix.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn summary_filters_before_paging_and_keeps_counts_on_the_returned_page() {
+    let world = World::new();
+    world.finished_worker(SessionStatus::Completed, T3);
+    world.finished_worker(SessionStatus::Completed, T2);
+    let running = world.worker(SessionStatus::Running, None, T1);
+    let stranded = world.worker(SessionStatus::Completed, None, T0);
+    world.finished_worker(SessionStatus::Failed, "2026-10-13T09:00:00.000000000Z");
+    let roster = world
+        .roster(
+            world.manager,
+            AgentWorkerRosterRequestV1 {
+                limit: Some(2),
+                ..AgentWorkerRosterRequestV1::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(roster.count, 2);
+    assert_eq!(
+        roster.counts,
+        BTreeMap::from([
+            (WorkerRosterStateV1::FinalHandoff, 1),
+            (WorkerRosterStateV1::Running, 1),
+        ])
+    );
+    assert_eq!(roster.workers[1].session_id, running);
+    assert_eq!(roster.hidden_finished, 1);
+    assert!(roster.truncated);
+
+    // Removing the extra matching worker lets the scan reach older history.
+    world
+        .store
+        .update_session_status(stranded, SessionStatus::Archived)
+        .unwrap();
+    let roster = world
+        .roster(
+            world.manager,
+            AgentWorkerRosterRequestV1 {
+                limit: Some(2),
+                ..AgentWorkerRosterRequestV1::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(roster.count, 2);
+    assert_eq!(roster.hidden_finished, 2);
+    assert!(!roster.truncated);
+}
+
 /// A worker mid-turn is `running`; its Issue, model, effort and activity show.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
@@ -287,7 +509,7 @@ fn a_worker_mid_turn_is_running_with_its_issue_model_and_activity() {
     let issue = world.issue();
     let running = world.worker(SessionStatus::Running, Some(issue), T1);
     let waiting = world.worker(SessionStatus::WaitingApproval, None, T0);
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     assert_eq!(roster.scope.kind, WorkerRosterScopeKindV1::Project);
     assert_eq!(roster.scope.project_id, Some(world.project));
 
@@ -329,7 +551,7 @@ fn a_completed_worker_with_a_job_wake_is_parked_on_the_job() {
     let job = world.job(worker, "test", "running", None, None);
     let wake = world.wake(worker, WakeMode::Resume, Some(job_wake_predicate(job)));
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let row = state_of(&roster, worker);
     assert_eq!(row.state, WorkerRosterStateV1::ParkedOnJob);
     assert_eq!(row.session_status, "Completed");
@@ -361,6 +583,55 @@ fn a_completed_worker_with_a_job_wake_is_parked_on_the_job() {
         roster.counts.get(&WorkerRosterStateV1::ParkedOnJob),
         Some(&1)
     );
+}
+
+/// #364: an open owner-wake job parks its owner before a scheduled wake row
+/// exists. A silent settlement leaves the worker stranded again.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn owner_wake_job_parks_the_roster_only_while_open() {
+    for state in ["queued", "running"] {
+        for params in [r#"{"kind":"test"}"#, r#"{"kind":"test","wake":"owner"}"#] {
+            let world = World::new();
+            let worker = world.worker(SessionStatus::Completed, None, T1);
+            world.say(worker, Role::Assistant, "waiting for my job's owner wake");
+            let job = world.job(worker, "test", state, None, None);
+            world
+                .store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET params_json=?2 WHERE id=?1",
+                    params![job.to_string(), params],
+                )
+                .unwrap();
+
+            let roster = world.manager_full_roster();
+            let row = state_of(&roster, worker);
+            assert_eq!(row.state, WorkerRosterStateV1::ParkedOnJob);
+            assert_eq!(row.open_jobs, 1);
+            assert_eq!(row.pending_wakes.len(), 0);
+            assert_eq!(row.latest_job.as_ref().unwrap().job_id, job);
+
+            world
+                .store
+                .settle_agent_job(
+                    job,
+                    JobState::Succeeded,
+                    &rsi_common::agent_jobs::AgentJobResultV1 {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    },
+                    false,
+                    Utc::now(),
+                )
+                .unwrap();
+            let roster = world.manager_full_roster();
+            let row = state_of(&roster, worker);
+            assert_eq!(row.state, WorkerRosterStateV1::Stranded);
+            assert_eq!(row.open_jobs, 0);
+            assert_eq!(row.latest_job.as_ref().unwrap().state, JobState::Succeeded);
+        }
+    }
 }
 
 /// A `Completed` worker with another armed wake (a timer, a commit predicate,
@@ -399,7 +670,7 @@ fn a_completed_worker_with_another_armed_wake_is_parked_on_the_wake() {
     world.job(jobless_wake, "test", "succeeded", Some(0), None);
     world.wake(jobless_wake, WakeMode::Resume, None);
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     for worker in [timer, landing, watcher, jobless_wake] {
         assert_eq!(
             state_of(&roster, worker).state,
@@ -429,8 +700,8 @@ fn a_completed_worker_with_another_armed_wake_is_parked_on_the_wake() {
 }
 
 /// A `Completed` worker with no final report and nothing that will resume it is
-/// `stranded`, even when it left a job running (a running unit cannot resume
-/// it). A disabled wake does not count.
+/// `stranded`, even when it left a `wake: none` job running. A disabled wake
+/// does not count.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
 #[test]
 fn a_completed_worker_nothing_will_resume_is_stranded() {
@@ -459,7 +730,7 @@ fn a_completed_worker_nothing_will_resume_is_stranded() {
     world.say(watched, Role::Assistant, "waiting");
     world.wake(world.manager, WakeMode::OnTerminal(watched), None);
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     for worker in [bare, owns_job, retired_wake, watched] {
         let row = state_of(&roster, worker);
         assert_eq!(row.state, WorkerRosterStateV1::Stranded, "{worker}");
@@ -492,7 +763,7 @@ fn a_roster_job_carries_the_receipts_rolling_merge_fields_348() {
             }
         })),
     );
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let latest = state_of(&roster, worker).latest_job.as_ref().unwrap();
     assert_eq!(latest.merges_cleanly_onto_rolling, Some(false));
     assert_eq!(latest.conflict_paths.len(), ROSTER_CONFLICT_PATHS_MAX);
@@ -510,10 +781,36 @@ fn a_roster_job_carries_the_receipts_rolling_merge_fields_348() {
             "receipt": {"head": "d".repeat(40), "ok": true}
         })),
     );
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let latest = state_of(&roster, older).latest_job.as_ref().unwrap();
     assert_eq!(latest.merges_cleanly_onto_rolling, None);
     assert!(latest.conflict_paths.is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn a_roster_job_carries_the_signal_interruption_class_516() {
+    let world = World::new();
+    let worker = world.worker(SessionStatus::Completed, None, T1);
+    world.job(
+        worker,
+        "test",
+        "failed",
+        Some(1),
+        Some(serde_json::json!({
+            "exit_code": 1, "receipt": {"head": "c".repeat(40), "ok": false,
+                "failure_class": "infrastructure_interrupted"}
+        })),
+    );
+    let roster = world.manager_full_roster();
+    let latest = state_of(&roster, worker).latest_job.as_ref().unwrap();
+    assert_eq!(latest.state, JobState::Failed);
+    assert_eq!(
+        latest.failure_class.as_deref(),
+        Some("infrastructure_interrupted")
+    );
+    let wire = serde_json::to_value(latest).unwrap();
+    assert_eq!(wire["failure_class"], "infrastructure_interrupted");
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
@@ -538,7 +835,7 @@ fn a_completed_worker_with_a_final_handoff_is_final_with_its_receipt_head() {
         "PIPELINE HANDOFF — IMPLEMENTATION:\nFriction: none",
     );
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let row = state_of(&roster, worker);
     assert_eq!(row.state, WorkerRosterStateV1::FinalHandoff);
     assert!(row.final_handoff);
@@ -551,7 +848,7 @@ fn a_completed_worker_with_a_final_handoff_is_final_with_its_receipt_head() {
     // A later user turn without a new report makes it a live worker again.
     world.say(worker, Role::User, "one more thing");
     world.say(worker, Role::Assistant, "on it");
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     assert_eq!(
         state_of(&roster, worker).state,
         WorkerRosterStateV1::Stranded
@@ -628,7 +925,7 @@ fn a_provisional_handoff_beside_an_owed_job_result_wake_stays_parked_3090() {
     world.job(done, "test", "succeeded", Some(0), None);
     world.say(done, Role::Assistant, HANDOFF);
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let row = state_of(&roster, running);
     assert_eq!(row.state, WorkerRosterStateV1::ParkedOnJob);
     assert!(!row.final_handoff);
@@ -691,7 +988,7 @@ fn failed_and_interrupted_workers_are_failed_and_archived_ones_are_not_listed() 
     let archived = world.worker(SessionStatus::Archived, None, T2);
     let deleted = world.worker(SessionStatus::Deleted, None, T3);
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     assert_eq!(roster.count, 2);
     for worker in [failed, interrupted] {
         assert_eq!(state_of(&roster, worker).state, WorkerRosterStateV1::Failed);
@@ -721,6 +1018,7 @@ fn states_filter_and_limit_page_the_roster() {
             .roster(
                 world.manager,
                 AgentWorkerRosterRequestV1 {
+                    fields: Some(WorkerRosterFieldsV1::Full),
                     states,
                     limit,
                     ..AgentWorkerRosterRequestV1::default()
@@ -825,7 +1123,7 @@ fn a_non_manager_lists_only_the_workers_it_launched_itself() {
 
     // The manager's project view holds both the manager-launched worker and
     // the lead's child, and never the manager itself or the lead.
-    let project_view = world.manager_roster();
+    let project_view = world.manager_full_roster();
     let ids: Vec<Uuid> = project_view.workers.iter().map(|w| w.session_id).collect();
     assert!(
         ids.contains(&manager_worker) && ids.contains(&spawned),
@@ -951,7 +1249,7 @@ fn parked_states_agree_with_the_daemons_parked_session_predicate() {
     world.wake(workers[2], WakeMode::Resume, None);
     world.say(workers[3], Role::Assistant, "RESULT: done");
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     for worker in workers {
         let parked = world
             .store
@@ -1065,7 +1363,7 @@ fn a_worker_that_published_an_issue_handoff_without_the_marker_is_final_not_stra
             .unwrap();
     }
 
-    let roster = world.manager_roster();
+    let roster = world.manager_full_roster();
     let row = state_of(&roster, reviewer);
     assert_eq!(row.state, WorkerRosterStateV1::FinalHandoff);
     assert!(row.final_handoff);
@@ -1111,7 +1409,9 @@ fn stale_strands_leave_the_default_view_but_not_an_explicit_stranded_filter() {
             .unwrap();
     }
 
-    let default = world.manager_roster();
+    let default = world
+        .roster(world.manager, AgentWorkerRosterRequestV1::default())
+        .unwrap();
     assert_eq!(
         default
             .workers
@@ -1168,7 +1468,10 @@ fn list_wakes_serves_own_wakes_and_a_managers_live_worker_wakes_after_handoff() 
     let manager_wake = world.wake(world.manager, WakeMode::Resume, None);
 
     // The roster lists the worker; the wake read agrees.
-    assert_eq!(state_of(&world.manager_roster(), worker).session_id, worker);
+    assert_eq!(
+        state_of(&world.manager_full_roster(), worker).session_id,
+        worker
+    );
     // Default and explicit-self reads are caller-bound and unchanged.
     assert_eq!(
         read_wakes(&world.store, world.manager, None).unwrap(),
@@ -1741,7 +2044,10 @@ fn list_wakes_serves_topology_node_sessions_of_the_managers_project_only() {
         read_wakes(&world.store, world.manager, Some(node)).unwrap(),
         [wake]
     );
-    assert_eq!(state_of(&world.manager_roster(), node).session_id, node);
+    assert_eq!(
+        state_of(&world.manager_full_roster(), node).session_id,
+        node
+    );
 
     // An execution of another project is out of scope, even when it ran a node.
     let other = project(&world.store, "other-topology");
@@ -1775,4 +2081,96 @@ fn list_wakes_serves_an_epic_leads_own_execution_nodes_only() {
         code(read_wakes(&world.store, lead, Some(theirs)).unwrap_err()),
         LIST_WAKES_REFUSED
     );
+}
+
+/// Health and the roster agree on parked workers; jobs count separately even
+/// when one worker owns multiple jobs. Terminal history does not consume capacity.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn satellite_health_separates_running_parked_workers_and_open_jobs() {
+    let world = World::new();
+    world.worker(SessionStatus::Running, None, T0);
+    let job_worker = world.worker(SessionStatus::Completed, None, T1);
+    let wake_worker = world.worker(SessionStatus::Completed, None, T2);
+    let finished = world.worker(SessionStatus::Completed, None, T3);
+    world.say(job_worker, Role::Assistant, "verification submitted");
+    world.say(wake_worker, Role::Assistant, "waiting for rolling");
+    world.say(
+        finished,
+        Role::Assistant,
+        "PIPELINE HANDOFF — IMPLEMENTATION\nstatus: complete",
+    );
+    let job = world.job(job_worker, "test", "running", None, None);
+    world.job(job_worker, "test", "queued", None, None);
+    world.job(finished, "test", "succeeded", Some(0), None);
+    world.wake(job_worker, WakeMode::Resume, Some(job_wake_predicate(job)));
+    world.wake(wake_worker, WakeMode::Resume, None);
+    world.worker(SessionStatus::Completed, None, T3);
+    let disabled = world.worker(SessionStatus::Completed, None, T3);
+    let wake = world.wake(disabled, WakeMode::Resume, None);
+    world
+        .store
+        .conn
+        .execute(
+            "UPDATE scheduled_jobs SET enabled=0 WHERE id=?1",
+            [wake.to_string()],
+        )
+        .unwrap();
+    let counts = world.store.satellite_health_counts().unwrap();
+    assert_eq!(
+        (
+            counts.sessions_running,
+            counts.workers_parked,
+            counts.open_jobs
+        ),
+        (1, 2, 2)
+    );
+    let roster = world.manager_full_roster();
+    assert_eq!(
+        state_of(&roster, job_worker).state,
+        WorkerRosterStateV1::ParkedOnJob
+    );
+    assert_eq!(
+        state_of(&roster, wake_worker).state,
+        WorkerRosterStateV1::ParkedOnWake
+    );
+    assert_eq!(
+        state_of(&roster, finished).state,
+        WorkerRosterStateV1::FinalHandoff
+    );
+}
+
+/// #475: every terminal execution state completes its node workers even if
+/// their transcripts omit a final marker; an unsettled execution does not.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+#[test]
+fn completed_nodes_of_settled_executions_have_a_final_handoff() {
+    for status in ["succeeded", "failed", "cancelled", "blocked"] {
+        let world = World::new();
+        let node = world.topology_node_session(Some(world.project), Some(world.manager), None);
+        world
+            .store
+            .update_session_status(node, SessionStatus::Completed)
+            .unwrap();
+        assert_eq!(
+            state_of(&world.manager_full_roster(), node).state,
+            WorkerRosterStateV1::Stranded
+        );
+        world.store.conn.execute(
+            "UPDATE topology_executions SET status=?2 WHERE id=(SELECT execution_id FROM topology_node_attempts WHERE session_id=?1)",
+            params![node.to_string(), status],
+        ).unwrap();
+        let roster = world.manager_full_roster();
+        let worker = state_of(&roster, node);
+        assert_eq!(worker.state, WorkerRosterStateV1::FinalHandoff, "{status}");
+        assert!(worker.final_handoff);
+        world
+            .store
+            .update_session_status(node, SessionStatus::Running)
+            .unwrap();
+        assert_eq!(
+            state_of(&world.manager_full_roster(), node).state,
+            WorkerRosterStateV1::Running
+        );
+    }
 }

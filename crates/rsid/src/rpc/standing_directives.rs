@@ -58,6 +58,7 @@ impl RpcServer {
                 scope: params.scope,
                 text: &params.text,
                 provenance: None,
+                kind: rsi_common::standing_directives::StandingDirectiveKindV1::OperatorRelay,
                 expires_in_secs: params.expires_in_secs,
                 idempotency_key: &params.idempotency_key,
             },

@@ -7,9 +7,17 @@
 //! materialized read-only under `<jobs_dir>/scoped-test-tools/<rev>-<set digest>/`, unless
 //! the candidate diff itself changes the tool or one of its helpers: then the
 //! candidate's own copy runs, so a change to the tool is verified by that
-//! change. The copy that ran is named in the receipt (`tool`, filled in by the
-//! script from its own path and content hash; the daemon passes the source and
-//! the rev through the environment so an older script still runs).
+//! change. The daemon records the selected path/revision/file blobs before
+//! launch in the job's result JSON. The script's `tool` receipt is diagnostic
+//! only. `rolling_tool:true` forces trusted rolling verification (#579).
+//!
+//! #279: a candidate whose tool change sits in its base (an unlanded tool
+//! change the worker built on) leaves `base...head` untouched, yet its copy is
+//! the one under test. When the tool files changed on the candidate's side of
+//! `origin/rolling` (`rolling...head`) and still differ from rolling's bytes,
+//! the candidate's copy runs too, with `source: candidate_differs_from_rolling`.
+//! A sandbox merely behind rolling has no such change, so it still runs the
+//! rolling copy.
 //!
 //! Any failure to resolve the rolling copy (no `origin/rolling`, not a git
 //! checkout, no disk) falls back to the sandbox copy: verification still runs,
@@ -30,7 +38,6 @@ pub(super) const TOOL_FILES: &[&str] = &[
     "scripts/scoped-test",
     "scripts/check-touched-shards",
     "scripts/python-test-gate.py",
-    "scripts/desktop-test-gate.py",
     "scripts/target-pool",
     "scripts/e2e-prebuild-bins.txt",
 ];
@@ -59,13 +66,101 @@ pub(super) enum ScopedTool {
         files: Vec<String>,
     },
     /// The candidate changes the tool or a helper it loads: its own
-    /// `scripts/scoped-test`, with the helpers it references in `files`.
-    Candidate { files: Vec<String> },
+    /// `scripts/scoped-test`, with the helpers it references in `files`, and
+    /// `why` names which comparison chose it.
+    Candidate {
+        files: Vec<String>,
+        why: CandidateWhy,
+    },
     /// The rolling copy could not be resolved: the sandbox's own copy.
     Worktree,
 }
 
+/// Why a job runs the candidate's own copy of the tool; the receipt's
+/// `tool.source` carries [`CandidateWhy::source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CandidateWhy {
+    /// The candidate diff (`base...head`) changes a tool file (#1938).
+    DiffChangesTool,
+    /// The diff does not, but the head changed a tool file on its side of
+    /// `origin/rolling` and its bytes differ from rolling's: the tool change
+    /// is in the base, not yet on rolling (#279).
+    DiffersFromRolling,
+}
+
+impl CandidateWhy {
+    /// The receipt's `tool.source` for this choice.
+    pub(super) fn source(self) -> &'static str {
+        match self {
+            Self::DiffChangesTool => "candidate",
+            Self::DiffersFromRolling => "candidate_differs_from_rolling",
+        }
+    }
+}
+
 impl ScopedTool {
+    /// Observe selected files directly, never from the script's output/env.
+    pub(super) fn provenance(
+        &self,
+        cwd: &Path,
+    ) -> Result<rsi_common::agent_jobs::ScopedToolProvenanceV1, String> {
+        use rsi_common::agent_jobs::{ScopedToolFileV1, ScopedToolProvenanceV1, ScopedToolSource};
+        let (source, script, revision, files) = match self {
+            Self::Rolling { script, rev, files } => (
+                ScopedToolSource::Rolling,
+                script.clone(),
+                rev.as_str(),
+                files.clone(),
+            ),
+            Self::Candidate { files, .. } => (
+                ScopedToolSource::Candidate,
+                cwd.join("scripts/scoped-test"),
+                "HEAD",
+                files.clone(),
+            ),
+            Self::Worktree => (
+                ScopedToolSource::Sandbox,
+                cwd.join("scripts/scoped-test"),
+                "HEAD",
+                tool_names(&tool_paths(&helpers_at(cwd, "HEAD"))),
+            ),
+        };
+        let text = |args: &[&str]| {
+            git(cwd, args)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(|value| value.trim().to_string())
+        };
+        let rev = text(&["rev-parse", "--verify", &format!("{revision}^{{commit}}")]);
+        let mut observed = Vec::new();
+        for name in files {
+            let path = script.with_file_name(&name);
+            let blob = text(&["hash-object", "--no-filters", &path.to_string_lossy()]);
+            if source == ScopedToolSource::Rolling {
+                let expected = text(&[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{revision}:scripts/{name}"),
+                ]);
+                if blob.is_none() || blob != expected {
+                    return Err(format!(
+                        "scoped_test_rolling_tool_unavailable: rolling tool file {} differs from {revision}; rerun scoped_test with the rolling tool copy (rolling_tool:true)",
+                        path.display()
+                    ));
+                }
+            }
+            observed.push(ScopedToolFileV1 {
+                path: path.display().to_string(),
+                blob,
+            });
+        }
+        Ok(ScopedToolProvenanceV1 {
+            source,
+            path: script.display().to_string(),
+            rev,
+            files: observed,
+        })
+    }
+
     /// The script path and the `NAME=value` entries to put after `env`.
     pub(super) fn launch(&self) -> (String, Vec<String>) {
         match self {
@@ -77,10 +172,10 @@ impl ScopedTool {
                     format!("{TOOL_FILES_ENV}={}", files.join(",")),
                 ],
             ),
-            Self::Candidate { files } => (
+            Self::Candidate { files, why } => (
                 "scripts/scoped-test".to_string(),
                 vec![
-                    format!("{TOOL_SOURCE_ENV}=candidate"),
+                    format!("{TOOL_SOURCE_ENV}={}", why.source()),
                     format!("{TOOL_FILES_ENV}={}", files.join(",")),
                 ],
             ),
@@ -97,6 +192,42 @@ fn git(cwd: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .output()
         .ok()?;
     output.status.success().then_some(output.stdout)
+}
+
+/// Refuse unresolved scoped-test inputs before toolchain probes or job effects.
+pub(crate) fn validate_refs(
+    cwd: &Path,
+    params: &rsi_common::agent_jobs::JobParams,
+) -> crate::error::Result<()> {
+    let rsi_common::agent_jobs::JobParams::Test(test) = params else {
+        return Ok(());
+    };
+    let Some(scoped) = &test.scoped_test else {
+        return Ok(());
+    };
+    for (field, reference) in [
+        ("base", scoped.base.as_str()),
+        ("head", scoped.head.as_deref().unwrap_or("HEAD")),
+    ] {
+        if git(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{reference}^{{commit}}"),
+            ],
+        )
+        .is_none()
+        {
+            return Err(crate::error::DaemonError::InvalidParam(format!(
+                "{}: params.scoped_test.{field} {reference:?} does not resolve to a commit in {}; pass a full 40-hex SHA or a fetched ref",
+                rsi_common::agent_jobs::JOB_SCOPED_TEST_REF_UNRESOLVED,
+                cwd.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The sibling file names a tool script's text loads next to itself: the
@@ -179,13 +310,35 @@ fn candidate_changes_tool(cwd: &Path, base: &str, head: &str, paths: &[String]) 
     git(cwd, &args).map(|out| !out.is_empty())
 }
 
+/// True when `head` changed a file of `paths` on its own side of `rolling`
+/// (`rolling...head`, from their merge base) and that file still differs from
+/// rolling's (`rolling head`). A head merely behind rolling, or one whose tool
+/// change has landed, is false; so is a pair Git cannot compare.
+fn head_tool_differs_from_rolling(cwd: &Path, rolling: &str, head: &str, paths: &[String]) -> bool {
+    let changed = |range: &[&str]| {
+        let mut args = vec!["diff", "--name-only", "-z"];
+        args.extend(range);
+        args.push("--");
+        args.extend(paths.iter().map(String::as_str));
+        git(cwd, &args).is_some_and(|out| !out.is_empty())
+    };
+    let ahead = format!("{rolling}...{head}");
+    changed(&[ahead.as_str()]) && changed(&[rolling, head])
+}
+
 /// The candidate's own copy, unless it loads a helper its head lacks.
-fn candidate_tool(cwd: &Path, head: &str, extra: &BTreeSet<String>) -> Result<ScopedTool, String> {
+fn candidate_tool(
+    cwd: &Path,
+    head: &str,
+    extra: &BTreeSet<String>,
+    why: CandidateWhy,
+) -> Result<ScopedTool, String> {
     if let Some(refusal) = first_missing(cwd, head, extra, "the candidate's") {
         return Err(refusal);
     }
     Ok(ScopedTool::Candidate {
         files: tool_names(&tool_paths(extra)),
+        why,
     })
 }
 
@@ -197,6 +350,9 @@ fn candidate_tool(cwd: &Path, head: &str, extra: &BTreeSet<String>) -> Result<Sc
 /// copy a job runs just because this daemon's list predates it (hub #3024):
 /// a candidate that changes any file of the set runs its own copy, the rolling
 /// copy materializes the whole rolling set, and the receipt lists the set.
+/// A candidate whose diff leaves the set alone but whose head carries its own
+/// unlanded change to it (the change is in the base) runs its own copy too
+/// (#279, [`head_tool_differs_from_rolling`]); the same helper check applies.
 ///
 /// # Errors
 /// `scoped_test_tool_helper_missing` (naming the file) when the copy that would
@@ -206,6 +362,26 @@ pub(super) fn resolve(
     base: &str,
     head: Option<&str>,
     cache_root: &Path,
+) -> Result<ScopedTool, String> {
+    resolve_with_policy(cwd, base, head, cache_root, false)
+}
+
+/// A forced rolling run refuses rather than silently using candidate code.
+pub(super) fn resolve_rolling(
+    cwd: &Path,
+    base: &str,
+    head: Option<&str>,
+    cache_root: &Path,
+) -> Result<ScopedTool, String> {
+    resolve_with_policy(cwd, base, head, cache_root, true)
+}
+
+fn resolve_with_policy(
+    cwd: &Path,
+    base: &str,
+    head: Option<&str>,
+    cache_root: &Path,
+    rolling_tool: bool,
 ) -> Result<ScopedTool, String> {
     let Some(rev) = git(
         cwd,
@@ -227,8 +403,16 @@ pub(super) fn resolve(
     let watched = tool_paths(&both);
     // An unreadable diff (bad ref) leaves the choice to the candidate's own
     // script, which refuses the same ref with its own message.
-    if candidate_changes_tool(cwd, base, head, &watched).unwrap_or(true) {
-        return candidate_tool(cwd, head, &candidate_extra);
+    if !rolling_tool && candidate_changes_tool(cwd, base, head, &watched).unwrap_or(true) {
+        return candidate_tool(cwd, head, &candidate_extra, CandidateWhy::DiffChangesTool);
+    }
+    if !rolling_tool && head_tool_differs_from_rolling(cwd, &rev, head, &watched) {
+        return candidate_tool(
+            cwd,
+            head,
+            &candidate_extra,
+            CandidateWhy::DiffersFromRolling,
+        );
     }
     if let Some(refusal) = first_missing(cwd, &rev, &rolling_extra, "the rolling tip's") {
         return Err(refusal);
@@ -456,7 +640,8 @@ mod tests {
         assert_eq!(
             tool,
             ScopedTool::Candidate {
-                files: tool_names(&tool_paths(&BTreeSet::new()))
+                files: tool_names(&tool_paths(&BTreeSet::new())),
+                why: CandidateWhy::DiffChangesTool,
             }
         );
         let (argv0, env) = tool.launch();
@@ -465,6 +650,230 @@ mod tests {
         assert_eq!(env.len(), 2);
         // Nothing was materialized.
         assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn synthetic_green_direct_and_inherited_tool_edits_require_a_rolling_rerun() {
+        use crate::store::agent_jobs::NewAgentJob;
+        use rsi_common::agent_jobs::{JobParams, JobState, JobWake, ScopedToolSource};
+        use rsi_common::agent_landing_candidate::{
+            CANDIDATE_TOOL_UNTRUSTED, assess_candidate, assess_candidate_with_alternatives,
+        };
+        for inherited in [false, true] {
+            for forged in [false, true] {
+                let (dir, _) = repo("rolling", "rolling");
+                let path = dir.path();
+                let script = |claim: &str| {
+                    format!(
+                        "import json, subprocess\nr = {{'ok': True, 'head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'new_failures': []}}\n{claim}\nprint('SCOPED_TEST_RECEIPT ' + json.dumps(r))\n"
+                    )
+                };
+                let rolling = commit(
+                    path,
+                    &[("scripts/scoped-test", &script("# trusted rolling fixture"))],
+                    "rolling tool",
+                );
+                run(
+                    path,
+                    &["update-ref", "refs/remotes/origin/rolling", &rolling],
+                );
+                let candidate = commit(
+                    path,
+                    &[(
+                        "scripts/scoped-test",
+                        &script(if forged {
+                            "r['tool'] = {'source': 'rolling', 'rev': 'forged'}"
+                        } else {
+                            "# omit tool fields"
+                        }),
+                    )],
+                    "synthetic green tool",
+                );
+                let base = if inherited {
+                    commit(
+                        path,
+                        &[("other.txt", "worker edit\n")],
+                        "worker on unlanded tool",
+                    );
+                    candidate.as_str()
+                } else {
+                    rolling.as_str()
+                };
+                let head = run(path, &["rev-parse", "HEAD"]);
+                let cache = crate::test_support::disk_backed_tempdir("scoped-tool-provenance");
+                let tool = resolve(path, base, None, cache.path()).unwrap();
+                assert!(
+                    matches!(tool, ScopedTool::Candidate { why, .. } if why == if inherited { CandidateWhy::DiffersFromRolling } else { CandidateWhy::DiffChangesTool })
+                );
+                let store = crate::store::Store::open_in_memory().unwrap();
+                let owner = uuid::Uuid::new_v4();
+                let execute = |tool: &ScopedTool| {
+                    let provenance = tool.provenance(path).unwrap();
+                    let id = uuid::Uuid::new_v4();
+                    let (row, _) = store
+                        .insert_agent_job(
+                            &NewAgentJob {
+                                id,
+                                owner_session_id: owner,
+                                project_id: None,
+                                name: None,
+                                params: serde_json::from_value::<JobParams>(
+                                    serde_json::json!({"kind":"test", "scoped_test":{"base":base}}),
+                                )
+                                .unwrap(),
+                                cwd: path.display().to_string(),
+                                unit_name: format!("rsi-job-{id}"),
+                                log_path: path.join(format!("{id}.log")).display().to_string(),
+                                status_path: path
+                                    .join(format!("{id}.status"))
+                                    .display()
+                                    .to_string(),
+                                idempotency_key: None,
+                                wake: JobWake::None,
+                            },
+                            chrono::Utc::now(),
+                        )
+                        .unwrap();
+                    store.record_agent_job_scoped_tool(id, &provenance).unwrap();
+                    let running = store.get_agent_job(id).unwrap().unwrap().job;
+                    assert_eq!(
+                        running.result.unwrap().scoped_tool,
+                        Some(provenance.clone())
+                    );
+                    let output = Command::new("python3")
+                        .arg(&provenance.path)
+                        .current_dir(path)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                    let (state, result) = super::super::classify(
+                        &row.job,
+                        Some(0),
+                        &String::from_utf8(output.stdout).unwrap(),
+                    );
+                    assert_eq!(state, JobState::Succeeded);
+                    store
+                        .settle_agent_job(id, state, &result, false, chrono::Utc::now())
+                        .unwrap();
+                    let job = store.get_agent_job(id).unwrap().unwrap().job;
+                    assert_eq!(job.result.as_ref().unwrap().scoped_tool, Some(provenance));
+                    job
+                };
+                let candidate_job = execute(&tool);
+                let refused = assess_candidate(&candidate_job, &head);
+                assert_eq!(refused.ok, false);
+                assert_eq!(refused.refusal.as_deref(), Some(CANDIDATE_TOOL_UNTRUSTED));
+                assert_eq!(
+                    refused.scoped_tool.unwrap().source,
+                    ScopedToolSource::Candidate
+                );
+                let rolling_tool = resolve_rolling(path, base, None, cache.path()).unwrap();
+                let rolling_job = execute(&rolling_tool);
+                let accepted =
+                    assess_candidate_with_alternatives(&candidate_job, [&rolling_job], &head);
+                assert!(accepted.ok, "{accepted:?}");
+                assert_eq!(accepted.job_id, Some(rolling_job.id));
+                assert_eq!(
+                    accepted.scoped_tool.unwrap().source,
+                    ScopedToolSource::Rolling
+                );
+                assert_eq!(accepted.tool_under_test.unwrap().job_id, candidate_job.id);
+            }
+        }
+    }
+
+    /// Commit every `(file, text)` write in `dir` and return the new HEAD.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn commit(dir: &Path, writes: &[(&str, &str)], message: &str) -> String {
+        for (file, text) in writes {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-q", "-m", message]);
+        run(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// #279: the worker built on an unlanded tool change (it is in the base, so
+    /// `base...head` does not touch the tool). Its head's tool differs from
+    /// rolling's on its own side, so its copy runs and the receipt says why.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_tool_change_in_the_base_not_on_rolling_runs_the_candidate_copy() {
+        let (dir, rolling) = repo("rolling", "rolling");
+        let path = dir.path();
+        // HEAD of the fixture is one non-tool commit on rolling; restart from
+        // rolling: the base adds the tool change, the head one more commit.
+        run(path, &["reset", "-q", "--hard", &rolling]);
+        let base = commit(
+            path,
+            &[("scripts/scoped-test", "linux_check lane\n")],
+            "tool change (unlanded)",
+        );
+        commit(path, &[("other.txt", "worker\n")], "worker change");
+        let cache = crate::test_support::disk_backed_tempdir("scoped-tool-cache");
+        let tool = resolve(path, &base, Some("HEAD"), cache.path()).unwrap();
+        assert_eq!(
+            tool,
+            ScopedTool::Candidate {
+                files: tool_names(&tool_paths(&BTreeSet::new())),
+                why: CandidateWhy::DiffersFromRolling,
+            }
+        );
+        let (argv0, env) = tool.launch();
+        assert_eq!(argv0, "scripts/scoped-test");
+        assert_eq!(
+            env[0],
+            "RSI_SCOPED_TEST_TOOL_SOURCE=candidate_differs_from_rolling"
+        );
+        assert!(std::fs::read_dir(cache.path()).unwrap().next().is_none());
+    }
+
+    /// A sandbox merely behind rolling (rolling's tool advanced, the worker
+    /// never touched it) still runs the rolling copy, the point of #1938.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_sandbox_behind_a_rolling_tool_change_runs_the_rolling_copy() {
+        let (dir, old) = repo("old", "old");
+        let path = dir.path();
+        let worker_head = run(path, &["rev-parse", "HEAD"]);
+        // Rolling advances from the old tip with a tool fix the worker lacks.
+        run(path, &["reset", "-q", "--hard", &old]);
+        let rolling = commit(path, &[("scripts/scoped-test", "rolling fix\n")], "fix");
+        run(
+            path,
+            &["update-ref", "refs/remotes/origin/rolling", &rolling],
+        );
+        run(path, &["reset", "-q", "--hard", &worker_head]);
+        let cache = crate::test_support::disk_backed_tempdir("scoped-tool-cache");
+        // Both the usual base and the worker's own old base pick rolling.
+        for base in ["origin/rolling", old.as_str()] {
+            let tool = resolve(path, base, Some("HEAD"), cache.path()).unwrap();
+            let ScopedTool::Rolling { script, rev, .. } = &tool else {
+                panic!("expected the rolling copy for base {base}, got {tool:?}");
+            };
+            assert_eq!(rev, &rolling);
+            assert_eq!(std::fs::read_to_string(script).unwrap(), "rolling fix\n");
+        }
+    }
+
+    /// Once the tool change has landed (the head's tool equals rolling's), the
+    /// rolling copy runs again.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_landed_tool_change_in_the_base_runs_the_rolling_copy() {
+        let (dir, rolling) = repo("rolling", "rolling");
+        let path = dir.path();
+        run(path, &["reset", "-q", "--hard", &rolling]);
+        let base = commit(path, &[("scripts/scoped-test", "landed lane\n")], "tool");
+        run(path, &["update-ref", "refs/remotes/origin/rolling", &base]);
+        commit(path, &[("other.txt", "worker\n")], "worker change");
+        let cache = crate::test_support::disk_backed_tempdir("scoped-tool-cache");
+        let tool = resolve(path, &base, Some("HEAD"), cache.path()).unwrap();
+        assert!(
+            matches!(&tool, ScopedTool::Rolling { rev, .. } if rev == &base),
+            "{tool:?}"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -541,7 +950,6 @@ mod tests {
         for loaded in [
             "check-touched-shards",
             "python-test-gate.py",
-            "desktop-test-gate.py",
             "target-pool",
             "e2e-prebuild-bins.txt",
         ] {
@@ -620,7 +1028,7 @@ up = SCRIPT.with_name("../four.py")
         );
         let cache = crate::test_support::disk_backed_tempdir("scoped-tool-cache");
         let tool = resolve(dir.path(), "origin/rolling", Some("HEAD"), cache.path()).unwrap();
-        let ScopedTool::Candidate { files } = &tool else {
+        let ScopedTool::Candidate { files, .. } = &tool else {
             panic!("expected the candidate copy, got {tool:?}");
         };
         assert!(files.contains(&"new-helper.py".to_string()), "{files:?}");
@@ -687,7 +1095,7 @@ up = SCRIPT.with_name("../four.py")
         );
         let cache = crate::test_support::disk_backed_tempdir("scoped-tool-cache");
         let tool = resolve(dir.path(), "origin/rolling", Some("HEAD"), cache.path()).unwrap();
-        let ScopedTool::Candidate { files } = &tool else {
+        let ScopedTool::Candidate { files, .. } = &tool else {
             panic!("expected the candidate copy, got {tool:?}");
         };
         assert!(files.contains(&"new-helper.py".to_string()), "{files:?}");

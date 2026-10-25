@@ -39,8 +39,8 @@ never a wildcard, and it is mechanical:
 - `.config/nextest.toml` `[profile.default] default-filter` leaves exactly those tests
   out, so `rsid-fast` (the merge-queue gate), `test-timings` and the default profile skip
   them. The line is generated: `python3 scripts/check-touched-shards
-  --write-slow-tier-filter`; `scripts/tests/test_slow_tier.py` fails on drift or on a name
-  no source defines.
+  --write-slow-tier-filter`; the rsi-repo-guards tests in
+  `touched_shards::slow_checkout_tests` fail on drift or on a name no source defines.
 - `ci-full` and `rsid-qa` set `default-filter = "all()"`: `make test-full`, the satellite
   `make rolling-library-qa`, the QA sweep (`scripts/run-rolling-qa.py`, which passes
   `--slow-tier` to `scripts/run-rsid-test-shards.sh`) and the cloud sweep run the tier.

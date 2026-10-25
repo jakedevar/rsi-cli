@@ -1,8 +1,8 @@
 // Styles of the graph review, the recursive DAG browser, the ESP Square and
 // the topology preview (slice 11, hub #3013). Injected at startup by
 // actions/graphs-run.ts, so the slice adds no static file. Colours are the
-// desktop CSS variables the theme sets; the ESP squares keep the TUI's fixed
-// feedback colours (esp-model.ts).
+// desktop CSS variables the theme sets; the ESP squares keep the TUI's hues,
+// lifted per theme to stay readable (esp-model.ts squareColorsOn, #301).
 export const GRAPHS_CSS = `
 .graph-pane, .dag-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--base); outline: none; }
 .graph-pane[hidden], .dag-pane[hidden], .esp-overlay[hidden] { display: none; }
@@ -37,7 +37,7 @@ export const GRAPHS_CSS = `
 .graph-side h3 { margin: 0 0 6px; font-size: 14px; color: var(--blue); }
 .graph-side h4 { margin: 10px 0 4px; font-size: 12px; color: var(--mauve); text-transform: uppercase; letter-spacing: .04em; }
 .gv-facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; margin: 0; font-size: 12px; }
-.gv-facts dt { color: var(--overlay0); }
+.gv-facts dt { color: var(--muted); }
 .gv-facts dd { margin: 0; color: var(--text); word-break: break-word; }
 .gv-instructions, .topo-preview, .dag-pre { white-space: pre-wrap; font-family: var(--mono); font-size: 12px; background: var(--base); border: 1px solid var(--surface0); border-radius: 6px; padding: 6px 8px; margin: 4px 0; max-height: 260px; overflow: auto; }
 .gv-edges, .gv-picker, .gv-diags { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12px; }
@@ -47,7 +47,7 @@ export const GRAPHS_CSS = `
 .gv-diags li.warn { color: var(--yellow); }
 .gv-picker li { display: flex; flex-direction: column; padding: 4px 6px; border-radius: 4px; cursor: pointer; }
 .gv-pick-label { color: var(--text); font-weight: 600; }
-.gv-pick-detail { color: var(--overlay0); font-size: 11px; }
+.gv-pick-detail { color: var(--muted); font-size: 11px; }
 .gv-mini { width: 100%; max-height: 140px; margin-top: 6px; background: var(--crust); border-radius: 6px; }
 .gv-mini-node { fill: var(--surface0); stroke-width: 1; }
 .gv-edit-input { width: 100%; box-sizing: border-box; background: var(--base); color: var(--text); border: 1px solid var(--blue); border-radius: 6px; padding: 4px 6px; font-family: var(--mono); }
@@ -56,10 +56,13 @@ textarea.gv-edit-input { min-height: 140px; resize: vertical; }
 .gv-run-title { color: var(--mauve); font-weight: 700; }
 .gv-run-current { color: var(--yellow); font-weight: 700; }
 .gv-run-warn { color: var(--yellow); }
-.gv-run-hint { color: var(--overlay0); }
+.gv-run-hint { color: var(--muted); }
 .graph-status, .dag-footer { padding: 4px 14px; border-top: 1px solid var(--surface0); background: var(--mantle); font-size: 11px; }
 .dag-caps { padding: 2px 14px; font-family: var(--mono); font-size: 11px; }
 .dag-tabs { display: flex; flex-wrap: wrap; padding: 4px 14px; }
+.dag-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 14px 4px; }
+.dag-actions:empty { display: none; }
+.dag-actions .btn.active { border-color: var(--blue); }
 .dag-control-slot:empty, .dag-gates[hidden] { display: none; }
 .dag-control, .dag-gates { margin: 4px 14px; padding: 6px 10px; border: 1px solid var(--yellow); border-radius: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }
 .dag-gates { flex-direction: column; align-items: flex-start; border-color: var(--surface1); font-family: var(--mono); }
@@ -68,12 +71,12 @@ textarea.gv-edit-input { min-height: 140px; resize: vertical; }
 .dag-body { flex: 1; overflow: auto; padding: 4px 14px 14px; font-size: 12px; }
 .dag-message { color: var(--yellow); }
 .dag-section { margin: 10px 0; }
-.dag-section h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .04em; color: var(--overlay0); cursor: pointer; }
+.dag-section h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .04em; color: var(--muted); cursor: pointer; }
 .dag-section.active h3 { color: var(--yellow); }
 .dag-kv { margin: 1px 0; font-family: var(--mono); }
-.dag-k { color: var(--overlay0); margin-right: 8px; }
+.dag-k { color: var(--muted); margin-right: 8px; }
 .dag-table { border-collapse: collapse; font-family: var(--mono); font-size: 12px; width: 100%; }
-.dag-table th { text-align: left; color: var(--overlay0); font-weight: 400; padding: 1px 6px; }
+.dag-table th { text-align: left; color: var(--muted); font-weight: 400; padding: 1px 6px; }
 .dag-table td { padding: 1px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40ch; }
 .dag-table tr { cursor: pointer; }
 .dag-table.active tr.sel { background: var(--surface1); }
@@ -84,7 +87,7 @@ textarea.gv-edit-input { min-height: 140px; resize: vertical; }
 .esp-card h2 { margin: 0 0 6px; font-size: 14px; color: var(--mauve); }
 .esp-head { display: flex; gap: 14px; color: var(--text); margin-bottom: 10px; }
 .esp-grid { display: grid; grid-template-columns: repeat(3, 72px); grid-template-rows: repeat(3, 56px); gap: 8px; justify-content: center; }
-.esp-sq { background: transparent; border: 2px solid; border-radius: 10px; font: 700 16px var(--mono); cursor: pointer; opacity: .9; }
+.esp-sq { background: transparent; border: 2px solid; border-radius: 10px; font: 700 16px var(--mono); cursor: pointer; }
 .esp-sq.cursor { border-width: 3px; }
 .esp-foot { margin-top: 10px; }
 .esp-message { font-weight: 700; color: var(--text); margin-bottom: 4px; }

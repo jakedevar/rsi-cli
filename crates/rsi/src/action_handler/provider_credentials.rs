@@ -261,7 +261,7 @@ mod tests {
     /// RPC method + params (slot + secret verbatim, nothing extra).
     #[tokio::test]
     async fn set_provider_credential_sends_exact_rpc() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -303,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_provider_credential_sends_exact_rpc() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -338,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_provider_credential_sends_exact_rpc() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -380,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_provider_credential_sends_exact_rpc() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -409,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_provider_credentials_from_env_sends_exact_rpc_then_refreshes() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {

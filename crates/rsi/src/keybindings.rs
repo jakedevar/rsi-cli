@@ -86,6 +86,9 @@ fn registered_normal_effect(
         ActionId::GlobalManagerWorkspace => {
             RegisteredNormalEffect::Application(LcAction::OpenGlobalManagerWorkspace)
         }
+        ActionId::GlobalDashboard => {
+            RegisteredNormalEffect::Application(LcAction::OpenGlobalDashboard)
+        }
         ActionId::ManagerPolicy => {
             RegisteredNormalEffect::Application(LcAction::EditHarnessManagerPolicy)
         }
@@ -106,6 +109,9 @@ fn registered_normal_effect(
         }
         ActionId::ClearOperatorPause => {
             RegisteredNormalEffect::Application(LcAction::ClearOperatorPause)
+        }
+        ActionId::ClearProviderUsageHold => {
+            RegisteredNormalEffect::Application(LcAction::ClearProviderUsageHold)
         }
         ActionId::ContinueSession => RegisteredNormalEffect::Application(LcAction::QuickContinue),
         ActionId::TogglePin => RegisteredNormalEffect::Application(LcAction::TogglePinSession),
@@ -562,6 +568,7 @@ mod tests {
             ("<Space>gr", &[]),
             ("<Space>h", &[]),
             ("<Space>hc", &[ClearOperatorPause]),
+            ("<Space>hu", &[ClearProviderUsageHold]),
             ("<Space>hs", &[DowngradeOperatorPause]),
             ("<Space>i", &[OpenIssuesWorkspace]),
             ("<Space>k", &[CancelRetry]),
@@ -753,6 +760,12 @@ mod tests {
                 vec![OpenGlobalManagerWorkspace],
                 "global manager workspace (#1213)",
             ),
+            (
+                "gd",
+                None,
+                vec![OpenGlobalDashboard],
+                "global dashboard (#3317)",
+            ),
             ("g?", None, vec![], "retired no-op"),
         ];
 
@@ -919,6 +932,7 @@ mod tests {
             ("<Space>gr", Inert),
             ("<Space>R", Inert),
             ("gm", Dispatch(OpenGlobalManagerWorkspace)),
+            ("gd", Dispatch(OpenGlobalDashboard)),
             ("g?", Inert),
             ("<Space>M", Dispatch(OpenMemorySearch)),
             ("<Space>K", Dispatch(OpenScheduleBrowser)),
@@ -988,8 +1002,9 @@ mod tests {
         // inventory; the three loops expand to 12 + 9 + 9 mappings.
         // The eleven `<Space>d` operator to-do chords (#1747, #1903, #2950: eight
         // actions, `dc` kept beside `dy`, plus view and undo) add 11 more,
-        // and the `<Space>gl` operator landing chord (#2055) adds 1.
-        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4 + 1 + 11 + 1);
+        // and the `<Space>gl` operator landing chord (#2055) adds 1,
+        // and the `gd` global dashboard (#3317) adds 1.
+        assert_eq!(cases.len(), 92 - 3 + 12 + 9 + 9 - 4 + 1 + 11 + 1 + 1);
 
         for (sequence, pin) in &cases {
             let actions = all_actions_for_events(&pinned_sequence_events(sequence));

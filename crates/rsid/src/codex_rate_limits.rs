@@ -37,7 +37,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// The read succeeded but the answer could not be stored.
 pub(crate) const REASON_PERSIST_FAILED: &str = "persist_failed";
@@ -80,6 +79,7 @@ pub(crate) struct Reading {
     /// answer carried no window: nothing to store, and not an error.
     pub(crate) snapshot: Option<ProviderRateLimitSnapshot>,
     pub(crate) logged_out: bool,
+    pub(crate) account_fingerprint: Option<String>,
 }
 
 fn window_base_key(window: &Value, slot: &str) -> String {
@@ -245,6 +245,7 @@ async fn drive_rate_limit_read(
         return Ok(Reading {
             snapshot: None,
             logged_out: true,
+            account_fingerprint: None,
         });
     }
 
@@ -259,6 +260,7 @@ async fn drive_rate_limit_read(
             return Ok(Reading {
                 snapshot: None,
                 logged_out: true,
+                account_fingerprint: None,
             });
         }
         return Err(rpc_error_reason(error));
@@ -267,6 +269,9 @@ async fn drive_rate_limit_read(
     Ok(Reading {
         snapshot: parse_rate_limits(result, Utc::now())?,
         logged_out: false,
+        account_fingerprint: account
+            .pointer("/result/account")
+            .and_then(crate::provider_login::account_fingerprint),
     })
 }
 
@@ -390,7 +395,9 @@ pub(crate) enum PollOutcome {
     Failed(&'static str),
 }
 
-async fn load_codex_snapshot(store: &Arc<Mutex<Store>>) -> Option<ProviderRateLimitSnapshot> {
+async fn load_codex_snapshot(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+) -> Option<ProviderRateLimitSnapshot> {
     let store = Arc::clone(store);
     tokio::task::spawn_blocking(move || {
         let store = store.blocking_lock();
@@ -413,7 +420,7 @@ pub(crate) async fn poll_once(
     tracker: &PollTracker,
     binary: &Path,
     timeout: Duration,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: &EventBus,
 ) -> PollOutcome {
     let attempted_at = Utc::now();
@@ -421,27 +428,48 @@ pub(crate) async fn poll_once(
         Ok(reading) => reading,
         Err(reason) => return fail(tracker, attempted_at, reason, store, bus).await,
     };
+    let to_store = reading.snapshot.clone();
+    let stored = tokio::task::spawn_blocking({
+        let store = Arc::clone(store);
+        move || -> crate::error::Result<bool> {
+            let store = store.blocking_lock();
+            let changed = if let Some(fingerprint) = reading.account_fingerprint {
+                store.observe_provider_rate_limit_account(
+                    SessionProvider::Codex,
+                    &fingerprint,
+                    attempted_at,
+                )?
+            } else {
+                false
+            };
+            if let Some(snapshot) = to_store {
+                store.upsert_provider_rate_limit_snapshot(&snapshot, None)?;
+            }
+            Ok(changed)
+        }
+    })
+    .await;
+    let changed = match stored {
+        Ok(Ok(changed)) => changed,
+        _ => {
+            tracing::warn!("Failed to persist Codex plan-window snapshot");
+            return fail(tracker, attempted_at, REASON_PERSIST_FAILED, store, bus).await;
+        }
+    };
+    tracker.record_success(attempted_at, reading.logged_out);
     let Some(snapshot) = reading.snapshot else {
-        tracker.record_success(attempted_at, reading.logged_out);
+        if changed {
+            bus.publish(DaemonEvent::ProviderRateLimitUpdated {
+                snapshot: ProviderRateLimitSnapshot::invalidated(
+                    SessionProvider::Codex,
+                    attempted_at,
+                ),
+            });
+        }
         return PollOutcome::NothingToStore {
             logged_out: reading.logged_out,
         };
     };
-
-    let to_store = snapshot.clone();
-    let stored = tokio::task::spawn_blocking({
-        let store = Arc::clone(store);
-        move || {
-            let store = store.blocking_lock();
-            store.upsert_provider_rate_limit_snapshot(&to_store, None)
-        }
-    })
-    .await;
-    if !matches!(stored, Ok(Ok(()))) {
-        tracing::warn!("Failed to persist Codex plan-window snapshot");
-        return fail(tracker, attempted_at, REASON_PERSIST_FAILED, store, bus).await;
-    }
-    tracker.record_success(attempted_at, false);
     bus.publish(DaemonEvent::ProviderRateLimitUpdated {
         snapshot: snapshot.clone(),
     });
@@ -452,7 +480,7 @@ async fn fail(
     tracker: &PollTracker,
     at: DateTime<Utc>,
     reason: &'static str,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: &EventBus,
 ) -> PollOutcome {
     let was = tracker.stale_reason();
@@ -480,7 +508,7 @@ pub(crate) const fn effective_poll_secs(configured: u32, offline: bool) -> u32 {
 /// The daemon's poll loop. The interval is read every cycle (live setting; 0
 /// leaves the stored windows alone and stops reading).
 pub async fn run_codex_rate_limit_poll_loop(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     settings: Arc<crate::config::RuntimeConfig>,
 ) {
@@ -509,7 +537,7 @@ pub(crate) async fn poll_tick(
     configured_secs: u32,
     offline: bool,
     resolve: impl FnOnce() -> Option<std::path::PathBuf> + Send + 'static,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: &EventBus,
 ) -> u32 {
     let secs = effective_poll_secs(configured_secs, offline);
@@ -644,29 +672,113 @@ mod tests {
     }
 
     fn answering_stub(rate_limits: &str) -> StubCodex {
+        answering_account_stub("x@example.test", rate_limits)
+    }
+
+    fn answering_account_stub(email: &str, rate_limits: &str) -> StubCodex {
         StubCodex::with_app_server(&format!(
             r#"while IFS= read -r line; do
       case "$line" in
         *'"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-        *'"account/read"'*) echo '{{"id":2,"result":{{"account":{{"type":"chatgpt","email":"x@example.test","planType":"pro"}},"requiresOpenaiAuth":true}}}}' ;;
+        *'"account/read"'*) echo '{{"id":2,"result":{{"account":{{"type":"chatgpt","email":"{email}","planType":"pro"}},"requiresOpenaiAuth":true}}}}' ;;
         *'"account/rateLimits/read"'*) echo '{rate_limits}' ;;
       esac
     done"#
         ))
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[tokio::test]
+    async fn account_switch_without_new_windows_invalidates_the_previous_codex_hold() {
+        let (store, bus) = store_and_bus().await;
+        let tracker = PollTracker::default();
+        let provider = SessionProvider::Codex;
+        {
+            let store = store.lock().await;
+            let fingerprint =
+                crate::provider_login::account_fingerprint(&json!({"email":"x@example.test"}))
+                    .unwrap();
+            store
+                .observe_provider_rate_limit_account(provider, &fingerprint, Utc::now())
+                .unwrap();
+            store
+                .upsert_provider_rate_limit_snapshot(
+                    &ProviderRateLimitSnapshot {
+                        provider,
+                        status: None,
+                        rate_limit_type: None,
+                        overage_status: None,
+                        is_using_overage: false,
+                        stale_reason: None,
+                        observed_at: Utc::now(),
+                        windows: vec![ProviderRateLimitWindow {
+                            window_key: "old_account_bucket".into(),
+                            utilization: 1.0,
+                            resets_at_epoch: Some(
+                                (Utc::now() + chrono::Duration::days(4)).timestamp(),
+                            ),
+                        }],
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+        let empty = r#"{"id":3,"result":{"rateLimits":{}}}"#;
+        let same = answering_stub(empty);
+        assert!(matches!(
+            poll_once(&tracker, &same.path(), PROBE_TIMEOUT, &store, &bus).await,
+            PollOutcome::NothingToStore { logged_out: false }
+        ));
+        assert!(
+            store
+                .lock()
+                .await
+                .provider_usage_window_hold_until(provider, Utc::now())
+                .unwrap()
+                .is_some()
+        );
+        let switched = answering_account_stub("y@example.test", empty);
+        assert!(matches!(
+            poll_once(&tracker, &switched.path(), PROBE_TIMEOUT, &store, &bus).await,
+            PollOutcome::NothingToStore { logged_out: false }
+        ));
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .provider_usage_window_hold_until(provider, Utc::now())
+                .unwrap(),
+            None
+        );
+        let fresh = answering_account_stub("y@example.test", &plan_reply());
+        assert!(matches!(
+            poll_once(&tracker, &fresh.path(), PROBE_TIMEOUT, &store, &bus).await,
+            PollOutcome::Stored(_)
+        ));
+        let snapshot = stored_codex(&store).await.unwrap();
+        assert_eq!(
+            snapshot.windows.len(),
+            3,
+            "only the new account's current buckets are visible"
+        );
+    }
+
     fn plan_reply() -> String {
         json!({"id": 3, "result": plan_response()}).to_string()
     }
 
-    async fn store_and_bus() -> (Arc<Mutex<Store>>, Arc<EventBus>) {
+    async fn store_and_bus() -> (Arc<rsid_core::store_lock::Mutex<Store>>, Arc<EventBus>) {
         (
-            Arc::new(Mutex::new(Store::open_in_memory().unwrap())),
+            Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().unwrap(),
+            )),
             Arc::new(EventBus::new(16)),
         )
     }
 
-    async fn stored_codex(store: &Arc<Mutex<Store>>) -> Option<ProviderRateLimitSnapshot> {
+    async fn stored_codex(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> Option<ProviderRateLimitSnapshot> {
         load_codex_snapshot(store).await
     }
 

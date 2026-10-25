@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="513" height="414" viewBox="0 0 513 414">
+<title>Operator to-do cards</title>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<g font-family="JetBrainsMono Nerd Font Mono, monospace" font-size="15" xml:space="preserve">
+<rect x="9" y="9" width="495" height="18" fill="#ffffff"/>
+<text x="9" y="23" fill="#1e1e1e" font-weight="bold" textLength="126" lengthAdjust="spacingAndGlyphs">To-do · 2 open</text>
+<text x="135" y="23" fill="#117d2d" font-weight="bold" textLength="72" lengthAdjust="spacingAndGlyphs"> · 2 new</text>
+<rect x="9" y="27" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="45" width="207" height="18" fill="#d6d2c6"/>
+<rect x="216" y="45" width="288" height="18" fill="#ffffff"/>
+<text x="9" y="59" fill="#1c66b5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">▸ </text>
+<text x="27" y="59" fill="#ab5400" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">! </text>
+<text x="45" y="59" fill="#117d2d" font-weight="bold" textLength="171" lengthAdjust="spacingAndGlyphs">Log in to Codex NEW</text>
+<rect x="9" y="63" width="153" height="18" fill="#d6d2c6"/>
+<rect x="162" y="63" width="342" height="18" fill="#ffffff"/>
+<text x="45" y="77" fill="#78746e" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">$ </text>
+<text x="63" y="77" fill="#1e1e1e" font-weight="normal" textLength="99" lengthAdjust="spacingAndGlyphs">codex login</text>
+<rect x="9" y="81" width="288" height="18" fill="#d6d2c6"/>
+<rect x="297" y="81" width="207" height="18" fill="#ffffff"/>
+<text x="45" y="95" fill="#78746e" font-weight="normal" textLength="252" lengthAdjust="spacingAndGlyphs">3h · portfolio · issue #1747</text>
+<rect x="9" y="99" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="117" width="495" height="18" fill="#ffffff"/>
+<text x="45" y="131" fill="#117d2d" font-weight="bold" textLength="351" lengthAdjust="spacingAndGlyphs">Restore the grants after the outage NEW</text>
+<rect x="9" y="135" width="495" height="18" fill="#ffffff"/>
+<text x="45" y="149" fill="#78746e" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">$ </text>
+<text x="63" y="149" fill="#1e1e1e" font-weight="normal" textLength="441" lengthAdjust="spacingAndGlyphs">rsi grant restore --scope portfolio:global --caps</text>
+<rect x="9" y="153" width="495" height="18" fill="#ffffff"/>
+<text x="45" y="167" fill="#78746e" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">$ </text>
+<text x="63" y="167" fill="#1e1e1e" font-weight="normal" textLength="198" lengthAdjust="spacingAndGlyphs">v8 --caps v8 --caps v8</text>
+<rect x="9" y="171" width="495" height="18" fill="#ffffff"/>
+<text x="45" y="185" fill="#78746e" font-weight="normal" textLength="252" lengthAdjust="spacingAndGlyphs">2h · portfolio · issue #1747</text>
+<rect x="9" y="189" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="207" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="225" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="243" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="261" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="279" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="297" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="315" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="333" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="351" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="369" width="495" height="18" fill="#ffffff"/>
+<rect x="9" y="387" width="495" height="18" fill="#ffffff"/>
+</g>
+</svg>

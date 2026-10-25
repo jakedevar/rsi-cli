@@ -113,7 +113,10 @@ impl RpcServer {
         params.validate().map_err(DaemonError::InvalidParam)?;
         serde_json::to_value(
             self.session_manager
-                .audit_source_worktree_cohort(params.repository_identity)
+                .audit_source_worktree_cohort_page(
+                    params.repository_identity,
+                    params.after_custody_id,
+                )
                 .await?,
         )
         .map_err(Into::into)

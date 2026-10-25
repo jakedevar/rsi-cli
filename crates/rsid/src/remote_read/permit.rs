@@ -7,7 +7,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 const MAX_IN_FLIGHT: usize = 4;
@@ -101,7 +101,7 @@ impl RemoteReadLimiter {
     /// The completed result still owns the permit through socket settlement.
     pub fn spawn_staged_store<C, S, T>(
         &self,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         capture: impl FnOnce(RemoteReadBudget) -> Result<C> + Send + 'static,
         read_store: impl FnOnce(&Connection, &C, RemoteReadBudget) -> Result<S> + Send + 'static,
         finish: impl FnOnce(C, S, RemoteReadBudget) -> Result<T> + Send + 'static,
@@ -137,10 +137,11 @@ const STORE_LOCK_POLL: Duration = Duration::from_millis(5);
 
 /// Take the Store lock from a blocking worker, polling for at most
 /// `STORE_LOCK_WAIT` (and never past the read's own deadline).
+#[track_caller]
 pub(super) fn acquire_store(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     budget: RemoteReadBudget,
-) -> Result<tokio::sync::OwnedMutexGuard<Store>> {
+) -> Result<rsid_core::store_lock::OwnedMutexGuard<Store>> {
     let give_up = (Instant::now() + STORE_LOCK_WAIT).min(budget.deadline);
     loop {
         if let Ok(guard) = Arc::clone(store).try_lock_owned() {
@@ -224,7 +225,7 @@ mod tests {
     async fn staged_store_worker_releases_lock_before_cursor_and_keeps_permit() {
         let store = Store::open_in_memory().unwrap();
         store.conn.busy_timeout(Duration::from_secs(10)).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let project = Uuid::new_v4();
         let request: ReadRequestV1 = serde_json::from_value(serde_json::json!({
             "method":"RemoteListProjectsV1",
@@ -278,7 +279,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[tokio::test]
     async fn staged_store_worker_refuses_held_store_after_a_short_bounded_wait() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let held = Arc::clone(&store).lock_owned().await;
         let limiter = RemoteReadLimiter::new();
         let started = Instant::now();

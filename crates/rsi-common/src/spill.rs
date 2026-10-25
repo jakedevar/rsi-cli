@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 pub const DEFAULT_MAX_BYTES: usize = 8 * 1024;
 /// Default line threshold above which an output is spilled.
 pub const DEFAULT_MAX_LINES: usize = 200;
+/// How every stub begins; a Harness transcript or trace counts spills by it.
+pub const STUB_PREFIX: &str = "[rsi-spill ";
 /// Hard cap for one stub (the principle says "under 2 KB").
 pub const STUB_BUDGET: usize = 1900;
 /// Most bytes of one output kept on disk; the rest is dropped with a marker.
@@ -193,7 +195,7 @@ pub fn build_stub(handle: &str, tool: &str, exit: Option<i32>, text: &str) -> St
     let lines_total = text.lines().count();
     let exit_label = exit.map_or_else(|| "?".to_string(), |n| n.to_string());
     let header = format!(
-        "[rsi-spill {handle}] {tool} exit={exit_label} {}B {lines_total} lines",
+        "{STUB_PREFIX}{handle}] {tool} exit={exit_label} {}B {lines_total} lines",
         text.len()
     );
     let footer = format!("full: rsi-spill show {handle} [--grep P] [--range a:b]");

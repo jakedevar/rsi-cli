@@ -17,6 +17,10 @@ use rsi_common::harness_manager::{
     HarnessManagerConfigV1, ManagerSeatConditionV1, ManagerSeatStateV1,
 };
 use rsi_common::harness_manager_v2::{HarnessManagerPolicyConfigV2, ManagerOperatingModeV2};
+use rsi_common::satellite_dispatch::{
+    AgentReportToHubRequestV1, SatelliteManagerSeatFailedV1, SatelliteReportKindV1,
+    seat_report_limit_text,
+};
 use rsi_common::types::{Session, SessionProvider, SessionStatus};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
@@ -173,6 +177,9 @@ pub struct ManagerSeatPassV1 {
     pub changed: usize,
     pub notice: Option<(String, String)>,
     pub claim: Option<ManagerSeatClaimV1>,
+    /// The seat entered a non-live condition (or a new one): a satellite
+    /// reports it to the hub once (hub #3859, [`Store::queue_manager_seat_report`]).
+    pub seat_report: Option<ManagerSeatStateV1>,
 }
 
 struct SeatAttempts {
@@ -487,6 +494,13 @@ impl Store {
             if transition {
                 pass.notice = Some(seat_notice(project, &next));
             }
+            if next.is_down()
+                && stored
+                    .as_ref()
+                    .is_none_or(|old| seat_report_key(old) != seat_report_key(&next))
+            {
+                pass.seat_report = Some(next.clone());
+            }
         }
         tx.commit()?;
         Ok(pass)
@@ -669,6 +683,92 @@ impl Store {
             ],
         )? == 1)
     }
+
+    /// Satellite side (hub #3859): queue ONE short typed report for the hub
+    /// when this daemon's appointed manager seat is not live, so a provider
+    /// weekly limit that fails the seat is not invisible until a relay bounces.
+    /// The report is the `RESULT` line of
+    /// [`SatelliteManagerSeatFailedV1::report_text`]: peer, project, seat,
+    /// condition, the tip's `terminal_reason`, the provider reset time when the
+    /// daemon holds one, and the provider's own limit sentence when it recorded
+    /// one. Returns `None` when this daemon is not a satellite that pairs a hub
+    /// or the tip is not the declared seat; a full outbox or an unreachable hub
+    /// is the typed refusal the caller logs (the report is informational and
+    /// at most once).
+    ///
+    /// # Errors
+    /// The `satellite_report_*` refusal of the outbox, or a persistence error.
+    pub fn queue_manager_seat_report(
+        &self,
+        seat: &ManagerSeatStateV1,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        if !seat.is_down() {
+            return Ok(None);
+        }
+        let tip = seat.tip_session_id;
+        let scope = self.inbound_scope()?;
+        if scope.policy.allowed_hub_installations.is_empty() || !scope.is_seat(tip) {
+            return Ok(None);
+        }
+        let Some(project) = self.get_session(tip)?.and_then(|s| s.project_id) else {
+            return Ok(None);
+        };
+        let held = seat.reason == SEAT_USAGE_LIMIT_HOLD_REASON;
+        let limit_text = self.seat_limit_text(tip)?;
+        let text = SatelliteManagerSeatFailedV1 {
+            project,
+            peer: self.satellite_installation_id().ok(),
+            seat: tip,
+            state: seat.state.label(),
+            terminal_reason: seat.last_terminal_reason.as_deref(),
+            reason: &seat.reason,
+            reset_at: seat.not_before.filter(|_| held),
+            limit_text: limit_text.as_deref(),
+        }
+        .report_text();
+        let receipt = self.queue_hub_report_at(
+            tip,
+            &AgentReportToHubRequestV1 {
+                kind: SatelliteReportKindV1::Result,
+                text,
+                binaries_dir: None,
+            },
+            now,
+        )?;
+        Ok(Some(receipt.report_id))
+    }
+
+    /// The provider's limit sentence from the tip's latest `Process Error`
+    /// event, when it says anything about a limit (see
+    /// [`rsi_common::satellite_dispatch::seat_report_limit_text`]).
+    fn seat_limit_text(&self, tip: Uuid) -> Result<Option<String>> {
+        let content: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT e.content FROM conversation_events e JOIN sessions s ON s.id=e.session_id
+                 WHERE e.session_id=?1 AND s.status='Failed'
+                   AND e.content LIKE '**Process Error%'
+                 ORDER BY e.id DESC LIMIT 1",
+                [tip.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(content
+            .map(|content| crate::store::provider_exhaustion::strip_event_frame(&content))
+            .and_then(|body| seat_report_limit_text(&body)))
+    }
+}
+
+/// What makes a seat condition worth one more hub report: the tip, the
+/// condition, and whether the provider usage window holds it. Attempt counts
+/// and retry timestamps do not (hub #3859).
+fn seat_report_key(seat: &ManagerSeatStateV1) -> (Uuid, ManagerSeatConditionV1, bool) {
+    (
+        seat.tip_session_id,
+        seat.state,
+        seat.reason == SEAT_USAGE_LIMIT_HOLD_REASON,
+    )
 }
 
 /// Operator notice: `error` while the seat is not live, `info` on recovery.

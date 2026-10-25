@@ -346,6 +346,7 @@ mod tests {
             project_id: project,
             name: Some("check".into()),
             params: JobParams::Build(BuildJobParams {
+                release_members: Vec::new(),
                 command: BuildCommand::Check,
                 package: None,
                 workspace: true,
@@ -354,6 +355,7 @@ mod tests {
                 no_default_features: false,
                 features: Vec::new(),
                 shards: Vec::new(),
+                bins: Vec::new(),
                 cpu_quota_percent: None,
                 sha: None,
             }),

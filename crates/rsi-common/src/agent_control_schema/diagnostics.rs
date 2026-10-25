@@ -284,6 +284,11 @@ pub(super) fn validate(
     Ok(())
 }
 
+/// `params.timeout_minutes` of a test job (kaizen #254): workers kept sending
+/// 30-90 minutes and meeting `job_timeout_not_authorized`, so the field itself
+/// says to omit it and who may raise it.
+const TEST_TIMEOUT_DESCRIPTION: &str = "Omit it unless you are the appointed manager or an Epic lead: the default (the operator job_test_timeout_mins, 20; 60 for scoped_test) fits an exact-name package run, and a larger value from a worker is refused job_timeout_not_authorized. Need longer? Say so in your handoff instead of retrying with a bigger value";
+
 pub(super) fn add_job_schemas(schema: &mut Value) {
     use crate::agent_jobs::*;
     let token = json!({"type":["string","null"],"minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES});
@@ -293,12 +298,14 @@ pub(super) fn add_job_schemas(schema: &mut Value) {
         "package":token,"shard":token,"filterset":{"type":["string","null"]},
         "recipe":token,"candidate_receipt":token,
         "lib_only":{"type":"boolean"},"exact":{"type":"boolean"},
-        "test_target":{"type":["string","null"],"minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES,"pattern":"^[A-Za-z0-9_][A-Za-z0-9_-]*$","description":"Integration test name for cargo --test; package only, requires exact:true and nonempty filters, mutually exclusive with lib_only"},
+        "test_target":{"type":["string","null"],"minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES,"pattern":"^[A-Za-z0-9_][A-Za-z0-9_-]*$","description":"Integration test name for cargo --test; package only, requires exact:true and nonempty filters, mutually exclusive with lib_only and bin"},
+        "bin":{"type":["string","null"],"minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES,"pattern":"^[A-Za-z0-9_][A-Za-z0-9_-]*$","description":"Binary target name for cargo --bin (a bin unit test such as rsid rsi-rolling-land); package only, requires exact:true and nonempty filters, mutually exclusive with lib_only and test_target; also selects the target of an at_commit run"},
+        "features":{"type":"array","maxItems":JOB_MAX_SHARD_SWEEP,"items":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES},"description":"Package runs only: dev features of the package from the daemon allowlist (today rsid e2e-seed), passed as one --features list; anything else is refused job_invalid_params naming the allowed features."},
         "filters":filters(JOB_MAX_TEST_FILTERS, JOB_MAX_TOKEN_BYTES),
         "cpu_quota_percent":{"type":["integer","null"],"minimum":JOB_CPU_QUOTA_MIN_PERCENT,"maximum":JOB_CPU_QUOTA_MAX_PERCENT},
-        "timeout_minutes":{"type":["integer","null"],"minimum":JOB_TEST_TIMEOUT_MIN_MINS,"maximum":JOB_TEST_TIMEOUT_MAX_MINS},
+        "timeout_minutes":{"type":["integer","null"],"minimum":JOB_TEST_TIMEOUT_MIN_MINS,"maximum":JOB_TEST_TIMEOUT_MAX_MINS,"description":TEST_TIMEOUT_DESCRIPTION},
         "qa_lane":{"type":["object","null"],"additionalProperties":false,"required":["sha"],"properties":{"sha":oid}},
-        "scoped_test":{"type":["object","null"],"additionalProperties":false,"required":["base"],"properties":{"base":token,"head":token}}
+        "scoped_test":{"type":["object","null"],"additionalProperties":false,"required":["base"],"properties":{"base":token,"head":token,"rolling_tool":{"type":"boolean","default":false,"description":"Force the rolling tool copy for trusted verification, including when the candidate edits the tool; candidate Python tests still run from the candidate tree"}}}
     },"allOf":[
         {"if":{"required":["recipe"],"properties":{"recipe":{"type":"string"}}},"then":{"properties":{"filters":filters(JOB_RECIPE_MAX_FILTERS, crate::rolling_queue::ROLLING_QUEUE_MAX_FILTER_BYTES)}}},
         {"if":{"required":["qa_lane"],"properties":{"qa_lane":{"type":"object"}}},"then":{"properties":{"timeout_minutes":{"maximum":JOB_QA_LANE_TIMEOUT_MAX_MINS}}}}
@@ -311,9 +318,14 @@ pub(super) fn add_job_schemas(schema: &mut Value) {
         json!({"properties":{"filters":filters(JOB_MAX_TEST_FILTERS, JOB_MAX_TOKEN_BYTES)}});
     let build = json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{
         "command":{"type":"string","enum":["check","build","test_no_run"]},"package":token,
+        "release_members":{"type":"array","maxItems":JOB_MAX_RELEASE_MEMBERS,"items":{"type":"object","additionalProperties":false,"required":["package","bins"],"properties":{
+            "package":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES},
+            "bins":{"type":"array","minItems":1,"maxItems":JOB_MAX_RELEASE_BINS,"items":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES}}
+        }},"description":"Pinned clean release build; each package/bin set runs in a separate Cargo invocation under one source fence and target, stops on failure, and successful result.release_members proves staging coverage. Requires command build, release true and sha; excludes single-build flags."},
         "workspace":{"type":"boolean"},"all_targets":{"type":"boolean"},"release":{"type":"boolean"},
         "no_default_features":{"type":"boolean"},
         "features":{"type":"array","maxItems":JOB_MAX_SHARD_SWEEP,"items":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES}},
+        "bins":{"type":"array","maxItems":JOB_MAX_BUILD_BINS,"items":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES}},
         "shards":{"type":"array","maxItems":JOB_MAX_SHARD_SWEEP,"items":{"type":"string","minLength":1,"maxLength":JOB_MAX_TOKEN_BYTES}},
         "sha":{"type":["string","null"],"pattern":"^[0-9a-f]{40}$"},
         "cpu_quota_percent":{"type":["integer","null"],"minimum":JOB_CPU_QUOTA_MIN_PERCENT,"maximum":JOB_CPU_QUOTA_MAX_PERCENT}
@@ -322,6 +334,10 @@ pub(super) fn add_job_schemas(schema: &mut Value) {
         "accepted":oid,"test_filters":filters(JOB_MAX_TEST_FILTERS, crate::rolling_queue::ROLLING_QUEUE_MAX_FILTER_BYTES)
     }});
     let sweep = json!({"type":"object","additionalProperties":false,"required":["sha"],"properties":{"sha":oid}});
+    let bench = json!({"type":"object","additionalProperties":false,"required":["config","budget_usd"],"properties":{
+        "config":{"type":"string","pattern":"^eval/bench/tb2/(runs/[A-Za-z0-9][A-Za-z0-9_.-]*|candidates/[A-Za-z0-9][A-Za-z0-9_.-]*/run)\\.toml$","maxLength":JOB_MAX_TOKEN_BYTES},
+        "budget_usd":{"type":"number","exclusiveMinimum":0,"maximum":JOB_BENCH_MAX_BUDGET_USD}
+    }});
     schema["allOf"] = Value::Array(
         [
             ("test", test),
@@ -329,6 +345,7 @@ pub(super) fn add_job_schemas(schema: &mut Value) {
             ("landing", landing.clone()),
             ("cloud_gate", landing),
             ("cloud_sweep", sweep),
+            ("bench", bench),
         ]
         .into_iter()
         .map(|(kind, params)| {
@@ -419,6 +436,85 @@ mod tests {
     }
 
     #[test]
+    fn submit_job_test_timeout_tells_a_worker_to_omit_it() {
+        // kaizen #254: the served schema of a test job's timeout_minutes says
+        // a worker leaves it out and names the refusal a larger value meets.
+        let schema = Verb::SubmitJob.descriptor().parameters();
+        let test = schema["allOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|branch| branch["if"]["properties"]["kind"]["const"] == "test")
+            .expect("test branch");
+        let description =
+            test["then"]["properties"]["params"]["properties"]["timeout_minutes"]["description"]
+                .as_str()
+                .expect("timeout_minutes is described");
+        assert!(
+            description.starts_with("Omit it unless you are the appointed manager or an Epic lead")
+                && description.contains("job_timeout_not_authorized"),
+            "{description}"
+        );
+        let summary = schema["properties"]["params"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            summary.contains("timeout_minutes? (a worker omits it"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn submit_job_schema_accepts_typed_release_members_and_refuses_conflicting_flags() {
+        let request = json!({"kind":"build","params":{"command":"build","release":true,
+            "sha":"a".repeat(40),"release_members":[{"package":"server","bins":["server","cli"]},
+                {"package":"guards","bins":["guard"]}]}});
+        assert_eq!(Verb::SubmitJob.schema_error(&request), None);
+        assert!(Verb::SubmitJob.validate_params(&request).is_ok());
+        let mut conflict = request.clone();
+        conflict["params"]["workspace"] = json!(true);
+        let refusal = Verb::SubmitJob.validate_params(&conflict).unwrap_err();
+        assert!(refusal.constraint.unwrap().contains("release_members"));
+        let mut malformed = request;
+        malformed["params"]["release_members"][0]["bins"] = json!([]);
+        assert!(Verb::SubmitJob.schema_error(&malformed).is_some());
+    }
+
+    #[test]
+    fn submit_job_validation_names_the_allowed_build_features() {
+        let refused = json!({"kind":"build","params":{"command":"build","package":"rsid",
+            "features":["test-ollama"]}});
+        let error = Verb::SubmitJob.validate_params(&refused).unwrap_err();
+        let constraint = error.constraint.expect("the refusal names its reason");
+        assert!(
+            constraint.contains("`test-ollama` is not allowed for `rsid`")
+                && constraint.contains("allowed features for `rsid`: e2e-seed"),
+            "{constraint}"
+        );
+        let accepted = json!({"kind":"build","params":{"command":"build","package":"rsid",
+            "features":["e2e-seed"],"bins":["rsid","rsi-e2e-seed"]}});
+        assert!(Verb::SubmitJob.validate_params(&accepted).is_ok());
+        assert_eq!(Verb::SubmitJob.schema_error(&accepted), None);
+    }
+
+    #[test]
+    fn submit_job_validation_names_the_allowed_test_features() {
+        let refused = json!({"kind":"test","params":{"package":"rsid",
+            "features":["test-ollama"]}});
+        let error = Verb::SubmitJob.validate_params(&refused).unwrap_err();
+        let constraint = error.constraint.expect("the refusal names its reason");
+        assert!(
+            constraint.contains("`test-ollama` is not allowed for `rsid` (test job)")
+                && constraint.contains("allowed features for `rsid`: e2e-seed"),
+            "{constraint}"
+        );
+        let accepted = json!({"kind":"test","params":{"package":"rsid","test_target":"seed_suite",
+            "exact":true,"filters":["one"],"features":["e2e-seed"]}});
+        assert!(Verb::SubmitJob.validate_params(&accepted).is_ok());
+        assert_eq!(Verb::SubmitJob.schema_error(&accepted), None);
+    }
+
+    #[test]
     fn catalog_schema_diagnostics_cover_required_type_enum_pattern_and_format() {
         for descriptor in agent_control_catalog_v1() {
             let error = descriptor.verb.schema_error(&json!(42)).unwrap();
@@ -435,7 +531,7 @@ mod tests {
             (
                 json!({"kind":"unknown","params":{}}),
                 "params.kind",
-                "enum [\"test\",\"build\",\"landing\",\"cloud_gate\",\"cloud_sweep\"]",
+                "enum [\"test\",\"build\",\"landing\",\"cloud_gate\",\"cloud_sweep\",\"bench\"]",
             ),
             (
                 json!({"kind":"landing","params":{"accepted":"BAD"}}),

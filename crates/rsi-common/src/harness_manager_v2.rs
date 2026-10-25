@@ -95,7 +95,6 @@ pub enum ManagerOperatingModeV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagerLaunchChoiceV2 {
     pub provider: SessionProvider,
     pub model: String,
@@ -179,16 +178,24 @@ pub struct ManagerSandboxSourceReceiptV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagerProviderLimitV2 {
     pub provider: SessionProvider,
     pub max_active: u16,
 }
 
+/// The rolling window `max_created_sessions` counts over when a policy names
+/// none (#3416), in hours.
+pub const DEFAULT_CREATED_SESSIONS_WINDOW_HOURS: u16 = 24;
+/// The longest window an operator may set: one year.
+pub const MAX_CREATED_SESSIONS_WINDOW_HOURS: u16 = 8760;
+/// The sessions-per-window a new grant, preset or pushed satellite policy
+/// starts with (#3416).
+pub const DEFAULT_MAX_CREATED_SESSIONS: u16 = 256;
+
 /// All defaults preserve status-only v1 behavior. Grants are operator-owned;
 /// sessions and containers created under a grant consume persistent quotas.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ManagerPolicyV2 {
     pub mode: ManagerOperatingModeV2,
     pub paused: bool,
@@ -197,7 +204,15 @@ pub struct ManagerPolicyV2 {
     pub group_ids: Vec<Uuid>,
     pub allow_create_groups: bool,
     pub max_created_containers: u16,
+    /// Sessions the seat lineage may create in any rolling
+    /// `created_sessions_window_hours` window (#3416): the allowance refills
+    /// as the oldest creations leave the window, so a long program never
+    /// waits on the operator while a runaway spawner is still stopped.
     pub max_created_sessions: u16,
+    /// The rolling window `max_created_sessions` counts over, in hours. A
+    /// policy saved before this field existed reads as
+    /// [`DEFAULT_CREATED_SESSIONS_WINDOW_HOURS`].
+    pub created_sessions_window_hours: u16,
     pub max_active_sessions: u16,
     pub provider_limits: Vec<ManagerProviderLimitV2>,
     pub allowed_launches: Vec<ManagerLaunchChoiceV2>,
@@ -205,11 +220,21 @@ pub struct ManagerPolicyV2 {
     pub retry_delay_seconds: u32,
     pub request_timeout_seconds: u32,
     pub max_spend_usd: Option<f64>,
+    /// Operator spend grants per paid provider (#3417): while one has budget
+    /// left, any model of its provider is launchable at its efforts without an
+    /// exact `allowed_launches` tuple. Operator-only: see
+    /// [`crate::provider_grant`].
+    pub provider_grants: Vec<crate::provider_grant::ManagerProviderGrantV2>,
     /// Minimum reviewer model tier for explicitly classified Tier-2 work.
     pub minimum_tier2_reviewer_tier: ModelTier,
     /// #1046: operator-set `min`/`max` per allowlisted daemon setting. A key
     /// without an entry is not manager-adjustable (default: none).
     pub daemon_setting_bounds: Vec<ManagerDaemonSettingBoundV2>,
+    /// #4041: the launch the daemon gives this seat's successor when it
+    /// rotates the seat at its context cap (provider, model and effort). Unset
+    /// keeps the predecessor's launch. The voluntary `succeed_manager` path
+    /// names its own launch and never reads this.
+    pub succession_launch: Option<ManagerLaunchChoiceV2>,
 }
 
 impl Default for ManagerPolicyV2 {
@@ -223,6 +248,7 @@ impl Default for ManagerPolicyV2 {
             allow_create_groups: false,
             max_created_containers: 0,
             max_created_sessions: 0,
+            created_sessions_window_hours: DEFAULT_CREATED_SESSIONS_WINDOW_HOURS,
             max_active_sessions: 4,
             provider_limits: vec![],
             allowed_launches: vec![],
@@ -230,8 +256,10 @@ impl Default for ManagerPolicyV2 {
             retry_delay_seconds: 60,
             request_timeout_seconds: 900,
             max_spend_usd: None,
+            provider_grants: vec![],
             minimum_tier2_reviewer_tier: ModelTier::Standard,
             daemon_setting_bounds: vec![],
+            succession_launch: None,
         }
     }
 }
@@ -248,6 +276,8 @@ impl ManagerPolicyV2 {
                 .any(|(i, c)| self.capabilities[..i].contains(c))
             || self.max_created_containers > 64
             || self.max_created_sessions > 1024
+            || !(1..=MAX_CREATED_SESSIONS_WINDOW_HOURS)
+                .contains(&self.created_sessions_window_hours)
             || !(1..=100).contains(&self.max_active_sessions)
             || self.provider_limits.len() > 8
             || self.allowed_launches.len() > crate::global_manager::GLOBAL_MANAGER_MAX_LAUNCHES
@@ -274,6 +304,10 @@ impl ManagerPolicyV2 {
         for choice in &self.allowed_launches {
             choice.validate()?;
         }
+        if let Some(choice) = &self.succession_launch {
+            choice.validate()?;
+        }
+        crate::provider_grant::validate_provider_grants(&self.provider_grants)?;
         validate_daemon_setting_bounds(&self.daemon_setting_bounds)?;
         Ok(())
     }
@@ -287,18 +321,33 @@ impl ManagerLaunchChoiceV2 {
     /// string; an unknown model keeps admitting every effort (the provider CLI
     /// validates it). An exact entry admits exactly its own effort and cannot
     /// grant a child entry that permits every effort.
+    ///
+    /// A provider grant (#3417) expands to entries whose model is
+    /// [`crate::provider_grant::PROVIDER_GRANT_ANY_MODEL`]: they allow any
+    /// model of the provider at their effort.
     #[must_use]
     pub fn allows(&self, launch: &Self) -> bool {
-        if self.provider != launch.provider || self.model != launch.model {
+        let any_model = self.is_provider_wide();
+        if self.provider != launch.provider || (!any_model && self.model != launch.model) {
             return false;
         }
         match (self.effort.as_deref(), launch.effort.as_deref()) {
             (Some(granted), Some(requested)) => granted == requested,
             (Some(_), None) => false,
             (None, None) => true,
-            (None, Some(requested)) => crate::model_utils::known_effort_ladder(&self.model)
-                .is_none_or(|ladder| ladder.contains(&requested)),
+            (None, Some(requested)) => crate::model_utils::known_effort_ladder(if any_model {
+                &launch.model
+            } else {
+                &self.model
+            })
+            .is_none_or(|ladder| ladder.contains(&requested)),
         }
+    }
+
+    /// Whether this is the any-model entry a provider grant expands to.
+    #[must_use]
+    pub fn is_provider_wide(&self) -> bool {
+        self.model == crate::provider_grant::PROVIDER_GRANT_ANY_MODEL
     }
 
     #[must_use]
@@ -313,6 +362,11 @@ impl ManagerLaunchChoiceV2 {
 
     pub fn validate(&self) -> Result<(), &'static str> {
         text(&self.model, 256)?;
+        // A provider-wide entry exists only as the expansion of a budgeted
+        // provider grant (#3417); an operator-written list cannot carry one.
+        if self.is_provider_wide() {
+            return Err("manager_v2_invalid_policy");
+        }
         if let Some(effort) = &self.effort {
             text(effort, 32)?;
         }
@@ -327,6 +381,7 @@ pub struct ConfigureHarnessManagerPolicyRequestV2 {
     pub expected_scope_version: i64,
     pub expected_policy_version: i64,
     pub idempotency_key: String,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub policy: ManagerPolicyV2,
 }
 
@@ -343,6 +398,7 @@ pub struct ConfigureHarnessManagerWithPolicyRequestV2 {
     pub scope: crate::harness_manager::ConfigureHarnessManagerRequestV1,
     pub expected_policy_version: i64,
     pub idempotency_key: String,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub policy: ManagerPolicyV2,
 }
 
@@ -697,17 +753,20 @@ pub enum PreparedManagerActionV2 {
     RetryLead {
         epic_id: Uuid,
         message: String,
+        #[serde(default, deserialize_with = "crate::strict_input::deserialize")]
         launch: Option<ManagerLaunchChoiceV2>,
     },
     ReplaceLead {
         epic_id: Uuid,
         query: String,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
     },
     CreateSession {
         parent_id: Uuid,
         kind: SessionKind,
         query: String,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
         /// #1195: omitted means a fresh `origin/rolling` base.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -827,6 +886,8 @@ pub enum ManagerPreparedActionReadinessV2 {
 #[serde(rename_all = "snake_case")]
 pub enum ManagerPreparedActionBlockerCodeV2 {
     PendingOperatorDecision,
+    /// A pending decision a manager may rule on (#3240).
+    PendingManagerDecision,
     HumanOrRecoveryOwner,
     OperatorPause,
     ProgramEvidence,
@@ -837,6 +898,8 @@ pub enum ManagerPreparedActionBlockerCodeV2 {
 #[serde(rename_all = "snake_case")]
 pub enum ManagerPreparedActionRequiredActionV2 {
     AnswerOperatorDecision,
+    /// Rule on the pending decision with `AgentManagerUpdate decision_ruling` (#3240).
+    RuleManagerDecision,
     ResolveHumanOrRecoveryOwner,
     ResumeManagerOrPolicy,
     InspectProgramEvidence,
@@ -961,6 +1024,7 @@ impl AgentManagerGetActionRequestV2 {
 pub enum ManagerActionV2 {
     SucceedManager {
         expected: ManagerSuccessionFenceV2,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
         handoff: ManagerCommittedHandoffV2,
     },
@@ -978,12 +1042,14 @@ pub enum ManagerActionV2 {
         epic_id: Uuid,
         expected: ManagerLeadFenceV2,
         message: String,
+        #[serde(default, deserialize_with = "crate::strict_input::deserialize")]
         launch: Option<ManagerLaunchChoiceV2>,
     },
     ReplaceLead {
         epic_id: Uuid,
         expected: ManagerLeadFenceV2,
         query: String,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
     },
     CreateContainer {
@@ -1014,6 +1080,7 @@ pub enum ManagerActionV2 {
         parent_id: Uuid,
         kind: SessionKind,
         query: String,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
         /// #1195: omitted means a fresh `origin/rolling` base.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1029,6 +1096,12 @@ pub enum ManagerActionV2 {
         target_ref: String,
         expected_tip: String,
         source_commit: String,
+    },
+    /// Withdraw an exact queued create before admission claims it. Once claimed,
+    /// use AgentHalt on the target session instead.
+    WithdrawQueuedCreate {
+        operation_id: Uuid,
+        expected_row_version: i64,
     },
     /// Ask the daemon to re-observe one uncertain action's effect. It never
     /// re-executes that effect; unobservable effects stay uncertain.
@@ -1177,6 +1250,7 @@ impl ManagerActionV2 {
             Self::CreateSession { .. } => ManagerActionKindV2::CreateSession,
             Self::AssignLead { .. } => ManagerActionKindV2::AssignLead,
             Self::Integrate { .. } => ManagerActionKindV2::Integrate,
+            Self::WithdrawQueuedCreate { .. } => ManagerActionKindV2::WithdrawQueuedCreate,
             Self::SettleUncertainAction { .. } => ManagerActionKindV2::SettleUncertainAction,
             Self::RetireLeadContinuations { .. } => ManagerActionKindV2::RetireLeadContinuations,
             Self::ArchiveSession { .. } => ManagerActionKindV2::ArchiveSession,
@@ -1194,7 +1268,9 @@ impl ManagerActionV2 {
             | Self::PauseLead { .. }
             | Self::AssignLead { .. }
             | Self::RetireLeadContinuations { .. } => ManagerActionTargetTypeV2::EpicLead,
-            Self::SettleUncertainAction { .. } => ManagerActionTargetTypeV2::ManagerOperation,
+            Self::SettleUncertainAction { .. } | Self::WithdrawQueuedCreate { .. } => {
+                ManagerActionTargetTypeV2::ManagerOperation
+            }
             Self::RetryLead { .. }
             | Self::ReplaceLead { .. }
             | Self::CreateSession { .. }
@@ -1252,6 +1328,7 @@ impl ManagerActionV2 {
                 session_id: None, ..
             } => ManagerActionResultV2::LeadUnassigned,
             Self::Integrate { .. } => ManagerActionResultV2::SourceIntegrated,
+            Self::WithdrawQueuedCreate { .. } => ManagerActionResultV2::QueuedCreateWithdrawn,
             Self::SettleUncertainAction { .. } => ManagerActionResultV2::UncertainActionSettled,
             Self::RetireLeadContinuations { .. } => ManagerActionResultV2::LeadContinuationsRetired,
             Self::ArchiveSession { .. } => ManagerActionResultV2::SessionArchived,
@@ -1275,7 +1352,9 @@ impl ManagerActionV2 {
             | Self::ArchiveContainer { .. }
             | Self::DeleteContainer { .. }
             | Self::RestoreContainer { .. } => ManagerCapabilityV2::Topology,
-            Self::CreateSession { .. } => ManagerCapabilityV2::SessionCreate,
+            Self::CreateSession { .. } | Self::WithdrawQueuedCreate { .. } => {
+                ManagerCapabilityV2::SessionCreate
+            }
             Self::AssignLead { .. } => ManagerCapabilityV2::LeadAssign,
             Self::Integrate { .. } => ManagerCapabilityV2::GitEffect,
             Self::ArchiveSession { .. }
@@ -1420,6 +1499,10 @@ impl ManagerActionV2 {
             Self::SettleUncertainAction {
                 operation_id,
                 expected_row_version,
+            }
+            | Self::WithdrawQueuedCreate {
+                operation_id,
+                expected_row_version,
             } => {
                 if operation_id.is_nil() || *expected_row_version <= 0 {
                     return Err("manager_v2_invalid_action");
@@ -1517,6 +1600,7 @@ pub enum ManagerActionKindV2 {
     AssignLead,
     Integrate,
     SettleUncertainAction,
+    WithdrawQueuedCreate,
     RetireLeadContinuations,
     ArchiveSession,
     RestoreSession,
@@ -1575,6 +1659,7 @@ pub enum ManagerActionResultV2 {
     LeadUnassigned,
     SourceIntegrated,
     UncertainActionSettled,
+    QueuedCreateWithdrawn,
     LeadContinuationsRetired,
     SessionArchived,
     SessionRestored,
@@ -1624,6 +1709,12 @@ pub struct ManagerActionReceiptV2 {
     /// every later read, refresh and idempotent replay returns the same ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_wakes: Option<ManagerCancelledWakesV1>,
+    /// #3640: the bounded, secret-redacted text of the error behind a catch-all
+    /// `outcome` (`manager_v2_lifecycle_unconfirmed`), so a manager reads why a
+    /// launch ended without the daemon log. Absent when the outcome is already
+    /// a specific code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_detail: Option<String>,
 }
 
 /// Resume wakes retired together with a displaced manager seat. The rows stay,
@@ -1652,9 +1743,12 @@ pub struct ManagerActionHeldV1 {
     ///
     /// `thermal` and `disk_pressure` (#2562): the host CPU is at or above
     /// `job_thermal_ceiling_c`, or free disk is below the governor floor
-    /// `min_free_disk_gb`; the same predicate holds build/test jobs. The
+    /// `min_free_disk_gb` plus the per-launch build reserve. Build/test jobs
+    /// use only the governor floor. The
     /// `create_session` is queued, never refused, and starts once the
     /// condition clears, oldest first, sharing one queue with `host_load`.
+    /// `sandbox_git_timeout` (#495): this create is waiting for its durable
+    /// 30-second retry cooldown (`release_by`); at most three attempts run.
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_id: Option<Uuid>,
@@ -1684,6 +1778,12 @@ pub struct ManagerActionHeldV1 {
     /// `disk_pressure` only: the governor's `min_free_disk_gb` floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_free_disk_gb: Option<u64>,
+    /// `disk_pressure` only: target estimate reserved for this launch, in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_gb: Option<u64>,
+    /// `disk_pressure` only: governor floor plus the launch reserve, in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needed_free_gb: Option<u64>,
 }
 
 /// `AgentManagerGetAction` result: the stored receipt plus, while the action
@@ -1694,6 +1794,9 @@ pub struct ManagerActionViewV2 {
     pub receipt: ManagerActionReceiptV2,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<ManagerActionHeldV1>,
+    /// Recovery guidance for a typed terminal launch refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 impl ManagerActionReceiptV2 {
@@ -1885,19 +1988,42 @@ pub fn review_receipt_is_infrastructure_only<'a>(
 
 /// Reviewer-authored content only. The daemon binds the caller, source,
 /// invocation, and custody from the live assignment.
+///
+/// `assignment_id` is optional on the wire (#3213): a reviewer session is
+/// bound to one live assignment, so an omitted (or null) id arrives as
+/// [`Uuid::nil`] and the daemon resolves it from that binding before any
+/// store call. The store only ever sees a resolved, non-nil id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSubmitReviewReceiptRequestV1 {
+    #[serde(
+        default,
+        deserialize_with = "uuid_or_nil",
+        skip_serializing_if = "Uuid::is_nil"
+    )]
     pub assignment_id: Uuid,
     pub verdict: ManagerReviewVerdictV1,
     pub findings: Vec<ManagerReviewFindingV1>,
     pub idempotency_key: String,
 }
 
+fn uuid_or_nil<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Uuid, D::Error> {
+    Ok(Option::<Uuid>::deserialize(deserializer)?.unwrap_or_else(Uuid::nil))
+}
+
 impl AgentSubmitReviewReceiptRequestV1 {
+    /// Validate a resolved request: the assignment id is present.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.assignment_id.is_nil()
-            || self.findings.len() > MANAGER_REVIEW_MAX_FINDINGS
+        if self.assignment_id.is_nil() {
+            return Err("manager_review_invalid_receipt");
+        }
+        self.validate_wire()
+    }
+
+    /// Validate a request as a caller sends it: the assignment id may be
+    /// omitted (nil) and is resolved from the reviewer's binding (#3213).
+    pub fn validate_wire(&self) -> Result<(), &'static str> {
+        if self.findings.len() > MANAGER_REVIEW_MAX_FINDINGS
             || self.findings.iter().enumerate().any(|(index, finding)| {
                 finding.validate().is_err()
                     || self.findings[..index]
@@ -2009,6 +2135,7 @@ pub enum ManagerUpdateV2 {
         expected_row_version: i64,
         source_commit: String,
         query: String,
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         launch: ManagerLaunchChoiceV2,
         #[serde(default)]
         delta_of: Option<Uuid>,
@@ -2032,6 +2159,13 @@ pub enum ManagerUpdateV2 {
         state: ManagerRequestStateV2,
         message: String,
         work_key: Option<String>,
+    },
+    /// The current sending manager slot (including its successor) retires a
+    /// pending request without claiming the lead completed it.
+    RequestWithdraw {
+        request_id: Uuid,
+        expected_row_version: i64,
+        reason: String,
     },
     Decision {
         key: String,
@@ -2281,6 +2415,16 @@ impl AgentManagerUpdateRequestV2 {
                 if let Some(key) = work_key {
                     text(key, 256)?;
                 }
+            }
+            ManagerUpdateV2::RequestWithdraw {
+                request_id,
+                expected_row_version,
+                reason,
+            } => {
+                if request_id.is_nil() || *expected_row_version < 0 {
+                    return Err("manager_v2_invalid_update");
+                }
+                text(reason, 2048)?;
             }
             ManagerUpdateV2::Decision {
                 key,
@@ -2753,14 +2897,17 @@ mod tests {
     }
 
     #[test]
-    fn manager_v2_default_grant_preserves_status_only_and_rejects_unknown_fields() {
+    fn manager_v2_default_grant_preserves_status_only_and_tolerates_new_read_fields() {
         let policy: ManagerPolicyV2 = serde_json::from_value(json!({})).unwrap();
         assert_eq!(policy.mode, ManagerOperatingModeV2::Status);
         assert!(policy.capabilities.is_empty());
         assert_eq!(policy.max_created_sessions, 0);
         assert_eq!(policy.max_recovery_attempts, 0);
         assert!(policy.validate().is_ok());
-        assert!(serde_json::from_value::<ManagerPolicyV2>(json!({"admin":true})).is_err());
+        assert_eq!(
+            serde_json::from_value::<ManagerPolicyV2>(json!({"future_policy_field":true})).unwrap(),
+            policy
+        );
     }
 
     #[test]
@@ -3318,6 +3465,22 @@ mod tests {
             idempotency_key: "receipt-v1".into(),
         };
         assert!(valid.validate().is_ok());
+        // #3213: an omitted or null assignment id is valid on the wire (the
+        // daemon resolves it) but never valid for the store.
+        let mut omitted = serde_json::to_value(&valid).unwrap();
+        omitted.as_object_mut().unwrap().remove("assignment_id");
+        let parsed: AgentSubmitReviewReceiptRequestV1 =
+            serde_json::from_value(omitted.clone()).unwrap();
+        assert!(parsed.assignment_id.is_nil());
+        assert!(parsed.validate_wire().is_ok());
+        assert!(parsed.validate().is_err());
+        omitted["assignment_id"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<AgentSubmitReviewReceiptRequestV1>(omitted)
+                .unwrap()
+                .assignment_id
+                .is_nil()
+        );
         let mut injected = serde_json::to_value(&valid).unwrap();
         for field in [
             "reviewer_session_id",

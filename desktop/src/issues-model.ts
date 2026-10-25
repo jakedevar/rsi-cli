@@ -4,6 +4,9 @@
 // rules mirror the TUI's Issues pane (crates/rsi/src/ui/issues.rs,
 // app/issues.rs) and the daemon's typed contracts (rsi-common issue_workspace).
 
+import type { Platform } from './keyengine.js';
+import { hintLabel } from './keylabel.js';
+
 export type IssueStatus = 'Open' | 'InProgress' | 'Closed' | 'Cancelled';
 export type Readiness = 'ready' | 'blocked' | 'not_eligible';
 export type ReadinessFilter = 'any' | 'ready' | 'blocked';
@@ -279,6 +282,24 @@ export function statusTitle(s: IssueStatus): string {
   return s === 'InProgress' ? 'In progress' : s;
 }
 
+/** The Filters form's Status checkbox group: [serde enum string, plain label]. */
+export const STATUS_CHOICES: ReadonlyArray<readonly [IssueStatus, string]> = STATUSES.map((s) => [s, statusTitle(s)] as const);
+
+/** The checked Status boxes as the exact serde enum strings, in list order; none checked = [] (the active ones). */
+export function statusesFromChecked(checked: readonly string[]): IssueStatus[] {
+  return STATUSES.filter((s) => checked.includes(s));
+}
+
+/** The Issue list's empty row: a next step when the project has no Issues, the filters when some are set. */
+export function emptyIssuesText(f: Filters): string {
+  return filterChips(f).length === 0 ? 'No Issues in this project yet. Click New Issue to add one.' : 'No Issues match these filters.';
+}
+
+/** The retry banner: what may have failed and how to try again (the retry replays the same idempotency key). */
+export function retryBannerText(label: string, platform: Platform = 'other'): string {
+  return `Saving “${label}” may have failed. Try again (${hintLabel('Ctrl-Enter', platform)})`;
+}
+
 export type WriteWhat = 'edit' | 'status' | 'cancel' | 'archive' | 'restore';
 
 /** Why a write is not offered, or null. */
@@ -294,6 +315,28 @@ export function writeBlock(i: Issue | null, what: WriteWhat): string | null {
     case 'archive': return canArchive(i) ? null : isArchived(i) ? 'Already archived' : 'Close or cancel the Issue before archiving it';
     case 'restore': return canRestore(i) ? null : 'This Issue is not archived';
   }
+}
+
+// ---------- visible action buttons ----------
+
+/** One labelled button in the Issue detail pane. `action` is the same action id the key, palette and menu run. */
+export interface IssueButton {
+  readonly action: 'issues-edit' | 'issues-status' | 'issues-archive' | 'issues-restore';
+  readonly label: string;
+  readonly title: string;
+}
+
+/**
+ * The buttons the detail pane shows for this Issue, in plain words. Each one opens the form the key does, so the
+ * same checks and confirmations apply; a button is listed only when its action can run on this Issue now.
+ */
+export function issueButtons(i: Issue): IssueButton[] {
+  const out: IssueButton[] = [];
+  if (canEdit(i)) out.push({ action: 'issues-edit', label: 'Edit…', title: 'Change the title, description, priority, labels or assignee' });
+  if (statusTargets(i).length > 0) out.push({ action: 'issues-status', label: 'Change status…', title: `Now ${statusTitle(i.status)}; choose where to move it` });
+  if (canArchive(i)) out.push({ action: 'issues-archive', label: 'Archive…', title: 'Hide this finished Issue from the default list; you can restore it' });
+  if (canRestore(i)) out.push({ action: 'issues-restore', label: 'Restore', title: 'Bring this archived Issue back to the list' });
+  return out;
 }
 
 // ---------- display ----------

@@ -35,7 +35,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -79,14 +78,17 @@ pub(crate) struct SealWorkerTickStats {
 /// The bounded control worker.
 pub(crate) struct AppServerSealWorker {
     plane: Arc<AppServerControlPlane>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     /// Resumable sweep position. Held as a plain field rather than shared
     /// state: the worker is owned by exactly one task.
     cursor: Option<AttemptKey>,
 }
 
 impl AppServerSealWorker {
-    pub(crate) const fn new(plane: Arc<AppServerControlPlane>, store: Arc<Mutex<Store>>) -> Self {
+    pub(crate) const fn new(
+        plane: Arc<AppServerControlPlane>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> Self {
         Self {
             plane,
             store,

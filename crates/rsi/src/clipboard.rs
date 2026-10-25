@@ -45,6 +45,19 @@ pub(crate) fn encode_osc52(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exiting_leaves_a_still_named_pasted_image_in_place() {
+        let home = tempfile::tempdir().unwrap();
+        let paste = home.path().join(".rsi/paste");
+        std::fs::create_dir_all(&paste).unwrap();
+        let named = paste.join(format!("{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&named, b"queued image").unwrap();
+
+        assert_eq!(super::leave_paste_dir_to_daemon(&paste), 1);
+
+        assert_eq!(std::fs::read(&named).unwrap(), b"queued image");
+    }
+
     use super::encode_osc52;
 
     #[test]
@@ -290,16 +303,20 @@ fn read_clipboard_xclip(paste_dir: &std::path::Path) -> ClipboardContent {
     try_xclip_text()
 }
 
-/// Remove all `.png` files from the paste directory.
-/// Called on TUI shutdown to avoid stale temp files.
-pub fn cleanup_paste_dir(paste_dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(paste_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "png") {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+/// Called on TUI shutdown. Deliberately removes nothing (local #155): a
+/// pasted image stays referenced as `@path` by queued or live messages after
+/// the TUI quits, so cleanup belongs to the daemon's retention rule
+/// (`rsid::paste_retention`: older than 7 days and never named by a message,
+/// conversation or enabled scheduled job; a named one only under the opt-in
+/// setting `paste_retention_referenced_days`, #86).
+/// Returns how many pasted `.png` files stay for the daemon to manage.
+pub fn leave_paste_dir_to_daemon(paste_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(paste_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "png"))
+                .count()
+        })
+        .unwrap_or(0)
 }

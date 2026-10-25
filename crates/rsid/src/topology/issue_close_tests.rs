@@ -58,14 +58,24 @@ fn closing_flow(close_issue: bool) -> TopologyDefinition {
 }
 
 pub(super) async fn open_issue(world: &World, title: &str) -> Issue {
+    open_labeled_issue(world, title, &[]).await
+}
+
+/// [`open_issue`] carrying `labels` (#3772).
+pub(super) async fn open_labeled_issue(world: &World, title: &str, labels: &[&str]) -> Issue {
+    open_issue_with(world, title, "Fix it.", labels).await
+}
+
+/// [`open_labeled_issue`] with an explicit `body` (#3808).
+async fn open_issue_with(world: &World, title: &str, body: &str, labels: &[&str]) -> Issue {
     let store = world.harness.executor.store.lock().await;
     store
         .create_issue(&NewIssue {
             project_id: world.project,
             title: title.into(),
-            body: "Fix it.".into(),
+            body: body.into(),
             priority: None,
-            labels: Vec::new(),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
             created_by_session_id: None,
             assignee: None,
             idea_id: None,
@@ -597,6 +607,63 @@ async fn land_close_issue_refused_authority_settles_published_with_refusal_outpu
     );
 }
 
+/// #3273/#3274: the project manager seat is re-appointed (the operator seats a
+/// fresh session) while the land waits. The close is authorized as the current
+/// appointed manager when its scope covers the execution's Epic.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_close_issue_after_a_reappointment_closes_as_the_current_manager() {
+    let world = World::new(coordinator()).await;
+    let issue = open_issue(&world, "Displaced owner").await;
+    let (execution, land) = land_waiting(&world, &issue, "displaced-owner").await;
+    let seat =
+        super::reappointment_tests::reappoint(&world, vec![world.epic_a, world.epic_b]).await;
+    world.grant(coordinator()).await;
+    published(&world, &land);
+    let land = settled_land(&world, execution).await;
+
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    assert_eq!(issue_close(&land), ("closed".to_owned(), None));
+    assert_eq!(issue_now(&world, &issue).await.status, IssueStatus::Closed);
+    let actor: String = {
+        let store = world.harness.executor.store.lock().await;
+        store
+            .conn
+            .query_row(
+                "SELECT actor_session_id FROM issue_events WHERE issue_id=?1 AND idempotency_key=?2",
+                rusqlite::params![
+                    issue.id.to_string(),
+                    format!("topology-land:{execution}:{}", land.id)
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(actor, seat.to_string(), "the current seat wrote the close");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_close_issue_after_a_reappointment_that_drops_the_epic_is_refused() {
+    let world = World::new(coordinator()).await;
+    let issue = open_issue(&world, "Epic left the scope").await;
+    let (execution, land) = land_waiting(&world, &issue, "epic-dropped").await;
+    super::reappointment_tests::reappoint(&world, vec![world.epic_b]).await;
+    world.grant(coordinator()).await;
+    published(&world, &land);
+    let land = settled_land(&world, execution).await;
+
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    assert_eq!(
+        issue_close(&land),
+        ("refused".to_owned(), Some("epic_out_of_scope".to_owned()))
+    );
+    assert_eq!(
+        issue_now(&world, &issue).await.status,
+        IssueStatus::InProgress
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn land_refused_entry_leaves_the_issue_open() {
@@ -988,6 +1055,17 @@ async fn satisfied_run(
     key: &str,
     evidence: impl FnOnce(&std::path::Path, &str) -> String,
 ) -> (Uuid, rows::AttemptRow) {
+    satisfied_run_body(world, issue, key, evidence, None).await
+}
+
+/// [`satisfied_run`] with an explicit handoff body after `evidence_commit` (#3772).
+async fn satisfied_run_body(
+    world: &World,
+    issue: &Issue,
+    key: &str,
+    evidence: impl FnOnce(&std::path::Path, &str) -> String,
+    body: Option<&str>,
+) -> (Uuid, rows::AttemptRow) {
     let flow = upsert_flow(world, key, true).await;
     let execution = start(world, &flow, json!({"issue": issue.display_number}), key)
         .await
@@ -997,7 +1075,10 @@ async fn satisfied_run(
     let running = harness.attempt(execution, "A", 0, 1).await;
     assert_eq!(running.status, AttemptStatus::Running);
     let evidence = evidence(&harness.sandbox(running.session_id), &harness.base);
-    harness.complete_already_satisfied(running.session_id, &evidence);
+    match body {
+        Some(body) => harness.complete_already_satisfied_with(running.session_id, &evidence, body),
+        None => harness.complete_already_satisfied(running.session_id, &evidence),
+    }
     harness.executor.advance(execution).await.unwrap();
     (execution, harness.attempt(execution, "A", 0, 1).await)
 }
@@ -1059,7 +1140,7 @@ async fn already_satisfied_handoff_closes_the_issue_without_landing() {
         )
         .unwrap();
     assert!(note.contains(&world.harness.base), "{note}");
-    assert!(note.contains("cargo test -p x ok 3/3"), "{note}");
+    assert!(note.contains("cargo test -p x: ok 3/3"), "{note}");
     assert!(
         topology_events(&world, execution, "topology_landed")
             .await
@@ -1186,4 +1267,338 @@ fn already_satisfied_without_evidence_commit_does_not_parse() {
                  manifest_path: inline\nstatus: already_satisfied\n";
     let error = rsi_common::agent_contract::parse_pipeline_handoff_v2(reply, "").unwrap_err();
     assert!(error.to_string().contains("evidence_commit"), "{error}");
+}
+
+/// #3772: an `already_satisfied` claim with no `summary` or no `tests` is
+/// refused (`already_satisfied_unproven`); the node fails and the Issue stays
+/// open, even though the evidence commit is a valid ancestor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn already_satisfied_without_proof_is_refused_and_the_issue_stays_open() {
+    let world = World::new(coordinator()).await;
+    let issue = open_issue(&world, "Bare claim").await;
+    for (key, body) in [
+        ("bare", ""),
+        ("no-tests", "summary: all criteria hold\n"),
+        ("no-summary", "tests: cargo test -p x ok\n"),
+        ("empty-values", "summary: none\ntests: n/a\n"),
+        // #3808: the right fields with the wrong shape.
+        (
+            "generic",
+            "summary: all criteria hold\ntests: cargo test passed\n",
+        ),
+        ("bare-words", "summary: ok\ntests: cargo test ok\n"),
+        (
+            "no-result",
+            "summary:\n- AC1: lib.rs:1\ntests:\n- cargo test passed\n",
+        ),
+    ] {
+        let (_, author) =
+            satisfied_run_body(&world, &issue, key, |_, base| base.into(), Some(body)).await;
+        assert_eq!(author.status, AttemptStatus::Failed, "{key}: {author:?}");
+        assert_eq!(
+            author.failure_class.as_deref(),
+            Some(rows::failure::HANDOFF_INVALID),
+            "{key}"
+        );
+        assert!(
+            author
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already_satisfied_unproven"),
+            "{key}: {author:?}"
+        );
+        assert_ne!(
+            issue_now(&world, &issue).await.status,
+            IssueStatus::Closed,
+            "{key}"
+        );
+    }
+}
+
+/// #3772: a proven `already_satisfied` claim on an `operator-request` Issue
+/// settles the node but leaves the Issue open for a manager to acknowledge; the
+/// output says `issue_close: held`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn already_satisfied_never_auto_closes_an_operator_request_issue() {
+    let world = World::new(coordinator()).await;
+    let issue = open_labeled_issue(&world, "Operator asked", &["operator-request"]).await;
+    let (execution, author) =
+        satisfied_run(&world, &issue, "operator-request", |_, base| base.into()).await;
+
+    assert_eq!(author.status, AttemptStatus::Succeeded, "{author:?}");
+    let close = &author.output.as_ref().unwrap()["fields"]["issue_close"];
+    assert_eq!(close["status"], "held", "{close}");
+    assert_eq!(close["code"], "manager_acknowledgement_required", "{close}");
+    assert_eq!(world.harness.run_to_end(execution).await, Step::Done);
+    assert_ne!(issue_now(&world, &issue).await.status, IssueStatus::Closed);
+    assert_eq!(
+        status_events(&world, &issue).await,
+        vec![format!("topology-start:{execution}")]
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn satisfied_proof_gap_reads_inline_and_block_values() {
+    use crate::topology::issue_close::satisfied_proof_gap;
+    let head = "PIPELINE HANDOFF — IMPLEMENTATION:\nstatus: already_satisfied\n";
+    assert!(satisfied_proof_gap(head, 1).is_some());
+    // One criterion: an inline `AC1:` summary and an inline `<command>: <result>` test.
+    let inline = format!("{head}summary: AC1: lib.rs:10 asserts it\ntests: cargo test -p x: ok\n");
+    assert_eq!(satisfied_proof_gap(&inline, 1), None);
+    let added = format!("{head}summary: AC1: lib.rs:10\ntests_added: none\n");
+    assert!(satisfied_proof_gap(&added, 1).is_some());
+    let block =
+        format!("{head}summary:\n- AC1: test a\n- AC2: test b\ntests:\n  cargo test -p x: ok\n");
+    assert_eq!(satisfied_proof_gap(&block, 2), None);
+    let empty_block = format!("{head}summary:\ntests: cargo test: ok\n");
+    assert!(satisfied_proof_gap(&empty_block, 1).is_some());
+}
+
+/// #3808: the shape check rejects (a) generic claims, (b) bare words, (c) a
+/// summary with fewer criterion lines than the Issue has criteria, and a
+/// criterion with no evidence; it accepts one `AC<n>: <evidence>` line per
+/// criterion plus `tests` entries naming a command and a result.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn satisfied_proof_gap_checks_the_proof_shape() {
+    use crate::topology::issue_close::satisfied_proof_gap;
+    let head = "PIPELINE HANDOFF — IMPLEMENTATION:\nstatus: already_satisfied\n";
+    let rejected = |criteria: usize, body: &str| {
+        let gap = satisfied_proof_gap(&format!("{head}{body}"), criteria);
+        assert!(gap.is_some(), "{body:?} must be refused");
+    };
+    // (a) a generic claim, (b) bare words.
+    rejected(1, "summary: all criteria hold\ntests: cargo test passed\n");
+    rejected(1, "summary: ok\ntests: cargo test ok\n");
+    // (c) fewer criterion lines than criteria.
+    rejected(
+        3,
+        "summary:\n- AC1: a.rs:1\n- AC2: b.rs:2\ntests:\n- cargo test -p x: ok\n",
+    );
+    // A criterion without evidence, a repeated number, a non-criterion line.
+    rejected(
+        2,
+        "summary:\n- AC1: a.rs:1\n- AC2:\ntests:\n- cargo test: ok\n",
+    );
+    rejected(
+        2,
+        "summary:\n- AC1: a.rs:1\n- AC1: b.rs:2\ntests:\n- cargo test: ok\n",
+    );
+    rejected(
+        2,
+        "summary:\n- AC1: a.rs:1\n- AC2: ok\ntests:\n- cargo test: ok\n",
+    );
+    // Tests that name no command or no result.
+    rejected(1, "summary:\n- AC1: a.rs:1\ntests:\n- cargo test passed\n");
+    rejected(
+        1,
+        "summary:\n- AC1: a.rs:1\ntests:\n- cargo test: ok\n- ran them all\n",
+    );
+    rejected(1, "summary:\n- AC1: a.rs:1\ntests: cargo test:\n");
+
+    let accepted = format!(
+        "{head}summary:\n- AC1: crates/x/src/lib.rs:10 returns None\n- AC2: test x::y\n\
+         tests:\n- cargo test -p x --lib -- --exact x::y: ok (1 passed)\n- scoped_test: exit 0\n"
+    );
+    assert_eq!(satisfied_proof_gap(&accepted, 2), None);
+}
+
+/// #3808: the Issue's criteria are the list items under its "acceptance
+/// criteria" heading or label; prose criteria count as one.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn issue_acceptance_criteria_count_reads_the_criteria_list() {
+    use crate::topology::issue_close::issue_acceptance_criteria_count;
+    assert_eq!(issue_acceptance_criteria_count("Fix it."), 1);
+    assert_eq!(
+        issue_acceptance_criteria_count("Acceptance tests: it must work."),
+        1
+    );
+    let listed = "Intro\n- not a criterion\n\n## Acceptance criteria\n- one\n- [ ] two\n3. three\n   continued\n\n## Notes\n- other\n";
+    assert_eq!(issue_acceptance_criteria_count(listed), 3);
+    let labeled =
+        "**Acceptance criteria:**\n1. a\n2) b\n\nPlain closing paragraph.\n- later bullet\n";
+    assert_eq!(issue_acceptance_criteria_count(labeled), 2);
+}
+
+/// #3808: an Issue with two acceptance criteria needs an `AC<n>: <evidence>`
+/// line for each. A summary with one line fails the node
+/// `already_satisfied_unproven` and leaves the Issue open; one line per
+/// criterion with `<command>: <result>` tests settles it and closes the Issue.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn already_satisfied_needs_a_summary_line_per_issue_criterion() {
+    let world = World::new(coordinator()).await;
+    let body = "Fix it.\n\n## Acceptance criteria\n- the first holds\n- the second holds\n";
+    let issue = open_issue_with(&world, "Two criteria", body, &[]).await;
+
+    let short = "summary:\n- AC1: lib.rs:10\ntests:\n- cargo test -p x: ok\n";
+    let (_, author) =
+        satisfied_run_body(&world, &issue, "short", |_, base| base.into(), Some(short)).await;
+    assert_eq!(author.status, AttemptStatus::Failed, "{author:?}");
+    assert_eq!(
+        author.failure_class.as_deref(),
+        Some(rows::failure::HANDOFF_INVALID)
+    );
+    let error = author.error.as_deref().unwrap();
+    assert!(error.contains("already_satisfied_unproven"), "{error}");
+    assert!(error.contains("AC2"), "{error}");
+    assert_ne!(issue_now(&world, &issue).await.status, IssueStatus::Closed);
+
+    let full = "summary:\n- AC1: lib.rs:10\n- AC2: lib.rs:20\ntests:\n- cargo test -p x: ok\n";
+    let (_, author) =
+        satisfied_run_body(&world, &issue, "full", |_, base| base.into(), Some(full)).await;
+    assert_eq!(author.status, AttemptStatus::Succeeded, "{author:?}");
+    assert_eq!(issue_now(&world, &issue).await.status, IssueStatus::Closed);
+}
+
+/// #3880: a `tests` result that reports a failure, an error or a nonzero exit
+/// is no proof; a passing result (also one that counts zero failures) is.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn satisfied_proof_gap_rejects_failing_test_results() {
+    use crate::topology::issue_close::satisfied_proof_gap;
+    let head =
+        "PIPELINE HANDOFF — IMPLEMENTATION:\nstatus: already_satisfied\nsummary:\n- AC1: a.rs:1\n";
+    let gap = |test: &str| satisfied_proof_gap(&format!("{head}tests:\n- {test}\n"), 1);
+    for failing in [
+        "cargo test -p app: failed (3 failures)",
+        "cargo test -p app: fail",
+        "cargo test -p app: error",
+        "cargo test -p app: red",
+        "scoped_test: exit 1",
+        "scoped_test: exit code 101",
+        "scoped_test: exited with status 2",
+        "cargo test -p app: 3 failed, 12 passed",
+        "cargo test -p app: nonzero exit",
+        "cargo test -p app: not passed",
+        "cargo test -p app: 42",
+    ] {
+        assert!(gap(failing).is_some(), "{failing:?} must be refused");
+    }
+    for passing in [
+        "cargo test -p app: ok",
+        "cargo test -p app: passed (0 failed)",
+        "cargo test -p app: ok. 3 passed; 0 failed",
+        "cargo test -p app: green, no errors",
+        "scoped_test: exit 0",
+        "scoped_test: exit code 0",
+    ] {
+        assert_eq!(gap(passing), None, "{passing:?} must be accepted");
+    }
+}
+
+/// #3880: an `already_satisfied` handoff whose tests report a failure fails the
+/// node `already_satisfied_unproven` and leaves the Issue open; a passing
+/// result still closes it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn already_satisfied_with_a_failing_test_result_leaves_the_issue_open() {
+    let world = World::new(coordinator()).await;
+    let issue = open_issue(&world, "Red tests").await;
+    for (key, test) in [
+        ("failed", "cargo test -p x: failed (3 failures)"),
+        ("exit-1", "scoped_test: exit 1"),
+    ] {
+        let body = format!("summary:\n- AC1: lib.rs:10\ntests:\n- {test}\n");
+        let (_, author) =
+            satisfied_run_body(&world, &issue, key, |_, base| base.into(), Some(&body)).await;
+        assert_eq!(author.status, AttemptStatus::Failed, "{key}: {author:?}");
+        assert!(
+            author
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("already_satisfied_unproven"),
+            "{key}: {author:?}"
+        );
+        assert_ne!(
+            issue_now(&world, &issue).await.status,
+            IssueStatus::Closed,
+            "{key}"
+        );
+    }
+    let passing = "summary:\n- AC1: lib.rs:10\ntests:\n- cargo test -p x: ok (3 passed)\n";
+    let (_, author) = satisfied_run_body(
+        &world,
+        &issue,
+        "passing",
+        |_, base| base.into(),
+        Some(passing),
+    )
+    .await;
+    assert_eq!(author.status, AttemptStatus::Succeeded, "{author:?}");
+    assert_eq!(issue_now(&world, &issue).await.status, IssueStatus::Closed);
+}
+
+/// #3881: a proof validated against one Issue version closes only that
+/// version. An acceptance criterion added after validation and before the
+/// close refuses the close, leaves the Issue open and records why.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn already_satisfied_close_refuses_an_issue_edited_after_the_proof() {
+    use crate::topology::issue_close::ISSUE_CHANGED_AFTER_PROOF;
+    let world = World::new(coordinator()).await;
+    let body = "Fix it.\n\n## Acceptance criteria\n- the first holds\n";
+    let issue = open_issue_with(&world, "Edited mid-proof", body, &[]).await;
+    let flow = upsert_flow(&world, "edited", true).await;
+    let execution = start(
+        &world,
+        &flow,
+        json!({"issue": issue.display_number}),
+        "edited",
+    )
+    .await
+    .unwrap();
+    world.harness.executor.advance(execution).await.unwrap();
+    let attempt = world.harness.attempt(execution, "A", 0, 1).await;
+
+    let store = world.harness.executor.store.lock().await;
+    let row = rows::load_execution(&store, execution).unwrap().unwrap();
+    // The proof covers one criterion: validated at this row version.
+    let proved = store.get_issue(issue.id).unwrap().unwrap();
+    assert_eq!(
+        crate::topology::issue_close::issue_acceptance_criteria_count(&proved.body),
+        1
+    );
+    let request = IssueCloseRequest::for_already_satisfied(
+        &row,
+        &attempt,
+        "note".into(),
+        Some(proved.row_version),
+    )
+    .unwrap();
+    // An operator adds a second criterion before the close.
+    store
+        .update_issue(
+            issue.id,
+            &rsi_common::types::IssueUpdate {
+                body: Some(format!("{body}- the second holds\n")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        close_input_issue(&store, &request).unwrap(),
+        IssueClose::Refused(ISSUE_CHANGED_AFTER_PROOF.into())
+    );
+    let now = store.get_issue(issue.id).unwrap().unwrap();
+    assert_ne!(now.status, IssueStatus::Closed);
+
+    // A request fenced on the current version closes.
+    let fresh = IssueCloseRequest::for_already_satisfied(
+        &row,
+        &attempt,
+        "note".into(),
+        Some(now.row_version),
+    )
+    .unwrap();
+    assert_eq!(
+        close_input_issue(&store, &fresh).unwrap(),
+        IssueClose::Closed
+    );
 }

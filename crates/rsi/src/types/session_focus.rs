@@ -106,10 +106,7 @@ fn compute_entry(
     };
 
     let own_attention = state.session.pending_question.is_some()
-        || matches!(
-            state.session.status,
-            SessionStatus::WaitingApproval | SessionStatus::Failed
-        );
+        || matches!(state.session.status, SessionStatus::WaitingApproval);
     let own_active = matches!(
         state.session.status,
         SessionStatus::Running | SessionStatus::Starting
@@ -121,7 +118,7 @@ fn compute_entry(
         SessionFocusGroup::NeedsYou
     } else if own_active {
         SessionFocusGroup::InFlight
-    } else if age_days < RECENT_DAYS {
+    } else if state.session.status == SessionStatus::Failed || age_days < RECENT_DAYS {
         SessionFocusGroup::Recent
     } else {
         SessionFocusGroup::Quiet
@@ -317,5 +314,32 @@ mod tests {
         assert_eq!(index[&running_id].group, SessionFocusGroup::InFlight);
         assert_eq!(index[&recent_id].group, SessionFocusGroup::Recent);
         assert_eq!(index[&quiet_id].group, SessionFocusGroup::Quiet);
+    }
+    #[test]
+    fn failed_history_is_recent_and_human_gates_need_attention() {
+        let now = Utc::now();
+        let mut failed = baseline_session(Uuid::new_v4(), SessionKind::Standard);
+        failed.status = SessionStatus::Failed;
+        failed.stop_reason = Some("provider_spawn_failed".into());
+        failed.updated_at = now - chrono::Duration::days(30);
+        let mut epic = baseline_session(Uuid::new_v4(), SessionKind::Epic);
+        epic.status = SessionStatus::Completed;
+        epic.updated_at = failed.updated_at;
+        failed.parent_id = Some(epic.id);
+        let failed_id = failed.id;
+        let epic_id = epic.id;
+        let sessions = HashMap::from([
+            (failed_id, SessionState::new(failed)),
+            (epic_id, SessionState::new(epic)),
+        ]);
+        let index = compute_session_focus_index(&sessions, now);
+        assert_eq!(index[&failed_id].group, SessionFocusGroup::Recent);
+        assert_eq!(index[&epic_id].group, SessionFocusGroup::Recent);
+        assert_eq!(index[&epic_id].attention_count, 0);
+        assert_eq!(sessions[&failed_id].session.status, SessionStatus::Failed);
+        assert_eq!(
+            sessions[&failed_id].session.stop_reason.as_deref(),
+            Some("provider_spawn_failed")
+        );
     }
 }

@@ -8,6 +8,18 @@
 //!   percentile bootstrap for `k > 1`. Invalid trials are excluded and counted separately.
 //! * [`observation_fingerprint`] is a sha256 of the canonical JSON of everything that defines
 //!   the observation domain; a stored record is reused only for an identical fingerprint.
+//! * **Comparable runs across a redeploy (#3192).** The rsid build SHA is provenance only
+//!   (`RunInfo::build_sha`, `TrialRow::build_sha`) and is NOT a fingerprint input: the hub daemon
+//!   is redeployed often, and a redeploy that leaves the harness code alone must keep an earlier
+//!   baseline usable. What the fingerprint and [`check_comparable`] hold fixed instead is
+//!   `harness_source_digest`, a sha256 over the git tree or blob ids, at the build commit, of the
+//!   code in the committed path list `data/harness_source_paths.txt` (one reason per path; see
+//!   [`crate::harness_source_digest`]), plus the effective-input digests ([`EffectiveInputs`]:
+//!   prompt, tool spec, policy, loop knobs, overlay), model, effort, route and the dataset, Harbor
+//!   and adapter pins. A change under a listed path changes the digest; a change anywhere else does
+//!   not. [`compare`] refuses any other difference with [`BenchError::NotComparable`], which names
+//!   the first differing field, and also refuses a pair whose `harness_version_hash` differs on a
+//!   shared task.
 //!
 //! JSON keys are alphabetical: struct fields are declared in alphabetical order and
 //! `serde_json` maps are sorted.
@@ -43,6 +55,8 @@ pub enum BenchError {
     UnsupportedSchema(u32),
     #[error("pass@k needs k >= 1")]
     ZeroK,
+    #[error("run.k must be >= 1 (attempts per task), got 0")]
+    ZeroRunK,
     #[error("pass@{k} is undefined for task {task}: only {n} valid trial(s)")]
     InsufficientTrials { task: String, n: usize, k: usize },
     #[error("records cover different task sets: {0}")]
@@ -53,8 +67,31 @@ pub enum BenchError {
     NothingToCompare,
     #[error("observation_fingerprint {stored} does not match the record's inputs ({computed})")]
     FingerprintMismatch { stored: String, computed: String },
+    #[error(
+        "records are not comparable: {field} differs (baseline {baseline}, candidate {candidate})"
+    )]
+    NotComparable {
+        /// The first differing field, in the order [`check_comparable`] checks them.
+        field: String,
+        baseline: String,
+        candidate: String,
+    },
+    #[error(
+        "trial {task}#{attempt} ran on harness source {trial}, not the run's {run}: a run measures one harness source"
+    )]
+    MixedHarnessSource {
+        task: String,
+        attempt: u32,
+        trial: String,
+        run: String,
+    },
     #[error("bench record JSON: {0}")]
     Json(String),
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` takes a reference.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One trial of one task. Fields are alphabetical.
@@ -63,12 +100,18 @@ pub enum BenchError {
 #[serde(deny_unknown_fields)]
 pub struct TrialRow {
     pub attempt: u32,
+    /// The rsid build (`RSI_BUILD_SHA`) the trial ran on; provenance, not a comparison input.
+    pub build_sha: String,
     pub cached_tokens: u64,
     pub cost_usd: f64,
     /// Harbor `exception_info.exception_type`.
     pub exception_type: Option<String>,
     /// Harbor `failure_cause`.
     pub failure_cause: Option<String>,
+    /// `harness_source_digest` of the daemon build the trial ran on.
+    pub harness_source_digest: String,
+    /// `Session.harness_version_hash` of the trial's session.
+    pub harness_version_hash: String,
     /// Image digest the trial ran.
     pub image_digest: String,
     /// The trial was cut short by infrastructure, not by the agent.
@@ -78,12 +121,20 @@ pub struct TrialRow {
     pub output_tokens: u64,
     pub passed: bool,
     pub prompt_tokens: u64,
+    /// `read_output` calls the model made (#3173). Absent in a record from before it, and
+    /// omitted when zero, so a record without spills is byte-identical to one from before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_output_calls: u32,
     pub reasoning_tokens: u64,
     pub reward: f64,
     /// Harbor `reward_valid`; false when the verifier did not produce a trustworthy reward.
     pub reward_valid: bool,
     pub session_id: Option<String>,
     pub split: String,
+    /// Command results the harness replaced with a spill stub (#3173), counted from the trace.
+    /// Absent in a record from before it, and omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spills: u32,
     pub stop_reason: Option<String>,
     /// The trace shows network access to Terminal-Bench sources ([`scan_solution_lookup`]).
     pub suspected_solution_lookup: bool,
@@ -111,8 +162,66 @@ impl TrialRow {
         self.trace_sha256 = Some(format!("sha256:{:x}", Sha256::digest(trace.as_bytes())));
         let scan = scan_solution_lookup(trace, upstream_repo);
         self.suspected_solution_lookup = scan.suspected;
+        let counts = scan_output_spills(trace);
+        self.spills = counts.spills;
+        self.read_output_calls = counts.read_output_calls;
         scan
     }
+}
+
+/// What a trace shows of the output spill (#3173): how often a tool result was a spill stub and
+/// how often the model asked for one back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputSpillCounts {
+    pub spills: u32,
+    pub read_output_calls: u32,
+}
+
+/// Counts spill stubs (a `tool_result` of any tool but `read_output` whose output starts with
+/// [`crate::spill::STUB_PREFIX`]) and `read_output` calls in a bench trace (`trace.jsonl`, one JSON
+/// line per event). A line that is not an event is ignored.
+#[must_use]
+pub fn scan_output_spills(trace: &str) -> OutputSpillCounts {
+    #[derive(Deserialize)]
+    struct Line {
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        result: Option<LineResult>,
+    }
+    #[derive(Deserialize)]
+    struct LineResult {
+        #[serde(default)]
+        output: String,
+    }
+    let mut counts = OutputSpillCounts::default();
+    for line in trace.lines() {
+        // Most of a trace is model requests that repeat the whole transcript; only a tool
+        // event can matter, so skip the rest without parsing it.
+        if !line.contains("\"kind\":\"tool_") {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Line>(line) else {
+            continue;
+        };
+        match event.kind.as_str() {
+            "tool_call" if event.name == "read_output" => {
+                counts.read_output_calls = counts.read_output_calls.saturating_add(1);
+            }
+            "tool_result"
+                if event.name != "read_output"
+                    && event
+                        .result
+                        .is_some_and(|r| r.output.starts_with(crate::spill::STUB_PREFIX)) =>
+            {
+                counts.spills = counts.spills.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    counts
 }
 
 /// Timeouts that bound a trial. Fields are alphabetical.
@@ -165,21 +274,42 @@ impl Totals {
     }
 }
 
+/// Digests of the effective inputs a run's harness interpreted. Fields are alphabetical.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveInputs {
+    /// Per-launch loop knobs and the daemon globals they replace.
+    pub loop_knobs: String,
+    /// The bench prompt overlay.
+    pub overlay: String,
+    /// The effective tool policy.
+    pub policy: String,
+    /// The base system prompt.
+    pub prompt: String,
+    /// The advertised tool catalog.
+    pub tool_spec: String,
+}
+
 /// The run part of the record. Fields are alphabetical.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunInfo {
     pub adapter_tree_hash: String,
+    /// The rsid build (`RSI_BUILD_SHA`) the run started on; provenance. Each trial records its own.
+    pub build_sha: String,
     pub concurrency: u32,
     pub config_digest: String,
     pub dataset_commit: String,
     pub dataset_repo: String,
+    pub effective_inputs: EffectiveInputs,
     pub effort: String,
     pub finished_at: String,
     pub harbor_version: String,
-    /// Identifies the harness build across tasks (unlike `harness_version_hash`, which folds in
-    /// the task query).
+    /// Identifies the harness configuration across tasks (unlike `harness_version_hash`, which
+    /// folds in the task query). It does not contain the rsid build SHA (#3192).
     pub harness_build_digest: String,
+    /// Digest of the harness source at the build commit ([`crate::harness_source_digest`]).
+    pub harness_source_digest: String,
     pub host: String,
     /// Image digest per task.
     pub image_digests: BTreeMap<String, String>,
@@ -212,9 +342,11 @@ pub struct FingerprintInputs {
     pub adapter_tree_hash: String,
     pub dataset_commit: String,
     pub dataset_repo: String,
+    pub effective_inputs: EffectiveInputs,
     pub effort: String,
     pub harbor_version: String,
     pub harness_build_digest: String,
+    pub harness_source_digest: String,
     pub image_digests: BTreeMap<String, String>,
     pub k: u32,
     pub model: String,
@@ -245,9 +377,11 @@ impl BenchRunRecord {
             adapter_tree_hash: run.adapter_tree_hash.clone(),
             dataset_commit: run.dataset_commit.clone(),
             dataset_repo: run.dataset_repo.clone(),
+            effective_inputs: run.effective_inputs.clone(),
             effort: run.effort.clone(),
             harbor_version: run.harbor_version.clone(),
             harness_build_digest: run.harness_build_digest.clone(),
+            harness_source_digest: run.harness_source_digest.clone(),
             image_digests: run.image_digests.clone(),
             k: run.k,
             model: run.model.clone(),
@@ -271,25 +405,49 @@ impl BenchRunRecord {
         self.run.observation_fingerprint = self.computed_fingerprint();
     }
 
-    /// Parses and validates a record: known schema version and a fingerprint that matches the
-    /// record's own inputs.
+    /// Checks that the record is well-formed: known schema version, `run.k >= 1`, every trial on
+    /// the run's harness source and a fingerprint that matches the record's own inputs.
     ///
     /// # Errors
-    /// [`BenchError::Json`], [`BenchError::UnsupportedSchema`] or
-    /// [`BenchError::FingerprintMismatch`].
-    pub fn from_json(text: &str) -> Result<Self, BenchError> {
-        let record: Self =
-            serde_json::from_str(text).map_err(|error| BenchError::Json(error.to_string()))?;
-        if record.schema_version != SCHEMA_VERSION {
-            return Err(BenchError::UnsupportedSchema(record.schema_version));
+    /// [`BenchError::UnsupportedSchema`], [`BenchError::ZeroRunK`],
+    /// [`BenchError::MixedHarnessSource`] or [`BenchError::FingerprintMismatch`].
+    pub fn validate(&self) -> Result<(), BenchError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(BenchError::UnsupportedSchema(self.schema_version));
         }
-        let computed = record.computed_fingerprint();
-        if computed != record.run.observation_fingerprint {
+        if self.run.k == 0 {
+            return Err(BenchError::ZeroRunK);
+        }
+        if let Some(trial) = self
+            .trials
+            .iter()
+            .find(|t| t.harness_source_digest != self.run.harness_source_digest)
+        {
+            return Err(BenchError::MixedHarnessSource {
+                task: trial.task.clone(),
+                attempt: trial.attempt,
+                trial: trial.harness_source_digest.clone(),
+                run: self.run.harness_source_digest.clone(),
+            });
+        }
+        let computed = self.computed_fingerprint();
+        if computed != self.run.observation_fingerprint {
             return Err(BenchError::FingerprintMismatch {
-                stored: record.run.observation_fingerprint,
+                stored: self.run.observation_fingerprint.clone(),
                 computed,
             });
         }
+        Ok(())
+    }
+
+    /// Parses and validates a record ([`Self::validate`]).
+    ///
+    /// # Errors
+    /// [`BenchError::Json`] or any [`Self::validate`] error.
+    pub fn from_json(text: &str) -> Result<Self, BenchError> {
+        let record: Self =
+            serde_json::from_str(text).map_err(|error| BenchError::Json(error.to_string()))?;
+        record.validate()?;
         Ok(record)
     }
 
@@ -606,9 +764,13 @@ fn ratio(numerator: f64, denominator: f64) -> Option<f64> {
 }
 
 /// Computes [`Summary`] for `record` with the given bootstrap `seed`.
-#[must_use]
+///
+/// # Errors
+/// Any [`BenchRunRecord::validate`] error (for example [`BenchError::ZeroRunK`]): a published
+/// number must come from a well-formed record, not only one that passed through `from_json`.
 #[allow(clippy::cast_precision_loss)]
-pub fn summarize(record: &BenchRunRecord, seed: u64) -> Summary {
+pub fn summarize(record: &BenchRunRecord, seed: u64) -> Result<Summary, BenchError> {
+    record.validate()?;
     let trials = &record.trials;
     let counts = per_task_counts(trials);
     let all_tasks: BTreeSet<&str> = trials.iter().map(|t| t.task.as_str()).collect();
@@ -654,7 +816,7 @@ pub fn summarize(record: &BenchRunRecord, seed: u64) -> Summary {
 
     let totals = Totals::from_trials(trials);
     let count = |pred: fn(&TrialRow) -> bool| trials.iter().filter(|t| pred(t)).count() as u64;
-    Summary {
+    Ok(Summary {
         cached_tokens_per_output_token: ratio(
             totals.cached_tokens as f64,
             totals.output_tokens as f64,
@@ -678,7 +840,7 @@ pub fn summarize(record: &BenchRunRecord, seed: u64) -> Summary {
         tasks_unscored: (all_tasks.len() - counts.len()) as u64,
         usd_per_solved_trial: ratio(totals.cost_usd, passed_trials as f64),
         valid_trials,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -729,12 +891,110 @@ fn task_set(record: &BenchRunRecord) -> BTreeSet<&str> {
         .collect()
 }
 
+/// `harness_version_hash` values per task, for the tasks of `record`.
+fn version_hashes(record: &BenchRunRecord) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for t in &record.trials {
+        map.entry(t.task.as_str())
+            .or_default()
+            .insert(t.harness_version_hash.as_str());
+    }
+    map
+}
+
+/// Accepts `baseline` and `candidate` as one paired observation only when they differ at most in
+/// the rsid build SHA (#3192): the dataset pin (`dataset_repo`, `dataset_commit`), `harbor_version`,
+/// `adapter_tree_hash`, `model`, `effort`, `route`, `harness_source_digest` (a digest that is
+/// [`crate::harness_source_digest::is_unavailable`] is never comparable), the
+/// [`EffectiveInputs`] digests and, task by task, `harness_version_hash` must all match. Anything
+/// else (`k`, timeouts, sampling, host, split, build SHA) is not examined here.
+///
+/// # Errors
+/// [`BenchError::NotComparable`] naming the first differing field in the order above.
+pub fn check_comparable(
+    baseline: &BenchRunRecord,
+    candidate: &BenchRunRecord,
+) -> Result<(), BenchError> {
+    let (a, b) = (&baseline.run, &candidate.run);
+    let refuse = |field: &str, x: &str, y: &str| BenchError::NotComparable {
+        field: field.to_string(),
+        baseline: x.to_string(),
+        candidate: y.to_string(),
+    };
+    let pairs: [(&str, &str, &str); 13] = [
+        ("dataset_repo", &a.dataset_repo, &b.dataset_repo),
+        ("dataset_commit", &a.dataset_commit, &b.dataset_commit),
+        ("harbor_version", &a.harbor_version, &b.harbor_version),
+        (
+            "adapter_tree_hash",
+            &a.adapter_tree_hash,
+            &b.adapter_tree_hash,
+        ),
+        ("model", &a.model, &b.model),
+        ("effort", &a.effort, &b.effort),
+        ("route", &a.route, &b.route),
+        (
+            "harness_source_digest",
+            &a.harness_source_digest,
+            &b.harness_source_digest,
+        ),
+        (
+            "effective_inputs.prompt",
+            &a.effective_inputs.prompt,
+            &b.effective_inputs.prompt,
+        ),
+        (
+            "effective_inputs.tool_spec",
+            &a.effective_inputs.tool_spec,
+            &b.effective_inputs.tool_spec,
+        ),
+        (
+            "effective_inputs.policy",
+            &a.effective_inputs.policy,
+            &b.effective_inputs.policy,
+        ),
+        (
+            "effective_inputs.loop_knobs",
+            &a.effective_inputs.loop_knobs,
+            &b.effective_inputs.loop_knobs,
+        ),
+        (
+            "effective_inputs.overlay",
+            &a.effective_inputs.overlay,
+            &b.effective_inputs.overlay,
+        ),
+    ];
+    for (field, x, y) in pairs {
+        if x != y {
+            return Err(refuse(field, x, y));
+        }
+        if field == "harness_source_digest" && crate::harness_source_digest::is_unavailable(x) {
+            return Err(refuse(field, x, y));
+        }
+    }
+    let (hashes_a, hashes_b) = (version_hashes(baseline), version_hashes(candidate));
+    for (task, x) in &hashes_a {
+        if let Some(y) = hashes_b.get(task) {
+            if x != y {
+                let join = |set: &BTreeSet<&str>| set.iter().copied().collect::<Vec<_>>().join(",");
+                return Err(refuse(
+                    &format!("harness_version_hash[{task}]"),
+                    &join(x),
+                    &join(y),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Paired compare of `a` (baseline) against `b` (candidate) on the same task set: per-task
 /// pass-fraction differences `b - a`, a seeded 95% bootstrap interval of their mean over tasks
 /// and the counts of improved and regressed tasks.
 ///
 /// # Errors
-/// [`BenchError::DatasetMismatch`] or [`BenchError::TaskSetMismatch`] when the records do not
+/// Any [`BenchRunRecord::validate`] error (for example [`BenchError::ZeroRunK`]) for either
+/// record; [`BenchError::NotComparable`] ([`check_comparable`]); [`BenchError::DatasetMismatch`] or [`BenchError::TaskSetMismatch`] when the records do not
 /// share a dataset pin and task set; [`BenchError::NothingToCompare`] when no task has a valid
 /// trial on both sides.
 #[allow(clippy::cast_precision_loss)]
@@ -743,6 +1003,8 @@ pub fn compare(
     b: &BenchRunRecord,
     seed: u64,
 ) -> Result<Comparison, BenchError> {
+    a.validate()?;
+    b.validate()?;
     if (&a.run.dataset_repo, &a.run.dataset_commit) != (&b.run.dataset_repo, &b.run.dataset_commit)
     {
         return Err(BenchError::DatasetMismatch(format!(
@@ -750,6 +1012,7 @@ pub fn compare(
             a.run.dataset_repo, a.run.dataset_commit, b.run.dataset_repo, b.run.dataset_commit
         )));
     }
+    check_comparable(a, b)?;
     let (tasks_a, tasks_b) = (task_set(a), task_set(b));
     if tasks_a != tasks_b {
         let only_a: Vec<&str> = tasks_a.difference(&tasks_b).copied().collect();
@@ -812,13 +1075,20 @@ mod tests {
 
     const GOLDEN: &str = include_str!("../fixtures/bench_run_record_v1.json");
 
+    fn source_digest() -> String {
+        format!("sha256:{}", "f".repeat(64))
+    }
+
     fn trial(task: &str, attempt: u32, passed: bool) -> TrialRow {
         TrialRow {
             attempt,
+            build_sha: "1".repeat(40),
             cached_tokens: 600,
             cost_usd: 0.25,
             exception_type: None,
             failure_cause: (!passed).then(|| "verifier_failed".to_string()),
+            harness_source_digest: source_digest(),
+            harness_version_hash: format!("hvh-{task}"),
             image_digest: format!("sha256:{}", "a".repeat(64)),
             infra_interrupted: false,
             invalid_route: false,
@@ -831,6 +1101,8 @@ mod tests {
             session_id: Some(format!("session-{task}-{attempt}")),
             split: "held_out".to_string(),
             stop_reason: Some("end_turn".to_string()),
+            read_output_calls: 0,
+            spills: 0,
             suspected_solution_lookup: false,
             task: task.to_string(),
             trace_sha256: Some(format!("sha256:{}", "b".repeat(64))),
@@ -852,14 +1124,23 @@ mod tests {
         let mut record = BenchRunRecord {
             run: RunInfo {
                 adapter_tree_hash: "c".repeat(40),
+                build_sha: "1".repeat(40),
                 concurrency: 4,
                 config_digest: format!("sha256:{}", "d".repeat(64)),
                 dataset_commit: "2fd12b88aafdd04a52c298e3940bcb189f9766d6".to_string(),
                 dataset_repo: "harbor-framework/terminal-bench-2".to_string(),
+                effective_inputs: EffectiveInputs {
+                    loop_knobs: format!("sha256:{}", "1".repeat(64)),
+                    overlay: format!("sha256:{}", "2".repeat(64)),
+                    policy: format!("sha256:{}", "3".repeat(64)),
+                    prompt: format!("sha256:{}", "4".repeat(64)),
+                    tool_spec: format!("sha256:{}", "5".repeat(64)),
+                },
                 effort: "high".to_string(),
                 finished_at: "2026-10-19T13:00:00.000000000Z".to_string(),
                 harbor_version: "0.24.0".to_string(),
                 harness_build_digest: format!("sha256:{}", "e".repeat(64)),
+                harness_source_digest: source_digest(),
                 host: "bench-host-1".to_string(),
                 image_digests,
                 k,
@@ -926,6 +1207,38 @@ mod tests {
             BenchRunRecord::from_json(&rec.to_json().unwrap()),
             Err(BenchError::FingerprintMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn in_memory_summarize_and_compare_refuse_a_zero_k_record() {
+        let good = record(vec![trial("t1", 0, true)], 1);
+        let mut zero = good.clone();
+        zero.run.k = 0;
+        assert_eq!(summarize(&zero, 1).unwrap_err(), BenchError::ZeroRunK);
+        zero.seal();
+        assert_eq!(summarize(&zero, 1).unwrap_err(), BenchError::ZeroRunK);
+        assert_eq!(compare(&zero, &good, 5).unwrap_err(), BenchError::ZeroRunK);
+        assert_eq!(compare(&good, &zero, 5).unwrap_err(), BenchError::ZeroRunK);
+        assert!(summarize(&good, 1).is_ok());
+    }
+
+    #[test]
+    fn zero_run_k_is_refused_even_with_a_valid_fingerprint() {
+        let mut rec = golden_record();
+        rec.run.k = 0;
+        rec.seal();
+        assert_eq!(rec.run.observation_fingerprint, rec.computed_fingerprint());
+        assert_eq!(rec.validate(), Err(BenchError::ZeroRunK));
+        let error = BenchRunRecord::from_json(&rec.to_json().unwrap()).unwrap_err();
+        assert_eq!(error, BenchError::ZeroRunK);
+        assert!(error.to_string().contains("run.k"), "{error}");
+        // k = 1 and k > 1 stay valid.
+        for k in [1, 3] {
+            let mut rec = golden_record();
+            rec.run.k = k;
+            rec.seal();
+            assert_eq!(rec.validate(), Ok(()));
+        }
     }
 
     #[test]
@@ -1029,7 +1342,7 @@ mod tests {
             ],
             1,
         );
-        let s = summarize(&rec, 1);
+        let s = summarize(&rec, 1).unwrap();
         assert_eq!(
             (s.valid_trials, s.invalid_trials, s.passed_trials),
             (2, 3, 1)
@@ -1066,7 +1379,7 @@ mod tests {
             }
         }
         let rec = record(trials, 2);
-        let s = summarize(&rec, DEFAULT_BOOTSTRAP_SEED);
+        let s = summarize(&rec, DEFAULT_BOOTSTRAP_SEED).unwrap();
         // fractions: a=1, b=0.5, c=0.
         assert!((s.pass_rate.unwrap() - 0.5).abs() < 1e-12);
         assert_eq!(s.ci_method, Some(IntervalMethod::ClusteredBootstrap));
@@ -1085,7 +1398,7 @@ mod tests {
         let mut short = trial("a", 1, true);
         short.reward_valid = false;
         let rec = record(vec![trial("a", 0, true), short], 2);
-        let s = summarize(&rec, 1);
+        let s = summarize(&rec, 1).unwrap();
         assert_eq!(s.pass_at_k, None);
         assert!(s.pass_at_k_refusal.unwrap().contains("task a"));
     }
@@ -1137,6 +1450,7 @@ mod tests {
 
         let mut moved = record(passing.clone(), 1);
         moved.run.dataset_commit = "f".repeat(40);
+        moved.seal();
         assert!(matches!(
             compare(&record(passing, 1), &moved, 5),
             Err(BenchError::DatasetMismatch(_))
@@ -1176,6 +1490,24 @@ mod tests {
                 i.harbor_version = "0.25.0".to_string()
             }),
             ("harness_build_digest", |i| i.harness_build_digest.push('x')),
+            ("harness_source_digest", |i| {
+                i.harness_source_digest.push('x')
+            }),
+            ("effective_inputs.prompt", |i| {
+                i.effective_inputs.prompt.push('x')
+            }),
+            ("effective_inputs.tool_spec", |i| {
+                i.effective_inputs.tool_spec.push('x')
+            }),
+            ("effective_inputs.policy", |i| {
+                i.effective_inputs.policy.push('x')
+            }),
+            ("effective_inputs.loop_knobs", |i| {
+                i.effective_inputs.loop_knobs.push('x')
+            }),
+            ("effective_inputs.overlay", |i| {
+                i.effective_inputs.overlay.push('x')
+            }),
             ("image_digests", |i| {
                 i.image_digests
                     .insert("fix-git".to_string(), "sha256:0".to_string());
@@ -1204,6 +1536,7 @@ mod tests {
         assert_eq!(observation_fingerprint(&reordered), reference);
         let mut rec = golden_record();
         rec.run.host = "other".to_string();
+        rec.run.build_sha = "9".repeat(40);
         rec.run.concurrency = 99;
         rec.run.started_at = "2020-01-01T00:00:00.000000000Z".to_string();
         assert_eq!(rec.computed_fingerprint(), reference);
@@ -1223,6 +1556,173 @@ mod tests {
         let mut tampered = a.clone();
         tampered.run.k = 9;
         assert!(find_reusable(&[tampered], &a.run.observation_fingerprint).is_none());
+    }
+
+    /// A copy of `base` that ran on another daemon build, sealed.
+    fn redeployed(base: &BenchRunRecord) -> BenchRunRecord {
+        let mut other = base.clone();
+        other.run.build_sha = "2".repeat(40);
+        for t in &mut other.trials {
+            t.build_sha = "2".repeat(40);
+        }
+        other.seal();
+        other
+    }
+
+    fn two_task_baseline() -> BenchRunRecord {
+        record(vec![trial("t1", 0, false), trial("t2", 0, true)], 1)
+    }
+
+    #[test]
+    fn a_redeploy_that_changes_only_the_build_sha_stays_comparable_and_reusable() {
+        let baseline = two_task_baseline();
+        let mut candidate = redeployed(&baseline);
+        candidate.trials[0].passed = true;
+        candidate.trials[0].reward = 1.0;
+        candidate.seal();
+        assert_ne!(baseline.run.build_sha, candidate.run.build_sha);
+        assert_eq!(baseline.trials[0].build_sha, "1".repeat(40));
+        assert_eq!(candidate.trials[0].build_sha, "2".repeat(40));
+        // The build SHA is provenance: the fingerprint, baseline reuse and the compare ignore it.
+        assert_eq!(
+            baseline.run.observation_fingerprint,
+            candidate.run.observation_fingerprint
+        );
+        assert!(
+            find_reusable(&[baseline.clone()], &candidate.run.observation_fingerprint).is_some()
+        );
+        assert_eq!(check_comparable(&baseline, &candidate), Ok(()));
+        assert!(compare(&baseline, &candidate, 5).is_ok());
+        // Both records survive a round trip with their own builds.
+        let again = BenchRunRecord::from_json(&candidate.to_json().unwrap()).unwrap();
+        assert_eq!(again.run.build_sha, "2".repeat(40));
+    }
+
+    #[test]
+    fn compare_refuses_each_other_difference_naming_the_field() {
+        let baseline = two_task_baseline();
+        type Mutation = fn(&mut BenchRunRecord);
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("dataset_repo", |r| r.run.dataset_repo.push('x')),
+            ("dataset_commit", |r| r.run.dataset_commit = "f".repeat(40)),
+            ("harbor_version", |r| {
+                r.run.harbor_version = "0.25.0".to_string()
+            }),
+            ("adapter_tree_hash", |r| r.run.adapter_tree_hash.push('x')),
+            ("model", |r| r.run.model = "other-model".to_string()),
+            ("effort", |r| r.run.effort = "low".to_string()),
+            ("route", |r| r.run.route = "bedrock".to_string()),
+            ("harness_source_digest", |r| {
+                r.run.harness_source_digest.push('x');
+                for t in &mut r.trials {
+                    t.harness_source_digest.push('x');
+                }
+            }),
+            ("effective_inputs.prompt", |r| {
+                r.run.effective_inputs.prompt.push('x')
+            }),
+            ("effective_inputs.tool_spec", |r| {
+                r.run.effective_inputs.tool_spec.push('x')
+            }),
+            ("effective_inputs.policy", |r| {
+                r.run.effective_inputs.policy.push('x')
+            }),
+            ("effective_inputs.loop_knobs", |r| {
+                r.run.effective_inputs.loop_knobs.push('x')
+            }),
+            ("effective_inputs.overlay", |r| {
+                r.run.effective_inputs.overlay.push('x')
+            }),
+            ("harness_version_hash[t2]", |r| {
+                r.trials[1].harness_version_hash = "hvh-changed".to_string()
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut candidate = baseline.clone();
+            mutate(&mut candidate);
+            candidate.seal();
+            let error = compare(&baseline, &candidate, 5).unwrap_err();
+            match &error {
+                BenchError::DatasetMismatch(_) => assert!(field.starts_with("dataset"), "{field}"),
+                BenchError::NotComparable { field: named, .. } => assert_eq!(named, field),
+                other => panic!("{field}: unexpected {other:?}"),
+            }
+            if field != "dataset_repo" && field != "dataset_commit" {
+                assert!(error.to_string().contains(field), "{error}");
+            }
+            // The refusal also holds when the candidate is also a redeploy.
+            let mut redeploy = redeployed(&candidate);
+            redeploy.seal();
+            assert!(compare(&baseline, &redeploy, 5).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn the_first_differing_field_is_the_one_named() {
+        let baseline = two_task_baseline();
+        let mut candidate = baseline.clone();
+        candidate.run.effective_inputs.overlay.push('x');
+        candidate.run.effective_inputs.prompt.push('x');
+        candidate.run.model = "other-model".to_string();
+        candidate.seal();
+        match check_comparable(&baseline, &candidate).unwrap_err() {
+            BenchError::NotComparable {
+                field,
+                baseline: from,
+                candidate: to,
+            } => {
+                assert_eq!(field, "model");
+                assert_eq!(
+                    (from.as_str(), to.as_str()),
+                    ("claude-sonnet-5-5", "other-model")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        candidate.run.model = baseline.run.model.clone();
+        candidate.seal();
+        assert!(matches!(
+            check_comparable(&baseline, &candidate),
+            Err(BenchError::NotComparable { field, .. }) if field == "effective_inputs.prompt"
+        ));
+    }
+
+    #[test]
+    fn an_unavailable_source_digest_is_never_comparable() {
+        let digest = crate::harness_source_digest::unavailable_digest(&"1".repeat(40));
+        let mut baseline = two_task_baseline();
+        baseline.run.harness_source_digest = digest.clone();
+        for t in &mut baseline.trials {
+            t.harness_source_digest = digest.clone();
+        }
+        baseline.seal();
+        let candidate = baseline.clone();
+        assert!(matches!(
+            compare(&baseline, &candidate, 5),
+            Err(BenchError::NotComparable { field, .. }) if field == "harness_source_digest"
+        ));
+    }
+
+    #[test]
+    fn a_run_cannot_mix_harness_sources_across_trials() {
+        let mut mixed = two_task_baseline();
+        mixed.trials[1].harness_source_digest = format!("sha256:{}", "9".repeat(64));
+        mixed.seal();
+        assert!(matches!(
+            mixed.validate(),
+            Err(BenchError::MixedHarnessSource { task, .. }) if task == "t2"
+        ));
+        assert!(compare(&mixed, &two_task_baseline(), 5).is_err());
+    }
+
+    #[test]
+    fn compare_ignores_differences_the_issue_does_not_name() {
+        let baseline = two_task_baseline();
+        let mut candidate = redeployed(&baseline);
+        candidate.run.host = "other-host".to_string();
+        candidate.run.concurrency = 1;
+        candidate.seal();
+        assert!(compare(&baseline, &candidate, 5).is_ok());
     }
 
     #[test]
@@ -1270,5 +1770,48 @@ mod tests {
         assert!(t.trace_sha256.as_deref().unwrap().starts_with("sha256:"));
         let scan = t.apply_trace_scan("ls -la", None);
         assert!(!scan.suspected && !t.suspected_solution_lookup);
+    }
+
+    #[test]
+    fn the_trace_scan_counts_spill_stubs_and_read_output_calls() {
+        let call = |name: &str| format!("{{\"kind\":\"tool_call\",\"name\":\"{name}\",\"seq\":1}}");
+        let result = |name: &str, output: &str| {
+            format!(
+                "{{\"kind\":\"tool_result\",\"name\":\"{name}\",\"result\":{{\"output\":{output:?},\"success\":true}},\"seq\":2}}"
+            )
+        };
+        let trace = [
+            call("shell"),
+            result("shell", "[rsi-spill ab12/1] shell exit=0 9000B 300 lines"),
+            result("shell", "short output"),
+            call("read_output"),
+            // The retrieval result is never itself a spill.
+            result("read_output", "[rsi-spill ab12/1] quoted by the model"),
+            result(
+                "exec_command",
+                "[rsi-spill ab12/2] exec_command exit=1 1B 1 lines",
+            ),
+            call("read_output"),
+            "{\"kind\":\"model_request\",\"note\":\"\\\"kind\\\":\\\"tool_call\\\"\"}".to_string(),
+            "not json".to_string(),
+        ]
+        .join("\n");
+        let counts = scan_output_spills(&trace);
+        assert_eq!(counts.spills, 2);
+        assert_eq!(counts.read_output_calls, 2);
+
+        let mut t = trial("t1", 0, true);
+        t.apply_trace_scan(&trace, None);
+        assert_eq!((t.spills, t.read_output_calls), (2, 2));
+        // Zero counts are omitted, so a record without spills is unchanged; an old record parses.
+        let mut quiet = trial("t2", 0, true);
+        quiet.apply_trace_scan("ls", None);
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert!(json.get("spills").is_none() && json.get("read_output_calls").is_none());
+        let back: TrialRow = serde_json::from_value(json).unwrap();
+        assert_eq!((back.spills, back.read_output_calls), (0, 0));
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["spills"], 2);
+        assert_eq!(json["read_output_calls"], 2);
     }
 }

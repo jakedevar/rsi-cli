@@ -500,6 +500,7 @@ fn fence_for(tip: Uuid) -> ContinuationFenceV1 {
         lead_generation: None,
         authority: ContinuationAuthorityV1::Automated,
         observed_restart_cut: None,
+        self_wake_event_sequence: None,
     }
 }
 
@@ -1252,6 +1253,214 @@ fn a_reappointed_pm_reads_its_projects_displaced_seats_only_118() {
         );
     }
     assert!(!store.manager_seat_reads_predecessor(seat, first).unwrap());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn predecessor_appointments_stay_index_bounded_over_large_retirement_history() {
+    use rusqlite::StatementStatus;
+
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let b = project(&store, "B");
+    let seat = appoint_pm(&store, a);
+    let anchors: Vec<_> = (0..40).map(|_| session(&store, Some(a))).collect();
+    for (i, anchor) in anchors.iter().enumerate() {
+        store
+            .conn
+            .execute(
+                "INSERT INTO harness_manager_notice_scope_retirements
+                (project_id,manager_session_id,scope_version,retired_at)
+             VALUES(?1,?2,1,?3)",
+                params![
+                    a.to_string(),
+                    anchor.to_string(),
+                    format!("2026-01-01T00:00:00.{i:09}Z")
+                ],
+            )
+            .unwrap();
+    }
+    // A tie at the cutoff keeps the same manager-id ordering as GROUP BY.
+    store
+        .conn
+        .execute(
+            "INSERT INTO harness_manager_notice_scope_retirements
+            (project_id,manager_session_id,scope_version,retired_at)
+         VALUES(?1,?2,2,'2026-01-01T00:00:00.000000008Z')",
+            params![a.to_string(), anchors[7].to_string()],
+        )
+        .unwrap();
+    // The current anchor must be excluded before LIMIT, even when retired
+    // scope generations of its own are the newest records in the project.
+    store
+        .conn
+        .execute(
+            "INSERT INTO harness_manager_notice_scope_retirements
+            (project_id,manager_session_id,scope_version,retired_at)
+         VALUES(?1,?2,1,'2026-01-03T00:00:00.000000000Z')",
+            params![a.to_string(), seat.to_string()],
+        )
+        .unwrap();
+
+    let arguments = params![
+        a.to_string(),
+        seat.to_string(),
+        PREDECESSOR_APPOINTMENTS_MAX
+    ];
+    let bounded_read = || {
+        let mut statement = store.conn.prepare(PREDECESSOR_APPOINTMENTS_SQL).unwrap();
+        let rows = statement
+            .query_map(arguments, |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(statement.get_status(StatementStatus::FullscanStep), 0);
+        assert_eq!(statement.get_status(StatementStatus::Sort), 0);
+        let steps = statement.get_status(StatementStatus::VmStep);
+        assert!(
+            steps > 0 && steps < 1000,
+            "bounded predecessor read: {steps} VM steps"
+        );
+        (rows, steps)
+    };
+    let (before, before_steps) = bounded_read();
+
+    let tx = store.conn.unchecked_transaction().unwrap();
+    // 20,000 older distinct appointments, plus 20,000 newer rows in a
+    // different project. None may increase the bounded read's work.
+    for project in [a, b] {
+        store.conn.execute(
+            "WITH RECURSIVE history(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM history WHERE n<20000)
+             INSERT INTO harness_manager_notice_scope_retirements
+                (project_id,manager_session_id,scope_version,retired_at)
+             SELECT ?1,printf('%08x-0000-4000-8000-000000000000',n),1,?2 FROM history",
+            params![project.to_string(), if project == a {
+                "2025-01-01T00:00:00.000000000Z"
+            } else {
+                "2027-01-01T00:00:00.000000000Z"
+            }],
+        ).unwrap();
+    }
+    // Thousands of scope edits under one recent appointment would crowd
+    // out the other 31 anchors if LIMIT were applied to raw retirements.
+    for (anchor, retired_at) in [
+        (anchors[39], "2026-01-02T00:00:00.000000000Z"),
+        (seat, "2026-01-03T00:00:00.000000000Z"),
+    ] {
+        store.conn.execute(
+            "WITH RECURSIVE scopes(n) AS (VALUES(2) UNION ALL SELECT n+1 FROM scopes WHERE n<2001)
+             INSERT INTO harness_manager_notice_scope_retirements
+                (project_id,manager_session_id,scope_version,retired_at)
+             SELECT ?1,?2,n,?3 FROM scopes",
+            params![a.to_string(), anchor.to_string(), retired_at],
+        ).unwrap();
+    }
+    tx.commit().unwrap();
+    let (after, after_steps) = bounded_read();
+    let legacy: Vec<String> = store
+        .conn
+        .prepare(
+            "SELECT manager_session_id FROM harness_manager_notice_scope_retirements
+         WHERE project_id=?1 AND manager_session_id<>?2
+         GROUP BY manager_session_id ORDER BY MAX(retired_at) DESC LIMIT ?3",
+        )
+        .unwrap()
+        .query_map(arguments, |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(after, legacy);
+    assert_eq!(after, before);
+    assert_eq!(after.len(), PREDECESSOR_APPOINTMENTS_MAX as usize);
+    assert_eq!(
+        after_steps, before_steps,
+        "history growth must not grow read work"
+    );
+    for anchor in &anchors {
+        assert_eq!(
+            store.manager_seat_reads_predecessor(seat, *anchor).unwrap(),
+            after.contains(&anchor.to_string())
+        );
+    }
+
+    let plan: Vec<String> = store
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {PREDECESSOR_APPOINTMENTS_SQL}"
+        ))
+        .unwrap()
+        .query_map(arguments, |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(plan.len(), 1, "one bounded index search: {plan:?}");
+    assert!(plan[0].contains("SEARCH harness_manager_retired_appointments USING COVERING INDEX harness_manager_retired_appointments_recent (project_id=?)"), "{plan:?}");
+    assert!(
+        !plan
+            .iter()
+            .any(|step| step.contains("SCAN") || step.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn retired_appointments_migration_backfills_and_tracks_latest_retirement() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let b = project(&store, "B");
+    let anchor = session(&store, Some(a));
+    let latest = "2026-01-03T00:00:00.000000000Z";
+    crate::store::tests::rewind_store_to_schema_version(&store.conn, 183);
+    let old_catalog = crate::store::catalog_sql_by_name(&store.conn);
+    let insert = |project: Uuid, version: i64, stamp: &str| {
+        store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO harness_manager_notice_scope_retirements
+                (project_id,manager_session_id,scope_version,retired_at)
+             VALUES(?1,?2,?3,?4)",
+                params![project.to_string(), anchor.to_string(), version, stamp],
+            )
+            .unwrap();
+    };
+    insert(a, 1, latest);
+    insert(a, 2, "2026-01-01T00:00:00.000000000Z");
+    insert(b, 1, "2026-01-02T00:00:00.000000000Z");
+    store.init_schema().unwrap();
+    crate::store::assert_catalog_preserved_across_replay(&old_catalog, &store.conn, 183);
+    let check_projection = || {
+        let projected: Vec<(String, String, String)> = store.conn.prepare(
+            "SELECT project_id,manager_session_id,retired_at FROM harness_manager_retired_appointments
+             ORDER BY project_id,manager_session_id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        let historical: Vec<(String, String, String)> = store.conn.prepare(
+            "SELECT project_id,manager_session_id,MAX(retired_at) FROM harness_manager_notice_scope_retirements
+             GROUP BY project_id,manager_session_id ORDER BY project_id,manager_session_id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(projected, historical);
+        assert_eq!(projected.len(), 2);
+    };
+    check_projection();
+    // Older, equal, replayed, then newer retirement timestamps.
+    insert(a, 3, "2026-01-02T00:00:00.000000000Z");
+    insert(a, 4, latest);
+    insert(a, 1, "2026-01-09T00:00:00.000000000Z");
+    check_projection();
+    insert(a, 5, "2026-01-04T00:00:00.000000000Z");
+    store.conn.execute(
+        "UPDATE harness_manager_notice_scope_retirements SET completed_at=?1 WHERE project_id=?2",
+        params!["2026-01-05T00:00:00.000000000Z", a.to_string()],
+    ).unwrap();
+    check_projection();
+    let tx = store.conn.unchecked_transaction().unwrap();
+    insert(a, 6, "2026-01-06T00:00:00.000000000Z");
+    tx.rollback().unwrap();
+    check_projection();
+    store.init_schema().unwrap();
+    check_projection();
 }
 
 /// #2531: the live holder of a PM slot reads earlier seats of that slot, and

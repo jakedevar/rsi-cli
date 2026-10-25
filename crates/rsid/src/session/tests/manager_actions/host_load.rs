@@ -364,6 +364,7 @@ async fn thermal_and_disk_pressure_hold_a_create_until_the_host_recovers() {
     *pressure.lock().unwrap() = Some(PressureHold::DiskPressure {
         free_gb: 11.0,
         min_gb: 30,
+        reserve_gb: 0,
     });
     let held = view(&p, receipt.operation_id).await.held.unwrap();
     assert_eq!(held.reason, "disk_pressure");
@@ -388,6 +389,92 @@ async fn thermal_and_disk_pressure_hold_a_create_until_the_host_recovers() {
         receipt.operation_id,
         "the create starts on its own once the host cooled"
     );
+}
+
+/// #467 / hub #3312: launches above the job floor must leave room for one
+/// target. The reserve is live, and zero restores floor-only admission.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn build_reserve_holds_creates_above_the_job_floor_and_reports_needed_space() {
+    for (reserve, free, held) in [
+        (8, 35.0, true),
+        (8, 37.999, true),
+        (12, 38.0, true),
+        (8, 38.0, false),
+        (8, 39.0, false),
+        (0, 35.0, false),
+        (0, 29.0, true),
+    ] {
+        let p = pilot().await;
+        set_threshold(&p, 0);
+        let config = Arc::clone(&p.manager.runtime_config);
+        config
+            .update_field("governor_min_free_disk_gb", &serde_json::json!(30))
+            .unwrap();
+        config
+            .update_field("worker_build_reserve_gb", &serde_json::json!(reserve))
+            .unwrap();
+        let reading = Arc::new(std::sync::Mutex::new(free));
+        let shared = Arc::clone(&reading);
+        let live_config = Arc::clone(&config);
+        p.manager.host_load().set_pressure_source(Arc::new(move || {
+            crate::host_pressure::disk_hold(
+                *shared.lock().unwrap(),
+                live_config.governor_policy().min_free_disk_gb,
+                live_config.worker_build_reserve_gb.load(Ordering::Relaxed),
+            )
+        }));
+        let receipt = p.admit("build-reserve", create(p.epic, &p, "worker")).await;
+        let action = view(&p, receipt.operation_id).await;
+        assert_eq!(
+            action.held.is_some(),
+            held,
+            "reserve={reserve}, free={free}"
+        );
+        if held {
+            assert!(claim_like_the_loop(&p.manager).await.is_none());
+            assert_eq!(
+                p.receipt(receipt.operation_id).await.state,
+                ManagerActionStateV2::Queued
+            );
+            let wire = serde_json::to_value(action.held.unwrap()).unwrap();
+            assert_eq!(wire["reason"], "disk_pressure");
+            assert_eq!(wire["free_disk_gb"], free);
+            assert_eq!(wire["min_free_disk_gb"], 30);
+            assert_eq!(wire["reserve_gb"], reserve);
+            assert_eq!(wire["needed_free_gb"], 30 + reserve);
+            if free >= 30.0 {
+                assert!(
+                    crate::host_pressure::build_disk_floor(free, 30).open,
+                    "jobs can build above their own floor while launches wait"
+                );
+                config
+                    .update_field("worker_build_reserve_gb", &serde_json::json!(0))
+                    .unwrap();
+                assert_eq!(
+                    view(&p, receipt.operation_id).await.held,
+                    None,
+                    "disabling the reserve releases a create above the floor immediately"
+                );
+                config
+                    .update_field("worker_build_reserve_gb", &serde_json::json!(reserve))
+                    .unwrap();
+                assert!(view(&p, receipt.operation_id).await.held.is_some());
+                *reading.lock().unwrap() = f64::from(30 + reserve);
+                assert_eq!(
+                    view(&p, receipt.operation_id).await.held,
+                    None,
+                    "reaching floor plus reserve releases the queued create"
+                );
+            } else {
+                *reading.lock().unwrap() = 30.0;
+            }
+        }
+        assert_eq!(
+            claim_like_the_loop(&p.manager).await.unwrap().id(),
+            receipt.operation_id
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -588,6 +675,7 @@ async fn disk_held_creates_request_one_reclaim_and_appear_in_roster() {
         Some(PressureHold::DiskPressure {
             free_gb: 8.0,
             min_gb: 30,
+            reserve_gb: 0,
         })
     }));
     let first = p
@@ -804,5 +892,151 @@ async fn a_sandbox_root_cap_refusal_keeps_its_own_typed_code() {
     assert!(
         p.manager.host_load().pressure_now().is_none(),
         "a root-count refusal is no free-space hold"
+    );
+}
+
+/// #495: a timed-out allocator rolls back before a durable admission cooldown;
+/// the same action and target then establish successfully without a new key.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_git_timeout_holds_then_establishes_the_same_target() {
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    let receipt = p
+        .admit(
+            "git-timeout-once",
+            create(p.epic, &p, "worker after Git timeout"),
+        )
+        .await;
+    let child = receipt.target_session_id.unwrap();
+    crate::sandbox::git_worktree::timeout_worktree_add_for_test(child, 1);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let held = view(&p, receipt.operation_id).await;
+    assert_eq!(held.receipt.state, ManagerActionStateV2::Queued);
+    assert_eq!(held.receipt.outcome.as_deref(), Some("sandbox_git_timeout"));
+    let reason = held.held.unwrap();
+    assert_eq!(reason.reason, "sandbox_git_timeout");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&reason.release_by.unwrap()).unwrap()
+            > chrono::Utc::now()
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(child)
+            .unwrap()
+            .is_none()
+    );
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+    // Queued cooldowns survive claim recovery; after cooldown, ordinary host
+    // admission still holds the retry until the thermal/load condition clears.
+    p.manager
+        .store
+        .lock()
+        .await
+        .recover_manager_actions_startup(Uuid::new_v4())
+        .unwrap();
+    assert_eq!(
+        view(&p, receipt.operation_id).await.held.unwrap().reason,
+        "sandbox_git_timeout"
+    );
+    let roster = p
+        .manager
+        .agent_control()
+        .agent_worker_roster(
+            p.owner,
+            rsi_common::agent_worker_roster::AgentWorkerRosterRequestV1::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        roster.queued_launches[0].held_reason.as_deref(),
+        Some("sandbox_git_timeout")
+    );
+    expire_git_timeout(&p, receipt.operation_id).await;
+    set_threshold(&p, 40);
+    let load = host_load(&p, 62.5);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        view(&p, receipt.operation_id).await.held.unwrap().reason,
+        "host_load"
+    );
+    *load.lock().unwrap() = 0.0;
+    let process = super::super::super::launch::install_controller_candidate_test_process(child);
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    assert_eq!(
+        p.receipt(receipt.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn expire_git_timeout(p: &Pilot, id: Uuid) {
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_operations SET not_before=?2 WHERE id=?1",
+            rusqlite::params![
+                id.to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )
+        .unwrap();
+}
+
+/// #495: the durable attempt count bounds a repeated transient failure.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sandbox_git_timeout_exhaustion_has_a_typed_relaunch_outcome() {
+    let p = pilot().await;
+    set_threshold(&p, 0);
+    let receipt = p
+        .admit(
+            "git-timeout-repeated",
+            create(p.epic, &p, "worker after repeated Git timeouts"),
+        )
+        .await;
+    let child = receipt.target_session_id.unwrap();
+    crate::sandbox::git_worktree::timeout_worktree_add_for_test(child, 3);
+    for _ in 0..2 {
+        p.manager.reconcile_manager_actions_once().await.unwrap();
+        assert_eq!(
+            view(&p, receipt.operation_id).await.held.unwrap().reason,
+            "sandbox_git_timeout"
+        );
+        expire_git_timeout(&p, receipt.operation_id).await;
+    }
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let ended = view(&p, receipt.operation_id).await;
+    assert_eq!(ended.receipt.state, ManagerActionStateV2::Blocked);
+    assert_eq!(
+        ended.receipt.outcome.as_deref(),
+        Some("sandbox_git_timeout")
+    );
+    assert!(
+        ended
+            .next_step
+            .unwrap()
+            .contains("Relaunch under a new idempotency key")
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(child)
+            .unwrap()
+            .is_none()
     );
 }

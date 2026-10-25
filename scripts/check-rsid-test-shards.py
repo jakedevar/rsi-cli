@@ -17,6 +17,7 @@ import argparse
 import functools
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import posixpath
 import re
@@ -38,39 +39,84 @@ CONDITIONAL_RUNTIME_NAMES = {
         "v100_unknown_or_hybrid_v99_catalog_fails_closed",
     },  # enclosing cfg(any()) historical fixture
     "session-03": {"proc_map_device_identity_rejects_oversized_macos_components"},
-    "other-02": {
-        "recursive_dag_smoke_fixture_can_opt_into_live_dogfood_graph",
-        "recursive_dag_smoke_fixture_can_upgrade_marked_fixture_with_live_dogfood_graph",
-        "recursive_dag_smoke_fixture_copies_source_without_mutating_it",
-        "recursive_dag_smoke_fixture_generates_store_readbacks_and_is_idempotent",
-        "recursive_dag_smoke_fixture_refuses_default_db_path",
-        "recursive_dag_smoke_fixture_refuses_existing_unmarked_output_db",
-        "recursive_dag_smoke_fixture_rehomes_copied_existing_fixture_summary",
-    },  # enclosing dev-fixtures feature
     "other-03": {"refuses_reclaim_without_linux_openat2_containment"},
 }
-TARGET_OS_GATE = re.compile(r'#\[cfg\((?:all\(test, )?(not\()?target_os = "([a-z]+)"\)?\)?\)\]')
-HOST_TARGET_OS = {"darwin": "macos", "linux": "linux"}.get(sys.platform, sys.platform)
-# Tests whose `#[cfg(target_os = ...)]` excludes this host: present in the static
+PLATFORM_GATE = re.compile(r"#\[\s*cfg\s*\((.*)\)\s*\]", re.S)
+HOST_TARGET_OS = {"darwin": "macos", "win32": "windows"}.get(sys.platform, sys.platform)
+HOST_TARGET_FAMILY = {"posix": "unix", "nt": "windows"}.get(os.name)
+# Tests whose platform cfg excludes this host: present in the static
 # manifest, absent at runtime here. Filled by `source_inventory`.
 PLATFORM_CONDITIONAL_NAMES: dict[str, Counter] = {}
 MOD_DECL = re.compile(r"^[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z_0-9]*)\s*;")
 
 
 def host_excluded(gate_line: str) -> bool:
-    """Whether a `#[cfg([not(]target_os = "...")[)]]` line excludes this host."""
-    stripped = gate_line.strip()
-    gate = TARGET_OS_GATE.fullmatch(stripped)
-    if not gate or stripped.count("(") != stripped.count(")"):
+    """Exclude only cfgs provably false here; unknown predicates stay required."""
+    gate = PLATFORM_GATE.fullmatch(gate_line.strip())
+    if not gate:
         return False
-    return (gate.group(2) == HOST_TARGET_OS) == bool(gate.group(1))
+    try:
+        value, end = platform_cfg_value(gate.group(1), 0)
+    except ValueError:
+        return False
+    return value is False and not gate.group(1)[end:].strip()
+
+
+def platform_cfg_value(text: str, position: int) -> tuple[bool | None, int]:
+    """Three-valued cfg evaluation for host lib tests, separate from shard policy.
+
+    A feature or unknown Rust cfg may be either true or false. In particular,
+    `not(unknown)` and `any(not(unix), unknown)` cannot waive a missing test.
+    """
+    _, ident, _, at = cfg_token(text, position)
+    if ident is None:
+        raise ValueError("expected a cfg predicate")
+    _, _, punct, after = cfg_token(text, at)
+    if punct == "(":
+        if ident not in ("all", "any", "not"):
+            raise ValueError("unknown cfg operator")
+        values = []
+        at = after
+        while True:
+            _, _, closing, peek = cfg_token(text, at)
+            if closing == ")":
+                at = peek
+                break
+            value, at = platform_cfg_value(text, at)
+            values.append(value)
+            _, _, separator, peek = cfg_token(text, at)
+            if separator == ",":
+                at = peek
+            elif separator != ")":
+                raise ValueError("expected a cfg separator")
+        if ident == "not":
+            if len(values) != 1:
+                raise ValueError("cfg not() takes one predicate")
+            return (None if values[0] is None else not values[0]), at
+        if ident == "all":
+            return (False if False in values else None if None in values else True), at
+        return (True if True in values else None if None in values else False), at
+    if punct == "=":
+        literal, _, _, end = cfg_token(text, after)
+        if literal is None:
+            raise ValueError("expected a cfg string")
+        if ident == "target_os":
+            return literal == HOST_TARGET_OS, end
+        if ident == "target_family" and HOST_TARGET_FAMILY is not None:
+            return literal == HOST_TARGET_FAMILY, end
+        return None, end
+    if ident == "test":
+        return True, at
+    if ident in ("unix", "windows") and HOST_TARGET_FAMILY is not None:
+        return ident == HOST_TARGET_FAMILY, at
+    return None, at
 
 
 MOD_BLOCK = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z_0-9]*\s*\{\s*$")
 
 
 def host_excluded_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
-    """1-based line ranges of inline `mod name { ... }` blocks gated to another OS."""
+    """1-based line ranges of inline modules excluded on this platform."""
     ranges = []
     for index, line in enumerate(lines):
         block = MOD_BLOCK.match(line)
@@ -85,7 +131,7 @@ def host_excluded_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
 
 
 def host_excluded_module_files() -> set[str]:
-    """Source files whose `mod name;` declaration is gated to another OS."""
+    """Source files whose `mod name;` declaration excludes this platform."""
     excluded: set[str] = set()
     for path in sorted(path for source in SOURCES for path in source.rglob("*.rs")):
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -129,6 +175,31 @@ SHARD_GATE_FIX = (
 
 def fail(message: str) -> None:
     raise ValueError(message)
+
+
+def ungated_test_fix(raw_lines: list[str], line: int, package: str, shard_packages: dict[str, list[str]]) -> str:
+    """The exact gate line to add above the `#[test]` at `line`, with a suggested shard.
+
+    The shard is the one the file's other gated tests use, else `other-01` for a new
+    file (the first shard of that name that is a feature of `package`).
+    """
+    shard = None
+    for text in raw_lines:
+        found = SHARD_GATE.search(text)
+        if found and package in shard_packages.get(found.group(1), []):
+            shard = found.group(1)
+            break
+    suggestion = "the shard this file's other tests use"
+    if shard is None:
+        shard = "other-01"
+        suggestion = "other-01 for a file with no gated tests yet"
+    indent = raw_lines[line - 1][: len(raw_lines[line - 1]) - len(raw_lines[line - 1].lstrip())]
+    gate = f'{indent}#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-{shard}"))]'
+    return (
+        f"add this line directly above `#[test]` ({suggestion}):\n    {gate}\n"
+        "  Keep `use super::*` out of a module whose tests may all be cfg'd out in a shard "
+        "build (it becomes an unused import); import only what the gated tests use, inside them"
+    )
 
 
 # The only characters that can start a comment, raw/byte string, string or char.
@@ -528,7 +599,10 @@ def source_inventory(
             elif "test-shard-" in attribute_block(raw_lines, line - 1):
                 fail(f"{relative}:{line}: incorrect shard gate; {SHARD_GATE_FIX}")
             elif require_gates:
-                fail(f"{relative}:{line}: ungated test blocks a bounded lib harness")
+                fail(
+                    f"{relative}:{line}: ungated test blocks a bounded lib harness; "
+                    + ungated_test_fix(raw_lines, line, package, shard_packages)
+                )
             else:
                 ungated.append((relative, name, line))
     for relative, name, line in ungated:
@@ -615,6 +689,160 @@ def mounted_sources(files: dict[str, str], root: str) -> set[str]:
                 path_mounted.add(target)
             queue.append(target)
     return mounted
+
+
+def feature_cfg_values(text: str, at: int, shard: str, opt_in: bool) -> tuple[set[bool], int]:
+    """Possible cfg values, fixing test/shard features and leaving platform predicates open.
+
+    Compare the unsharded opt-in view with the actual no-default-features shard.
+    Platform exclusions and intentionally disabled any() fixtures are equal in
+    both views, so they cannot be mistaken for missing shard feature wiring.
+    """
+    _, ident, _, end = cfg_token(text, at)
+    if ident is None:
+        fail(f"cannot parse module cfg near {text[at:at + 40]!r}")
+    _, _, punct, after = cfg_token(text, end)
+    if ident in ("all", "any", "not") and punct == "(":
+        values, end = [], after
+        while True:
+            _, _, closing, peek = cfg_token(text, end)
+            if closing == ")":
+                end = peek
+                break
+            value, end = feature_cfg_values(text, end, shard, opt_in)
+            values.append(value)
+            _, _, separator, peek = cfg_token(text, end)
+            if separator == ",":
+                end = peek
+            elif separator != ")":
+                fail(f"cannot parse module cfg near {text[end:end + 40]!r}")
+        if ident == "not":
+            if len(values) != 1:
+                fail("cfg not() takes one predicate")
+            return {not value for value in values[0]}, end
+        if ident == "all":
+            return ({True} if all(True in value for value in values) else set()) | (
+                {False} if any(False in value for value in values) else set()
+            ), end
+        return ({True} if any(True in value for value in values) else set()) | (
+            {False} if all(False in value for value in values) else set()
+        ), end
+    if punct == "=":
+        literal, _, _, end = cfg_token(text, after)
+        if literal is None:
+            fail(f"cannot parse module cfg near {text[after:after + 40]!r}")
+        if ident == "feature":
+            if literal.startswith("test-shard-"):
+                value = not opt_in and literal in ("test-shard-mode", f"test-shard-{shard}")
+            else:
+                value = opt_in
+            return {value}, end
+        return {False, True}, end
+    return ({True} if ident == "test" else {False, True}), end
+
+
+@functools.lru_cache(maxsize=None)
+def module_cfg_ranges(text: str) -> list[tuple[int, int, str]]:
+    """Cfg predicates and item ranges for module mounts, inline modules and includes.
+
+    Mask comments/literals before finding delimiters, keeping the original
+    predicate/path strings for evaluation and mount resolution. Ranges are
+    parsed once per source, rather than scanning its Rust braces per shard.
+    """
+    code = mask_literals_and_comments(text, "module mount")
+    pairs, stack = {}, []
+    for index, char in enumerate(code):
+        if char in "[{(":
+            stack.append((char, index))
+        elif char in "]})" and stack and stack[-1][0] == {"]": "[", "}": "{", ")": "("}[char]:
+            _, opening = stack.pop()
+            pairs[opening] = index
+    ranges = []
+    for match in CFG_ATTR.finditer(code):
+        if match.group(1) != "cfg":
+            continue
+        closing = pairs.get(match.end() - 1)
+        if closing is None:
+            fail("unterminated module cfg attribute")
+        predicate = text[match.end():closing]
+        bracket = code.find("]", closing)
+        at = bracket + 1
+        # File or inline-module inner cfg controls the rest of that scope.
+        if code[match.start():match.start() + 3] == "#![":
+            containing = [(start, end) for start, end in pairs.items()
+                          if code[start] == "{" and start < match.start() < end]
+            end = min(containing, key=lambda pair: pair[1] - pair[0])[1] if containing else len(code)
+            ranges.append((match.start(), end, predicate))
+            continue
+        while at < len(code):
+            if code[at].isspace():
+                at += 1
+            elif code.startswith("#[", at) and at + 1 in pairs:
+                at = pairs[at + 1] + 1
+            else:
+                break
+        declared = MOD_ITEM.match(code[at:])
+        include = re.match(r"include!\s*\(", code[at:])
+        if declared:
+            terminator = at + declared.end() - 1
+            end = pairs[terminator] + 1 if code[terminator] == "{" else terminator + 1
+        elif include:
+            end = code.find(";", at) + 1
+        else:
+            continue
+        ranges.append((match.start(), end, predicate))
+    return ranges
+
+
+def shard_module_source(text: str, shard: str, opt_in: bool) -> str:
+    """Blank module scopes whose cfg definitely excludes this feature view."""
+    excluded = [(start, end) for start, end, predicate in module_cfg_ranges(text)
+                if True not in feature_cfg_values(predicate, 0, shard, opt_in)[0]]
+    if not excluded:
+        return text
+    pieces, cursor = [], 0
+    for start, end in sorted(excluded):
+        if end <= cursor:
+            continue
+        start = max(start, cursor)
+        pieces.extend((text[cursor:start], re.sub(r"[^\n]", " ", text[start:end])))
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def check_shard_module_mounts(manifest: dict[tuple[str, str], str]) -> None:
+    """A test's declared shard must reach its enclosing modules without opt-in features.
+
+    Runtime exceptions never bypass this check. Deliberate always-disabled
+    historical fixtures and platform predicates remain the runtime checker's
+    responsibility; neither differs between the two feature views.
+    """
+    files = {path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8")
+             for source in SOURCES for path in source.rglob("*.rs")}
+    tests = {relative: extract_tests(ROOT / relative) for relative in {relative for relative, _ in manifest}}
+    for shard in sorted(set(manifest.values()) - {"bin"}):
+        actual = {path: shard_module_source(text, shard, False) for path, text in files.items()}
+        permissive = {path: shard_module_source(text, shard, True) for path, text in files.items()}
+        selected_files = {relative for (relative, _), assigned in manifest.items() if assigned == shard}
+        actual_lines = {path: actual[path].splitlines() for path in selected_files}
+        permissive_lines = {path: permissive[path].splitlines() for path in selected_files}
+        for package in CRATES:
+            root = f"crates/{package}/src/lib.rs"
+            if root not in files:
+                continue
+            reached = mounted_sources(actual, root)
+            possible = mounted_sources(permissive, root)
+            for (relative, name), assigned in manifest.items():
+                if assigned != shard or package_of(relative) != package or relative not in possible:
+                    continue
+                line = next(line for test, line, _ in tests[relative] if test == name)
+                feature_visible = ATTR.match(permissive_lines[relative][line - 1])
+                shard_visible = relative in reached and ATTR.match(actual_lines[relative][line - 1])
+                if feature_visible and not shard_visible:
+                    fail(f"{relative}:{line}: test {name} declares shard {shard}, but an enclosing module cfg "
+                         f"excludes that shard without opt-in features; make the module mount include "
+                         f'all(test, feature = "test-shard-{shard}") (runtime exceptions cannot waive this)')
 
 
 def target_roots(relative_files: set[str]) -> list[str]:
@@ -748,6 +976,7 @@ def main() -> int:
                 + "; a `#[path]`-mounted file's `mod tests;` loads `tests.rs` beside it, so mount the test file "
                 'with an explicit `#[path = "<stem>/tests.rs"]`'
             )
+        check_shard_module_mounts(manifest)
         populated = {(package_of(source), assigned) for (source, _), assigned in manifest.items()}
         for shard, packages in shard_packages.items():
             for package in packages:

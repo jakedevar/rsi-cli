@@ -1,14 +1,23 @@
 {
   "run": {
     "adapter_tree_hash": "cccccccccccccccccccccccccccccccccccccccc",
+    "build_sha": "1111111111111111111111111111111111111111",
     "concurrency": 4,
     "config_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "dataset_commit": "2fd12b88aafdd04a52c298e3940bcb189f9766d6",
     "dataset_repo": "harbor-framework/terminal-bench-2",
+    "effective_inputs": {
+      "loop_knobs": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "overlay": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "policy": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "prompt": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "tool_spec": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    },
     "effort": "high",
     "finished_at": "2026-10-19T13:00:00.000000000Z",
     "harbor_version": "0.24.0",
     "harness_build_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "harness_source_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "host": "bench-host-1",
     "image_digests": {
       "build-pov-ray": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -16,7 +25,7 @@
     },
     "k": 1,
     "model": "claude-sonnet-5-5",
-    "observation_fingerprint": "sha256:fc82c4d7dccbd3ae2a510ff03a4a2befa41b38b1f207b3e54921b9a0d96ea77f",
+    "observation_fingerprint": "sha256:1dc0802d06408b885aaff23b9633b4e1b9086f6023295c8b02b71640d5938684",
     "route": "direct",
     "sampling": {
       "temperature": 0.0
@@ -49,10 +58,13 @@
   "trials": [
     {
       "attempt": 0,
+      "build_sha": "1111111111111111111111111111111111111111",
       "cached_tokens": 600,
       "cost_usd": 0.25,
       "exception_type": null,
       "failure_cause": null,
+      "harness_source_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "harness_version_hash": "hvh-build-pov-ray",
       "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "infra_interrupted": false,
       "invalid_route": false,
@@ -73,10 +85,13 @@
     },
     {
       "attempt": 0,
+      "build_sha": "1111111111111111111111111111111111111111",
       "cached_tokens": 600,
       "cost_usd": 0.25,
       "exception_type": "AgentTimeoutError",
       "failure_cause": "verifier_failed",
+      "harness_source_digest": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "harness_version_hash": "hvh-fix-git",
       "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "infra_interrupted": false,
       "invalid_route": false,

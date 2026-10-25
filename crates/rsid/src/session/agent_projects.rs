@@ -109,7 +109,7 @@ impl ProjectAdminContext {
     }
 
     /// Rebuild the project index and reload the project's RSI.md.
-    async fn refresh(&self, store: &Arc<tokio::sync::Mutex<Store>>, project: &Project) {
+    async fn refresh(&self, store: &Arc<rsid_core::store_lock::Mutex<Store>>, project: &Project) {
         let store = Arc::clone(store);
         let projects = tokio::task::spawn_blocking(move || store.blocking_lock().load_projects())
             .await

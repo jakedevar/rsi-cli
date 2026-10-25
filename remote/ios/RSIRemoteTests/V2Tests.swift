@@ -99,10 +99,10 @@ private let fixtureKey = "550e8400-e29b-41d4-a716-446655440009"
 private let messageId = "550e8400-e29b-41d4-a716-44665544000a"
 private let fixtureText = "please prioritize the migration, tell nobody secret-token-text"
 
-private func v2Client() -> RemoteClient {
+private func v2Client(retry: ReadRetry = .instant) -> RemoteClient {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubProtocol.self]
-    return RemoteClient(host: V2Fixture.host, session: URLSession(configuration: configuration))
+    return RemoteClient(host: V2Fixture.host, session: URLSession(configuration: configuration), retry: retry)
 }
 
 private func v2SignIn() {
@@ -125,6 +125,8 @@ final class V2FixtureTests: XCTestCase {
         "message_replayed_200", "message_switch_off_403", "message_bad_csrf_403",
         "message_not_a_seat_403", "message_invalid_400", "message_key_conflict_409",
         "message_rate_limited_429", "message_outcome_unknown_504", "message_busy_503",
+        "dashboard_200", "dashboard_empty_200", "dashboard_incomplete_200", "dashboard_busy_503",
+        "providers_200", "providers_empty_200", "providers_busy_503",
     ]
 
     /// What each error fixture means to the app.
@@ -149,6 +151,15 @@ final class V2FixtureTests: XCTestCase {
             switch (fixture.method, fixture.status) {
             case ("GET", 200) where fixture.path == "/api/v2/projects":
                 XCTAssertNoThrow(try fixture.decode(ProjectSeatsList.self), label)
+            case ("GET", 200) where fixture.path == "/api/v2/dashboard":
+                XCTAssertNoThrow(try fixture.decode(Dashboard.self), label)
+            case ("GET", 200) where fixture.path == "/api/v2/providers":
+                XCTAssertNoThrow(try fixture.decode(ProviderUsage.self), label)
+            case ("GET", 503):
+                XCTAssertTrue(["/api/v2/dashboard", "/api/v2/providers"].contains(fixture.path), label)
+                XCTAssertEqual(fixture.retryAfter, 2, label)
+                XCTAssertEqual(
+                    statusError(503, code: errorCode(from: try XCTUnwrap(fixture.body))), .busy, label)
             case ("GET", 200):
                 XCTAssertTrue(fixture.path.hasSuffix("/conversation"), label)
                 XCTAssertNoThrow(try fixture.decode(ConversationPage.self), label)
@@ -304,9 +315,7 @@ final class V2FixtureTests: XCTestCase {
         XCTAssertEqual(AppInfo.contract, "RSI Remote v1 + v2")
     }
 
-    func testShortTimeAndTheProjectBadge() throws {
-        XCTAssertEqual(shortTime("2026-10-17T09:24:00.000000000Z"), "10-17 09:24 UTC")
-        XCTAssertEqual(shortTime("soon"), "soon")
+    func testTheProjectBadge() throws {
         let seats = try XCTUnwrap(
             V2Fixture.named("projects_with_global_200").decode(ProjectSeatsList.self).projects.first)
         var row = ProjectRow(project: WireProject(id: project, name: "Alpha"), waiting: 3, sessions: [])
@@ -316,7 +325,7 @@ final class V2FixtureTests: XCTestCase {
     }
 }
 
-// MARK: Poll backoff and draft rules
+// MARK: Poll backoff
 
 final class V2ScheduleTests: XCTestCase {
     func testPollBackoffDoublesToTwoMinutesAndResetsOnSuccess() {
@@ -335,81 +344,6 @@ final class V2ScheduleTests: XCTestCase {
         XCTAssertEqual(backoff.interval, .seconds(40))
         for _ in 0..<100 { backoff.failed() }
         XCTAssertEqual(backoff.interval, .seconds(120))
-    }
-
-    private func keys() -> () -> String {
-        var next = 0
-        return {
-            next += 1
-            return String(format: "00000000-0000-4000-8000-%012d", next)
-        }
-    }
-
-    func testTheSameTextReusesItsKeyAndNewTextGetsANewOne() throws {
-        let key = keys()
-        var draft = MessageDraft()
-        draft.text = "ship it"
-        let first = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        draft.finish(.failure(messageRefusal(status: 503, code: "busy", retryAfter: 1)))
-        XCTAssertFalse(draft.locked)
-        let again = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        XCTAssertEqual(again, first)
-        draft.finish(.failure(messageRefusal(status: 429, code: "rate_limited", retryAfter: 1)))
-        draft.text = "ship it now"
-        let edited = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        XCTAssertNotEqual(edited.idempotencyKey, first.idempotencyKey)
-        XCTAssertEqual(edited.text, "ship it now")
-    }
-
-    func testAnUnknownOutcomeFreezesTheAttemptUntilADefinitiveReply() throws {
-        let key = keys()
-        var draft = MessageDraft()
-        draft.text = "ship it"
-        let first = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        draft.finish(.failure(messageRefusal(status: 504, code: "outcome_unknown", retryAfter: nil)))
-        XCTAssertTrue(draft.locked)
-        draft.text = "something else"  // the view disables editing; the frozen attempt still wins
-        // Neither a busy host nor a refusal unfreezes it: the first send may have queued.
-        for refusal in [
-            messageRefusal(status: 503, code: "busy", retryAfter: 1), MessageError.messagingOff(),
-            messageRefusal(status: 409, code: "seat_not_live", retryAfter: nil),
-        ] {
-            XCTAssertEqual(try draft.begin(project: project, seat: globalSeat, newKey: key), first)
-            draft.finish(.failure(refusal))
-            XCTAssertTrue(draft.locked)
-        }
-        XCTAssertEqual(try draft.begin(project: project, seat: pmSeat, newKey: key), first)
-        let receipt = try V2Fixture.named("message_replayed_200").decode(MessageReceipt.self)
-        draft.finish(.success(receipt))
-        XCTAssertFalse(draft.locked)
-        XCTAssertEqual(draft.text, "")
-        XCTAssertEqual(draft.phase, .sent(receipt))
-    }
-
-    func testAConflictOrAMovedSeatDropsTheKey() throws {
-        let key = keys()
-        var draft = MessageDraft()
-        draft.text = "ship it"
-        let first = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        draft.finish(.failure(messageRefusal(status: 409, code: "idempotency_conflict", retryAfter: nil)))
-        let second = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        XCTAssertNotEqual(second.idempotencyKey, first.idempotencyKey)
-        draft.finish(.failure(.seatChanged(status: 403)))
-        XCTAssertEqual(draft.text, "ship it")
-        let third = try draft.begin(project: project, seat: pmSeat, newKey: key)
-        XCTAssertNotEqual(third.idempotencyKey, second.idempotencyKey)
-    }
-
-    func testDiscardClearsAFrozenAttempt() throws {
-        var draft = MessageDraft()
-        draft.text = "ship it"
-        _ = try draft.begin(project: project, seat: pmSeat, newKey: keys())
-        draft.finish(.failure(messageRefusal(status: 502, code: "outcome_unknown", retryAfter: nil)))
-        draft.discard()
-        XCTAssertFalse(draft.locked)
-        XCTAssertNil(draft.attempt)
-        XCTAssertEqual(draft.phase, .idle)
-        XCTAssertThrowsError(try draft.begin(project: project, seat: pmSeat, newKey: keys()))
     }
 }
 
@@ -432,6 +366,10 @@ final class V2ClientTests: XCTestCase {
         do {
             if fixture.path == "/api/v2/projects" {
                 result = .success(try await client.managerSeats())
+            } else if fixture.path == "/api/v2/dashboard" {
+                result = .success(try await client.dashboard())
+            } else if fixture.path == "/api/v2/providers" {
+                result = .success(try await client.providers())
             } else if fixture.method == "GET" {
                 let (project, seat) = try XCTUnwrap(fixture.projectAndSeat)
                 let before = fixture.query.map { String($0.dropFirst("before=".count)) }
@@ -468,8 +406,15 @@ final class V2ClientTests: XCTestCase {
                 XCTAssertEqual(error.kind, .invalid, label)
                 continue
             }
-            // A 401 re-bootstraps once and resends; nothing else is retried.
-            XCTAssertEqual(requests.count, fixture.status == 401 ? 2 : 1, label)
+            // A 401 re-bootstraps once and resends; a busy read is tried again
+            // up to the read limit (#350); nothing else is retried, no write ever.
+            let expected =
+                switch (fixture.method, fixture.status) {
+                case (_, 401): 2
+                case ("GET", 503): ReadRetry.standard.attempts
+                default: 1
+                }
+            XCTAssertEqual(requests.count, expected, label)
             guard let seen = requests.first else { continue }
             XCTAssertEqual(seen.query, fixture.query, label)
             XCTAssertEqual(seen.headers["origin"], fixture.headers["origin"], label)
@@ -490,6 +435,8 @@ final class V2ClientTests: XCTestCase {
                 XCTAssertEqual(error as? RemoteError, .unauthorized, label)
             case (404, .failure(let error)):
                 XCTAssertEqual((error as? ReadFailure)?.error, .server(status: 404, code: "not_found"), label)
+            case (503, .failure(let error)) where fixture.method == "GET":
+                XCTAssertEqual(error as? RemoteError, .busy, label)
             case (let status, .failure(let error)) where fixture.method == "POST":
                 let (kind, retry) = try XCTUnwrap(V2FixtureTests.messageErrors[label], label)
                 let refusal = try XCTUnwrap(error as? MessageError, label)
@@ -571,7 +518,6 @@ final class ManagerChatTests: XCTestCase {
     }
 
     private var conversationPath: String { managerPath(project, pmSeat) + "/conversation" }
-    private var messagesPath: String { managerPath(project, pmSeat) + "/messages" }
 
     private func seats(pm: String = pmSeat) throws -> ProjectSeats {
         let row = try XCTUnwrap(
@@ -585,83 +531,8 @@ final class ManagerChatTests: XCTestCase {
             projectId: row.projectId, name: row.name, projectManager: moved, globalManager: row.globalManager)
     }
 
-    private func makeChat(pm: String = pmSeat) throws -> ManagerChat {
-        var next = 0
-        return ManagerChat(
-            project: project, seats: try seats(pm: pm), client: v2Client(),
-            newKey: {
-                next += 1
-                return String(format: "00000000-0000-4000-8000-%012d", next)
-            })
-    }
-
-    func testTheSwitchOffRefusalIsTheCalmMessagingOffState() async throws {
-        StubGateway.shared.script("POST \(messagesPath)", try V2Fixture.named("message_switch_off_403").reply)
-        StubGateway.shared.script("GET /api/v2/projects", try V2Fixture.named("projects_with_global_200").reply)
-        let chat = try makeChat()
-        chat.draft.text = "ship it"
-        await chat.send()
-        XCTAssertTrue(chat.messagingOff)
-        guard case .failed(let error) = chat.draft.phase else { return XCTFail("expected a refusal") }
-        XCTAssertEqual(error.kind, .messagingOff)
-        XCTAssertEqual(error.message, MessageError.messagingOffText)
-        XCTAssertEqual(chat.draft.text, "ship it")
-        XCTAssertFalse(chat.draft.locked)
-        // Exactly one POST: a refusal is never retried automatically.
-        XCTAssertEqual(StubGateway.shared.requests.filter { $0.path == messagesPath }.count, 1)
-
-        // The operator turns messaging on; the next send clears the state.
-        StubGateway.shared.script("POST \(messagesPath)", try V2Fixture.named("message_accepted_200").reply)
-        StubGateway.shared.script("GET \(conversationPath)", try V2Fixture.named("conversation_first_page_200").reply)
-        await chat.send()
-        XCTAssertFalse(chat.messagingOff)
-        guard case .sent(let receipt) = chat.draft.phase else { return XCTFail("expected a receipt") }
-        XCTAssertEqual(receipt.messageId, messageId)
-        // The receipt said queued; the polled first page says delivered.
-        XCTAssertEqual(chat.delivery(of: receipt).text, describeDelivery("delivered").text)
-        let posts = StubGateway.shared.requests.filter { $0.path == messagesPath }
-        XCTAssertEqual(posts[0].body, posts[1].body)
-    }
-
-    func testANotASeatRefusalReListsAndMovesToTheCurrentSeat() async throws {
-        let stale = managerPath(project, workerSeat) + "/messages"
-        StubGateway.shared.script("POST \(stale)", try V2Fixture.named("message_not_a_seat_403").reply)
-        StubGateway.shared.script("GET /api/v2/projects", try V2Fixture.named("projects_with_global_200").reply)
-        let chat = try makeChat(pm: workerSeat)
-        chat.draft.text = "ship it"
-        await chat.send()
-        guard case .failed(let error) = chat.draft.phase else { return XCTFail("expected a refusal") }
-        // The seat is gone from the list, so this is a rotation, not "messaging off";
-        // the composer follows the list's own messages_enabled (false in this fixture).
-        XCTAssertEqual(error.kind, .seatChanged)
-        XCTAssertEqual(chat.messagesEnabled, false)
-        XCTAssertTrue(chat.composeDisabled)
-        XCTAssertEqual(chat.seat?.sessionId, pmSeat)
-        XCTAssertEqual(chat.draft.text, "ship it")
-    }
-
-    func testAnUnknownOutcomeRetriesUnderTheSameKeyAndShowsTheReplay() async throws {
-        StubGateway.shared.script(
-            "POST \(messagesPath)", try V2Fixture.named("message_outcome_unknown_504").reply,
-            try V2Fixture.named("message_replayed_200").reply)
-        StubGateway.shared.script("GET \(conversationPath)", try V2Fixture.named("conversation_empty_200").reply)
-        let chat = try makeChat()
-        chat.draft.text = "ship it"
-        await chat.send()
-        XCTAssertTrue(chat.draft.locked)
-        guard case .failed(let error) = chat.draft.phase else { return XCTFail("expected unknown") }
-        XCTAssertEqual(error.kind, .unknown)
-        XCTAssertTrue(error.message.contains("Not known whether delivered"))
-        // Nothing is resent until the operator taps Retry.
-        XCTAssertEqual(StubGateway.shared.requests.filter { $0.path == messagesPath }.count, 1)
-        await chat.send()
-        let posts = StubGateway.shared.requests.filter { $0.path == messagesPath }
-        XCTAssertEqual(posts.count, 2)
-        XCTAssertEqual(posts[0].body, posts[1].body)
-        guard case .sent(let receipt) = chat.draft.phase else { return XCTFail("expected a receipt") }
-        XCTAssertTrue(receipt.deduplicated)
-        XCTAssertTrue(chat.delivery(of: receipt).text.hasPrefix("Already queued earlier"))
-        XCTAssertFalse(chat.draft.locked)
+    private func makeChat(pm: String = pmSeat, retry: ReadRetry = .instant) throws -> ManagerChat {
+        ManagerChat(project: project, seats: try seats(pm: pm), client: v2Client(retry: retry))
     }
 
     func testTheTranscriptLoadsOlderPagesAndPollsWithoutDuplicates() async throws {
@@ -692,7 +563,8 @@ final class ManagerChatTests: XCTestCase {
             "GET \(conversationPath)", .json(#"{"error":"busy"}"#, status: 503, headers: ["Retry-After": "1"]),
             .json(#"{"error":"busy"}"#, status: 503), .fail(.timedOut),
             try V2Fixture.named("conversation_empty_200").reply)
-        let chat = try makeChat()
+        // One attempt per read, so each poll sees one failure.
+        let chat = try makeChat(retry: ReadRetry(attempts: 1))
         var schedule: [Duration] = []
         for _ in 0..<4 {
             await chat.refresh()
@@ -701,6 +573,33 @@ final class ManagerChatTests: XCTestCase {
         XCTAssertEqual(schedule, [20, 40, 80, 10].map { Duration.seconds($0) })
         XCTAssertEqual(chat.thread?.loaded, true)
         XCTAssertNil(chat.thread?.error)
+    }
+
+    func testAPollRidesOutBusyAnswersInsideOneRead() async throws {
+        StubGateway.shared.script(
+            "GET \(conversationPath)", .json(#"{"error":"busy"}"#, status: 503, headers: ["Retry-After": "2"]),
+            .json(#"{"error":"busy"}"#, status: 503), try V2Fixture.named("conversation_first_page_200").reply)
+        let chat = try makeChat()
+        await chat.refresh()
+        XCTAssertEqual(chat.thread?.items.map(\.id), ["904", "903"])
+        XCTAssertNil(chat.thread?.error)
+        XCTAssertEqual(chat.backoff.failures, 0)
+        XCTAssertEqual(StubGateway.shared.requests.filter { $0.path == conversationPath }.count, 3)
+    }
+
+    func testACancelledPollLeavesTheThreadAsItWas() async throws {
+        StubGateway.shared.script("GET \(conversationPath)", try V2Fixture.named("conversation_first_page_200").reply)
+        let chat = try makeChat()
+        await chat.refresh()
+        StubGateway.shared.script(
+            "GET \(conversationPath)", try V2Fixture.named("conversation_first_page_200").reply.after(5))
+        let poll = Task { await chat.refresh() }
+        try await Task.sleep(for: .milliseconds(100))
+        poll.cancel()
+        await poll.value
+        XCTAssertNil(chat.thread?.error)
+        XCTAssertEqual(chat.backoff.failures, 0)
+        XCTAssertEqual(chat.thread?.items.map(\.id), ["904", "903"])
     }
 
     func testAStaleSeatConversationReListsAndReadsTheNewSeat() async throws {

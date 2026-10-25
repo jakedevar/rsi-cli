@@ -1,0 +1,56 @@
+{
+  "name": "dashboard_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/dashboard"
+  },
+  "response": {
+    "body": {
+      "agents": [
+        {
+          "effort": "high",
+          "provider": "Claude",
+          "running": 4
+        },
+        {
+          "effort": "xhigh",
+          "provider": "Codex",
+          "running": 2
+        },
+        {
+          "effort": null,
+          "provider": "Claude",
+          "running": 1
+        }
+      ],
+      "agents_incomplete": false,
+      "agents_total": 7,
+      "agents_truncated": false,
+      "observed_at": "2026-10-19T19:30:00.000000000Z",
+      "satellites": [
+        {
+          "build_sha": null,
+          "label": "laptop",
+          "last_seen_at": "2026-10-19T18:02:11.000000000Z",
+          "reachable": false,
+          "running_agents": null
+        },
+        {
+          "build_sha": "a077ca3b02ae7d9de512c24d56a5803d88f703e5",
+          "label": "mac-mini",
+          "last_seen_at": "2026-10-19T19:29:40.000000000Z",
+          "reachable": true,
+          "running_agents": 3
+        }
+      ],
+      "satellites_truncated": false
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

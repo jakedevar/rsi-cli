@@ -29,7 +29,7 @@ const TMPFS_MIN_FREE_GB: u64 = 12;
 /// defaults to the handoff; the hermetic binary tests default to the inline
 /// canary they were written for and opt in explicitly.
 pub(super) fn handoff_enabled() -> bool {
-    match std::env::var("RSI_LANDER_CANARY_MODE").as_deref() {
+    match crate::lander_env::var("RSI_LANDER_CANARY_MODE").as_deref() {
         Ok("inline") => false,
         Ok("handoff") => true,
         _ => !cfg!(test),
@@ -62,7 +62,7 @@ pub(super) fn hand_off(
     // Enqueue before probing the lock: a runner that is finishing re-reads
     // the queue after it releases the lock, so the request is never stranded.
     registry.enqueue(&request)?;
-    let spawn = std::env::var("RSI_LANDER_CANARY_SPAWN").as_deref() != Ok("0");
+    let spawn = crate::lander_env::var("RSI_LANDER_CANARY_SPAWN").as_deref() != Ok("0");
     if spawn && !registry.runner_lock_held()? {
         spawn_runner(&root)?;
     }
@@ -70,7 +70,7 @@ pub(super) fn hand_off(
 }
 
 fn systemd_run_available() -> bool {
-    std::process::Command::new("systemd-run")
+    crate::lander_env::command("systemd-run")
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -131,8 +131,12 @@ fn spawn_runner(root: &Path) -> Result<(), String> {
 /// Entry point for `rsi-rolling-land --canary-runner`.
 pub(super) fn run_main() -> i32 {
     match canary::default_root().and_then(|root| ensure_runner_target_dir(&root)) {
-        // SAFETY: still single-threaded; the async runtime starts below.
-        Ok(target) => unsafe { std::env::set_var("CARGO_TARGET_DIR", target) },
+        Ok(target) => {
+            // SAFETY: still single-threaded; the async runtime starts below.
+            unsafe { std::env::set_var("CARGO_TARGET_DIR", &target) };
+            // #192: the lander's knob reads and children use the snapshot.
+            crate::lander_env::set_startup_var("CARGO_TARGET_DIR", target);
+        }
         Err(error) => {
             let line = format!("canary_runner error={error}");
             eprintln!("rsi-rolling-land {line}");
@@ -354,8 +358,9 @@ impl LanderCanaryGate {
                 &["clone", "--no-checkout", "--quiet", remote_url, &repo_arg],
             )?;
         }
-        copy_committed_script(&repo, "scripts/rolling-landing-guard.py")?;
-        copy_committed_script(&repo, "tools/check-released-migrations.py")?;
+        if !super::landing_policy::native_guard_installed() {
+            copy_committed_script(&repo, "scripts/rolling-landing-guard.py")?;
+        }
         for (key, value) in [
             ("maintenance.auto", "false"),
             ("maintenance.autoDetach", "false"),
@@ -372,7 +377,7 @@ impl LanderCanaryGate {
         )?;
         let _ = git_ok(&repo, &["update-ref", "-d", TARGET]);
         let cargo_build_jobs =
-            parse_cargo_build_jobs(std::env::var_os("CARGO_BUILD_JOBS").as_deref())?;
+            parse_cargo_build_jobs(crate::lander_env::var_os("CARGO_BUILD_JOBS").as_deref())?;
         Ok(Self {
             workspace,
             repo,
@@ -589,19 +594,16 @@ mod tests {
 
     #[test]
     fn runner_target_dir_is_created_under_the_registry_root() {
-        let _guard = crate::tests::env_lock();
         let root = tempfile::TempDir::new().unwrap();
-        let saved = std::env::var_os("CARGO_TARGET_DIR");
-        // SAFETY: serialised through the lander tests' environment lock.
-        unsafe { std::env::remove_var("CARGO_TARGET_DIR") };
+        // #192: no CARGO_TARGET_DIR in this thread's lander environment; the
+        // process environment is left alone.
+        let _env = crate::lander_env::current()
+            .as_ref()
+            .clone()
+            .without_var("CARGO_TARGET_DIR")
+            .enter();
         let target = ensure_runner_target_dir(root.path()).unwrap();
         assert_eq!(target, root.path().join("target"));
         assert!(target.is_dir());
-        // SAFETY: as above.
-        unsafe {
-            if let Some(saved) = saved {
-                std::env::set_var("CARGO_TARGET_DIR", saved);
-            }
-        }
     }
 }

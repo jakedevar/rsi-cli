@@ -272,11 +272,16 @@ impl RpcServer {
         let params: rsi_common::agent_jobs::AgentGetJobRequestV1 =
             rsi_common::harness_manager::decode_manager_request(expanded)
                 .map_err(|_| DaemonError::InvalidParam("job_invalid_request".into()))?;
+        let compact = params.fields == rsi_common::agent_jobs::AgentJobFieldsV1::Compact;
         let job = self
             .session_manager
             .agent_control()
             .agent_get_job(caller, params)
             .await?;
+        // hub #3852: `fields:"compact"` is the bounded view; the default is the whole job.
+        if compact {
+            return Ok(job.compact_view());
+        }
         Ok(serde_json::to_value(job)?)
     }
 
@@ -303,17 +308,18 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let caller = self.resolve_caller_session_id(request).await?;
         let params: rsi_common::agent_jobs::AgentListJobsRequestV1 = if request.params.is_null() {
-            rsi_common::agent_jobs::AgentListJobsRequestV1 { limit: None }
+            rsi_common::agent_jobs::AgentListJobsRequestV1::default()
         } else {
             rsi_common::harness_manager::decode_manager_request(request.params.clone())
                 .map_err(|_| DaemonError::InvalidParam("job_invalid_request".into()))?
         };
+        let fields = params.fields;
         let listed = self
             .session_manager
             .agent_control()
             .agent_list_jobs(caller, params)
             .await?;
-        Ok(serde_json::to_value(listed)?)
+        Ok(listed.render(fields))
     }
 
     pub(super) async fn handle_agent_enqueue_landing_source(
@@ -726,8 +732,10 @@ impl RpcServer {
                 .await?;
             if let Some(handle) = &self.scheduler_handle {
                 // Evaluate now: an already-terminal batch fires without waiting
-                // for the next fast-lane pass.
-                let _ = handle.check_now().await;
+                // for the next fast-lane pass. The wake is already durable,
+                // so the receipt never waits behind a busy scheduler queue
+                // (hub #3631).
+                handle.try_check_now();
             }
             return Ok(serde_json::json!({
                 "job_id": job.id,
@@ -736,6 +744,10 @@ impl RpcServer {
                 "wake_session_id": job.wake_session_id,
                 "when": predicate,
                 "replaced_job_ids": replaced,
+                // #170: the caller is mid-turn, so the wake has not fired into
+                // it, however close next_fire_at is to now.
+                "delivered": false,
+                "delivery": wp::WAKE_WHEN_ARMED_DELIVERY,
             }));
         }
         if params.when.is_some() || params.timeout_seconds.is_some() {

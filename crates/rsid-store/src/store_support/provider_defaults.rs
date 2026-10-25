@@ -120,6 +120,12 @@ pub const CLAUDE_MODEL_UNRECOGNIZED_STOP_REASON: &str = "provider_model_unrecogn
 /// result schema; the session is not retried, a retry would spend again).
 pub const CLAUDE_BUDGET_EXCEEDED_STOP_REASON: &str = "provider_budget_exceeded";
 
+/// Closed stop reason of a Harness session the OpenRouter spend ceiling ended
+/// at a model call (#3154). Not retried automatically: a retry would spend
+/// again past the line the operator set.
+pub const OPENROUTER_SPEND_CAP_STOP_REASON: &str =
+    rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE;
+
 /// How long a model stays unavailable after its last refusal when no later
 /// launch of it got past startup: after this one probe launch is admitted
 /// again, so a restored model heals without an operator.

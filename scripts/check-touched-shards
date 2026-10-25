@@ -25,6 +25,9 @@ the summary says `MERGE_BASES=n`, #1633) it:
   * reports whether head merges cleanly into base and which migrations it adds;
   * suggests landing filters (rsid=shard:<shard>:test(<module>), rsi-common=,
     rsi=, plus the cross-cutting pins the worker contract names).
+    Public library definition changes also select exact tests in transitive
+    workspace dependents' modules that name the item (#3408); `downstream_tests`
+    records items, modules and generic-name skips. scoped-test reuses this plan.
     The receipt's `changed_modules` names each changed library module (with the sources
     below it that did not change, so a descendant's tests stay out) and each changed bin or
     integration-test target; scoped-test runs their tests before unrelated observers (#2182).
@@ -134,9 +137,11 @@ the summary says `MERGE_BASES=n`, #1633) it:
       - a changed source named in SOURCE_OBSERVER_PINS (crates/rsi-common/src/agent_control_schema.rs
         -> rsid `rpc::tests::operator_daemon_config_is_absent_from_every_agent_surface`, #2949)
         selects those exact tests: they consume the data through a function call, which the
-        include_str! trace cannot see. The manager spend inputs also pin the external
-        delegation VM-cost regression (#3076). The receipt's `source_observer_pins` lists them;
+        include_str! trace cannot see. The receipt's `source_observer_pins` lists them;
         `source_observer_missing` names a pin whose test no longer exists;
+      - tools/test-guards.json declares cross-module invariant observers (#509/#3061).
+        A changed guarded module selects its exact test, in addition to ordinary coverage.
+        Every declaration must resolve; malformed or stale declarations stop derivation;
       - any Rust file scanned by rsi-common's workspace manifest-path guard selects that
         integration test with one exact filter (#417), including comment-only changes;
       - a diff confined to the functions a rule in scripts/test-coverage.json names
@@ -227,6 +232,7 @@ import argparse
 import collections
 import difflib
 import functools
+import fnmatch
 import json
 import os
 import posixpath
@@ -284,16 +290,8 @@ AGENT_VERB_PIN_CAP = 80
 # include_str!, so the data-file observer trace cannot see it) pins that test by exact name.
 # {changed source: ((test module, test name), ...)}; a pin whose test no longer exists is
 # reported in the receipt (`source_observer_missing`) instead of silently selecting nothing.
-# #3076: the small spend-input modules retain their own tests without a caller trace.
-# The delegation cost bound observes both inputs through the manager snapshot/gate,
-# so it must join those module filters even though it lives elsewhere in rsid-store.
-MANAGER_SPEND_OBSERVERS = (
-    ("store::portfolio_nodes::delegation_tests",
-     "a_manager_pass_costs_a_bounded_number_of_instructions_per_member_2494"),
-)
+# Cross-module invariants use GUARD_DECLARATIONS below; these are source-reader pins.
 SOURCE_OBSERVER_PINS = {
-    RSID_STORE_SRC + "model_control/cost.rs": MANAGER_SPEND_OBSERVERS,
-    RSID_STORE_SRC + "store/manager_resources.rs": MANAGER_SPEND_OBSERVERS,
     "crates/rsi-common/src/agent_control_schema.rs": (
         ("rpc::tests", "operator_daemon_config_is_absent_from_every_agent_surface"),
     ),
@@ -437,7 +435,7 @@ def mod_declarations(text):
 
     `inline_stack` is the chain of enclosing `mod y {` blocks (rustfmt indentation
     pairs each block's closing brace with its opener). `host_off` is whether a
-    plain `#[cfg(target_os = ..)]` on the declaration or an enclosing inline block
+    `#[cfg(..)]` condition on the declaration or an enclosing inline block
     leaves it out of a build on this host (#2291).
     """
     found, stack, lines = [], [], text.split("\n")
@@ -463,7 +461,7 @@ def mod_declarations(text):
         if not match:
             continue
         _, name, terminator = match.groups()
-        own_off = gated_to_other_os("\n".join(peeled + attrs_above(lines, index)))
+        own_off = cfg_gated_off("\n".join(peeled + attrs_above(lines, index)))
         if terminator == "{":
             stack.append((indent, name, own_off))
             continue
@@ -477,10 +475,23 @@ def mod_declarations(text):
 
 
 def attrs_above(lines, index):
-    """The contiguous `#[..]` rows directly above line `index`."""
+    """Contiguous outer attributes above `index`, including multiline cfgs (nearest first)."""
     rows, back = [], index - 1
-    while back >= 0 and ATTR_LINE.match(lines[back]):
-        rows.append(lines[back])
+    while back >= 0:
+        if ATTR_LINE.match(lines[back]):
+            rows.append(lines[back])
+            back -= 1
+            continue
+        if not lines[back].rstrip().endswith("]"):
+            break
+        last = back
+        while back >= 0 and not ATTR_LINE.match(lines[back]):
+            if not lines[back].strip():
+                return rows
+            back -= 1
+        if back < 0:
+            break
+        rows.append("\n".join(lines[back:last + 1]))
         back -= 1
     return rows
 
@@ -492,7 +503,7 @@ def mount_closure(files, root, gated_off=None):
     `tests/x.rs`): its `mod x;` lines resolve beside it and it maps to "".
 
     When `gated_off` is a set, it receives every mounted source that no declaration
-    chain from `root` reaches without a `cfg(target_os)` gate leaving it out of a
+    chain from `root` reaches without a recognized cfg gate leaving it out of a
     build on this host (#2291). A source also mounted through an ungated chain stays out.
     """
     mapped = {root: ""}
@@ -567,10 +578,10 @@ def module_map(files, gated_off=None):
 
 
 # Appended (never prepended: diff line numbers stay put) to the text of a source that is
-# mounted only behind a `cfg(target_os)` gate leaving it out of a build on this host.
+# mounted only behind a recognized cfg gate leaving it out of a build on this host.
 # rust_functions and holds_runnable_test read it, so no consumer of a tree text needs
 # to know which declaration gated it (#2291).
-HOST_GATED_OFF = "\n// rsi-host-gated-off: mounted only behind a cfg(target_os) that excludes this host\n"
+HOST_GATED_OFF = "\n// rsi-host-gated-off: mounted only behind a cfg that excludes this host\n"
 
 
 def mark_gated_off(texts, gated_off):
@@ -594,6 +605,9 @@ class SourceTree:
         self._functions = None
         self._function_paths = None
         self._frequency = None
+        self._type_counts = None
+        self._typed_index = {}
+        self._exported_leaf = None
         self._targets = None
         self._mounts = {}
         self._loaded_packages = set()
@@ -845,6 +859,55 @@ class SourceTree:
                 result.append((name, module, bool(TEST_ATTR.search(attrs)), shards_in(attrs), words, end - start))
         return result
 
+    def typed_function_index(self, types):
+        """(exported defs, {(name, module, words): owning types}, test helpers) over every source,
+        for the type names `types`. Cached per type set (#3372): `narrow_tests` asks once per changed
+        file, and a wide mechanical diff repeated this repo-wide walk hundreds of times."""
+        key = frozenset(types)
+        index = self._typed_index.get(key)
+        if index is None:
+            exported_defs, owners, typed_helpers = set(), {}, set()
+            for source, text in self.texts.items():
+                module = self.trace_module(source)
+                if module is None:
+                    continue
+                line_owners = type_owners(text, key)
+                test_regions = test_module_regions(text)
+                for name, start, _, attrs, body in rust_functions(text):
+                    words = frozenset(WORD.findall(body)) - {name}
+                    if body.lstrip().startswith("pub"):
+                        exported_defs.add((name, module, words))
+                    owner = line_owners[start]
+                    if owner:
+                        owners.setdefault((name, module, words), set()).add(owner)
+                    if (is_test_module(module or "") or "#[cfg(test)]" in attrs
+                            or any(a <= start + 1 <= b for a, b in test_regions)):
+                        typed_helpers.add((name, module))
+            index = self._typed_index[key] = (exported_defs, owners, typed_helpers)
+        return index
+
+    def exported_leaf_functions(self):
+        """{(name, module)} of the public functions of leaf packages, computed once per tree (#3372)."""
+        if self._exported_leaf is None:
+            self._exported_leaf = set()
+            for source, text in self.texts.items():
+                if leaf_package(source):
+                    module = self.trace_module(source)
+                    self._exported_leaf.update((name, module) for name, _, _, _, body in rust_functions(text)
+                                               if body.lstrip().startswith("pub"))
+        return self._exported_leaf
+
+    def type_declaration_counts(self):
+        """{type name: how many `struct`/`enum` declarations name it}, computed once per tree (#3372).
+
+        `narrow_tests` runs once per changed source; scanning every source again for each one made a
+        wide mechanical diff super-linear (181 files took over 400 s)."""
+        if self._type_counts is None:
+            self._type_counts = collections.Counter(
+                name for text in self.texts.values()
+                for name in re.findall(r"\b(?:struct|enum)\s+(\w+)", code_only(text)))
+        return self._type_counts
+
     def token_frequency(self):
         """{identifier: how many functions mention it}, to tell a rare identifier from a common one."""
         if self._frequency is None:
@@ -997,7 +1060,7 @@ def holds_runnable_test(text):
     if not TEST_ATTR.search(code):
         return False
     declared = len(TEST_ATTR.findall(code))
-    # A test gated to another OS is not compiled here (#2291), so it runs nothing, like an
+    # A test gated off by cfg is not compiled here, so it runs nothing, like an
     # ignored one. The gates are read from `text`: `code` blanks their string literal, and
     # blanking keeps every line where it was, so the spans of `code` index `text`.
     lines = text.splitlines()
@@ -2174,9 +2237,7 @@ def rust_function_spans(text):
                         if lines[i] == indent + "}"), None)
         if end is None:
             continue
-        attr = start
-        while attr and lines[attr - 1].lstrip().startswith("#["):
-            attr -= 1
+        attr = start - sum(len(block.splitlines()) for block in attrs_above(lines, start))
         spans.append((name, start, end, attr))
     return tuple(spans)
 
@@ -2190,35 +2251,89 @@ def _rust_functions(text):
 
 
 HOST_OS = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(sys.platform, sys.platform)
-# The supported gate grammar is check-rsid-test-shards.py's TARGET_OS_GATE/host_excluded,
-# copied rather than imported because a daemon tool copy may hold this script alone; the
-# parity fixture in test_check_touched_shards.py pins the two to the same answers.
-OS_GATE = re.compile(r'#\[cfg\((?:all\(test, )?(not\()?target_os = "([a-z]+)"\)?\)?\)\]')
+# Keep this evaluator standalone: a daemon tool copy may hold this script alone.
+# The parity fixture pins the platform grammar shared with check-rsid-test-shards.py.
+OS_GATE = re.compile(r'#\[\s*cfg\s*\((.*?)\)\s*\]', re.S)
+OS_CFG_TOKEN = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|([A-Za-z_][A-Za-z_0-9]*)|(.))', re.S)
+
+
+def platform_cfg_value(text, position=0):
+    """(True/False/unknown, end) for host test cfgs; unknowns never prove exclusion."""
+    def token(at):
+        match = OS_CFG_TOKEN.match(text, at)
+        if not match:
+            return None, None, None, len(text)
+        return *match.groups(), match.end()
+
+    _, ident, _, at = token(position)
+    if ident is None:
+        raise ValueError("expected a cfg predicate")
+    _, _, punct, after = token(at)
+    if punct == "(":
+        if ident not in ("all", "any", "not"):
+            raise ValueError("unknown cfg operator")
+        values = []
+        at = after
+        while True:
+            _, _, closing, peek = token(at)
+            if closing == ")":
+                at = peek
+                break
+            value, at = platform_cfg_value(text, at)
+            values.append(value)
+            _, _, separator, peek = token(at)
+            if separator == ",":
+                at = peek
+            elif separator != ")":
+                raise ValueError("expected a cfg separator")
+        if ident == "not":
+            if len(values) != 1:
+                raise ValueError("cfg not() takes one predicate")
+            return (None if values[0] is None else not values[0]), at
+        if ident == "all":
+            return (False if False in values else None if None in values else True), at
+        # Rust defines empty any() as false, so it excludes tests on every host (#551).
+        return (True if True in values else None if None in values else False), at
+    family = {"linux": "unix", "macos": "unix", "windows": "windows"}.get(
+        HOST_OS, {"posix": "unix", "nt": "windows"}.get(os.name))
+    if punct == "=":
+        literal, _, _, end = token(after)
+        if literal is None:
+            raise ValueError("expected a cfg string")
+        if ident == "target_os":
+            return literal == HOST_OS, end
+        if ident == "target_family" and family is not None:
+            return literal == family, end
+        return None, end
+    if ident == "test":
+        return True, at
+    if ident in ("unix", "windows") and family is not None:
+        return ident == family, at
+    return None, at
 
 
 def other_os_gate(row):
-    """Whether one `#[cfg([all(test, )][not(]target_os = "X"[)])]` row leaves its item out of this host.
-
-    Any other condition (`any`, an `all` with another predicate, a feature, an unknown OS
-    spelling) is not read: the item is kept, so a runnable test is never hidden."""
-    row = row.strip()
-    gate = OS_GATE.fullmatch(row)
-    if not gate or row.count("(") != row.count(")"):
+    """Exclude only a cfg proven false on this host; malformed/unknown cfgs stay selected."""
+    gate = OS_GATE.fullmatch(row.strip())
+    if not gate:
         return False
-    return (gate.group(2) == HOST_OS) == bool(gate.group(1))
+    try:
+        value, end = platform_cfg_value(gate[1])
+    except (ValueError, RecursionError):
+        return False
+    return value is False and not gate[1][end:].strip()
 
 
-def gated_to_other_os(attrs):
-    """Whether a plain `target_os` gate among the rows of `attrs` leaves the item out of a
-    build on this host, so no landing filter can select it (#2291)."""
-    return any(other_os_gate(row) for row in attrs.splitlines())
+def cfg_gated_off(attrs):
+    """Whether a cfg among the item's attributes proves exclusion on this host."""
+    return any(other_os_gate(gate[0]) for gate in OS_GATE.finditer(attrs))
 
 
 INLINE_MOD = re.compile(r"^([ \t]*)(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*\{\s*$")
 
 
 @functools.lru_cache(maxsize=4096)
-def other_os_regions(text):
+def cfg_gated_regions(text):
     """0-based inclusive (first, last) line ranges of the inline `mod x { .. }` blocks whose own
     gate leaves them out of this host. rustfmt pairs a block's closing brace with its opener's
     indentation; a block that never closes is not a region, so its items are kept."""
@@ -2226,7 +2341,7 @@ def other_os_regions(text):
     regions = []
     for index, line in enumerate(lines):
         block = INLINE_MOD.match(line)
-        if not block or not gated_to_other_os("\n".join(attrs_above(lines, index))):
+        if not block or not cfg_gated_off("\n".join(attrs_above(lines, index))):
             continue
         closing = block.group(1) + "}"
         end = next((j for j in range(index + 1, len(lines)) if lines[j].rstrip() == closing), None)
@@ -2237,8 +2352,7 @@ def other_os_regions(text):
 
 @functools.lru_cache(maxsize=4096)
 def file_gated_off(text):
-    """Whether the whole source is out of this host: mounted only behind another OS's
-    `mod x;` gate (see HOST_GATED_OFF), or its own `#![cfg(target_os = ..)]` says so."""
+    """Whether a recognized cfg excludes the whole source, on its mount or inner attributes."""
     if text.endswith(HOST_GATED_OFF):
         return True
     for row in text.splitlines():
@@ -2247,14 +2361,14 @@ def file_gated_off(text):
             continue
         if not row.startswith("#!["):
             return False
-        if other_os_gate(row.replace("#![", "#[", 1)):
+        if cfg_gated_off(row.replace("#![", "#[", 1)):
             return True
     return False
 
 
 def function_gated_off(text, start, attrs):
     """Whether the function at 0-based line `start` with attribute rows `attrs` is out of this host."""
-    return gated_to_other_os(attrs) or any(first <= start <= last for first, last in other_os_regions(text))
+    return cfg_gated_off(attrs) or any(first <= start <= last for first, last in cfg_gated_regions(text))
 
 
 def rust_functions(text):
@@ -2264,9 +2378,9 @@ def rust_functions(text):
     does for modules. Ambiguous/unclosed declarations are omitted, so the
     fixture-only diff check falls back to the full module. A function not compiled on
     this host is left out (#2291): a filter naming it selects no test. That is a
-    function gated to another OS (a `#[cfg(target_os = "macos")]` test on Linux), one in
-    an inline `mod` so gated, and every function of a source mounted or declared only
-    behind such a gate.
+    function gated by empty `any()` or another OS (a `#[cfg(target_os = "macos")]`
+    test on Linux), one in an inline `mod` so gated, and every function of a source
+    mounted or declared only behind such a gate.
     """
     if file_gated_off(text):
         return iter(())
@@ -2558,7 +2672,15 @@ def relocation_lines(before, after, moved, regions):
 
 
 def type_owners(text, types):
-    """Line owners of simple rustfmt struct/enum/impl blocks, in one source scan."""
+    """Line owners of simple rustfmt struct/enum/impl blocks, in one source scan.
+
+    Memoized on the text and the type set (#3372): `narrow_tests` asks for every source once per changed
+    file with the same set. Each caller gets its own list."""
+    return list(_type_owners(text, frozenset(types)))
+
+
+@functools.lru_cache(maxsize=4096)
+def _type_owners(text, types):
     owners, stack = [], []
     for row in text.splitlines():
         match = re.match(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum)\s+(\w+)\s*\{|"
@@ -2570,7 +2692,7 @@ def type_owners(text, types):
         owners.append(stack[-1][1] if stack else None)
         if stack and row == stack[-1][0] + "}":
             stack.pop()
-    return owners
+    return tuple(owners)
 
 
 def enum_item_lines(text, resolved_types):
@@ -2704,7 +2826,12 @@ def initializer_value(rows, index, owned_field, enclosing):
 
 
 def test_module_regions(text):
-    """Rustfmt inline test modules, including their helper functions."""
+    """Rustfmt inline test modules, including their helper functions (memoized per text, #3372)."""
+    return list(_test_module_regions(text))
+
+
+@functools.lru_cache(maxsize=4096)
+def _test_module_regions(text):
     rows, regions = text.splitlines(), []
     for start, row in enumerate(rows):
         test_mod = re.fullmatch(r"(\s*)mod\s+(\w+)\s*\{", row)
@@ -3579,9 +3706,7 @@ def narrow_tests(sources, old_sources, repo, merge_base, head, path, diagnostics
         # decides whether the type's consumers are small enough to name.
         # A declaration quoted in a string literal or a comment (a source-scanner test naming
         # `pub(crate) struct X`) is not a second declaration of the type (#2247).
-        types = collections.Counter(name for text in sources.texts.values()
-                                    for name in re.findall(r"\b(?:struct|enum)\s+(\w+)", code_only(text)))
-        resolved_types = {name for name, count in types.items() if count == 1}
+        resolved_types = {name for name, count in sources.type_declaration_counts().items() if count == 1}
         known = {}
 
         def owned_field(field):
@@ -3618,40 +3743,18 @@ def narrow_tests(sources, old_sources, repo, merge_base, head, path, diagnostics
                     return None
                 test_methods[name] = owner
     typed_tests = set()
-    owners = {}
-    typed_helpers = set()
     # A private helper sharing its name with a pub item of the same module (a test fake's
     # `new` beside a public constructor) is its own definition, not the exported one.
-    exported_defs, exported_leaf = set(), set()
     definitions = {}
     for name, module, is_test, _, _, _ in functions:
         if not is_test:
             definitions.setdefault(name, set()).add(module)
-    if moved or resolved_types:
-        for source, text in sources.texts.items():
-            module = sources.trace_module(source)
-            if module is None:
-                continue
-            types = set(moved) | resolved_types
-            line_owners = type_owners(text, types)
-            test_regions = test_module_regions(text)
-            for name, start, _, attrs, body in rust_functions(text):
-                words = frozenset(WORD.findall(body)) - {name}
-                if body.lstrip().startswith("pub"):
-                    exported_defs.add((name, module, words))
-                owner = line_owners[start]
-                if owner:
-                    owners.setdefault((name, module, words), set()).add(owner)
-                if (is_test_module(module or "") or "#[cfg(test)]" in attrs
-                        or any(a <= start + 1 <= b for a, b in test_regions)):
-                    typed_helpers.add((name, module))
+    exported_defs, owners, typed_helpers = (
+        sources.typed_function_index(set(moved) | resolved_types) if moved or resolved_types
+        else (set(), {}, set()))
     # #2441: a public leaf function is called from another crate by its bare name, so a name another
     # module also defines cannot be told apart: the trace is then ambiguous, never module-local.
-    for source, text in sources.texts.items():
-        if leaf_package(source):
-            module = sources.trace_module(source)
-            exported_leaf.update((name, module) for name, _, _, _, body in rust_functions(text)
-                                 if body.lstrip().startswith("pub"))
+    exported_leaf = sources.exported_leaf_functions()
     # #2441: a leaf crate cannot name its callers and its wrappers are routinely long, so the walk
     # from a leaf edit follows large functions too; the function and test bounds still make an
     # over-wide trace unprovable (facade tests only, with the reason).
@@ -3946,6 +4049,62 @@ def is_test_module(module):
     return any(part == "tests" or part.endswith("_tests") for part in module.split("::"))
 
 
+def sibling_behaviour_filters(sources, path):
+    """A production module without tests is observed by its nearest parent's test modules.
+
+    Separate RPC behaviour suites (tests.rs, legacy_import_tests.rs) need not name
+    the implementation functions they reach through dispatch. Do not stop at an
+    empty module filter, or broaden all the way to the crate's tests.
+    """
+    module = sources.module(path)
+    if not module or not sources.lib_mounted(path) or is_test_module(module) or sources.has_tests(path):
+        return []
+    package = package_for(path)
+    parent = module.rpartition("::")[0]
+    while parent:
+        prefix = parent + "::"
+        siblings = [(p, m) for p, m in sources.modules.items()
+                    if package_for(p) == package and m.startswith(prefix)
+                    and is_test_module(m[len(prefix):].split("::", 1)[0])]
+        filters = sorted({f"rsid=shard:{shard}:{anchored_filterset(m)}"
+                          for p, m in siblings for shard in sources.shards_for(p)
+                          if sources.filter_matches(shard, m)})
+        if filters:
+            return filters
+        parent = parent.rpartition("::")[0]
+    return []
+
+
+# These opt-in fixture modules need features in the ordinary, unsharded test
+# build. smoke_fixture also compiles in its other-02 shard without dev-fixtures.
+# Keep this declaration
+# next to the source inventory: interpreting arbitrary Rust cfg(any/all/not(...))
+# as features to enable would be unsound (especially the test-shard gates).
+TEST_FEATURE_MODULES = {
+    "rsid": {"recursive_dag::smoke_fixture": ("dev-fixtures",)},
+}
+
+
+def feature_test_inventory(repo, head, package):
+    """[(fully qualified test name, required features)] from the pinned candidate.
+
+    SourceScopes includes inline test modules, so exact names, regex filters and
+    ancestor module filters all get the same feature set. No Cargo is needed.
+    """
+    modules = TEST_FEATURE_MODULES.get(package, {})
+    if not modules:
+        return []
+    paths = {f"crates/{package}/src/{m.replace('::', '/')}.rs": m for m in modules}
+    inventory = []
+    for path, text in read_blobs(repo, head, sorted(paths)).items():
+        module = paths[path]
+        scopes = SourceScopes(module, text)
+        for name, start, _, attrs, _ in rust_functions(text):
+            if TEST_ATTR.search(attrs):
+                inventory.append((f"{scopes.scope[start][0]}::{name}", modules[module]))
+    return inventory
+
+
 def source_observer_pins(sources, changed, comment_only):
     """([(module, test, shard)], [missing]) the exact tests SOURCE_OBSERVER_PINS names for the changed sources (#2949)."""
     wanted = {pin for path, pins in SOURCE_OBSERVER_PINS.items()
@@ -3956,6 +4115,74 @@ def source_observer_pins(sources, changed, comment_only):
             seen.add((module, name))
             found += [(module, name, shard) for shard in shards]
     return found, sorted(wanted - seen)
+
+
+GUARD_DECLARATIONS = "tools/test-guards.json"
+
+
+def declared_guard_filters(sources, changed, packages_of_shard):
+    """Additive, exact cross-module observers; validate the entire candidate table.
+
+    Unlike test-coverage.json these declarations never replace normal coverage or
+    depend on a function trace. Read the table from head, just like the sources,
+    so both scoped-test and the queue's --head derivation see the same declarations.
+    """
+    present = git_out(sources.repo, "ls-tree", "--name-only", sources.head, GUARD_DECLARATIONS).strip()
+    if not present:  # Older candidates and small fixture repositories have no table.
+        return [], []
+    config = json.loads(git_out(sources.repo, "show", f"{sources.head}:{GUARD_DECLARATIONS}"))
+    if (not isinstance(config, dict) or set(config) != {"version", "guards"}
+            or type(config["version"]) is not int or config["version"] != 1
+            or not isinstance(config["guards"], list)):
+        raise ValueError("expected version: 1 and a guards array")
+    filters, selected, seen = [], [], set()
+    for index, rule in enumerate(config["guards"]):
+        label = f"guards[{index}]"
+        if not isinstance(rule, dict) or set(rule) != {"package", "test", "modules"}:
+            raise ValueError(f"{label}: expected package, test and modules")
+        package, test, modules = rule["package"], rule["test"], rule["modules"]
+        if not isinstance(package, str) or package not in ("rsid", "rsid-store"):
+            raise ValueError(f"{label}: package must be rsid or rsid-store")
+        module_pattern = r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*"
+        if not isinstance(test, str) or not re.fullmatch(module_pattern, test):
+            raise ValueError(f"{label}: expected a full test name")
+        if (not isinstance(modules, list) or not modules
+                or any(not isinstance(m, str) or not re.fullmatch(module_pattern, m) for m in modules)
+                or len(set(modules)) != len(modules)):
+            raise ValueError(f"{label}: expected unique module names in a nonempty modules array")
+        if (package, test) in seen:
+            raise ValueError(f"{label}: duplicate test {package}::{test}")
+        seen.add((package, test))
+        paths = {p: m for p, m in sources.modules.items()
+                 if package_for(p) == package and sources.lib_mounted(p)}
+        for module in modules:
+            if module not in paths.values():
+                raise ValueError(f"{label}: unknown file-backed module {package}::{module}")
+        matches = []
+        for path, module in paths.items():
+            text = sources.text(path)
+            # Most files cannot contain this exact test; avoid building their scopes.
+            if test.rsplit("::", 1)[-1] not in text:
+                continue
+            scopes = SourceScopes(module, text)
+            for name, start, _, attrs, _ in rust_functions(text):
+                full = "::".join(p for p in (scopes.scope[start][0], name) if p)
+                if full == test and TEST_ATTR.search(attrs) and not IGNORE_ATTR.search(attrs):
+                    matches.append(shards_in(attrs))
+        if len(matches) != 1 or not matches[0]:
+            raise ValueError(f"{label}: unknown or non-runnable sharded test {package}::{test}")
+        shards = sorted(matches[0])
+        if any(package not in packages_of_shard.get(shard, []) for shard in shards):
+            raise ValueError(f"{label}: test shard does not declare package {package}")
+        exact = [f"rsid=shard:{shard}:test(={test})" for shard in shards]
+        if any(len(f.encode()) > GATE_FILTER_LENGTH for f in exact):
+            raise ValueError(f"{label}: exact test filter exceeds {GATE_FILTER_LENGTH} bytes")
+        touched = sorted(p for p, m in paths.items() if p in changed
+                         and any(m == guard or m.startswith(guard + "::") for guard in modules))
+        if touched or GUARD_DECLARATIONS in changed:
+            filters += exact
+            selected.append({"package": package, "test": test, "paths": touched, "filters": exact})
+    return list(dict.fromkeys(filters)), selected
 
 
 def manifest_dir_guard_filters(sources, changed):
@@ -4236,6 +4463,294 @@ def cargo_prefix():
     held = bool(os.environ.get("RSI_CARGO_SLOT_HELD"))
     prefix = [str(slot)] if slot.exists() and not held else []
     return prefix + ["env", "-u", "RSI_PROCESS_OWNERSHIP_NAMESPACE", "cargo"]
+
+
+def public_api_edit(text, lines):
+    """Conservative API signal, excluding proven test/comment/private-function edits.
+
+    Public types can expose inferred types, trait impls and macro-generated items. Do not
+    pretend a lexical signature comparison proves compatibility or external reachability.
+    Unclear production edits in a file with public items keep the reverse-dependency gate.
+    """
+    if only_test_lines(text, lines):
+        return False
+    code = code_only(text)
+    if not re.search(r"\bpub\s+(?!\()|\bimpl\b|#\s*\[\s*macro_export\b", code):
+        return False
+    scopes = SourceScopes("", text)
+    private = []
+    for _, start, end, attrs, body in rust_functions(text):
+        if (not re.match(r"\s*pub\s", body) and not scopes.scope[start][1]
+                and "macro_export" not in attrs):
+            private.append((start + 1, end))
+    rows = code.splitlines()
+    return any(0 < line <= len(rows) and rows[line - 1].strip()
+               and not only_test_lines(text, [line])
+               and not any(first <= line <= last for first, last in private) for line in lines)
+
+
+def workspace_test_graph(repo, revision):
+    """Pinned workspace manifests and path edges, including target-specific, dev and build deps.
+
+    Read Git blobs, never cargo metadata: planning must neither resolve nor compile.
+    """
+    files = git_out(repo, "ls-tree", "-r", "--name-only", revision).splitlines()
+    manifests = read_blobs(repo, revision, [p for p in files if p == "Cargo.toml" or p.endswith("/Cargo.toml")])
+    if "Cargo.toml" not in manifests:
+        return {}, files
+    if tomllib is None:
+        raise ValueError("downstream test planning requires Python tomllib")
+    root = tomllib.loads(manifests["Cargo.toml"])
+    workspace = root.get("workspace", {})
+    members = workspace.get("members", [])
+    excludes = workspace.get("exclude", [])
+    packages = {}
+    for manifest, text in manifests.items():
+        directory = posixpath.dirname(manifest)
+        if manifest != "Cargo.toml" and (
+                not any(fnmatch.fnmatchcase(directory, member.rstrip("/")) for member in members)
+                or any(fnmatch.fnmatchcase(directory, pattern.rstrip("/")) for pattern in excludes)):
+            continue
+        data = root if manifest == "Cargo.toml" else tomllib.loads(text)
+        if not data.get("package"):
+            continue
+        library = data.get("lib", {}).get("path", "src/lib.rs")
+        library = posixpath.normpath(posixpath.join(directory, library))
+        packages[data["package"]["name"]] = {
+            "manifest": manifest, "directory": directory, "data": data,
+            "library": library if library in files else None, "dependencies": set(),
+        }
+    by_directory = {item["directory"] or ".": name for name, item in packages.items()}
+    for package in packages.values():
+        data = package["data"]
+        sections = [data, *data.get("target", {}).values()]
+        for section in sections:
+            for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+                for alias, spec in section.get(kind, {}).items():
+                    if not isinstance(spec, dict):
+                        continue
+                    inherited = spec.get("workspace", False)
+                    if inherited:
+                        spec = workspace.get("dependencies", {}).get(alias, {})
+                    if not isinstance(spec, dict) or "path" not in spec:
+                        continue
+                    directory = posixpath.normpath(posixpath.join("" if inherited else package["directory"], spec["path"]))
+                    if directory in by_directory:
+                        package["dependencies"].add(by_directory[directory])
+    return packages, files
+
+
+def downstream_compile_plan(repo, base, head, snapshots=None):
+    """Changed public library surfaces -> transitive workspace test-target builds.
+
+    Keep all reverse deps: Rust reexports, macros and inference make per-consumer item
+    reachability expensive to prove. Private functions and test-only paths are cheap exclusions.
+    """
+    result = {"policy": "workspace_reverse_dependencies", "changed_libraries": [], "packages": []}
+    changed = [p for p in git_out(repo, "diff", "--name-only", "--no-renames", f"{base}..{head}").splitlines()
+               if p.endswith(".rs")]
+    if not changed:
+        return result
+    snapshots = snapshots or [workspace_test_graph(repo, revision) for revision in (base, head)]
+    affected, edges = {}, {}
+    for revision, (packages, files), side in zip((base, head), snapshots, (0, 1)):
+        for name, package in packages.items():
+            edges.setdefault(name, set()).update(package["dependencies"])
+            library = package["library"]
+            if not library:
+                continue
+            prefix = package["directory"] + "/" if package["directory"] else ""
+            candidates = [p for p in changed if p.startswith(prefix)]
+            if not candidates:
+                continue
+            texts = read_blobs(repo, revision, [p for p in files if p.startswith(prefix) and p.endswith(".rs")])
+            mounted = mount_closure(texts, library)
+            for path in candidates:
+                if path not in mounted:
+                    continue
+                lines = changed_line_numbers(repo, base, head, path)[side]
+                if public_api_edit(texts[path], lines):
+                    affected.setdefault(name, set()).add(path)
+    result["changed_libraries"] = [{"package": name, "paths": sorted(paths)} for name, paths in sorted(affected.items())]
+    reverse, frontier = set(), set(affected)
+    while frontier:
+        next_frontier = {name for name, dependencies in edges.items() if dependencies & frontier} - reverse
+        reverse.update(next_frontier)
+        frontier = next_frontier
+    result["packages"] = [{"package": name, "status": "pending"} for name in sorted(reverse & snapshots[1][0].keys())]
+    return result
+
+
+# A lexical scan cannot disambiguate these ubiquitous associated functions. Keep
+# the reverse-dependency compile gate, and explain why no runtime filters were added.
+DOWNSTREAM_GENERIC_ITEMS = frozenset({"new", "default", "from", "into", "get", "set", "len", "is_empty", "clone", "fmt"})
+DOWNSTREAM_REFERENCE_FILE_CAP = 40
+PUBLIC_DEFINITION = re.compile(
+    r'\bpub\s+(?:(?:async|unsafe|const|extern\s*(?:"[^"\n]*")?)\s+)*'
+    r'(?P<kind>fn|const|static|struct|enum|type)\s+(?:mut\s+)?(?P<name>[A-Za-z_]\w*)\b')
+
+
+def public_item_definitions(text):
+    """Public definition names and executable tokens, including bodies.
+
+    Balance code delimiters (literals/comments are blanked), rather than treating
+    the next declaration as the end: a private neighbour must not seed observers.
+    Restricted visibility isn't a workspace API. Test definitions stay excluded.
+    """
+    code = code_text(text)
+    scopes = SourceScopes("", text)
+    for match in PUBLIC_DEFINITION.finditer(code):
+        first = code.count("\n", 0, match.start()) + 1
+        module = scopes.scope[first - 1][0]
+        if (any(is_test_module(part) for part in module.split("::"))
+                or only_test_lines(text, [first])):
+            continue
+        attr = "\n".join(attrs_above(text.splitlines(), first - 1))
+        if re.search(r'#\[cfg\(\s*test\s*\)\]', attr):
+            continue
+        depth, opened, end = 0, False, len(code)
+        for cursor in range(match.end(), len(code)):
+            char = code[cursor]
+            if char in "([{":
+                depth += 1
+                if char == "{" and depth == 1:
+                    opened = True
+            elif char in ")]}":
+                depth -= 1
+                if char == "}" and not depth and opened:
+                    end = cursor + 1
+                    break
+            elif char == ";" and not depth:
+                end = cursor + 1
+                break
+        definition = text[match.start():end]
+        tokens, previous = [], 0
+        for kind, start, stop in rust_lexemes(definition):
+            tokens.extend(RUST_TOKEN.findall(definition[previous:start]))
+            if kind == "literal":
+                tokens.append(definition[start:stop])
+            previous = stop
+        tokens.extend(RUST_TOKEN.findall(definition[previous:]))
+        yield match.group("name"), tuple(tokens)
+
+
+def downstream_test_plan(repo, base, head, sources=None):
+    """One shared reverse-dependency compile + exact runtime selection (#3408).
+
+    Search code identifiers in mounted dependent sources, including imports and
+    qualified paths. A reference in a production module selects that module's
+    descendant tests; a reference inside an inline test module stays there. This
+    intentionally over-approximates resolution, while common names are bounded.
+    """
+    changed = git_out(repo, "diff", "--name-only", "--no-renames", f"{base}..{head}").splitlines()
+    snapshots = ([workspace_test_graph(repo, revision) for revision in (base, head)]
+                 if any(path.endswith(".rs") for path in changed) else None)
+    result = downstream_compile_plan(repo, base, head, snapshots)
+    result.update(items=[], selections=[], filters=[], notes=[])
+    if not result["changed_libraries"]:
+        return result
+    items = collections.defaultdict(set)
+    edges = collections.defaultdict(set)
+    for packages, _ in snapshots:
+        for name, package in packages.items():
+            edges[name].update(package["dependencies"])
+    for changed in result["changed_libraries"]:
+        definitions = []
+        for revision, (packages, files) in zip((base, head), snapshots):
+            package = packages.get(changed["package"])
+            found = {}
+            if package and package["library"]:
+                prefix = package["directory"] + "/" if package["directory"] else ""
+                texts = read_blobs(repo, revision, [p for p in files if p.startswith(prefix) and p.endswith(".rs")])
+                mounted = mount_closure(texts, package["library"])
+                for path in changed["paths"]:
+                    module = mounted.get(path)
+                    if module is None or any(is_test_module(part) for part in module.split("::")):
+                        continue
+                    found[path] = collections.defaultdict(list)
+                    for item, tokens in public_item_definitions(texts[path]):
+                        found[path][item].append(tokens)
+            definitions.append(found)
+        for path in changed["paths"]:
+            before, after = [found.get(path, {}) for found in definitions]
+            for item in before.keys() | after.keys():
+                if before.get(item) != after.get(item):
+                    items[changed["package"], item].add(path)
+    for library, item in sorted(items):
+        result["items"].append({"package": library, "item": item, "paths": sorted(items[library, item])})
+        if item in DOWNSTREAM_GENERIC_ITEMS or len(item) < 4:
+            result["notes"].append({"package": library, "item": item, "reason": "generic identifier; compile coverage retained"})
+    items = {key: paths for key, paths in items.items() if key[1] not in DOWNSTREAM_GENERIC_ITEMS and len(key[1]) >= 4}
+    if not items:
+        return result
+    packages, files = snapshots[1]
+    sources = sources or SourceTree(repo, head, files)
+    # Inventory real targets, mounts, inline module identities and runnable tests
+    # once per dependent, independently of the number of changed items.
+    inventory = {}
+    for entry in result["packages"]:
+        name = entry["package"]
+        package = packages[name]
+        sources.load_package(name)
+        targets = [("lib", None, package["library"])] if package["library"] else []
+        targets += sources.targets().get(name, [])
+        inventory[name] = []
+        for kind, target, root in targets:
+            off = set()
+            mounted = mount_closure(sources.texts, root, off)
+            references, tests = {}, []
+            for path, module in mounted.items():
+                text = sources.text(path)
+                if path in off or file_gated_off(text):
+                    continue
+                code = code_text(text)
+                scopes = SourceScopes(module, text)
+                for line, row in enumerate(code.splitlines()):
+                    owner = scopes.scope[line][0]
+                    references.setdefault((path, owner), set()).update(WORD.findall(row))
+                rows = text.splitlines()
+                for test, start, _, attr_start in rust_function_spans(code):
+                    attrs = "\n".join(rows[attr_start:start])
+                    if (not TEST_ATTR.search(attrs) or IGNORE_ATTR.search(attrs)
+                            or function_gated_off(text, start, attrs)):
+                        continue
+                    owner = scopes.scope[start][0]
+                    full = "::".join(part for part in (owner, test) if part)
+                    shards = sorted(code_shards(attrs)) if kind == "lib" and name in ("rsid", "rsid-store") else []
+                    # Sharded library tests must retain their own gate; don't
+                    # invent a shard for a test the gate cannot build.
+                    if kind == "lib" and name in ("rsid", "rsid-store") and not shards:
+                        continue
+                    tests.append((owner, full, shards))
+            inventory[name].append((kind, target, references, tests))
+    for library, item in sorted(items):
+        dependents, frontier = set(), {library}
+        while frontier:
+            frontier = {name for name, deps in edges.items() if deps & frontier} - dependents
+            dependents.update(frontier)
+        matches = [(name, kind, target, path, module, tests)
+                   for name in sorted(dependents & inventory.keys())
+                   for kind, target, references, tests in inventory[name]
+                   for (path, module), words in references.items() if item in words]
+        if len({path for _, _, _, path, _, _ in matches}) > DOWNSTREAM_REFERENCE_FILE_CAP:
+            result["notes"].append({"package": library, "item": item,
+                                    "reason": "generic identifier: reference file cap exceeded; compile coverage retained",
+                                    "cap": DOWNSTREAM_REFERENCE_FILE_CAP})
+            continue
+        for name, kind, target, path, module, tests in matches:
+            selected = [(full, shards) for owner, full, shards in tests
+                        if not module or owner == module or owner.startswith(module + "::")]
+            filters = []
+            for full, shards in selected:
+                prefixes = ([f"rsid=shard:{shard}:" for shard in shards] if shards else
+                            [f"{name}=" if kind == "lib" else f"{name}={kind}:{target}:"])
+                filters.extend(f"{prefix}test(={full})" for prefix in prefixes)
+            result["selections"].append({"library": library, "item": item, "package": name,
+                                         "path": path, "module": module, "kind": kind, "target": target,
+                                         "tests": sorted({full for full, _ in selected}), "filters": sorted(set(filters))})
+            result["filters"].extend(filters)
+    result["filters"] = sorted(set(result["filters"]))
+    return result
 
 
 def workspace_packages(repo):
@@ -4740,6 +5255,13 @@ def main() -> int:
     shard_files: dict[str, list[str]] = {}
     rsid_changed = [p for p in affected if lib_source(p)]
     packages_of_shard = shard_packages(repo)
+    try:
+        guard_filters, guard_observers = declared_guard_filters(sources, set(changed), packages_of_shard)
+    except ValueError as error:
+        # No usable partial receipt: the queue must refuse derivation, rather than
+        # accept a narrowed filter list that silently omits a broken guard.
+        sys.stderr.write(f"check-touched-shards: {GUARD_DECLARATIONS}: {error}\n")
+        return 2
     for path in rsid_changed:
         for shard in sources.shards_for(path):
             shard_files.setdefault(shard, []).append(path)
@@ -5098,6 +5620,10 @@ def main() -> int:
             else:
                 derived_by_path[path] = shard_filters(path, module, shards)
             suggested += derived_by_path[path]
+            # A proven observer trace (including one into another crate) already
+            # covers the edit. Fill an empty selection, never widen that proof.
+            if path in changed and not declared and not derived_by_path[path]:
+                suggested += sibling_behaviour_filters(sources, path)
         elif sources.has_tests(path):
             # The owning package: `rsid-core=process_control`, not `rsi=process_control`.
             suggested.append(f"{package_for(path)}={module}")
@@ -5142,6 +5668,9 @@ def main() -> int:
             continue
         if filter_ not in suggested:
             suggested.append(filter_)
+    # Public library item consumers share the worker and queue derivation (#3408).
+    downstream_tests = downstream_test_plan(repo, merge_base, head, sources)
+    suggested += downstream_tests["filters"]
     # #2029: a new or edited migration file changes what every replay/rewind/catalog
     # pin observes (e.g. an ALTER on an older table breaks a replay that compares
     # sqlite_master), although no test names the file. Select every caller of the
@@ -5162,6 +5691,7 @@ def main() -> int:
                           "reason": "more than %d catalog/operator_only tests" % AGENT_VERB_PIN_CAP})
     observer_tests, observer_missing = source_observer_pins(sources, set(changed), comment_only)
     pins += traced_filters(observer_tests)
+    pins += guard_filters
     workspace_observers = manifest_dir_guard_filters(sources, changed)
     pins += workspace_observers
     manual_docs_changed = "docs/keybindings.md" in changed
@@ -5301,9 +5831,11 @@ def main() -> int:
         # lander's complete closure. scoped-test can still run these mandatory
         # pins without replacing that unfiltered landing (#2495).
         "scanned_token_filters": traced_filters(token_scanners),
+        "downstream_tests": downstream_tests,
         "leaf_observers": leaf_notes,
         "unfiltered_leaf_paths": unprovable,
         "declared_coverage": declared_used,
+        "declared_guards": guard_observers,
         "source_observer_pins": sorted(f"{m}::{n}" for m, n, _ in observer_tests),
         "workspace_source_observers": workspace_observers,
         "source_observer_missing": [f"{m}::{n}" for m, n in observer_missing],

@@ -1,6 +1,8 @@
 #![allow(clippy::redundant_pub_crate)]
 
 pub(crate) mod agent;
+pub(crate) mod auto_dispatch;
+pub(crate) mod baton;
 pub(crate) mod catalog;
 pub(crate) mod command;
 pub(crate) mod custody;
@@ -15,6 +17,7 @@ pub(crate) mod launch;
 pub(crate) mod oncall;
 pub(crate) mod outcome;
 pub(crate) mod recovery;
+pub(crate) mod repair_review;
 pub(crate) mod resolve;
 pub(crate) mod review;
 pub(crate) mod review_policy;

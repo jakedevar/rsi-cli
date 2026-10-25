@@ -224,7 +224,7 @@ pub(crate) const AGENT_MESSAGE_RECONCILE_MAX_PAGES_PER_DRAIN: usize = 16;
 ///    That query holds no explicit transaction and takes no write lock at all,
 ///    and every writer this worker calls is one `BEGIN IMMEDIATE` over a single
 ///    row. What a long scan actually costs the daemon is the process-wide
-///    `Arc<Mutex<Store>>`, which the whole pass holds. So the bound belongs at
+///    `Arc<rsid_core::store_lock::Mutex<Store>>`, which the whole pass holds. So the bound belongs at
 ///    the pass, where it governs the resource that is really shared.
 ///
 /// # Placement

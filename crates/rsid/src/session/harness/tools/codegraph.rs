@@ -3,7 +3,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::HarnessTool;
@@ -16,7 +15,7 @@ use crate::store::Store;
 pub struct CodegraphTool {
     kind: NativeCodegraphToolKind,
     handle: IndexHandle,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     binding: NativeCodegraphBinding,
     schema: String,
@@ -26,7 +25,7 @@ impl CodegraphTool {
     pub fn new(
         kind: NativeCodegraphToolKind,
         handle: IndexHandle,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         binding: NativeCodegraphBinding,
     ) -> Self {

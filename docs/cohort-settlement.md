@@ -544,3 +544,17 @@ Transient database-finalization failures retain `branch_removed` and their typed
 retry reason. The driver retries that exact database tail once after attempting
 the cohort. If the database still cannot settle it, the intent remains replayable
 by startup recovery rather than becoming an inspection-only terminal fence.
+
+### Bounded traversal of large cohorts (#581)
+
+Audits classify at most 256 Live roots per page. In the TUI press `Enter` to start
+and `n` to audit the next page, even when the current page has no eligible roots.
+The page displays its complete identity-snapshot count and digest. Roots outside
+it remain protected and unexamined; retained counts and receipts cover that page.
+For RPC use, pass `traversal.last_custody_id` as `after_custody_id` while `has_more`
+is true. Complete traversal requires starting without a hint, reaching the last
+page, and observing one unchanged snapshot digest throughout. Restart if it
+changes. Apply repeats the audited hint and exact displayed phrase/digest.
+Applying a page changes the snapshot, so audit again before another apply. The
+complete identity scan retains its existing 16,384-root cap; the automatic pass
+starts at the first page and does not advance past a retained-only first page.

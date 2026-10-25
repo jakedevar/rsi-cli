@@ -16,13 +16,14 @@ use crate::store::Store;
 use crate::store::agent_deploys::{DeployRow, deploy_fingerprint_with};
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use rsi_common::agent_deploy::{
-    DEPLOY_BINARIES, DEPLOY_BINARY_MISSING, DEPLOY_DIR_NOT_ALLOWED, DEPLOY_NEEDS_SUPERVISOR,
-    DEPLOY_RESTART_BUDGET, DEPLOY_RESTARTS_PER_HOUR_DEFAULT, DEPLOY_RESTARTS_PER_HOUR_MAX,
-    DEPLOY_RESTARTS_PER_HOUR_MIN, DEPLOY_RETRY_AFTER_MARKER, DEPLOY_SCHEMA_DOWNGRADE,
-    DEPLOY_SHA_MISMATCH, DEPLOY_STAGE_FAILED, DEPLOY_STAGED_CHANGED, DEPLOY_TARGET_MISMATCH,
-    DeployBinaryV1, DeployState, ObjectIdentityV1, SUPERVISOR_SHUTDOWN_GRACE_MAX_SECS,
-    SUPERVISOR_SHUTDOWN_GRACE_MIN_SECS, is_deploy_tool_script,
+    DEPLOY_BINARIES, DEPLOY_BINARY_MISSING, DEPLOY_DIR_NOT_ALLOWED, DEPLOY_GUARD_UNRESOLVABLE,
+    DEPLOY_MEMBER_UNRESOLVABLE, DEPLOY_NEEDS_SUPERVISOR, DEPLOY_RESTART_BUDGET,
+    DEPLOY_RESTARTS_PER_HOUR_DEFAULT, DEPLOY_RESTARTS_PER_HOUR_MAX, DEPLOY_RESTARTS_PER_HOUR_MIN,
+    DEPLOY_RETRY_AFTER_MARKER, DEPLOY_SCHEMA_DOWNGRADE, DEPLOY_SHA_MISMATCH, DEPLOY_STAGE_FAILED,
+    DEPLOY_STAGED_CHANGED, DEPLOY_TARGET_MISMATCH, DeployBinaryV1, DeployState, ObjectIdentityV1,
+    SUPERVISOR_SHUTDOWN_GRACE_MAX_SECS, SUPERVISOR_SHUTDOWN_GRACE_MIN_SECS, is_deploy_tool_script,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -135,6 +136,9 @@ pub struct DeployService {
     /// Operator `deploy_restarts_per_hour` (#1777), refreshed by the deploy
     /// runner from the live config.
     restarts_per_hour: AtomicU64,
+    /// The supervisor's published restart history (#3492); `None` judges only
+    /// the recorded deploys (tests, a host with no supervisor file).
+    supervisor_restarts: Option<PathBuf>,
 }
 
 /// What staging needs; cloneable so blocking file work leaves the runtime.
@@ -149,6 +153,12 @@ pub struct StagePlan {
     /// Where the running supervisor reads its script (#2368), set by
     /// [`DeployService::stage_plan`].
     supervisor_script: Option<PathBuf>,
+    /// Whether a build must leave a trusted `rsi-repo-guard` beside the `rsid`
+    /// and `rsi-rolling-land` it installs (hub #3886). Production only: the
+    /// fixtures that deploy a lone `rsid` do not carry one.
+    require_guard: bool,
+    /// Operator home anchor for installed-guard trust; injected by fixtures.
+    guard_home: Option<PathBuf>,
 }
 
 static GLOBAL: OnceLock<DeployService> = OnceLock::new();
@@ -168,6 +178,8 @@ impl DeployService {
                 allowed_roots,
                 probe,
                 supervisor_script: None,
+                require_guard: false,
+                guard_home: dirs::home_dir(),
             },
             supervised,
             supervisor_binary: Box::new(|| None),
@@ -175,7 +187,16 @@ impl DeployService {
             staging_root: None,
             restart: Mutex::new(None),
             restarts_per_hour: AtomicU64::new(DEPLOY_RESTARTS_PER_HOUR_DEFAULT),
+            supervisor_restarts: None,
         }
+    }
+
+    /// Judge deploy admission against the restart history the supervisor
+    /// publishes at `path` (#3492), so crash and watchdog restarts count too.
+    #[must_use]
+    pub fn with_supervisor_restarts(mut self, path: PathBuf) -> Self {
+        self.supervisor_restarts = Some(path);
+        self
     }
 
     /// Set the restarts allowed per rolling hour (the operator setting),
@@ -215,6 +236,15 @@ impl DeployService {
     #[must_use]
     pub fn with_tools_dir(mut self, tools_dir: PathBuf) -> Self {
         self.plan.tools_dir = Some(tools_dir);
+        self
+    }
+
+    /// Refuse a build, at staging and again after its restart, that would leave
+    /// the daemon or the lander with no trusted `rsi-repo-guard` beside it (hub
+    /// #3886).
+    #[must_use]
+    pub fn with_guard_required(mut self) -> Self {
+        self.plan.require_guard = true;
         self
     }
 
@@ -290,7 +320,9 @@ impl DeployService {
         .with_supervisor_binary(Box::new(crate::daemon_info::supervisor_binary))
         .with_supervisor_script(Box::new(crate::daemon_info::supervisor_script))
         .with_tools_dir(home.join(".rsi/bin"))
+        .with_guard_required()
         .with_staging_root(rsi_common::identity::data_dir().join("staging"))
+        .with_supervisor_restarts(rsi_common::supervisor_restarts::default_path())
     }
 
     /// Initialise the process-wide service with the configured sandbox base.
@@ -343,15 +375,43 @@ impl DeployService {
         let times = store.agent_deploy_restart_times_since(now - window)?;
         let limit =
             usize::try_from(self.restarts_per_hour.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
-        if times.len() >= limit {
+        let mut frees = (times.len() >= limit).then(|| {
             // Room opens once enough restarts left the window to get under it.
-            let frees = times[times.len() - limit] + window;
+            times[times.len() - limit] + window
+        });
+        // #3492: the supervisor spends ONE budget on every restart it makes
+        // (deploys, watchdog exits, unannounced signal stops), so a deploy it
+        // would refuse or delay is refused here, with the same retry time.
+        if let Some(at) = self.supervisor_budget_frees_at(now)
+            && frees.is_none_or(|current| at > current)
+        {
+            frees = Some(at);
+        }
+        if let Some(frees) = frees {
             return Err(DaemonError::PolicyDenied(format!(
                 "{DEPLOY_RESTART_BUDGET}{DEPLOY_RETRY_AFTER_MARKER}{}",
                 frees.to_rfc3339_opts(SecondsFormat::Secs, true),
             )));
         }
         Ok(())
+    }
+
+    /// When the supervisor's published budget has room for this deploy's
+    /// restart plus the slot it reserves for rollback and watchdog recovery;
+    /// `None` when it has room now or publishes nothing.
+    fn supervisor_budget_frees_at(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let published = rsi_common::supervisor_restarts::SupervisorRestarts::read(
+            self.supervisor_restarts.as_deref()?,
+        )?;
+        let now_secs = now.timestamp();
+        let recent = published.in_window(now_secs);
+        let allowance = published.deploy_allowance();
+        let mut frees_secs = (recent.len() >= allowance)
+            .then(|| recent[recent.len() - allowance] + published.window_secs);
+        if let Some(until) = published.backoff_until.filter(|until| *until > now_secs) {
+            frees_secs = Some(frees_secs.map_or(until, |current| current.max(until)));
+        }
+        frees_secs.and_then(|secs| DateTime::from_timestamp(secs, 0))
     }
 
     /// The cloneable staging inputs.
@@ -409,14 +469,23 @@ impl StagePlan {
         live_schema: i64,
     ) -> Result<(Vec<DeployBinaryV1>, String)> {
         let invalid = |msg: String| DaemonError::InvalidParam(msg);
-        let dir = std::fs::canonicalize(binaries_dir)
-            .map_err(|_| invalid(DEPLOY_DIR_NOT_ALLOWED.to_string()))?;
+        let dir = std::fs::canonicalize(binaries_dir).map_err(|_| {
+            invalid(directory_not_allowed_message(
+                binaries_dir,
+                "does not exist",
+                &self.allowed_roots,
+            ))
+        })?;
         let allowed = self
             .allowed_roots
             .iter()
             .any(|root| std::fs::canonicalize(root).is_ok_and(|root| dir.starts_with(root)));
         if !allowed {
-            return Err(invalid(DEPLOY_DIR_NOT_ALLOWED.to_string()));
+            return Err(invalid(directory_not_allowed_message(
+                binaries_dir,
+                "is outside every allowed root",
+                &self.allowed_roots,
+            )));
         }
         let mut manifest = Vec::new();
         match self.stage_all(id, &dir, &mut manifest, expected_sha, live_schema) {
@@ -465,7 +534,18 @@ impl StagePlan {
                     .join(name),
             );
         }
-        real(self.install_dir.join(name))
+        let link = self.install_dir.join(name);
+        // A plain member with no link in `install_dir` (absent, or a stale regular
+        // file such as the one a pre-#3886 deploy left in `~/.local/bin`) goes
+        // beside the resolved `rsid`, like every member `make release-install`
+        // links, so the sibling lookup of the daemon and the lander finds it.
+        // The deploy then points the `install_dir` link at it (`link_members`).
+        if name != "rsid"
+            && !std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            return self.new_member_paths(name).0;
+        }
+        real(link)
     }
 
     fn stage_all(
@@ -483,22 +563,37 @@ impl StagePlan {
                 std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.file_type().is_file());
             if !is_file {
                 if name == "rsid" {
-                    return Err(invalid(DEPLOY_BINARY_MISSING.to_string()));
+                    return Err(invalid(format!(
+                        "{DEPLOY_BINARY_MISSING}: member rsid is not a regular file in {}",
+                        dir.display()
+                    )));
                 }
                 continue;
             }
             let dest = self.install_path(name);
-            let parent = dest
-                .parent()
-                .ok_or_else(|| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            let fail = |step: &str, detail: String| stage_failure(name, step, &detail);
+            let parent = dest.parent().ok_or_else(|| {
+                fail(
+                    "resolve install directory",
+                    format!("{} has no parent", dest.display()),
+                )
+            })?;
             let staged = staged_path(&dest, id);
-            let source_hash =
-                binary_sha256(&source).ok_or_else(|| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
-            std::fs::create_dir_all(parent)
-                .map_err(|_| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            let source_hash = binary_sha256(&source)
+                .ok_or_else(|| fail("hash source", format!("cannot read {}", source.display())))?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                fail(
+                    "create install directory",
+                    format!("{}: {error}", parent.display()),
+                )
+            })?;
             let prior_present = std::fs::symlink_metadata(&dest).is_ok();
-            std::fs::copy(&source, &staged)
-                .map_err(|_| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            std::fs::copy(&source, &staged).map_err(|error| {
+                fail(
+                    "copy",
+                    format!("{} to {}: {error}", source.display(), staged.display()),
+                )
+            })?;
             manifest.push(DeployBinaryV1 {
                 name: name.to_string(),
                 dest: dest.to_string_lossy().into_owned(),
@@ -506,36 +601,50 @@ impl StagePlan {
                 prior_present,
                 staged_identity: None,
             });
-            set_executable(&staged).map_err(|_| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            set_executable(&staged)
+                .map_err(|error| fail("chmod", format!("{}: {error}", staged.display())))?;
             if binary_sha256(&staged).as_deref() != Some(source_hash.as_str()) {
-                return Err(invalid(DEPLOY_STAGE_FAILED.to_string()));
+                return Err(fail(
+                    "verify copy hash",
+                    format!(
+                        "{} does not match the source hash {source_hash}",
+                        staged.display()
+                    ),
+                ));
             }
-            if (name == "rsid-supervisor.sh" || name == "cargo-slot")
-                && !std::process::Command::new("bash")
-                    .arg("-n")
-                    .arg(&staged)
-                    .status()
-                    .is_ok_and(|status| status.success())
-            {
-                return Err(invalid(DEPLOY_STAGE_FAILED.to_string()));
+            if name == "rsid-supervisor.sh" || name == "cargo-slot" || name == "target-pool" {
+                script_syntax_check(&staged).map_err(|reason| fail("syntax check", reason))?;
             }
-            if name == "target-pool" && !python_script_parses(&staged) {
-                return Err(invalid(DEPLOY_STAGE_FAILED.to_string()));
-            }
-            let identity =
-                object_identity(&staged).ok_or_else(|| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            let identity = object_identity(&staged).ok_or_else(|| {
+                fail(
+                    "record staged identity",
+                    format!("{} is not a regular file", staged.display()),
+                )
+            })?;
             if let Some(entry) = manifest.last_mut() {
                 entry.staged_identity = Some(identity);
             }
         }
         self.stage_cargo_slot_wrapper(id, manifest)
-            .map_err(|_| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            .map_err(|error| {
+                stage_failure(CARGO_SLOT_WRAPPER_NAME, "stage wrapper", &error.to_string())
+            })?;
+        // Hub #3886: refuse now a build whose rsid or lander would run with no
+        // trusted guard beside it, rather than let it go live and refuse landings.
+        if let Some(reason) = self.guard_unresolvable(manifest, true) {
+            tracing::warn!(%reason, "deploy refused at staging: no trusted rsi-repo-guard");
+            return Err(invalid(reason));
+        }
         let rsid = manifest
             .iter()
             .find(|entry| entry.name == "rsid")
-            .ok_or_else(|| invalid(DEPLOY_BINARY_MISSING.to_string()))?;
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{DEPLOY_BINARY_MISSING}: member rsid was not staged"
+                ))
+            })?;
         let (sha, schema) = (self.probe)(&staged_path(Path::new(&rsid.dest), id))
-            .map_err(|_| invalid(DEPLOY_STAGE_FAILED.to_string()))?;
+            .map_err(|error| stage_failure("rsid", "probe --build-info", &error))?;
         if expected_sha.is_some_and(|expected| sha != expected) {
             let requested = expected_sha.unwrap();
             return Err(invalid(format!(
@@ -620,23 +729,6 @@ pub(crate) fn is_cargo_slot_wrapper(path: &Path) -> bool {
         && std::fs::read(path).is_ok_and(|bytes| bytes == CARGO_SLOT_WRAPPER)
 }
 
-/// Whether `python3` parses `script` (no execution, no bytecode written). A
-/// host without `python3` cannot run `target-pool` either, so a missing
-/// interpreter does not refuse the deploy; a script it rejects does.
-fn python_script_parses(script: &Path) -> bool {
-    std::process::Command::new("python3")
-        .args([
-            "-I",
-            "-c",
-            "import ast, sys; ast.parse(open(sys.argv[1], encoding='utf-8').read())",
-        ])
-        .arg(script)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .is_none_or(|output| output.status.success())
-}
-
 fn staged_path(dest: &Path, id: Uuid) -> PathBuf {
     let name = dest
         .file_name()
@@ -701,6 +793,395 @@ fn set_executable(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
 }
 
+/// What [`StagePlan::complete_upgrade_members`] did for one verified deploy.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UpgradeMembersReport {
+    /// Members installed from the verified stage that the staging daemon's
+    /// older compiled inventory did not carry.
+    pub installed: Vec<String>,
+    /// Members the stage holds but that could not be installed, with the cause.
+    pub failed: Vec<(String, String)>,
+}
+
+impl UpgradeMembersReport {
+    /// A note for the deploy's settled reason; `None` when nothing happened.
+    fn note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.installed.is_empty() {
+            parts.push(format!(
+                "installed new members from the verified stage: {}",
+                self.installed.join(", ")
+            ));
+        }
+        if !self.failed.is_empty() {
+            let failed: Vec<String> = self
+                .failed
+                .iter()
+                .map(|(name, cause)| format!("{name} ({cause})"))
+                .collect();
+            parts.push(format!(
+                "PARTIAL INSTALL, members left uninstalled: {}; \
+                 re-run the deploy or `make release-install NOW=1`",
+                failed.join(", ")
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+}
+
+/// The manifest `install-release.sh --stage-dir` writes into a stage.
+const STAGE_MANIFEST_NAME: &str = "MANIFEST.sha256";
+
+/// Parse a stage manifest: one `<sha256>  <relative path>` line per file
+/// (`sha256sum` text or binary mode). A malformed line makes the whole
+/// manifest untrusted.
+fn parse_stage_manifest(text: &str) -> std::result::Result<HashMap<String, String>, String> {
+    let mut hashes = HashMap::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (digest, rest) = line
+            .split_once(' ')
+            .ok_or_else(|| format!("malformed {STAGE_MANIFEST_NAME} line"))?;
+        let path = rest.strip_prefix([' ', '*']).unwrap_or(rest);
+        let valid = digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid || path.is_empty() {
+            return Err(format!("malformed {STAGE_MANIFEST_NAME} line"));
+        }
+        hashes.insert(path.to_string(), digest.to_ascii_lowercase());
+    }
+    Ok(hashes)
+}
+
+/// The stage's manifest hashes; the error names why they cannot be trusted.
+fn read_stage_manifest(dir: &Path) -> std::result::Result<HashMap<String, String>, String> {
+    let text = std::fs::read_to_string(dir.join(STAGE_MANIFEST_NAME))
+        .map_err(|_| format!("stage {STAGE_MANIFEST_NAME} unreadable, not installed"))?;
+    parse_stage_manifest(&text).map_err(|cause| format!("{cause}, not installed"))
+}
+
+/// The verified stage directory of `sha`: a real `bin-<hex>` directory under
+/// `root` whose hex part is a prefix of `sha` (a deploy row stores no
+/// directory, #2681).
+fn stage_dir_for(root: &Path, sha: &str) -> Option<PathBuf> {
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name();
+            name.to_str()
+                .and_then(|name| name.strip_prefix("bin-"))
+                .is_some_and(|hex| hex.len() >= 7 && sha.starts_with(hex))
+        })
+        .map(|entry| entry.path())
+        .next()
+}
+
+impl StagePlan {
+    /// Where a plain binary that has no install path yet goes: beside the
+    /// resolved `rsid` (so `~/.local/bin` links to the install directory as it
+    /// does for every other member), plus the `install_dir` link that names it.
+    fn new_member_paths(&self, name: &str) -> (PathBuf, Option<PathBuf>) {
+        let link = self.install_dir.join(name);
+        let rsid = std::fs::canonicalize(self.install_dir.join("rsid"))
+            .unwrap_or_else(|_| self.install_dir.join("rsid"));
+        let dest = rsid
+            .parent()
+            .map_or_else(|| link.clone(), |parent| parent.join(name));
+        let needs_link = dest != link;
+        (dest, needs_link.then_some(link))
+    }
+
+    /// The directory each installed consumer of the guard runs from, with the
+    /// consumer's name: the `rsid` this deploy installs and the
+    /// `rsi-rolling-land` it installs or that is already installed.
+    fn guard_consumers(&self, manifest: &[DeployBinaryV1]) -> Vec<(&'static str, PathBuf)> {
+        let mut consumers = Vec::new();
+        for consumer in ["rsid", "rsi-rolling-land"] {
+            let dir = manifest
+                .iter()
+                .find(|entry| entry.name == consumer)
+                .map(|entry| PathBuf::from(&entry.dest))
+                .or_else(|| {
+                    let installed = self.install_dir.join(consumer);
+                    std::fs::symlink_metadata(&installed)
+                        .is_ok()
+                        .then(|| std::fs::canonicalize(&installed).unwrap_or(installed))
+                })
+                .and_then(|path| path.parent().map(Path::to_path_buf));
+            if let Some(dir) = dir {
+                consumers.push((consumer, dir));
+            }
+        }
+        consumers
+    }
+
+    /// Why the build `manifest` installs cannot resolve a trusted guard, or
+    /// `None` (hub #3886). Each consumer's directory must hold what
+    /// [`crate::repo_guard_call::installed_tool_in`] accepts, the very lookup the
+    /// running binary makes, and an identity record there must not refuse it.
+    /// `planned` is the staging-time answer: a guard this manifest swaps into the
+    /// directory counts as present. Always `None` unless the plan requires one.
+    pub(crate) fn guard_unresolvable(
+        &self,
+        manifest: &[DeployBinaryV1],
+        planned: bool,
+    ) -> Option<String> {
+        if !self.require_guard {
+            return None;
+        }
+        let guard = crate::repo_guard_call::GUARD_BIN;
+        for (consumer, dir) in self.guard_consumers(manifest) {
+            use crate::repo_guard_call::{
+                InstalledToolError, installed_guard_dir_in_home, installed_tool_in_home,
+            };
+            let refusal = |why: InstalledToolError| {
+                format!(
+                    "{DEPLOY_GUARD_UNRESOLVABLE}: {guard} beside {consumer} in {} is refused: {why}",
+                    dir.display()
+                )
+            };
+            let Some(home) = self.guard_home.as_deref() else {
+                return Some(refusal(InstalledToolError::HomeUnresolvable));
+            };
+            // A manifest entry is not a trust grant. Even a future regular
+            // guard must land in a protected directory, not a cargo target.
+            if let Err(why) = installed_guard_dir_in_home(&dir, home) {
+                return Some(refusal(why));
+            }
+            let staged_here = planned
+                && manifest
+                    .iter()
+                    .any(|entry| entry.name == guard && Path::new(&entry.dest) == dir.join(guard));
+            if staged_here {
+                continue;
+            }
+            let tool = match installed_tool_in_home(&dir, home) {
+                Ok(tool) => tool,
+                Err(why) => return Some(refusal(why)),
+            };
+            if let crate::repo_guard_call::Identity::Refused(why) =
+                crate::repo_guard_call::check_identity(&tool, None)
+            {
+                return Some(format!(
+                    "{DEPLOY_GUARD_UNRESOLVABLE}: {} beside {consumer} is refused: {why}",
+                    tool.display()
+                ));
+            }
+        }
+        None
+    }
+
+    /// The plain binary members of `manifest` (not `rsid`, the supervisor or a
+    /// tool script): the ones that live beside `rsid` as `make release-install`
+    /// lays them out and that the daemon and the lander find by that sibling
+    /// lookup (`rsi-repo-guard`, `rsi-eval`, `rsi-rpc`, `rsi-agent-mcp`, ...).
+    fn plain_members<'a>(
+        manifest: &'a [DeployBinaryV1],
+    ) -> impl Iterator<Item = &'a DeployBinaryV1> {
+        manifest.iter().filter(|entry| {
+            DEPLOY_BINARIES.contains(&entry.name.as_str())
+                && entry.name != "rsid"
+                && entry.name != "rsid-supervisor.sh"
+                && !is_deploy_tool_script(&entry.name)
+        })
+    }
+
+    /// The directory the deployed `rsid` runs from.
+    fn rsid_dir(&self, manifest: &[DeployBinaryV1]) -> Option<PathBuf> {
+        self.guard_consumers(manifest)
+            .into_iter()
+            .find(|(name, _)| *name == "rsid")
+            .map(|(_, dir)| dir)
+    }
+
+    /// Lay the links of the plain members `manifest` installed (hub #3886). With
+    /// `install_dir_links` false: for a member an older staging daemon put outside
+    /// the directory of `rsid`, a link beside `rsid` so the sibling lookup finds
+    /// it (before verification, and harmless to a rollback). With it true: the
+    /// `install_dir` link (`~/.local/bin/<name>`), only after verification passed,
+    /// because replacing a stale file there before a rollback could loop a restored
+    /// hand-made link. Each link is a temporary symlink renamed
+    /// over the old one, so a stale regular file or a hand-made link is replaced
+    /// atomically; a regular file beside `rsid` that is not ours is left and
+    /// reported. Returns `(member, cause)` for each link it could not make: the
+    /// install itself is unaffected, so the caller reports it and carries on.
+    pub(crate) fn link_members(
+        &self,
+        manifest: &[DeployBinaryV1],
+        install_dir_links: bool,
+    ) -> Vec<(String, String)> {
+        let mut failed = Vec::new();
+        let rsid_dir = self.rsid_dir(manifest);
+        for entry in Self::plain_members(manifest) {
+            let dest = Path::new(&entry.dest);
+            let mut links = Vec::new();
+            if install_dir_links {
+                links.push((self.install_dir.join(&entry.name), true));
+            } else if let Some(dir) = &rsid_dir {
+                links.push((dir.join(&entry.name), false));
+            }
+            for (link, replace_regular) in links {
+                if link == dest {
+                    continue;
+                }
+                if let Err(cause) = point_link(&link, dest, replace_regular) {
+                    failed.push((entry.name.clone(), format!("{}: {cause}", link.display())));
+                }
+            }
+        }
+        failed
+    }
+
+    /// Why a plain member of the deployed build is not where the daemon and the
+    /// lander look for it (hub #3886): after [`Self::link_members`], the file
+    /// beside `rsid` must be the very file this deploy installed. `None` unless
+    /// the plan checks the layout.
+    pub(crate) fn member_unresolvable(&self, manifest: &[DeployBinaryV1]) -> Option<String> {
+        if !self.require_guard {
+            return None;
+        }
+        let dir = self.rsid_dir(manifest)?;
+        for entry in Self::plain_members(manifest) {
+            let beside = dir.join(&entry.name);
+            if binary_sha256(&beside).as_deref() != Some(entry.sha256.as_str()) {
+                return Some(format!(
+                    "{DEPLOY_MEMBER_UNRESOLVABLE}: {} is not the deployed {} (installed at {}); \
+                     the daemon and the lander resolve it beside rsid",
+                    beside.display(),
+                    entry.name,
+                    entry.dest
+                ));
+            }
+        }
+        None
+    }
+
+    /// Finish an upgrade whose staging daemon predates a member (#587).
+    ///
+    /// `stage_all` stages only the members the *old* daemon compiled in, so a
+    /// commit that adds a member cannot carry it on its first upgrade even
+    /// when the verified stage holds it. The new daemon knows the full
+    /// inventory: once the deploy verified, install each plain binary of
+    /// [`DEPLOY_BINARIES`] that the manifest skipped and the stage `dir`
+    /// holds, with the same copy, mode and sha-256 checks, and no change to
+    /// the allowlist. `rsid`, the supervisor and the tool scripts keep their
+    /// manifest-driven swap and rollback; they are never installed here. A
+    /// member already installed at the staged hash is left alone.
+    pub(crate) fn complete_upgrade_members(
+        &self,
+        dir: &Path,
+        manifest: &[DeployBinaryV1],
+        id: Uuid,
+    ) -> UpgradeMembersReport {
+        let mut report = UpgradeMembersReport::default();
+        let manifest_hashes = read_stage_manifest(dir);
+        for name in DEPLOY_BINARIES {
+            let special =
+                name == "rsid" || name == "rsid-supervisor.sh" || is_deploy_tool_script(name);
+            if special || manifest.iter().any(|entry| entry.name == name) {
+                continue;
+            }
+            let source = dir.join(name);
+            if !std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.file_type().is_file()) {
+                continue;
+            }
+            let expected = match manifest_hashes.as_ref() {
+                Ok(hashes) => hashes.get(name).map(String::as_str).ok_or_else(|| {
+                    format!("no entry in the stage {STAGE_MANIFEST_NAME}, not installed")
+                }),
+                Err(cause) => Err(cause.clone()),
+            };
+            let installed =
+                expected.and_then(|expected| self.install_new_member(name, &source, expected, id));
+            match installed {
+                Ok(true) => report.installed.push(name.to_string()),
+                Ok(false) => {}
+                Err(cause) => report.failed.push((name.to_string(), cause)),
+            }
+        }
+        report
+    }
+
+    /// `Ok(true)` when installed, `Ok(false)` when already current. The staged
+    /// bytes must hash to `expected`, the stage manifest entry, before any
+    /// destination is touched (hub #3856); that same hash then guards the copy.
+    fn install_new_member(
+        &self,
+        name: &str,
+        source: &Path,
+        expected: &str,
+        id: Uuid,
+    ) -> std::result::Result<bool, String> {
+        let source_hash = binary_sha256(source).ok_or("stage unreadable")?;
+        if source_hash != expected {
+            return Err(format!(
+                "staged {name} hashes to {source_hash} but the stage {STAGE_MANIFEST_NAME} lists {expected}, not installed"
+            ));
+        }
+        let existing = {
+            let installed = self.install_path(name);
+            std::fs::symlink_metadata(&installed)
+                .is_ok()
+                .then_some(installed)
+        };
+        let (dest, link) = match existing {
+            Some(path) if binary_sha256(&path).as_deref() == Some(source_hash.as_str()) => {
+                return Ok(false);
+            }
+            Some(path) => (path, None),
+            None => self.new_member_paths(name),
+        };
+        let _guard = INSTALL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staged = staged_path(&dest, id);
+        let copy = || -> std::io::Result<()> {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(source, &staged)?;
+            set_executable(&staged)?;
+            if binary_sha256(&staged).as_deref() != Some(source_hash.as_str()) {
+                return Err(std::io::Error::other("staged copy hash mismatch"));
+            }
+            std::fs::rename(&staged, &dest)
+        };
+        if let Err(error) = copy() {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.to_string());
+        }
+        if binary_sha256(&dest).as_deref() != Some(source_hash.as_str()) {
+            return Err("installed hash mismatch".to_string());
+        }
+        let Some(link) = link else {
+            return Ok(true);
+        };
+        if std::fs::symlink_metadata(&link).is_ok() {
+            return Ok(true);
+        }
+        std::os::unix::fs::symlink(&dest, &link).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+}
+
+impl DeployService {
+    /// After `deployed` verified: complete the members its staging daemon did
+    /// not know (#587), logging the outcome. Returns the note for the settled
+    /// reason. Blocking file work, called under the verify step.
+    pub(crate) fn complete_upgrade_members(&self, deployed: &DeployRow) -> Option<String> {
+        let root = self.staging_root.as_ref()?;
+        let dir = stage_dir_for(root, &deployed.sha)?;
+        let report = self
+            .plan
+            .complete_upgrade_members(&dir, &deployed.manifest, deployed.id);
+        for name in &report.installed {
+            tracing::info!(member = %name, deploy = %deployed.id, "installed upgrade-boundary deploy member from the verified stage");
+        }
+        for (name, cause) in &report.failed {
+            tracing::warn!(member = %name, %cause, deploy = %deployed.id, "upgrade-boundary deploy member left uninstalled (partial install)");
+        }
+        report.note()
+    }
+}
+
 /// Remove staged copies of a manifest (best effort).
 pub(crate) fn remove_staged(manifest: &[DeployBinaryV1], id: Uuid) {
     for entry in manifest {
@@ -734,6 +1215,44 @@ fn object_identity(path: &Path) -> Option<ObjectIdentityV1> {
         dev: meta.dev(),
         ino: meta.ino(),
     })
+}
+
+/// Make `link` a symlink to `dest`, atomically: a temporary symlink in the same
+/// directory is renamed over the old entry. A link that already resolves to
+/// `dest` stays. A regular file at `link` is replaced only when
+/// `replace_regular`; otherwise it is reported, never overwritten.
+fn point_link(link: &Path, dest: &Path, replace_regular: bool) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if std::fs::canonicalize(link).ok() == std::fs::canonicalize(dest).ok() {
+                return Ok(());
+            }
+        }
+        Ok(meta) if meta.file_type().is_file() && !replace_regular => {
+            return Err(std::io::Error::other(
+                "a regular file that is not the deployed member is in the way",
+            ));
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            return Err(std::io::Error::other("a directory is in the way"));
+        }
+        _ => {}
+    }
+    let (Some(parent), Some(name)) = (link.parent(), link.file_name()) else {
+        return Err(std::io::Error::other("link has no parent"));
+    };
+    let temp = parent.join(format!(
+        ".{}.link-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&temp);
+    std::fs::create_dir_all(parent)?;
+    let made = std::os::unix::fs::symlink(dest, &temp).and_then(|()| std::fs::rename(&temp, link));
+    if made.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    made
 }
 
 /// Serializes every mutation and removal of an install destination: the swap
@@ -881,6 +1400,91 @@ fn after_move_aside_hook() {
     {
         hook();
     }
+}
+
+/// #3423: the `deploy_directory_not_allowed` refusal names the directory it
+/// received and the roots it accepts, so an operator whose build output sits
+/// elsewhere sees the fix. The stable code stays first: the satellite
+/// pass-through (`satellite::deploy_link`) reads it there.
+pub(crate) fn directory_not_allowed_message(
+    received: &str,
+    why: &str,
+    allowed_roots: &[PathBuf],
+) -> String {
+    let roots = allowed_roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{DEPLOY_DIR_NOT_ALLOWED}: {received} {why}; allowed roots: {roots} \
+         (stage the build into a bin-<sha> directory under the staging root)"
+    )
+}
+
+/// Longest reason text a stage refusal carries (bytes).
+const STAGE_REASON_LIMIT: usize = 512;
+
+/// The typed `deploy_stage_failed` refusal: it names the staged member, the
+/// step that failed and a bounded reason, and logs the same text (hub #3884).
+fn stage_failure(member: &str, step: &str, reason: &str) -> DaemonError {
+    let mut reason = reason.trim().to_string();
+    if reason.len() > STAGE_REASON_LIMIT {
+        let mut cut = STAGE_REASON_LIMIT;
+        while !reason.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        reason.truncate(cut);
+        reason.push_str("...");
+    }
+    let message = format!("{DEPLOY_STAGE_FAILED}: member {member}: {step} failed: {reason}");
+    tracing::warn!(member, step, %reason, "deploy refused at staging");
+    DaemonError::InvalidParam(message)
+}
+
+/// Syntax-check a staged shell script with the interpreter its shebang names
+/// (`sh`/`bash`, directly or through `env`); no shebang means bash. Any other
+/// interpreter is refused. No Python (operator directive).
+fn script_syntax_check(path: &Path) -> std::result::Result<(), String> {
+    let head = std::fs::read(path).map_err(|error| format!("cannot read script: {error}"))?;
+    let first = head.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let interpreter = if first.starts_with(b"#!") {
+        let line = String::from_utf8_lossy(&first[2..]).into_owned();
+        let mut words = line.split_whitespace();
+        let program = words.next().unwrap_or_default();
+        let program = if program.rsplit('/').next() == Some("env") {
+            words
+                .find(|word| !word.starts_with('-'))
+                .unwrap_or_default()
+        } else {
+            program
+        };
+        match program.rsplit('/').next().unwrap_or_default() {
+            "sh" => "sh",
+            "bash" => "bash",
+            other => {
+                return Err(format!(
+                    "unsupported script interpreter {other:?} in shebang {line:?}"
+                ));
+            }
+        }
+    } else {
+        "bash"
+    };
+    let output = std::process::Command::new(interpreter)
+        .arg("-n")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot run {interpreter} -n: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "{interpreter} -n exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 /// Production probe: `<binary> --build-info` prints `<sha> <schema>`.
@@ -1094,7 +1698,7 @@ fn drain_hold_over(
 /// # Errors
 /// A persistence error; the caller logs and retries next tick.
 pub async fn poll_once(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     now: DateTime<Utc>,
     gate: &mut GateState,
@@ -1169,8 +1773,9 @@ fn hold_end(
 }
 
 /// Engage the holds the durable live deploy `row` calls for: the worker-start
-/// hold (to `hold_end`, or the deploy's deadline) and, for a staged
-/// `interrupt_workers` deploy, the hold on new test/build jobs. Returns whether
+/// hold (to `hold_end`, or the deploy's deadline) and, for a staged deploy,
+/// the hold on new test/build jobs (with a retry window for an
+/// `interrupt_workers` one; none for the others, #3373). Returns whether
 /// the deploy asked to interrupt workers. The one derivation shared by every
 /// poll, staging and the startup restore ([`restore_drain_at_startup`]).
 fn engage_hold(
@@ -1183,14 +1788,19 @@ fn engage_hold(
 ) -> Result<bool> {
     let end = hold_end(store, row, drain, quiet_seen)?;
     drain.sync_until(Some(row), end, drain_enabled, now);
-    // #2190: a staged `interrupt_workers` deploy stops test jobs after their
-    // grace, so new test/build jobs wait for it whatever the worker-start hold
-    // cap says (the setting-off case included: the kill does not depend on it).
+    // #2190: new test/build jobs wait for a staged `interrupt_workers` deploy
+    // whatever the worker-start hold cap says (the setting-off case included: the
+    // restart does not depend on it).
     let interrupt_requested = row.state == DeployState::Staged
         && row.owner_session_id.is_some()
         && store.agent_deploy_interrupt(row.id)?.requested;
     if interrupt_requested {
         drain.hold_jobs_until_settled(row, now);
+    } else if drain_enabled && row.state == DeployState::Staged && row.owner_session_id.is_some() {
+        // #3373: a deploy that stops no job still needs the running ones to
+        // drain; past the worker-start hold a newly started job would keep
+        // `job_running` set to the deadline and starve the held merge queue.
+        drain.hold_jobs_until_deadline(row, now);
     }
     Ok(interrupt_requested)
 }
@@ -1222,7 +1832,7 @@ pub(crate) fn engage_hold_at_stage(
 /// # Errors
 /// A persistence error reading the live deploy or its interrupt request.
 pub async fn restore_drain_at_startup(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     drain: &DeployDrain,
     config: &crate::config::RuntimeConfig,
     now: DateTime<Utc>,
@@ -1257,7 +1867,7 @@ pub async fn restore_drain_at_startup(
 /// # Errors
 /// The restore's persistence error; `start` has not run then.
 pub async fn start_admission_after_restore<F, Fut, T>(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     drain: &DeployDrain,
     config: &crate::config::RuntimeConfig,
     start: F,
@@ -1271,7 +1881,7 @@ where
 }
 
 async fn poll_step(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     now: DateTime<Utc>,
     gate: &mut GateState,
@@ -1304,11 +1914,15 @@ async fn poll_step(
     // #1461: past the drain hold, an `interrupt_workers` deploy no longer waits
     // for workers mid-turn; a landing and a local job still block.
     let mut interrupting = false;
+    // #3554: an `interrupt_workers` deploy does not wait for, stop or requeue an
+    // ordinary test job: its unit outlives the restart and the new daemon
+    // re-adopts it. A landing, a build and a protected test still block.
+    let surviving = crate::agent_jobs::deploy_surviving_jobs_or_none(&store, &row);
     let blockers = match row.owner_session_id {
         Some(owner) => {
             interrupting =
                 interrupt_requested && drain_hold_over(&store, &row, drain, drain_enabled, now)?;
-            store.deploy_quiet_blockers_with(owner, !interrupting)?
+            store.deploy_quiet_blockers_surviving(owner, !interrupting, &surviving)?
         }
         // An operator restart also waits for managers mid-turn (#1122).
         None => store.operator_quiet_blockers()?.0,
@@ -1390,6 +2004,17 @@ async fn poll_step(
         }
         if interrupting {
             note_deploy_interrupts(&store, &row, &interrupted);
+        }
+        if !surviving.is_empty() {
+            // The jobs still running at the restart, named for the outcome.
+            match store.record_agent_deploy_surviving_jobs(row.id, &surviving) {
+                Ok(marked) => {
+                    tracing::info!(deploy = %row.id, jobs = ?marked, "test jobs kept running across the deploy restart")
+                }
+                Err(error) => {
+                    tracing::warn!(%error, deploy = %row.id, "surviving jobs not recorded on the deploy")
+                }
+            }
         }
         return Ok(PollOutcome::Restarting(row.id));
     }
@@ -1497,7 +2122,7 @@ enum VerifyStep {
 /// # Errors
 /// A persistence error.
 pub async fn verify_after_restart(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     build_sha: &str,
     running_sha256: Option<&str>,
@@ -1510,7 +2135,7 @@ pub async fn verify_after_restart(
 }
 
 async fn verify_step(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     build_sha: &str,
     running_sha256: Option<&str>,
@@ -1526,9 +2151,33 @@ async fn verify_step(
     }
     let rsid_entry = row.manifest.iter().find(|entry| entry.name == "rsid");
     let expected = rsid_entry.map(|entry| entry.sha256.as_str());
-    let failure = match check_running_build(build_sha, &row.sha, expected, running_sha256) {
+    let mut upgrade_note = None;
+    let mut verdict = check_running_build(build_sha, &row.sha, expected, running_sha256);
+    if matches!(verdict, BuildCheck::Verified) {
+        upgrade_note = service.complete_upgrade_members(&row);
+        // Hub #3886: a member the staging daemon put outside rsid's directory is
+        // linked beside it first, then the build that came up must resolve a
+        // trusted guard and every deployed member where the daemon and the lander
+        // look; otherwise it is rolled back like any failed verification.
+        for (member, cause) in service.plan.link_members(&row.manifest, false) {
+            tracing::warn!(%member, %cause, deploy = %row.id, "link beside rsid for a deployed member not made");
+        }
+        if let Some(reason) = service
+            .plan
+            .guard_unresolvable(&row.manifest, false)
+            .or_else(|| service.plan.member_unresolvable(&row.manifest))
+        {
+            tracing::warn!(deploy = %row.id, %reason, "deploy verification failed: member layout");
+            verdict = BuildCheck::Failed(reason);
+        }
+    }
+    let failure = match verdict {
         BuildCheck::Verified => {
-            store.settle_agent_deploy(row.id, DeployState::Succeeded, None, now)?;
+            let note = upgrade_note;
+            for (member, cause) in service.plan.link_members(&row.manifest, true) {
+                tracing::warn!(%member, %cause, deploy = %row.id, "install-directory link for a deployed member not made");
+            }
+            store.settle_agent_deploy(row.id, DeployState::Succeeded, note.as_deref(), now)?;
             remove_marker(&row.manifest);
             remove_prev_files(&row.manifest);
             drop(service.prune_staging_after_success(&store, &row));
@@ -1580,7 +2229,7 @@ async fn verify_step(
 /// # Errors
 /// A persistence error.
 pub async fn verify_with_patience<H, P>(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     build_sha: &str,
     patience: VerifyPatience,
@@ -1617,7 +2266,7 @@ where
 
 /// The daemon-owned runner: verify once at startup, then poll.
 pub async fn run_deploy_loop(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     service: &'static DeployService,
     drain: Arc<DeployDrain>,
     config: Arc<crate::config::RuntimeConfig>,
@@ -1707,6 +2356,54 @@ mod tests {
             .expect("a wake sent before the loop sleeps is not lost");
     }
 
+    /// #3423: a refused `binaries_dir` names the directory it got and the
+    /// roots it accepts; the stable code stays first.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_refused_binaries_dir_names_the_path_and_the_allowed_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let service = DeployService::new(
+            allowed.path().join("install"),
+            vec![allowed.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        );
+        let outside_dir = outside.path().to_string_lossy().into_owned();
+        let error = service
+            .stage_plan()
+            .stage_binaries_discovering_sha(Uuid::new_v4(), &outside_dir, 999)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "{DEPLOY_DIR_NOT_ALLOWED}: {outside_dir} is outside"
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains(&allowed.path().display().to_string()),
+            "{error}"
+        );
+        let missing = allowed.path().join("absent");
+        let missing_dir = missing.to_string_lossy().into_owned();
+        let error = service
+            .stage_plan()
+            .stage_binaries_discovering_sha(Uuid::new_v4(), &missing_dir, 999)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "{DEPLOY_DIR_NOT_ALLOWED}: {missing_dir} does not exist"
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains(&allowed.path().display().to_string()),
+            "{error}"
+        );
+    }
+
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
     const OLD: &[u8] = b"old-rsid";
     const NEW: &[u8] = b"new-rsid";
@@ -1717,7 +2414,7 @@ mod tests {
         install: PathBuf,
         service: DeployService,
         restarts: Arc<AtomicUsize>,
-        store: tokio::sync::Mutex<Store>,
+        store: rsid_core::store_lock::Mutex<Store>,
         owner: Uuid,
         drain: DeployDrain,
     }
@@ -1766,7 +2463,7 @@ mod tests {
             install,
             service,
             restarts,
-            store: tokio::sync::Mutex::new(store),
+            store: rsid_core::store_lock::Mutex::new(store),
             owner,
             drain: DeployDrain::new(),
         }
@@ -1846,8 +2543,12 @@ mod tests {
                 "rsi-agent-mcp",
                 "rsi-build-rustc",
                 "rsi-contract-validate",
+                "rsi-known-failure",
+                "rsi-repo-guard",
                 "rsi-turn-shim",
                 "rsi-socket-hold",
+                "rsi-cloud",
+                "rsi-eval",
                 "rsid-supervisor.sh",
                 "cargo-slot",
                 "target-pool",
@@ -1870,6 +2571,371 @@ mod tests {
             b"new-remote"
         );
         assert_eq!(installed(&f), NEW);
+    }
+
+    /// #451: the lander and the queue probe run `rsi-repo-guard` installed beside
+    /// themselves (`repo_guard_call::trusted_tool`), so a deploy stages, verifies
+    /// and swaps it in with the lander, and names it when a build did not carry it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn repo_guard_deploys_beside_the_lander_when_present_and_is_named_when_absent() {
+        let f = fixture(true);
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        assert!(
+            rsi_common::agent_deploy::skipped_binaries(&manifest)
+                .contains(&"rsi-repo-guard".to_string())
+        );
+        std::fs::write(f.source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        std::fs::write(f.source.join("rsi-repo-guard"), b"new-guard").unwrap();
+        let id = Uuid::new_v4();
+        let manifest = f
+            .service
+            .stage_plan()
+            .stage_binaries(id, f.source.to_str().unwrap(), SHA, 1)
+            .unwrap();
+        let names: Vec<&str> = manifest.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["rsid", "rsi-rolling-land", "rsi-repo-guard"]);
+        let guard = manifest
+            .iter()
+            .find(|entry| entry.name == "rsi-repo-guard")
+            .unwrap();
+        assert_eq!(
+            guard.sha256,
+            binary_sha256(&f.source.join("rsi-repo-guard")).unwrap()
+        );
+        assert!(
+            !rsi_common::agent_deploy::skipped_binaries(&manifest)
+                .contains(&"rsi-repo-guard".to_string())
+        );
+        swap_in(&manifest, id).unwrap();
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-repo-guard")).unwrap(),
+            b"new-guard"
+        );
+        assert_eq!(
+            std::fs::read(f.install.join("rsi-rolling-land")).unwrap(),
+            b"new-lander"
+        );
+    }
+
+    /// Hub #3886 production layout: `~/.rsi/install` holds the real `rsid` and
+    /// `rsi-rolling-land`, and `~/.local/bin` (the plan's install dir) links them.
+    struct Layout {
+        _dir: tempfile::TempDir,
+        source: PathBuf,
+        /// `~/.rsi/install`: where the daemon and the lander run from.
+        real: PathBuf,
+        /// `~/.local/bin`: the plan's install dir.
+        bin: PathBuf,
+        service: DeployService,
+    }
+
+    fn layout(guard_required: bool) -> Layout {
+        let dir = crate::test_support::disk_backed_tempdir("guard-deploy-layout");
+        let home = dir.path().canonicalize().unwrap();
+        let source = home.join("build");
+        let real = home.join(".rsi/install");
+        let bin = home.join(".local/bin");
+        for path in [&source, &real, &bin] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for name in ["rsid", "rsi-rolling-land"] {
+            std::fs::write(real.join(name), b"old").unwrap();
+            std::os::unix::fs::symlink(real.join(name), bin.join(name)).unwrap();
+        }
+        std::fs::write(source.join("rsid"), NEW).unwrap();
+        std::fs::write(source.join("rsi-rolling-land"), b"new-lander").unwrap();
+        let mut service = DeployService::new(
+            bin.clone(),
+            vec![dir.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        );
+        if guard_required {
+            service = service.with_guard_required();
+        }
+        service.plan.guard_home = Some(home);
+        Layout {
+            _dir: dir,
+            source,
+            real,
+            bin,
+            service,
+        }
+    }
+
+    fn stage_layout(l: &Layout) -> (Uuid, Result<Vec<DeployBinaryV1>>) {
+        let id = Uuid::new_v4();
+        let staged = l
+            .service
+            .stage_plan()
+            .stage_binaries(id, l.source.to_str().unwrap(), SHA, 1);
+        (id, staged)
+    }
+
+    /// Hub #3886: the guard lands where `installed_tool()` of the deployed `rsid`
+    /// and of the lander finds it (beside them, not in `~/.local/bin`), the
+    /// `install_dir` link follows, and the same holds for `rsi-eval`.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn members_deploy_beside_rsid_where_the_sibling_lookup_finds_them_3886() {
+        let l = layout(true);
+        std::fs::write(l.source.join("rsi-repo-guard"), b"new-guard").unwrap();
+        std::fs::write(l.source.join("rsi-eval"), b"new-eval").unwrap();
+        let (id, staged) = stage_layout(&l);
+        let manifest = staged.unwrap();
+        for name in ["rsi-repo-guard", "rsi-eval"] {
+            let entry = manifest.iter().find(|entry| entry.name == name).unwrap();
+            assert_eq!(Path::new(&entry.dest), l.real.join(name), "{name}");
+        }
+        swap_in(&manifest, id).unwrap();
+        let plan = l.service.stage_plan();
+        assert_eq!(plan.guard_unresolvable(&manifest, false), None);
+        assert_eq!(plan.member_unresolvable(&manifest), None);
+        // The lookup rsid and the lander each make from their own directory.
+        for consumer in ["rsid", "rsi-rolling-land"] {
+            let dir = std::fs::canonicalize(l.bin.join(consumer))
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            assert_eq!(
+                crate::repo_guard_call::installed_tool_in_home(&dir, l._dir.path()),
+                Ok(l.real.join("rsi-repo-guard")),
+                "{consumer}"
+            );
+        }
+        assert!(plan.link_members(&manifest, true).is_empty());
+        for name in ["rsi-repo-guard", "rsi-eval"] {
+            let link = l.bin.join(name);
+            assert!(
+                std::fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::canonicalize(&link).unwrap(),
+                std::fs::canonicalize(l.real.join(name)).unwrap()
+            );
+        }
+    }
+
+    /// Hub #3886: a build with no guard, installed nowhere, is refused at staging
+    /// with the named reason; a missing guard after the restart fails
+    /// verification with it too.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_build_whose_guard_would_not_resolve_is_refused_with_the_named_reason_3886() {
+        let l = layout(true);
+        let (_, staged) = stage_layout(&l);
+        let error = staged.unwrap_err().to_string();
+        assert!(
+            error.contains(rsi_common::agent_deploy::DEPLOY_GUARD_UNRESOLVABLE),
+            "{error}"
+        );
+        assert!(error.contains("rsi-repo-guard"), "{error}");
+        // A guard already installed beside rsid is enough; the build need not carry it.
+        std::fs::write(l.real.join("rsi-repo-guard"), b"old-guard").unwrap();
+        let (id, staged) = stage_layout(&l);
+        let manifest = staged.unwrap();
+        swap_in(&manifest, id).unwrap();
+        let plan = l.service.stage_plan();
+        assert_eq!(plan.guard_unresolvable(&manifest, false), None);
+        // The guard vanishes before verification: the deploy fails closed.
+        std::fs::remove_file(l.real.join("rsi-repo-guard")).unwrap();
+        let reason = plan.guard_unresolvable(&manifest, false).unwrap();
+        assert!(
+            reason.starts_with(rsi_common::agent_deploy::DEPLOY_GUARD_UNRESOLVABLE),
+            "{reason}"
+        );
+        // A plan that does not check the layout (fixtures) is never refused.
+        let lax = layout(false);
+        assert!(stage_layout(&lax).1.is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn staging_refuses_writable_guard_targets_and_redirected_install_dirs_3911() {
+        let l = layout(true);
+        let guard = l.real.join("rsi-repo-guard");
+        let operator_guard = l.bin.join("rsi-repo-guard");
+        std::fs::write(&operator_guard, b"operator-guard").unwrap();
+        std::os::unix::fs::symlink(&operator_guard, &guard).unwrap();
+        // The legitimate hand fix, with no guard in this build, still stages.
+        assert!(stage_layout(&l).1.is_ok());
+        std::fs::remove_file(&guard).unwrap();
+        let writable = l._dir.path().join(".rsi/sandboxes/worker/target/release");
+        std::fs::create_dir_all(&writable).unwrap();
+        let target = writable.join("rsi-repo-guard");
+        std::fs::write(&target, b"agent-guard").unwrap();
+        std::os::unix::fs::symlink(&target, &guard).unwrap();
+        let error = stage_layout(&l).1.unwrap_err().to_string();
+        assert!(error.contains(DEPLOY_GUARD_UNRESOLVABLE), "{error}");
+        assert!(error.contains("guard_untrusted_path"), "{error}");
+
+        // A planned guard must not bypass trust when the whole install
+        // directory resolves into writable storage, even without a file link.
+        std::fs::remove_file(&guard).unwrap();
+        let redirected = l._dir.path().join("agent-install");
+        std::fs::rename(&l.real, &redirected).unwrap();
+        std::os::unix::fs::symlink(&redirected, &l.real).unwrap();
+        std::fs::write(l.source.join("rsi-repo-guard"), b"new-guard").unwrap();
+        let error = stage_layout(&l).1.unwrap_err().to_string();
+        assert!(error.contains(DEPLOY_GUARD_UNRESOLVABLE), "{error}");
+        assert!(error.contains("guard_untrusted_path"), "{error}");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn restart_verification_accepts_operator_guard_and_rolls_back_writable_target_3911() {
+        for writable_target in [false, true] {
+            let l = layout(true);
+            let mut f = fixture(true);
+            // Reuse the deploy/store driver with a hermetic operator layout.
+            std::fs::write(l.real.join("rsid"), OLD).unwrap();
+            f.install = l.real.clone();
+            f.source = l.source.clone();
+            f.service.plan = l.service.stage_plan();
+            let operator_guard = l.bin.join("rsi-repo-guard");
+            std::fs::write(&operator_guard, b"operator-guard").unwrap();
+            let guard = l.real.join("rsi-repo-guard");
+            std::os::unix::fs::symlink(&operator_guard, &guard).unwrap();
+            let row = stage(&f, "verify-guard-trust", 900).await;
+            let mut gate = GateState::default();
+            let now = Utc::now();
+            for _ in 0..2 {
+                poll_once(&f.store, &f.service, now, &mut gate, &f.drain, true)
+                    .await
+                    .unwrap();
+            }
+            if writable_target {
+                let writable = l._dir.path().join(".rsi/sandboxes/worker/target/release");
+                std::fs::create_dir_all(&writable).unwrap();
+                let target = writable.join("rsi-repo-guard");
+                std::fs::write(&target, b"agent-guard").unwrap();
+                std::fs::remove_file(&guard).unwrap();
+                std::os::unix::fs::symlink(&target, &guard).unwrap();
+            }
+            let new_sha = binary_sha256(&f.install.join("rsid")).unwrap();
+            let outcome = verify_after_restart(&f.store, &f.service, SHA, Some(&new_sha), now)
+                .await
+                .unwrap();
+            let expected = if writable_target {
+                DeployState::Failed
+            } else {
+                DeployState::Succeeded
+            };
+            assert_eq!(outcome, Some(PollOutcome::Settled(row.id, expected)));
+            assert_eq!(installed(&f), if writable_target { OLD } else { NEW });
+            if writable_target {
+                let reason = f
+                    .store
+                    .lock()
+                    .await
+                    .get_agent_deploy(row.id)
+                    .unwrap()
+                    .unwrap()
+                    .reason
+                    .unwrap();
+                assert!(reason.contains(DEPLOY_GUARD_UNRESOLVABLE), "{reason}");
+                assert!(reason.contains("guard_untrusted_path"), "{reason}");
+            }
+        }
+    }
+
+    /// Hub #3886: the PM's hand symlink (`install/rsi-repo-guard` ->
+    /// `bin/rsi-repo-guard`, a regular file) is replaced by a regular file beside
+    /// rsid, and the stale file in `bin` becomes a link to it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn an_existing_hand_symlink_is_replaced_cleanly_3886() {
+        let l = layout(true);
+        std::fs::write(l.bin.join("rsi-repo-guard"), b"old-guard").unwrap();
+        std::os::unix::fs::symlink(l.bin.join("rsi-repo-guard"), l.real.join("rsi-repo-guard"))
+            .unwrap();
+        std::fs::write(l.source.join("rsi-repo-guard"), b"new-guard").unwrap();
+        let (id, staged) = stage_layout(&l);
+        let manifest = staged.unwrap();
+        let entry = manifest
+            .iter()
+            .find(|entry| entry.name == "rsi-repo-guard")
+            .unwrap();
+        assert_eq!(Path::new(&entry.dest), l.real.join("rsi-repo-guard"));
+        swap_in(&manifest, id).unwrap();
+        let beside = l.real.join("rsi-repo-guard");
+        assert!(
+            std::fs::symlink_metadata(&beside)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(std::fs::read(&beside).unwrap(), b"new-guard");
+        let plan = l.service.stage_plan();
+        assert!(plan.link_members(&manifest, true).is_empty());
+        let link = l.bin.join("rsi-repo-guard");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"new-guard");
+        assert_eq!(plan.guard_unresolvable(&manifest, false), None);
+        // Running it again changes nothing.
+        assert!(plan.link_members(&manifest, true).is_empty());
+    }
+
+    /// Hub #3886: a member an older staging daemon put in `bin` is linked beside
+    /// rsid after the restart, and a member that stays unlinked fails verification
+    /// with the named reason.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_member_installed_outside_rsids_directory_is_bridged_or_fails_verification_3886() {
+        let l = layout(true);
+        std::fs::write(l.real.join("rsi-repo-guard"), b"guard").unwrap();
+        std::fs::write(l.bin.join("rsi-eval"), b"eval").unwrap();
+        let entry = |name: &str, dest: PathBuf, body: &[u8]| {
+            use sha2::Digest;
+            DeployBinaryV1 {
+                name: name.to_string(),
+                dest: dest.to_string_lossy().into_owned(),
+                sha256: hex::encode(sha2::Sha256::digest(body)),
+                prior_present: false,
+                staged_identity: None,
+            }
+        };
+        let manifest = vec![
+            entry("rsid", l.real.join("rsid"), b"old"),
+            entry("rsi-eval", l.bin.join("rsi-eval"), b"eval"),
+        ];
+        let plan = l.service.stage_plan();
+        let reason = plan.member_unresolvable(&manifest).unwrap();
+        assert!(
+            reason.starts_with(rsi_common::agent_deploy::DEPLOY_MEMBER_UNRESOLVABLE),
+            "{reason}"
+        );
+        assert!(reason.contains("rsi-eval"), "{reason}");
+        assert!(plan.link_members(&manifest, false).is_empty());
+        assert_eq!(plan.member_unresolvable(&manifest), None);
+        assert_eq!(
+            std::fs::canonicalize(l.real.join("rsi-eval")).unwrap(),
+            std::fs::canonicalize(l.bin.join("rsi-eval")).unwrap()
+        );
+        // A different regular file already beside rsid is never overwritten.
+        std::fs::remove_file(l.real.join("rsi-eval")).unwrap();
+        std::fs::write(l.real.join("rsi-eval"), b"someone else's").unwrap();
+        let failed = plan.link_members(&manifest, false);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(
+            std::fs::read(l.real.join("rsi-eval")).unwrap(),
+            b"someone else's"
+        );
+        assert!(plan.member_unresolvable(&manifest).is_some());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
@@ -2224,6 +3290,60 @@ mod tests {
         assert!(!tools.join("cargo-slot").exists());
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_missing_rsid_member_is_refused_naming_the_member_and_directory() {
+        let f = fixture(true);
+        std::fs::remove_file(f.source.join("rsid")).unwrap();
+        let error = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(DEPLOY_BINARY_MISSING), "{error}");
+        assert!(error.contains("member rsid"), "{error}");
+        assert!(error.contains(f.source.to_str().unwrap()), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_member_failing_its_syntax_check_is_refused_naming_member_step_and_reason() {
+        let (f, _tools) = fixture_with_tools_dir();
+        std::fs::write(f.source.join("target-pool"), b"#!/bin/sh\nif then\n").unwrap();
+        let error = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(DEPLOY_STAGE_FAILED), "{error}");
+        assert!(error.contains("member target-pool"), "{error}");
+        assert!(error.contains("syntax check failed"), "{error}");
+        assert!(error.contains("sh -n exited"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_script_with_an_unsupported_shebang_is_refused_not_run_as_another_language() {
+        let (f, _tools) = fixture_with_tools_dir();
+        std::fs::write(
+            f.source.join("target-pool"),
+            b"#!/usr/bin/env ruby\nputs 1\n",
+        )
+        .unwrap();
+        let error = f
+            .service
+            .stage_plan()
+            .stage_binaries(Uuid::new_v4(), f.source.to_str().unwrap(), SHA, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("member target-pool"), "{error}");
+        assert!(error.contains("unsupported script interpreter"), "{error}");
+    }
+
     #[cfg(unix)]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
@@ -2244,16 +3364,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn an_unparseable_tool_script_is_refused_and_leaves_nothing_staged() {
-        let python = std::process::Command::new("python3")
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success());
         let broken: &[(&str, &[u8])] =
-            &[("cargo-slot", b"if then\n"), ("target-pool", b"def (:\n")];
+            &[("cargo-slot", b"if then\n"), ("target-pool", b"if then\n")];
         for (name, body) in broken {
-            if *name == "target-pool" && !python {
-                continue;
-            }
             let (f, tools) = fixture_with_tools_dir();
             std::fs::write(f.source.join(name), body).unwrap();
             let error = f
@@ -2368,14 +3481,14 @@ mod tests {
         assert!(f.drain.holds(other, true), "held inside the window");
         let status = f.drain.status();
         assert!(status.draining && status.waiting);
-        let release_by = DateTime::parse_from_rfc3339(status.release_by.as_deref().unwrap())
-            .unwrap()
-            .with_timezone(&Utc);
+        // Worker starts are released by the window, not the 3600 s deadline;
+        // new test/build jobs stay held to the deadline (#3373).
         assert!(
-            release_by <= start + ChronoDuration::seconds(61),
-            "released by the window, not the {}s deadline: {release_by}",
-            3600
+            !f.drain
+                .holds_at(other, true, start + ChronoDuration::seconds(61)),
+            "worker hold released by the window"
         );
+        assert_eq!(f.drain.job_release_by(), Some(row.deadline_at));
 
         // Past the window: still waiting on the worker, nothing held.
         let past = start + ChronoDuration::seconds(120);
@@ -2385,7 +3498,11 @@ mod tests {
         assert_eq!(unheld, PollOutcome::Waiting(vec!["worker_mid_turn"]));
         assert!(!f.drain.holds(other, true), "launches run past the window");
         let status = f.drain.status();
-        assert!(!status.draining);
+        assert!(
+            status.draining,
+            "only the new-job hold (#3373) remains past the worker window"
+        );
+        assert!(f.drain.holds_job_start(other, true));
         assert!(status.waiting, "the deploy still waits for a lull");
         assert_eq!(status.deploy_id, Some(row.id));
         assert_eq!(status.blockers, vec!["worker_mid_turn".to_string()]);
@@ -2473,7 +3590,7 @@ mod tests {
                 .execute(
                     "INSERT INTO agent_jobs(id, owner_session_id, kind, params_json, cwd, \
                      unit_name, log_path, status_path, state, created_at, row_version) \
-                     VALUES (?1,?2,'test','{}','/tmp','u','/tmp/l','/tmp/s','running',?3,1)",
+                     VALUES (?1,?2,'build','{}','/tmp','u','/tmp/l','/tmp/s','running',?3,1)",
                     rusqlite::params![
                         Uuid::new_v4().to_string(),
                         f.owner.to_string(),
@@ -2523,12 +3640,15 @@ mod tests {
         };
         insert("cloud_sweep");
         insert("cloud_gate");
+        // #3181: a benchmark run lasts hours in its own unit; a deploy never waits
+        // on it (the trials a restart interrupts are rerun once).
+        insert("bench");
         assert_eq!(
             poll_once(&f.store, &f.service, now, &mut gate, &f.drain, true)
                 .await
                 .unwrap(),
             PollOutcome::Waiting(vec![]),
-            "running cloud jobs are not blockers"
+            "running cloud and bench jobs are not blockers"
         );
         assert!(f.drain.status().blockers.is_empty());
         assert_eq!(gate.quiet_polls, 1);
@@ -2798,7 +3918,26 @@ mod tests {
         let w2 = worker_mid_turn(&f).await;
         let mut expected = vec![w1, w2];
         expected.sort();
-        let row = stage_with(&f, "interrupt", 3600, true).await;
+        let request: rsi_common::agent_deploy::AgentRequestDeployRequestV1 =
+            serde_json::from_value(serde_json::json!({
+                "sha": SHA, "binaries_dir": f.source, "idempotency_key": "interrupt",
+                "peer_id": Uuid::new_v4(), "max_wait_secs": 3600
+            }))
+            .unwrap();
+        let row = stage_with(&f, "interrupt", 3600, request.interrupts_workers()).await;
+        {
+            let store = f.store.lock().await;
+            let receipt = crate::session::deploy_verb::receipt_with_blockers(
+                &store,
+                &row,
+                store.agent_deploy_interrupt(row.id).unwrap(),
+                false,
+            )
+            .unwrap();
+            let mut predicted = receipt.expected_interrupted_workers;
+            predicted.sort();
+            assert_eq!(predicted, expected);
+        }
         f.drain.set_hold_cap_secs(60);
         let mut gate = GateState::default();
         let start = Utc::now();
@@ -2881,7 +4020,13 @@ mod tests {
     async fn without_interrupt_workers_a_worker_mid_turn_blocks_past_the_hold() {
         let f = fixture(true);
         worker_mid_turn(&f).await;
-        let row = stage(&f, "plain", 3600).await;
+        let request: rsi_common::agent_deploy::AgentRequestDeployRequestV1 =
+            serde_json::from_value(serde_json::json!({
+                "sha": SHA, "binaries_dir": f.source, "idempotency_key": "plain",
+                "peer_id": Uuid::new_v4(), "interrupt_workers": false
+            }))
+            .unwrap();
+        let row = stage_with(&f, "plain", 3600, request.interrupts_workers()).await;
         f.drain.set_hold_cap_secs(60);
         let mut gate = GateState::default();
         let past = Utc::now() + ChronoDuration::seconds(120);
@@ -2899,9 +4044,44 @@ mod tests {
         );
     }
 
-    /// #1461: only workers stop blocking. A landing in progress and a running
-    /// local job still hold the deploy back past the hold, so a landing or a
-    /// test/build run is never cut off.
+    /// #3373: a staged deploy that does not interrupt workers still needs the
+    /// running jobs to drain, so it holds new `test`/`build` job starts to its
+    /// deadline, past the worker-start hold cap, with no retry window; with the
+    /// drain setting off nothing is held, and a cancel releases the hold.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn a_staged_deploy_without_interrupt_workers_holds_new_jobs_past_the_worker_hold() {
+        for enabled in [true, false] {
+            let f = fixture(true);
+            worker_mid_turn(&f).await;
+            let row = stage_with(&f, "plain-jobs", 3600, false).await;
+            f.drain.set_hold_cap_secs(60);
+            let mut gate = GateState::default();
+            let past = Utc::now() + ChronoDuration::seconds(120);
+            let worker = Some(Uuid::new_v4());
+            for _ in 0..3 {
+                assert_eq!(
+                    poll_at(&f, &mut gate, past, enabled).await,
+                    PollOutcome::Waiting(vec!["worker_mid_turn"])
+                );
+            }
+            assert!(!f.drain.holds(worker, true), "the worker hold is over");
+            assert_eq!(f.drain.holds_job_start_at(worker, true, past), enabled);
+            assert_eq!(
+                f.drain.holds_job_start_at(Some(f.owner), false, past),
+                enabled,
+                "the deploy's own caller is held too"
+            );
+            assert_eq!(f.drain.job_release_by(), enabled.then_some(row.deadline_at));
+            // No retry window: the hold ends at the deadline.
+            assert!(!f.drain.holds_job_start_at(worker, true, row.deadline_at));
+            f.drain.release(row.id);
+            assert!(!f.drain.holds_job_start_at(worker, true, past));
+        }
+    }
+
+    /// A landing and a local build job still block the runner past the hold; an
+    /// ordinary test job does not (#3554: it survives the restart).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn interrupt_workers_still_waits_for_a_landing_and_a_local_job() {
@@ -3720,6 +4900,332 @@ mod tests {
                 .check_budget(&store, now + ChronoDuration::hours(2))
                 .unwrap();
         }
+    }
+
+    fn admission_service_reading(f: &Fixture, published: &str) -> DeployService {
+        let path = f._dir.path().join("supervisor-restarts");
+        std::fs::write(&path, published).unwrap();
+        DeployService::new(
+            f.install.clone(),
+            vec![f._dir.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        )
+        .with_supervisor_restarts(path)
+    }
+
+    /// #3492: crash and watchdog restarts spend the same supervisor budget as
+    /// deploys, so admission reads them from the supervisor's published file
+    /// and refuses the deploy the supervisor would back off or refuse.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn deploy_admission_counts_supervisor_crash_restarts_3492() {
+        let f = fixture(true);
+        let now = Utc::now();
+        let at = now.timestamp();
+        let store = f.store.lock().await;
+        // limit=3 (two deploys per hour + the rollback slot): one crash leaves
+        // room for a deploy, two crashes take the room a deploy needs.
+        let one_crash =
+            admission_service_reading(&f, &format!("limit=3\nwindow=3600\nrestart={}\n", at - 120));
+        one_crash.check_budget(&store, now).unwrap();
+        let two_crashes = admission_service_reading(
+            &f,
+            &format!(
+                "limit=3\nwindow=3600\nrestart={}\nrestart={}\n",
+                at - 600,
+                at - 120
+            ),
+        );
+        let error = two_crashes
+            .check_budget(&store, now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(DEPLOY_RESTART_BUDGET), "{error}");
+        // The refusal names when the oldest restart leaves the window.
+        let frees = DateTime::from_timestamp(at - 600 + 3600, 0)
+            .unwrap()
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert!(
+            error.ends_with(&format!("{DEPLOY_RETRY_AFTER_MARKER}{frees}")),
+            "{error} vs {frees}"
+        );
+        // Once the older crash left the window the deploy is admitted again.
+        two_crashes
+            .check_budget(&store, now + ChronoDuration::seconds(3100))
+            .unwrap();
+    }
+
+    /// #3492: deploys then a crash inside one window: the supervisor holds the
+    /// spent budget, so a further deploy is refused until the window frees.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[tokio::test]
+    async fn deploy_admission_refuses_after_deploys_then_a_crash_and_during_backoff_3492() {
+        let f = fixture(true);
+        let now = Utc::now();
+        let at = now.timestamp();
+        let store = f.store.lock().await;
+        // Two deploys and one crash: all of limit=3, though the store holds no deploy.
+        let spent = admission_service_reading(
+            &f,
+            &format!(
+                "limit=3\nwindow=3600\nrestart={}\nrestart={}\nrestart={}\n",
+                at - 900,
+                at - 600,
+                at - 30
+            ),
+        );
+        let error = spent.check_budget(&store, now).unwrap_err().to_string();
+        assert!(error.contains(DEPLOY_RESTART_BUDGET), "{error}");
+        // The supervisor waiting out an exhausted budget refuses until it restarts.
+        let backing_off = admission_service_reading(
+            &f,
+            &format!("limit=3\nwindow=3600\nbackoff_until={}\n", at + 300),
+        );
+        let error = backing_off
+            .check_budget(&store, now)
+            .unwrap_err()
+            .to_string();
+        let until = DateTime::from_timestamp(at + 300, 0)
+            .unwrap()
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert!(
+            error.ends_with(&format!("{DEPLOY_RETRY_AFTER_MARKER}{until}")),
+            "{error}"
+        );
+        // No supervisor file: only the recorded deploys count, as before.
+        DeployService::new(
+            f.install.clone(),
+            vec![f._dir.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        )
+        .with_supervisor_restarts(f._dir.path().join("absent"))
+        .check_budget(&store, now)
+        .unwrap();
+    }
+
+    /// Write `<stage>/MANIFEST.sha256` the way `install-release.sh` does: one
+    /// `<sha256>  <name>` line per plain file, sorted.
+    fn write_stage_manifest(stage: &Path) {
+        let mut lines: Vec<String> = std::fs::read_dir(stage)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != STAGE_MANIFEST_NAME)
+            .map(|name| format!("{}  {name}", binary_sha256(&stage.join(&name)).unwrap()))
+            .collect();
+        lines.sort();
+        std::fs::write(stage.join(STAGE_MANIFEST_NAME), lines.join("\n") + "\n").unwrap();
+    }
+
+    /// hub #3856: a stage holding one skipped member, with `rsid` installed.
+    fn upgrade_member_fixture(root: &Path) -> (StagePlan, PathBuf, PathBuf) {
+        let (install, stage) = (root.join("install"), root.join("stage"));
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(install.join("rsid"), NEW).unwrap();
+        std::fs::write(stage.join("rsid"), NEW).unwrap();
+        std::fs::write(stage.join("rsi-eval"), b"fresh-eval").unwrap();
+        let service = DeployService::new(
+            install.clone(),
+            vec![root.to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        );
+        (service.stage_plan(), install, stage)
+    }
+
+    /// hub #3856: a skipped member altered after the stage manifest was written
+    /// is not installed, and the reason names it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn upgrade_completion_refuses_a_skipped_member_altered_after_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, install, stage) = upgrade_member_fixture(root.path());
+        write_stage_manifest(&stage);
+        std::fs::write(stage.join("rsi-eval"), b"tampered-eval").unwrap();
+        let report = plan.complete_upgrade_members(&stage, &[], Uuid::new_v4());
+        assert!(report.installed.is_empty());
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, "rsi-eval");
+        assert!(report.failed[0].1.contains("MANIFEST.sha256"), "{report:?}");
+        assert!(!install.join("rsi-eval").exists());
+        let note = report.note().expect("a note");
+        assert!(
+            note.contains("PARTIAL INSTALL") && note.contains("rsi-eval"),
+            "{note}"
+        );
+    }
+
+    /// hub #3856: a skipped member the stage manifest does not list, or a stage
+    /// with no manifest at all, installs nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn upgrade_completion_refuses_a_skipped_member_without_a_manifest_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, install, stage) = upgrade_member_fixture(root.path());
+        write_stage_manifest(&stage);
+        let manifest = std::fs::read_to_string(stage.join(STAGE_MANIFEST_NAME)).unwrap();
+        let without: String = manifest
+            .lines()
+            .filter(|line| !line.ends_with("  rsi-eval"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(stage.join(STAGE_MANIFEST_NAME), without).unwrap();
+        let report = plan.complete_upgrade_members(&stage, &[], Uuid::new_v4());
+        assert!(report.installed.is_empty());
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].0, "rsi-eval");
+        assert!(!install.join("rsi-eval").exists());
+
+        std::fs::remove_file(stage.join(STAGE_MANIFEST_NAME)).unwrap();
+        let report = plan.complete_upgrade_members(&stage, &[], Uuid::new_v4());
+        assert!(report.installed.is_empty());
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(!install.join("rsi-eval").exists());
+    }
+
+    /// hub #3856: a member that matches its manifest entry still installs.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn upgrade_completion_installs_a_skipped_member_that_matches_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let (plan, install, stage) = upgrade_member_fixture(root.path());
+        write_stage_manifest(&stage);
+        let report = plan.complete_upgrade_members(&stage, &[], Uuid::new_v4());
+        assert_eq!(report.installed, vec!["rsi-eval".to_string()]);
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(
+            std::fs::read(install.join("rsi-eval")).unwrap(),
+            b"fresh-eval"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn stage_manifest_parser_reads_text_and_binary_lines_and_rejects_garbage() {
+        let digest = "ab".repeat(32);
+        let parsed =
+            parse_stage_manifest(&format!("{digest}  rsi-eval\n{digest} *rsi-cloud\n\n")).unwrap();
+        assert_eq!(parsed.get("rsi-eval"), Some(&digest));
+        assert_eq!(parsed.get("rsi-cloud"), Some(&digest));
+        assert!(parse_stage_manifest("nothex  rsi-eval\n").is_err());
+        assert!(parse_stage_manifest(&format!("{digest}\n")).is_err());
+    }
+
+    /// #587: a stage built by a daemon that knew fewer members still reaches
+    /// the host. The new daemon installs a plain member the manifest skipped,
+    /// beside the resolved `rsid` with an `install_dir` link, hash-verified.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_verified_deploy_installs_a_member_the_old_inventory_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let (real, links, staging) = (
+            root.path().join("install"),
+            root.path().join("bin"),
+            root.path().join("staging"),
+        );
+        let stage = staging.join(format!("bin-{}", &SHA[..9]));
+        for dir in [&real, &links, &stage] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(real.join("rsid"), NEW).unwrap();
+        std::os::unix::fs::symlink(real.join("rsid"), links.join("rsid")).unwrap();
+        std::fs::write(stage.join("rsid"), NEW).unwrap();
+        std::fs::write(stage.join("rsi-known-failure"), b"known-failure-bin").unwrap();
+        // Not a member of the allowlist: never installed.
+        std::fs::write(stage.join("rsi-stray"), b"stray").unwrap();
+        write_stage_manifest(&stage);
+        let service = DeployService::new(
+            links.clone(),
+            vec![root.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        )
+        .with_staging_root(staging.clone());
+        let manifest = vec![DeployBinaryV1 {
+            name: "rsid".to_string(),
+            dest: real.join("rsid").to_string_lossy().into_owned(),
+            sha256: binary_sha256(&stage.join("rsid")).unwrap(),
+            prior_present: true,
+            staged_identity: None,
+        }];
+        let row = DeployRow {
+            id: Uuid::new_v4(),
+            owner_session_id: None,
+            sha: SHA.to_string(),
+            manifest,
+            state: DeployState::Restarting,
+            reason: None,
+            deadline_at: Utc::now(),
+            operator: false,
+            forced: false,
+        };
+        let note = service.complete_upgrade_members(&row).expect("a note");
+        assert!(note.contains("installed new members"), "{note}");
+        assert!(note.contains("rsi-known-failure"), "{note}");
+        let installed = real.join("rsi-known-failure");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"known-failure-bin");
+        assert_eq!(
+            std::fs::metadata(&installed).unwrap().permissions().mode() & 0o111,
+            0o111
+        );
+        assert_eq!(
+            std::fs::canonicalize(links.join("rsi-known-failure")).unwrap(),
+            std::fs::canonicalize(&installed).unwrap()
+        );
+        assert!(!real.join("rsi-stray").exists() && !links.join("rsi-stray").exists());
+        // Already current: a second pass changes nothing and files no note.
+        assert_eq!(service.complete_upgrade_members(&row), None);
+    }
+
+    /// #587: a stale copy of a skipped member is replaced; a member the
+    /// manifest carried is never touched by the completion pass.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn upgrade_completion_replaces_a_stale_member_and_leaves_manifest_members_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let (install, stage) = (root.path().join("install"), root.path().join("stage"));
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(install.join("rsid"), OLD).unwrap();
+        std::fs::write(install.join("rsi-eval"), b"stale-eval").unwrap();
+        std::fs::write(install.join("rsi-remote"), b"installed-remote").unwrap();
+        std::fs::write(stage.join("rsid"), NEW).unwrap();
+        std::fs::write(stage.join("rsi-eval"), b"fresh-eval").unwrap();
+        std::fs::write(stage.join("rsi-remote"), b"staged-remote").unwrap();
+        write_stage_manifest(&stage);
+        let service = DeployService::new(
+            install.clone(),
+            vec![root.path().to_path_buf()],
+            Box::new(|| true),
+            Arc::new(|_: &Path| Ok((SHA.to_string(), 999))),
+        );
+        let manifest = vec![DeployBinaryV1 {
+            name: "rsi-remote".to_string(),
+            dest: install.join("rsi-remote").to_string_lossy().into_owned(),
+            sha256: binary_sha256(&stage.join("rsi-remote")).unwrap(),
+            prior_present: true,
+            staged_identity: None,
+        }];
+        let report =
+            service
+                .stage_plan()
+                .complete_upgrade_members(&stage, &manifest, Uuid::new_v4());
+        assert_eq!(report.installed, vec!["rsi-eval".to_string()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            std::fs::read(install.join("rsi-eval")).unwrap(),
+            b"fresh-eval"
+        );
+        assert_eq!(std::fs::read(install.join("rsid")).unwrap(), OLD);
+        assert_eq!(
+            std::fs::read(install.join("rsi-remote")).unwrap(),
+            b"installed-remote"
+        );
     }
 
     /// #2681: a verified deploy prunes the old `bin-<sha>` staging directories

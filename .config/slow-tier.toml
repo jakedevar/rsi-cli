@@ -14,7 +14,7 @@
 #     these tests, so every profile that inherits it (rsid-fast, test-timings,
 #     the default profile) skips them. It is generated from `tests` below:
 #         python3 scripts/check-touched-shards --write-slow-tier-filter
-#     and scripts/tests/test_slow_tier.py fails on drift.
+#     and the rsi-repo-guards test module `touched_shards::slow_checkout_tests` fails on drift.
 #   * `ci-full` and `rsid-qa` set `default-filter = "all()"`, and the full QA
 #     (`make rolling-library-qa`, scripts/run-rolling-qa.py) runs the slow tier.
 #   * scripts/check-touched-shards decides mechanically, per candidate diff,

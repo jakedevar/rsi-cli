@@ -7,16 +7,18 @@
 import { invoke } from './api.js';
 import { copyText, dispatch, type Invocation } from './commands.js';
 import { $, el, toast } from './dom.js';
+import { focusInside, focusStranded, keepFocus, landFocus } from './focus-return.js';
 import { select, setView } from './sessions.js';
 import { projectName, state, uiChanged } from './state.js';
 import {
-  type PopupState, type TodoItem, TODO_REFRESH_MS, TodoPanel, NO_ITEM, NOTHING_TO_UNDO, ageLabel, badgeText,
-  closeTarget, closeToast, copiedMessage, linkLabel, parseLink, parseTodoItem, parseTodoList, popupKey,
+  type PopupState, type TodoItem, TODO_DRAWER_QUERY, TODO_REFRESH_MS, TodoPanel, NO_ITEM, NOTHING_TO_UNDO, ageLabel, badgeText,
+  closeTarget, closeToast, copiedMessage, drawerEscape, drawerReturnTarget, initialPanelOpen, linkLabel, parseLink, parseTodoItem, parseTodoList, popupKey,
   priorityLabel, sourceLabel, UNDO_WINDOW_SECS,
 } from './todo-model.js';
 import { dialogEl, focusDialog, overlayKey } from './actions/detail.js';
 import type { TodoActionId, TodoSnapshot } from './actions/todo.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
 
 const STORE_KEY = 'rsi-desktop.todo';
 
@@ -35,13 +37,13 @@ const CSS = `
 .todo-urgent { color: var(--yellow); margin-right: 4px; }
 .todo-tag { color: var(--green); font-size: 11px; margin-left: 4px; }
 .todo-how { font-family: var(--mono); font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-all; max-height: 3em; overflow: hidden; margin-top: 2px; }
-.todo-how::before { content: "$ "; color: var(--overlay0); }
-.todo-meta { font-size: 11px; color: var(--overlay0); margin-top: 2px; }
-.todo-empty { padding: 10px; color: var(--overlay0); }
+.todo-how::before { content: "$ "; color: var(--muted); }
+.todo-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.todo-empty { padding: 10px; color: var(--muted); }
 .todo-closed-head { margin: 8px 8px 4px; color: var(--green); font-weight: 700; font-size: 12px; }
 .todo-closed { padding: 2px 8px; color: var(--green); font-size: 12px; }
-.todo-foot { padding: 6px 10px; border-top: 1px solid var(--surface0); font-size: 11px; color: var(--overlay0); }
-.todo-badge { cursor: pointer; font-size: 12px; color: var(--overlay0); padding: 2px 6px; border-radius: 4px; }
+.todo-foot { padding: 6px 10px; border-top: 1px solid var(--surface0); font-size: 11px; color: var(--muted); }
+.todo-badge { cursor: pointer; font-size: 12px; color: var(--muted); padding: 2px 6px; border-radius: 4px; }
 .todo-badge.news { color: var(--yellow); font-weight: 700; }
 .todo-badge[hidden] { display: none; }
 .todo-popup { width: min(720px, 92vw); }
@@ -51,6 +53,8 @@ const CSS = `
 .todo-confirm { color: var(--yellow); font-weight: 700; min-height: 18px; margin-bottom: 6px; }
 `;
 
+/** The open choice that is stored: what the operator last chose, which a narrow launch (drawer closed) does not overwrite. */
+let rememberedOpen = false;
 const panel = loadPanel();
 let reading = false;
 /** Bumped to drop a read that started before a reopen (it would hide the item again). */
@@ -67,14 +71,16 @@ function loadPanel(): TodoPanel {
   try {
     const raw = storage()?.getItem(STORE_KEY);
     const o = raw ? JSON.parse(raw) as { open?: unknown; lastVisit?: unknown } : {};
-    return new TodoPanel(o.open === true, typeof o.lastVisit === 'number' ? o.lastVisit : null);
+    rememberedOpen = o.open === true;
+    // A narrow window starts with the drawer closed; the remembered choice stays stored for the next wide launch.
+    return new TodoPanel(initialPanelOpen(o.open, isDrawer()), typeof o.lastVisit === 'number' ? o.lastVisit : null);
   } catch {
     return new TodoPanel();
   }
 }
 
 function persist(): void {
-  try { storage()?.setItem(STORE_KEY, JSON.stringify({ open: panel.open, lastVisit: panel.lastVisitMs })); } catch { /* private mode */ }
+  try { storage()?.setItem(STORE_KEY, JSON.stringify({ open: rememberedOpen, lastVisit: panel.lastVisitMs })); } catch { /* private mode */ }
 }
 
 export function todoSnapshot(): TodoSnapshot {
@@ -118,6 +124,7 @@ function itemRow(item: TodoItem, now: number, isSel: boolean): HTMLLIElement {
   const li = el('li', `todo-item${isSel ? ' sel' : ''}${panel.isNew(item) ? ' new' : ''}`);
   li.setAttribute('role', 'option');
   li.setAttribute('aria-selected', String(isSel));
+  li.dataset.key = item.id;
   const title = el('div', 'todo-title');
   if (item.priority <= 2) title.append(el('span', 'todo-urgent', '!'));
   title.append(document.createTextNode(item.title));
@@ -152,7 +159,8 @@ function render(): void {
     const hide = el('button', 'btn', 'Hide');
     hide.type = 'button';
     hide.addEventListener('click', () => toggle());
-    ui.head.replaceChildren(...parts, el('span', 'spacer'), ack, hide);
+    // Caught up and Hide are rebuilt on every refresh: a keyboard user on one keeps it (local #297).
+    keepFocus(ui.head, () => ui!.head.replaceChildren(...parts, el('span', 'spacer'), ack, hide));
     const sel = panel.selected()?.id;
     const rows: HTMLElement[] = panel.items().map((i) => itemRow(i, now, i.id === sel));
     if (rows.length === 0) rows.push(el('li', 'todo-empty', panel.loaded() ? 'Nothing needs you.' : 'Loading…'));
@@ -163,6 +171,8 @@ function render(): void {
     }
     ui.list.replaceChildren(...rows);
     ui.list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    // The drawer holds focus on the aside, a column holds none: the aside announces the selected item (local #318).
+    syncListbox(ui.list, ui.aside);
     renderFoot(now);
   }
   popupRedraw?.();
@@ -176,11 +186,44 @@ function renderFoot(now: number): void {
     : '<Space>dj/dk move · dv open · dd done · dx dismiss · dy copy · do link';
 }
 
+/** Whether the panel is a drawer over the session pane (a narrow window) rather than a column (local #291). */
+function isDrawer(): boolean {
+  return typeof window.matchMedia === 'function' && window.matchMedia(TODO_DRAWER_QUERY).matches;
+}
+
+/** Where focus was when the drawer opened, so closing it puts focus back there. */
+let drawerFrom: Element | null = null;
+
 function toggle(): void {
+  const held = !!ui && focusInside(ui.aside);
   panel.open = !panel.open;
+  rememberedOpen = panel.open;
   persist();
   render();
   uiChanged();
+  if (!ui || !isDrawer()) { drawerFrom = null; return; }
+  if (panel.open) {
+    // The drawer takes focus so Esc closes it; the key layer sees the aside, not a text field, so the Vim keys still work.
+    drawerFrom = document.activeElement;
+    ui.aside.focus({ preventScroll: true });
+  } else {
+    const back = drawerReturnTarget<Element>(drawerFrom, (e) => e.isConnected && e.checkVisibility(), (e) => ui!.aside.contains(e));
+    drawerFrom = null;
+    if (back instanceof HTMLElement) back.focus({ preventScroll: true });
+  }
+  // Hide pressed on a column (or a drawer opened from nowhere): the panel and its focus are gone; never leave focus on the page.
+  if (held && !panel.open && focusStranded()) landFocus(['session-list']);
+}
+
+/** Esc closes the open drawer, from inside it or from nowhere in particular; a dialog or a field keeps its own Esc. */
+function onDrawerEscape(ev: KeyboardEvent): void {
+  if (!ui || ev.defaultPrevented) return;
+  const t = ev.target instanceof Element ? ev.target : null;
+  const free = !t || t === document.body || t === document.documentElement || ui.aside.contains(t);
+  const dialogOpen = !!document.querySelector('dialog[open]');
+  if (!free || drawerEscape({ drawer: isDrawer(), open: panel.open, dialogOpen, key: ev.key }) !== 'close') return;
+  ev.preventDefault();
+  toggle();
 }
 
 function move(delta: number): void {
@@ -346,17 +389,18 @@ export function initTodo(): void {
   style.id = 'todo-style';
   style.textContent = CSS;
   document.head.append(style);
-  const aside = el('aside', 'todo-panel');
+  const aside = el('aside', 'todo-panel focus-pane');
   aside.id = 'todo-panel';
   aside.setAttribute('aria-label', 'Operator to-do');
+  aside.tabIndex = -1; // a drawer takes focus when it opens (local #291)
   const head = el('div', 'todo-head');
   const list = el('ul', 'todo-list');
-  list.setAttribute('role', 'listbox');
   list.setAttribute('aria-label', 'Open to-do items');
   const foot = el('div', 'todo-foot');
   foot.dataset.keyHint = ''; // the leader-key footer follows the Vim keys switch (key-hints.ts)
   aside.append(head, list, foot);
   document.querySelector('.layout')?.append(aside);
+  document.addEventListener('keydown', onDrawerEscape);
   const badge = el('span', 'todo-badge');
   badge.id = 'todo-badge';
   badge.addEventListener('click', () => toggle());

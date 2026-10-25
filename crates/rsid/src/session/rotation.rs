@@ -387,7 +387,7 @@ fn failed_rotation_successor(
 async fn should_suppress_final_handoff(
     session_id: Uuid,
     completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) -> Result<bool> {
     let (parent_id, final_handoff) = {
         let completed_guard = completed.read().await;
@@ -930,7 +930,7 @@ fn install_rotation_pre_restore_mutation_for_test(
 async fn apply_rotation_pre_restore_mutation_for_test(
     child_id: Uuid,
     parent_id: Uuid,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) {
     let mutation = rotation_pre_restore_mutations()
         .lock()
@@ -1002,7 +1002,7 @@ fn schedule_prepared_rotation_retry(
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
     event_bus: Arc<crate::bus::EventBus>,
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
     persistence: PersistenceHandle,
     context_rotation_enabled: bool,
@@ -1075,7 +1075,7 @@ fn schedule_prepared_rotation_retry(
 }
 
 async fn preflight_rotation_lead_transfer(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     parent_id: Uuid,
 ) -> Result<Vec<Uuid>> {
     let store = Arc::clone(store);
@@ -1091,7 +1091,7 @@ async fn preflight_rotation_lead_transfer(
 async fn revoke_transferred_rotation_predecessor_after_failure(
     disposition: RotationCustodyDisposition,
     parent_id: Uuid,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     agent_tokens: &Arc<RwLock<super::AgentTokenRegistry>>,
 ) {
     if disposition != RotationCustodyDisposition::Transferred {
@@ -1281,7 +1281,7 @@ impl SessionManager {
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
         persistence: &PersistenceHandle,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) {
         let recorded = if disposition == RotationCustodyDisposition::Transferred {
             let store = store.lock().await;
@@ -1343,7 +1343,7 @@ impl SessionManager {
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
         persistence: &PersistenceHandle,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) {
         Box::pin(Self::record_rotation_refusal_with_notice(
             session_id,
@@ -1366,7 +1366,7 @@ impl SessionManager {
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
         persistence: &PersistenceHandle,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         quarantined_successor: Option<Uuid>,
     ) {
         let generated_rotation_id;
@@ -1463,7 +1463,7 @@ impl SessionManager {
         disposition: &str,
         recovery: &str,
         event_bus: &Arc<crate::bus::EventBus>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) {
         let result = store.lock().await.record_manager_rotation_failure_notice(
             session_id,
@@ -1496,7 +1496,7 @@ impl SessionManager {
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
         persistence: &PersistenceHandle,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> bool {
         let refusal = completed.read().await.get(&session_id).and_then(|turn| {
             runtime_config.launch_model_refusal(
@@ -1534,7 +1534,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         context_rotation_enabled: bool,
@@ -1902,7 +1902,7 @@ impl SessionManager {
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
         persistence: &PersistenceHandle,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> bool {
         let hold = store
             .lock()
@@ -1933,7 +1933,7 @@ impl SessionManager {
         session_id: Uuid,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: &Arc<crate::bus::EventBus>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         persistence: &PersistenceHandle,
     ) -> bool {
         let protection = store.lock().await.automatic_rotation_protection(session_id);
@@ -1961,7 +1961,7 @@ impl SessionManager {
         handoff_filepath: Option<&str>,
         rotation_id: Option<&str>,
         completed: &Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         persistence: &PersistenceHandle,
     ) -> bool {
         match should_suppress_final_handoff(session_id, completed, store).await {
@@ -2024,7 +2024,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         context_rotation_enabled: bool,
@@ -2382,6 +2382,9 @@ impl SessionManager {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
         config.completion_gates =
             match super::completion_gates_launch::resolve_launch_completion_gates(
@@ -2512,6 +2515,23 @@ impl SessionManager {
             None,
         )
         .await;
+        // #3176: the rotated session keeps its container binding (re-validated),
+        // or the launch below fails like any definite spawn error; it never
+        // rotates onto the host.
+        let custom_provider_gate =
+            super::custom_provider_launch::restore(&store, &mut config).await;
+        let exec_gate = super::exec_target_launch::resolve_launch_exec_target(
+            &store,
+            &runtime_config,
+            session_id,
+            completed_session.session.continued_from,
+            &rsi_common::exec_target::ExecTarget::Host,
+        )
+        .await
+        .and_then(|target| custom_provider_gate.map(|()| target));
+        if let Ok(target) = &exec_gate {
+            config.exec_target = target.clone();
+        }
         let launcher = super::provider_spawn::FreshLauncher {
             runtime_config: Arc::clone(&runtime_config),
             harness: super::provider_spawn::FreshHarnessCtx {
@@ -2539,8 +2559,10 @@ impl SessionManager {
         };
 
         #[cfg(test)]
-        let launch_result = super::launch::take_controller_candidate_test_process(session_id)
-            .map_or_else(
+        let launch_result = if let Err(error) = exec_gate {
+            Err(error)
+        } else {
+            super::launch::take_controller_candidate_test_process(session_id).map_or_else(
                 || {
                     super::provider_spawn::spawn_provider_process(
                         provider,
@@ -2551,15 +2573,18 @@ impl SessionManager {
                     )
                 },
                 Ok,
-            );
+            )
+        };
         #[cfg(not(test))]
-        let launch_result = super::provider_spawn::spawn_provider_process(
-            provider,
-            &config,
-            &launcher,
-            &admission_permit,
-            &spawn_guard,
-        );
+        let launch_result = exec_gate.and_then(|_| {
+            super::provider_spawn::spawn_provider_process(
+                provider,
+                &config,
+                &launcher,
+                &admission_permit,
+                &spawn_guard,
+            )
+        });
         let (process, event_rx) = match launch_result {
             Ok(pair) => pair,
             Err(e) => {
@@ -2835,7 +2860,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         context_rotation_enabled: bool,
@@ -2889,7 +2914,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         context_rotation_enabled: bool,
@@ -3367,6 +3392,17 @@ impl SessionManager {
             if request.provider.is_some() || request.model.is_some() {
                 child_session.model = request.model.clone();
             }
+        } else if carries_rolling_health {
+            // #4041: a cap-rotation successor takes the seat's configured
+            // launch (provider, model, effort) when its policy sets one,
+            // else it copies the predecessor as before.
+            let launch = {
+                let store_guard = store.lock().await;
+                super::context_cap::seat_succession_launch(&store_guard, &parent_completed.session)
+            };
+            if let Some(launch) = launch {
+                super::context_cap::apply_seat_succession_launch(&mut child_session, &launch);
+            }
         }
         if let Err(error) =
             crate::sandbox::custody::CustodyExecutionRuntime::apply_rotation_successor_tuple(
@@ -3516,7 +3552,7 @@ impl SessionManager {
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
         event_bus: Arc<crate::bus::EventBus>,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         model_call_settlements: crate::model_control::call_control::ModelCallSettlementHandle,
         persistence: PersistenceHandle,
         context_rotation_enabled: bool,
@@ -4253,6 +4289,9 @@ impl SessionManager {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
         let system_prompt = if matches!(
             provider,
@@ -4481,6 +4520,19 @@ impl SessionManager {
             None,
         )
         .await;
+        // #3176: the rotation child inherits the parent's container binding
+        // (re-validated), or the spawn below fails; it never lands on the host.
+        let exec_gate = super::exec_target_launch::resolve_launch_exec_target(
+            &store,
+            &runtime_config,
+            child_id,
+            child_session.continued_from,
+            &rsi_common::exec_target::ExecTarget::Host,
+        )
+        .await;
+        if let Ok(target) = &exec_gate {
+            config.exec_target = target.clone();
+        }
         config.completion_gates =
             match super::completion_gates_launch::resolve_launch_completion_gates(
                 &store,
@@ -4536,6 +4588,11 @@ impl SessionManager {
             "provider_spawn_attempt",
             Some(&spawn_metadata),
         );
+        let custom_provider_gate =
+            super::custom_provider_launch::restore(&store, &mut config).await;
+        let spawn_journal = spawn_journal
+            .and_then(|journal| exec_gate.map(|_| journal))
+            .and_then(|journal| custom_provider_gate.map(|()| journal));
         #[cfg(test)]
         let launch_result = if let Err(error) = spawn_journal {
             Err(error)
@@ -11257,6 +11314,214 @@ mod tests {
         Ok(())
     }
 
+    /// #3392: the project manager seat's real context-cap style rotation (the
+    /// production `trigger_rotation` finalizer writes the succession edge and
+    /// archives the predecessor) leaves the successor in authority over the
+    /// queue entries its predecessor enqueued: it supersedes one and cancels
+    /// another, while an unrelated worker is refused with a refusal that names
+    /// the scope checks that did not match.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn successor_seat_supersedes_and_cancels_predecessor_queue_entries_3392()
+    -> anyhow::Result<()> {
+        use crate::store::rolling_queue::NewQueueEntry;
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::rolling_queue::AgentRollingQueueEntryV1;
+        use rsi_common::rolling_queue::{RollingQueueBinding, RollingQueueEntryState};
+        let (manager, directory) = rotation_manager_with_context_rotation(true);
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Queue scope rotation".into(),
+            path: None,
+            description: None,
+            color: Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let mut parent = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        parent.project_id = Some(project.id);
+        parent.working_dir = directory.path().to_path_buf();
+        parent.provider = SessionProvider::Codex;
+        parent.model = Some("gpt-6-astra".into());
+        let mut worker = test_session(Uuid::new_v4(), SessionStatus::Completed);
+        worker.project_id = Some(project.id);
+        worker.working_dir = directory.path().to_path_buf();
+        let enqueue = |store: &Store, session: Uuid, commit: char, key: &str| {
+            store
+                .enqueue_rolling_queue_source(
+                    &NewQueueEntry {
+                        project_id: Some(project.id),
+                        repo_path: "/tmp/repo".into(),
+                        source_commit: commit.to_string().repeat(40),
+                        source_session_id: session,
+                        owner_epic_id: None,
+                        binding: RollingQueueBinding::Unbound,
+                        work_key: None,
+                        migration_version: None,
+                        hot_files: vec![],
+                        test_filters: vec![],
+                        fixes_tests: Vec::new(),
+                        idempotency_key: key.into(),
+                    },
+                    chrono::Utc::now(),
+                )
+                .map(|(entry, _)| entry)
+        };
+        let (superseded_target, cancelled_target) = {
+            let mut store = manager.store.lock().await;
+            store.insert_project(&project)?;
+            store.insert_session(&parent)?;
+            store.insert_session(&worker)?;
+            store.publish_startup_ordinary(parent.id)?;
+            store.configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                group_ids: Vec::new(),
+                project_id: project.id,
+                session_id: parent.id,
+                epic_ids: Some(Vec::new()),
+                expected_row_version: 0,
+            })?;
+            // Both entries are enqueued by the predecessor, while it is the seat.
+            (
+                enqueue(&store, parent.id, 'a', "predecessor-a")?,
+                enqueue(&store, parent.id, 'b', "predecessor-b")?,
+            )
+        };
+        manager
+            .completed
+            .write()
+            .await
+            .insert(parent.id, CompletedSession::for_test(parent.clone()));
+
+        // The real rotation: the successor is established, the predecessor is
+        // archived and the succession edge recorded in one finalizer.
+        let successor = Uuid::new_v4();
+        install_rotation_child_id_for_test(parent.id, successor);
+        super::super::launch::install_controller_candidate_test_process(successor);
+        manager.trigger_rotation(parent.id).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let current = manager
+                    .store
+                    .lock()
+                    .await
+                    .get_harness_manager(project.id)
+                    .unwrap()
+                    .unwrap()
+                    .current_session_id;
+                if current == Some(successor) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let store = manager.store.lock().await;
+        assert_eq!(
+            store.get_session(parent.id)?.unwrap().status,
+            SessionStatus::Archived
+        );
+        assert_eq!(
+            store.get_session(successor)?.unwrap().continued_from,
+            Some(parent.id)
+        );
+        // The successor sees the predecessor's entries.
+        let listed: Vec<AgentRollingQueueEntryV1> = store
+            .list_rolling_queue_for_agent(
+                successor,
+                &rsi_common::rolling_queue::AgentListRollingQueueRequestV1 {
+                    fields: Some(rsi_common::rolling_queue::RollingQueueFieldsV1::Full),
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            )?
+            .0;
+        for id in [superseded_target.id, cancelled_target.id] {
+            let seen = listed.iter().find(|entry| entry.id == id).unwrap();
+            assert_eq!(seen.enqueuer_session_id, parent.id);
+        }
+
+        // Supersede the predecessor's entry as the successor.
+        assert!(
+            store
+                .get_rolling_queue_entry_for_supersession(successor, superseded_target.id)?
+                .is_some()
+        );
+        let replacement = NewQueueEntry {
+            project_id: Some(project.id),
+            repo_path: "/tmp/repo".into(),
+            source_commit: "c".repeat(40),
+            source_session_id: successor,
+            owner_epic_id: None,
+            binding: RollingQueueBinding::Unbound,
+            work_key: None,
+            migration_version: None,
+            hot_files: vec![],
+            test_filters: vec![],
+            fixes_tests: Vec::new(),
+            idempotency_key: "successor-replacement".into(),
+        };
+        let (new, replayed) = store.enqueue_rolling_queue_source_superseding(
+            &replacement,
+            None,
+            Some((superseded_target.id, &superseded_target.source_commit)),
+            chrono::Utc::now(),
+        )?;
+        assert!(!replayed);
+        assert_eq!(
+            store
+                .get_rolling_queue_entry(superseded_target.id)?
+                .unwrap()
+                .state,
+            RollingQueueEntryState::Superseded
+        );
+        assert_eq!(new.source_session_id, successor);
+
+        // Cancel the predecessor's other entry as the successor.
+        let (cancelled, replayed) = store.cancel_rolling_queue_entry_for_agent(
+            successor,
+            cancelled_target.id,
+            None,
+            chrono::Utc::now(),
+        )?;
+        assert!(!replayed);
+        assert_eq!(cancelled.state, RollingQueueEntryState::Superseded);
+
+        // An unrelated worker of the same project holds neither: the refusal
+        // keeps the code and names the scope checks that did not match.
+        let pending = enqueue(&store, parent.id, 'd', "predecessor-d")?;
+        let refusal = store
+            .cancel_rolling_queue_entry_for_agent(worker.id, pending.id, None, chrono::Utc::now())
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("queue_entry_not_found"), "{refusal}");
+        assert!(
+            refusal.contains("project manager seat: this session is not the current seat"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("portfolio grant: none"), "{refusal}");
+        assert!(
+            refusal.contains("enqueuer or outcome-wake holder"),
+            "{refusal}"
+        );
+        assert_eq!(
+            store.get_rolling_queue_entry(pending.id)?.unwrap().state,
+            RollingQueueEntryState::Queued
+        );
+        let refused_supersede = store
+            .queue_entry_not_found_refusal(worker.id, pending.id)
+            .to_string();
+        assert!(
+            refused_supersede
+                .contains("project manager seat: this session is not the current seat"),
+            "{refused_supersede}"
+        );
+        drop(store);
+        super::super::launch::drop_controller_candidate_test_stream(successor);
+        Ok(())
+    }
+
     struct RotationFinalizationProbe {
         reached: tokio::sync::oneshot::Sender<bool>,
         replays: mpsc::Receiver<tokio::sync::oneshot::Sender<Result<bool>>>,
@@ -11808,7 +12073,9 @@ mod tests {
                     committed,
                     "active replay preserves the committed receipt"
                 );
-                store.update_session_status(parent.id, SessionStatus::Completed)?;
+                // #667 fences the API writers while the receipt is current; the
+                // raw seam simulates the unfenced restore that retires it (#4005).
+                store.unfenced_status_write_for_test(parent.id, SessionStatus::Completed)?;
                 assert_eq!(
                     store
                         .get_harness_manager(project_id)?
@@ -15986,7 +16253,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn route_preflight_refusal_ends_the_session_failed_naming_the_cause() -> anyhow::Result<()>
     {
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory()?));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(Store::open_in_memory()?));
         let persistence = crate::session::PersistenceHandle::new(Arc::clone(&store));
         let mut session = test_session(Uuid::new_v4(), SessionStatus::Completed);
         session.provider = SessionProvider::OpenRouter;

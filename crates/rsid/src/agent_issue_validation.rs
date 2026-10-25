@@ -6,11 +6,9 @@
 #[cfg(test)]
 use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::rpc::{
-    AGENT_ISSUE_LIST_LABEL_MAX_BYTES, AGENT_ISSUE_LIST_LABELS_MAX_COUNT,
-    AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES, AgentArchiveIssueRequestV1, AgentGetIssueRequestV1,
-    AgentIssueValidationClassV1, AgentIssueValidationFieldV1, AgentIssueValidationV1,
-    AgentListIssuesRequestV1, AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1,
-    AgentUpdateIssueStatusRequestV1,
+    AgentArchiveIssueRequestV1, AgentGetIssueRequestV1, AgentIssueValidationClassV1,
+    AgentIssueValidationFieldV1, AgentIssueValidationV1, AgentListIssuesRequestV1,
+    AgentRestoreIssueRequestV1, AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1,
 };
 use rsi_common::types::IssueEventPageRequestV1;
 use serde::de::DeserializeOwned;
@@ -73,6 +71,7 @@ impl AgentIssueRequestKind {
                 "assignee",
                 "clear_assignee",
                 "handoff",
+                "replace_body",
             ],
             Self::UpdateStatus => &[
                 "project_id",
@@ -131,6 +130,7 @@ fn field(name: &str) -> Option<AgentIssueValidationFieldV1> {
         "project_id" => Some(AgentIssueValidationFieldV1::ProjectId),
         "include_issue" => Some(AgentIssueValidationFieldV1::IncludeIssue),
         "note" => Some(AgentIssueValidationFieldV1::Note),
+        "fields" => Some(AgentIssueValidationFieldV1::Fields),
         _ => None,
     }
 }
@@ -219,26 +219,10 @@ pub(crate) fn decode_list(
     value: &Value,
 ) -> Result<AgentListIssuesRequestV1, AgentIssueValidationV1> {
     let mut request: AgentListIssuesRequestV1 = decode(AgentIssueRequestKind::List, value)?;
-    if request.title_contains.as_ref().is_some_and(|needle| {
-        needle.is_empty() || needle.len() > AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES
-    }) {
-        return Err(hint(
-            AgentIssueValidationClassV1::InvalidField,
-            Some(AgentIssueValidationFieldV1::TitleContains),
-        ));
-    }
-    if request.labels.len() > AGENT_ISSUE_LIST_LABELS_MAX_COUNT
-        || request.labels.iter().any(|label| {
-            label.trim().is_empty()
-                || label.len() > AGENT_ISSUE_LIST_LABEL_MAX_BYTES
-                || label.contains('\0')
-        })
-    {
-        return Err(hint(
-            AgentIssueValidationClassV1::InvalidField,
-            Some(AgentIssueValidationFieldV1::Labels),
-        ));
-    }
+    // Cursor, title_contains, labels and limit bounds; the hint names the field.
+    request
+        .validate()
+        .map_err(|(field, _)| hint(AgentIssueValidationClassV1::InvalidField, Some(field)))?;
     let mut seen = std::collections::HashSet::with_capacity(request.labels.len());
     request.labels.retain(|label| seen.insert(label.clone()));
     Ok(request)
@@ -305,6 +289,137 @@ mod tests {
         let error = decode_list(&serde_json::json!({"ready": "yes"})).unwrap_err();
         assert_eq!(error.class, Class::InvalidField);
         assert_eq!(error.field, Some(Field::Ready));
+    }
+
+    /// The wire `next_action` of the refusal a list request produces.
+    fn list_refusal_next_action(value: &Value) -> (AgentIssueValidationV1, String) {
+        let validation = decode_list(value).unwrap_err();
+        let error = crate::error::normalize_agent_issue_error(
+            crate::error::agent_issue_list_invalid_request(validation.clone()),
+        );
+        let crate::error::DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("list refusal must be a structured Issue envelope");
+        };
+        let envelope: rsi_common::rpc::AgentIssueErrorV1 = serde_json::from_value(data).unwrap();
+        assert_eq!(envelope.validation, Some(validation.clone()));
+        (validation, envelope.next_action)
+    }
+
+    /// #184: every `AgentListIssues` invalid_request names its field and fix.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn list_refusals_name_their_field_and_fix() {
+        // (request, class, field, text the next_action must carry)
+        let cases: Vec<(Value, Class, Option<Field>, &[&str])> = vec![
+            (
+                serde_json::json!({"query": "manager_ledger"}),
+                Class::UnknownField,
+                None,
+                &["an unknown field", "title_contains", "no `query` field"],
+            ),
+            (
+                serde_json::json!([1]),
+                Class::InvalidShape,
+                None,
+                &["JSON object", "title_contains"],
+            ),
+            (
+                serde_json::json!({"status": "open"}),
+                Class::InvalidField,
+                Some(Field::Status),
+                &["params.status", "Open, InProgress, Closed, Cancelled"],
+            ),
+            (
+                serde_json::json!({"archive": "none"}),
+                Class::InvalidField,
+                Some(Field::Archive),
+                &["params.archive", "Active, Archived, All"],
+            ),
+            (
+                serde_json::json!({"limit": 0}),
+                Class::InvalidField,
+                Some(Field::Limit),
+                &["params.limit", "1..=256"],
+            ),
+            (
+                serde_json::json!({"limit": 500}),
+                Class::InvalidField,
+                Some(Field::Limit),
+                &["params.limit", "1..=256"],
+            ),
+            (
+                serde_json::json!({"order": "up"}),
+                Class::InvalidField,
+                Some(Field::Order),
+                &["params.order", "asc or desc"],
+            ),
+            (
+                serde_json::json!({"fields": "everything"}),
+                Class::InvalidField,
+                Some(Field::Fields),
+                &["params.fields", "summary or full"],
+            ),
+            (
+                serde_json::json!({"title_contains": ""}),
+                Class::InvalidField,
+                Some(Field::TitleContains),
+                &["params.title_contains", "1..=128"],
+            ),
+            (
+                serde_json::json!({"labels": [""]}),
+                Class::InvalidField,
+                Some(Field::Labels),
+                &["params.labels", "at most 16"],
+            ),
+            (
+                serde_json::json!({"cursor": {"display_number": 0, "issue_id": uuid::Uuid::nil()}}),
+                Class::InvalidField,
+                Some(Field::Cursor),
+                &["params.cursor", "next_cursor"],
+            ),
+            (
+                serde_json::json!({"project_id": "not-a-uuid"}),
+                Class::InvalidField,
+                Some(Field::ProjectId),
+                &["params.project_id", "UUID"],
+            ),
+        ];
+        for (request, class, field, expected) in cases {
+            let (validation, next_action) = list_refusal_next_action(&request);
+            assert_eq!(validation.class, class, "{request}");
+            assert_eq!(validation.field, field, "{request}");
+            assert_ne!(
+                next_action, "correct the request fields and retry",
+                "{request}"
+            );
+            for text in expected {
+                assert!(next_action.contains(text), "{request}: {next_action}");
+            }
+            // Static text: the caller's own value is never echoed back.
+            assert!(!next_action.contains("manager_ledger"), "{next_action}");
+        }
+        // An unbound caller's valid requests decode as before.
+        for request in [
+            serde_json::json!({}),
+            serde_json::json!({"status": "Open"}),
+            serde_json::json!({"labels": ["kaizen"], "limit": 256}),
+        ] {
+            assert!(decode_list(&request).is_ok(), "{request}");
+        }
+    }
+
+    /// The generic (non-list) wording still names the field and the catalog.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn non_list_refusals_name_their_field() {
+        let validation = decode_get(&serde_json::json!({})).unwrap_err();
+        let text = rsi_common::rpc::agent_issue_invalid_request_next_action(false, &validation);
+        assert_eq!(text, "params.issue_id: required; add it and retry");
+        let validation = decode_get(&serde_json::json!({"nope": 1})).unwrap_err();
+        let text = rsi_common::rpc::agent_issue_invalid_request_next_action(false, &validation);
+        assert!(text.contains("an unknown field") && text.contains("AgentGetAuthorityCatalog"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

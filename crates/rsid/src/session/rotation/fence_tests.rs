@@ -113,14 +113,305 @@ async fn fire(manager: &Arc<SessionManager>, job: &rsi_common::types::ScheduledJ
     crate::scheduler::fire_job_for_test(&manager.store, manager.event_bus(), &launcher, job).await;
 }
 
+/// Mirror daemon-authored history into both durable and cached transcripts,
+/// as the real restart/delivery producers do.
+async fn advance_wake_history(
+    manager: &SessionManager,
+    session: Uuid,
+    role: Option<rsi_common::types::Role>,
+    content: &str,
+    operator: bool,
+) -> anyhow::Result<()> {
+    let event = {
+        let store = manager.store.lock().await;
+        let event = rsi_common::types::ConversationEvent {
+            id: 0,
+            session_id: session,
+            sequence: (store.conversation_max_sequence(session)? + 1) as i32,
+            event_type: if role.is_some() {
+                rsi_common::types::EventType::Message
+            } else {
+                rsi_common::types::EventType::System
+            },
+            role,
+            content: content.into(),
+            created_at: chrono::Utc::now(),
+            tool_name: None,
+            tool_input: None,
+            offload_id: None,
+            tool_use_id: None,
+            metadata: operator.then(|| Box::new(serde_json::json!({"source":"operator"}))),
+        };
+        store.insert_event(&event)?;
+        event
+    };
+    if let Some(cached) = manager.completed.write().await.get_mut(&session) {
+        cached.events.push(event);
+    }
+    Ok(())
+}
+
+/// #360: both self-wake modes survive System, deploy and failed-provider
+/// history after arming. Also advance the cursor after delivery capture, at
+/// a deterministic barrier, to prove daemon traffic does not stale it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_resume_and_when_wakes_deliver_after_system_events_advance_the_cursor()
+-> anyhow::Result<()> {
+    use crate::scheduler::wake_when_tests::{arm, finish, insert_job, jobs_terminal};
+    use rsi_common::types::Role;
+    for predicate in [false, true] {
+        let (manager, dir) = rotation_manager();
+        let manager = Arc::new(manager);
+        let parent = completed_parent(&manager, dir.path(), "finish the green job").await?;
+        let job = {
+            let store = manager.store.lock().await;
+            if predicate {
+                let work = insert_job(&store, parent.id, "green");
+                finish(
+                    &store,
+                    work,
+                    rsi_common::agent_jobs::JobState::Succeeded,
+                    0,
+                    None,
+                );
+                arm(&store, parent.id, jobs_terminal(&[work]), None)?
+            } else {
+                let job = resume_job(parent.id, dir.path())?;
+                store.insert_scheduled_job(&job)?;
+                job
+            }
+        };
+        advance_wake_history(&manager, parent.id, None, "daemon restarted", false).await?;
+        advance_wake_history(
+            &manager,
+            parent.id,
+            Some(Role::User),
+            &rsi_common::daemon_message::wrap("daemon-restart", "continue after deploy"),
+            false,
+        )
+        .await?;
+        advance_wake_history(
+            &manager,
+            parent.id,
+            Some(Role::Assistant),
+            "provider limit",
+            false,
+        )
+        .await?;
+        let process = install_controller_candidate_test_process(parent.id);
+        let (reached, resume) =
+            crate::session::lifecycle::install_continuation_pause_for_test(parent.id);
+        let dispatch = {
+            let manager = Arc::clone(&manager);
+            let job = job.clone();
+            tokio::spawn(async move { fire(&manager, &job).await })
+        };
+        reached.await?;
+        advance_wake_history(&manager, parent.id, None, "daemon health notice", false).await?;
+        resume
+            .send(())
+            .map_err(|()| anyhow::anyhow!("delivery barrier dropped"))?;
+        dispatch.await?;
+        let delivered = if predicate { "batch done?" } else { WAKE };
+        assert_eq!(delivered_events(&manager, parent.id, delivered).await, 1);
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let store = manager.store.lock().await;
+        let settled = store.get_scheduled_job(&job.id)?.expect("wake kept");
+        assert!(!settled.enabled);
+        assert!(settled.last_fired_at.is_some());
+        assert_eq!(store.continuation_retry(job.id)?, None);
+        drop_controller_candidate_test_stream(parent.id);
+    }
+    Ok(())
+}
+
+/// A human turn defers a self-wake, whether it predates capture or races the
+/// guarded effect claim. Boundary operator metadata wins over an envelope.
+/// #189: the refused target is live, so it is busy, not gone: the wake spends
+/// no retry, stays armed, and is delivered exactly once at its next idle point
+/// (it would otherwise be refused `continuation_turn_changed` until the
+/// retry cap escalated it with relaunch advice).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn self_wake_refuses_newer_operator_input_before_and_after_capture() -> anyhow::Result<()> {
+    use rsi_common::types::Role;
+    for after_capture in [false, true] {
+        let (manager, dir) = rotation_manager();
+        let manager = Arc::new(manager);
+        let parent = completed_parent(&manager, dir.path(), "original task").await?;
+        let job = resume_job(parent.id, dir.path())?;
+        manager.store.lock().await.insert_scheduled_job(&job)?;
+        let process = install_controller_candidate_test_process(parent.id);
+        let pending = if after_capture {
+            let (reached, resume) =
+                crate::session::lifecycle::install_continuation_seam_pause_for_test(
+                    crate::session::lifecycle::ContinuationPauseSeam::AfterFenceCheck,
+                    parent.id,
+                );
+            let manager = Arc::clone(&manager);
+            let job = job.clone();
+            let dispatch = tokio::spawn(async move { fire(&manager, &job).await });
+            reached.await?;
+            Some((resume, dispatch))
+        } else {
+            None
+        };
+        let content = if after_capture {
+            rsi_common::daemon_message::wrap("example", "new operator instruction")
+        } else {
+            "new human instruction".into()
+        };
+        advance_wake_history(
+            &manager,
+            parent.id,
+            Some(Role::User),
+            &content,
+            after_capture,
+        )
+        .await?;
+        if let Some((resume, dispatch)) = pending {
+            resume
+                .send(())
+                .map_err(|()| anyhow::anyhow!("delivery barrier dropped"))?;
+            dispatch.await?;
+        } else {
+            fire(&manager, &job).await;
+        }
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        {
+            let store = manager.store.lock().await;
+            assert!(
+                store
+                    .get_scheduled_job(&job.id)?
+                    .expect("wake kept")
+                    .enabled
+            );
+            assert_eq!(store.continuation_retry(job.id)?, None, "no retry spent");
+            let seen = store
+                .self_wake_input_seen(job.id)?
+                .expect("busy target's input acknowledged");
+            assert_eq!(
+                seen.through_sequence,
+                store.conversation_max_sequence(parent.id)?
+            );
+        }
+        // The target is idle with nothing newer: the wake is delivered once,
+        // and a stale re-fire of the settled row never delivers it again.
+        fire(&manager, &job).await;
+        fire(&manager, &job).await;
+        assert_eq!(delivered_events(&manager, parent.id, WAKE).await, 1);
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let store = manager.store.lock().await;
+        let settled = store.get_scheduled_job(&job.id)?.expect("wake kept");
+        assert!(!settled.enabled);
+        assert!(settled.last_fired_at.is_some());
+        assert_eq!(store.continuation_retry(job.id)?, None);
+        drop_controller_candidate_test_stream(parent.id);
+    }
+    Ok(())
+}
+
+/// #482 + #189: transfer and busy-deferral cursors can coexist. Whichever
+/// cursor is larger authenticates the prefix; only later operator input
+/// refuses capture and the guarded effect check.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn self_wake_uses_larger_of_transfer_and_acknowledged_input_cursors() -> anyhow::Result<()> {
+    use crate::store::manager_actions::fence::{
+        CONTINUATION_TURN_CHANGED, continuation_fence_code,
+    };
+    use rsi_common::types::Role;
+
+    for seen_is_larger in [false, true] {
+        let (manager, dir) = rotation_manager();
+        let parent = completed_parent(&manager, dir.path(), "original task").await?;
+        let job = resume_job(parent.id, dir.path())?;
+        manager.store.lock().await.insert_scheduled_job(&job)?;
+        advance_wake_history(&manager, parent.id, Some(Role::User), "first input", true).await?;
+        let lower = {
+            let store = manager.store.lock().await;
+            let lower = store.conversation_max_sequence(parent.id)?;
+            if !seen_is_larger {
+                assert_eq!(
+                    store.acknowledge_self_wake_input(job.id, parent.id)?,
+                    Some(lower)
+                );
+            }
+            lower
+        };
+        advance_wake_history(&manager, parent.id, Some(Role::User), "second input", true).await?;
+        let fence = {
+            let store = manager.store.lock().await;
+            let higher = store.conversation_max_sequence(parent.id)?;
+            if seen_is_larger {
+                assert_eq!(
+                    store.acknowledge_self_wake_input(job.id, parent.id)?,
+                    Some(higher)
+                );
+            }
+            let transfer_sequence = if seen_is_larger { lower } else { higher };
+            store.conn.execute(
+                "UPDATE scheduled_jobs SET schedule_json=json_set(
+                    schedule_json,'$.self_wake_transfer',json(?2)) WHERE id=?1",
+                rusqlite::params![
+                    job.id.to_string(),
+                    serde_json::json!({
+                        "owner": parent.id,
+                        "event_sequence": transfer_sequence,
+                    })
+                    .to_string()
+                ],
+            )?;
+            let fence = store
+                .capture_scheduled_continuation_fence(parent.id, &[job.id])?
+                .expect("both authenticated input cursors permit capture");
+            store.check_continuation_fence_durable(&fence)?;
+            fence
+        };
+        advance_wake_history(&manager, parent.id, Some(Role::User), "third input", true).await?;
+        let store = manager.store.lock().await;
+        let capture_error = store
+            .capture_scheduled_continuation_fence(parent.id, &[job.id])
+            .expect_err("operator input above both cursors refuses capture");
+        assert_eq!(
+            continuation_fence_code(&capture_error),
+            Some(CONTINUATION_TURN_CHANGED)
+        );
+        let claim_error = store
+            .check_continuation_fence_durable(&fence)
+            .expect_err("operator input after capture refuses the effect");
+        assert_eq!(
+            continuation_fence_code(&claim_error),
+            Some(CONTINUATION_TURN_CHANGED)
+        );
+    }
+    Ok(())
+}
+
 /// K2 finding c / design tests 1-2: the dispatcher captures L1, the lineage
 /// rotates and publishes L2 before L1's guard is taken, and the guarded check
 /// refuses `continuation_tip_changed`. The one-shot wake is retained with
-/// durable backoff, L1 is not restarted, and the next pass delivers to L2.
+/// durable backoff, L1 is not restarted, and its self-wake cannot start L2.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::expect_used)]
-async fn continuation_captured_before_rotation_publication_retries_then_delivers_to_successor()
+async fn self_wake_captured_before_rotation_refuses_the_successor_on_every_delivery()
 -> anyhow::Result<()> {
     let (manager, dir) = rotation_manager();
     let manager = Arc::new(manager);
@@ -168,17 +459,9 @@ async fn continuation_captured_before_rotation_publication_retries_then_delivers
         );
     }
 
-    // Next pass: the fence captures the published successor and delivers.
+    // A fresh capture still refuses: this wake belongs to the predecessor,
+    // rather than granting a second turn to its successor.
     wait_inactive(&manager, successor.id).await;
-    // The scripted provider reports no session id; a resumable successor has one.
-    let provider_session = format!("provider-{}", successor.id);
-    manager.store.lock().await.conn.execute(
-        "UPDATE sessions SET claude_session_id=?1 WHERE id=?2",
-        rusqlite::params![provider_session, successor.id.to_string()],
-    )?;
-    if let Some(cached) = manager.completed.write().await.get_mut(&successor.id) {
-        cached.session.claude_session_id = Some(provider_session);
-    }
     let process = install_controller_candidate_test_process(successor.id);
     let retained = manager
         .store
@@ -187,24 +470,19 @@ async fn continuation_captured_before_rotation_publication_retries_then_delivers
         .get_scheduled_job(&job.id)?
         .ok_or_else(|| anyhow::anyhow!("wake row missing"))?;
     fire(&manager, &retained).await;
-    assert_eq!(delivered_events(&manager, successor.id, WAKE).await, 1);
     assert_eq!(
         process
             .productive_start_count
             .load(std::sync::atomic::Ordering::SeqCst),
-        1
+        0
     );
-    {
-        let store = manager.store.lock().await;
-        let settled = store
-            .get_scheduled_job(&job.id)?
-            .ok_or_else(|| anyhow::anyhow!("wake row missing"))?;
-        assert!(
-            settled.last_fired_at.is_some(),
-            "the delivered one-shot is stamped"
-        );
-        assert_eq!(store.continuation_retry(job.id)?, None);
-    }
+    let store = manager.store.lock().await;
+    let row = store.get_scheduled_job(&job.id)?.expect("wake row kept");
+    assert!(row.enabled);
+    assert_eq!(row.last_fired_at, None);
+    let retry = store.continuation_retry(job.id)?.expect("retry kept");
+    assert_eq!(retry.attempts, 2);
+    assert_eq!(retry.last_code, CONTINUATION_TIP_CHANGED);
     drop_controller_candidate_test_stream(successor.id);
     Ok(())
 }

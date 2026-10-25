@@ -730,17 +730,11 @@ pub fn handle_form_key(form: &mut LaunchForm, key: KeyEvent) -> FormOutcome {
     FormOutcome::Stay
 }
 
-/// Launch the session (unless an earlier attempt already did) and appoint it.
-///
-/// # Errors
-/// An operator sentence naming the refused step. When the launch succeeded,
-/// `launched` holds the session so a retry only appoints.
-pub async fn launch_and_appoint(
+pub(crate) async fn launch_for_appointment(
     app: &mut App,
     request: &LaunchRequest,
     launched: &mut Option<Uuid>,
-    confirm_cap_reductions: bool,
-) -> Result<(Uuid, String), String> {
+) -> Result<Uuid, String> {
     let session_id = match *launched {
         Some(id) => id,
         None => {
@@ -769,6 +763,21 @@ pub async fn launch_and_appoint(
             id
         }
     };
+    Ok(session_id)
+}
+
+/// Launch the session (unless an earlier attempt already did) and appoint it.
+///
+/// # Errors
+/// An operator sentence naming the refused step. When the launch succeeded,
+/// `launched` holds the session so a retry only appoints.
+pub async fn launch_and_appoint(
+    app: &mut App,
+    request: &LaunchRequest,
+    launched: &mut Option<Uuid>,
+    confirm_cap_reductions: bool,
+) -> Result<(Uuid, String), String> {
+    let session_id = launch_for_appointment(app, request, launched).await?;
     let short = &session_id.to_string()[..8];
     let not_appointed = |error: String| {
         if error
@@ -866,6 +875,7 @@ pub async fn launch_and_appoint(
             let appointment = ManagerAppointment {
                 plan,
                 grant: request.grant.as_ref().map(|choice| choice.policy.clone()),
+                preset_chosen: false,
             };
             let socket = app.client.socket_path().to_path_buf();
             let message = crate::overlay::launch_settings::appoint_launched_manager(

@@ -21,7 +21,9 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
+mod escape_sweep;
 mod owned_group;
+pub use escape_sweep::{ESCAPE_SWEEP_ENV, EscapeSweep};
 pub use owned_group::{OwnedGroupError, OwnedGroupLeader, OwnedGroupLimits, capture_owned_group};
 
 pub const PROCESS_READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -129,6 +131,11 @@ pub struct CaptureLimits {
     pub cleanup_timeout: Duration,
     pub overflow: OverflowBehavior,
     pub containment: ProcessContainment,
+    /// When the execution deadline expires, return the output captured so far
+    /// as `Ok(CapturedOutput { timed_out: true })` instead of
+    /// `Err(ExecutionTimedOut)`. The process group is killed either way.
+    /// [`OverflowBehavior::RetainTail`] always behaves this way.
+    pub partial_on_timeout: bool,
 }
 
 impl CaptureLimits {
@@ -147,6 +154,7 @@ impl CaptureLimits {
             cleanup_timeout: PROCESS_CLEANUP_TIMEOUT,
             overflow,
             containment,
+            partial_on_timeout: false,
         }
     }
 
@@ -199,8 +207,9 @@ pub struct CapturedOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     /// True when the execution deadline expired and the process was killed.
-    /// Only set for [`OverflowBehavior::RetainTail`]; other overflow modes
-    /// return `Err(CaptureError::ExecutionTimedOut)` on timeout.
+    /// Only set for [`OverflowBehavior::RetainTail`] or a limit with
+    /// `partial_on_timeout`; other captures return
+    /// `Err(CaptureError::ExecutionTimedOut)` on timeout.
     pub timed_out: bool,
 }
 
@@ -534,7 +543,7 @@ async fn supervise_capture(
             // Tail-retaining capture returns partial output on timeout so the
             // caller can report output emitted before the deadline.
             if matches!(failure, Some(CaptureError::ExecutionTimedOut))
-                && limits.overflow == OverflowBehavior::RetainTail
+                && (limits.overflow == OverflowBehavior::RetainTail || limits.partial_on_timeout)
                 && let Ok(status) = reaped.as_ref()
             {
                 let stdout = stdout_result
@@ -1743,6 +1752,7 @@ mod tests {
             cleanup_timeout: Duration::from_millis(250),
             overflow,
             containment: ProcessContainment::GroupNoEscape,
+            partial_on_timeout: false,
         }
     }
 
@@ -1933,6 +1943,36 @@ mod tests {
             text.contains("early-output"),
             "expected pre-timeout output retained: {text:?}"
         );
+    }
+
+    /// #3168: a head-retaining capture with `partial_on_timeout` returns the
+    /// printed prefix and kills the group; without it a timeout is an error.
+    #[allow(clippy::expect_used)]
+    #[tokio::test]
+    async fn partial_on_timeout_returns_the_printed_prefix_for_a_head_capture() {
+        let mut limits = short_limits(OverflowBehavior::TruncateAndDrain);
+        limits.execution_timeout = Duration::from_millis(200);
+        let error = capture_bounded(
+            shell("printf 'early-output'; sleep 5"),
+            limits,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("a plain head capture reports the timeout only");
+        assert_eq!(error, CaptureError::ExecutionTimedOut);
+
+        limits.partial_on_timeout = true;
+        let started = std::time::Instant::now();
+        let output = capture_bounded(
+            shell("printf 'early-output'; sleep 5"),
+            limits,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("timeout returns partial output");
+        assert!(output.timed_out);
+        assert_eq!(output.stdout, b"early-output");
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[allow(clippy::expect_used)]

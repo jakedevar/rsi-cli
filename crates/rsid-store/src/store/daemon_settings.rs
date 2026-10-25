@@ -146,6 +146,7 @@ impl From<C5JournalError> for DaemonError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C5StageOutcome {
     Committed,
+    SupersededByRotation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,13 +387,22 @@ impl Store {
         let now = now_nanos();
         let key = c5_autofile_pending_key(session_id);
         let stop_reason = format!("terminal_failure:{}", cause.as_str());
-        let tx =
-            self.conn
-                .unchecked_transaction()
-                .map_err(|source| C5TransitionError::Retryable {
-                    operation: "stage_begin",
-                    source: DaemonError::Database(source),
-                })?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|source| C5TransitionError::Retryable {
+            operation: "stage_begin",
+            source: DaemonError::Database(source),
+        })?;
+        if super::sessions::archived_rotation_predecessor_on(&tx, session_id).map_err(|source| {
+            C5TransitionError::Retryable {
+                operation: "stage_rotation_guard",
+                source,
+            }
+        })? {
+            return Ok(C5StageOutcome::SupersededByRotation);
+        }
         let changed = tx
             .execute(
                 "UPDATE sessions SET status = 'Failed', stop_reason = COALESCE(NULLIF(TRIM(stop_reason), ''), ?1), updated_at = ?2 WHERE id = ?3",
@@ -882,6 +892,9 @@ fn daemon_setting_text_to_json(field: &str, raw: &str) -> serde_json::Value {
         | "claude_subagent_model"
         | "codex_subagent_model"
         | "claude_fallback_models"
+        | "bench.docker_hosts"
+        | "bench.laptop_host"
+        | "openrouter_spend_armed_at"
         | "provider_skill_delivery"
         | "system_prompt_preset"
         | "editing_mode"

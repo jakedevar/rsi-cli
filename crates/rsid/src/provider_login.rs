@@ -4,7 +4,8 @@
 //! Each probe runs the CLI's own status command (`claude auth status --json`,
 //! `codex login status`) and keeps three facts: the [`ProviderLoginState`], the
 //! closed [`ProviderLoginMethod`] and the check time. The CLI's output (account
-//! e-mail, organisation, directory) is read only to decide those, never stored,
+//! e-mail, organisation, directory) is reduced to an opaque account fingerprint,
+//! used to invalidate a previous account’s plan windows; raw output is never stored,
 //! logged or served; no auth file is ever opened.
 //!
 //! A probe runs in the environment a launch gives the same CLI (the launch
@@ -364,6 +365,28 @@ fn claude_json(stdout: &[u8]) -> Option<serde_json::Value> {
     })
 }
 
+/// Stable identity only: plan type and login method are not account identity.
+/// Raw identity is neither logged nor returned on any RPC surface.
+pub(crate) fn account_fingerprint(account: &serde_json::Value) -> Option<String> {
+    let identity = ["accountId", "accountUuid", "id", "email"]
+        .into_iter()
+        .find_map(|field| {
+            account
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+        })?;
+    let organization = account
+        .get("orgId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Some(
+        blake3::hash(&serde_json::to_vec(&(identity, organization)).ok()?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
 fn lowercase_text(run_stdout: &[u8], run_stderr: &[u8]) -> String {
     let mut text = String::from_utf8_lossy(run_stdout).into_owned();
     text.push('\n');
@@ -459,6 +482,11 @@ pub struct ProviderLoginService {
     /// One probe in flight per provider.
     flights: [tokio::sync::Mutex<()>; 2],
     probes_started: std::sync::atomic::AtomicUsize,
+    billing_store:
+        Mutex<Option<std::sync::Weak<rsid_core::store_lock::Mutex<crate::store::Store>>>>,
+    rate_limit_store:
+        Mutex<Option<std::sync::Weak<rsid_core::store_lock::Mutex<crate::store::Store>>>>,
+    rate_limit_bus: Mutex<Option<std::sync::Weak<crate::bus::EventBus>>>,
 }
 
 impl ProviderLoginService {
@@ -467,9 +495,12 @@ impl ProviderLoginService {
         Self {
             runner,
             ttl,
+            billing_store: Mutex::new(None),
             slots: Mutex::new([Slot::default(), Slot::default()]),
             flights: [tokio::sync::Mutex::new(()), tokio::sync::Mutex::new(())],
             probes_started: std::sync::atomic::AtomicUsize::new(0),
+            rate_limit_store: Mutex::new(None),
+            rate_limit_bus: Mutex::new(None),
         }
     }
 
@@ -488,9 +519,23 @@ impl ProviderLoginService {
         })
     }
 
-    /// The service a session manager launches against: the process-wide one,
-    /// or a private one in unit tests so a seeded state never leaks between
-    /// tests.
+    /// Bind account-switch observations to the manager's telemetry store.
+    #[must_use]
+    pub(crate) fn for_manager_with_rate_limits(
+        store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+        bus: &Arc<crate::bus::EventBus>,
+    ) -> Arc<Self> {
+        let service = Self::for_manager();
+        service.attach_rate_limit_store(store);
+        *service
+            .rate_limit_bus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(bus));
+        service
+    }
+
+    /// The process-wide service, or a private service in unit tests so a
+    /// seeded state never leaks between tests.
     #[must_use]
     pub fn for_manager() -> Arc<Self> {
         #[cfg(test)]
@@ -503,6 +548,76 @@ impl ProviderLoginService {
         #[cfg(not(test))]
         {
             Arc::clone(Self::global())
+        }
+    }
+
+    /// Publish only the closed login method for billing classification.
+    pub fn set_billing_store(
+        &self,
+        store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+    ) {
+        *self
+            .billing_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(store));
+    }
+
+    pub(crate) fn attach_rate_limit_store(
+        &self,
+        store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+    ) {
+        *self
+            .rate_limit_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(store));
+    }
+
+    async fn observe_account(&self, provider: LoginProvider, run: &ProbeRun) {
+        if provider != LoginProvider::Claude
+            || interpret(provider, run).0 != ProviderLoginState::LoggedIn
+        {
+            return;
+        }
+        let ProbeRun::Exited { stdout, .. } = run else {
+            return;
+        };
+        let Some(account) = claude_json(stdout) else {
+            return;
+        };
+        let Some(fingerprint) = account_fingerprint(&account) else {
+            return;
+        };
+        let store = self
+            .rate_limit_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(store) = store {
+            let store = store.lock().await;
+            let now = Utc::now();
+            let provider = rsi_common::types::SessionProvider::Claude;
+            match store.observe_provider_rate_limit_account(provider, &fingerprint, now) {
+                Ok(true) => {
+                    let bus = self
+                        .rate_limit_bus
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade);
+                    if let Some(bus) = bus {
+                        bus.publish(crate::bus::DaemonEvent::ProviderRateLimitUpdated {
+                            snapshot: rsi_common::rpc::ProviderRateLimitSnapshot::invalidated(
+                                provider, now,
+                            ),
+                        });
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not reconcile provider plan-window account")
+                }
+            }
         }
     }
 
@@ -557,7 +672,26 @@ impl ProviderLoginService {
         self.probes_started
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let run = self.runner.run(provider).await;
+        self.observe_account(provider, &run).await;
         let (state, method) = interpret(provider, &run);
+        let billing_store = self
+            .billing_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if state == ProviderLoginState::LoggedIn
+            && method != ProviderLoginMethod::Unknown
+            && let Some(store) = billing_store
+        {
+            if let Err(error) = store
+                .lock()
+                .await
+                .record_provider_billing_login(provider.name(), method)
+            {
+                tracing::warn!(%error, "could not publish provider billing login method");
+            }
+        }
         let record = Record {
             state,
             method,

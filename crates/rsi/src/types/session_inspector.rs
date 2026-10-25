@@ -213,7 +213,9 @@ pub fn compute_session_inspector(
         },
         turns: session.num_turns,
         context: compute_context_budget_view(state),
-        cost_usd: session.cost_usd,
+        cost_usd: session
+            .cost_usd
+            .filter(|_| crate::provider_billing_view::session_is_metered(session)),
         work_time_ms: session.work_time_ms,
         duration_ms: session.duration_ms,
         created_at: session.created_at,

@@ -239,7 +239,7 @@ test('every Tauri command forwards one operator RPC and is wired into the app', 
     assert.ok(api.includes(`'${cmd}'`), `${cmd} is called by the adapter`);
     assert.ok(handlers.includes(`operator_config::${cmd},`), `${cmd} is in the generated handler list`);
   }
-  assert.match(readFileSync(here('../src-tauri/src/lib.rs'), 'utf8'), /^pub mod operator_config;$/m);
+  assert.match(readFileSync(here('../src-tauri/src/modules.generated.rs'), 'utf8'), /^pub mod operator_config;$/m);
   // The route read is sanitized by an allowlist on the Rust side before the webview sees it.
   assert.match(rs, /pub async fn list_custom_provider_routes\(/);
   assert.match(rs, /pub const LIST_ROUTES: &str = "ListCustomProviderRoutes";/);

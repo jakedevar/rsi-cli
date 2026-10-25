@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="369" height="648" viewBox="0 0 369 648">
+<title>Operator to-do cards</title>
+<rect width="100%" height="100%" fill="#0b0d11"/>
+<g font-family="JetBrainsMono Nerd Font Mono, monospace" font-size="15" xml:space="preserve">
+<rect x="9" y="9" width="351" height="18" fill="#0b0d11"/>
+<text x="9" y="23" fill="#f4f0ff" font-weight="bold" textLength="198" lengthAdjust="spacingAndGlyphs">To-do · 2 open · 2 new</text>
+<rect x="9" y="27" width="351" height="18" fill="#0b0d11"/>
+<rect x="9" y="45" width="351" height="18" fill="#202434"/>
+<text x="9" y="59" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">╭</text>
+<text x="18" y="59" fill="#6437a5" font-weight="normal" textLength="342" lengthAdjust="spacingAndGlyphs">─────────────────────────────────────╮</text>
+<rect x="9" y="63" width="351" height="18" fill="#202434"/>
+<text x="9" y="77" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="27" y="77" fill="#b58ad7" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">▸ </text>
+<text x="45" y="77" fill="#e55369" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">● </text>
+<text x="63" y="77" fill="#f4f0ff" font-weight="bold" textLength="135" lengthAdjust="spacingAndGlyphs">Log in to Codex</text>
+<text x="198" y="77" fill="#6fbf8d" font-weight="bold" textLength="36" lengthAdjust="spacingAndGlyphs"> NEW</text>
+<text x="234" y="77" fill="#6437a5" font-weight="normal" textLength="126" lengthAdjust="spacingAndGlyphs">             │</text>
+<rect x="9" y="81" width="351" height="18" fill="#202434"/>
+<text x="9" y="95" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="27" y="95" fill="#767090" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="95" fill="#cbc4dd" font-weight="normal" textLength="99" lengthAdjust="spacingAndGlyphs">codex login</text>
+<text x="144" y="95" fill="#6437a5" font-weight="normal" textLength="216" lengthAdjust="spacingAndGlyphs">                       │</text>
+<rect x="9" y="99" width="351" height="18" fill="#202434"/>
+<text x="9" y="113" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="27" y="113" fill="#cbc4dd" font-weight="normal" textLength="153" lengthAdjust="spacingAndGlyphs">scope · portfolio</text>
+<text x="180" y="113" fill="#6437a5" font-weight="normal" textLength="180" lengthAdjust="spacingAndGlyphs">                   │</text>
+<rect x="9" y="117" width="351" height="18" fill="#202434"/>
+<text x="9" y="131" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">│</text>
+<text x="27" y="131" fill="#767090" font-weight="normal" textLength="144" lengthAdjust="spacingAndGlyphs">issue #1747 · 3h</text>
+<text x="171" y="131" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="135" width="351" height="18" fill="#202434"/>
+<text x="9" y="149" fill="#b58ad7" font-weight="normal" textLength="9" lengthAdjust="spacingAndGlyphs">╰</text>
+<text x="18" y="149" fill="#6437a5" font-weight="normal" textLength="342" lengthAdjust="spacingAndGlyphs">─────────────────────────────────────╯</text>
+<rect x="9" y="153" width="351" height="18" fill="#0b0d11"/>
+<rect x="9" y="171" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="185" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╭─────────────────────────────────────╮</text>
+<rect x="9" y="189" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="203" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="203" fill="#b58ad7" font-weight="normal" textLength="36" lengthAdjust="spacingAndGlyphs">  • </text>
+<text x="63" y="203" fill="#f4f0ff" font-weight="bold" textLength="243" lengthAdjust="spacingAndGlyphs">Restore the grants after t…</text>
+<text x="306" y="203" fill="#6fbf8d" font-weight="bold" textLength="36" lengthAdjust="spacingAndGlyphs"> NEW</text>
+<text x="342" y="203" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs"> │</text>
+<rect x="9" y="207" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="221" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="221" fill="#767090" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="221" fill="#cbc4dd" font-weight="normal" textLength="297" lengthAdjust="spacingAndGlyphs">rsi grant restore --scope portfol</text>
+<text x="342" y="221" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs"> │</text>
+<rect x="9" y="225" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="239" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="239" fill="#767090" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="239" fill="#cbc4dd" font-weight="normal" textLength="297" lengthAdjust="spacingAndGlyphs">io:global --caps v8 --caps v8 --…</text>
+<text x="342" y="239" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs"> │</text>
+<rect x="9" y="243" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="257" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="257" fill="#cbc4dd" font-weight="normal" textLength="153" lengthAdjust="spacingAndGlyphs">scope · portfolio</text>
+<text x="180" y="257" fill="#6437a5" font-weight="normal" textLength="180" lengthAdjust="spacingAndGlyphs">                   │</text>
+<rect x="9" y="261" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="275" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="275" fill="#767090" font-weight="normal" textLength="144" lengthAdjust="spacingAndGlyphs">issue #1747 · 2h</text>
+<text x="171" y="275" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="279" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="293" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╰─────────────────────────────────────╯</text>
+<rect x="9" y="297" width="351" height="18" fill="#0b0d11"/>
+<rect x="9" y="315" width="351" height="18" fill="#0b0d11"/>
+<text x="9" y="329" fill="#767090" font-weight="bold" textLength="252" lengthAdjust="spacingAndGlyphs">Closed since your last visit</text>
+<rect x="9" y="333" width="351" height="18" fill="#0b0d11"/>
+<rect x="9" y="351" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="365" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╭─────────────────────────────────────╮</text>
+<rect x="9" y="369" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="383" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="383" fill="#df8f76" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">◆ </text>
+<text x="63" y="383" fill="#cbc4dd" font-weight="bold" textLength="126" lengthAdjust="spacingAndGlyphs">Grant repaired</text>
+<text x="189" y="383" fill="#6437a5" font-weight="normal" textLength="171" lengthAdjust="spacingAndGlyphs">                  │</text>
+<rect x="9" y="387" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="401" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="401" fill="#6fbf8d" font-weight="normal" textLength="54" lengthAdjust="spacingAndGlyphs">✓ done</text>
+<text x="81" y="401" fill="#6437a5" font-weight="normal" textLength="279" lengthAdjust="spacingAndGlyphs">                              │</text>
+<rect x="9" y="405" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="419" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="419" fill="#767090" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="419" fill="#cbc4dd" font-weight="normal" textLength="126" lengthAdjust="spacingAndGlyphs">rsi grant show</text>
+<text x="171" y="419" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="423" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="437" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="437" fill="#cbc4dd" font-weight="normal" textLength="153" lengthAdjust="spacingAndGlyphs">scope · portfolio</text>
+<text x="180" y="437" fill="#6437a5" font-weight="normal" textLength="180" lengthAdjust="spacingAndGlyphs">                   │</text>
+<rect x="9" y="441" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="455" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="455" fill="#767090" font-weight="normal" textLength="144" lengthAdjust="spacingAndGlyphs">issue #1747 · 3h</text>
+<text x="171" y="455" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="459" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="473" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╰─────────────────────────────────────╯</text>
+<rect x="9" y="477" width="351" height="18" fill="#0b0d11"/>
+<rect x="9" y="495" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="509" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╭─────────────────────────────────────╮</text>
+<rect x="9" y="513" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="527" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="527" fill="#df8f76" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">◆ </text>
+<text x="63" y="527" fill="#cbc4dd" font-weight="bold" textLength="99" lengthAdjust="spacingAndGlyphs">Old request</text>
+<text x="162" y="527" fill="#6437a5" font-weight="normal" textLength="198" lengthAdjust="spacingAndGlyphs">                     │</text>
+<rect x="9" y="531" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="545" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="545" fill="#767090" font-weight="normal" textLength="99" lengthAdjust="spacingAndGlyphs">× dismissed</text>
+<text x="126" y="545" fill="#6437a5" font-weight="normal" textLength="234" lengthAdjust="spacingAndGlyphs">                         │</text>
+<rect x="9" y="549" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="563" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="563" fill="#767090" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="45" y="563" fill="#cbc4dd" font-weight="normal" textLength="126" lengthAdjust="spacingAndGlyphs">rsi grant show</text>
+<text x="171" y="563" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="567" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="581" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="581" fill="#cbc4dd" font-weight="normal" textLength="153" lengthAdjust="spacingAndGlyphs">scope · portfolio</text>
+<text x="180" y="581" fill="#6437a5" font-weight="normal" textLength="180" lengthAdjust="spacingAndGlyphs">                   │</text>
+<rect x="9" y="585" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="599" fill="#6437a5" font-weight="normal" textLength="18" lengthAdjust="spacingAndGlyphs">│ </text>
+<text x="27" y="599" fill="#767090" font-weight="normal" textLength="144" lengthAdjust="spacingAndGlyphs">issue #1747 · 3h</text>
+<text x="171" y="599" fill="#6437a5" font-weight="normal" textLength="189" lengthAdjust="spacingAndGlyphs">                    │</text>
+<rect x="9" y="603" width="351" height="18" fill="#1a1d27"/>
+<text x="9" y="617" fill="#6437a5" font-weight="normal" textLength="351" lengthAdjust="spacingAndGlyphs">╰─────────────────────────────────────╯</text>
+<rect x="9" y="621" width="351" height="18" fill="#0b0d11"/>
+</g>
+</svg>

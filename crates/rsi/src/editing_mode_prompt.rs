@@ -6,7 +6,8 @@
 //! left (recommended unless the operator is experienced with Vim), **Vim** on
 //! the right (the mode RSI was built around). The modal is deliberately not an
 //! `OverlayState`: it owns every key and click until a choice is made, and has
-//! no dismissal. The only key that escapes it is the global quit chord.
+//! no dismissal. The only key that escapes it is `q` (quit rsi); Ctrl-C never
+//! quits (#3434) and shows a hint instead.
 //!
 //! Buttons are chosen by mouse click, by Left/Right/Tab then Enter, or
 //! directly with `s` / `v`.
@@ -46,6 +47,8 @@ pub enum PromptOutcome {
     Consumed,
     /// The operator chose a mode.
     Choose(EditingMode),
+    /// The operator pressed `q`: leave rsi without choosing.
+    Quit,
 }
 
 impl EditingModePrompt {
@@ -77,6 +80,7 @@ impl EditingModePrompt {
             KeyCode::Enter => PromptOutcome::Choose(self.selected),
             KeyCode::Char('s' | 'S') if plain => PromptOutcome::Choose(EditingMode::Standard),
             KeyCode::Char('v' | 'V') if plain => PromptOutcome::Choose(EditingMode::Vim),
+            KeyCode::Char('q' | 'Q') if plain => PromptOutcome::Quit,
             _ => PromptOutcome::Consumed,
         }
     }
@@ -98,13 +102,15 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 /// Key entry point (the caller has already filtered to key presses and let
-/// the quit chord through). Always consumes the key.
+/// the Ctrl-C hint through). Always consumes the key.
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
     let Some(prompt) = app.editing_mode_prompt.as_mut() else {
         return;
     };
-    if let PromptOutcome::Choose(mode) = prompt.on_key(key) {
-        commit(app, mode).await;
+    match prompt.on_key(key) {
+        PromptOutcome::Choose(mode) => commit(app, mode).await,
+        PromptOutcome::Quit => app.quit = true,
+        PromptOutcome::Consumed => {}
     }
     app.mark_dirty();
 }
@@ -269,7 +275,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let hint_y = inner.y + inner.height - 1;
     frame.render_widget(
-        Paragraph::new("Click, or: Left/Right/Tab then Enter  |  s Standard  |  v Vim")
+        Paragraph::new("Click, or: Left/Right/Tab then Enter  |  s Standard  |  v Vim  |  q Quit")
             .style(Style::default().fg(theme::overlay_hint())),
         Rect::new(inner.x + 1, hint_y, inner.width.saturating_sub(2), 1),
     );
@@ -325,7 +331,7 @@ impl App {
         if self.issue_editor_open() {
             let ctrl_only = key.modifiers == KeyModifiers::CONTROL;
             match key.code {
-                KeyCode::Char('c' | 'C') if ctrl_only && self.field_edit.has_selection() => {
+                KeyCode::Char('c' | 'C') if ctrl_only && self.issue_editor_has_selection() => {
                     return true;
                 }
                 KeyCode::Left | KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -342,7 +348,7 @@ impl App {
         let ctrl = m.contains(KeyModifiers::CONTROL);
         let shift = m.contains(KeyModifiers::SHIFT);
         match key.code {
-            // Ctrl-C copies a selection; with none it keeps its global meaning.
+            // Ctrl-C copies a selection; with none it shows the exit hint (#3434).
             KeyCode::Char('c' | 'C') if m == KeyModifiers::CONTROL => {
                 crate::input_surface::has_selection(surface)
             }
@@ -626,15 +632,20 @@ mod tests {
     #[test]
     fn escape_and_other_keys_never_dismiss() {
         let mut prompt = EditingModePrompt::default();
-        for code in [
-            KeyCode::Esc,
-            KeyCode::Char('q'),
-            KeyCode::Char('x'),
-            KeyCode::Backspace,
-        ] {
+        for code in [KeyCode::Esc, KeyCode::Char('x'), KeyCode::Backspace] {
             assert_eq!(prompt.on_key(key(code)), PromptOutcome::Consumed);
         }
         assert_eq!(prompt.selected, EditingMode::Standard);
+    }
+
+    #[test]
+    fn q_quits_and_ctrl_q_does_not() {
+        let mut prompt = EditingModePrompt::default();
+        assert_eq!(prompt.on_key(key(KeyCode::Char('q'))), PromptOutcome::Quit);
+        assert_eq!(
+            prompt.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            PromptOutcome::Consumed
+        );
     }
 
     use crate::app::bootstrap::BootstrapComponentState;
@@ -692,7 +703,7 @@ mod tests {
         tempfile::TempDir,
         tokio::task::JoinHandle<Vec<(String, serde_json::Value)>>,
     ) {
-        let Ok(dir) = tempfile::tempdir() else {
+        let Ok(dir) = crate::test_support::socket_tempdir() else {
             panic!("tempdir");
         };
         let socket = dir.path().join("daemon.sock");
@@ -798,9 +809,30 @@ mod tests {
         let mut app = ready_app(0);
         app.editing_mode_prompt = Some(EditingModePrompt::default());
         crate::event::step_once(&mut app, key(KeyCode::Esc)).await;
-        crate::event::step_once(&mut app, key(KeyCode::Char('q'))).await;
+        crate::event::step_once(&mut app, key(KeyCode::Char('x'))).await;
         assert!(app.editing_mode_prompt.is_some());
         assert!(!app.quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_hints_and_q_quits_while_the_prompt_is_open() {
+        let mut app = ready_app(0);
+        app.editing_mode_prompt = Some(EditingModePrompt::default());
+        crate::event::step_once(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .await;
+        assert!(!app.quit, "Ctrl-C never quits (#3434)");
+        assert!(app.editing_mode_prompt.is_some());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("press q to quit")),
+            "the hint names the exit"
+        );
+        crate::event::step_once(&mut app, key(KeyCode::Char('q'))).await;
+        assert!(app.quit, "q quits from the prompt");
     }
 
     #[tokio::test]

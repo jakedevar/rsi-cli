@@ -8,6 +8,7 @@ use crate::process_control::{
     CaptureError, CaptureLimits, OverflowBehavior, ProcessContainment, capture_bounded,
 };
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -79,9 +80,30 @@ pub struct GuardReport {
 /// Run `spec` inside `worktree`. An empty spec fails: a guard that verifies
 /// nothing must never read as green.
 pub async fn run_guard(worktree: &Path, spec: &GuardSpec) -> GuardReport {
+    run_guard_in(worktree, spec, None).await
+}
+
+/// [`run_guard`] over an explicit base environment instead of the process
+/// environment (#192): each command starts from `base` alone, with the same
+/// variables withheld ([`scrubbed`] and every credential name) and
+/// `spec.env` on top. With `base` equal to the process environment the child
+/// environment is the one [`run_guard`] gives.
+pub async fn run_guard_with_env(
+    worktree: &Path,
+    spec: &GuardSpec,
+    base: &BTreeMap<OsString, OsString>,
+) -> GuardReport {
+    run_guard_in(worktree, spec, Some(base)).await
+}
+
+async fn run_guard_in(
+    worktree: &Path,
+    spec: &GuardSpec,
+    base: Option<&BTreeMap<OsString, OsString>>,
+) -> GuardReport {
     let mut commands = Vec::with_capacity(spec.commands.len());
     for command in &spec.commands {
-        let report = run_command(worktree, spec, command).await;
+        let report = run_command(worktree, spec, command, base).await;
         let passed = report.status == GuardStatus::Passed;
         commands.push(report);
         if !passed {
@@ -100,12 +122,28 @@ async fn run_command(
     worktree: &Path,
     spec: &GuardSpec,
     guard: &GuardCommand,
+    base: Option<&BTreeMap<OsString, OsString>>,
 ) -> GuardCommandReport {
     let mut command = Command::new(&guard.program);
     command.args(&guard.args).current_dir(worktree);
-    for (key, _) in std::env::vars_os() {
-        if key.to_str().is_some_and(scrubbed) {
-            command.env_remove(&key);
+    if let Some(base) = base {
+        // Credential names are left out here, not removed below: the scrub
+        // keeps a value the command sets explicitly, and these are inherited.
+        command.env_clear();
+        for (key, value) in base {
+            let withheld = key.to_str().is_some_and(|key| {
+                scrubbed(key)
+                    || crate::vault::slots::scrubbed_env_var_names().any(|name| name == key)
+            });
+            if !withheld {
+                command.env(key, value);
+            }
+        }
+    } else {
+        for (key, _) in std::env::vars_os() {
+            if key.to_str().is_some_and(scrubbed) {
+                command.env_remove(&key);
+            }
         }
     }
     // #694 K1: guarded suites run worktree-authored code; no provider key.

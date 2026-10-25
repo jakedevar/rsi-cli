@@ -24,8 +24,8 @@ pub(crate) struct DaemonHealthRead {
     pub(crate) resources: crate::daemon_resources::DaemonResourceSample,
     /// #1122: the pending operator restart line, when one is waiting.
     pub(crate) restart_pending: Option<String>,
-    /// Outer None preserves the last warning across a transient failed read.
-    pub(crate) local_build_warning: Option<Option<String>>,
+    /// Outer None preserves identity and guidance across a transient failed read.
+    pub(crate) daemon_info: Option<Option<rsi_common::agent_daemon_info::DaemonInfoV1>>,
 }
 
 async fn fetch_worker_pressure(
@@ -44,8 +44,8 @@ async fn fetch_worker_pressure(
             .await
             .ok()
             .and_then(|restart| restart.summary());
-        let local_build_warning = match client.get_daemon_info().await {
-            Ok(info) => Some(info.local_build_warning()),
+        let daemon_info = match client.get_daemon_info().await {
+            Ok(info) => Some(Some(info)),
             Err(crate::client::ClientError::Rpc { code, .. })
                 if code == rsi_common::rpc::METHOD_NOT_FOUND =>
             {
@@ -57,7 +57,7 @@ async fn fetch_worker_pressure(
             resources: crate::daemon_resources::DaemonResourceSample::from_health(&status, pid),
             pressure: status.worker_slice_memory_pressure,
             restart_pending,
-            local_build_warning,
+            daemon_info,
         })
     })
     .await
@@ -107,6 +107,7 @@ async fn run_background_conversation_poll_with_timeout(
             batches: Err(error.to_string()),
             batch_unsupported: false,
             connection_lost: is_connection_error(&error),
+            timed_out: false,
         };
     }
 
@@ -159,6 +160,7 @@ async fn run_background_conversation_poll_with_timeout(
             batches: Ok(batches),
             batch_unsupported,
             connection_lost: false,
+            timed_out: false,
         },
         Ok(Err((error, connection_lost))) => ConversationPollResult {
             attempt,
@@ -166,16 +168,18 @@ async fn run_background_conversation_poll_with_timeout(
             batches: Err(error),
             batch_unsupported: false,
             connection_lost,
+            timed_out: false,
         },
         Err(_) => ConversationPollResult {
             attempt,
             generation,
-            batches: Err("fallback conversation poll timed out".to_string()),
+            batches: Err(crate::client::ClientError::Timeout(method_timeout.as_secs()).to_string()),
             batch_unsupported: false,
             // A method deadline is not transport evidence. The daemon may be
             // healthy but slow; only an observed connect/read/write closure
             // withdraws readiness and starts bootstrap.
             connection_lost: false,
+            timed_out: true,
         },
     }
 }
@@ -190,12 +194,12 @@ impl App {
             .is_some_and(tokio::task::JoinHandle::is_finished)
             && let Some(handle) = self.worker_pressure_refresh_handle.take()
         {
-            let (pressure, resources, restart_pending, local_build_warning) = match handle.await {
+            let (pressure, resources, restart_pending, daemon_info) = match handle.await {
                 Ok(Ok(read)) => (
                     read.pressure,
                     Some(read.resources),
                     read.restart_pending,
-                    read.local_build_warning,
+                    read.daemon_info,
                 ),
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "worker pressure Health refresh unavailable");
@@ -206,11 +210,8 @@ impl App {
                     (None, None, None, None)
                 }
             };
-            if let Some(warning) = local_build_warning
-                && self.local_build_warning != warning
-            {
-                self.local_build_warning = warning;
-                self.mark_dirty();
+            if let Some(info) = daemon_info {
+                self.apply_daemon_info(info);
             }
             if self.worker_slice_memory_pressure != pressure {
                 self.worker_slice_memory_pressure = pressure;
@@ -371,12 +372,23 @@ impl App {
         }
 
         // Fetch sessions
-        match self.client.list_sessions().await {
+        let result = tokio::time::timeout(CONVERSATION_POLL_TIMEOUT, self.client.list_sessions())
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::client::ClientError::Timeout(
+                    CONVERSATION_POLL_TIMEOUT.as_secs(),
+                ))
+            });
+        match result {
             Ok(sessions) => {
                 let _ = self.update_sessions(sessions);
             }
             Err(e) => {
-                self.mark_transport_lost(e.to_string());
+                if is_connection_error(&e) {
+                    self.mark_transport_lost(e.to_string());
+                } else {
+                    self.notify_error(e.to_string());
+                }
                 return;
             }
         }
@@ -721,11 +733,14 @@ impl App {
             Err(error) => {
                 if result.connection_lost {
                     self.mark_transport_lost(error);
+                } else if result.timed_out {
+                    self.notify(error);
+                    self.mark_dirty();
                 } else {
                     tracing::debug!(%error, "fallback conversation poll failed");
                 }
                 self.dispatch_pending_conversation_poll();
-                return false;
+                return result.timed_out;
             }
         };
 
@@ -1616,7 +1631,7 @@ mod worker_pressure_refresh_tests {
 
     #[tokio::test]
     async fn held_health_read_keeps_one_background_refresh_and_returns_promptly() {
-        let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+        let temp_dir = crate::test_support::socket_tempdir().expect("temporary socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket listener");
         let mut app = App::new(DaemonClient::new(socket_path));
@@ -2413,6 +2428,7 @@ mod conversation_poll_filter_tests {
             batches: Err("connection closed by daemon".to_string()),
             batch_unsupported: false,
             connection_lost: true,
+            timed_out: false,
         });
 
         assert!(!changed);
@@ -2486,6 +2502,7 @@ mod conversation_poll_filter_tests {
                 batches: Ok(Vec::new()),
                 batch_unsupported: false,
                 connection_lost: false,
+                timed_out: false,
             });
         }
 
@@ -2514,6 +2531,7 @@ mod conversation_poll_filter_tests {
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         });
         assert!(!applied);
         assert!(app.bootstrap.handshake_in_flight());
@@ -2551,6 +2569,7 @@ mod conversation_poll_filter_tests {
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         });
         assert!(!applied);
         assert_eq!(app.conversation_poll_active_generation, Some(2));
@@ -2563,7 +2582,7 @@ mod conversation_poll_filter_tests {
 
     #[tokio::test]
     async fn slow_method_timeout_preserves_healthy_transport_readiness() {
-        let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+        let temp_dir = crate::test_support::socket_tempdir().expect("temporary socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket listener");
         let held_server = tokio::spawn(async move {
@@ -2591,17 +2610,115 @@ mod conversation_poll_filter_tests {
         app.poll.authoritative_config_ready = true;
         app.poll.sessions_authoritative = true;
         app.conversation_poll_active_generation = Some(1);
-        assert!(!app.apply_conversation_poll_result(result));
+        assert!(app.apply_conversation_poll_result(result));
         assert!(app.poll.connected);
         assert!(app.poll.authoritative_config_ready);
         assert!(app.poll.sessions_authoritative);
         assert!(!app.bootstrap.handshake_in_flight());
+        assert!(
+            app.notifications
+                .back()
+                .unwrap()
+                .message
+                .starts_with("Daemon busy (no reply in")
+        );
         held_server.abort();
     }
 
     #[tokio::test]
+    async fn session_refresh_timeout_keeps_connection_and_next_action_succeeds() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = crate::test_support::socket_tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let slow: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(slow["method"], "ListSessions");
+            let next: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(next["method"], "ListProjects");
+            // Coalesce the timed-out reply and the next action's reply. Use
+            // different result shapes so accepting the wrong id cannot pass.
+            let stale =
+                serde_json::json!({"jsonrpc":"2.0", "id":slow["id"], "result":"stale sessions"});
+            let fresh = serde_json::json!({"jsonrpc":"2.0", "id":next["id"], "result":[]});
+            write
+                .write_all(format!("{stale}\n{fresh}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut app = App::new(DaemonClient::new(socket));
+        app.client.connect().await.unwrap();
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        app.poll.sessions_authoritative = true;
+        tokio::time::timeout(std::time::Duration::from_secs(5), app.poll_sessions())
+            .await
+            .unwrap();
+        assert!(app.client.is_connected());
+        assert!(app.poll.connected);
+        assert!(app.poll.authoritative_config_ready);
+        assert!(app.poll.sessions_authoritative);
+        assert_eq!(
+            app.notifications.back().unwrap().message,
+            "Daemon busy (no reply in 3 s); try again"
+        );
+        let projects = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.client.list_projects(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(projects.is_empty());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fallback_reply_eof_withdraws_readiness_and_starts_reconnect() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let dir = crate::test_support::socket_tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            lines.next_line().await.unwrap().unwrap();
+        });
+        let result = super::run_background_conversation_poll_with_timeout(
+            socket.clone(),
+            0,
+            1,
+            vec![rsi_common::rpc::ConversationFetchCursor {
+                session_id: Uuid::new_v4(),
+                since_sequence: None,
+            }],
+            true,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.connection_lost);
+        let mut app = App::new(DaemonClient::new(socket));
+        app.poll.connected = true;
+        app.poll.authoritative_config_ready = true;
+        app.conversation_poll_active_generation = Some(1);
+        app.apply_conversation_poll_result(result);
+        assert!(!app.client.is_connected());
+        assert!(app.bootstrap.handshake_in_flight());
+        assert_eq!(
+            app.notifications.back().unwrap().kind,
+            crate::types::NotificationKind::ConnectionLost
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn actual_connect_failure_withdraws_readiness_and_starts_bootstrap() {
-        let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+        let temp_dir = crate::test_support::socket_tempdir().expect("temporary socket directory");
         let socket_path = temp_dir.path().join("missing.sock");
         let result = super::run_background_conversation_poll_with_timeout(
             socket_path.clone(),
@@ -2703,6 +2820,7 @@ mod conversation_poll_filter_tests {
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         });
         assert!(
             matches!(
@@ -2727,6 +2845,7 @@ mod conversation_poll_filter_tests {
             batches: Ok(Vec::new()),
             batch_unsupported: false,
             connection_lost: false,
+            timed_out: false,
         });
         assert!(app.conversation_poll_pending_phase.is_none());
         assert!(app.conversation_poll_handle.is_some());
@@ -2734,7 +2853,7 @@ mod conversation_poll_filter_tests {
 
     #[tokio::test]
     async fn held_post_snapshot_conversation_poll_keeps_main_task_state_live() {
-        let temp_dir = tempfile::tempdir().expect("temporary socket directory");
+        let temp_dir = crate::test_support::socket_tempdir().expect("temporary socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("socket listener");
         let held_server = tokio::spawn(async move {

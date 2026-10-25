@@ -322,6 +322,23 @@ pub fn describe(field: BudgetCapFieldV1, value: Option<f64>) -> String {
 
 /// Keys while the panel is open. Returns after marking the frame dirty.
 pub async fn handle_key(app: &mut App, key: KeyEvent) {
+    // A coverage draft's budget link is a read-only view, never a second writer
+    // that can invalidate its saved grant fence or partially apply the draft.
+    let read_only = workspace(app).is_some_and(|workspace| workspace.coverage.is_some());
+    if read_only
+        && matches!(
+            key.code,
+            KeyCode::Char('+' | '=' | 'y' | '0'..='9') | KeyCode::Enter
+        )
+    {
+        if let Some(panel) = panel(app) {
+            panel.notice = Some(
+                "Read-only budget chain; edit draft limits in Coverage and permissions.".into(),
+            );
+        }
+        app.mark_dirty();
+        return;
+    }
     let Some(panel) = panel(app) else { return };
     if panel.pending.is_some() {
         match key.code {

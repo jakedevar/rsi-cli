@@ -18,6 +18,9 @@ SSH options:
 EOF
 }
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then usage; exit 0; fi
+# Hub-side installer: it writes a systemd user unit and health-checks with GNU
+# `timeout` and `stat -c`. A macOS satellite is the SSH target, never the host (#141).
+[[ "$(uname -s)" == Linux ]] || { echo "install-direct.sh is Linux-only (systemd user units); run it on the hub, with this machine as SSH_TARGET (docs/satellites.md)" >&2; exit 1; }
 positionals=(); ssh_port=""; ssh_jump=""; ssh_config=""; replace_template=0
 while (($#)); do
   case "$1" in

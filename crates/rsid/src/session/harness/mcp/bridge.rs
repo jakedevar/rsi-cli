@@ -44,7 +44,10 @@ impl McpBridge {
     /// Read operator definitions, fetch vault values, and launch one confined
     /// stdio child per enabled server. Individual server and tool failures are
     /// nonfatal and are reported through `take_events`.
-    pub async fn build(store: &Arc<Mutex<Store>>, vault: &VaultHandle) -> Self {
+    pub async fn build(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        vault: &VaultHandle,
+    ) -> Self {
         let mut bridge = Self {
             tools: Vec::new(),
             events: Vec::new(),

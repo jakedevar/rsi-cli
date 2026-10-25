@@ -738,6 +738,68 @@ export function launchCatalog(...lists: ReadonlyArray<readonly LaunchChoice[]>):
   return out;
 }
 
+// ---- launches a global or portfolio grant above a project manager does not cover (hub #3270, desktop #324) ----
+
+/**
+ * `ManagerLaunchChoiceV2::allows`: a granted launch admits the same provider and model, an exact effort admits only
+ * itself, and an omitted effort admits every effort. (rsid also fails an effort off a known model's ladder; the
+ * desktop does not keep the ladders, so an unknown spelling here counts as admitted and rsid has the last word.)
+ */
+const launchAllows = (granted: LaunchChoice, wanted: LaunchChoice): boolean => {
+  if (granted.provider !== wanted.provider || granted.model !== wanted.model) return false;
+  const g = granted.effort ?? null;
+  const w = wanted.effort ?? null;
+  return g === null ? true : w !== null && g === w;
+};
+
+/** `intersect_launches`: for each matching pair, the narrower entry, once. */
+export function intersectLaunches(left: readonly LaunchChoice[], right: readonly LaunchChoice[]): LaunchChoice[] {
+  const out: LaunchChoice[] = [];
+  for (const a of left) {
+    for (const b of right) {
+      const pick = launchAllows(a, b) ? b : launchAllows(b, a) ? a : null;
+      if (pick && !out.some((x) => launchKey(x) === launchKey(pick))) out.push({ provider: pick.provider, model: pick.model, effort: pick.effort ?? null });
+    }
+  }
+  return out;
+}
+
+/** `portfolio_effective_launches`: the grant's launches narrowed by its project policy's list; a disjoint list falls back to the grant's. */
+export function portfolioEffectiveLaunches(allowed: readonly LaunchChoice[], policy: Record<string, unknown> | null | undefined): LaunchChoice[] {
+  const own = (policy?.allowed_launches as LaunchChoice[] | undefined) ?? [];
+  const narrowed = own.length ? intersectLaunches(allowed, own) : [...allowed];
+  return narrowed.length ? narrowed : [...allowed];
+}
+
+/**
+ * The launches every live portfolio node covering `projectId` admits, intersected as rsid resolves a manager's effective
+ * launches (`ancestor_launches_of`); null when no live node covers the project. A node with an empty launch list admits
+ * nothing, as in rsid.
+ */
+export function ancestorLaunches(nodes: ReadonlyArray<Pick<PortfolioNode, 'state' | 'grant'>>, projectId: string): LaunchChoice[] | null {
+  let out: LaunchChoice[] | null = null;
+  for (const n of nodes) {
+    if (n.state !== 'active' || !n.grant.project_ids.includes(projectId)) continue;
+    const effective = portfolioEffectiveLaunches(n.grant.allowed_launches as LaunchChoice[], n.grant.project_policy);
+    out = out === null ? effective : intersectLaunches(out, effective);
+  }
+  return out;
+}
+
+/** What a launch row says when the ancestor grants do not cover it. */
+export const NOT_GRANTED_MARK = '✗ not granted by global manager';
+
+/** The fix, in plain words (the same command the TUI names; the desktop's command line runs it too). */
+export const NOT_GRANTED_HINT = 'A launch marked “✗ not granted by global manager” is outside what the global manager may start, so this project manager’s launches of that kind will be refused. To allow it, add it to the global manager’s grant: open the command line (:) and run “:manager portfolio launch add <node> <Provider/model>”.';
+
+/** The catalog launches (by `launchText`) that `ancestors` do not cover; none when no ancestor restricts launches. */
+export function uncoveredLaunchTexts(catalog: readonly LaunchChoice[], ancestors: readonly LaunchChoice[] | null): Set<string> {
+  const out = new Set<string>();
+  if (ancestors === null) return out;
+  for (const l of catalog) if (!intersectLaunches([l], ancestors).length) out.add(launchText(l));
+  return out;
+}
+
 /** The picked catalog entries (by their text) plus typed spellings; an unparsable spelling is an error. */
 export function pickLaunches(catalog: readonly LaunchChoice[], checked: readonly string[], typed: string): { launches: LaunchChoice[] } | { error: string } {
   const out = catalog.filter((l) => checked.includes(launchText(l)));

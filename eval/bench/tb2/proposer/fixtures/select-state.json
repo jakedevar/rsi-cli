@@ -1,0 +1,32 @@
+{
+  "baseline_records": [
+    "record.json"
+  ],
+  "candidates": [
+    {
+      "id": "c01-fixture",
+      "screen": [
+        "outcomes/screen-1.json"
+      ],
+      "verify_clean": true
+    },
+    {
+      "id": "c02-fixture",
+      "screen": [
+        "outcomes/screen-2.json"
+      ],
+      "verify_clean": true
+    },
+    {
+      "id": "c03-fixture",
+      "screen": [
+        "outcomes/screen-3.json"
+      ],
+      "verify_clean": true
+    }
+  ],
+  "heldout_tasks": 59,
+  "no_further_hypothesis": false,
+  "search_tasks": 6,
+  "spent_usd": 0.0
+}

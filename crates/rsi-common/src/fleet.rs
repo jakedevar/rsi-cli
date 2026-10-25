@@ -20,6 +20,8 @@ pub struct FleetUsage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// Metered API and cloud only. Subscription list-price estimates are excluded.
+    #[serde(default, skip_serializing_if = "zero")]
     pub cost: f64,
     /// Invocations lacking at least one usage field; totals are partial.
     pub unknown_usage: u64,
@@ -53,9 +55,34 @@ pub struct FleetGroup {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetOverview {
     pub as_of: DateTime<Utc>,
+    #[serde(default)]
+    pub plan_windows: Vec<crate::rpc::ProviderRateLimitSnapshot>,
+    #[serde(default)]
+    pub plan_usage_by_role: Vec<PlanRoleUsageV1>,
     pub agents: Vec<FleetAgent>,
     pub groups: Vec<FleetGroup>,
     pub totals: [FleetUsage; 3],
     pub agents_truncated: bool,
     pub usage_truncated: bool,
+}
+
+fn zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// Recorded token attribution within a provider plan window. The provider
+/// reports account utilization only, so these tokens do not claim a role's
+/// share of the provider's quota (models can consume quota at different rates).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlanRoleUsageV1 {
+    pub provider: String,
+    pub window_key: String,
+    pub role: String,
+    pub origin: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// A bounded query hit its row cap; attribution is a lower bound.
+    pub incomplete: bool,
 }

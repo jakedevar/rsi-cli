@@ -205,6 +205,7 @@ pub const fn chapter_for_overlay_class(class: OverlayHelpClass) -> &'static str 
         | C::ManagerPolicy
         | C::ManagerTextEntry
         | C::GlobalManagerWorkspace
+        | C::GlobalDashboard
         | C::Fleet
         | C::FleetFilter
         | C::FleetSort

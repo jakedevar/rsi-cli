@@ -10,10 +10,10 @@
 # file in tools/portable-shell-baseline.json, which may only go down.
 #
 # Usage: scripts/check-portable-shell.sh [--base REF] [paths...]   (default: scripts/)
-#        python3 tools/check_portable_shell.py --refresh            (lower the baseline)
+#        scripts/repo-guard portable-shell --refresh                (lower the baseline)
 # Exit 1 on any finding above the baseline.
 
 set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 2
-exec python3 tools/check_portable_shell.py "$@"
+exec "$ROOT/scripts/repo-guard" portable-shell "$@"

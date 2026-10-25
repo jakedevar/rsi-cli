@@ -297,6 +297,11 @@ pub fn handed_policy_narrows(
     node_allowed_launches: &[ManagerLaunchChoiceV2],
     node_policy: &ManagerPolicyV2,
 ) -> Result<(), &'static str> {
+    // #3417: a provider spend grant is real-money authority only the operator
+    // writes; a policy a node hands down never carries one.
+    if !handed.provider_grants.is_empty() {
+        return Err(crate::provider_grant::PROVIDER_GRANT_OPERATOR_ONLY_MESSAGE);
+    }
     let node_launches = portfolio_effective_launches(node_allowed_launches, node_policy);
     grant_narrows(
         &policy_bounds(

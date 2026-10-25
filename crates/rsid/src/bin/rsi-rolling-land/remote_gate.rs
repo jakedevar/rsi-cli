@@ -450,7 +450,7 @@ fn ssh_failure_code<'a>(reason: &'a str, exit_code: Option<i32>) -> &'a str {
 }
 
 fn scrub_transport_env(command: &mut Command) {
-    let home = std::env::var_os("HOME");
+    let home = crate::lander_env::var_os("HOME");
     command.env_clear().env("PATH", "/usr/bin:/bin");
     if let Some(home) = home {
         command.env("HOME", home);
@@ -458,7 +458,7 @@ fn scrub_transport_env(command: &mut Command) {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let output = Command::new("git")
+    let output = crate::lander_env::command("git")
         .args(args)
         .current_dir(repo)
         .output()

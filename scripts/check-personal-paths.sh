@@ -7,10 +7,10 @@
 # repo-relative paths, or placeholders (remote.example.net, 203.0.113.0/24).
 #
 # Catches: the maintainer's account/home names and any globally-routable IPv4
-# literal. Private, loopback, link-local, CGNAT (100.64/10) and documentation
-# ranges are fine. `thoughts/` is historical and skipped.
+# literal. Private, loopback, link-local, CGNAT (100.64/10), multicast (224/4),
+# reserved (240/4) and documentation ranges are fine. `thoughts/` is historical and skipped.
 #
-# Allowlist (in tools/check_personal_paths.py, intentionally tiny): GitHub
+# Allowlist (in crates/rsi-repo-guards/src/personal_paths.rs, intentionally tiny): GitHub
 # repository slugs (github.com/<owner>/...) and the public resolver 8.8.8.8.
 #
 # Usage: scripts/check-personal-paths.sh [paths...]   (default: all tracked files)
@@ -19,4 +19,4 @@
 set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 2
-exec python3 tools/check_personal_paths.py "$@"
+exec "$ROOT/scripts/repo-guard" personal-paths "$@"

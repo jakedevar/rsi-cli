@@ -2,15 +2,19 @@
 // The chosen theme and the role overrides are applied as CSS variables on
 // :root and kept in localStorage. All text is set with textContent.
 import { overlayKey } from './actions/detail.js';
+import { api, inTauri } from './api.js';
 import { el, toast } from './dom.js';
 import { uiChanged } from './state.js';
 import { THEME_ROLES } from './settings.generated.js';
 import {
-  type Assessment, DEFAULT_CHOICE, DESKTOP_DEFAULT_NAME, STORAGE_KEY, type ThemeChoice, allVarNames, assessRole,
-  cssVars, decodeChoice, encodeChoice, findTheme, parseHex, pickerEntries, pickerKey, resolveRoles, roleBaseline,
-  setOverride, swatch, themeByKey, unmappedRoles,
+  type Assessment, DEFAULT_CHOICE, DESKTOP_DEFAULT_NAME, MATCH_SYSTEM_NAME, STORAGE_KEY, type ThemeChoice, allVarNames,
+  assessRole, colorSchemeOf, cssVars, decodeChoice, effectiveChoice, encodeChoice, findTheme, isMatchSystemName,
+  parseHex, pickerEntries, pickerIndexOf, pickerKey, resolveRoles, roleBaseline, setOverride, swatch, systemSwatch,
+  themeByKey, unmappedRoles,
 } from './theme-model.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
+import { setKeyTable } from './keytable.js';
 
 let current: ThemeChoice = DEFAULT_CHOICE;
 const listeners: (() => void)[] = [];
@@ -28,8 +32,20 @@ export function currentChoice(): ThemeChoice {
   return current;
 }
 
+/** The system's light/dark setting right now (dark when the page cannot tell). */
+export function systemIsLight(): boolean {
+  try { return window.matchMedia('(prefers-color-scheme: light)').matches; } catch { return false; }
+}
+
+/** The choice with "Match system" resolved to the theme the system asks for. */
+function effective(choice: ThemeChoice): ThemeChoice {
+  return effectiveChoice(choice, systemIsLight());
+}
+
 export function themeName(choice: ThemeChoice = current): string {
-  return themeByKey(choice.theme)?.name ?? DESKTOP_DEFAULT_NAME;
+  const shown = effective(choice);
+  const name = themeByKey(shown.theme)?.name ?? DESKTOP_DEFAULT_NAME;
+  return choice.system ? `${MATCH_SYSTEM_NAME}: now ${themeByKey(shown.theme) ? 'Light' : 'Dark'}` : name;
 }
 
 export function overrideCount(): number {
@@ -37,11 +53,29 @@ export function overrideCount(): number {
 }
 
 /** Set the CSS variables of `choice` (a preview when `persist` is false). */
-function paint(choice: ThemeChoice): void {
+function paint(requested: ThemeChoice): void {
+  const choice = effective(requested);
   const style = document.documentElement.style;
   for (const v of allVarNames()) style.removeProperty(v);
   for (const [v, hex] of Object.entries(cssVars(choice))) style.setProperty(v, hex);
+  // Native controls (checkboxes, radios, select arrows, scrollbars) follow the colours the theme paints.
+  style.setProperty('color-scheme', colorSchemeOf(choice));
   document.documentElement.dataset.theme = choice.theme ?? 'desktop-default';
+  syncWindowTheme(requested.system === true, colorSchemeOf(choice));
+}
+
+let windowTheme = '';
+
+/**
+ * The native window (title bar, frame) follows the app's effective theme: "Match system" hands the window back to the
+ * OS (which already shows what the page matched), an explicit theme pins the window to its light or dark side. Sent
+ * only when it changed; a plain browser preview has no window to theme.
+ */
+function syncWindowTheme(matchSystem: boolean, scheme: 'light' | 'dark'): void {
+  const want = matchSystem ? 'system' : scheme;
+  if (want === windowTheme || !inTauri()) return;
+  windowTheme = want;
+  api.setWindowTheme(want).catch(() => { windowTheme = ''; /* an older shell without the command: the title bar keeps the OS look */ });
 }
 
 function commit(choice: ThemeChoice): void {
@@ -56,6 +90,13 @@ function commit(choice: ThemeChoice): void {
 export function initThemes(): void {
   current = decodeChoice(storage()?.getItem(STORAGE_KEY));
   paint(current);
+  // "Match system" follows the system live; an explicit theme ignores the change.
+  try {
+    const mq = window.matchMedia('(prefers-color-scheme: light)');
+    const onChange = () => { if (current.system) { paint(current); for (const cb of listeners) cb(); uiChanged(); } };
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onChange);
+    else (mq as MediaQueryList).addListener?.(onChange);
+  } catch { /* no matchMedia: the theme stays as painted */ }
 }
 
 /** Clear every role override; the theme stays (the TUI's "Reset active theme"). */
@@ -67,18 +108,23 @@ export function resetRoles(): void {
 
 /** `:theme <name>` applies a theme directly. */
 export function applyThemeByName(name: string): void {
+  if (isMatchSystemName(name)) {
+    commit({ ...current, theme: null, system: true });
+    toast(`Theme: ${themeName()}`, true);
+    return;
+  }
   const t = findTheme(name);
   if (!t && !/^desktop|default$/i.test(name.trim())) {
     toast(`No built-in theme “${name}”`);
     return;
   }
-  commit({ ...current, theme: t?.key ?? null });
+  commit({ overrides: current.overrides, theme: t?.key ?? null });
   toast(`Theme: ${themeName()}`, true);
 }
 
 // ---------- picker ----------
 
-function pickDialog(id: string, title: string): { dlg: HTMLDialogElement; box: HTMLElement } {
+function pickDialog(id: string, title: string, keyTable?: string): { dlg: HTMLDialogElement; box: HTMLElement } {
   let dlg = document.getElementById(id) as HTMLDialogElement | null;
   if (!dlg) {
     dlg = document.createElement('dialog');
@@ -88,6 +134,7 @@ function pickDialog(id: string, title: string): { dlg: HTMLDialogElement; box: H
   }
   dlg.onkeydown = null;
   dlg.onclose = null;
+  setKeyTable(dlg, keyTable);
   const box = el('div');
   box.append(el('h2', '', title));
   dlg.replaceChildren(box);
@@ -98,22 +145,21 @@ function pickDialog(id: string, title: string): { dlg: HTMLDialogElement; box: H
 export function openThemePicker(): void {
   const entries = pickerEntries();
   const opening = current;
-  let index = Math.max(0, entries.findIndex((e) => e.key === opening.theme));
+  let index = pickerIndexOf(opening);
   let done = false;
-  const { dlg, box } = pickDialog('theme-picker', 'Choose theme');
+  const { dlg, box } = pickDialog('theme-picker', 'Choose theme', 'Theme Picker');
   const list = el('ul', 'pick-list theme-list');
-  list.setAttribute('role', 'listbox');
-  const hint = el('div', 'pick-empty', 'j/k preview · Enter applies · 1-9 pick · Esc rolls back');
+  const hint = el('div', 'pick-empty', 'j/k preview · Enter applies · 1-9 pick · Esc rolls back · Match system follows your light/dark setting');
   box.append(list, hint);
   const draw = () => {
     list.replaceChildren(...entries.map((e, i) => {
       const li = el('li', `pick-item${i === index ? ' sel' : ''}`);
       li.setAttribute('role', 'option');
       li.setAttribute('aria-selected', String(i === index));
-      li.append(el('span', 'pick-mark', e.key === opening.theme ? '●' : ''));
-      li.append(el('span', '', i > 0 && i <= 9 ? `${i}  ${e.name}` : e.name));
+      li.append(el('span', 'pick-mark', i === pickerIndexOf(opening) ? '●' : ''));
+      li.append(el('span', '', i > 1 && i <= 10 ? `${i - 1}  ${e.name}` : e.name));
       const sw = el('span', 'theme-swatch');
-      for (const hex of swatch(e.key)) {
+      for (const hex of e.system ? systemSwatch() : swatch(e.key)) {
         const chip = el('span', 'chip');
         chip.style.background = hex;
         sw.append(chip);
@@ -123,13 +169,18 @@ export function openThemePicker(): void {
       return li;
     }));
     list.children[index]?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, dlg, { label: 'Themes' });
   };
-  const preview = () => paint({ ...opening, theme: entries[index]!.key });
+  const picked = (): ThemeChoice => {
+    const e = entries[index]!;
+    return e.system ? { overrides: opening.overrides, theme: null, system: true } : { overrides: opening.overrides, theme: e.key };
+  };
+  const preview = () => paint(picked());
   const finish = (apply: boolean) => {
     if (done) return;
     done = true;
     if (apply) {
-      commit({ ...opening, theme: entries[index]!.key });
+      commit(picked());
       toast(`Theme: ${themeName()}`, true);
     } else {
       paint(opening);
@@ -184,7 +235,7 @@ export function openRoleEditor(startRole?: string): void {
   let acked: string | null = null;
   let previewed: string | null = null;
   const unmapped = new Set(unmappedRoles());
-  const { dlg, box } = pickDialog('theme-roles', `Theme roles · ${themeName(opening)}`);
+  const { dlg, box } = pickDialog('theme-roles', `Theme roles · ${themeName(opening)}`, 'Theme Role Editor');
   const list = el('ul', 'pick-list theme-list');
   const input = el('input');
   input.type = 'text';
@@ -196,9 +247,12 @@ export function openRoleEditor(startRole?: string): void {
   box.append(list, input, status, el('div', 'pick-empty', 'j/k role · type a colour · Enter preview, Enter commit · Delete resets · Esc restores'));
   const role = () => THEME_ROLES[index]!;
   const draw = () => {
-    const roles = resolveRoles(working);
+    const roles = resolveRoles(effective(working));
     list.replaceChildren(...THEME_ROLES.map((r, i) => {
       const li = el('li', `pick-item${i === index ? ' sel' : ''}`);
+      li.setAttribute('role', 'option');
+      li.setAttribute('aria-selected', String(i === index));
+      li.dataset.key = r.key;
       const chip = el('span', 'chip');
       chip.style.background = roles[r.key]!;
       li.append(chip, el('span', '', r.label));
@@ -208,18 +262,19 @@ export function openRoleEditor(startRole?: string): void {
       return li;
     }));
     list.children[index]?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, input, { label: 'Theme roles' });
   };
   const load = () => {
     acked = null;
     previewed = null;
     const r = role();
-    input.value = working.overrides[r.key] ?? roleBaseline(themeByKey(working.theme), r.key);
-    status.textContent = describe(assessRole(working, r.key, input.value));
+    input.value = working.overrides[r.key] ?? roleBaseline(themeByKey(effective(working).theme), r.key);
+    status.textContent = describe(assessRole(effective(working), r.key, input.value));
     draw();
   };
   const enter = () => {
     const r = role();
-    const a = assessRole(working, r.key, input.value);
+    const a = assessRole(effective(working), r.key, input.value);
     status.textContent = describe(a);
     if (a.kind === 'invalid') return;
     const hex = parseHex(input.value)!;

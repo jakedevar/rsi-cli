@@ -26,14 +26,14 @@ struct ContextBlock {
 pub(super) struct ContextPipeline {
     token_counter: Arc<TokenCounter>,
     memory_handle: Option<crate::memory::worker::MemoryHandle>,
-    store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
 }
 
 impl ContextPipeline {
     pub fn new(
         token_counter: Arc<TokenCounter>,
         memory_handle: Option<crate::memory::worker::MemoryHandle>,
-        store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     ) -> Self {
         Self {
             token_counter,
@@ -692,9 +692,9 @@ pub(super) fn context_injection_allowance(window: u64) -> u64 {
 mod tests {
     use super::*;
 
-    fn test_store() -> Arc<tokio::sync::Mutex<crate::store::Store>> {
+    fn test_store() -> Arc<rsid_core::store_lock::Mutex<crate::store::Store>> {
         let store = crate::store::Store::open_in_memory().unwrap();
-        Arc::new(tokio::sync::Mutex::new(store))
+        Arc::new(rsid_core::store_lock::Mutex::new(store))
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

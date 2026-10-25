@@ -272,7 +272,9 @@ impl GuardLabel for GlobalGuard {
 pub enum GlobalEffect {
     ToggleHelp,
     InterruptTerminal,
-    Quit,
+    /// Ctrl-C never quits (#3434): it only shows the hint naming the proper
+    /// exit, so a reflexive Ctrl-C cannot close rsi.
+    CtrlCHint,
     ToggleTerminal,
     JumpBack,
     JumpForward,
@@ -312,8 +314,8 @@ pub static GLOBAL_KEY_INTERCEPTS: &[KeyEntry<GlobalGuard, GlobalEffect>] = &[
     KeyEntry {
         chord: code(KeyCode::Char('c'), ModMatch::Contains(CTRL), "Ctrl-C"),
         guard: GlobalGuard::Always,
-        effect: GlobalEffect::Quit,
-        label: "quit rsi",
+        effect: GlobalEffect::CtrlCHint,
+        label: "does not quit; shows the hint naming the proper exit (:q or ZZ)",
     },
     KeyEntry {
         chord: code(KeyCode::Char('\\'), ModMatch::Contains(CTRL), "Ctrl-\\"),

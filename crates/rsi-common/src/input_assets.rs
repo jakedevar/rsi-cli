@@ -28,11 +28,14 @@
 //!   follow-up, local #97): the TUI's Settings > Skills `e` and `d` on the
 //!   daemon user's `~/.claude/skills` ([`set_skill_enabled`],
 //!   [`toggle_skill`], [`delete_skill`], which the TUI calls too). Enable and
-//!   disable rename `<name>/` and `<name>.disabled/`; delete removes the
-//!   directory tree, as the TUI always has (no trash). The entry must be a real
-//!   directory directly in the skills directory (a symlink, file or other
-//!   non-directory entry is refused) and all I/O goes through pinned handles
-//!   that never follow a link.
+//!   disable rename `<name>/` and `<name>.disabled/`; delete moves the
+//!   directory into the recoverable trash `<data dir>/`[`SKILL_TRASH_DIR`]
+//!   (`<UTC %Y%m%dT%H%M%S>-<8 hex>/<entry>` with a `<batch>.origin` sidecar
+//!   naming where it came from, the [`crate::trash_prune`] batch layout;
+//!   local #91), so nothing is unlinked. The entry must be a real directory
+//!   directly in the skills directory (a symlink, file or other non-directory
+//!   entry is refused) and all I/O goes through pinned handles that never
+//!   follow a link.
 //!
 //! None of these methods is in the attributed verb registry (operator-only,
 //! AGENTS.md rule 10) and none is on the rsi-remote gateway.
@@ -62,10 +65,11 @@ pub const INPUT_ASSET_METHODS: &[&str] = &[
 
 /// Largest decoded image `UploadPasteImage` stores (the desktop's G1 limit).
 pub const MAX_PASTE_IMAGE_BYTES: usize = 32 << 20;
-/// Subdirectory of `~/.rsi/paste` that holds uploads. The TUI removes the
-/// top-level `*.png` files of `~/.rsi/paste` when it exits
-/// (`rsi::clipboard::cleanup_paste_dir`); uploads live one level down so a
-/// TUI exit never deletes an image a desktop message still references.
+/// Subdirectory of `~/.rsi/paste` that holds uploads. The TUI deletes nothing
+/// at exit (local #155); `rsid::paste_retention` removes both these uploads
+/// and the TUI's own top-level `<uuid>.png` pastes once they are older than
+/// seven days and nothing ever named them (a named one only under the opt-in
+/// setting `paste_retention_referenced_days`, #86).
 pub const PASTE_UPLOAD_SUBDIR: &str = "rsid";
 
 /// MIME types `UploadPasteImage` accepts, with the file extension stored.
@@ -100,6 +104,15 @@ pub const MAX_SKILLS: usize = 2_000;
 pub const MAX_SKILL_NAME_BYTES: usize = 255;
 /// The TUI disables a skill by renaming `<name>/` to `<name>.disabled/`.
 pub const DISABLED_SKILL_SUFFIX: &str = ".disabled";
+/// Where `DeleteSkill` keeps a deleted skill, below the rsi data directory.
+pub const SKILL_TRASH_DIR: [&str; 2] = ["trash", "skills"];
+
+/// The skill trash below `data_dir` (`<data dir>/trash/skills`).
+pub fn skill_trash_root(data_dir: &Path) -> PathBuf {
+    SKILL_TRASH_DIR
+        .iter()
+        .fold(data_dir.to_path_buf(), |path, part| path.join(part))
+}
 
 /// `UploadPasteImage` request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +276,7 @@ pub struct SetSkillEnabledResponseV1 {
 }
 
 /// `DeleteSkill` request: the daemon user's skill `name`; `<name>/` is
-/// deleted, else `<name>.disabled/`, as the TUI does.
+/// moved to the skill trash, else `<name>.disabled/`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeleteSkillRequestV1 {
@@ -276,8 +289,10 @@ pub struct DeleteSkillResponseV1 {
     pub name: String,
     /// Whether the deleted directory was the enabled one.
     pub enabled: bool,
-    /// The directory removed.
+    /// The directory removed from the skills directory.
     pub path: String,
+    /// Where the directory now is: `<trash>/<batch>/<entry>`.
+    pub trash_path: String,
 }
 
 /// Where skills are read from. The containment root of a project or session
@@ -363,6 +378,57 @@ pub fn paste_image_extension(mime: &str) -> Option<&'static str> {
         .iter()
         .find(|(allowed, _)| *allowed == mime)
         .map(|(_, ext)| *ext)
+}
+
+/// Calls `found` with each pasted image name `text` mentions: a
+/// `<64 lowercase hex>.<ext>` upload name (`ext` in
+/// [`PASTE_IMAGE_MIME_ALLOWLIST`], not followed by an alphanumeric) or a TUI
+/// `<lowercase hyphenated uuid>.png` paste. The one matcher both
+/// `rsid::paste_retention` (#86) and `Store::update_event_content`'s
+/// reference fence (#179) use, so they agree on what a reference is.
+pub fn paste_image_names_in(text: &str, found: &mut dyn FnMut(String)) {
+    const SHA256_HEX_LEN: usize = 64;
+    const UUID_LEN: usize = 36;
+    fn is_lower_hex(b: u8) -> bool {
+        b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+    }
+    fn is_lower_uuid(bytes: &[u8]) -> bool {
+        bytes.len() == UUID_LEN
+            && bytes.iter().enumerate().all(|(i, b)| match i {
+                8 | 13 | 18 | 23 => *b == b'-',
+                _ => is_lower_hex(*b),
+            })
+    }
+    let bytes = text.as_bytes();
+    for (at, _) in text.match_indices(".png") {
+        if at >= UUID_LEN && is_lower_uuid(&bytes[at - UUID_LEN..at]) {
+            found(format!("{}.png", &text[at - UUID_LEN..at]));
+        }
+    }
+    let mut start = 0;
+    while start < bytes.len() {
+        if !is_lower_hex(bytes[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && is_lower_hex(bytes[end]) {
+            end += 1;
+        }
+        if end - start == SHA256_HEX_LEN && bytes.get(end) == Some(&b'.') {
+            for (_, ext) in PASTE_IMAGE_MIME_ALLOWLIST {
+                let tail = &bytes[end + 1..];
+                if tail.starts_with(ext.as_bytes())
+                    && !tail
+                        .get(ext.len())
+                        .is_some_and(|b| b.is_ascii_alphanumeric())
+                {
+                    found(format!("{}.{ext}", &text[start..end]));
+                }
+            }
+        }
+        start = end;
+    }
 }
 
 /// The image MIME type the magic bytes declare, if it is an allowlisted one.
@@ -883,11 +949,16 @@ pub fn toggle_skill(
 }
 
 /// Delete skill `name` in `scope` (`DeleteSkill`, the TUI's `d`): `<name>/`,
-/// else `<name>.disabled/`, and everything below it, removed for good as the
-/// TUI always has. The entry must be a real directory in the pinned skills
-/// directory; nothing below it is followed (a link inside is unlinked, its
-/// target kept).
-pub fn delete_skill(scope: &SkillScope, name: &str) -> Result<DeleteSkillResponseV1, SkillError> {
+/// else `<name>.disabled/`, is moved whole into a fresh batch of the skill
+/// trash `trash_root` (created when missing) with one `renameat`, so it can be
+/// restored. The entry must be a real directory in the pinned skills
+/// directory and is never followed. A trash on another filesystem is refused
+/// and nothing moves.
+pub fn delete_skill(
+    scope: &SkillScope,
+    name: &str,
+    trash_root: &Path,
+) -> Result<DeleteSkillResponseV1, SkillError> {
     let (handle, dir) = skills_dir_for_write(scope, name)?;
     for (entry, enabled) in [
         (name.to_string(), true),
@@ -896,16 +967,76 @@ pub fn delete_skill(scope: &SkillScope, name: &str) -> Result<DeleteSkillRespons
         if !real_skill_dir(&handle, &entry)? {
             continue;
         }
-        handle
-            .remove_tree(Path::new(&entry))
-            .map_err(SkillError::WriteFailed)?;
+        let path = dir.join(&entry);
+        let trash_path = trash_skill_entry(&handle, &path, &entry, trash_root)?;
         return Ok(DeleteSkillResponseV1 {
             name: name.to_string(),
             enabled,
-            path: dir.join(&entry).to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            trash_path: trash_path.to_string_lossy().into_owned(),
         });
     }
     Err(skill_missing(name))
+}
+
+/// Move `entry` of the pinned skills directory into a new trash batch. The
+/// sidecar is created first and exclusively, so it claims the batch name; a
+/// failed move removes the empty batch and its sidecar again.
+fn trash_skill_entry(
+    skills: &AssetDir,
+    origin: &Path,
+    entry: &str,
+    trash_root: &Path,
+) -> Result<PathBuf, SkillError> {
+    use std::io::Write as _;
+    let trash = AssetDir::create_data_root(trash_root).map_err(SkillError::WriteFailed)?;
+    let id = Uuid::new_v4().simple().to_string();
+    let batch = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S"),
+        &id[..8]
+    );
+    let sidecar = PathBuf::from(format!("{batch}.{}", crate::trash_prune::ORIGIN_EXTENSION));
+    let discard = |batch_made: bool| {
+        if batch_made {
+            let _ = trash.remove_tree(Path::new(&batch));
+        }
+        let _ = trash.remove_file(&sidecar);
+    };
+    let mut origin_file = trash
+        .create_file(&sidecar)
+        .map_err(SkillError::WriteFailed)?;
+    if let Err(e) = origin_file
+        .write_all(origin.to_string_lossy().as_bytes())
+        .and_then(|()| origin_file.sync_all())
+    {
+        discard(false);
+        return Err(SkillError::WriteFailed(e));
+    }
+    let batch_dir = match trash.create_dir(Path::new(&batch)) {
+        Ok(dir) => dir,
+        Err(e) => {
+            discard(false);
+            return Err(SkillError::WriteFailed(e));
+        }
+    };
+    match skills.rename_into(Path::new(entry), &batch_dir, Path::new(entry)) {
+        Ok(()) => Ok(trash_root.join(&batch).join(entry)),
+        Err(e) => {
+            discard(true);
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                return Err(SkillError::WriteFailed(std::io::Error::new(
+                    std::io::ErrorKind::CrossesDevices,
+                    format!(
+                        "the skill trash {} is on another filesystem than {}; nothing was deleted",
+                        trash_root.display(),
+                        origin.display()
+                    ),
+                )));
+            }
+            Err(SkillError::WriteFailed(e))
+        }
+    }
 }
 
 /// The only content-opening boundary for skill and slash-command reads.
@@ -1451,12 +1582,15 @@ mod tests {
         }
     }
 
-    /// `d` semantics: the enabled directory, else the disabled one, removed
-    /// with everything below it; a link inside is unlinked, its target kept.
+    /// `d` semantics (local #91): the enabled directory, else the disabled
+    /// one, moved whole into a fresh batch of the skill trash with an origin
+    /// sidecar; links inside move as links and their targets are kept.
     #[cfg(unix)]
     #[test]
-    fn delete_skill_removes_the_tree_without_following_links() {
+    fn delete_skill_moves_the_tree_to_the_trash_without_following_links() {
         let home = tempfile::TempDir::new().unwrap();
+        let data = tempfile::TempDir::new().unwrap();
+        let trash = skill_trash_root(data.path());
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("keep.txt"), "keep\n").unwrap();
         let skills = home.path().join(".claude/skills");
@@ -1464,30 +1598,50 @@ mod tests {
         std::fs::create_dir_all(skills.join("demo/nested/deeper")).unwrap();
         std::fs::write(skills.join("demo/nested/deeper/x.md"), "x").unwrap();
         std::os::unix::fs::symlink(outside.path(), skills.join("demo/nested/out")).unwrap();
-        std::os::unix::fs::symlink(
-            outside.path().join("keep.txt"),
-            skills.join("demo/file-out"),
-        )
-        .unwrap();
         skill(&skills, "parked.disabled", "parked\n");
         let scope = SkillScope::User {
             home: home.path().to_path_buf(),
         };
-        let gone = delete_skill(&scope, "demo").unwrap();
+        let gone = delete_skill(&scope, "demo", &trash).unwrap();
         assert!(gone.enabled);
         assert!(gone.path.ends_with("demo"));
         assert!(std::fs::symlink_metadata(skills.join("demo")).is_err());
+        let kept = PathBuf::from(&gone.trash_path);
+        assert_eq!(kept.file_name().unwrap(), "demo");
+        let batch = kept.parent().unwrap();
+        assert_eq!(batch.parent().unwrap(), trash);
+        assert_eq!(
+            std::fs::read_to_string(kept.join("SKILL.md")).unwrap(),
+            "demo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kept.join("nested/deeper/x.md")).unwrap(),
+            "x"
+        );
+        assert_eq!(
+            std::fs::read_link(kept.join("nested/out")).unwrap(),
+            outside.path()
+        );
+        assert_eq!(
+            std::fs::read_to_string(batch.with_extension("origin")).unwrap(),
+            gone.path
+        );
         assert_eq!(
             std::fs::read_to_string(outside.path().join("keep.txt")).unwrap(),
             "keep\n"
         );
-        let parked = delete_skill(&scope, "parked").unwrap();
+
+        let parked = delete_skill(&scope, "parked", &trash).unwrap();
         assert!(!parked.enabled);
         assert!(std::fs::symlink_metadata(skills.join("parked.disabled")).is_err());
+        assert!(PathBuf::from(&parked.trash_path).join("SKILL.md").is_file());
+        assert!(parked.trash_path.ends_with("parked.disabled"));
         assert_eq!(
-            delete_skill(&scope, "parked").unwrap_err().code(),
+            delete_skill(&scope, "parked", &trash).unwrap_err().code(),
             "skill_not_found"
         );
+        // Two batches and their two sidecars, nothing else.
+        assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 4);
     }
 
     /// A skill entry that is a link (in or out of the root), a file or a FIFO
@@ -1515,7 +1669,7 @@ mod tests {
             for err in [
                 set_skill_enabled(&scope, name, false).unwrap_err(),
                 toggle_skill(&scope, name).unwrap_err(),
-                delete_skill(&scope, name).unwrap_err(),
+                delete_skill(&scope, name, &home.path().join("trash")).unwrap_err(),
             ] {
                 assert_eq!(err.code(), "skill_not_directory", "{name}");
             }
@@ -1536,7 +1690,9 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), linked.path().join(".claude/skills")).unwrap();
         let scope = SkillScope::Root(linked.path().to_path_buf());
         assert_eq!(
-            delete_skill(&scope, "secret").unwrap_err().code(),
+            delete_skill(&scope, "secret", &home.path().join("trash"))
+                .unwrap_err()
+                .code(),
             "skill_outside_root"
         );
         assert!(outside.path().join("secret/SKILL.md").is_file());

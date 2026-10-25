@@ -28,7 +28,21 @@
 //! These aggregate bounds leave room outside builds for the daemon/desktop;
 //! the parent and daemon are never given the build memory ceiling. MemoryHigh
 //! throttles reclaim; MemoryMax may OOM a build rather than exhaust the host.
+//! #3999: MemoryHigh is not static. The operator's own work (games, local
+//! models) outranks agent builds, so MemoryHigh follows the memory left once
+//! everything resident outside the slice and a 10% headroom are set aside
+//! ([`MemoryBudget::for_pressure`], sampled from `/proc/meminfo` and the slice's
+//! cgroup), never above the 60% ceiling. The daemon re-applies it on a timer
+//! (`build_budget::spawn_memory_watch`) and at every launch, so it shrinks live
+//! while the operator is using memory and recovers afterwards. MemoryMax stays
+//! at the static 75% ceiling: pressure throttles a running build or landing
+//! gate through reclaim and never kills it. No operator setting is involved:
+//! the budget follows the host, with fixed headroom.
 //! This memory policy is a no-op on macOS/Windows (no systemd user slice).
+//! The build slice also gets IOWeight=20, below the daemon's default 100, so
+//! sustained cargo writes yield IO bandwidth to SQLite. Weight enforcement
+//! depends on the host's cgroup IO controller and block scheduler; it is not a
+//! latency guarantee. No IO weight is applied to the parent or daemon.
 //!
 //! #2282: the slices are the user's, shared by every process on the host, so a
 //! process writes them only when it is the hub daemon (its data directory is
@@ -53,6 +67,9 @@ pub const SLICE: &str = "rsi-build.slice";
 pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
 /// `CPUWeight` of the slice: builds yield to everything else under `rsi.slice`.
 pub const CPU_WEIGHT: u32 = 20;
+/// Build IO yields to the daemon's default systemd IOWeight (100). Applied
+/// only to the build slice, so all nested cargo units share the lower weight.
+pub const IO_WEIGHT: u32 = 20;
 /// The parent of [`SLICE`] and `rsi-workers.slice` (the dash in a slice name
 /// encodes its parent).
 pub const PARENT_SLICE: &str = "rsi.slice";
@@ -247,6 +264,29 @@ pub fn host_memory_bytes() -> Option<u64> {
     }
 }
 
+/// Memory the operator's own work holds outside the build slice, sampled for
+/// [`MemoryBudget::for_pressure`] (#3999).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPressure {
+    /// Physical host RAM.
+    pub total_bytes: u64,
+    /// `MemAvailable`: what the kernel can hand out without swapping.
+    pub available_bytes: u64,
+    /// Anonymous memory the build slice itself holds (its page cache is
+    /// reclaimable and already counted as available).
+    pub build_anon_bytes: u64,
+}
+
+/// `MemoryHigh` moves in steps of this size, so the budget does not rewrite the
+/// slice on every sample and systemd's page rounding never causes a rewrite.
+const HIGH_STEP_BYTES: u64 = 256 * 1024 * 1024;
+/// A shown `MemoryHigh` within this distance of the wanted one is left alone
+/// (hysteresis: the sample drifts by small amounts all the time).
+const HIGH_TOLERANCE_BYTES: u64 = 1024 * 1024 * 1024;
+/// The smallest `MemoryHigh` pressure ever sets (a host with less RAM: 1/16 of
+/// it): the builds are throttled to this, never frozen.
+const HIGH_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Aggregate build memory bounds. No per-job multiplication of host RAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBudget {
@@ -267,6 +307,131 @@ impl MemoryBudget {
             max_bytes: share(75),
         }
     }
+
+    /// [`Self::for_host`] as the ceiling, with `MemoryHigh` lowered to what the
+    /// host has left once the operator's own work (everything resident outside
+    /// the build slice) and a 10% headroom are set aside (#3999). The operator's
+    /// games and local models outrank agent builds: a build that would take
+    /// memory they hold is throttled by `MemoryHigh` (reclaim pressure), never
+    /// killed, so `MemoryMax` stays at the static ceiling and a landing gate
+    /// slows down instead of failing. `MemoryHigh` never drops below a floor
+    /// (the larger of 2 GiB and 1/16 of RAM, within the ceiling) and moves in
+    /// 256 MiB steps.
+    #[must_use]
+    pub fn for_pressure(pressure: MemoryPressure) -> Self {
+        let ceiling = Self::for_host(pressure.total_bytes);
+        let outside = pressure
+            .total_bytes
+            .saturating_sub(pressure.available_bytes)
+            .saturating_sub(pressure.build_anon_bytes);
+        let headroom = pressure.total_bytes / 10;
+        let wanted = pressure
+            .total_bytes
+            .saturating_sub(outside)
+            .saturating_sub(headroom);
+        let floor = HIGH_FLOOR_BYTES
+            .max(pressure.total_bytes / 16)
+            .min(ceiling.high_bytes);
+        // Unsqueezed, the ceiling itself; squeezed, the stepped remainder.
+        let high = if wanted >= ceiling.high_bytes {
+            ceiling.high_bytes
+        } else {
+            let stepped = wanted.max(floor) / HIGH_STEP_BYTES * HIGH_STEP_BYTES;
+            if stepped == 0 {
+                ceiling.high_bytes
+            } else {
+                stepped
+            }
+        };
+        Self {
+            high_bytes: high,
+            max_bytes: ceiling.max_bytes,
+        }
+    }
+
+    /// Whether `shown` (the slice's current `MemoryHigh`/`MemoryMax`) already
+    /// carries this budget: the same `MemoryMax`, and a `MemoryHigh` within
+    /// [`HIGH_TOLERANCE_BYTES`] of it.
+    fn matches(self, shown_high: Option<u64>, shown_max: Option<u64>) -> bool {
+        shown_max == Some(self.max_bytes)
+            && shown_high.is_some_and(|high| high.abs_diff(self.high_bytes) < HIGH_TOLERANCE_BYTES)
+    }
+}
+
+/// `MemAvailable` in bytes from a `/proc/meminfo` body.
+#[must_use]
+pub fn parse_mem_available(meminfo: &str) -> Option<u64> {
+    let kib: u64 = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    kib.checked_mul(1024)
+}
+
+/// `anon` in bytes from a cgroup v2 `memory.stat` body.
+#[must_use]
+pub fn parse_cgroup_anon(memory_stat: &str) -> Option<u64> {
+    memory_stat.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next() == Some("anon"))
+            .then(|| fields.next()?.parse().ok())
+            .flatten()
+    })
+}
+
+/// `ControlGroup` path from `systemctl show --property=ControlGroup` output
+/// (empty when the unit is inactive).
+fn parse_control_group(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("ControlGroup="))
+        .map(str::trim)
+        .filter(|path| path.starts_with('/'))
+}
+
+/// Sample the host's memory pressure (Linux; `None` elsewhere, or when
+/// `/proc/meminfo` cannot be read, so the caller keeps the static budget).
+/// The build slice's own anonymous memory comes from its cgroup, found through
+/// `run`; a slice that is not running holds none.
+#[cfg(target_os = "linux")]
+fn sample_memory_pressure(run: &dyn Fn(&[&str]) -> io::Result<Output>) -> Option<MemoryPressure> {
+    let total_bytes = host_memory_bytes()?;
+    let available_bytes = parse_mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let build_anon_bytes = run(&["show", SLICE, "--property=ControlGroup"])
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let cgroup = String::from_utf8_lossy(&output.stdout).into_owned();
+            let path = parse_control_group(&cgroup)?;
+            let stat = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.stat")).ok()?;
+            parse_cgroup_anon(&stat)
+        })
+        .unwrap_or(0);
+    Some(MemoryPressure {
+        total_bytes,
+        available_bytes,
+        build_anon_bytes,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_memory_pressure(_run: &dyn Fn(&[&str]) -> io::Result<Output>) -> Option<MemoryPressure> {
+    None
+}
+
+/// The budget for the host's memory right now: pressure-aware where it can be
+/// sampled, else the static share of physical RAM, else none.
+fn current_memory_budget(run: &dyn Fn(&[&str]) -> io::Result<Output>) -> Option<MemoryBudget> {
+    sample_memory_pressure(run)
+        .map(MemoryBudget::for_pressure)
+        .or_else(|| {
+            host_memory_bytes()
+                .filter(|bytes| *bytes > 0)
+                .map(MemoryBudget::for_host)
+        })
 }
 
 /// The slice's `CPUQuota`, in percent of one CPU: `percent` of `host_threads`
@@ -365,6 +530,7 @@ impl SliceReport {
             "hub_build_cpu_percent": self.hub_build_cpu_percent,
             "cpu_quota_percent": self.cpu_quota_percent,
             "cpu_weight": self.cpu_weight,
+            "io_weight": (self.slice == SLICE).then_some(IO_WEIGHT),
             "budget_cores": self.budget_cores,
             "memory_high_bytes": self.memory.map(|memory| memory.high_bytes),
             "memory_max_bytes": self.memory.map(|memory| memory.max_bytes),
@@ -486,6 +652,7 @@ fn apply_properties_with(
         slice,
         "--property=CPUQuotaPerSecUSec",
         "--property=CPUWeight",
+        "--property=IOWeight",
         "--property=MemoryHigh",
         "--property=MemoryMax",
     ]) {
@@ -504,7 +671,7 @@ fn apply_properties_with(
         }
     };
     let (have_quota, have_weight) = parse_show(&String::from_utf8_lossy(&shown.stdout));
-    let shown_memory = |name: &str| {
+    let shown_property = |name: &str| {
         String::from_utf8_lossy(&shown.stdout)
             .lines()
             .find_map(|line| {
@@ -513,10 +680,10 @@ fn apply_properties_with(
             })
     };
     let memory_matches = memory.is_none_or(|budget| {
-        shown_memory("MemoryHigh=") == Some(budget.high_bytes)
-            && shown_memory("MemoryMax=") == Some(budget.max_bytes)
+        budget.matches(shown_property("MemoryHigh="), shown_property("MemoryMax="))
     });
-    if have_quota == Some(quota) && have_weight == Some(weight) && memory_matches {
+    let io_matches = slice != SLICE || shown_property("IOWeight=") == Some(u64::from(IO_WEIGHT));
+    if have_quota == Some(quota) && have_weight == Some(weight) && memory_matches && io_matches {
         report.state = SliceState::Unchanged;
         return report;
     }
@@ -529,6 +696,11 @@ fn apply_properties_with(
         &quota_property,
         &weight_property,
     ];
+    let io_property;
+    if slice == SLICE {
+        io_property = format!("IOWeight={IO_WEIGHT}");
+        args.push(&io_property);
+    }
     let high_property;
     let max_property;
     if let Some(budget) = memory {
@@ -603,7 +775,7 @@ pub fn apply_pair_with(
     host_threads: usize,
     percent: u32,
 ) -> SliceReport {
-    apply_pair_with_memory(run, host_threads, percent, host_memory_bytes())
+    apply_pair_with_budget(run, host_threads, percent, current_memory_budget(run))
 }
 
 /// Both slices with explicit physical RAM for fixture-only policy verification.
@@ -617,6 +789,18 @@ pub fn apply_pair_with_memory(
     let memory = host_memory
         .filter(|bytes| *bytes > 0)
         .map(MemoryBudget::for_host);
+    apply_pair_with_budget(run, host_threads, percent, memory)
+}
+
+/// Both slices with an explicit memory budget (the pressure-aware one in
+/// production, see MemoryBudget::for_pressure); None keeps CPU budgeting
+/// and reports the missing memory protection.
+pub fn apply_pair_with_budget(
+    run: &dyn Fn(&[&str]) -> io::Result<Output>,
+    host_threads: usize,
+    percent: u32,
+    memory: Option<MemoryBudget>,
+) -> SliceReport {
     let mut report = apply_properties_with(run, SLICE, host_threads, percent, CPU_WEIGHT, memory);
     if memory.is_none() && !report.is_unavailable() {
         report.detail =
@@ -667,6 +851,139 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn pressure(total: u64, available: u64, build_anon: u64) -> MemoryPressure {
+        MemoryPressure {
+            total_bytes: total,
+            available_bytes: available,
+            build_anon_bytes: build_anon,
+        }
+    }
+
+    #[test]
+    fn memory_high_shrinks_when_a_non_rsi_process_holds_memory() {
+        let total = 64 * GIB;
+        let ceiling = MemoryBudget::for_host(total);
+        // An idle host: only the builds' own 4 GiB is resident, so the ceiling holds.
+        let idle = MemoryBudget::for_pressure(pressure(total, total - 4 * GIB, 4 * GIB));
+        assert_eq!(idle, ceiling);
+        // The operator's game and local models take 30 GiB outside the slice
+        // while the builds still hold 4 GiB: MemoryHigh falls to what is left
+        // after the operator's memory and the 10% headroom.
+        let busy = MemoryBudget::for_pressure(pressure(total, total - 34 * GIB, 4 * GIB));
+        assert!(busy.high_bytes < idle.high_bytes, "{busy:?} vs {idle:?}");
+        assert!(busy.high_bytes <= total - 30 * GIB - total / 10);
+        assert!(busy.high_bytes > total - 30 * GIB - total / 10 - HIGH_STEP_BYTES);
+        // Builds are throttled, never killed: MemoryMax is the static ceiling.
+        assert_eq!(busy.max_bytes, ceiling.max_bytes);
+        assert!(busy.high_bytes < busy.max_bytes);
+    }
+
+    #[test]
+    fn memory_high_has_a_floor_and_ignores_the_builds_own_memory() {
+        let total = 64 * GIB;
+        // The operator holds nearly everything: builds are throttled to the
+        // floor (the larger of 2 GiB and 1/16 of RAM), not frozen at zero.
+        let starved = MemoryBudget::for_pressure(pressure(total, 2 * GIB, 0));
+        assert_eq!(starved.high_bytes, total / 16);
+        // Memory the build slice holds itself is not the operator's: the same
+        // total in use gives a larger budget the more of it is the builds'.
+        let all_builds = MemoryBudget::for_pressure(pressure(total, total - 20 * GIB, 20 * GIB));
+        let all_operator = MemoryBudget::for_pressure(pressure(total, total - 20 * GIB, 0));
+        assert!(all_builds.high_bytes > all_operator.high_bytes);
+        // A small host keeps the floor inside the static ceiling.
+        let small = MemoryBudget::for_pressure(pressure(2 * GIB, GIB / 4, 0));
+        assert!(small.high_bytes <= MemoryBudget::for_host(2 * GIB).high_bytes);
+        assert!(small.high_bytes > 0 && small.high_bytes < small.max_bytes);
+        // Steps of 256 MiB.
+        assert_eq!(
+            MemoryBudget::for_pressure(pressure(total, total - 21 * GIB, 0)).high_bytes
+                % HIGH_STEP_BYTES,
+            0
+        );
+    }
+
+    #[test]
+    fn memory_pressure_inputs_parse_from_proc_and_cgroup_text() {
+        assert_eq!(
+            parse_mem_available("MemTotal: 100 kB\nMemAvailable:    2048 kB\nBuffers: 1 kB\n"),
+            Some(2048 * 1024)
+        );
+        assert_eq!(parse_mem_available("MemTotal: 100 kB\n"), None);
+        assert_eq!(
+            parse_cgroup_anon("file 5\nanon 12345\nkernel 7\n"),
+            Some(12345)
+        );
+        assert_eq!(parse_cgroup_anon("file 5\n"), None);
+        assert_eq!(
+            parse_control_group("ControlGroup=/user.slice/x/rsi-build.slice\n"),
+            Some("/user.slice/x/rsi-build.slice")
+        );
+        assert_eq!(parse_control_group("ControlGroup=\n"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shrunk_budget_is_written_live_and_small_drift_is_left_alone() {
+        let total = 64 * GIB;
+        let properties = RefCell::new(std::collections::BTreeMap::<String, Vec<String>>::new());
+        let writes = RefCell::new(Vec::<Vec<String>>::new());
+        let run = |args: &[&str]| -> io::Result<Output> {
+            if args[0] == "show" {
+                let shown = properties
+                    .borrow()
+                    .get(args[1])
+                    .map(|rows| rows.join("\n"))
+                    .unwrap_or_default();
+                return Ok(output(0, &shown, ""));
+            }
+            writes
+                .borrow_mut()
+                .push(args.iter().map(ToString::to_string).collect());
+            let rows = args[3..]
+                .iter()
+                .map(|property| {
+                    if let Some(quota) = property.strip_prefix("CPUQuota=") {
+                        let quota: u64 = quota.trim_end_matches('%').parse().unwrap();
+                        format!("CPUQuotaPerSecUSec={}s", quota / 100)
+                    } else {
+                        property.to_string()
+                    }
+                })
+                .collect();
+            properties.borrow_mut().insert(args[2].to_string(), rows);
+            Ok(output(0, "", ""))
+        };
+        let idle = MemoryBudget::for_pressure(pressure(total, total - 4 * GIB, 4 * GIB));
+        assert_eq!(
+            apply_pair_with_budget(&run, 8, 50, Some(idle)).state,
+            SliceState::Applied
+        );
+        // The operator starts a game: the next apply lowers MemoryHigh and
+        // leaves MemoryMax at the ceiling.
+        let busy = MemoryBudget::for_pressure(pressure(total, total - 34 * GIB, 4 * GIB));
+        writes.borrow_mut().clear();
+        assert_eq!(
+            apply_pair_with_budget(&run, 8, 50, Some(busy)).state,
+            SliceState::Applied
+        );
+        let writes_now = writes.borrow().clone();
+        assert!(writes_now[0].contains(&format!("MemoryHigh={}", busy.high_bytes)));
+        assert!(writes_now[0].contains(&format!("MemoryMax={}", idle.max_bytes)));
+        // A sample one step away is inside the hysteresis: no rewrite.
+        writes.borrow_mut().clear();
+        let nudged = MemoryBudget {
+            high_bytes: busy.high_bytes + HIGH_STEP_BYTES,
+            ..busy
+        };
+        assert_eq!(
+            apply_pair_with_budget(&run, 8, 50, Some(nudged)).state,
+            SliceState::Unchanged
+        );
+        assert!(writes.borrow().is_empty());
     }
 
     #[test]
@@ -742,6 +1059,7 @@ mod tests {
                     SLICE.into(),
                     "CPUQuota=400%".into(),
                     "CPUWeight=20".into(),
+                    "IOWeight=20".into(),
                     format!("MemoryHigh={}", budget.high_bytes),
                     format!("MemoryMax={}", budget.max_bytes)
                 ],
@@ -774,6 +1092,58 @@ mod tests {
             apply_pair_with_memory(&run, 8, 50, Some(ram)).state,
             SliceState::Unchanged
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_io_weight_repairs_io_only_drift_without_weighting_the_parent() {
+        let calls = RefCell::new(Vec::<Vec<String>>::new());
+        let io_weight = RefCell::new(None::<u32>);
+        let run = |args: &[&str]| -> io::Result<Output> {
+            calls
+                .borrow_mut()
+                .push(args.iter().map(ToString::to_string).collect());
+            if args[0] == "show" {
+                let weight = if args[1] == SLICE {
+                    CPU_WEIGHT
+                } else {
+                    PARENT_CPU_WEIGHT
+                };
+                return Ok(output(
+                    0,
+                    &format!(
+                        "CPUQuotaPerSecUSec=4s\nCPUWeight={weight}\nIOWeight={}\n",
+                        io_weight
+                            .borrow()
+                            .map_or("[not set]".into(), |weight| weight.to_string()),
+                    ),
+                    "",
+                ));
+            }
+            assert_eq!(args[2], SLICE, "the parent's CPU policy already matches");
+            assert!(args.contains(&"IOWeight=20"));
+            *io_weight.borrow_mut() = Some(IO_WEIGHT);
+            Ok(output(0, "", ""))
+        };
+        // A previously configured slice is upgraded even if only IO differs.
+        let report = apply_pair_with_memory(&run, 8, 50, None);
+        assert_eq!(report.state, SliceState::Applied);
+        assert_eq!(report.parent_state, SliceState::Unchanged);
+        assert_eq!(report.to_json()["io_weight"], 20);
+        calls.borrow_mut().clear();
+        assert_eq!(
+            apply_pair_with_memory(&run, 8, 50, None).state,
+            SliceState::Unchanged
+        );
+        assert!(calls.borrow().iter().all(|call| call[0] == "show"));
+        // Repair later IO drift as well, preserving CPU quota and weight.
+        *io_weight.borrow_mut() = Some(100);
+        assert_eq!(
+            apply_pair_with_memory(&run, 8, 50, None).state,
+            SliceState::Applied
+        );
+        assert_eq!(*io_weight.borrow(), Some(20));
+        assert!(IO_WEIGHT < 100);
     }
 
     #[cfg(unix)]
@@ -870,7 +1240,7 @@ mod tests {
                 return Ok(output(0, &shown.borrow(), ""));
             }
             // The write lands in what `show` reports next.
-            *shown.borrow_mut() = "CPUWeight=20\nCPUQuotaPerSecUSec=16s\n".into();
+            *shown.borrow_mut() = "CPUWeight=20\nIOWeight=20\nCPUQuotaPerSecUSec=16s\n".into();
             Ok(output(0, "", ""))
         };
         let first = apply_with(&run, SLICE, 32, 50);
@@ -884,7 +1254,8 @@ mod tests {
                 "--runtime",
                 "rsi-build.slice",
                 "CPUQuota=1600%",
-                "CPUWeight=20"
+                "CPUWeight=20",
+                "IOWeight=20"
             ]
         );
         // The second apply finds the properties in place and writes nothing.
@@ -1024,7 +1395,10 @@ mod tests {
                 let (quota, weight) = self.state.borrow()[&slice];
                 return Ok(output(
                     0,
-                    &format!("CPUWeight={weight}\nCPUQuotaPerSecUSec={}s\n", quota / 100),
+                    &format!(
+                        "CPUWeight={weight}\nIOWeight={IO_WEIGHT}\nCPUQuotaPerSecUSec={}s\n",
+                        quota / 100
+                    ),
                     "",
                 ));
             }

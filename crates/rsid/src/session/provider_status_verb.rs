@@ -147,6 +147,39 @@ impl AgentControlHandle {
         if let Some(config) = self.spawn_coordinator.runtime_config() {
             report.apply_provider_profile(config.provider_profile());
         }
+        // #3154: the OpenRouter spend ceiling and, for the models the request
+        // named, their prices from the daemon's own discovery. The report just
+        // probed the account, so the ceiling is read from that probe.
+        if report
+            .providers
+            .iter()
+            .any(|entry| entry.provider == "openrouter")
+            && let Some(config) = self.spawn_coordinator.runtime_config()
+        {
+            let enforcer = crate::openrouter_spend::SpendEnforcer {
+                service,
+                vault: vault.clone(),
+                config: std::sync::Arc::clone(config),
+                store: std::sync::Arc::clone(&self.store),
+            };
+            let cap = enforcer.state(true).await;
+            let (prices, unknown) = if request.models.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                service.model_prices(vault, &request.models).await
+            };
+            // The per-run budget of a benchmark run (M3): judged from the
+            // spend of the sessions it launched and the cap's remainder.
+            let run_budget = match request.run_budget_usd {
+                Some(budget) => Some(
+                    enforcer
+                        .run_budget_report(budget, &request.run_sessions)
+                        .await?,
+                ),
+                None => None,
+            };
+            report.apply_openrouter_spend(cap, prices, unknown, run_budget);
+        }
         Ok(report)
     }
 

@@ -559,7 +559,7 @@ async fn transient_heal_sixty_minute_budget_survives_daemon_restart() {
         rusqlite::params![id.to_string(), first],
     ).unwrap();
     // Reopen the actual SQLite database; the scheduler has no volatile retry state.
-    let restarted = Arc::new(tokio::sync::Mutex::new(
+    let restarted = Arc::new(rsid_core::store_lock::Mutex::new(
         Store::open_test_fixture(&f._dir.path().join("rsi.db")).unwrap(),
     ));
     let process = install_controller_candidate_test_process(lead.id);

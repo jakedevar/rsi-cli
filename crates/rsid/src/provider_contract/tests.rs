@@ -141,13 +141,13 @@ async fn trusted_hooks_with_rsis_hashes_are_ok_and_the_probe_passes_rsis_real_ov
 
     // The app-server was started with the overrides a launch passes, ahead of
     // the subcommand: both hooks, the probed lifecycle hooks (#2766
-    // PreCompact, hub #2919 SessionStart) and the trust state for all four.
+    // PreCompact, hub #2919 SessionStart) the prompt-submit fallback and the trust state for all five.
     let argv = std::fs::read_to_string(dir.path().join("argv")).unwrap();
     let launch_overrides = crate::codex::codex_session_hook_overrides_with_lifecycle(
         HOOK_COMMAND,
         &crate::codex::CODEX_PROBED_LIFECYCLE_EVENTS,
     );
-    assert_eq!(launch_overrides.len(), 5);
+    assert_eq!(launch_overrides.len(), 6);
     assert!(
         launch_overrides
             .iter()

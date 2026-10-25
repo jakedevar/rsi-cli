@@ -35,7 +35,7 @@ function initPromptCreatorSlice(): void {
   initPromptCreator();
   registerRowOverlay('claude_skills', {
     enter: 'Opens the skills list (Enter previews SKILL.md, e enables or disables, d d deletes)',
-    stored: "the daemon host's ~/.claude/skills, through ListSkills / GetSkill / SetSkillEnabled / DeleteSkill",
+    stored: "the daemon host's Claude skills folder",
     keys: SKILL_ROW_KEYS,
     run: () => void openSkills(),
   });

@@ -221,7 +221,7 @@ pub struct AgentControlHandle {
     pub(super) topology_agent: Option<super::TopologyAgentSelf>,
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    pub(super) store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    pub(super) store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     pub(super) event_bus: Arc<crate::bus::EventBus>,
     pub(super) spawn_coordinator: Arc<super::spawn_coordinator::SpawnCoordinator>,
     /// Deploy drain (#1073); `None` for handles built without a manager.
@@ -234,6 +234,9 @@ pub struct AgentControlHandle {
     /// Project index and RSI.md cache the project verbs refresh (#1626);
     /// `None` for handles built without a manager.
     pub(super) project_admin: Option<super::agent_projects::ProjectAdminContext>,
+    /// #3181: the ports of the `bench` job gates; `None` falls back to the
+    /// daemon's installed ports (tests inject a double).
+    pub(super) bench_ports: Option<Arc<dyn crate::agent_jobs::bench::BenchJobPorts>>,
 }
 
 impl AgentControlHandle {
@@ -244,7 +247,7 @@ impl AgentControlHandle {
     pub fn new(
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-        store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         event_bus: Arc<crate::bus::EventBus>,
         spawn_coordinator: Arc<super::spawn_coordinator::SpawnCoordinator>,
     ) -> Self {
@@ -260,7 +263,38 @@ impl AgentControlHandle {
             host_load: None,
             runtime_config: None,
             project_admin: None,
+            bench_ports: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_bench_ports(
+        mut self,
+        ports: Arc<dyn crate::agent_jobs::bench::BenchJobPorts>,
+    ) -> Self {
+        self.bench_ports = Some(ports);
+        self
+    }
+
+    /// #3688: publish a container the daemon created for a manager's first
+    /// Issue worker launch into the in-memory view, as
+    /// `project_manager_container` does for a `create_container` action.
+    pub(super) async fn project_default_container(&self, session: rsi_common::types::Session) {
+        self.completed.write().await.insert(
+            session.id,
+            CompletedSession {
+                session: session.clone(),
+                events: Vec::new(),
+                turn_metrics: Vec::new(),
+                retry_cancel: None,
+                retry_fired_at: None,
+                superseded_by_retry: None,
+                events_hydrated: true,
+                store_writes: Default::default(),
+            },
+        );
+        self.event_bus
+            .publish(crate::bus::DaemonEvent::SessionCreated { session });
     }
 
     pub(super) fn with_project_admin(
@@ -444,9 +478,16 @@ impl AgentControlHandle {
         caller_session_id: Uuid,
         target_session_id: Uuid,
     ) -> Result<Session> {
-        let target = self
+        let mut target = self
             .authorize_agent_target(caller_session_id, target_session_id)
             .await?;
+        // #197: the active/completed maps can hold a copy older than the row,
+        // and `expected_updated_at` fences compare the row. Report the stored
+        // value so what a manager reads is what the fence compares.
+        let stored = self.store.lock().await.get_session(target_session_id)?;
+        if let Some(stored) = stored {
+            target.updated_at = stored.updated_at;
+        }
         Ok(target)
     }
 
@@ -461,6 +502,22 @@ impl AgentControlHandle {
             .await?;
         self.audit_manager_control(manager_scope.as_ref(), "AgentHalt")
             .await?;
+        // Serialize with scheduled delivery, including a due-list snapshot
+        // already claimed by the scheduler. Recheck authority after waiting.
+        let _spawn_guard = super::spawn_single_flight::acquire_spawn_guard(target_session_id).await;
+        self.authorize_agent_mutation_target(caller_session_id, target_session_id)
+            .await?;
+        if caller_session_id != target_session_id {
+            super::lifecycle::record_external_halt(
+                &self.store,
+                &self.active,
+                &self.completed,
+                &self.event_bus,
+                target_session_id,
+                None,
+            )
+            .await?;
+        }
         if super::lifecycle::interrupt_active_in_maps_from(
             &self.active,
             target_session_id,
@@ -483,9 +540,6 @@ impl AgentControlHandle {
             // the same id before consulting any observation again: a bare
             // active-map recheck followed by /proc scanning would otherwise
             // race a legitimate replacement process.
-            let _spawn_guard =
-                super::spawn_single_flight::acquire_spawn_guard(target_session_id).await;
-
             let target = self
                 .authorize_agent_mutation_target(caller_session_id, target_session_id)
                 .await?;
@@ -810,9 +864,36 @@ impl AgentControlHandle {
             .ok_or(DaemonError::SessionNotFound(caller_session_id))?;
         if params.source_issue.is_some() && !params.harness {
             return Err(DaemonError::InvalidParam(
-                "agent_create_issue_source_issue_requires_harness".into(),
+                SOURCE_ISSUE_REQUIRES_HARNESS_REFUSAL.into(),
             ));
         }
+        // #3787: an operator intake seat files only into its own project, always
+        // as an `operator-request` with a priority; a P1 later mails the manager.
+        let intake_filing =
+            if caller.agent_role.as_deref() == Some(rsi_common::intake_agent::INTAKE_AGENT_ROLE) {
+                if params.harness || params.source_issue.is_some() {
+                    return Err(DaemonError::InvalidParam(
+                        "intake_harness_filing_denied".into(),
+                    ));
+                }
+                if params
+                    .project_id
+                    .is_some_and(|p| Some(p) != caller.project_id)
+                {
+                    return Err(DaemonError::InvalidParam(
+                        "intake_cross_project_filing_denied".into(),
+                    ));
+                }
+                Some(
+                    rsi_common::intake_agent::normalize_intake_filing(
+                        params.priority.map(i64::from),
+                        &params.labels,
+                    )
+                    .map_err(|refusal| DaemonError::InvalidParam(refusal.code()))?,
+                )
+            } else {
+                None
+            };
         // #1389: `harness` files into the RSI harness project from any project.
         let harness_target = if params.harness {
             if params.project_id.is_some() {
@@ -828,10 +909,33 @@ impl AgentControlHandle {
         } else {
             None
         };
+        // Hub #3315: the home project holds no Issues. A home seat that names
+        // no project files into the admission project of the appointment that
+        // launched its lineage; naming the home project is refused.
+        use rsi_common::types::Project;
+        let home_refused = || DaemonError::InvalidParam(Project::HOME_ISSUE_REFUSED.into());
+        if params.project_id.is_some_and(Project::is_home_id) {
+            return Err(home_refused());
+        }
+        let caller_default = match caller.project_id {
+            Some(project)
+                if Project::is_home_id(project)
+                    && harness_target.is_none()
+                    && params.project_id.is_none() =>
+            {
+                Some(
+                    store
+                        .appointment_admission_project_for_lineage(caller_session_id)?
+                        .filter(|project| !Project::is_home_id(*project))
+                        .ok_or_else(home_refused)?,
+                )
+            }
+            other => other,
+        };
         // #1235: a global seat may name a granted project; the store checks it.
         let project_id = harness_target
             .or(params.project_id)
-            .or(caller.project_id)
+            .or(caller_default)
             .ok_or_else(|| {
                 DaemonError::InvalidParam(format!(
                     "agent_create_issue_project_unavailable:{caller_session_id}"
@@ -862,6 +966,12 @@ impl AgentControlHandle {
         let issue_id = deterministic_agent_issue_id(caller_session_id, key);
         let mut body = params.body;
         let mut labels = params.labels;
+        if let Some(filing) = &intake_filing {
+            labels.clone_from(&filing.labels);
+            body = format!(
+                "{body}\n\n---\nFiled by the operator intake agent (session {caller_session_id}, #3787)."
+            );
+        }
         if cross_project_harness {
             // Stable identifiers only: project names can change and can carry
             // personal metadata. The authenticated session is the creator.
@@ -934,6 +1044,23 @@ impl AgentControlHandle {
             return Err(DaemonError::InvalidParam(format!(
                 "agent_create_issue_idempotency_conflict:{issue_id}"
             )));
+        }
+        // Mail-only-on-P1 (#3787): exactly one manager notice naming the Issue,
+        // and none for a deduplicated replay or any lower priority.
+        if let Some(filing) = &intake_filing
+            && !outcome.deduplicated
+            && rsi_common::intake_agent::intake_notifies_manager(filing)
+        {
+            let notice = crate::store::intake_notice::OperatorIntakeNotice {
+                issue_number: outcome.issue.display_number,
+                title: outcome.issue.title.clone(),
+                priority: filing.priority,
+                labels: filing.labels.clone(),
+            };
+            if let Some(job_id) = store.record_operator_intake_notice(project_id, &notice)? {
+                self.event_bus
+                    .publish(crate::bus::DaemonEvent::ManagerNoticeQueued { job_id });
+            }
         }
         Ok(AgentCreateIssueResult {
             issue: outcome.issue,
@@ -2076,7 +2203,8 @@ impl AgentControlHandle {
 
     /// `AgentScheduleWake` mode `when` (#1006): arm one daemon-evaluated
     /// predicate wake for `caller`. Both the RPC verb and the native tool
-    /// route here. Every job id must be one the caller owns (a foreign or
+    /// route here. Every job id must be owned or proven watchable through
+    /// manager succession or an explicit Issue-worker continuation (a foreign or
     /// unknown id is refused as `wake_when_job_not_found`); the row and its
     /// predicate state commit in one transaction. Returns the armed row and
     /// the ids an explicit name replaced.
@@ -4043,11 +4171,17 @@ fn c5_issue_namespace() -> Uuid {
 /// Label stamped on an Issue filed into the harness project from another one.
 const HARNESS_FILED_LABEL: &str = "harness-filed";
 
+/// The refusal for `source_issue` without `harness` (andon #188). `source_issue`
+/// only records provenance on a `harness: true` filing; workers sent it to link
+/// the Issue they found a problem in. The code stays the first token (the
+/// friction classifier reads it), the rest names the fix.
+const SOURCE_ISSUE_REQUIRES_HARNESS_REFUSAL: &str = "agent_create_issue_source_issue_requires_harness: source_issue is only for harness:true filings (a defect in RSI itself filed into the harness project); to link an Issue in your own project, drop source_issue and cite it as #N in the body";
+
 /// Resolve only a unique path match to the daemon's trusted harness root.
 /// A mutable display name cannot establish cross-project write authority.
 /// Missing discovery or duplicate paths fail closed instead of choosing by
 /// project list order (including aliases of the same canonical path).
-fn resolve_harness_project(
+pub(crate) fn resolve_harness_project(
     projects: &[rsi_common::types::Project],
     harness_root: Option<&std::path::Path>,
 ) -> Option<Uuid> {
@@ -4207,10 +4341,91 @@ pub(crate) mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
+    async fn self_halt_preserves_armed_resume_and_when_wakes() {
+        use crate::session::harness::tools::schedule_wake::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+        let (control, store) = control_handle_with_store();
+        let dir = TempDir::new().unwrap();
+        let id = Uuid::new_v4();
+        let session = test_session(id, dir.path().into());
+        let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+            message: "continue later".into(),
+            in_seconds: Some(60),
+            at: None,
+            name: Some("self timer".into()),
+            every_seconds: None,
+            mode: Some("resume".into()),
+            working_dir: dir.path().into(),
+            provider: None,
+            model: None,
+            project_id: None,
+            origin_session_id: Some(id),
+            watch_session_id: None,
+        })
+        .unwrap();
+        let mut when = wake.clone();
+        when.id = Uuid::new_v4();
+        when.name = "self predicate".into();
+        {
+            let guard = store.lock().await;
+            guard.insert_session(&session).unwrap();
+            guard.insert_scheduled_job(&wake).unwrap();
+            guard
+                .insert_wake_when(
+                    &when,
+                    &WakeWhenState {
+                        predicate: WakePredicate {
+                            sha_on_rolling: Some("a".repeat(40)),
+                            ..Default::default()
+                        },
+                        armed_at: chrono::Utc::now(),
+                        deadline: None,
+                        repo_dir: None,
+                        delivered_shas: Vec::new(),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        control
+            .active
+            .write()
+            .await
+            .insert(id, super::super::TrackedSession::new_for_test(session));
+        control.agent_halt(id, id).await.unwrap();
+        assert!(
+            control
+                .active
+                .read()
+                .await
+                .get(&id)
+                .unwrap()
+                .interrupt_requested
+        );
+        let views = store
+            .lock()
+            .await
+            .list_owned_wake_views(id, true, 10)
+            .unwrap();
+        assert_eq!(views.len(), 2);
+        assert!(
+            views
+                .iter()
+                .all(|wake| wake.enabled && wake.disabled_reason.is_none())
+        );
+        assert_eq!(store.lock().await.load_events(id).unwrap().len(), 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
     async fn c5_agent_halt_pending_retry_exhausts_budget_and_suppresses_marker() {
         let active = Arc::new(RwLock::new(HashMap::new()));
         let completed = Arc::new(RwLock::new(HashMap::new()));
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(4);
         let coordinator = Arc::new(super::super::spawn_coordinator::SpawnCoordinator::new(
             spawn_tx,
@@ -4625,15 +4840,15 @@ pub(crate) mod tests {
         );
     }
 
-    pub(crate) fn control_handle_with_store() -> (AgentControlHandle, Arc<tokio::sync::Mutex<Store>>)
-    {
+    pub(crate) fn control_handle_with_store()
+    -> (AgentControlHandle, Arc<rsid_core::store_lock::Mutex<Store>>) {
         let (control, store, _) = control_handle_with_store_and_bus();
         (control, store)
     }
 
     pub(crate) fn control_handle_with_store_and_bus() -> (
         AgentControlHandle,
-        Arc<tokio::sync::Mutex<Store>>,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
         Arc<crate::bus::EventBus>,
     ) {
         control_handle_for_store(Store::open_in_memory().expect("in-memory store"))
@@ -4643,7 +4858,7 @@ pub(crate) mod tests {
     /// database file).
     pub(crate) fn control_handle_for_file_store(
         store: Store,
-    ) -> (AgentControlHandle, Arc<tokio::sync::Mutex<Store>>) {
+    ) -> (AgentControlHandle, Arc<rsid_core::store_lock::Mutex<Store>>) {
         let (control, store, _) = control_handle_for_store(store);
         (control, store)
     }
@@ -4652,12 +4867,12 @@ pub(crate) mod tests {
         store: Store,
     ) -> (
         AgentControlHandle,
-        Arc<tokio::sync::Mutex<Store>>,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
         Arc<crate::bus::EventBus>,
     ) {
         let active = Arc::new(RwLock::new(HashMap::new()));
         let completed = Arc::new(RwLock::new(HashMap::new()));
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let (spawn_tx, _spawn_rx) = tokio::sync::mpsc::channel(4);
         let coordinator = Arc::new(super::super::spawn_coordinator::SpawnCoordinator::new(
             spawn_tx,
@@ -4736,7 +4951,7 @@ pub(crate) mod tests {
     }
 
     async fn insert_capacity_invocation(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
     ) -> Uuid {
         let invocation = Uuid::new_v4();
@@ -6886,6 +7101,422 @@ pub(crate) mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
+    async fn explicit_continue_child_after_halt_delivers_with_wake_disabled() {
+        use crate::session::harness::tools::schedule_wake::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        let (manager, dir, caller, tip) = fresh_relaunch_fixture().await;
+        let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+            message: "cancelled work".into(),
+            in_seconds: Some(60),
+            at: None,
+            name: None,
+            every_seconds: None,
+            mode: Some("resume".into()),
+            working_dir: dir.path().into(),
+            provider: None,
+            model: None,
+            project_id: None,
+            origin_session_id: Some(tip),
+            watch_session_id: None,
+        })
+        .unwrap();
+        manager
+            .store
+            .lock()
+            .await
+            .insert_scheduled_job(&wake)
+            .unwrap();
+        manager.agent_halt(caller, tip).await.unwrap();
+        let notices = manager.store.lock().await.load_events(tip).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].event_type, rsi_common::types::EventType::System);
+        assert_eq!(
+            notices[0].metadata.as_ref().unwrap()["halt_wake_notice"]["job_ids"],
+            serde_json::json!([wake.id])
+        );
+        assert!(
+            !manager
+                .store
+                .lock()
+                .await
+                .get_scheduled_job(&wake.id)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        let process = crate::session::launch::install_controller_candidate_test_process(tip);
+        let error = crate::issue_tracker::poller::SessionLauncher::resume_scheduled_job(
+            &manager,
+            tip,
+            "old wake".into(),
+            vec![wake.id],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("scheduled_wake_retired_or_disabled"),
+            "{error}"
+        );
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let result = manager
+            .agent_continue_child(caller, continue_request(tip, tip, 0, None))
+            .await
+            .unwrap();
+        assert_eq!(result.continued_session_id, tip);
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            !manager
+                .store
+                .lock()
+                .await
+                .get_scheduled_job(&wake.id)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        let events = manager.get_conversation(tip).await.unwrap();
+        assert!(events.iter().any(|event| event.id == notices[0].id));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn operator_halt_notices_exact_wakes_for_soft_and_hard_pauses() {
+        use crate::session::harness::tools::schedule_wake::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        use crate::store::manager_actions::OperatorPause;
+        use rsi_common::wake_predicate::{WakePredicate, WakeWhenState};
+        for pause in [OperatorPause::Soft, OperatorPause::Hard] {
+            let (manager, dir, _caller, tip) = fresh_relaunch_fixture().await;
+            let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+                message: "cancelled work".into(),
+                in_seconds: Some(60),
+                at: None,
+                name: None,
+                every_seconds: None,
+                mode: Some("resume".into()),
+                working_dir: dir.path().into(),
+                provider: None,
+                model: None,
+                project_id: None,
+                origin_session_id: Some(tip),
+                watch_session_id: None,
+            })
+            .unwrap();
+            let mut when = wake.clone();
+            when.id = Uuid::new_v4();
+            when.name = "halt notice health wait".into();
+            let mut terminal = wake.clone();
+            terminal.id = Uuid::new_v4();
+            terminal.wake_mode = rsi_common::types::WakeMode::OnTerminal(tip);
+            let mut protected = wake.clone();
+            protected.id =
+                crate::store_support::schedule_wake_job::deterministic_program_guard_job_id(tip);
+            let mut internal = wake.clone();
+            internal.id = Uuid::new_v4();
+            internal.name = format!("background-process-{tip}");
+            let mut unrelated = wake.clone();
+            unrelated.id = Uuid::new_v4();
+            unrelated.wake_session_id = Some(_caller);
+            let session = manager
+                .store
+                .lock()
+                .await
+                .get_session(tip)
+                .unwrap()
+                .unwrap();
+            {
+                let store = manager.store.lock().await;
+                for job in [&wake, &terminal, &protected, &internal, &unrelated] {
+                    store.insert_scheduled_job(job).unwrap();
+                }
+                store
+                    .insert_wake_when(
+                        &when,
+                        &WakeWhenState {
+                            predicate: WakePredicate {
+                                health_anomaly: Some(Default::default()),
+                                ..Default::default()
+                            },
+                            armed_at: chrono::Utc::now(),
+                            deadline: None,
+                            repo_dir: None,
+                            delivered_shas: Vec::new(),
+                        },
+                        false,
+                    )
+                    .unwrap();
+            }
+            manager
+                .active
+                .write()
+                .await
+                .insert(tip, super::super::TrackedSession::new_for_test(session));
+            let inbox = manager
+                .active
+                .read()
+                .await
+                .get(&tip)
+                .unwrap()
+                .operator_inbox
+                .clone();
+            // Inert monitor: exercise its actual queue/drain, never a provider.
+            let drain = async {
+                tokio::time::timeout(std::time::Duration::from_secs(2), inbox.notified())
+                    .await
+                    .unwrap();
+                let mut sequence = 40;
+                super::super::boundary_mail::drain_operator_transcript_inbox(
+                    &inbox,
+                    &manager.store,
+                    &manager.active,
+                    &manager.event_bus,
+                    tip,
+                    &mut sequence,
+                )
+                .await;
+                assert_eq!(sequence, 41);
+            };
+            let halt = if pause == OperatorPause::Soft {
+                // An unavailable monitor cannot prevent the stop. Its final
+                // drain can still persist the notice after the receipt expires.
+                let halt = manager
+                    .interrupt_session_operator_with_pause(tip, pause)
+                    .await;
+                assert!(
+                    manager
+                        .active
+                        .read()
+                        .await
+                        .get(&tip)
+                        .unwrap()
+                        .interrupt_requested
+                );
+                drain.await;
+                halt
+            } else {
+                let (halt, ()) = tokio::join!(
+                    manager.interrupt_session_operator_with_pause(tip, pause),
+                    drain
+                );
+                halt
+            };
+            halt.unwrap();
+            assert!(
+                manager
+                    .active
+                    .read()
+                    .await
+                    .get(&tip)
+                    .unwrap()
+                    .interrupt_requested
+            );
+            let guard = manager.store.lock().await;
+            assert_eq!(guard.get_operator_pause(tip).unwrap(), pause);
+            let views = guard.list_owned_wake_views(tip, true, 10).unwrap();
+            assert_eq!(views.len(), 5);
+            for id in [wake.id, when.id] {
+                let view = views.iter().find(|view| view.job_id == id).unwrap();
+                assert_eq!(
+                    (view.enabled, view.disabled_reason.as_deref()),
+                    (false, Some("disabled_by_halt"))
+                );
+            }
+            for job in [&terminal, &protected, &internal, &unrelated] {
+                assert!(guard.get_scheduled_job(&job.id).unwrap().unwrap().enabled);
+            }
+            let events = guard.load_events(tip).unwrap();
+            assert_eq!(events.len(), 1);
+            let notice = &events[0];
+            assert_eq!(notice.sequence, 41);
+            assert_eq!(notice.event_type, rsi_common::types::EventType::System);
+            let mut ids = vec![wake.id, when.id];
+            ids.sort_unstable();
+            assert_eq!(
+                notice.metadata.as_ref().unwrap()["halt_wake_notice"],
+                serde_json::json!({
+                    "disabled_reason": "disabled_by_halt", "count": 2, "job_ids": ids,
+                })
+            );
+            assert!(
+                notice
+                    .content
+                    .contains("External halt disabled 2 own resume/when wake(s)")
+            );
+            for id in ids {
+                assert!(notice.content.contains(&id.to_string()));
+            }
+            assert!(notice.content.contains("disabled_by_halt"));
+            assert!(
+                notice
+                    .content
+                    .contains("AgentListWakes {\"include_disabled\":true}")
+            );
+            assert_eq!(guard.conversation_max_sequence(_caller).unwrap(), -1);
+            drop(guard);
+            let listed = manager
+                .agent_control()
+                .agent_list_wakes(
+                    tip,
+                    rsi_common::agent_control_schema::AgentListWakesParams {
+                        include_disabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for id in [wake.id, when.id] {
+                let view = listed.wakes.iter().find(|view| view.job_id == id).unwrap();
+                assert_eq!(view.disabled_reason.as_deref(), Some("disabled_by_halt"));
+            }
+            let visible = manager.get_conversation(tip).await.unwrap();
+            assert_eq!(visible[0].id, notice.id);
+            // A retry has no newly disabled rows and must not queue another notice.
+            manager
+                .interrupt_session_operator_with_pause(tip, pause)
+                .await
+                .unwrap();
+            assert_eq!(
+                manager.store.lock().await.load_events(tip).unwrap().len(),
+                1
+            );
+            assert_eq!(manager.active.read().await.len(), 1);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
+    async fn halt_notice_write_failure_preserves_committed_stop() {
+        use crate::session::harness::tools::schedule_wake::{
+            ScheduleWakeRequest, build_agent_scheduled_job,
+        };
+        use crate::store::manager_actions::OperatorPause;
+        // Cover both the idle direct writer and the live monitor writer.
+        for live in [false, true] {
+            let (manager, dir, _caller, tip) = fresh_relaunch_fixture().await;
+            let wake = build_agent_scheduled_job(ScheduleWakeRequest {
+                message: "wait for authorized continuation".into(),
+                in_seconds: Some(60),
+                at: None,
+                name: None,
+                every_seconds: None,
+                mode: Some("resume".into()),
+                working_dir: dir.path().into(),
+                provider: None,
+                model: None,
+                project_id: None,
+                origin_session_id: Some(tip),
+                watch_session_id: None,
+            })
+            .unwrap();
+            {
+                let store = manager.store.lock().await;
+                store.insert_scheduled_job(&wake).unwrap();
+                store.conn.execute_batch(
+                    "CREATE TEMP TRIGGER reject_halt_notice BEFORE INSERT ON conversation_events
+                     WHEN json_extract(NEW.metadata,'$.halt_wake_notice') IS NOT NULL
+                     BEGIN SELECT RAISE(ABORT, 'injected halt notice failure'); END;"
+                ).unwrap();
+            }
+            if live {
+                let session = manager
+                    .store
+                    .lock()
+                    .await
+                    .get_session(tip)
+                    .unwrap()
+                    .unwrap();
+                manager
+                    .active
+                    .write()
+                    .await
+                    .insert(tip, super::super::TrackedSession::new_for_test(session));
+                let inbox = manager
+                    .active
+                    .read()
+                    .await
+                    .get(&tip)
+                    .unwrap()
+                    .operator_inbox
+                    .clone();
+                let drain = async {
+                    tokio::time::timeout(std::time::Duration::from_secs(2), inbox.notified())
+                        .await
+                        .unwrap();
+                    let mut sequence = 40;
+                    super::super::boundary_mail::drain_operator_transcript_inbox(
+                        &inbox,
+                        &manager.store,
+                        &manager.active,
+                        &manager.event_bus,
+                        tip,
+                        &mut sequence,
+                    )
+                    .await;
+                    assert_eq!(sequence, 40);
+                };
+                let (halt, ()) = tokio::join!(
+                    manager.interrupt_session_operator_with_pause(tip, OperatorPause::Hard),
+                    drain
+                );
+                halt.unwrap();
+                assert!(
+                    manager
+                        .active
+                        .read()
+                        .await
+                        .get(&tip)
+                        .unwrap()
+                        .interrupt_requested
+                );
+            } else {
+                let _spawn_guard =
+                    super::super::spawn_single_flight::acquire_spawn_guard(tip).await;
+                super::super::lifecycle::record_external_halt(
+                    &manager.store,
+                    &manager.active,
+                    &manager.completed,
+                    &manager.event_bus,
+                    tip,
+                    Some(OperatorPause::Hard),
+                )
+                .await
+                .unwrap();
+            }
+            let store = manager.store.lock().await;
+            assert_eq!(store.get_operator_pause(tip).unwrap(), OperatorPause::Hard);
+            assert!(
+                store
+                    .get_daemon_setting(&format!("session_halt_requested:{tip}"))
+                    .unwrap()
+                    .is_some()
+            );
+            let views = store.list_owned_wake_views(tip, true, 10).unwrap();
+            assert_eq!(views.len(), 1);
+            assert_eq!(views[0].job_id, wake.id);
+            assert_eq!(
+                (views[0].enabled, views[0].disabled_reason.as_deref()),
+                (false, Some("disabled_by_halt"))
+            );
+            assert_eq!(store.load_events(tip).unwrap().len(), 0);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+    #[tokio::test]
     async fn continue_child_relaunches_fresh_when_no_provider_session_id() {
         let (manager, _dir, caller, tip) = fresh_relaunch_fixture().await;
         let process = crate::session::launch::install_controller_candidate_test_process(tip);
@@ -7303,7 +7934,7 @@ pub(crate) mod tests {
     /// Persist `caller` and a direct child of it, plus `events` conversation
     /// rows on the child so the cursor has a non-trivial sequence.
     async fn insert_caller_and_child(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         dir: &TempDir,
         events: i32,
     ) -> (Uuid, Uuid) {
@@ -7715,7 +8346,10 @@ pub(crate) mod tests {
         );
     }
 
-    async fn insert_failed_pending(store: &Arc<tokio::sync::Mutex<Store>>, session: &Session) {
+    async fn insert_failed_pending(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        session: &Session,
+    ) {
         let store = store.lock().await;
         store.insert_session(session).unwrap();
         store
@@ -8449,6 +9083,15 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("agent_create_issue_source_issue_requires_harness")
         );
+        // The refusal names the fix, and the friction classifier still reads
+        // only the leading code (andon #188).
+        let message = orphan_source.to_string();
+        assert!(message.contains("harness:true"), "{message}");
+        assert!(message.contains("cite it as #N in the body"), "{message}");
+        assert_eq!(
+            crate::friction::agent_refusal_code(&orphan_source),
+            "agent_create_issue_source_issue_requires_harness"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
@@ -8547,6 +9190,7 @@ pub(crate) mod tests {
                 AgentUpdateIssueRequestV1 {
                     issue_id: Some(created.issue.id),
                     body: Some("updated".into()),
+                    replace_body: true,
                     ..AgentUpdateIssueRequestV1::new(
                         created.issue.row_version,
                         "agent-control-edit".into(),
@@ -8750,7 +9394,10 @@ pub(crate) mod tests {
             .expect("record arm intent fixture");
     }
 
-    async fn enabled_watch_count(store: &tokio::sync::Mutex<Store>, caller: Uuid) -> usize {
+    async fn enabled_watch_count(
+        store: &rsid_core::store_lock::Mutex<Store>,
+        caller: Uuid,
+    ) -> usize {
         store
             .lock()
             .await
@@ -9795,7 +10442,7 @@ mod send_message_tests {
 
     /// Insert a live session row with an explicit kind/parent/lead shape.
     async fn insert(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         id: Uuid,
         kind: SessionKind,
         parent_id: Option<Uuid>,
@@ -9811,7 +10458,7 @@ mod send_message_tests {
 
     /// Reserve a spawn owned by `owner` whose child id has NO session row yet.
     async fn reserve(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         owner: Uuid,
         epic_id: Uuid,
         child_id: Uuid,
@@ -9854,7 +10501,7 @@ mod send_message_tests {
         spawn_request_id
     }
 
-    async fn message_row_count(store: &Arc<tokio::sync::Mutex<Store>>) -> i64 {
+    async fn message_row_count(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> i64 {
         store
             .lock()
             .await

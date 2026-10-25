@@ -35,6 +35,7 @@ use rsi_common::agent_jobs::{
     AgentJobV1, JOB_ADMISSION_TIMED_OUT, JOB_INTERRUPTED_BY_DEPLOY, JOB_START_TIMED_OUT, JobParams,
     JobState, JobWake, TestJobParams,
 };
+use rsi_common::failure_signature::{Matcher, digest, panic_matcher_for};
 use rsi_common::rolling_queue::{failing_test_outcomes, failing_test_paths};
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatellitePeerV1, SatelliteUuidV1};
 use rsi_common::satellite_qa::{
@@ -42,6 +43,7 @@ use rsi_common::satellite_qa::{
     SATELLITE_QA_NOT_FOUND, SATELLITE_QA_STALE, SatelliteQaRunReceiptV1, SatelliteQaRunRequestV1,
 };
 use rsi_common::types::NewIssue;
+use std::collections::BTreeMap;
 
 pub(super) const RECIPE: &str = agent_jobs::LIBRARY_QA_RECIPE;
 /// `<jobs>/rolling-library-qa/<id>/source`: every snapshot below this
@@ -100,7 +102,10 @@ pub(super) fn full_library_params() -> JobParams {
         exact: false,
         lib_only: false,
         test_target: None,
+        bin: None,
+        features: Vec::new(),
         candidate_receipt: None,
+        at_commit: None,
         timeout_minutes: Some(180),
         cpu_quota_percent: None,
     })
@@ -120,6 +125,10 @@ const HOST_LOAD_BYPASS_HOURS: i64 = 3;
 /// A pending landing this old gets `bounded_qa_held` receipts naming why its
 /// start is postponed (#2394); a younger one is just in the normal interval.
 const HOLD_AUDIT_AFTER_MINS: i64 = 60;
+
+/// #4003: the typed `bounded_qa_held` reason while the operator's minimum
+/// interval since the previous dispatch postpones a start.
+const MIN_INTERVAL: &str = "min_interval";
 
 /// Why a start is postponed right now (#2394). The code is the typed reason
 /// in the `bounded_qa_held` receipt and the overdue Issue.
@@ -151,6 +160,8 @@ const MAX_REASON_BYTES: usize = 512;
 /// #2176: the deferral reason of an attempt a deploy stopped
 /// (`interrupted_by_deploy`, on a satellite or the hub).
 pub(super) const DEPLOY_PREEMPTED: &str = "deploy_preempted";
+/// #3758: the job a dispatch bound is an earlier run, not this dispatch's.
+const STALE_JOB_REPLAY: &str = "stale_job_replay";
 
 /// Hub-side satellite state (#2120): where the forwarded satellite sockets
 /// live, and the paced polls of in-flight satellite runs (the loop ticks every
@@ -197,7 +208,7 @@ impl SatelliteQa {
 }
 
 pub(super) async fn run_loop(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     config: Arc<RuntimeConfig>,
     launcher: LanderLauncher,
     drain: Arc<crate::deploy_drain::DeployDrain>,
@@ -530,6 +541,74 @@ fn omitted_suffix(omitted: u32) -> String {
     }
 }
 
+/// Read bounded local evidence before taking the Store lock. Satellite log
+/// paths belong to another host and must never be read as local paths.
+pub(super) fn qa_log(path: &str) -> String {
+    read_qa_log(path).unwrap_or_default()
+}
+
+/// Only categorical diagnostics cross the mining boundary: never retain an
+/// OS error's text, which may contain local paths or log contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct QaLogReadError {
+    pub(super) operation: QaLogOperation,
+    pub(super) kind: std::io::ErrorKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum QaLogOperation {
+    Open,
+    Seek,
+    Read,
+}
+
+pub(super) fn read_qa_log(path: &str) -> std::result::Result<String, QaLogReadError> {
+    qa_log_from_reader(|| std::fs::File::open(path))
+}
+
+/// The opener/reader seam also exercises failures after partial reads without
+/// depending on filesystem permissions or timing.
+pub(super) fn qa_log_from_reader<R: std::io::Read + std::io::Seek>(
+    open: impl FnOnce() -> std::io::Result<R>,
+) -> std::result::Result<String, QaLogReadError> {
+    use std::io::{Read, SeekFrom};
+    let failure = |operation, error: std::io::Error| QaLogReadError {
+        operation,
+        kind: error.kind(),
+    };
+    let mut file = open().map_err(|error| failure(QaLogOperation::Open, error))?;
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|error| failure(QaLogOperation::Seek, error))?;
+    // A short file starts at zero; a genuine seek failure remains an error.
+    file.seek(SeekFrom::Start(len.saturating_sub(LIMIT)))
+        .map_err(|error| failure(QaLogOperation::Seek, error))?;
+    let mut bytes = Vec::new();
+    file.take(LIMIT)
+        .read_to_end(&mut bytes)
+        .map_err(|error| failure(QaLogOperation::Read, error))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn qa_matchers(reported: &[String], log: &str) -> BTreeMap<String, Matcher> {
+    failing_test_paths(reported)
+        .into_iter()
+        .map(|test| {
+            let matcher = panic_matcher_for(log, &test).unwrap_or_else(|| {
+                let outcome = reported
+                    .iter()
+                    .find(|line| line.split_whitespace().next_back() == Some(test.as_str()));
+                Matcher {
+                    digest: Some(digest(outcome.map_or(test.as_str(), String::as_str))),
+                    contains: Vec::new(),
+                }
+            });
+            (test, matcher)
+        })
+        .collect()
+}
+
 fn hub_settlement(job: &AgentJobV1, sha: String, cohort: &[BoundedQaLanding]) -> Settlement {
     let result = job.result.clone().unwrap_or_default();
     let placement = cohort.first().and_then(|w| w.placement.clone());
@@ -561,6 +640,39 @@ fn hub_settlement(job: &AgentJobV1, sha: String, cohort: &[BoundedQaLanding]) ->
             exit_code: job.exit_code,
             failing_tests,
             log_path: Some(job.log_path.clone()),
+            failure_matchers: qa_matchers(
+                &result.failing_tests,
+                &if result.failing_tests.is_empty() {
+                    String::new()
+                } else {
+                    qa_log(&job.log_path)
+                },
+            ),
+        },
+    }
+}
+
+/// A hub job that is not the run its dispatch created (#3758): never a pass.
+/// It settles like a capacity deferral, so the obligation stays pending and the
+/// next dispatch (a new attempt, a new key) runs the tests.
+fn stale_replay_settlement(
+    job: &AgentJobV1,
+    sha: String,
+    cohort: &[BoundedQaLanding],
+    why: String,
+) -> Settlement {
+    let placement = cohort.first().and_then(|w| w.placement.clone());
+    Settlement {
+        sha,
+        passed: false,
+        kind: QaFailureKind::Capacity(STALE_JOB_REPLAY),
+        evidence: Evidence::plain(format!(
+            "Job {} is not the run this dispatch created: {why}.",
+            job.id
+        )),
+        run: BoundedQaRun {
+            placement,
+            ..BoundedQaRun::default()
         },
     }
 }
@@ -591,6 +703,25 @@ fn satellite_settlement(
     placement: &BoundedQaPlacement,
     cohort: &[BoundedQaLanding],
 ) -> Settlement {
+    let receipt = receipt.sanitized();
+    let mut matchers = qa_matchers(&receipt.failing_tests, "");
+    for (test, excerpt) in &receipt.panic_excerpts {
+        // A redacted line is no longer a literal substring of the panic.
+        // Do not turn a placeholder into a broad contains matcher.
+        if let Some(line) = excerpt
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.contains(rsi_common::daemon_handoff::REDACTED))
+        {
+            matchers.insert(
+                test.clone(),
+                Matcher {
+                    digest: Some(digest(excerpt)),
+                    contains: vec![line.chars().take(512).collect()],
+                },
+            );
+        }
+    }
     let placement = &confirmed(placement, &receipt);
     let omitted = omitted_suffix(receipt.failing_tests_omitted);
     let failing_tests = failing_test_paths(&receipt.failing_tests);
@@ -619,6 +750,7 @@ fn satellite_settlement(
             exit_code: receipt.exit_code,
             failing_tests,
             log_path: Some(receipt.log_path),
+            failure_matchers: matchers,
         },
         sha: receipt.sha,
     }
@@ -652,7 +784,7 @@ fn satellite_gap(
 /// event per landing and re-arms the obligation, with no Issue and no
 /// finished receipt: only the eight-hour overdue rule can still report it.
 async fn settle(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     cohort: Vec<BoundedQaLanding>,
     job_id: Uuid,
     settlement: Settlement,
@@ -708,7 +840,7 @@ async fn settle(
 
 /// A hub job's binding: its snapshot while the job runs, `None` once settled.
 async fn reconcile_hub_job(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     jobs: &Path,
     job_id: Uuid,
     cohort: Vec<BoundedQaLanding>,
@@ -727,7 +859,15 @@ async fn reconcile_hub_job(
         .await
         .map_err(|e| DaemonError::Process(e.to_string()))?
         .unwrap_or_else(|| "unavailable".into());
-    let settlement = hub_settlement(&row.job, sha, &cohort);
+    let settlement = match stale_replay(&row.job, &sha, &cohort) {
+        // Not this dispatch's run: nothing was tested for the cohort, so it
+        // is never credited. It re-arms like a capacity deferral (#3758).
+        Some(why) => {
+            tracing::warn!(%job_id, %why, "bounded library QA job is not this dispatch's run; the obligation stays pending");
+            stale_replay_settlement(&row.job, sha, &cohort, why)
+        }
+        None => hub_settlement(&row.job, sha, &cohort),
+    };
     settle(store, cohort, job_id, settlement, now).await?;
     let cwd = PathBuf::from(row.job.cwd);
     let owned = jobs.join(SNAPSHOTS);
@@ -742,7 +882,7 @@ async fn reconcile_hub_job(
 /// The registered peer `peer_id`, whatever its dispatch switch says now (an
 /// in-flight run is still collected after the operator stops new dispatch).
 async fn registered_peer(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     peer_id: Uuid,
 ) -> Result<Option<RegistryPeer>> {
     let view = with_store(store, Store::satellite_registry_view).await?;
@@ -766,7 +906,7 @@ enum SatellitePoll {
 /// the satellite reports the run it already has or starts it now, never a
 /// second one. A refusal of that replay leaves it pending until the deadline.
 async fn poll_satellite(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     satellites: &mut SatelliteQa,
     run_id: Uuid,
     placement: &BoundedQaPlacement,
@@ -871,7 +1011,7 @@ fn candidate(store: &Store, value: &SatellitePeerV1, now: DateTime<Utc>) -> Resu
 /// The project satellites that may take a run, in registry order, and why the
 /// others do not (`label: code`).
 async fn satellite_candidates(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     now: DateTime<Utc>,
 ) -> Result<(Vec<RegistryPeer>, Vec<String>)> {
     with_store(store, move |store| {
@@ -950,7 +1090,7 @@ fn peer_rejection(peer: Uuid, label: &str, code: &str) -> String {
 /// #2176: a peer whose deploy is pending is skipped (and not asked again
 /// within the pace); when no other peer takes the run it waits for it.
 async fn place(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     satellites: &mut SatelliteQa,
     run_id: Uuid,
     sha: &str,
@@ -1087,33 +1227,74 @@ fn plan_start(
     })
 }
 
-/// The job identity of the `attempt`th run for an obligation anchor. The first
-/// keeps its original key; a run re-armed after a capacity deferral (#2149)
-/// needs its own, or the idempotent submit would replay the failed job.
-fn attempt_key(prefix: &str, anchor: Uuid, attempt: u32) -> String {
+/// The job identity of the `attempt`th run of an obligation anchor against
+/// `sha`. The target commit is part of the key (#3758): the anchor entry can
+/// stay pending across a later landing (it is only retired by a green run that
+/// covers it, #3733), so a key made of the anchor alone would make the next
+/// dispatch replay the earlier, finished job and settle on its stale result.
+/// The first attempt at a commit keeps the short form; a run re-armed after a
+/// capacity deferral (#2149) needs its own, or the idempotent submit would
+/// replay the failed job.
+fn attempt_key(prefix: &str, anchor: Uuid, sha: &str, attempt: u32) -> String {
     match attempt {
-        0 => format!("{prefix}:{anchor}"),
-        n => format!("{prefix}:{anchor}:{n}"),
+        0 => format!("{prefix}:{anchor}:{sha}"),
+        n => format!("{prefix}:{anchor}:{sha}:{n}"),
     }
 }
 
 /// The run id a satellite attempt is replayed under (stable for a retry or a
-/// restart of the same attempt).
-fn satellite_run_id(anchor: Uuid, attempt: u32) -> Uuid {
+/// restart of the same attempt at the same commit, new for another commit).
+fn satellite_run_id(anchor: Uuid, sha: &str, attempt: u32) -> Uuid {
     match attempt {
-        0 => Uuid::new_v5(&anchor, b"bounded-library-qa-satellite"),
+        0 => Uuid::new_v5(
+            &anchor,
+            format!("bounded-library-qa-satellite:{sha}").as_bytes(),
+        ),
         n => Uuid::new_v5(
             &anchor,
-            format!("bounded-library-qa-satellite:{n}").as_bytes(),
+            format!("bounded-library-qa-satellite:{sha}:{n}").as_bytes(),
         ),
     }
+}
+
+/// The private snapshot root of a hub run: anchor and target commit, so a
+/// snapshot never serves another commit (#3758).
+fn snapshot_root(jobs: &Path, anchor: Uuid, sha: &str) -> PathBuf {
+    jobs.join(SNAPSHOTS).join(format!("{anchor}-{sha}"))
+}
+
+/// Grace between a job's creation stamp and the dispatch record, for clock
+/// differences between the two writers.
+const REPLAY_GRACE: chrono::Duration = chrono::Duration::minutes(2);
+
+/// Why `job` is not the run this dispatch created, if it is not (#3758): it
+/// was created before the cohort was dispatched, or its snapshot pins another
+/// commit than the one the dispatch recorded. Such a job's result belongs to an
+/// earlier run and says nothing about this cohort.
+fn stale_replay(job: &AgentJobV1, head: &str, cohort: &[BoundedQaLanding]) -> Option<String> {
+    if let Some(recorded) = cohort.iter().find_map(|w| w.qa_sha.as_deref())
+        && recorded != head
+    {
+        return Some(format!(
+            "the job's snapshot is at {head}, the dispatch recorded {recorded}"
+        ));
+    }
+    let dispatched = cohort.iter().find_map(|w| w.requested_at)?;
+    let created = DateTime::parse_from_rfc3339(&job.created_at).ok()?;
+    (created.with_timezone(&Utc) + REPLAY_GRACE < dispatched).then(|| {
+        format!(
+            "the job was created at {}, before this dispatch at {}",
+            job.created_at,
+            dispatched.to_rfc3339()
+        )
+    })
 }
 
 /// The hub fallback: pin the snapshot, submit the recipe job and bind the
 /// covered landings, recording `ran_on: hub` and why.
 #[allow(clippy::too_many_arguments)]
 async fn start_on_hub(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: Arc<dyn JobRuntime>,
     tools: &JobTools,
     jobs: &Path,
@@ -1122,7 +1303,13 @@ async fn start_on_hub(
     attempt: u32,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let root = jobs.join(SNAPSHOTS).join(plan.anchor.entry.id.to_string());
+    let root = snapshot_root(jobs, plan.anchor.entry.id, &plan.sha);
+    let key = attempt_key(
+        "bounded-library-qa",
+        plan.anchor.entry.id,
+        &plan.sha,
+        attempt,
+    );
     let (repo, sha, pending) = (plan.repo, plan.sha, plan.pending);
     let (cwd, pinned, cohort) = tokio::task::spawn_blocking(move || -> Result<_> {
         let cwd = snapshot(&repo, &sha, &root)?;
@@ -1150,7 +1337,7 @@ async fn start_on_hub(
             &anchor.entry.source_commit[..8]
         )),
         params: full_library_params(),
-        idempotency_key: Some(attempt_key("bounded-library-qa", anchor.entry.id, attempt)),
+        idempotency_key: Some(key),
         wake: JobWake::None,
     };
     let placement = BoundedQaPlacement::Hub { reason };
@@ -1195,7 +1382,7 @@ async fn replayed_cohort(
 /// second full run starting elsewhere. An unconfirmed dispatch (#180, no
 /// receipt) binds the planned landings with the satellite job unknown.
 async fn bind_satellite(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     satellites: &mut SatelliteQa,
     plan: &Plan,
     run_id: Uuid,
@@ -1230,7 +1417,7 @@ async fn bind_satellite(
 /// attempt is unresolved. A peer that never answers settles incomplete at
 /// the usual deadline, counted from this binding.
 async fn recover_dispatches(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     work: Vec<BoundedQaLanding>,
     now: DateTime<Utc>,
 ) -> Result<Vec<BoundedQaLanding>> {
@@ -1279,7 +1466,7 @@ async fn recover_dispatches(
 /// have, #180), else on the hub.
 #[allow(clippy::too_many_arguments)]
 async fn start(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: Arc<dyn JobRuntime>,
     tools: &JobTools,
     jobs: &Path,
@@ -1294,7 +1481,7 @@ async fn start(
         store.bounded_qa_capacity_deferrals(anchor)
     })
     .await?;
-    let run_id = satellite_run_id(anchor, attempt);
+    let run_id = satellite_run_id(anchor, &plan.sha, attempt);
     match place(store, satellites, run_id, &plan.sha, &plan.cohort, now).await? {
         Placed::Satellite { peer, receipt } => {
             bind_satellite(
@@ -1318,9 +1505,70 @@ async fn start(
     }
 }
 
+/// #3733: a pending, unbound landing that is an ancestor of the project's
+/// latest passing full-library run is already covered by it. Settle it from
+/// that run (and close any overdue Issue filed for it) instead of owing, or
+/// reporting, a second run. Returns the work that is still owed.
+async fn credit_green_coverage(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    launcher: &LanderLauncher,
+    work: Vec<BoundedQaLanding>,
+    now: DateTime<Utc>,
+) -> Result<Vec<BoundedQaLanding>> {
+    let projects: HashSet<Uuid> = work
+        .iter()
+        .filter(|w| w.job_id.is_none())
+        .filter_map(|w| w.project_id)
+        .collect();
+    if projects.is_empty() {
+        return Ok(work);
+    }
+    let mut greens = HashMap::new();
+    for project in projects {
+        let green = with_store(store, move |s| s.rolling_qa_green_for_project(project)).await?;
+        if let Some(green) = green {
+            greens.insert(project, green);
+        }
+    }
+    if greens.is_empty() {
+        return Ok(work);
+    }
+    // Git reads never hold the Store mutex.
+    let (candidates, launcher) = (work.clone(), launcher.clone());
+    let covered = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .filter(|w| w.job_id.is_none())
+            .filter_map(|w| {
+                let green = greens.get(&w.project_id?)?.clone();
+                let repo = repository(&launcher, &w)?;
+                covers(&repo, &green.sha, &w).then_some((w, green))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| DaemonError::Process(e.to_string()))?;
+    let mut credited = HashSet::new();
+    for (landing, green) in covered {
+        let entry = landing.entry.id;
+        let written = with_store(store, move |s| {
+            s.credit_bounded_qa_green(&landing, &green, now)
+        })
+        .await?;
+        if written {
+            tracing::info!(%entry, "bounded library QA obligation credited by a later green run");
+        }
+        credited.insert(entry);
+    }
+    Ok(work
+        .into_iter()
+        .filter(|w| !credited.contains(&w.entry.id))
+        .collect())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_once(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: &LanderLauncher,
     runtime: Arc<dyn JobRuntime>,
     tools: &JobTools,
@@ -1332,6 +1580,7 @@ async fn drive_once(
 ) -> Result<()> {
     let work = with_store(store, Store::bounded_qa_landings).await?;
     let work = recover_dispatches(store, work, now).await?;
+    let work = credit_green_coverage(store, launcher, work, now).await?;
     // #2394: a host-load hold ends once a pending landing has waited this long.
     let starved = work.iter().any(|w| {
         w.job_id.is_none() && pending_for(w, now) >= chrono::Duration::hours(HOST_LOAD_BYPASS_HOURS)
@@ -1345,6 +1594,29 @@ async fn drive_once(
         }
         other => other,
     };
+    // #2112: a project's next start waits out the minimum interval since its
+    // previous dispatch; its pending landings coalesce into that next run.
+    let mut waiting = HashSet::new();
+    if hold.is_none() {
+        let projects: HashSet<_> = work
+            .iter()
+            .filter(|w| w.job_id.is_none())
+            .map(|w| w.project_id)
+            .collect();
+        for project in projects {
+            let last = with_store(store, move |s| s.last_bounded_qa_dispatch(project)).await?;
+            if last.is_some_and(|last| now.signed_duration_since(last) < min_interval) {
+                waiting.insert(project);
+            }
+        }
+    }
+    // #4003: why a pending, unbound landing is not starting right now. The
+    // operator's minimum interval is a typed reason too (`min_interval`), so
+    // a start spaced hours after a landing reads as a wait, not as silence.
+    let postponed = |project: Option<Uuid>| {
+        hold.map(Hold::code)
+            .or_else(|| waiting.contains(&project).then_some(MIN_INTERVAL))
+    };
     // Detect an outage/admission stall without silently losing the obligation.
     // Keep it pending; deterministic Issue creation in the store dedupes wakes.
     // A landing bound to a run is not stalled: that run settles (or defers)
@@ -1355,10 +1627,7 @@ async fn drive_once(
         }
         let evidence = format!(
             "The full-library attempt is overdue: eight hours since publication. The obligation remains pending (current hold: {}) and will resume automatically after admission recovers.",
-            hold.map_or(
-                "none; awaiting placement or the minimum interval",
-                Hold::code
-            ),
+            postponed(landing.project_id).unwrap_or("none; awaiting placement"),
         );
         if let Some(issue) = failure_issue(
             std::slice::from_ref(landing),
@@ -1381,10 +1650,10 @@ async fn drive_once(
         {
             continue;
         }
-        if let Some(hold) = hold {
+        if let Some(reason) = postponed(landing.project_id) {
             let landing = landing.clone();
             with_store(store, move |store| {
-                store.note_bounded_qa_hold(&landing, hold.code(), now)
+                store.note_bounded_qa_hold(&landing, reason, now)
             })
             .await?;
         }
@@ -1418,22 +1687,6 @@ async fn drive_once(
             SatellitePoll::Settled(settlement) => {
                 satellites.polled.remove(&job_id);
                 settle(store, cohort, job_id, settlement, now).await?;
-            }
-        }
-    }
-    // #2112: a project's next start waits out the minimum interval since its
-    // previous dispatch; its pending landings coalesce into that next run.
-    let mut waiting = HashSet::new();
-    if hold.is_none() {
-        let projects: HashSet<_> = work
-            .iter()
-            .filter(|w| w.job_id.is_none())
-            .map(|w| w.project_id)
-            .collect();
-        for project in projects {
-            let last = with_store(store, move |s| s.last_bounded_qa_dispatch(project)).await?;
-            if last.is_some_and(|last| now.signed_duration_since(last) < min_interval) {
-                waiting.insert(project);
             }
         }
     }
@@ -1515,6 +1768,7 @@ mod tests {
     fn landing(source: &str, published: &str) -> BoundedQaLanding {
         BoundedQaLanding {
             entry: RollingQueueEntryV1 {
+                issue: None,
                 id: Uuid::new_v4(),
                 sequence: 1,
                 source_commit: source.into(),
@@ -1524,9 +1778,11 @@ mod tests {
                 work_key: None,
                 migration_version: None,
                 hot_files: vec![],
+                derived_test_filters: Vec::new(),
                 test_filters: vec![],
                 fixes_tests: Vec::new(),
                 filters_state: None,
+                expedite_reason: None,
                 state: RollingQueueEntryState::Published,
                 outcome: Some(RollingQueueOutcome {
                     landed_sha: Some(published.into()),
@@ -1565,9 +1821,39 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
     async fn bounded_qa_restart_reconciles_a_red_job_and_files_its_landing_issue_once() {
-        let issue = reconcile_failed_job(None).await;
+        use rsi_common::agent_failure_signatures::{
+            AgentQueryFailureSignaturesRequestV1, AgentQueryFailureSignaturesResultV1,
+        };
+
+        let failed = failed_job(None);
+        std::fs::write(failed.temp.path().join("qa.log"), "thread 'test::red' (1) panicked at src/a.rs:1:1:\nassertion failed: notification arrived\nnote: run with `RUST_BACKTRACE=1`\n").unwrap();
+        for _ in 0..2 {
+            failed.tick(failed.now).await;
+        }
+        let store = failed.store.lock().await;
+        let issue = store
+            .get_issue(Uuid::new_v5(&failed.job, b"bounded-library-qa-red"))
+            .unwrap()
+            .unwrap();
         assert!(issue.title.starts_with("Full library QA test red"));
         assert_eq!(issue.labels, ["qa", "bug"]);
+        let sources = store
+            .open_failure_signature_issues(issue.project_id)
+            .unwrap();
+        let queried = AgentQueryFailureSignaturesResultV1::from_issues(
+            &sources,
+            &AgentQueryFailureSignaturesRequestV1 {
+                test_id: Some("test::red".into()),
+                digest: None,
+            },
+        );
+        assert!(queried.malformed_issues.is_empty());
+        assert_eq!(queried.records.len(), 1);
+        assert_eq!(queried.records[0].issue_id, issue.id);
+        assert_eq!(
+            queried.records[0].record.matcher.contains,
+            ["assertion failed: notification arrived"]
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1586,7 +1872,7 @@ mod tests {
     /// One published landing bound to a hub job that settled `Failed` with
     /// `refusal` (and a failing test), not yet reconciled by the loop.
     struct FailedJob {
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         temp: tempfile::TempDir,
         entry: Uuid,
         job: Uuid,
@@ -1637,6 +1923,12 @@ mod tests {
     }
 
     fn failed_job(refusal: Option<&str>) -> FailedJob {
+        settled_job(refusal, false, chrono::Duration::zero())
+    }
+
+    /// `failed_job`, or a job that passed (`passed`), created `age` before the
+    /// dispatch that bound it.
+    fn settled_job(refusal: Option<&str>, passed: bool, age: chrono::Duration) -> FailedJob {
         use crate::store::agent_jobs::NewAgentJob;
         use crate::store::rolling_queue::NewQueueEntry;
         use rsi_common::agent_jobs::AgentJobResultV1;
@@ -1696,6 +1988,7 @@ mod tests {
             )
             .unwrap();
         let job = Uuid::new_v4();
+        let created = now - age;
         store
             .insert_agent_job(
                 &NewAgentJob {
@@ -1711,7 +2004,7 @@ mod tests {
                     idempotency_key: Some("qa".into()),
                     wake: JobWake::None,
                 },
-                now,
+                created,
             )
             .unwrap();
         store
@@ -1726,20 +2019,28 @@ mod tests {
         store
             .settle_agent_job(
                 job,
-                JobState::Failed,
+                if passed {
+                    JobState::Succeeded
+                } else {
+                    JobState::Failed
+                },
                 &AgentJobResultV1 {
-                    exit_code: Some(1),
+                    exit_code: Some(i32::from(!passed)),
                     // A timeout may include killed tests; the typed refusal wins.
                     refusal: refusal.map(str::to_owned),
-                    failing_tests: vec!["test::red".into()],
+                    failing_tests: if passed {
+                        Vec::new()
+                    } else {
+                        vec!["test::red".into()]
+                    },
                     ..Default::default()
                 },
                 false,
-                now,
+                created,
             )
             .unwrap();
         FailedJob {
-            store: Arc::new(tokio::sync::Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             temp,
             entry: entry.id,
             job,
@@ -1781,12 +2082,12 @@ mod tests {
             // The next attempt is a new job and satellite run, not a replay of this one.
             let attempt = store.bounded_qa_capacity_deferrals(failed.entry).unwrap();
             assert_ne!(
-                attempt_key("bounded-library-qa", failed.entry, 0),
-                attempt_key("bounded-library-qa", failed.entry, attempt)
+                attempt_key("bounded-library-qa", failed.entry, &failed.sha, 0),
+                attempt_key("bounded-library-qa", failed.entry, &failed.sha, attempt)
             );
             assert_ne!(
-                satellite_run_id(failed.entry, 0),
-                satellite_run_id(failed.entry, attempt)
+                satellite_run_id(failed.entry, &failed.sha, 0),
+                satellite_run_id(failed.entry, &failed.sha, attempt)
             );
             // A new run binds the landing again, and a second deferral is its own event.
             let second = Uuid::new_v4();
@@ -1883,6 +2184,248 @@ mod tests {
         assert_eq!(Evidence::plain("gap".into()).render(Some(&[])), "gap");
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn qa_log_reports_open_seek_and_partial_read_failures_without_partial_evidence() {
+        use std::io::{Cursor, Error, ErrorKind, Read, Seek, SeekFrom};
+
+        struct FaultReader {
+            cursor: Cursor<Vec<u8>>,
+            fail_seek: bool,
+        }
+
+        impl Read for FaultReader {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.cursor.position() > 0 {
+                    return Err(Error::new(
+                        ErrorKind::PermissionDenied,
+                        "private log detail",
+                    ));
+                }
+                self.cursor.read(bytes)
+            }
+        }
+
+        impl Seek for FaultReader {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                if self.fail_seek {
+                    return Err(Error::new(ErrorKind::Other, "private path detail"));
+                }
+                self.cursor.seek(from)
+            }
+        }
+
+        let open = qa_log_from_reader::<Cursor<Vec<u8>>>(|| {
+            Err(Error::new(ErrorKind::NotFound, "private path detail"))
+        });
+        assert_eq!(
+            open,
+            Err(QaLogReadError {
+                operation: QaLogOperation::Open,
+                kind: ErrorKind::NotFound,
+            })
+        );
+        for (fail_seek, operation, kind) in [
+            (true, QaLogOperation::Seek, ErrorKind::Other),
+            (false, QaLogOperation::Read, ErrorKind::PermissionDenied),
+        ] {
+            assert_eq!(
+                qa_log_from_reader(|| Ok(FaultReader {
+                    cursor: Cursor::new(b"partial evidence".to_vec()),
+                    fail_seek,
+                })),
+                Err(QaLogReadError { operation, kind })
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn qa_log_reads_empty_short_and_sixteen_mib_tails() {
+        use std::io::Cursor;
+
+        assert_eq!(qa_log_from_reader(|| Ok(Cursor::new(b""))), Ok("".into()));
+        assert_eq!(
+            qa_log_from_reader(|| Ok(Cursor::new(b"short\n\xff"))),
+            Ok("short\n\u{fffd}".into())
+        );
+        const LIMIT: usize = 16 * 1024 * 1024;
+        let mut bytes = vec![b'p'; 17];
+        bytes.extend(std::iter::repeat_n(b'x', LIMIT));
+        assert_eq!(
+            qa_log_from_reader(|| Ok(Cursor::new(bytes))),
+            Ok("x".repeat(LIMIT))
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn qa_matchers_read_local_panic_evidence_and_keep_missing_payloads_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("qa.log");
+        std::fs::write(&log, "thread 'a::red' (1) panicked at src/a.rs:1:1:\nassertion failed: inbox is ready\nnote: run with `RUST_BACKTRACE=1`\n").unwrap();
+        let reported = vec!["FAIL rsid a::red".into(), "TIMEOUT rsid b::slow".into()];
+        let local = qa_matchers(&reported, &qa_log(log.to_str().unwrap()));
+        assert_eq!(
+            local["a::red"].contains,
+            ["assertion failed: inbox is ready"]
+        );
+        assert_eq!(
+            local["b::slow"].digest,
+            Some(digest("TIMEOUT rsid b::slow"))
+        );
+        let satellite = qa_matchers(&reported, "");
+        assert!(satellite["a::red"].contains.is_empty());
+        assert_eq!(satellite["a::red"].digest, Some(digest("FAIL rsid a::red")));
+        assert_eq!(qa_log(dir.path().join("missing").to_str().unwrap()), "");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn satellite_evidence_upgrades_name_only_owners_and_replay_is_idempotent() {
+        use rsi_common::failure_signature::{
+            Classification, MatchedBy, SignatureClass, build_snapshot, classify, parse_issue_blocks,
+        };
+        let failed = failed_job(None);
+        let cohort = failed.store.lock().await.bounded_qa_landings().unwrap();
+        let placement = BoundedQaPlacement::Satellite {
+            peer_id: Uuid::new_v4(),
+            peer_label: "laptop".into(),
+            remote_job_id: None,
+        };
+        // This path exists on the hub, but its panic must never be read for
+        // the satellite's failure, including an older satellite's receipt.
+        std::fs::write(
+            failed.temp.path().join("qa.log"),
+            "thread 'test::red' panicked at src/a.rs:1:1:\nwrong host panic\n",
+        )
+        .unwrap();
+        let mut receipt = SatelliteQaRunReceiptV1 {
+            run_id: Uuid::new_v4(),
+            sha: failed.sha.clone(),
+            job_id: failed.job,
+            state: JobState::Failed,
+            exit_code: Some(1),
+            refusal: None,
+            failing_tests: vec![
+                "FAIL rsid test::red".into(),
+                "FAIL rsid test::second".into(),
+            ],
+            failing_tests_omitted: 0,
+            panic_excerpts: Default::default(),
+            log_path: failed.temp.path().join("qa.log").display().to_string(),
+            replayed: false,
+        };
+        let initial = satellite_settlement(receipt.clone(), &placement, &cohort);
+        assert!(
+            initial
+                .run
+                .failure_matchers
+                .values()
+                .all(|m| m.contains.is_empty())
+        );
+        settle(
+            &failed.store,
+            cohort.clone(),
+            failed.job,
+            initial,
+            failed.now,
+        )
+        .await
+        .unwrap();
+        let owner_id = Uuid::new_v5(&failed.job, b"bounded-library-qa-red");
+        let owner = failed
+            .store
+            .lock()
+            .await
+            .get_issue(owner_id)
+            .unwrap()
+            .unwrap();
+        let before = build_snapshot(
+            &[(owner.display_number as u64, "Open".into(), owner.body)],
+            None,
+        )
+        .snapshot;
+        assert_eq!(
+            classify(
+                &before,
+                "test::red",
+                "assertion failed: first inbox ready",
+                None
+            ),
+            Classification::NameOnly {
+                issues: vec![owner.display_number as u64]
+            }
+        );
+
+        receipt.job_id = Uuid::new_v4();
+        receipt.panic_excerpts = [
+            (
+                "test::red".into(),
+                "assertion failed: first inbox ready".into(),
+            ),
+            (
+                "test::second".into(),
+                "assertion failed: second worker ready".into(),
+            ),
+        ]
+        .into();
+        for _ in 0..2 {
+            let settled = satellite_settlement(receipt.clone(), &placement, &cohort);
+            settle(
+                &failed.store,
+                cohort.clone(),
+                receipt.job_id,
+                settled,
+                failed.now,
+            )
+            .await
+            .unwrap();
+        }
+        let owner = failed
+            .store
+            .lock()
+            .await
+            .get_issue(owner_id)
+            .unwrap()
+            .unwrap();
+        let records = parse_issue_blocks(&owner.body, owner.display_number as u64).unwrap();
+        assert_eq!(
+            records.len(),
+            4,
+            "one name-only and one strong record per test"
+        );
+        let snapshot = build_snapshot(
+            &[(owner.display_number as u64, "Open".into(), owner.body)],
+            None,
+        )
+        .snapshot;
+        for (test, excerpt) in &receipt.panic_excerpts {
+            assert_eq!(
+                classify(&snapshot, test, excerpt, None),
+                Classification::Known {
+                    issue: owner.display_number as u64,
+                    class: SignatureClass::Regression,
+                    by: MatchedBy::Digest,
+                }
+            );
+            assert_eq!(
+                classify(&snapshot, test, &format!("observed: {excerpt}"), None),
+                Classification::Known {
+                    issue: owner.display_number as u64,
+                    class: SignatureClass::Regression,
+                    by: MatchedBy::Contains,
+                }
+            );
+        }
+        assert_eq!(
+            classify(&snapshot, "test::red", "different cause", None),
+            Classification::NameOnly {
+                issues: vec![owner.display_number as u64]
+            }
+        );
+    }
+
     /// #2172: the Issue's `Failing tests:` line is one clean test path per
     /// test, whatever shape the run reported (nextest's progress counter and
     /// binary id, the bare echo of the same failure), so `fixes_issue` (#2167)
@@ -1912,6 +2455,7 @@ mod tests {
             refusal: None,
             failing_tests: reported,
             failing_tests_omitted: 0,
+            panic_excerpts: Default::default(),
             log_path: "/laptop/jobs/1.log".into(),
             replayed: false,
         };
@@ -1963,6 +2507,7 @@ mod tests {
             .map(String::from)
             .into(),
             failing_tests_omitted: 3,
+            panic_excerpts: Default::default(),
             log_path: "/laptop/jobs/1.log".into(),
             replayed: false,
         };
@@ -2113,7 +2658,7 @@ mod tests {
         for sha in &shas[1..] {
             obliged_landing(&store, project, &repo, sha, now);
         }
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let launcher = LanderLauncher::new(PathBuf::from("unused"));
         let tools = JobTools {
             cargo_slot: "unused".into(),
@@ -2161,11 +2706,128 @@ mod tests {
         .await;
         assert!(refused.is_err());
         assert_eq!(snapshots(), 1, "one coalesced start for both landings");
-        let pinned = jobs
-            .join("rolling-library-qa")
-            .join(pending[0].entry.id.to_string())
-            .join("source");
+        let pinned = snapshot_root(&jobs, pending[0].entry.id, &shas[2]).join("source");
         assert_eq!(head_commit(&pinned).as_deref(), Some(shas[2].as_str()));
+    }
+
+    /// #3733: a pending landing that is an ancestor of the project's latest
+    /// green full-library run is covered by it. It settles from that run, its
+    /// stale overdue Issue closes, and no overdue Issue is filed for it; a
+    /// landing newer than the green SHA stays pending and still goes overdue.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_later_green_run_credits_a_covered_pending_landing_and_closes_its_overdue_issue() {
+        use rsi_common::types::{IssueStatus, Project};
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        let shas: Vec<String> = ["zero", "one", "two"]
+            .iter()
+            .map(|value| commit(&repo, value))
+            .collect();
+        let store = Store::open_in_memory().unwrap();
+        let project = Uuid::new_v4();
+        let now = Utc::now();
+        store
+            .insert_project(&Project {
+                id: project,
+                name: "qa-credit".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let nine_hours = chrono::Duration::hours(9);
+        obliged_landing(&store, project, &repo, &shas[0], now - nine_hours);
+        let covered = store.bounded_qa_landings().unwrap()[0].entry.id;
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
+        // Nothing has run yet: the old landing goes overdue and files its Issue.
+        drive_held(&store, temp.path(), Some(Hold::Drain), now).await;
+        let overdue = Uuid::new_v5(&covered, b"bounded-library-qa-overdue");
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_issue(overdue)
+                .unwrap()
+                .unwrap()
+                .status,
+            IssueStatus::Open
+        );
+        // A later landing is published and a full run passes at its SHA.
+        let newer = {
+            let guard = store.lock().await;
+            obliged_landing(
+                &guard,
+                project,
+                &repo,
+                &shas[1],
+                now - chrono::Duration::hours(1),
+            );
+            let green = guard
+                .bounded_qa_landings()
+                .unwrap()
+                .into_iter()
+                .filter(|w| w.entry.source_commit == shas[1])
+                .collect::<Vec<_>>();
+            let job = Uuid::new_v4();
+            guard
+                .request_bounded_qa(&green, job, &shas[1], &hub(), now)
+                .unwrap();
+            guard
+                .finish_bounded_qa(
+                    &green,
+                    job,
+                    &shas[1],
+                    true,
+                    &BoundedQaRun::default(),
+                    None,
+                    now,
+                )
+                .unwrap();
+            // And one published after the green SHA, still pending and old.
+            obliged_landing(&guard, project, &repo, &shas[2], now - nine_hours);
+            guard
+                .bounded_qa_landings()
+                .unwrap()
+                .into_iter()
+                .find(|w| w.entry.source_commit == shas[2])
+                .unwrap()
+                .entry
+                .id
+        };
+        let later = now + chrono::Duration::minutes(5);
+        for _ in 0..2 {
+            drive_held(&store, temp.path(), Some(Hold::Drain), later).await;
+        }
+        let guard = store.lock().await;
+        // The covered landing is settled by the green run and its Issue closed.
+        assert_eq!(
+            guard.get_issue(overdue).unwrap().unwrap().status,
+            IssueStatus::Closed
+        );
+        let pending: Vec<_> = guard
+            .bounded_qa_landings()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.entry.id)
+            .collect();
+        assert_eq!(pending, [newer]);
+        let green = guard
+            .rolling_qa_green_for_project(project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(green.sha, shas[1]);
+        // The uncovered landing is still reported, once.
+        let newer_overdue = Uuid::new_v5(&newer, b"bounded-library-qa-overdue");
+        assert_eq!(
+            guard.get_issue(newer_overdue).unwrap().unwrap().status,
+            IssueStatus::Open
+        );
     }
 
     /// A project with one repository whose single obliged landing was
@@ -2173,7 +2835,11 @@ mod tests {
     fn aged_obligation(
         temp: &Path,
         age: chrono::Duration,
-    ) -> (Arc<tokio::sync::Mutex<Store>>, PathBuf, DateTime<Utc>) {
+    ) -> (
+        Arc<rsid_core::store_lock::Mutex<Store>>,
+        PathBuf,
+        DateTime<Utc>,
+    ) {
         use rsi_common::types::Project;
         let repo = temp.join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -2195,11 +2861,15 @@ mod tests {
             })
             .unwrap();
         obliged_landing(&store, project, &repo, &sha, now - age);
-        (Arc::new(tokio::sync::Mutex::new(store)), repo, now)
+        (
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
+            repo,
+            now,
+        )
     }
 
     async fn drive_held(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         temp: &Path,
         hold: Option<Hold>,
         now: DateTime<Utc>,
@@ -2260,6 +2930,78 @@ mod tests {
         assert_eq!(snapshots(), 0, "a deploy drain is never bypassed");
         drive_held(&store, temp.path(), Some(Hold::HostLoad), starved).await;
         assert_eq!(snapshots(), 1, "the starved obligation starts");
+    }
+
+    /// #4003: a landing that waits out the operator's minimum interval since
+    /// the previous dispatch records the typed reason `min_interval`, once,
+    /// instead of looking like a start that never comes; it still does not
+    /// start inside the interval and starts once the interval has passed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_start_waiting_out_the_interval_records_the_min_interval_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, repo, now) = aged_obligation(temp.path(), chrono::Duration::hours(2));
+        let previous = store.lock().await.bounded_qa_landings().unwrap();
+        let project = previous[0].project_id;
+        let earlier = now - chrono::Duration::minutes(30);
+        {
+            let guard = store.lock().await;
+            let job = Uuid::new_v4();
+            let sha = previous[0].entry.source_commit.clone();
+            guard
+                .request_bounded_qa(&previous, job, &sha, &hub(), earlier)
+                .unwrap();
+            guard
+                .finish_bounded_qa(
+                    &previous,
+                    job,
+                    &sha,
+                    true,
+                    &BoundedQaRun::default(),
+                    None,
+                    earlier,
+                )
+                .unwrap();
+            let next = commit(&repo, "one");
+            obliged_landing(
+                &guard,
+                project.unwrap(),
+                &repo,
+                &next,
+                now - chrono::Duration::hours(2),
+            );
+        }
+        let snapshots = || {
+            std::fs::read_dir(temp.path().join("jobs").join("rolling-library-qa"))
+                .map(|dir| dir.count())
+                .unwrap_or(0)
+        };
+        let mut satellites = SatelliteQa::new(temp.path().join("satellites"));
+        for _ in 0..2 {
+            drive_once(
+                &store,
+                &LanderLauncher::new(PathBuf::from("unused")),
+                Arc::new(NoLaunch),
+                &unused_tools(),
+                &temp.path().join("jobs"),
+                &mut satellites,
+                None,
+                chrono::Duration::minutes(60),
+                now,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(snapshots(), 0, "held by the interval");
+        let landing = store.lock().await.bounded_qa_landings().unwrap().remove(0);
+        assert!(landing.job_id.is_none());
+        let guard = store.lock().await;
+        assert!(
+            !guard
+                .note_bounded_qa_hold(&landing, "min_interval", now)
+                .unwrap(),
+            "the loop already recorded min_interval once, however often it ticked"
+        );
     }
 
     /// #2394: an obligation younger than the audit age records no hold
@@ -2434,6 +3176,8 @@ mod tests {
             uptime_seconds: 1,
             schema_version: None,
             sessions_running: 0,
+            workers_parked: None,
+            open_jobs: None,
             sessions_waiting_approval: 0,
             disk_free_bytes: admission.build_disk_free_bytes,
             load_avg_1m_milli: None,
@@ -2443,10 +3187,13 @@ mod tests {
             last_deploy: None,
             missing_provider_clis: Vec::new(),
             manager_launches: Vec::new(),
+            governor_disk: None,
+            manager_policies: None,
             qa_admission: Some(admission),
             provider_logins: Vec::new(),
             provider_faults: Vec::new(),
             store_probe_elapsed_ms: None,
+            usage: Vec::new(),
             latest_watchdog_trip: None,
         }
     }
@@ -2485,6 +3232,7 @@ mod tests {
         /// #2176: identity handshakes served (each new placement makes one).
         handshakes: Arc<std::sync::atomic::AtomicUsize>,
         platform: Arc<std::sync::Mutex<Option<rsi_common::satellite::SatellitePlatformV1>>>,
+        disk_wait: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// The hub's private satellite socket directory (mode 0700; under /tmp
@@ -2532,6 +3280,8 @@ mod tests {
         let error_next_start = Arc::new(std::sync::Mutex::new(None::<String>));
         let deploying = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let disk_wait = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_disk_wait = Arc::clone(&disk_wait);
         let (is_deploying, shaken) = (Arc::clone(&deploying), Arc::clone(&handshakes));
         let (seen, answer, dropping) = (
             Arc::clone(&requests),
@@ -2562,6 +3312,7 @@ mod tests {
                     Arc::clone(&failing),
                 );
                 let reported_platform = Arc::clone(&reported_platform);
+                let is_disk_wait = Arc::clone(&is_disk_wait);
                 let (is_deploying, shaken) = (Arc::clone(&is_deploying), Arc::clone(&shaken));
                 tokio::spawn(async move {
                     let mut stream = tokio::io::BufReader::new(stream);
@@ -2587,6 +3338,14 @@ mod tests {
                                 }
                                 let mut health = health(reported);
                                 health.platform = reported_platform.lock().unwrap().clone();
+                                if is_disk_wait.load(std::sync::atomic::Ordering::SeqCst) {
+                                    health.governor_disk =
+                                        Some(rsi_common::satellite::SatelliteGovernorDiskV1 {
+                                            free_bytes: Some(27 * GIB_BYTES),
+                                            floor_bytes: 30 * GIB_BYTES,
+                                            oldest_wait_seconds: Some(2400),
+                                        });
+                                }
                                 if is_deploying.load(std::sync::atomic::Ordering::SeqCst) {
                                     health.last_deploy =
                                         Some(rsi_common::satellite::SatelliteDeployStatusV1 {
@@ -2622,6 +3381,7 @@ mod tests {
                                     refusal: run.refusal,
                                     failing_tests: run.failing_tests,
                                     failing_tests_omitted: 0,
+                                    panic_excerpts: Default::default(),
                                     log_path: format!("/laptop/jobs/{job}.log"),
                                     replayed: !wire.start,
                                 };
@@ -2722,6 +3482,7 @@ mod tests {
             deploying,
             handshakes,
             platform,
+            disk_wait,
         }
     }
 
@@ -2761,7 +3522,7 @@ mod tests {
 
     /// One loop pass with no hold and a 60-minute minimum interval.
     async fn drive_every_hour(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         jobs: &Path,
         satellites: &mut SatelliteQa,
     ) {
@@ -2782,7 +3543,7 @@ mod tests {
 
     /// One loop pass with no hold and no minimum interval.
     async fn drive(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         jobs: &Path,
         satellites: &mut SatelliteQa,
     ) -> Result<()> {
@@ -2820,7 +3581,7 @@ mod tests {
             reported_with_target(56, 30, 25),
             true,
         );
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         satellites.poll_every = std::time::Duration::ZERO;
@@ -2885,7 +3646,7 @@ mod tests {
         let (store, _, sha) = hub_fixture(temp);
         let (sockets, root) = socket_root();
         let sat = fake_satellite(&store, &root, "laptop", admission, observed);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let cohort = store.lock().await.bounded_qa_landings().unwrap();
         let placed = place(
             &store,
@@ -2935,7 +3696,7 @@ mod tests {
                 os: os.into(),
                 arch: "another_arch".into(),
             });
-            let store = Arc::new(tokio::sync::Mutex::new(store));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
             let cohort = store.lock().await.bounded_qa_landings().unwrap();
             let placed = place(
                 &store,
@@ -3003,7 +3764,7 @@ mod tests {
     async fn no_qualifying_satellite_falls_back_to_the_hub_with_its_reason() {
         let temp = tempfile::tempdir().unwrap();
         let (store, _project, sha) = hub_fixture(temp.path());
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let mut unused = SatelliteQa::new(temp.path().join("satellites"));
         let cohort = store.lock().await.bounded_qa_landings().unwrap();
         assert_eq!(
@@ -3090,18 +3851,63 @@ mod tests {
         let (full_store, _, full_sha) = hub_fixture(&temp.path().join("full"));
         let (_sockets, root) = socket_root();
         let full = fake_satellite(&full_store, &root, "laptop", reported(25, 30), true);
-        let full_store = Arc::new(tokio::sync::Mutex::new(full_store));
+        let full_store = Arc::new(rsid_core::store_lock::Mutex::new(full_store));
         let mut satellites = SatelliteQa::new(root);
         let jobs = temp.path().join("full-jobs");
         let refused = drive(&full_store, &jobs, &mut satellites).await;
         assert!(refused.is_err());
         assert!(full.requests.lock().unwrap().is_empty());
         let pending = full_store.lock().await.bounded_qa_landings().unwrap();
-        let pinned = jobs
-            .join(SNAPSHOTS)
-            .join(pending[0].entry.id.to_string())
-            .join("source");
+        let pinned = snapshot_root(&jobs, pending[0].entry.id, &full_sha).join("source");
         assert_eq!(head_commit(&pinned).as_deref(), Some(full_sha.as_str()));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_satellite_disk_hold_routes_qa_to_the_hub_and_reports_rolling_health() {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, project, sha) = hub_fixture(temp.path());
+        let (_sockets, root) = socket_root();
+        // QA's floor-plus-target check would admit this report, including reclaim.
+        let sat = fake_satellite(&store, &root, "laptop", reported(60, 30), true);
+        sat.disk_wait
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
+        let cohort = store.lock().await.bounded_qa_landings().unwrap();
+        let placed = place(
+            &store,
+            &mut SatelliteQa::new(root),
+            Uuid::new_v4(),
+            &sha,
+            &cohort,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let reason = hub_reason(placed);
+        assert!(reason.contains(SATELLITE_QA_DISK_LOW));
+        assert!(sat.requests.lock().unwrap().is_empty());
+        let guard = store.lock().await;
+        guard
+            .request_bounded_qa(
+                &cohort,
+                Uuid::new_v4(),
+                &sha,
+                &BoundedQaPlacement::Hub {
+                    reason: reason.clone(),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let health = guard
+            .rolling_health_for_project(project, Utc::now())
+            .unwrap();
+        assert_eq!(health.qa_hub_fallback_reason, Some(reason.clone()));
+        assert!(
+            health
+                .render_block()
+                .contains(&format!("latest full-library QA routed to hub: {reason}"))
+        );
     }
 
     /// #180: a satellite that accepted the start but whose reply was lost
@@ -3122,7 +3928,7 @@ mod tests {
         first
             .drop_next_start
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         satellites.poll_every = std::time::Duration::ZERO;
@@ -3215,12 +4021,12 @@ mod tests {
         let (_sockets, root) = socket_root();
         let first = fake_satellite(&store, &root, "a-laptop", reported(31, 30), true);
         let second = fake_satellite(&store, &root, "b-laptop", reported(31, 30), true);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
 
         // The start is sent (and accepted); the hub stops before the binding.
         let cohort = store.lock().await.bounded_qa_landings().unwrap();
-        let run_id = satellite_run_id(cohort[0].entry.id, 0);
+        let run_id = satellite_run_id(cohort[0].entry.id, &sha, 0);
         let placed = place(
             &store,
             &mut SatelliteQa::new(root.clone()),
@@ -3328,7 +4134,7 @@ mod tests {
             "Process error: job_launch_failed: controller unavailable after dispatch; job 7c4d2a1e-0000-4000-8000-000000000000 remains running because service stop could not be confirmed"
                 .into(),
         );
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         satellites.poll_every = std::time::Duration::ZERO;
@@ -3396,7 +4202,7 @@ mod tests {
         let first = fake_satellite(&store, &root, "a-laptop", reported(31, 30), true);
         let second = fake_satellite(&store, &root, "b-laptop", reported(31, 30), true);
         *first.error_next_start.lock().unwrap() = Some("Policy denied: satellite_qa_busy".into());
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         satellites.poll_every = std::time::Duration::ZERO;
@@ -3430,7 +4236,7 @@ mod tests {
         let (_sockets, root) = socket_root();
         let sat = fake_satellite(&store, &root, "laptop", reported(56, 30), true);
         sat.deploying.store(true, SeqCst);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         for _ in 0..2 {
@@ -3474,7 +4280,7 @@ mod tests {
         deploying.refusal = Some(SATELLITE_QA_DEPLOY_PENDING.into());
         let first = fake_satellite(&store, &root, "a-laptop", deploying, true);
         let second = fake_satellite(&store, &root, "b-laptop", reported(56, 30), true);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         drive(&store, &jobs, &mut satellites).await.unwrap();
@@ -3501,17 +4307,17 @@ mod tests {
     #[tokio::test]
     async fn a_deploy_preempted_satellite_run_is_deferred_without_an_issue() {
         let temp = tempfile::tempdir().unwrap();
-        let (store, _project, _sha) = hub_fixture(temp.path());
+        let (store, _project, sha) = hub_fixture(temp.path());
         let (_sockets, root) = socket_root();
         let sat = fake_satellite(&store, &root, "laptop", reported(56, 30), true);
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let jobs = temp.path().join("jobs");
         let mut satellites = SatelliteQa::new(root.clone());
         satellites.poll_every = std::time::Duration::ZERO;
         drive_every_hour(&store, &jobs, &mut satellites).await;
         let bound = store.lock().await.bounded_qa_landings().unwrap();
         let (entry, run_id) = (bound[0].entry.id, bound[0].job_id.unwrap());
-        assert_eq!(run_id, satellite_run_id(entry, 0));
+        assert_eq!(run_id, satellite_run_id(entry, &sha, 0));
         *sat.run.lock().unwrap() = FakeRun {
             state: JobState::Failed,
             exit_code: None,
@@ -3543,6 +4349,251 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reason, DEPLOY_PREEMPTED);
-        assert_ne!(satellite_run_id(entry, 1), run_id, "a new attempt");
+        assert_ne!(satellite_run_id(entry, &sha, 1), run_id, "a new attempt");
+    }
+
+    /// A runtime that accepts every launch and never reports the unit active.
+    struct AcceptLaunch;
+    impl JobRuntime for AcceptLaunch {
+        fn launch(&self, _: &agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn unit_active(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    /// #3758: the job key, satellite run id and snapshot root follow the
+    /// target commit, so an anchor that stays pending across a later landing
+    /// can never reach the earlier run.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_job_key_run_id_and_snapshot_root_change_with_the_target_commit() {
+        let anchor = Uuid::new_v4();
+        let (old, new) = ("a".repeat(40), "b".repeat(40));
+        let jobs = Path::new("jobs");
+        for attempt in [0, 1, 2] {
+            assert_ne!(
+                attempt_key("bounded-library-qa", anchor, &old, attempt),
+                attempt_key("bounded-library-qa", anchor, &new, attempt)
+            );
+            assert_ne!(
+                satellite_run_id(anchor, &old, attempt),
+                satellite_run_id(anchor, &new, attempt)
+            );
+        }
+        assert_ne!(
+            snapshot_root(jobs, anchor, &old),
+            snapshot_root(jobs, anchor, &new)
+        );
+        assert_eq!(
+            attempt_key("bounded-library-qa", anchor, &old, 0),
+            attempt_key("bounded-library-qa", anchor, &old, 0),
+            "a retry of the same attempt at the same commit still replays"
+        );
+    }
+
+    /// #3758: pass at one commit, a later landing while the anchor entry is
+    /// still pending, re-dispatch from that same anchor. The idempotent submit
+    /// must not hand back the finished job: a NEW job runs and binds the new
+    /// landing, and the earlier green does not settle it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_redispatch_from_a_pending_anchor_at_a_new_commit_runs_a_new_job() {
+        use rsi_common::agent_jobs::AgentJobResultV1;
+        // A job's build environment refuses a scratch root under a shared
+        // tmpfs ancestor, so this fixture lives under the target directory.
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(rsi_common::manifest_dir!()).join("../../target"));
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("bounded-qa-redispatch-")
+            .tempdir_in(base.canonicalize().unwrap())
+            .unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".rsi")).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        std::fs::write(
+            repo.join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.rolling-library-qa]\nrunner = 'make'\ntarget = 'rolling-library-qa'\ntimeout_minutes = 180\ncpu_quota_percent = 200\n",
+        )
+        .unwrap();
+        git(&repo, &["add", ".rsi/jobs.toml"]).unwrap();
+        let first_sha = commit(&repo, "first");
+        let store = Store::open_in_memory().unwrap();
+        let project = Uuid::new_v4();
+        let now = Utc::now();
+        {
+            use rsi_common::types::Project;
+            store
+                .insert_project(&Project {
+                    id: project,
+                    name: "qa-redispatch".into(),
+                    path: None,
+                    description: None,
+                    color: Project::DEFAULT_COLOR.into(),
+                    context_files: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+        }
+        obliged_landing(&store, project, &repo, &first_sha, now);
+        let anchor = store.bounded_qa_landings().unwrap().remove(0);
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
+        let jobs = temp.path().join("jobs");
+        let plan = |sha: &str, pending: Vec<BoundedQaLanding>| Plan {
+            anchor: anchor.clone(),
+            repo: repo.clone(),
+            sha: sha.into(),
+            cohort: pending.clone(),
+            pending,
+        };
+        let tools = unused_tools();
+        // The first run already passed: a finished job under the key the
+        // pre-#3758 code used for this anchor at its first attempt.
+        let first_job = Uuid::new_v4();
+        {
+            use crate::store::agent_jobs::NewAgentJob;
+            let guard = store.lock().await;
+            guard
+                .insert_agent_job(
+                    &NewAgentJob {
+                        id: first_job,
+                        owner_session_id: anchor.entry.source_session_id,
+                        project_id: Some(project),
+                        name: Some("first".into()),
+                        params: full_library_params(),
+                        cwd: repo.display().to_string(),
+                        unit_name: format!("qa-{first_job}"),
+                        log_path: temp.path().join("first.log").display().to_string(),
+                        status_path: temp.path().join("first.status").display().to_string(),
+                        idempotency_key: Some(attempt_key(
+                            "bounded-library-qa",
+                            anchor.entry.id,
+                            &first_sha,
+                            0,
+                        )),
+                        wake: JobWake::None,
+                    },
+                    now,
+                )
+                .unwrap();
+            guard
+                .settle_agent_job(
+                    first_job,
+                    JobState::Succeeded,
+                    &AgentJobResultV1 {
+                        exit_code: Some(0),
+                        ..Default::default()
+                    },
+                    false,
+                    now,
+                )
+                .unwrap();
+        }
+        // A later landing, while the anchor stays pending, and a new dispatch
+        // from that same anchor at the new commit. Whether the job then
+        // launches depends on the host's scratch custody; the submit is what
+        // must not replay the finished job.
+        let second_sha = commit(&repo, "second");
+        obliged_landing(&*store.lock().await, project, &repo, &second_sha, now);
+        let later = store
+            .lock()
+            .await
+            .bounded_qa_landings()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.entry.source_commit == second_sha)
+            .unwrap();
+        let dispatched = start_on_hub(
+            &store,
+            Arc::new(AcceptLaunch),
+            &tools,
+            &jobs,
+            plan(&second_sha, vec![later.clone()]),
+            "test".into(),
+            0,
+            now,
+        )
+        .await;
+        let guard = store.lock().await;
+        let second = guard
+            .find_agent_job_by_key(&attempt_key(
+                "bounded-library-qa",
+                anchor.entry.id,
+                &second_sha,
+                0,
+            ))
+            .unwrap()
+            .expect("the re-dispatch submitted its own job");
+        assert_ne!(second.job.id, first_job, "a new job, not a replay");
+        assert_ne!(second.job.state, JobState::Succeeded, "not the stale green");
+        let bound = guard
+            .bounded_qa_landings()
+            .unwrap()
+            .into_iter()
+            .find(|w| w.entry.id == later.entry.id)
+            .unwrap();
+        if dispatched.is_ok() {
+            assert_eq!(bound.job_id, Some(second.job.id));
+        } else {
+            assert!(bound.job_id.is_none(), "a failed submit binds nothing");
+        }
+        assert!(bound.job_id != Some(first_job), "the stale job never binds");
+    }
+
+    /// #3758: a finished job created before the dispatch that bound it is an
+    /// earlier run. Settle treats it as not run: nothing is credited, no Issue
+    /// is filed, and the obligation is pending again for a real run. A job
+    /// created with the dispatch still settles as before.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_job_older_than_its_dispatch_is_not_run_and_never_passes() {
+        let stale = settled_job(None, true, chrono::Duration::hours(4));
+        for _ in 0..2 {
+            stale.tick(stale.now).await;
+        }
+        {
+            let store = stale.store.lock().await;
+            let pending = store.bounded_qa_landings().unwrap();
+            assert_eq!(pending.len(), 1, "still owed");
+            assert!(pending[0].job_id.is_none(), "free for a real run");
+            assert_eq!(store.bounded_qa_capacity_deferrals(stale.entry).unwrap(), 1);
+            let reason: String = store
+                .conn
+                .query_row(
+                    "SELECT json_extract(detail_json,'$.refusal') FROM rolling_queue_events
+                     WHERE entry_id=?1 AND kind='bounded_qa_capacity_deferred'",
+                    [stale.entry.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(reason, STALE_JOB_REPLAY);
+            let finished: i64 = store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM rolling_queue_events WHERE kind='bounded_qa_finished'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(finished, 0, "no receipt credits the landing");
+        }
+        let fresh = settled_job(None, true, chrono::Duration::zero());
+        for _ in 0..2 {
+            fresh.tick(fresh.now).await;
+        }
+        assert!(
+            fresh
+                .store
+                .lock()
+                .await
+                .bounded_qa_landings()
+                .unwrap()
+                .is_empty(),
+            "a job created with its dispatch settles green"
+        );
     }
 }

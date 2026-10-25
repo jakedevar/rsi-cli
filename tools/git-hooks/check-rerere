@@ -1,0 +1,12 @@
+#!/bin/sh
+# Common config is shared by every worktree; never reuse another agent's merge.
+enabled=$(git config --local --includes --bool --get rerere.enabled)
+status=$?
+if [ "$status" -gt 1 ]; then
+  echo "git-hooks: cannot read rerere.enabled; fix with: git config rerere.enabled false" >&2
+  exit 1
+fi
+if [ "$enabled" = true ]; then
+  echo "git-hooks: shared rerere.enabled=true is unsafe across worktrees; fix with: git config rerere.enabled false" >&2
+  exit 1
+fi

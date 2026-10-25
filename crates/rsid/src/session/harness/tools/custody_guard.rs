@@ -44,6 +44,16 @@
 //! its probe's exit and git's start. There is no locking: an edit by another
 //! process inside that window is not caught.
 //!
+//! Where it applies (#3165): the same location predicate as the CLI provider
+//! hook (`rsi_common::boundary_mail_hook::command_in_custody_scope`). The scan
+//! runs only for a command that starts inside the sandbox base or names a path
+//! under it; a scratch repository or a benchmark task's own repository
+//! elsewhere is not ours to guard. The predicate is what the CLI providers
+//! already use, so one rule decides it for every provider and no per-session
+//! switch has to be recorded. A host with no resolvable sandbox base fails
+//! closed (the guard applies everywhere). A container target skips the guard
+//! at the tool (#3176).
+//!
 //! It is a guard rail for cooperative agents, not a security boundary. It does
 //! not follow scripts, functions, variables, brace expansion, `env -S`, an
 //! alias that a script writes into a config file or here-document bodies fed
@@ -53,8 +63,11 @@ use super::git::scoped_git_command;
 use crate::process_control::{CaptureLimits, CapturedOutput, capture_bounded};
 use crate::session::harness::types::ToolResult;
 use rsi_common::custody_scan::{
-    ALIAS_PROBE_ARGS, Discard, Scan, alias_in_use, alias_names_from, alias_unverifiable,
-    branch_change_verdict, dirty, paths_at_risk_from_status, scan_git, scan_script, status_args,
+    Discard, EXEC_PATH_ARGS, Scan, alias_in_use, alias_names_from, alias_precheck,
+    alias_probe_args, alias_unverifiable, branch_change_verdict, conflict_in_progress_from,
+    conflict_state_args, dirty, dirty_during_merge, external_identity_args,
+    external_repository_verdict, external_worktrees_args, not_shipped, paths_at_risk_from_status,
+    resolves_conflict_side, scan_git, scan_script, ships_in_exec_path, status_args, unmerged_args,
     unverifiable, worktree_identity_args,
 };
 use std::path::Path;
@@ -94,10 +107,29 @@ pub(super) struct Probe<'a> {
     pub(super) invocation_id: Option<uuid::Uuid>,
     pub(super) working_dir: &'a Path,
     pub(super) cancel: &'a CancellationToken,
+    /// The RSI sandbox base ([`rsi_common::boundary_mail_hook::sandbox_base`]);
+    /// a command outside it is not guarded (#3165).
+    pub(super) sandbox_base: &'a Path,
+}
+
+impl Probe<'_> {
+    /// Whether `command` is inside RSI's git custody. An unresolvable (empty)
+    /// base fails closed: the guard applies.
+    fn guards(&self, command: &str) -> bool {
+        self.sandbox_base.as_os_str().is_empty()
+            || rsi_common::boundary_mail_hook::command_in_custody_scope(
+                command,
+                self.working_dir,
+                self.sandbox_base,
+            )
+    }
 }
 
 /// `Some(refusal)` when a `shell`/`exec_command` script breaks a custody rule.
 pub(super) async fn check_shell(command: &str, probe: &Probe<'_>) -> Option<Refusal> {
+    if !probe.guards(command) {
+        return None;
+    }
     let mut scan = Scan::default();
     scan_script(command, 0, true, &mut scan);
     settle(scan, probe).await
@@ -110,6 +142,9 @@ pub(super) async fn check_git_args<S: AsRef<str>>(
     probe: &Probe<'_>,
 ) -> Option<Refusal> {
     let words: Vec<String> = args.iter().map(|word| word.as_ref().to_owned()).collect();
+    if !probe.guards(&words.join(" ")) {
+        return None;
+    }
     let mut scan = Scan::default();
     scan_git(&words, &mut scan);
     settle(scan, probe).await
@@ -141,7 +176,14 @@ async fn settle(scan: Scan, probe: &Probe<'_>) -> Option<Refusal> {
     for discard in &scan.discards {
         match probe.paths_at_risk(discard).await {
             Ok(paths) if paths.is_empty() => {}
-            Ok(paths) => return Some(Refusal(dirty(discard.command(), &paths))),
+            Ok(paths) => {
+                if !probe.conflict_in_progress(discard).await {
+                    return Some(Refusal(dirty(discard.command(), &paths)));
+                }
+                if !probe.resolves_conflict_side(discard).await {
+                    return Some(Refusal(dirty_during_merge(discard.command(), &paths)));
+                }
+            }
             Err(error) => {
                 return Some(Refusal(unverifiable(
                     discard.command(),
@@ -194,29 +236,70 @@ async fn settle_branch_changes(scan: &Scan, probe: &Probe<'_>) -> Option<Refusal
 /// can spell any git command, so any alias use is refused.
 async fn settle_aliases(scan: &Scan, probe: &Probe<'_>) -> Option<Refusal> {
     let first = scan.alias_candidates.first()?;
-    if scan.relocated {
-        return Some(Refusal(alias_unverifiable(
-            first,
-            "it changes directory or repository first (cd, env -C, git -C, --git-dir, --work-tree or GIT_DIR)",
-        )));
+    if let Some(message) = alias_precheck(scan) {
+        return Some(Refusal(message));
     }
-    if scan.config_source_overridden {
-        return Some(Refusal(alias_unverifiable(
-            first,
-            "the line points git at other configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG, GIT_CONFIG_NOSYSTEM, GIT_COMMON_DIR, HOME or XDG_CONFIG_HOME), which the alias check does not see",
-        )));
+    let mut probed: Vec<Option<&Vec<String>>> = Vec::new();
+    let mut exec_path: Option<Option<String>> = None;
+    for candidate in &scan.alias_candidates {
+        if !probed.contains(&candidate.directory.as_ref()) {
+            probed.push(candidate.directory.as_ref());
+            match probe.alias_names(candidate.directory.as_deref()).await {
+                Ok(aliases) => {
+                    if let Some(name) = scan
+                        .alias_candidates
+                        .iter()
+                        .filter(|other| other.directory == candidate.directory)
+                        .map(|other| &other.name)
+                        .find(|name| aliases.contains(&name.to_ascii_lowercase()))
+                    {
+                        return Some(Refusal(alias_in_use(name)));
+                    }
+                }
+                Err(error) => {
+                    return Some(Refusal(alias_unverifiable(
+                        &first.name,
+                        &format!("`git config` failed: {error}"),
+                    )));
+                }
+            }
+        }
+        if !candidate.read_only {
+            let directory = candidate.directory.as_deref().unwrap_or_default();
+            let target = probe
+                .stdout_if_success(&external_identity_args(directory))
+                .await;
+            let own = probe.stdout_if_success(&external_identity_args(&[])).await;
+            let worktrees = probe
+                .stdout_if_success(&external_worktrees_args(directory))
+                .await;
+            if let Some(message) = external_repository_verdict(
+                candidate,
+                target.as_deref(),
+                own.as_deref(),
+                worktrees.as_deref(),
+                probe.working_dir,
+                probe.sandbox_base,
+            ) {
+                return Some(Refusal(message));
+            }
+        }
+        if exec_path.is_none() {
+            exec_path = Some(
+                probe
+                    .stdout_if_success(&EXEC_PATH_ARGS.map(str::to_owned))
+                    .await,
+            );
+        }
+        if !exec_path
+            .as_ref()
+            .and_then(Option::as_deref)
+            .is_some_and(|path| ships_in_exec_path(path, &candidate.name))
+        {
+            return Some(Refusal(not_shipped(&candidate.name)));
+        }
     }
-    match probe.alias_names().await {
-        Ok(aliases) => scan
-            .alias_candidates
-            .iter()
-            .find(|name| aliases.contains(&name.to_ascii_lowercase()))
-            .map(|name| Refusal(alias_in_use(name))),
-        Err(error) => Some(Refusal(alias_unverifiable(
-            first,
-            &format!("`git config` failed: {error}"),
-        ))),
-    }
+    None
 }
 
 impl Probe<'_> {
@@ -232,14 +315,46 @@ impl Probe<'_> {
     }
 
     /// Lowercase names of every alias the configuration defines here.
-    async fn alias_names(&self) -> Result<Vec<String>, String> {
-        let args = ALIAS_PROBE_ARGS.map(str::to_owned);
+    async fn alias_names(&self, directory: Option<&[String]>) -> Result<Vec<String>, String> {
+        let args = alias_probe_args(directory);
         let output = self.capture(&args).await?;
         match output.status.code() {
             // Exit 1 is "no such key": no alias is defined.
             Some(0 | 1) => Ok(alias_names_from(&String::from_utf8_lossy(&output.stdout))),
             code => Err(failure(&output, code)),
         }
+    }
+
+    /// Stdout of a read-only probe that exited 0; `None` otherwise.
+    async fn stdout_if_success(&self, args: &[String]) -> Option<String> {
+        match self.capture(args).await {
+            Ok(output) if output.status.success() => {
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// A merge, cherry-pick or revert is in progress in the working directory
+    /// and `discard` rewrites tracked files (#156). A failed probe reads false.
+    async fn conflict_in_progress(&self, discard: &Discard) -> bool {
+        if !matches!(discard, Discard::Tracked { .. }) {
+            return false;
+        }
+        self.stdout_if_success(&conflict_state_args())
+            .await
+            .is_some_and(|stdout| conflict_in_progress_from(&stdout, self.working_dir))
+    }
+
+    /// `discard` only takes `--ours`/`--theirs` of paths that are all unmerged
+    /// index entries (#156); the caller checked that a merge is in progress.
+    async fn resolves_conflict_side(&self, discard: &Discard) -> bool {
+        let Some(args) = unmerged_args(discard) else {
+            return false;
+        };
+        self.stdout_if_success(&args)
+            .await
+            .is_some_and(|stdout| resolves_conflict_side(discard, true, &stdout))
     }
 
     /// Paths a discard would destroy, from `git status --porcelain` limited to
@@ -618,6 +733,9 @@ mod tests {
         let mut scan = Scan::default();
         scan_git(&git_words(line), &mut scan);
         scan.alias_candidates
+            .into_iter()
+            .map(|candidate| candidate.name)
+            .collect()
     }
 
     /// #2287: aliases are refused, never resolved.
@@ -1033,6 +1151,80 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    macro_rules! rsi_common_manifest_dir {
+        () => {
+            rsi_common::manifest_dir!()
+        };
+    }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    mod external_fixtures {
+        include!("custody_scan_fixtures.rs");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn external_commands_require_independent_scratch_and_exact_dispatch() {
+        let fixture = external_fixtures::ExternalFixture::new();
+        let cancel = CancellationToken::new();
+        let probe = Probe {
+            session_id: None,
+            invocation_id: None,
+            working_dir: &fixture.sandbox,
+            cancel: &cancel,
+            sandbox_base: &fixture.base,
+        };
+        for (label, command, reason) in &fixture.refused {
+            let message = check_shell(command, &probe)
+                .await
+                .expect(label)
+                .message()
+                .to_owned();
+            assert!(message.contains(reason.as_str()), "{label}: {message}");
+        }
+        if fixture.shipped_subtree() {
+            for command in fixture.allowed() {
+                assert!(check_shell(&command, &probe).await.is_none(), "{command}");
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn external_commands_canonicalize_symlinked_parents() {
+        let fixture = external_fixtures::ExternalFixture::new();
+        let cancel = CancellationToken::new();
+        let probe = Probe {
+            session_id: None,
+            invocation_id: None,
+            working_dir: &fixture.sandbox,
+            cancel: &cancel,
+            sandbox_base: &fixture.base,
+        };
+        let scratch_parent = fixture.symlink(fixture.root.path(), "scratch-parent");
+        let managed_parent = fixture.symlink(&fixture.base, "managed-parent");
+        let refused = format!(
+            "git -C {}/assigned subtree split --prefix=d -b escaped HEAD",
+            managed_parent.display()
+        );
+        let message = check_shell(&refused, &probe)
+            .await
+            .expect("managed symlink")
+            .message()
+            .to_owned();
+        assert!(
+            message.contains("independent scratch repository"),
+            "{message}"
+        );
+        if fixture.shipped_subtree() {
+            let allowed = format!(
+                "git -C {}/scratch subtree split --prefix=d -b desktop-only HEAD",
+                scratch_parent.display()
+            );
+            assert!(check_shell(&allowed, &probe).await.is_none(), "{allowed}");
+        }
+    }
+
     // The probe-backed tests below run real git in a throwaway repository.
 
     use super::test_support::{git, repo};
@@ -1044,6 +1236,7 @@ mod tests {
             invocation_id: None,
             working_dir: dir,
             cancel: &cancel,
+            sandbox_base: dir,
         };
         check_shell(command, &probe)
             .await
@@ -1085,6 +1278,58 @@ mod tests {
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
             "changed\n"
         );
+    }
+
+    /// #156: mid-merge, taking one side of an unmerged path passes; a dirty
+    /// path that is not unmerged keeps the refusal, which names that form.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn a_conflict_side_resolution_mid_merge_is_allowed_only_for_unmerged_paths() {
+        let repo = repo();
+        let dir = repo.path();
+        git(dir, &["branch", "other"]);
+        std::fs::write(dir.join("a.txt"), "ours\n").unwrap();
+        git(dir, &["commit", "-q", "-am", "ours"]);
+        git(dir, &["checkout", "-q", "other"]);
+        std::fs::write(dir.join("a.txt"), "theirs\n").unwrap();
+        git(dir, &["commit", "-q", "-am", "theirs"]);
+        git(dir, &["checkout", "-q", "main"]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", "-q", "other"])
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run git merge");
+        assert!(!merge.status.success(), "the merge must conflict");
+        std::fs::write(dir.join("b.txt"), "real work\n").unwrap();
+        for command in [
+            "git checkout --theirs -- a.txt",
+            "git checkout --ours -- a.txt",
+            "git restore --theirs a.txt",
+        ] {
+            assert_eq!(check(command, dir).await, None, "{command}");
+        }
+        let b = vec!["b.txt".to_owned()];
+        assert_eq!(
+            check("git checkout --theirs -- b.txt", dir).await,
+            Some(dirty_during_merge("git checkout", &b))
+        );
+        assert_eq!(
+            check("git checkout -- a.txt", dir).await,
+            Some(dirty_during_merge("git checkout", &["a.txt".to_owned()]))
+        );
+        let mut scan = Scan::default();
+        scan_git(&git_words("restore --theirs a.txt"), &mut scan);
+        let cancel = CancellationToken::new();
+        let probe = Probe {
+            session_id: None,
+            invocation_id: None,
+            working_dir: dir,
+            cancel: &cancel,
+            sandbox_base: dir,
+        };
+        assert!(settle(scan, &probe).await.is_none(), "the git tool argv");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -1181,7 +1426,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
-    async fn a_configured_alias_is_refused_but_built_ins_and_unknown_commands_are_not() {
+    async fn a_configured_alias_is_refused_and_external_commands_need_scratch_custody() {
         let repo = repo();
         let dir = repo.path();
         git(dir, &["config", "alias.sx", "!git stash"]);
@@ -1207,12 +1452,19 @@ mod tests {
                 "{command}: {message}"
             );
         }
+        for command in ["git lfs version", "git nosuchcommand"] {
+            let message = check(command, dir)
+                .await
+                .expect("external command needs scratch custody");
+            assert!(
+                message.contains("independent scratch repository"),
+                "{message}"
+            );
+        }
         for command in [
             "git status",
             "git log --oneline -1",
             "git config --get alias.sx",
-            "git lfs version",
-            "git nosuchcommand",
             "git checkout -- a.txt",
         ] {
             assert_eq!(check(command, dir).await, None, "{command}");
@@ -1306,14 +1558,19 @@ mod tests {
                 "{command}: {message}"
             );
         }
-        // A built-in cannot be shadowed by an alias, so it is unaffected, and a
-        // plain `git x` is judged by the configuration the probe reads.
+        let message = check("git x", dir)
+            .await
+            .expect("unproven external command");
+        assert!(
+            message.contains("independent scratch repository"),
+            "{message}"
+        );
+        // A built-in cannot be shadowed by an alias, so it is unaffected.
         for command in [
             format!("GIT_CONFIG_GLOBAL={file} git status"),
             "GIT_CONFIG_GLOBAL=/dev/null git log -1".to_owned(),
             format!("HOME={home} git diff"),
             format!("export GIT_CONFIG_GLOBAL={file}; git log -1"),
-            "git x".to_owned(),
         ] {
             assert_eq!(check(&command, dir).await, None, "{command}");
         }

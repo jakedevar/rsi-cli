@@ -224,11 +224,28 @@ pub fn agent_issue_error(
 pub fn agent_issue_invalid_request(
     validation: rsi_common::rpc::AgentIssueValidationV1,
 ) -> DaemonError {
+    invalid_request_with_next_action(false, validation)
+}
+
+/// `agent_issue_invalid_request` for `AgentListIssues`: its `next_action`
+/// names the field and the fix in the list verb's own words (kaizen #184).
+pub fn agent_issue_list_invalid_request(
+    validation: rsi_common::rpc::AgentIssueValidationV1,
+) -> DaemonError {
+    invalid_request_with_next_action(true, validation)
+}
+
+fn invalid_request_with_next_action(
+    list: bool,
+    validation: rsi_common::rpc::AgentIssueValidationV1,
+) -> DaemonError {
     let mut envelope = agent_issue_error_envelope(
         rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
         None,
         None,
     );
+    envelope.next_action =
+        rsi_common::rpc::agent_issue_invalid_request_next_action(list, &validation);
     envelope.validation = Some(validation);
     agent_issue_error_from_envelope(envelope)
 }
@@ -248,6 +265,33 @@ pub fn agent_issue_bound_field_not_allowed(
         field,
     });
     agent_issue_error_from_envelope(envelope)
+}
+
+/// #3595: the refusal for a published body whose added or changed
+/// `rsi-failure-signature` block does not parse. The diagnostic is the
+/// validator's own text, capped at [`FAILURE_SIGNATURE_DIAGNOSTIC_MAX`] bytes.
+pub fn agent_issue_invalid_failure_signature(diagnostic: &str) -> DaemonError {
+    let mut envelope = agent_issue_error_envelope(
+        rsi_common::rpc::AgentIssueErrorCodeV1::InvalidFailureSignature,
+        None,
+        None,
+    );
+    envelope.diagnostic = Some(cap_diagnostic(diagnostic));
+    agent_issue_error_from_envelope(envelope)
+}
+
+/// Longest `diagnostic` an `invalid_failure_signature` refusal carries.
+pub const FAILURE_SIGNATURE_DIAGNOSTIC_MAX: usize = 512;
+
+fn cap_diagnostic(text: &str) -> String {
+    if text.len() <= FAILURE_SIGNATURE_DIAGNOSTIC_MAX {
+        return text.to_string();
+    }
+    let mut end = FAILURE_SIGNATURE_DIAGNOSTIC_MAX;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
 }
 
 fn agent_issue_error_from_envelope(envelope: rsi_common::rpc::AgentIssueErrorV1) -> DaemonError {
@@ -299,12 +343,19 @@ pub fn agent_issue_error_envelope(
         AgentIssueErrorCodeV1::BoundIssueNotAppendOnly => {
             "send {handoff} alone (no body copy) instead; to append to body, re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text (#1750)"
         }
+        AgentIssueErrorCodeV1::InvalidFailureSignature => {
+            "fix the rsi-failure-signature block named in diagnostic (a JSON object with schema_version 1, test_id, matcher, issue, class regression|flake|env|seed) and resend the body; blocks you did not change are not checked (#3595)"
+        }
+        AgentIssueErrorCodeV1::BodyWouldDropTail => {
+            "the new body does not keep the end of the current body (a read cut short?); to add a note send {handoff} alone, or re-read the Issue with AgentGetIssue and resend the whole body, or set replace_body:true to replace it on purpose (#3052)"
+        }
     };
     AgentIssueErrorV1 {
         code,
         expected_row_version,
         actual_row_version,
         validation: None,
+        diagnostic: None,
         next_action: next_action.to_string(),
     }
 }
@@ -324,7 +375,25 @@ pub fn normalize_agent_issue_error(error: DaemonError) -> DaemonError {
             envelope.expected_row_version,
             envelope.actual_row_version,
         );
+        // An invalid_request's next_action is derived from its typed
+        // validation hint (static text); the supplied text is never kept, only
+        // matched against the two wordings the constructors produce.
+        if envelope.code == AgentIssueErrorCodeV1::InvalidRequest
+            && let Some(validation) = envelope.validation.as_ref()
+        {
+            let generic =
+                rsi_common::rpc::agent_issue_invalid_request_next_action(false, validation);
+            let list = rsi_common::rpc::agent_issue_invalid_request_next_action(true, validation);
+            normalized.next_action = if envelope.next_action == list {
+                list
+            } else {
+                generic
+            };
+        }
         normalized.validation = envelope.validation;
+        if envelope.code == AgentIssueErrorCodeV1::InvalidFailureSignature {
+            normalized.diagnostic = envelope.diagnostic.as_deref().map(cap_diagnostic);
+        }
         return agent_issue_error_from_envelope(normalized);
     }
     let code = match error {
@@ -418,6 +487,7 @@ mod agent_issue_error_tests {
             expected_row_version: Some(4),
             actual_row_version: Some(5),
             validation: Some(validation.clone()),
+            diagnostic: None,
             next_action: "untrusted internal detail /tmp/private".to_string(),
         };
 
@@ -442,7 +512,10 @@ mod agent_issue_error_tests {
         assert_eq!(envelope.expected_row_version, Some(4));
         assert_eq!(envelope.actual_row_version, Some(5));
         assert_eq!(envelope.validation, Some(validation));
-        assert_eq!(envelope.next_action, "correct the request fields and retry");
+        assert_eq!(
+            envelope.next_action,
+            "params.issue_id: required; add it and retry"
+        );
         assert!(!data.to_string().contains("/tmp/private"));
         assert!(!data.to_string().contains("untrusted internal detail"));
     }

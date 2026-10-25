@@ -124,6 +124,41 @@ pub fn handle_list_nav_key(
     }
 }
 
+/// List navigation for a picker whose list is filtered by typing.
+///
+/// Every printable key belongs to the filter, so this handles only
+/// non-printable navigation: Down/Up, Ctrl-J/Ctrl-K and Home/End. Use it
+/// instead of [`handle_list_nav_key`] in any overlay with a type-to-filter
+/// field, in both editing modes. Returns `true` if the key was consumed.
+pub fn handle_filter_list_nav_key(
+    selected: &mut usize,
+    len: usize,
+    key: &crossterm::event::KeyEvent,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl_only = key.modifiers == KeyModifiers::CONTROL;
+    match key.code {
+        KeyCode::Down => step_down(selected, len),
+        KeyCode::Up => step_up(selected),
+        KeyCode::Char('j' | 'J') if ctrl_only => step_down(selected, len),
+        KeyCode::Char('k' | 'K') if ctrl_only => step_up(selected),
+        KeyCode::Home => *selected = 0,
+        KeyCode::End => *selected = len.saturating_sub(1),
+        _ => return false,
+    }
+    true
+}
+
+fn step_down(selected: &mut usize, len: usize) {
+    if *selected + 1 < len {
+        *selected += 1;
+    }
+}
+
+fn step_up(selected: &mut usize) {
+    *selected = selected.saturating_sub(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +258,46 @@ mod tests {
             len,
             &make_key(KeyCode::Enter)
         ));
+    }
+
+    #[test]
+    fn test_filter_list_nav_ignores_printable_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let plain = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        let mut sel = 1usize;
+        for c in ['j', 'k', 'g', 'G'] {
+            assert!(!handle_filter_list_nav_key(
+                &mut sel,
+                5,
+                &plain(KeyCode::Char(c))
+            ));
+            assert_eq!(sel, 1, "printable {c} must not move the selection");
+        }
+        assert!(handle_filter_list_nav_key(
+            &mut sel,
+            5,
+            &plain(KeyCode::Down)
+        ));
+        assert_eq!(sel, 2);
+        assert!(handle_filter_list_nav_key(&mut sel, 5, &ctrl('j')));
+        assert_eq!(sel, 3);
+        assert!(handle_filter_list_nav_key(&mut sel, 5, &ctrl('k')));
+        assert_eq!(sel, 2);
+        assert!(handle_filter_list_nav_key(&mut sel, 5, &plain(KeyCode::Up)));
+        assert_eq!(sel, 1);
+        assert!(handle_filter_list_nav_key(
+            &mut sel,
+            5,
+            &plain(KeyCode::End)
+        ));
+        assert_eq!(sel, 4);
+        assert!(handle_filter_list_nav_key(
+            &mut sel,
+            5,
+            &plain(KeyCode::Home)
+        ));
+        assert_eq!(sel, 0);
     }
 }

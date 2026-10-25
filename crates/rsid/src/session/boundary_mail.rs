@@ -68,7 +68,7 @@ use rsi_common::agent_coordination::{
     BoundaryProviderKindV1, MessageAttemptFenceV1,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -226,7 +226,7 @@ fn sender_role_label(store: &Store, owner_session_id: Uuid) -> String {
 /// `.await` that leaves the daemon. A refused or failed claim leaves the
 /// message queued (it is delivered at the next boundary or as the next turn).
 pub(crate) async fn claim_boundary_mail(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     arbiter: &Arc<AgentMessageArbiter>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     pending: &PendingBoundaryDeliveries,
@@ -286,7 +286,7 @@ pub(crate) async fn claim_boundary_mail(
 /// the turn-end dispatch. One operator message per claim: the open row blocks a
 /// second claim until it settles, and the next boundary picks the next one up.
 async fn claim_operator_queue(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     out: &mut Vec<BoundaryMail>,
 ) -> Result<()> {
@@ -350,8 +350,13 @@ pub(crate) struct OperatorTranscriptInbox {
     pending: std::sync::Mutex<Vec<Uuid>>,
     /// #2766: provider lifecycle-hook rows waiting for a sequence from the
     /// monitor (`provider_lifecycle_events.rs`).
-    lifecycle: std::sync::Mutex<Vec<rsi_common::types::ConversationEvent>>,
+    lifecycle: std::sync::Mutex<Vec<LifecycleTranscriptRow>>,
     wake: tokio::sync::Notify,
+}
+
+pub(crate) struct LifecycleTranscriptRow {
+    pub(crate) event: rsi_common::types::ConversationEvent,
+    pub(crate) receipt: Option<tokio::sync::oneshot::Sender<bool>>,
 }
 
 impl OperatorTranscriptInbox {
@@ -368,11 +373,32 @@ impl OperatorTranscriptInbox {
         self.lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(row);
+            .push(LifecycleTranscriptRow {
+                event: row,
+                receipt: None,
+            });
         self.wake.notify_one();
     }
 
-    fn take_lifecycle(&self) -> Vec<rsi_common::types::ConversationEvent> {
+    /// Awaitable persistence without handing sequence ownership to a second
+    /// writer. Notifies the existing monitor only; never starts a model turn.
+    pub(crate) fn push_lifecycle_with_receipt(
+        &self,
+        row: rsi_common::types::ConversationEvent,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(LifecycleTranscriptRow {
+                event: row,
+                receipt: Some(sender),
+            });
+        self.wake.notify_one();
+        receiver
+    }
+
+    fn take_lifecycle(&self) -> Vec<LifecycleTranscriptRow> {
         std::mem::take(
             &mut *self
                 .lifecycle
@@ -399,7 +425,7 @@ impl OperatorTranscriptInbox {
 /// live monitor to write its transcript event and settle `delivered`; with no
 /// live monitor there is no racing writer, so write and settle here.
 pub(crate) async fn finalize_operator_boundary_delivery(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     message_ids: &[Uuid],
@@ -440,7 +466,7 @@ pub(crate) async fn finalize_operator_boundary_delivery(
 /// The reply could not be written: the hook may or may not have seen the text,
 /// so the rows become `uncertain` (#945) rather than staying open forever.
 pub(crate) async fn abandon_operator_boundary_delivery(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     message_ids: &[Uuid],
 ) {
     for &message_id in message_ids {
@@ -459,7 +485,7 @@ pub(crate) async fn abandon_operator_boundary_delivery(
 /// recorded keeps its sequence number free and stays `effect_possible`.
 pub(crate) async fn drain_operator_transcript_inbox(
     inbox: &OperatorTranscriptInbox,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     session_id: Uuid,
@@ -603,7 +629,7 @@ pub(crate) async fn confirm_boundary_mail(
 /// provider conversation: the hook's provider session id equals the one rsid
 /// recorded for the session, and the path is an absolute `.jsonl` file named
 /// for it (`<id>.jsonl` for Claude, `rollout-...-<id>.jsonl` for Codex).
-fn verified_transcript_path(
+pub(super) fn verified_transcript_path(
     recorded: Option<&str>,
     claimed: Option<&str>,
     path: Option<&str>,
@@ -621,7 +647,10 @@ fn verified_transcript_path(
 
 /// Read the complete transcript lines after `cursor`; returns the lines and
 /// the cursor past the last complete one.
-fn read_transcript_tail(path: &std::path::Path, cursor: u64) -> Option<(Vec<String>, u64)> {
+pub(super) fn read_transcript_tail(
+    path: &std::path::Path,
+    cursor: u64,
+) -> Option<(Vec<String>, u64)> {
     use std::io::{Read as _, Seek as _};
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -649,7 +678,7 @@ fn read_transcript_tail(path: &std::path::Path, cursor: u64) -> Option<(Vec<Stri
 /// cannot be persisted the delivery stays pending, so the deadline settles it
 /// `uncertain`. Deliveries with no evidence are left for that settlement.
 pub(crate) async fn await_boundary_mail_evidence(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     pending: &PendingBoundaryDeliveries,
     message_ids: &[Uuid],
     deadline: tokio::time::Instant,
@@ -720,7 +749,7 @@ pub(crate) async fn await_boundary_mail_evidence(
 /// (#1183): each still-pending one becomes `uncertain`. Called when the reply
 /// could not be written and when [`BOUNDARY_MAIL_CONFIRM_DEADLINE`] passes.
 pub(crate) async fn settle_unconfirmed_boundary_mail(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     pending: &PendingBoundaryDeliveries,
     message_ids: &[Uuid],
 ) {
@@ -751,7 +780,7 @@ pub(crate) async fn settle_unconfirmed_boundary_mail(
 }
 
 async fn claim_one(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     pending: &PendingBoundaryDeliveries,
     session_id: Uuid,
     grant: Box<ArbitrationGrant>,
@@ -837,7 +866,7 @@ async fn claim_one(
 }
 
 async fn record(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     fence: &MessageAttemptFenceV1,
     authority_id: Uuid,
     classification: BoundaryClassificationV1,
@@ -887,7 +916,7 @@ mod tests {
     use rsi_common::types::{SessionKind, SessionProvider, SessionStatus};
 
     struct Fixture {
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         arbiter: Arc<AgentMessageArbiter>,
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         pending: PendingBoundaryDeliveries,
@@ -965,7 +994,7 @@ mod tests {
         tracked_row.session.claude_session_id = Some(THREAD.to_string());
         map.insert(target, tracked_row);
         Fixture {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             arbiter: Arc::new(AgentMessageArbiter::new()),
             active: Arc::new(RwLock::new(map)),
             pending: PendingBoundaryDeliveries::default(),

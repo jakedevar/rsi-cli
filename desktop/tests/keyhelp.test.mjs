@@ -16,8 +16,10 @@ test('All Commands lists every TUI key and command with the desktop answer', () 
   const t = rows.find((r) => r.keys[0] === 'T');
   assert.equal(t.bound, true);
   assert.match(t.detail, /Desktop: Choose theme…\./);
-  // Every TUI Normal-mode key is in the desktop; the last, <Space>gP, since local #88.
-  assert.ok(rows.filter((r) => r.section === 'Normal-mode keys').every((r) => r.bound));
+  // Every TUI Normal-mode key is in the desktop except the declared parity gap <Space>hu (#3568, owner #3636,
+  // parity-status.d/lifecycle.json); binding it must drop it from this list.
+  const unboundKeys = rows.filter((r) => r.section === 'Normal-mode keys' && !r.bound).map((r) => r.keys[0]);
+  assert.deepEqual(unboundKeys, ['<Space>hu']);
   const gp = rows.find((r) => r.keys[0] === '<Space>gP');
   assert.equal(gp.bound, true);
   assert.match(gp.detail, /Desktop: Prompt creator\.$/);
@@ -30,8 +32,8 @@ test('Contextual lists only what can run now, by menu, with keys', () => {
   const idle = contextualRows(snap({ open: null, cursorOnRow: false, rowCount: 0 }), 'other');
   const running = contextualRows(snap(), 'other');
   const titles = (rows) => rows.map((r) => r.title);
-  assert.ok(titles(running).includes('Interrupt (soft pause)'));
-  assert.ok(!titles(idle).includes('Interrupt (soft pause)'));
+  assert.ok(titles(running).includes('Stop this turn'));
+  assert.ok(!titles(idle).includes('Stop this turn'));
   const settings = running.find((r) => r.title === 'Settings…');
   assert.equal(settings.section, 'View');
   assert.ok(settings.keys.includes('<Space>,'));
@@ -82,4 +84,38 @@ test('help keys: scroll, views, search, Esc clears then closes', () => {
   assert.equal(step({ key: 'Escape' }).kind, 'close');
   assert.equal(helpKey(INITIAL_HELP, { key: 'q' }, 5).kind, 'close');
   assert.equal(helpKey(INITIAL_HELP, { key: '?' }, 5).kind, 'close');
+});
+
+// ---------- Vim keys off (local #227) ----------
+
+test('plainRows drops Vim-only rows and keys with the switch off and changes nothing with it on', async () => {
+  const { plainRows, helpFooter, initialHelp, gettingStartedRows } = await import('../dist/keyhelp-model.js');
+  const all = allRows();
+  assert.deepEqual(plainRows(all, true), all);
+  const off = plainRows(all, false);
+  assert.ok(off.length < all.length);
+  assert.ok(!off.some((r) => r.section === 'Normal-mode keys' && r.keys.some((k) => /^[a-z]$/.test(k))), 'no single-letter key row');
+  for (const r of off) for (const k of r.keys) assert.ok(/^(?:Ctrl|Alt|Shift|Cmd|Option)-|^F\d|^(?:Enter|Esc|Tab|Up|Down|Left|Right|PageUp|PageDown|Home|End)$/.test(k), `${r.title}: ${k}`);
+  assert.ok(off.some((r) => r.keys.includes('Ctrl-K')) || off.some((r) => r.keys.some((k) => k.startsWith('Ctrl-'))), 'chords stay');
+  // Contextual keeps its actions (they are in Actions… too), minus the keys that do nothing.
+  const ctx = contextualRows(snap({ vimKeys: false }), 'other');
+  const kept = plainRows(ctx, false, true);
+  assert.equal(kept.length, ctx.length);
+  assert.deepEqual(kept.find((r) => r.title === 'Next session').keys, []);
+  assert.deepEqual(plainRows(gettingStartedRows('other'), false, true).map((r) => r.title), gettingStartedRows('other').map((r) => r.title));
+  // The footer follows the switch and the platform.
+  assert.match(helpFooter(true, 'other'), /j\/k scroll/);
+  assert.doesNotMatch(helpFooter(false, 'other'), /j\/k|g\/G|q closes|\/ search|s symbols/);
+  assert.match(helpFooter(false, 'mac'), /Cmd-K opens Actions…/);
+  assert.match(helpFooter(false, 'other'), /Ctrl-K opens Actions…/);
+  // Getting started opens first with Vim keys off or the first time.
+  assert.equal(initialHelp(false, true).view, 'start');
+  assert.equal(initialHelp(true, false).view, 'start');
+  assert.equal(initialHelp(true, true).view, 'contextual');
+});
+
+test('Contextual rows carry the palette words, so "help" finds Keyboard shortcuts', () => {
+  const rows = contextualRows(snap({ vimKeys: false }), 'other');
+  assert.ok(filterRows(rows, 'help').some((r) => r.title === 'Keyboard shortcuts'));
+  assert.ok(!contextualRows(snap({ vimKeys: false }), 'other').some((r) => r.keys.includes('j')));
 });

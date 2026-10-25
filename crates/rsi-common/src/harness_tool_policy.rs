@@ -9,11 +9,53 @@
 
 use crate::egress_policy::EgressMode;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const WEB_SEARCH_TOOL: &str = "web_search";
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
+/// #3177: the closed tool surface of a benchmark session: the three tools that
+/// run in the task container, `read_output`, and the plan, context and
+/// compaction tools. Nothing else is advertised or runnable.
+pub const BENCH_ENABLED_TOOLS: [&str; 7] = [
+    "shell",
+    "exec_command",
+    "write_stdin",
+    "read_output",
+    "update_plan",
+    "context_status",
+    "compact",
+];
+/// #3173: the command tools whose output spill threshold a policy may set. The
+/// others either read content the model asked for verbatim or bound themselves.
+pub const SPILL_COMMAND_TOOLS: [&str; 4] = ["shell", "exec_command", "write_stdin", "git"];
+/// Range of an `output_spill` `max_bytes` (the stub itself is under 2 KiB, and
+/// the tool output hard cap is 1 MiB). Out of range is refused, never clamped.
+pub const OUTPUT_SPILL_MIN_BYTES: u64 = 2 * 1024;
+pub const OUTPUT_SPILL_MAX_BYTES: u64 = 1024 * 1024;
+/// Range of an `output_spill` `max_lines`.
+pub const OUTPUT_SPILL_MIN_LINES: u32 = 10;
+pub const OUTPUT_SPILL_MAX_LINES: u32 = 100_000;
 pub const TOOL_POLICY_MAX_NAMES: usize = 128;
 pub const TOOL_POLICY_MAX_NAME_BYTES: usize = 64;
+
+/// Substrings (uppercase) that make an environment variable name look like a
+/// credential (#3169). Such a name never reaches a `shell` or `exec_command`
+/// launch, whatever the policy allowlists.
+pub const ENV_CREDENTIAL_MARKERS: [&str; 6] =
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL"];
+/// Prefix of the daemon's own variables (`RSI_SESSION_TOKEN`, ...); never passed.
+pub const ENV_DAEMON_PREFIX: &str = "RSI_";
+
+/// Whether `name` is an environment variable the Harness must never hand to a
+/// command: it looks like a credential or is one of the daemon's own.
+#[must_use]
+pub fn env_name_is_withheld(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with(ENV_DAEMON_PREFIX)
+        || ENV_CREDENTIAL_MARKERS
+            .iter()
+            .any(|marker| upper.contains(marker))
+}
 /// Estimated cost of one provider-hosted web search: providers bill searches
 /// at about 10 USD per 1000 calls. Fetches add only token cost, which the
 /// model-call ledger already meters.
@@ -159,6 +201,31 @@ impl CliAccessMode {
     }
 }
 
+/// Where the Harness file tools (`read_file`, `write_file`, `file_edit`) may
+/// reach (#3172). Operator-only, like the rest of the policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePathScope {
+    /// Contained to the session working directory: an absolute path works only
+    /// when it lies inside it. The default, and what every RSI sandbox gets.
+    #[default]
+    WorkingDir,
+    /// Any absolute path of the task environment. For a disposable task
+    /// container (a benchmark session) whose filesystem is the whole sandbox;
+    /// never set it for a session that runs on the host.
+    TaskEnvironment,
+}
+
+impl FilePathScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkingDir => "working_dir",
+            Self::TaskEnvironment => "task_environment",
+        }
+    }
+}
+
 /// Ordered from most to least restrictive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,6 +342,46 @@ impl ToolBudgets {
     }
 }
 
+/// #3173: when a command tool's output is replaced by a spill stub. A `None`
+/// field keeps the default (`rsi_common::spill::DEFAULT_MAX_BYTES` /
+/// `DEFAULT_MAX_LINES`, or the daemon's `RSI_SPILL_*` environment).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSpill {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<u32>,
+}
+
+impl OutputSpill {
+    /// Sets nothing, so the default threshold stays.
+    #[must_use]
+    pub const fn is_unset(&self) -> bool {
+        self.max_bytes.is_none() && self.max_lines.is_none()
+    }
+
+    /// # Errors
+    /// A message naming the field that is outside its range.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(bytes) = self.max_bytes
+            && !(OUTPUT_SPILL_MIN_BYTES..=OUTPUT_SPILL_MAX_BYTES).contains(&bytes)
+        {
+            return Err(format!(
+                "max_bytes {bytes} is outside {OUTPUT_SPILL_MIN_BYTES}..={OUTPUT_SPILL_MAX_BYTES}"
+            ));
+        }
+        if let Some(lines) = self.max_lines
+            && !(OUTPUT_SPILL_MIN_LINES..=OUTPUT_SPILL_MAX_LINES).contains(&lines)
+        {
+            return Err(format!(
+                "max_lines {lines} is outside {OUTPUT_SPILL_MIN_LINES}..={OUTPUT_SPILL_MAX_LINES}"
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessToolPolicy {
@@ -304,9 +411,30 @@ pub struct HarnessToolPolicy {
     /// refuses it. `None` keeps today's argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_access: Option<CliAccessMode>,
+    /// Reach of the file tools (#3172). `None` is [`FilePathScope::WorkingDir`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_paths: Option<FilePathScope>,
+    /// Extra environment variable names a host `shell` / `exec_command` launch
+    /// passes through from the daemon's environment, on top of the fixed
+    /// allowlist (#3169). Names that look like credentials (`KEY`, `TOKEN`,
+    /// `SECRET`, `PASSWORD`) and the daemon's `RSI_*` variables are refused at
+    /// validation and again at launch. A container target runs with the
+    /// container's own environment, so this does not apply there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_passthrough: Vec<String>,
+    /// Spill thresholds for the command tools, by tool name (#3173): one of
+    /// [`SPILL_COMMAND_TOOLS`]. A tool with no entry keeps the default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub output_spill: BTreeMap<String, OutputSpill>,
 }
 
 impl HarnessToolPolicy {
+    /// The effective reach of the file tools.
+    #[must_use]
+    pub fn file_path_scope(&self) -> FilePathScope {
+        self.file_paths.unwrap_or_default()
+    }
+
     /// The first Harness-only field this policy sets, or `None` when a Claude
     /// or Codex CLI can enforce all of it (only `cli_access` is set).
     #[must_use]
@@ -323,6 +451,12 @@ impl HarnessToolPolicy {
             Some("context_editing")
         } else if !self.budgets.is_unlimited() {
             Some("budgets")
+        } else if self.file_paths.is_some() {
+            Some("file_paths")
+        } else if !self.env_passthrough.is_empty() {
+            Some("env_passthrough")
+        } else if !self.output_spill.is_empty() {
+            Some("output_spill")
         } else {
             None
         }
@@ -346,7 +480,33 @@ impl HarnessToolPolicy {
         {
             return Err(TOOL_POLICY_INVALID);
         }
+        let valid_env_name = |name: &String| {
+            !name.is_empty()
+                && name.len() <= TOOL_POLICY_MAX_NAME_BYTES
+                && !name.bytes().next().is_some_and(|b| b.is_ascii_digit())
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !env_name_is_withheld(name)
+        };
+        if self.env_passthrough.len() > TOOL_POLICY_MAX_NAMES
+            || !self.env_passthrough.iter().all(valid_env_name)
+        {
+            return Err(TOOL_POLICY_INVALID);
+        }
+        if self.output_spill.iter().any(|(tool, spill)| {
+            !SPILL_COMMAND_TOOLS.contains(&tool.as_str()) || spill.validate().is_err()
+        }) {
+            return Err(TOOL_POLICY_INVALID);
+        }
         Ok(())
+    }
+
+    /// The spill threshold this policy sets for `tool`, if any (#3173).
+    #[must_use]
+    pub fn output_spill_for(&self, tool: &str) -> Option<OutputSpill> {
+        self.output_spill
+            .get(tool)
+            .copied()
+            .filter(|spill| !spill.is_unset())
     }
 
     /// Fill every field this policy leaves unspecified from `defaults`; deny
@@ -370,6 +530,40 @@ impl HarnessToolPolicy {
             context_editing: self.context_editing.or(defaults.context_editing),
             budgets: self.budgets.or(defaults.budgets),
             cli_access: self.cli_access.or(defaults.cli_access),
+            file_paths: self.file_paths.or(defaults.file_paths),
+            env_passthrough: {
+                let mut names = self.env_passthrough.clone();
+                for name in &defaults.env_passthrough {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+                names
+            },
+            output_spill: {
+                let mut spill = defaults.output_spill.clone();
+                spill.extend(self.output_spill.iter().map(|(k, v)| (k.clone(), *v)));
+                spill
+            },
+        }
+    }
+
+    /// #3177: the bench preset: [`BENCH_ENABLED_TOOLS`] only and no web access.
+    /// An allowlist is enforced both when the catalog is built and again at
+    /// execution, so an MCP bridge tool, `web_search`, `web_fetch`,
+    /// `memory_search`, an `rsi_control_*` tool, `schedule_wake` or a codegraph
+    /// tool is neither advertised nor runnable.
+    #[must_use]
+    pub fn bench() -> Self {
+        Self {
+            enabled_tools: Some(
+                BENCH_ENABLED_TOOLS
+                    .iter()
+                    .map(|n| (*n).to_string())
+                    .collect(),
+            ),
+            web_access: Some(WebAccessMode::Disabled),
+            ..Self::default()
         }
     }
 
@@ -385,6 +579,9 @@ impl HarnessToolPolicy {
             context_editing: None,
             budgets: ToolBudgets::default(),
             cli_access: None,
+            file_paths: None,
+            env_passthrough: Vec::new(),
+            output_spill: BTreeMap::new(),
         }
     }
 
@@ -417,6 +614,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_bench_preset_is_the_closed_container_tool_set_with_web_off() {
+        let policy = HarnessToolPolicy::bench();
+        assert_eq!(policy.validate(), Ok(()));
+        assert_eq!(policy.web_mode(), WebAccessMode::Disabled);
+        let enabled = policy.enabled_tools.expect("an allowlist");
+        assert_eq!(
+            enabled,
+            [
+                "shell",
+                "exec_command",
+                "write_stdin",
+                "read_output",
+                "update_plan",
+                "context_status",
+                "compact"
+            ]
+        );
+        assert!(policy_denies_nothing_extra(&HarnessToolPolicy::bench()));
+    }
+
+    fn policy_denies_nothing_extra(policy: &HarnessToolPolicy) -> bool {
+        policy.denied_tools.is_empty() && policy.cli_access.is_none()
+    }
+
+    #[test]
     fn modes_round_trip_and_order_by_restriction() {
         for mode in [
             WebAccessMode::Enabled,
@@ -428,6 +650,80 @@ mod tests {
         }
         assert!(WebAccessMode::Disabled < WebAccessMode::HostedOnly);
         assert!(WebAccessMode::HostedOnly < WebAccessMode::Enabled);
+    }
+
+    #[test]
+    fn file_path_scope_defaults_contained_and_layers_under_the_session() {
+        assert_eq!(
+            HarnessToolPolicy::default().file_path_scope(),
+            FilePathScope::WorkingDir
+        );
+        assert!(
+            HarnessToolPolicy::default()
+                .cli_unsupported_field()
+                .is_none()
+        );
+        let defaults = HarnessToolPolicy {
+            file_paths: Some(FilePathScope::TaskEnvironment),
+            ..HarnessToolPolicy::default()
+        };
+        assert_eq!(
+            HarnessToolPolicy::default()
+                .or_defaults(&defaults)
+                .file_path_scope(),
+            FilePathScope::TaskEnvironment
+        );
+        let explicit = HarnessToolPolicy {
+            file_paths: Some(FilePathScope::WorkingDir),
+            ..HarnessToolPolicy::default()
+        };
+        assert_eq!(
+            explicit.or_defaults(&defaults).file_path_scope(),
+            FilePathScope::WorkingDir
+        );
+        assert_eq!(explicit.cli_unsupported_field(), Some("file_paths"));
+        let json = serde_json::json!({"file_paths": "task_environment"});
+        let parsed: HarnessToolPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.file_path_scope(), FilePathScope::TaskEnvironment);
+    }
+
+    #[test]
+    fn env_passthrough_refuses_credential_names_and_layers_as_a_union() {
+        assert!(env_name_is_withheld("GITHUB_TOKEN"));
+        assert!(env_name_is_withheld("anthropic_api_key"));
+        assert!(env_name_is_withheld("DB_PASSWORD"));
+        assert!(env_name_is_withheld("CLIENT_SECRET"));
+        assert!(env_name_is_withheld("RSI_SESSION_TOKEN"));
+        assert!(!env_name_is_withheld("JAVA_HOME"));
+        assert!(!env_name_is_withheld("HTTPS_PROXY"));
+
+        let allowed = HarnessToolPolicy {
+            env_passthrough: vec!["JAVA_HOME".into(), "PYTHONPATH".into()],
+            ..HarnessToolPolicy::default()
+        };
+        assert_eq!(allowed.validate(), Ok(()));
+        assert_eq!(allowed.cli_unsupported_field(), Some("env_passthrough"));
+        for bad in ["MY_TOKEN", "9LIVES", "has space", "", "RSI_ANYTHING"] {
+            let policy = HarnessToolPolicy {
+                env_passthrough: vec![bad.into()],
+                ..HarnessToolPolicy::default()
+            };
+            assert_eq!(policy.validate(), Err(TOOL_POLICY_INVALID), "{bad}");
+        }
+        let defaults = HarnessToolPolicy {
+            env_passthrough: vec!["PYTHONPATH".into(), "CC".into()],
+            ..HarnessToolPolicy::default()
+        };
+        assert_eq!(
+            allowed.or_defaults(&defaults).env_passthrough,
+            ["JAVA_HOME", "PYTHONPATH", "CC"]
+        );
+        // An unset list is not serialised, so stored policy rows are unchanged.
+        assert!(
+            !serde_json::to_string(&HarnessToolPolicy::default())
+                .unwrap()
+                .contains("env_passthrough")
+        );
     }
 
     #[test]
@@ -637,5 +933,38 @@ mod tests {
             Some("tool_policy_unsupported_for_provider:claude:daemon_defaults")
         );
         assert_eq!(provider_policy_refusal(P::Harness, None), None);
+    }
+
+    #[test]
+    fn output_spill_is_per_command_tool_bounded_and_layered() {
+        let spill = |bytes| OutputSpill {
+            max_bytes: Some(bytes),
+            max_lines: None,
+        };
+        let mut policy = HarnessToolPolicy::default();
+        assert_eq!(policy.output_spill_for("shell"), None);
+        policy.output_spill.insert("shell".into(), spill(32 * 1024));
+        assert_eq!(policy.validate(), Ok(()));
+        assert_eq!(policy.output_spill_for("shell"), Some(spill(32 * 1024)));
+        assert_eq!(policy.cli_unsupported_field(), Some("output_spill"));
+        // The default policy serialises without the field.
+        let json = serde_json::to_string(&HarnessToolPolicy::default()).unwrap();
+        assert!(!json.contains("output_spill"));
+        // A file tool is not a command tool, and a value outside its range is refused.
+        let mut bad = HarnessToolPolicy::default();
+        bad.output_spill.insert("read_file".into(), spill(4096));
+        assert_eq!(bad.validate(), Err(TOOL_POLICY_INVALID));
+        for out in [spill(1024), spill(OUTPUT_SPILL_MAX_BYTES + 1)] {
+            let mut bad = HarnessToolPolicy::default();
+            bad.output_spill.insert("git".into(), out);
+            assert_eq!(bad.validate(), Err(TOOL_POLICY_INVALID));
+        }
+        // A session entry wins over the defaults; the rest fill in.
+        let mut defaults = HarnessToolPolicy::default();
+        defaults.output_spill.insert("shell".into(), spill(4096));
+        defaults.output_spill.insert("git".into(), spill(8192));
+        let layered = policy.or_defaults(&defaults);
+        assert_eq!(layered.output_spill_for("shell"), Some(spill(32 * 1024)));
+        assert_eq!(layered.output_spill_for("git"), Some(spill(8192)));
     }
 }

@@ -5,18 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RSI</title>
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="layout.css">
 </head>
 <body>
   <header class="topbar">
     <span class="brand">rsi</span>
     <span id="conn" class="conn conn-unknown" title="">connecting…</span>
     <span class="spacer"></span>
-    <label class="check" title="Drive the app with the TUI's vim keys while focus is not in a text field"><input id="vim-keys" type="checkbox" checked> Vim keys</label>
+    <label class="check" title="Vim keys on: single letters such as j, k and a act on the app while you are not typing in a text field, and hints show those keys. Off: use the buttons and menus; Enter, Esc and the Actions… palette still work."><input id="vim-keys" type="checkbox"> Vim keys</label>
     <button id="open-issues" class="btn" type="button" data-action="issues-open">Issues</button>
+    <button id="open-settings" class="btn" type="button" data-action="settings-open">Settings</button>
     <button id="open-palette" class="btn" type="button" data-action="palette">Actions…</button>
     <button id="new-session" class="btn primary" type="button" data-action="launch">New session</button>
+    <button id="open-help" class="btn icon-btn" type="button" data-action="help" aria-label="Keyboard shortcuts and help" title="Help and keyboard shortcuts">?</button>
   </header>
   <div id="boot-banner" class="boot-banner" role="alert" hidden></div>
+  <div id="daemon-banner" class="daemon-banner" role="status" aria-live="polite" hidden></div>
+  <div id="build-notice" class="build-notice" role="status" aria-live="polite" hidden></div>
+  <div id="ai-banner" class="ai-banner" role="status" aria-live="polite" hidden></div>
   <div class="layout">
     <aside class="sidebar">
       <div class="view-toggle" role="group" aria-label="Session view">
@@ -33,9 +39,9 @@
       <div class="filters">
         <select id="project-filter" aria-label="Project"><option value="">All projects</option></select>
         <input id="search" type="search" placeholder="Filter sessions…" aria-label="Filter sessions">
-        <label class="check"><input id="show-finished" type="checkbox"> Show completed</label>
+        <label class="check" title="Untick to hide sessions that have finished"><input id="show-finished" type="checkbox" checked> Show completed</label>
       </div>
-      <ul id="session-list" class="session-list" aria-label="Sessions"></ul>
+      <ul id="session-list" class="session-list" role="tree" tabindex="0" aria-label="Sessions"></ul>
     </aside>
     <main class="detail">
       <div id="empty" class="empty" aria-live="polite">Select a session.</div>
@@ -44,21 +50,34 @@
           <div class="head-main">
             <h1 id="s-title"></h1>
             <div id="s-meta" class="meta"></div>
+            <div id="s-secondary" class="meta meta-secondary"></div>
           </div>
           <div class="head-actions">
-            <button id="toggle-tools" class="btn" type="button" data-action="toggle-tools">Hide tools</button>
+            <button id="toggle-tools" class="btn" type="button" data-action="toggle-tools">Hide tool calls</button>
             <span id="pause-state" class="pause-state" hidden></span>
-            <button id="clear-pause" class="btn" type="button" hidden data-action="clear-pause">Clear pause</button>
-            <button id="interrupt" class="btn danger" type="button" data-action="soft-interrupt">Interrupt</button>
-            <button id="hard-pause" class="btn danger" type="button" data-action="hard-pause">Hard pause</button>
+            <button id="clear-pause" class="btn" type="button" hidden data-action="clear-pause">Resume</button>
+            <button id="interrupt" class="btn" type="button" data-action="soft-interrupt">Stop this turn</button>
+            <button id="hard-pause" class="btn danger" type="button" data-action="hard-pause">Pause until I resume</button>
+            <button id="restore" class="btn primary" type="button" hidden data-action="unarchive-session">Restore</button>
             <button id="archive" class="btn" type="button" data-action="archive">Archive</button>
           </div>
         </div>
         <div id="approval-banner" class="approval-banner" hidden></div>
-        <div id="events" class="events" aria-live="polite"></div>
+        <div id="next-waiting" class="next-waiting" role="status" hidden>
+          <span id="next-waiting-text"></span>
+          <button id="next-waiting-go" class="btn primary" type="button" hidden>Next waiting</button>
+        </div>
+        <div id="outcome-card" class="outcome-card" hidden></div>
+        <div id="events" class="events" role="log" aria-live="polite" aria-relevant="additions"></div>
+        <div class="jump-slot"><button id="jump-latest" class="btn primary jump-latest" type="button" hidden>Jump to latest</button></div>
         <form id="composer" class="composer">
-          <textarea id="message" rows="3" placeholder="Message this session (Ctrl+Enter to send)"></textarea>
-          <button class="btn primary" type="submit">Send</button>
+          <ul id="attach-tray" class="attach-tray" aria-label="Attached images" hidden></ul>
+          <textarea id="message" rows="3" placeholder="Message this session" aria-label="Message to this session"></textarea>
+          <div id="composer-actions" class="composer-actions">
+            <button id="attach-image" class="btn" type="button" title="Attach an image (you can also paste one, or drop image files onto the conversation)">Attach image</button>
+            <button class="btn primary" type="submit">Send</button>
+          </div>
+          <input id="attach-file" type="file" multiple hidden>
         </form>
       </section>
     </main>
@@ -79,16 +98,16 @@
     <button id="issues-retry" class="issues-retry" type="button" hidden></button>
     <div class="issues-body">
       <div class="issues-listpane">
-        <ul id="issues-list" class="issues-list" role="listbox" aria-label="Issues" tabindex="0"></ul>
+        <ul id="issues-list" class="issues-list focus-list" role="listbox" aria-label="Issues" tabindex="0"></ul>
         <div class="issues-pager">
           <button id="issues-page-prev" class="btn" type="button" data-action="issues-page-prev">← Previous page</button>
           <button id="issues-page-next" class="btn" type="button" data-action="issues-page-next">Next page →</button>
         </div>
       </div>
-      <div id="issues-inspector" class="issues-inspector" tabindex="-1" aria-label="Issue details"></div>
+      <div id="issues-inspector" class="issues-inspector focus-pane" tabindex="-1" aria-label="Issue details"></div>
     </div>
   </section>
-  <div id="toast" class="toast" hidden></div>
+  <div id="toast" class="toast" popover="manual" role="status" aria-live="polite" aria-atomic="true" hidden></div>
   <div id="keyhint" class="keyhint" hidden aria-live="polite"></div>
   <div id="cmdline" class="cmdline" hidden aria-live="polite"></div>
 
@@ -101,25 +120,31 @@
     <form id="issue-form" method="dialog" class="launch-form"></form>
   </dialog>
 
-  <dialog id="launch-dialog">
+  <dialog id="launch-dialog" aria-labelledby="launch-title">
     <form id="launch-form" method="dialog" class="launch-form">
-      <h2>New session</h2>
-      <label>Prompt<textarea name="query" rows="6" required></textarea></label>
+      <h2 id="launch-title">New session</h2>
+      <label>Prompt<textarea name="query" rows="6" required placeholder="Describe the task…"></textarea></label>
       <div class="row">
         <label>Provider<select name="provider"></select></label>
-        <label>Model<input name="model" placeholder="default"></label>
-        <label>Effort
+        <label title="Leave blank for the provider’s default, pick one from the list, or type any model id.">Model
+          <span class="model-field"><input name="model" placeholder="provider default"><button class="btn small" type="button" id="launch-model-pick" title="Pick from the models this provider offers">List…</button></span>
+        </label>
+        <label title="How hard the model thinks: higher is slower and costs more. Default follows Settings › Models.">Effort
           <select name="effort">
             <option value="">default</option>
             <option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option>
           </select>
         </label>
       </div>
+      <p class="launch-hint" id="launch-provider-hint"></p>
       <div class="row">
         <label>Project<select name="project_id"><option value="">none</option></select></label>
-        <label class="grow">Working dir<input name="working_dir" placeholder="project path"></label>
+        <label class="grow">Folder
+          <span class="folder-field"><input name="working_dir" placeholder="Blank: the project’s folder"><button class="btn small" type="button" id="launch-folder-pick" title="Pick a folder on this computer; you can still type or edit the path.">Choose…</button></span>
+        </label>
       </div>
       <div class="actions">
+        <button class="btn launch-more" type="button" id="launch-more" aria-expanded="false" aria-controls="launch-side" title="Show or hide more choices for this launch: model, effort, its own git worktree, a manager. Your prompt is kept.">More options</button>
         <button class="btn" type="button" id="launch-cancel">Cancel</button>
         <button class="btn primary" type="submit" value="launch">Launch</button>
       </div>

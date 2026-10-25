@@ -1635,33 +1635,13 @@ fn validate_closed_join(
             && sink.typed_delegation
             && boundary_matches + exclusion_matches == 0;
         if boundary_matches + exclusion_matches != 1 && !compiler_closed_delegation {
-            let hint = match sink.kind {
-                PrimitiveKind::CliSpawn => {
-                    "a new utility CliSpawn needs a NON_INVOCATIONS row with \
-                    AllowedExclusionOperation::UtilityCliSpawn"
-                }
-                PrimitiveKind::HttpPost => {
-                    "a new non-model HttpPost needs a NON_INVOCATIONS row with \
-                    AllowedExclusionOperation::NonModelHttpPost"
-                }
-                _ => "register the appropriate model execution boundary",
-            };
-            let table_hint = match sink.kind {
-                PrimitiveKind::CliSpawn | PrimitiveKind::HttpPost => {
-                    "regenerate the exclusion table in thoughts/shared/reference/model-invocation-registry.md \
-                     with `cargo run -p rsid --bin rsi-model-control-validate -- --print-exclusions`; "
-                }
-                _ => "",
-            };
+            let matches = boundary_matches + exclusion_matches;
+            let (hint, table_hint) = unmatched_sink_hints(sink.kind, matches);
             violations.push(format!(
                 "{}:{}: {:?} sink joins {} contracts, expected exactly one \
-                 ({hint} in crates/rsid-store/src/model_control/registry.rs; \
-                 {table_hint}see \"Model-control registry\" in \
+                 ({hint}; {table_hint}see \"Model-control registry\" in \
                  crates/rsid-store/AGENTS.md)",
-                sink.path,
-                sink.item,
-                sink.kind,
-                boundary_matches + exclusion_matches
+                sink.path, sink.item, sink.kind, matches
             ));
         }
     }
@@ -1683,6 +1663,63 @@ fn validate_closed_join(
                 contract.path, contract.item, contract.primitive_kind
             ));
         }
+    }
+}
+
+/// The registration hint for a sink that joins `matches` contracts instead of exactly one,
+/// and the generated-table hint that goes with it. Each primitive kind names the registry
+/// edit that can actually cover it (`exclusion_covers` and the boundary checks above).
+fn unmatched_sink_hints(kind: PrimitiveKind, matches: usize) -> (&'static str, &'static str) {
+    const EXCLUSION_TABLE: &str = "regenerate the exclusion table in \
+        thoughts/shared/reference/model-invocation-registry.md with \
+        `cargo run -p rsid --bin rsi-model-control-validate -- --print-exclusions`; ";
+    if matches > 1 {
+        return (
+            "remove the duplicate rows so exactly one EXECUTION_BOUNDARIES or NON_INVOCATIONS \
+             row names this path and item \
+             in crates/rsid-store/src/model_control/registry.rs",
+            "",
+        );
+    }
+    match kind {
+        PrimitiveKind::CliSpawn => (
+            "a new utility CliSpawn needs a NON_INVOCATIONS row with \
+             AllowedExclusionOperation::UtilityCliSpawn (a model CLI launch needs an \
+             EXECUTION_BOUNDARIES row instead) \
+             in crates/rsid-store/src/model_control/registry.rs",
+            EXCLUSION_TABLE,
+        ),
+        PrimitiveKind::HttpPost => (
+            "a new non-model HttpPost needs a NON_INVOCATIONS row with \
+             AllowedExclusionOperation::NonModelHttpPost \
+             in crates/rsid-store/src/model_control/registry.rs",
+            EXCLUSION_TABLE,
+        ),
+        PrimitiveKind::ProviderChat => (
+            "a provider chat/stream_chat call must pass the `execution` capability bound \
+             from an admitted request's `into_parts()`, or needs an EXECUTION_BOUNDARIES row \
+             with PrimitiveKind::ProviderChat \
+             in crates/rsid-store/src/model_control/registry.rs",
+            "",
+        ),
+        PrimitiveKind::AppServerModelRequest => (
+            "a send_codex_app_server call belongs in the registered \
+             send_admitted_app_server_request boundary, or needs an EXECUTION_BOUNDARIES row \
+             with PrimitiveKind::AppServerModelRequest \
+             in crates/rsid-store/src/model_control/registry.rs",
+            "",
+        ),
+        PrimitiveKind::RawHttpSend => (
+            "a detached request .send()/.execute() cannot be registered: build it with \
+             .post(...) or .get(...) in the same item, or send a model request through \
+             AdmittedHttpRequest::send",
+            "",
+        ),
+        PrimitiveKind::Unknown => (
+            "register the appropriate model execution boundary in \
+             crates/rsid-store/src/model_control/registry.rs",
+            "",
+        ),
     }
 }
 

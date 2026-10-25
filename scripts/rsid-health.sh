@@ -38,143 +38,23 @@ rsid_daemon_environment() {
     DAEMON_ENV_ARGS+=("--setenv=PATH=$(rsid_daemon_path)")
 }
 
+# shellcheck source=scripts/repo-guard-bin.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/repo-guard-bin.sh"
+
+# rsid_rpc_ready <rsi-rpc> <socket> [launcher-pid]: one GetHealthStatus probe, run
+# by `rsi-repo-guard rsid-health-probe` (#465; it was an inline script heredoc).
+# Exit 0 ready, 1 not ready, 2 the launcher or daemon exited, 3 the process that
+# answered exited right after replying.
 rsid_rpc_ready() {
-    python3 - "$1" "$2" "${3:-}" <<'PY'
-import json
-from datetime import datetime
-import socket
-import struct
-import subprocess
-import sys
-import time
-
-# Probe identity on the health connection. The reported PID names the daemon
-# using an inherited listener; Linux credentials additionally bind its reply
-# to the actual sender. Older daemons keep the kernel identity fallback.
-deadline = time.monotonic() + 2
-
-
-def remaining():
-    return max(0.001, deadline - time.monotonic())
-
-
-def process(pid):
-    probe = subprocess.run(
-        ["ps", "-o", "ppid=,stat=", "-p", str(pid)],
-        capture_output=True, text=True, timeout=remaining(),
-    )
-    fields = probe.stdout.split()
-    if probe.returncode or len(fields) != 2 or fields[1].startswith("Z"):
-        raise ProcessLookupError("launcher or daemon exited")
-    return int(fields[0])
-
-
-class ResponderExited(ProcessLookupError):
-    """The process that sent the health reply is gone (exit code 3)."""
-
-
-def responder_parent(pid):
-    try:
-        return process(pid)
-    except ProcessLookupError as exited:
-        raise ResponderExited("process that answered exited") from exited
-
-
-def in_launcher_tree(pid, launcher):
-    seen = set()
-    lookup = responder_parent  # only the first process is the one that answered
-    while pid > 1 and pid not in seen and time.monotonic() < deadline:
-        seen.add(pid)
-        parent = lookup(pid)
-        lookup = process
-        if pid == launcher:
-            return True
-        pid = parent
-    return False
-
-
-try:
-    launcher = int(sys.argv[3]) if sys.argv[3] else None
-    if launcher is not None:
-        if launcher <= 1:
-            raise ProcessLookupError("launcher PID missing")
-        process(launcher)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(remaining())
-            if sys.platform.startswith("linux"):
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
-            elif sys.platform != "darwin":
-                raise OSError("daemon identity probe unsupported on this platform")
-            conn.connect(sys.argv[2])
-            conn.sendall(b'{"jsonrpc":"2.0","id":1,"method":"GetHealthStatus","params":null}\n')
-            data = b""
-            senders = set()
-            while b"\n" not in data and len(data) < 1024 * 1024:
-                conn.settimeout(remaining())
-                if sys.platform.startswith("linux"):
-                    chunk, ancillary, flags, _ = conn.recvmsg(65536, socket.CMSG_SPACE(12))
-                    if flags & socket.MSG_CTRUNC:
-                        raise ValueError("truncated credentials")
-                    credentials = [struct.unpack("3i", value)[0]
-                                   for level, kind, value in ancillary
-                                   if level == socket.SOL_SOCKET and kind == socket.SCM_CREDENTIALS]
-                    if not credentials:
-                        raise ValueError("health reply has no sender credentials")
-                    senders.update(credentials)
-                else:
-                    chunk = conn.recv(65536)
-                if not chunk:
-                    raise ValueError("incomplete health reply")
-                data += chunk
-            if b"\n" not in data:
-                raise ValueError("oversized health reply")
-            reply = json.loads(data.split(b"\n", 1)[0])
-            result = reply.get("result") if isinstance(reply, dict) else None
-            pid = result.get("daemon_pid") if isinstance(result, dict) else None
-            started = result.get("daemon_started_at") if isinstance(result, dict) else None
-            if pid is not None or started is not None:
-                if type(pid) is not int or pid <= 1 or not isinstance(started, str):
-                    raise ValueError("invalid daemon identity")
-                if datetime.fromisoformat(started.replace("Z", "+00:00")).tzinfo is None:
-                    raise ValueError("daemon startup time has no timezone")
-                if sys.platform.startswith("linux") and senders != {pid}:
-                    raise ValueError("reported daemon PID differs from health sender")
-                senders = {pid}
-            elif sys.platform == "darwin":
-                # Legacy Darwin SOL_LOCAL=0 / LOCAL_PEERPID=2 fallback.
-                senders.add(conn.getsockopt(0, 2))
-            if len(senders) != 1 or not in_launcher_tree(senders.pop(), launcher):
-                raise ValueError("foreign daemon answered GetHealthStatus")
-        process(launcher)
-    else:
-        probe = subprocess.run(
-            [sys.argv[1], "--socket", sys.argv[2], "GetHealthStatus"],
-            capture_output=True, text=True, timeout=remaining(),
-        )
-        reply = json.loads(probe.stdout) if probe.returncode == 0 else None
-    result = reply.get("result") if isinstance(reply, dict) else None
-    ready = (
-        isinstance(reply, dict)
-        and reply.get("jsonrpc") == "2.0"
-        and reply.get("id") == 1
-        and reply.get("error") is None
-        and isinstance(result, dict)
-        and type(result.get("persistence_queue_capacity")) is int
-        and type(result.get("project_cache_size")) is int
-    )
-except ResponderExited:
-    sys.exit(3)
-except ProcessLookupError:
-    sys.exit(2)
-except (OSError, subprocess.TimeoutExpired, ValueError):
-    ready = False
-sys.exit(0 if ready else 1)
-PY
+    rsid_resolve_repo_guard "$1" rsid-health-probe || return 1
+    "$RSI_GUARD_BIN" rsid-health-probe "$1" "$2" "${3:-}"
 }
 
 wait_for_rsid_health() {
     local rpc="$1" socket="$2" limit="$3" unit="${4:-}" launcher="${5:-}"
     local started=$SECONDS next_progress=$SECONDS state="socket pending"
+    # No probe binary is a fixed failure, not something to retry for the whole limit.
+    rsid_resolve_repo_guard "$rpc" rsid-health-probe || return 1
     while ((SECONDS - started < limit)); do
         if [[ -n "$unit" ]]; then
             state="$(systemctl --user show "$unit" --property=ActiveState --value 2>/dev/null || echo unknown)"

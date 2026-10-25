@@ -24,6 +24,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 export const OUT_PATH = join(root, 'src', 'settings.generated.ts');
 
+export const SETTINGS_UPDATE_HINT = 'From the repository root, run `node desktop/scripts/settings.mjs` to regenerate desktop/src/settings.generated.ts. '
+  + 'Map new rows in `widgetFor` / `OVERLAY_ROW_IDS` in desktop/src/settings-model.ts; intentional TUI-only rows also need '
+  + '`TUI_ONLY` in desktop/tests/settings-state.test.mjs and `tuiOnlyRows` in desktop/parity-audit.json.';
+
 export function sourcePaths(repo = join(root, '..')) {
   const tui = join(repo, 'crates', 'rsi', 'src');
   return {
@@ -465,20 +469,28 @@ ${lines(textEditors)}
 }
 
 export function settingsIsFresh(paths = sourcePaths(), out = OUT_PATH) {
-  return readFileSync(out, 'utf8') === renderSettings(buildModel(paths));
+  const expected = renderSettings(buildModel(paths));
+  let current = '';
+  try { current = readFileSync(out, 'utf8'); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return current === expected;
+}
+
+export function checkSettings(paths = sourcePaths(), out = OUT_PATH) {
+  if (!settingsIsFresh(paths, out)) {
+    throw new Error(`desktop/src/settings.generated.ts is stale. ${SETTINGS_UPDATE_HINT}`);
+  }
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const text = renderSettings(buildModel());
   if (process.argv.includes('--check')) {
-    let cur = '';
-    try { cur = readFileSync(OUT_PATH, 'utf8'); } catch { /* missing */ }
-    if (cur !== text) {
-      console.error('src/settings.generated.ts is stale: run `node scripts/settings.mjs`');
+    try { checkSettings(); } catch (error) {
+      console.error(error.message);
       process.exit(1);
     }
   } else {
-    writeFileSync(OUT_PATH, text);
+    writeFileSync(OUT_PATH, renderSettings(buildModel()));
     console.log(`wrote ${OUT_PATH}`);
   }
 }

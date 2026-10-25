@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "guards": [
+    {
+      "package": "rsid-store",
+      "test": "store::portfolio_nodes::delegation_tests::a_manager_pass_costs_a_bounded_number_of_instructions_per_member_2494",
+      "modules": [
+        "store::manager_resources",
+        "model_control::cost",
+        "store::manager_intent"
+      ]
+    }
+  ]
+}

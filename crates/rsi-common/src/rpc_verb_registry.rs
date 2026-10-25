@@ -232,6 +232,36 @@ mod tests {
         }
     }
 
+    /// #3774: a native tool is only ever the face of an `Agent*` verb; no
+    /// operator-only method (delegable or never delegable) has one.
+    #[test]
+    fn native_tools_never_front_an_operator_only_method() {
+        for declaration in rpc_verb_declarations() {
+            if let Some(tool) = declaration.native_tool {
+                assert_eq!(declaration.audience, RpcVerbAudience::Agent, "{tool}");
+                assert!(declaration.method.starts_with("Agent"), "{tool}");
+            }
+        }
+        for method in DELEGABLE_OPERATOR_METHODS
+            .iter()
+            .chain(NEVER_DELEGABLE_OPERATOR_METHODS_V1)
+        {
+            let declared = rpc_verb_declarations()
+                .iter()
+                .find(|declaration| declaration.method == *method);
+            assert!(
+                declared.is_none_or(|declaration| declaration.native_tool.is_none()),
+                "{method} must have no native tool"
+            );
+        }
+        for descriptor in agent_control_catalog_v1() {
+            if let Some(native) = descriptor.native_tool {
+                assert_eq!(native.verb(), descriptor.verb, "{}", native.name());
+                assert!(native_tool_names().contains(&native.name()));
+            }
+        }
+    }
+
     #[test]
     fn agent_visible_declarations_carry_the_catalog_exposure() {
         for declaration in rpc_verb_declarations() {

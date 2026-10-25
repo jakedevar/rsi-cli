@@ -109,18 +109,36 @@ pub const PORTFOLIO_CAP_REDUCTION_CONFIRMATION_REQUIRED: &str =
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagerResourceCapsV1 {
     pub max_active_sessions: u16,
+    /// Sessions per `created_sessions_window_hours` (#3416).
     pub max_created_sessions: u16,
+    /// The rolling window `max_created_sessions` counts over, in hours.
+    #[serde(default = "default_created_sessions_window_hours")]
+    pub created_sessions_window_hours: u16,
     pub max_created_containers: u16,
     pub max_spend_usd: Option<f64>,
     pub provider_limits: Vec<crate::harness_manager_v2::ManagerProviderLimitV2>,
 }
 
+const fn default_created_sessions_window_hours() -> u16 {
+    crate::harness_manager_v2::DEFAULT_CREATED_SESSIONS_WINDOW_HOURS
+}
+
 impl ManagerResourceCapsV1 {
+    /// Whether `sessions` per `window_hours` is no faster than these caps
+    /// allow (#3416: a per-window number compares as a rate, so a shorter
+    /// window must carry a proportionally smaller number).
+    #[must_use]
+    pub fn admits_created_rate(&self, sessions: u16, window_hours: u16) -> bool {
+        u32::from(sessions) * u32::from(self.created_sessions_window_hours)
+            <= u32::from(self.max_created_sessions) * u32::from(window_hours)
+    }
+
     #[must_use]
     pub fn from_policy(policy: &ManagerPolicyV2) -> Self {
         Self {
             max_active_sessions: policy.max_active_sessions,
             max_created_sessions: policy.max_created_sessions,
+            created_sessions_window_hours: policy.created_sessions_window_hours,
             max_created_containers: policy.max_created_containers,
             max_spend_usd: policy.max_spend_usd,
             provider_limits: policy.provider_limits.clone(),
@@ -129,7 +147,14 @@ impl ManagerResourceCapsV1 {
 
     pub fn intersect(&mut self, policy: &ManagerPolicyV2) {
         self.max_active_sessions = self.max_active_sessions.min(policy.max_active_sessions);
-        self.max_created_sessions = self.max_created_sessions.min(policy.max_created_sessions);
+        // #3416: the slower of two per-window allowances binds.
+        if self.admits_created_rate(
+            policy.max_created_sessions,
+            policy.created_sessions_window_hours,
+        ) {
+            self.max_created_sessions = policy.max_created_sessions;
+            self.created_sessions_window_hours = policy.created_sessions_window_hours;
+        }
         self.max_created_containers = self
             .max_created_containers
             .min(policy.max_created_containers);
@@ -307,10 +332,13 @@ pub struct ConfigurePortfolioNodeRequestV1 {
     pub tier_label: String,
     pub seat_session_id: Uuid,
     pub project_ids: Vec<Uuid>,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub allowed_launches: Vec<ManagerLaunchChoiceV2>,
     /// The node's own in-project policy (`GlobalManagerGrantV1.project_policy`).
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub policy: ManagerPolicyV2,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub child_policy: Option<ManagerPolicyV2>,
     #[serde(default = "default_max_direct_reports")]
     pub max_direct_reports: u16,
@@ -328,8 +356,10 @@ pub struct ConfigurePortfolioNodeRequestV1 {
 pub struct ConfigurePortfolioNodeLaunchesRequestV1 {
     pub node_id: Uuid,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub add: Vec<ManagerLaunchChoiceV2>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub remove: Vec<ManagerLaunchChoiceV2>,
     pub expected_node_grant_version: i64,
     pub idempotency_key: String,
@@ -851,6 +881,21 @@ mod tests {
     fn configure_rejects_unknown_fields() {
         let mut value = serde_json::to_value(request()).unwrap();
         value["caller"] = serde_json::json!(Uuid::new_v4());
+        assert!(serde_json::from_value::<ConfigurePortfolioNodeRequestV1>(value).is_err());
+    }
+
+    #[test]
+    fn portfolio_policy_writes_reject_additive_read_fields() {
+        let baseline = serde_json::to_value(request()).unwrap();
+        for field in ["policy", "child_policy"] {
+            let mut value = baseline.clone();
+            value[field] = serde_json::json!({"future_policy_field": true});
+            let error =
+                serde_json::from_value::<ConfigurePortfolioNodeRequestV1>(value).unwrap_err();
+            assert!(error.to_string().contains("future_policy_field"), "{error}");
+        }
+        let mut value = baseline;
+        value["allowed_launches"][0]["future_launch_field"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ConfigurePortfolioNodeRequestV1>(value).is_err());
     }
 

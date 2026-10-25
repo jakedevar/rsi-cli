@@ -94,9 +94,9 @@ const STATE_FILE: &str = "state.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const TEST_TARGET: &str = "test-target";
 const CHECK_TARGET: &str = "check-target";
-/// The desktop lane's Tauri Cargo target (hub #3023): slot-owned like the other
-/// two, with the candidate's own crates trimmed after every lane run.
-const DESKTOP_TARGET: &str = "desktop-target";
+/// The directory the removed desktop lane (hub #3023, #3453) used to build into.
+/// No longer slot-owned; a slot that still holds one has it removed at bind.
+const LEGACY_DESKTOP_TARGET: &str = "desktop-target";
 const SOURCE: &str = "source";
 
 /// Whether gates use warm targets at all. On by default: the delta soundness
@@ -264,8 +264,6 @@ pub struct WarmSlot {
     /// The tree stamped by the last [`WarmSlot::bind`], written by
     /// [`WarmSlot::commit`].
     pending: Option<Manifest>,
-    /// What the last [`WarmSlot::bind`] found, for the desktop target's evidence.
-    bound: Option<SlotState>,
     /// The slot directory opened once at acquisition with
     /// `O_DIRECTORY | O_NOFOLLOW`. Trim and reset act through this descriptor,
     /// never through `dir`'s pathname, so a slot directory renamed away and
@@ -311,7 +309,6 @@ impl WarmSlot {
                 dir,
                 max_bytes: MAX_SLOT_BYTES,
                 pending: None,
-                bound: None,
                 anchor,
                 _lease: lease,
             });
@@ -334,61 +331,6 @@ impl WarmSlot {
     #[must_use]
     pub fn check_target(&self) -> PathBuf {
         self.dir.join(CHECK_TARGET)
-    }
-
-    /// The target the desktop lane's `cargo test` in `desktop/src-tauri` uses
-    /// (hub #3023).
-    #[must_use]
-    pub fn desktop_target(&self) -> PathBuf {
-        self.dir.join(DESKTOP_TARGET)
-    }
-
-    /// The one `desktop_warm_target` line the lander prints before the lane
-    /// runs: the slot and whether the desktop target is warm (kept from an
-    /// earlier gate) or empty, with its size.
-    #[must_use]
-    pub fn desktop_evidence(&self) -> String {
-        let target = self.desktop_target();
-        let populated = fs::read_dir(&target).is_ok_and(|mut entries| entries.next().is_some());
-        let mut budget = SCAN_ENTRY_BUDGET;
-        let (bytes, _) = tree_bytes(&target, &mut budget);
-        format!(
-            "desktop_warm_target slot={} state={} bytes={bytes}",
-            self.index,
-            desktop_state(self.bound, populated),
-        )
-    }
-
-    /// Remove what the lane built of the candidate's own crates (`crates` are
-    /// the names its `Cargo.toml` declares), keeping every third-party
-    /// artifact, which Cargo keys on the locked package. With no names the
-    /// whole desktop target goes, so an unreadable manifest can only make the
-    /// next gate cold. Returns the entries removed.
-    ///
-    /// # Errors
-    /// An artifact cannot be removed; the target is then removed whole. A
-    /// symlink or non-directory where the layout needs a directory also removes
-    /// the target whole (never following the link) and is not an error.
-    pub fn trim_desktop(&self, crates: &[String]) -> io::Result<usize> {
-        let anchor = self.anchor.as_raw_fd();
-        // A name that is not a plain crate identifier (empty, a path, a dot
-        // name) could match entries it does not own, so it is treated like an
-        // unreadable manifest: the whole target goes, nothing else.
-        if crates.is_empty() || !crates.iter().all(|name| is_plain_crate_name(name)) {
-            remove_entry_at(anchor, DESKTOP_TARGET, 0)?;
-            return Ok(0);
-        }
-        let result = trim_candidate_artifacts(anchor, DESKTOP_TARGET, crates);
-        if let Err(error) = &result {
-            remove_entry_at(anchor, DESKTOP_TARGET, 0)?;
-            // A symlink or non-directory in the layout is not a failure of the
-            // gate: the target was emptied (a link unlinked, never followed),
-            // so the next lane starts cold.
-            if error.kind() == io::ErrorKind::InvalidData {
-                return Ok(0);
-            }
-        }
-        result
     }
 
     /// Materialize the candidate's HEAD at the slot's fixed checkout path,
@@ -436,13 +378,15 @@ impl WarmSlot {
             state = SlotState::OverSize;
             bytes = 0;
         }
-        self.bound = Some(state);
         // The manifest describes the state the last successful build left.
         // Take it off disk first: if this gate dies mid-build the next gate
         // must find none.
         let manifest: Option<Manifest> = read_json(&self.dir.join(MANIFEST_FILE))
             .filter(|manifest: &Manifest| manifest.schema == SCHEMA);
         remove_entry_at(self.anchor.as_raw_fd(), MANIFEST_FILE, 0)?;
+        // Best effort: the lander no longer builds the desktop app, so the
+        // target an earlier lander left in the slot is plain dead weight.
+        let _ = remove_entry_at(self.anchor.as_raw_fd(), LEGACY_DESKTOP_TARGET, 0);
         write_json(
             &self.dir.join(STATE_FILE),
             &SlotRecord {
@@ -516,13 +460,7 @@ impl WarmSlot {
     /// Every removal goes through the lease-time directory descriptor.
     fn reset(&self) -> io::Result<()> {
         let anchor = self.anchor.as_raw_fd();
-        for name in [
-            STATE_FILE,
-            MANIFEST_FILE,
-            TEST_TARGET,
-            CHECK_TARGET,
-            DESKTOP_TARGET,
-        ] {
+        for name in [STATE_FILE, MANIFEST_FILE, TEST_TARGET, CHECK_TARGET] {
             remove_entry_at(anchor, name, 0)?;
         }
         Ok(())
@@ -550,11 +488,7 @@ impl WarmSlot {
     fn measure(&self) -> (u64, bool) {
         let mut budget = SCAN_ENTRY_BUDGET;
         let mut bytes = 0_u64;
-        for target in [
-            self.test_target(),
-            self.check_target(),
-            self.desktop_target(),
-        ] {
+        for target in [self.test_target(), self.check_target()] {
             let (found, exhausted) = tree_bytes(&target, &mut budget);
             bytes = bytes.saturating_add(found);
             if exhausted {
@@ -565,220 +499,13 @@ impl WarmSlot {
     }
 }
 
-/// `warm` only when the slot was kept at bind and the desktop target still
-/// holds artifacts; otherwise the reason the slot was emptied, or `cold`.
-fn desktop_state(bound: Option<SlotState>, populated: bool) -> &'static str {
-    match bound {
-        Some(SlotState::Warm) if populated => SlotState::Warm.label(),
-        Some(SlotState::Warm) | None => SlotState::Cold.label(),
-        Some(state) => state.label(),
-    }
-}
-
-/// The crate names a `Cargo.toml` declares for itself: the package, its library
-/// and its binaries, which are what a candidate changes (a registry crate is
-/// fixed by `Cargo.lock`). Empty when the manifest does not parse.
-#[must_use]
-pub fn declared_crate_names(cargo_toml: &str) -> Vec<String> {
-    let Ok(manifest) = cargo_toml.parse::<toml::Table>() else {
-        return Vec::new();
-    };
-    let name = |table: Option<&toml::Value>| {
-        table
-            .and_then(|table| table.get("name"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
-    };
-    let mut names: Vec<String> = [name(manifest.get("package")), name(manifest.get("lib"))]
-        .into_iter()
-        .flatten()
-        .collect();
-    if let Some(bins) = manifest.get("bin").and_then(toml::Value::as_array) {
-        names.extend(bins.iter().filter_map(|bin| name(Some(bin))));
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// The most manifests one walk reads; a larger graph is not a desktop lane.
-const MAX_WALKED_MANIFESTS: usize = 256;
-
-/// Every dependency table of a parsed manifest (`dependencies`,
-/// `dev-dependencies`, `build-dependencies`, the same under `target.*`, and
-/// `workspace.dependencies`), as `scripts/desktop-test-gate.py` reads them.
-fn dependency_tables(manifest: &toml::Table) -> Vec<&toml::Table> {
-    const NAMES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    let mut tables: Vec<Option<&toml::Value>> = NAMES.iter().map(|n| manifest.get(*n)).collect();
-    tables.push(
-        manifest
-            .get("workspace")
-            .and_then(toml::Value::as_table)
-            .and_then(|workspace| workspace.get("dependencies")),
-    );
-    let targets = manifest.get("target").and_then(toml::Value::as_table);
-    for target in targets.into_iter().flat_map(toml::Table::values) {
-        let Some(target) = target.as_table() else {
-            continue;
-        };
-        tables.extend(NAMES.iter().map(|n| target.get(*n)));
-    }
-    tables
-        .into_iter()
-        .filter_map(|table| table.and_then(toml::Value::as_table))
-        .collect()
-}
-
-/// `base` joined with `relative`, lexically normalised, as a path under the
-/// checkout root; `None` when it leaves the root or names the root itself.
-fn normalized_under_root(base: &Path, relative: &str) -> Option<PathBuf> {
-    use std::path::Component;
-    let mut parts: Vec<&std::ffi::OsStr> = base
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(part) => Some(part),
-            _ => None,
-        })
-        .collect();
-    for component in Path::new(relative).components() {
-        match component {
-            Component::Normal(part) => parts.push(part),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                parts.pop()?;
-            }
-            Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    Some(parts.into_iter().collect())
-}
-
-/// The checkout-relative directories a manifest reaches through `path = ...`
-/// dependencies. A `workspace = true` dependency takes its path from
-/// `workspace_paths` (the root manifest's `workspace.dependencies`, relative
-/// to the root). A path leaving the checkout is dropped.
-fn path_dependency_dirs(
-    manifest: &toml::Table,
-    manifest_dir: &Path,
-    workspace_paths: &BTreeMap<String, PathBuf>,
-) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for table in dependency_tables(manifest) {
-        for (name, spec) in table {
-            let Some(spec) = spec.as_table() else {
-                continue;
-            };
-            if let Some(path) = spec.get("path").and_then(toml::Value::as_str) {
-                found.extend(normalized_under_root(manifest_dir, path));
-                continue;
-            }
-            if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                found.extend(workspace_paths.get(name).cloned());
-            }
-        }
-    }
-    found
-}
-
-/// The crate names of a manifest and of every `path = ...` dependency it
-/// reaches, transitively, inside `root`: what a desktop candidate may have
-/// changed (a registry crate is fixed by `Cargo.lock`). `manifest` is relative
-/// to `root`. Empty when the manifest, or any path dependency manifest it
-/// names, cannot be read or parsed, so the caller trims the whole target.
-#[must_use]
-pub fn candidate_crate_names(root: &Path, manifest: &Path) -> Vec<String> {
-    let read = |directory: &Path| -> Option<(String, toml::Table)> {
-        let text = fs::read_to_string(root.join(directory).join("Cargo.toml")).ok()?;
-        let table = text.parse::<toml::Table>().ok()?;
-        Some((text, table))
-    };
-    let workspace_paths: BTreeMap<String, PathBuf> = read(Path::new(""))
-        .map(|(_, root_manifest)| {
-            root_manifest
-                .get("workspace")
-                .and_then(toml::Value::as_table)
-                .and_then(|workspace| workspace.get("dependencies"))
-                .and_then(toml::Value::as_table)
-                .into_iter()
-                .flatten()
-                .filter_map(|(name, spec)| {
-                    let path = spec.as_table()?.get("path")?.as_str()?;
-                    Some((name.clone(), normalized_under_root(Path::new(""), path)?))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let start = manifest.parent().unwrap_or(Path::new("")).to_path_buf();
-    let mut names = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut queue = vec![start];
-    while let Some(directory) = queue.pop() {
-        if !seen.insert(directory.clone()) {
-            continue;
-        }
-        if seen.len() > MAX_WALKED_MANIFESTS {
-            return Vec::new();
-        }
-        let Some((text, table)) = read(&directory) else {
-            return Vec::new();
-        };
-        names.extend(declared_crate_names(&text));
-        queue.extend(path_dependency_dirs(&table, &directory, &workspace_paths));
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
-/// Whether an entry of a Cargo target directory is an artifact of one of
-/// `crates`: `name-<hex>[.ext]` (also `lib<name>-<hex>`) under `deps`,
-/// `.fingerprint`, `build` and `incremental`, or `name[.ext]` /
-/// `lib<name>[.ext]` at a profile's top level. A hyphen and an underscore name
-/// the same crate. The hash must be hex, so `rsi-desktop-extra` is not
-/// `rsi-desktop`.
-fn is_candidate_artifact(entry: &str, crates: &[String]) -> bool {
-    let bare = entry.strip_prefix("lib").unwrap_or(entry);
-    crates.iter().any(|name| {
-        [name.as_str(), &name.replace('-', "_")]
-            .into_iter()
-            .any(|spelling| {
-                [entry, bare].into_iter().any(|stem| {
-                    let Some(rest) = stem.strip_prefix(spelling) else {
-                        return false;
-                    };
-                    if rest.is_empty() || rest.starts_with('.') {
-                        return true;
-                    }
-                    let Some(hashed) = rest.strip_prefix('-') else {
-                        return false;
-                    };
-                    let hash = hashed.split('.').next().unwrap_or_default();
-                    hash.len() >= 8 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            })
-    })
-}
-
-/// Whether `name` is shaped like a Cargo package, library or binary name:
-/// non-empty ASCII letters, digits, `-` and `_`.
-fn is_plain_crate_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-/// Why a desktop target cannot be trimmed in place: a symlink or non-directory
+/// Why a slot entry cannot be removed in place: a symlink or non-directory
 /// sits where the layout needs a real directory, or the tree is implausibly
-/// deep. The caller then removes the target whole, which unlinks a symlink
-/// without ever following it.
+/// deep.
 fn invalid_layout(what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("desktop target layout is not a plain directory tree: {what}"),
+        format!("slot layout is not a plain directory tree: {what}"),
     )
 }
 
@@ -863,62 +590,6 @@ fn remove_entry_at(parent: RawFd, name: &str, depth: usize) -> io::Result<()> {
         Ok(()) | Err(nix::errno::Errno::ENOENT) => Ok(()),
         Err(errno) => Err(io::Error::from(errno)),
     }
-}
-
-/// Remove the candidate crates' artifacts from every profile directory of
-/// `target`, a name under the leased slot's descriptor `slot`; returns the
-/// entries removed. A target that does not exist trims nothing. Every directory
-/// is opened relative to its parent's descriptor without following a symlink,
-/// starting at the slot descriptor, so nothing outside the leased directory is
-/// read or removed; a symlink where a directory belongs is an error (the
-/// caller then removes the target whole).
-fn trim_candidate_artifacts(slot: RawFd, target: &str, crates: &[String]) -> io::Result<usize> {
-    let Some(mut root) = open_dir_nofollow(Some(slot), target)? else {
-        return Ok(0);
-    };
-    let root_fd = root.as_raw_fd();
-    let mut removed = 0;
-    for profile in dir_entry_names(&mut root)? {
-        // Files at the root (`CACHEDIR.TAG`, `.rustc_info.json`) are not
-        // profiles; a symlink is never followed.
-        let Some(mut profile_dir) = open_profile_dir(root_fd, &profile)? else {
-            continue;
-        };
-        let profile_fd = profile_dir.as_raw_fd();
-        removed += remove_matching(&mut profile_dir, crates)?;
-        for sub in ["deps", ".fingerprint", "build", "incremental"] {
-            if let Some(mut sub_dir) = open_dir_nofollow(Some(profile_fd), sub)? {
-                removed += remove_matching(&mut sub_dir, crates)?;
-            }
-        }
-    }
-    Ok(removed)
-}
-
-/// A profile directory of the target: `None` for an entry that is a plain file;
-/// an error for a symlink.
-fn open_profile_dir(root: RawFd, name: &str) -> io::Result<Option<nix::dir::Dir>> {
-    use nix::fcntl::AtFlags;
-    use nix::sys::stat::{SFlag, fstatat};
-    let stat = fstatat(Some(root), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(io::Error::from)?;
-    match SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT {
-        SFlag::S_IFDIR => open_dir_nofollow(Some(root), name),
-        SFlag::S_IFLNK => Err(invalid_layout(name)),
-        _ => Ok(None),
-    }
-}
-
-fn remove_matching(directory: &mut nix::dir::Dir, crates: &[String]) -> io::Result<usize> {
-    let fd = directory.as_raw_fd();
-    let mut removed = 0;
-    for name in dir_entry_names(directory)? {
-        if !is_candidate_artifact(&name, crates) {
-            continue;
-        }
-        remove_entry_at(fd, &name, 0)?;
-        removed += 1;
-    }
-    Ok(removed)
 }
 
 fn lock_path(warm_root: &Path, index: usize) -> PathBuf {
@@ -1743,158 +1414,44 @@ mod tests {
         assert!(!slot.test_target().exists());
     }
 
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    const DESKTOP_MANIFEST: &str = "[package]\nname = \"rsi-desktop\"\n\n[lib]\nname = \"rsi_desktop_lib\"\n\n[[bin]]\nname = \"rsi-desktop-cli\"\npath = \"src/main.rs\"\n";
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn a_manifest_declares_the_crates_a_candidate_changes() {
-        assert_eq!(
-            declared_crate_names(DESKTOP_MANIFEST),
-            ["rsi-desktop", "rsi-desktop-cli", "rsi_desktop_lib"]
-        );
-        assert!(declared_crate_names("not = [toml").is_empty());
-    }
-
-    /// Hub #3023: the lane trims the candidate's own crates from the slot's
-    /// desktop target and keeps every third-party artifact, whichever spelling
-    /// or directory Cargo used.
+    /// #3453 D1: the desktop lane's target is no longer slot-owned. One an
+    /// earlier lander left in a kept slot is removed at the next bind, and the
+    /// slot's own targets stay warm.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
-    fn trimming_the_desktop_target_removes_only_the_candidates_crates() {
+    fn a_legacy_desktop_target_is_removed_at_bind_and_the_slot_stays_warm() {
+        let repo = Repo::new();
         let root = tempfile::tempdir().unwrap();
-        let slot = slot(root.path());
-        let target = slot.desktop_target();
-        let removed = [
-            "debug/deps/rsi_desktop_lib-0123456789abcdef.d",
-            "debug/deps/librsi_desktop_lib-0123456789abcdef.rlib",
-            "debug/deps/rsi_desktop-0123456789abcdef",
-            "debug/.fingerprint/rsi-desktop-0123456789abcdef/lib-rsi_desktop_lib",
-            "debug/build/rsi-desktop-0123456789abcdef/out/gen.rs",
-            "debug/incremental/rsi_desktop_lib-0123456789abcdef/s-1.lock",
-            "debug/rsi-desktop",
-            "debug/rsi-desktop.d",
-            "debug/librsi_desktop_lib.rlib",
-            "release/deps/rsi_desktop-fedcba9876543210",
-        ];
-        let kept = [
-            "debug/deps/libtauri-0123456789abcdef.rlib",
-            "debug/.fingerprint/tauri-0123456789abcdef/lib-tauri",
-            "debug/build/tauri-0123456789abcdef/out/gen.rs",
-            "debug/deps/librsi_desktop_extra-0123456789abcdef.rlib",
-            "debug/deps/rsi_desktop_lib_helper-0123456789abcdef.d",
-            "debug/deps/rsi_desktop-notahash.d",
-            "debug/CACHEDIR.TAG",
-        ];
-        for path in removed.iter().chain(&kept) {
-            write(&target, path, "artifact");
-        }
-        let names = declared_crate_names(DESKTOP_MANIFEST);
-        assert_eq!(slot.trim_desktop(&names).unwrap(), 10);
-        for path in removed {
-            assert!(!target.join(path).exists(), "{path} must be trimmed");
-        }
-        for path in kept {
-            assert!(target.join(path).exists(), "{path} must stay warm");
-        }
-        // Trimming again finds nothing, and no declared name empties the target.
-        assert_eq!(slot.trim_desktop(&names).unwrap(), 0);
-        slot.trim_desktop(&[]).unwrap();
-        assert!(!target.exists());
+        let mut slot = slot(root.path());
+        slot.bind_with_toolchain(&repo.worktree("gate-1", &repo.first), "tc")
+            .unwrap();
+        write(&slot.test_target(), "debug/deps/libx-00112233.rlib", "warm");
+        write(
+            &slot.dir,
+            "desktop-target/debug/deps/libtauri-00112233.rlib",
+            "legacy",
+        );
+        slot.commit().unwrap();
+        let outcome = slot
+            .bind_with_toolchain(&repo.worktree("gate-2", &repo.second), "tc")
+            .unwrap();
+        assert_eq!(outcome.state, SlotState::Warm);
+        assert!(!slot.dir.join("desktop-target").exists());
+        assert!(
+            slot.test_target()
+                .join("debug/deps/libx-00112233.rlib")
+                .is_file()
+        );
     }
 
     const SENTINEL: &str = "outside the slot: must survive byte for byte";
 
-    /// An outside tree holding a candidate-named artifact and a sentinel.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    fn outside_tree(root: &Path) -> PathBuf {
-        let outside = root.join("outside");
-        write(&outside, "librsi_common-0123456789abcdef.rlib", SENTINEL);
-        write(&outside, "rsi_common-0123456789abcdef/nested", SENTINEL);
-        write(&outside, "tauri-0123456789abcdef.d", SENTINEL);
-        outside
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    fn assert_outside_untouched(outside: &Path) {
-        for path in [
-            "librsi_common-0123456789abcdef.rlib",
-            "rsi_common-0123456789abcdef/nested",
-            "tauri-0123456789abcdef.d",
-        ] {
-            assert_eq!(
-                fs::read_to_string(outside.join(path)).expect(path),
-                SENTINEL,
-                "{path} outside the slot must be untouched"
-            );
-        }
-    }
-
-    /// #3134: a symlink where the trim needs a directory (the target root, a
-    /// profile, or `deps`/`.fingerprint`/`build`/`incremental`) is never
-    /// followed. The sentinel outside the slot survives, the trim does not
-    /// error, and the next lane finds no warm target to reuse.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn trimming_the_desktop_target_never_follows_a_symlinked_directory() {
-        use std::os::unix::fs::symlink;
-        let names = vec!["rsi-common".to_owned()];
-        let cases: [(&str, Option<&str>); 6] = [
-            ("target root", None),
-            ("profile", Some("debug")),
-            ("deps", Some("debug/deps")),
-            (".fingerprint", Some("debug/.fingerprint")),
-            ("build", Some("debug/build")),
-            ("incremental", Some("debug/incremental")),
-        ];
-        for (label, link) in cases {
-            let root = tempfile::tempdir().unwrap();
-            let slot = slot(root.path());
-            let outside = outside_tree(root.path());
-            let target = slot.desktop_target();
-            match link {
-                None => symlink(&outside, &target).unwrap(),
-                Some(relative) => {
-                    // Keep ordinary candidate artifacts beside the link.
-                    write(
-                        &target,
-                        "debug/deps/librsi_common-aaaaaaaaaaaaaaaa.rlib",
-                        "x",
-                    );
-                    let link_path = target.join(relative);
-                    if let Some(parent) = link_path.parent() {
-                        fs::create_dir_all(parent).unwrap();
-                    }
-                    let _ = fs::remove_dir_all(&link_path);
-                    symlink(&outside, &link_path).unwrap();
-                }
-            }
-            slot.trim_desktop(&names)
-                .unwrap_or_else(|error| panic!("{label}: {error}"));
-            assert_outside_untouched(&outside);
-            assert!(
-                fs::symlink_metadata(&target).is_err(),
-                "{label}: the next lane must start cold"
-            );
-            // A fresh target is usable again.
-            write(
-                &target,
-                "debug/deps/librsi_common-bbbbbbbbbbbbbbbb.rlib",
-                "y",
-            );
-            assert_eq!(slot.trim_desktop(&names).unwrap(), 1);
-            assert_outside_untouched(&outside);
-        }
-    }
-
     /// A fake slot tree outside the lease, laid out like a slot: the artifacts
-    /// the trim and the reset would remove, each holding the sentinel.
+    /// the reset would remove, each holding the sentinel.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     fn outside_slot(root: &Path) -> PathBuf {
         let outside = root.join("outside-slot");
         for relative in [
-            "desktop-target/debug/deps/librsi_common-0123456789abcdef.rlib",
-            "desktop-target/debug/deps/libtauri-0123456789abcdef.rlib",
             "test-target/debug/deps/libx-0123456789abcdef.rlib",
             "check-target/marker",
             "source/Cargo.toml",
@@ -1909,8 +1466,6 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     fn assert_outside_slot_untouched(outside: &Path) {
         for relative in [
-            "desktop-target/debug/deps/librsi_common-0123456789abcdef.rlib",
-            "desktop-target/debug/deps/libtauri-0123456789abcdef.rlib",
             "test-target/debug/deps/libx-0123456789abcdef.rlib",
             "check-target/marker",
             "source/Cargo.toml",
@@ -1925,18 +1480,13 @@ mod tests {
         }
     }
 
-    /// Lease a slot, give it a desktop target, then rename the slot directory
+    /// Lease a slot, give it a test target, then rename the slot directory
     /// away and put a symlink to an outside slot at its path (#3187). Returns
     /// the slot, the renamed leased directory and the outside slot.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     fn slot_swapped_for_a_symlink(root: &Path) -> (WarmSlot, PathBuf, PathBuf) {
         use std::os::unix::fs::symlink;
         let slot = slot(root);
-        write(
-            &slot.desktop_target(),
-            "debug/deps/librsi_common-aaaaaaaaaaaaaaaa.rlib",
-            "leased",
-        );
         write(&slot.dir, "test-target/marker", "leased");
         write(&slot.dir, STATE_FILE, "leased");
         let outside = outside_slot(root);
@@ -1946,34 +1496,12 @@ mod tests {
         (slot, moved, outside)
     }
 
-    /// #3187: the trim acts on the directory leased at acquisition, never on
-    /// whatever the slot's pathname resolves to later.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn trimming_after_the_slot_dir_became_a_symlink_never_leaves_the_leased_dir() {
-        let root = tempfile::tempdir().unwrap();
-        let (slot, moved, outside) = slot_swapped_for_a_symlink(root.path());
-        assert_eq!(slot.trim_desktop(&["rsi-common".to_owned()]).unwrap(), 1);
-        assert_outside_slot_untouched(&outside);
-        assert!(
-            !moved
-                .join("desktop-target/debug/deps/librsi_common-aaaaaaaaaaaaaaaa.rlib")
-                .exists()
-        );
-    }
-
-    /// #3187: the full-reset fallback of the trim (no usable crate names) and
-    /// the slot reset both stay inside the leased directory.
+    /// #3187: the slot reset stays inside the leased directory.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn the_reset_after_the_slot_dir_became_a_symlink_never_leaves_the_leased_dir() {
         let root = tempfile::tempdir().unwrap();
         let (slot, moved, outside) = slot_swapped_for_a_symlink(root.path());
-        slot.trim_desktop(&[]).unwrap();
-        assert_outside_slot_untouched(&outside);
-        assert!(!moved.join("desktop-target").exists());
-        assert!(moved.join("test-target/marker").exists());
-
         slot.reset().unwrap();
         assert_outside_slot_untouched(&outside);
         assert!(!moved.join("test-target").exists());
@@ -1991,223 +1519,6 @@ mod tests {
         fs::create_dir_all(&candidate).unwrap();
         assert!(slot.bind_with_toolchain(&candidate, "toolchain").is_err());
         assert_outside_slot_untouched(&outside);
-    }
-
-    /// A symlink inside a matched artifact directory is unlinked, not followed.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn trimming_a_matched_directory_unlinks_symlinks_inside_it() {
-        use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
-        let slot = slot(root.path());
-        let outside = outside_tree(root.path());
-        let target = slot.desktop_target();
-        let build = target.join("debug/build/rsi-common-0123456789abcdef");
-        write(&build, "out/gen.rs", "x");
-        symlink(&outside, build.join("out/escape")).unwrap();
-        fs::create_dir_all(target.join("debug/deps")).unwrap();
-        symlink(
-            outside.join("tauri-0123456789abcdef.d"),
-            target.join("debug/deps/rsi_common-0123456789abcdef.d"),
-        )
-        .unwrap();
-        write(&target, "debug/deps/libtauri-0123456789abcdef.rlib", "keep");
-        assert_eq!(slot.trim_desktop(&["rsi-common".to_owned()]).unwrap(), 2);
-        assert_outside_untouched(&outside);
-        assert!(!build.exists());
-        assert!(
-            target
-                .join("debug/deps/libtauri-0123456789abcdef.rlib")
-                .exists()
-        );
-    }
-
-    /// A crate name that is not a plain identifier cannot select entries; it
-    /// empties only the desktop target.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn odd_crate_names_only_empty_the_desktop_target() {
-        for odd in ["", ".", "..", "../outside", "a/b", "rsi.common"] {
-            let root = tempfile::tempdir().unwrap();
-            let slot = slot(root.path());
-            let outside = outside_tree(root.path());
-            let target = slot.desktop_target();
-            write(&target, "debug/deps/libtauri-0123456789abcdef.rlib", "x");
-            write(&target, "debug/.fingerprint/p-0123456789abcdef/f", "x");
-            slot.trim_desktop(&[odd.to_owned()]).unwrap();
-            assert!(!target.exists(), "{odd:?}");
-            assert_outside_untouched(&outside);
-            assert!(root.path().join(WARM_DIR).exists(), "{odd:?}");
-        }
-    }
-
-    /// A checkout whose Tauri crate reaches `rsi-graph` directly (a path
-    /// dependency), `rsi-common` through `rsi-graph` and a workspace-inherited
-    /// one, plus a registry crate and a path outside the checkout.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    fn desktop_checkout() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        let manifests = [
-            (
-                "Cargo.toml",
-                "[workspace]\nmembers = [\"crates/*\"]\n[workspace.dependencies]\nrsi-extra = { path = \"crates/rsi-extra\" }\ntauri = \"2\"\n",
-            ),
-            (
-                "desktop/src-tauri/Cargo.toml",
-                "[package]\nname = \"rsi-desktop\"\n[dependencies]\ntauri = \"2\"\nrsi-graph = { path = \"../../crates/rsi-graph\" }\nrsi-extra = { workspace = true }\noutside = { path = \"../../../outside\" }\n",
-            ),
-            (
-                "crates/rsi-graph/Cargo.toml",
-                "[package]\nname = \"rsi-graph\"\n[lib]\nname = \"rsi_graph_lib\"\n[dev-dependencies]\nrsi-common = { path = \"../rsi-common\" }\n",
-            ),
-            (
-                "crates/rsi-common/Cargo.toml",
-                "[package]\nname = \"rsi-common\"\n[target.'cfg(unix)'.dependencies]\nrsi-graph = { path = \"../rsi-graph\" }\n",
-            ),
-            (
-                "crates/rsi-extra/Cargo.toml",
-                "[package]\nname = \"rsi-extra\"\n",
-            ),
-            (
-                "crates/unrelated/Cargo.toml",
-                "[package]\nname = \"unrelated\"\n",
-            ),
-        ];
-        for (path, text) in manifests {
-            write(root.path(), path, text);
-        }
-        root
-    }
-
-    /// Hub #3042 / #354: the trim names the Tauri crate and every workspace
-    /// path-dependency crate in its closure (transitive, workspace-inherited,
-    /// cycles tolerated), and nothing else.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn candidate_crates_follow_the_tauri_path_dependency_closure() {
-        let checkout = desktop_checkout();
-        let manifest = Path::new("desktop/src-tauri/Cargo.toml");
-        assert_eq!(
-            candidate_crate_names(checkout.path(), manifest),
-            [
-                "rsi-common",
-                "rsi-desktop",
-                "rsi-extra",
-                "rsi-graph",
-                "rsi_graph_lib"
-            ]
-        );
-        // A path dependency whose manifest is gone cannot be named: trim it all.
-        fs::remove_file(checkout.path().join("crates/rsi-common/Cargo.toml")).unwrap();
-        assert!(candidate_crate_names(checkout.path(), manifest).is_empty());
-        assert!(candidate_crate_names(checkout.path(), Path::new("nope/Cargo.toml")).is_empty());
-    }
-
-    /// Hub #3042 / #354: a workspace path crate's artifacts do not survive to
-    /// the next candidate; the registry artifacts and the tauri crate's stay.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn trimming_the_desktop_target_drops_path_dependency_artifacts() {
-        let checkout = desktop_checkout();
-        let root = tempfile::tempdir().unwrap();
-        let slot = slot(root.path());
-        let target = slot.desktop_target();
-        let removed = [
-            "debug/deps/librsi_graph_lib-0123456789abcdef.rlib",
-            "debug/deps/librsi_common-0123456789abcdef.rmeta",
-            "debug/.fingerprint/rsi-graph-0123456789abcdef/lib-rsi_graph_lib",
-            "debug/.fingerprint/rsi-common-0123456789abcdef/lib-rsi_common",
-            "debug/incremental/rsi_common-0123456789abcdef/s-1.lock",
-            "debug/deps/rsi_desktop-0123456789abcdef",
-        ];
-        let kept = [
-            "debug/deps/libtauri-0123456789abcdef.rlib",
-            "debug/.fingerprint/tauri-0123456789abcdef/lib-tauri",
-            "debug/deps/libserde-0123456789abcdef.rlib",
-            "debug/deps/librsi_graph_extra-0123456789abcdef.rlib",
-        ];
-        for path in removed.iter().chain(&kept) {
-            write(&target, path, "artifact");
-        }
-        let names =
-            candidate_crate_names(checkout.path(), Path::new("desktop/src-tauri/Cargo.toml"));
-        assert_eq!(slot.trim_desktop(&names).unwrap(), removed.len());
-        for path in removed {
-            assert!(!target.join(path).exists(), "{path} must be trimmed");
-        }
-        for path in kept {
-            assert!(target.join(path).exists(), "{path} must stay warm");
-        }
-    }
-
-    /// Hub #3023: the desktop target follows the slot, so a slot's warm state
-    /// and reset rules apply to it like the test and check targets.
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
-    #[test]
-    fn the_desktop_target_is_warm_only_while_its_slot_is() {
-        let repo = Repo::new();
-        let root = tempfile::tempdir().unwrap();
-        let mut slot = slot(root.path());
-        assert!(slot.desktop_target().starts_with(&slot.dir));
-        assert!(
-            slot.desktop_evidence()
-                .starts_with("desktop_warm_target slot=0 state=cold bytes=0"),
-            "{}",
-            slot.desktop_evidence()
-        );
-
-        // The first bind finds an empty slot.
-        slot.bind_with_toolchain(&repo.worktree("gate-1", &repo.first), "tc")
-            .unwrap();
-        assert!(slot.desktop_evidence().contains("state=cold"));
-        write(
-            &slot.desktop_target(),
-            "debug/deps/libtauri-00112233.rlib",
-            "tauri",
-        );
-        slot.commit().unwrap();
-
-        // The next gate keeps the slot, so it keeps the desktop target.
-        slot.bind_with_toolchain(&repo.worktree("gate-2", &repo.second), "tc")
-            .unwrap();
-        assert!(
-            slot.desktop_evidence()
-                .contains("slot=0 state=warm bytes=5")
-        );
-        assert!(
-            slot.desktop_target()
-                .join("debug/deps/libtauri-00112233.rlib")
-                .is_file()
-        );
-
-        // A kept slot whose desktop target was never built is still cold.
-        std::fs::remove_dir_all(slot.desktop_target()).unwrap();
-        assert!(slot.desktop_evidence().contains("state=cold"));
-
-        // A toolchain change empties the desktop target with the others.
-        write(
-            &slot.desktop_target(),
-            "debug/deps/libtauri-00112233.rlib",
-            "tauri",
-        );
-        slot.bind_with_toolchain(&repo.worktree("gate-3", &repo.second), "tc2")
-            .unwrap();
-        assert!(!slot.desktop_target().exists());
-        assert!(slot.desktop_evidence().contains("state=toolchain_changed"));
-
-        // The slot's size bound counts the desktop target.
-        write(
-            &slot.desktop_target(),
-            "debug/deps/big.rlib",
-            &"x".repeat(4096),
-        );
-        slot.max_bytes = 1024;
-        let outcome = slot
-            .bind_with_toolchain(&repo.worktree("gate-4", &repo.second), "tc2")
-            .unwrap();
-        assert_eq!(outcome.state, SlotState::OverSize);
-        assert!(!slot.desktop_target().exists());
-        assert!(slot.desktop_evidence().contains("state=over_size"));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -2731,8 +2042,24 @@ fn main() {
         let (build_id, _) = real
             .split_once("// SEAM-GUARD-BEGIN")
             .expect("build.rs keeps its seam guard marker");
+        // The fixture workspace has no digest dependencies, so the shared digest module and
+        // the emitter that uses it stay out: this regression is about the build id and main
+        // worktree code only (the digest is covered by its own tests).
+        let (modules, rest) = build_id
+            .split_once("/// The harness source digest of the build commit")
+            .expect("build.rs keeps the digest emitter after the shared modules");
+        let (_, build_identity) = modules
+            .split_once("mod harness_source_digest;")
+            .expect("build.rs declares the shared digest module before build_identity");
+        let (_, main_worktree) = rest
+            .split_once("/// Main worktree of the repo this binary is built from")
+            .expect("build.rs keeps the main worktree code after the digest emitter");
         format!(
-            "{build_id}fn main() {{\n    emit_build_sha();\n    emit_build_main_worktree();\n    \
+            "{build_identity}\
+             /// Main worktree of the repo this binary is built from{main_worktree}\
+             fn main() {{\n    \
+             println!(\"cargo:rerun-if-changed=../rsi-common/build_support/build_identity.rs\");\n    \
+             build_identity::emit_build_sha();\n    emit_build_main_worktree();\n    \
              println!(\"cargo:rerun-if-changed=build.rs\");\n}}\n"
         )
     }
@@ -2742,8 +2069,19 @@ fn main() {
     fn real_cargo_keeps_rsid_fresh_across_candidates_only_when_the_build_id_is_pinned() {
         let test = "build_id_is_set";
         let script = gate_build_script();
+        // Keep the production module at the relative path declared by build.rs, so Cargo
+        // compiles the shipped implementation and tracks it across candidate rebinds.
+        let build_identity = fs::read_to_string(
+            Path::new(rsi_common::manifest_dir!())
+                .join("../rsi-common/build_support/build_identity.rs"),
+        )
+        .unwrap();
         let mut repo = cargo_repo(&[
             ("consumer/build.rs", script.as_str()),
+            (
+                "rsi-common/build_support/build_identity.rs",
+                build_identity.as_str(),
+            ),
             (
                 "consumer/src/lib.rs",
                 "pub const ID: &str = env!(\"RSI_BUILD_SHA\");\n\
@@ -2779,7 +2117,7 @@ fn main() {
             let rebound = slot.bind_with_toolchain(&second, "tc").unwrap();
             assert_eq!(
                 (rebound.restored_files, rebound.files),
-                (5, 6),
+                (6, 7),
                 "every file but the new notes.txt keeps its mtime"
             );
             let output = cargo_test_with_build_id(&rebound.worktree, &target, test, build_id);

@@ -19,7 +19,6 @@ use rsi_common::operator_restart::{
     OperatorRestartStatusV1, RESTART_NOT_CANCELLABLE, RESTART_NOTHING_PENDING,
     RequestOperatorRestartRequestV1,
 };
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 fn status(
@@ -66,7 +65,10 @@ fn status(
 ///
 /// # Errors
 /// A persistence error.
-pub async fn get(store: &Mutex<Store>, service: &DeployService) -> Result<OperatorRestartStatusV1> {
+pub async fn get(
+    store: &rsid_core::store_lock::Mutex<Store>,
+    service: &DeployService,
+) -> Result<OperatorRestartStatusV1> {
     let store = store.lock().await;
     let live = store.live_agent_deploy()?.filter(|row| row.operator);
     let row = match live {
@@ -104,7 +106,7 @@ fn same_payload(row: &DeployRow, sha: &str, manifest: &[DeployBinaryV1]) -> bool
 /// `deploy_needs_supervisor`, `deploy_already_in_progress` (an agent deploy is
 /// live), a `deploy_*` staging refusal, or a persistence error.
 pub async fn request(
-    store: &Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     drain: &crate::deploy_drain::DeployDrain,
     config: &crate::config::RuntimeConfig,
@@ -210,7 +212,7 @@ pub async fn request(
 /// # Errors
 /// `operator_restart_nothing_pending` or a persistence error.
 pub async fn force(
-    store: &Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
 ) -> Result<OperatorRestartStatusV1> {
     {
@@ -229,7 +231,7 @@ pub async fn force(
 /// `operator_restart_nothing_pending`, `operator_restart_not_cancellable` once
 /// the swap has begun, or a persistence error.
 pub async fn cancel(
-    store: &Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     service: &DeployService,
     now: DateTime<Utc>,
 ) -> Result<OperatorRestartStatusV1> {
@@ -269,7 +271,7 @@ mod tests {
         install: PathBuf,
         service: DeployService,
         restarts: Arc<AtomicUsize>,
-        store: Mutex<Store>,
+        store: rsid_core::store_lock::Mutex<Store>,
         drain: DeployDrain,
         config: Arc<crate::config::RuntimeConfig>,
     }
@@ -325,7 +327,7 @@ mod tests {
             install,
             service,
             restarts,
-            store: Mutex::new(Store::open_in_memory().unwrap()),
+            store: rsid_core::store_lock::Mutex::new(Store::open_in_memory().unwrap()),
             drain: DeployDrain::new(),
             config: crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env()),
         }

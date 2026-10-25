@@ -17,6 +17,11 @@
 # it retries once on a fresh simulator and the receipt ends `reason=sim-preflight`
 # (`reason=timeout` wins when both happen). If a simulator cannot be created the
 # run falls back to the shared one named by --os/--device, with a warning.
+# Each clone is booted once up front with the simulator's own Family service
+# (com.apple.familynotification, which starts Family.app) disabled in its own
+# launchd, because Family.app aborts at launch on the 26.5 runtime and makes
+# macOS show a "Family quit unexpectedly" dialog (#509). Only the clone changes:
+# the host's com.apple.CrashReporter settings and all other crash reports stay.
 # Runs on macOS /bin/bash 3.2 (no GNU timeout).
 set -euo pipefail
 
@@ -28,7 +33,7 @@ while [ $# -gt 0 ]; do
         --os) os="$2"; shift ;;
         --device) device="$2"; shift ;;
         --timeout) timeout_secs="${2:-}"; shift ;;
-        -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+        -h | --help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "ios-test: unknown argument $1" >&2; exit 2 ;;
     esac
     shift
@@ -43,6 +48,8 @@ project_dir="$top/remote/ios"
 log=$(mktemp "${TMPDIR:-/tmp}/rsi-ios-test.XXXXXX")
 flag="$log.timeout"
 uuid_re='[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}'
+# shellcheck source=scripts/ios/sim-quiet-family.sh
+. "$top/scripts/ios/sim-quiet-family.sh"
 
 booted_sims() {
     command -v xcrun > /dev/null 2>&1 || return 0
@@ -84,6 +91,9 @@ make_clone() {
         grep -Eo "$uuid_re" | head -1) || true
     [ -n "$made" ] || return 1
     clone="$made"
+    # Stop the simulator's own Family service from crashing and raising the macOS
+    # "Family quit unexpectedly" dialog on every clone boot (#509).
+    sim_quiet_family "$clone"
 }
 
 # Run xcodebuild under the watchdog; sets $code and $timed_out.

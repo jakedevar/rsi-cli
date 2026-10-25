@@ -2,7 +2,7 @@
 //!
 //! Each command validates its input and forwards exactly one daemon method,
 //! mirroring the TUI client (`crates/rsi/src/client.rs`): `AnswerQuestion`,
-//! `ArchiveSession`, `InterruptSession` (with `pause_level`), `GetOperatorPause`
+//! `ArchiveSession`, `MarkPendingArchive`, `InterruptSession` (with `pause_level`), `GetOperatorPause`
 //! and `SetOperatorPause`.
 
 use serde_json::{Value, json};
@@ -28,6 +28,13 @@ pub fn answer_params(session_id: &str, response_text: &str) -> Result<Value, Str
     let id = parse_uuid("session_id", session_id)?;
     check_text("answer", response_text)?;
     Ok(json!({ "session_id": id, "response_text": response_text }))
+}
+
+/// `MarkPendingArchive` takes the wanted state explicitly: the TUI sends `!session.pending_archive`
+/// (crates/rsi/src/client.rs `mark_pending_archive`), so one command both sets and clears it.
+pub fn pending_archive_params(session_id: &str, pending: bool) -> Result<Value, String> {
+    let id = parse_uuid("session_id", session_id)?;
+    Ok(json!({ "session_id": id, "pending": pending }))
 }
 
 pub fn pause_params(session_id: &str, level: &str) -> Result<Value, String> {
@@ -60,6 +67,19 @@ pub async fn archive_session(state: State<'_, AppState>, session_id: String) -> 
     forward(&state, "ArchiveSession", json!({ "session_id": id })).await
 }
 
+/// Mark a Starting, Running or WaitingApproval session to archive itself when it finishes (`pending: true`), or clear the
+/// mark. rsid refuses `ArchiveSession` for an active session, so the frontend picks this for those.
+/// A write: it is not on the read-only allowlist.
+#[tauri::command]
+pub async fn mark_pending_archive(
+    state: State<'_, AppState>,
+    session_id: String,
+    pending: bool,
+) -> CmdResult {
+    let params = pending_archive_params(&session_id, pending)?;
+    forward(&state, "MarkPendingArchive", params).await
+}
+
 /// Interrupt the running turn and persist a soft or hard operator pause.
 #[tauri::command]
 pub async fn pause_session(
@@ -88,13 +108,20 @@ pub async fn set_operator_pause(
     forward(&state, "SetOperatorPause", params).await
 }
 
-/// Reflect the number of sessions needing the operator in the window title.
-/// Purely local: forwards nothing to the daemon.
+/// Reflect the number of sessions needing the operator in the window title and the Dock badge
+/// (local #294). Purely local: forwards nothing to the daemon.
 #[tauri::command]
 pub fn set_attention_count(window: tauri::WebviewWindow, count: u32) -> Result<(), String> {
+    // The badge is best effort: Windows has no count badge and Linux shows one only on some desktops.
+    let _ = window.set_badge_count(badge_count(count));
     window
         .set_title(&attention_title(count))
         .map_err(|e| e.to_string())
+}
+
+/// The Dock badge for `count` sessions waiting: none (cleared) at zero.
+pub fn badge_count(count: u32) -> Option<i64> {
+    (count > 0).then_some(i64::from(count))
 }
 
 pub fn attention_title(count: u32) -> String {
@@ -121,6 +148,15 @@ mod tests {
     }
 
     #[test]
+    fn pending_archive_params_carry_the_wanted_state() {
+        let on = pending_archive_params(ID, true).unwrap();
+        assert_eq!(on["session_id"], "e2cae1d4-1833-48eb-a7e8-6f1dd480fdae");
+        assert_eq!(on["pending"], true);
+        assert_eq!(pending_archive_params(ID, false).unwrap()["pending"], false);
+        assert!(pending_archive_params("nope", true).is_err());
+    }
+
+    #[test]
     fn pause_levels_are_closed() {
         assert_eq!(pause_params(ID, "Hard").unwrap()["pause_level"], "hard");
         assert_eq!(pause_params(ID, "soft").unwrap()["pause_level"], "soft");
@@ -128,6 +164,12 @@ mod tests {
         assert_eq!(set_pause_params(ID, "none").unwrap()["pause_level"], "none");
         assert!(set_pause_params(ID, "hard").is_err());
         assert!(set_pause_params("x", "none").is_err());
+    }
+
+    #[test]
+    fn badge_clears_at_zero() {
+        assert_eq!(badge_count(0), None);
+        assert_eq!(badge_count(2), Some(2));
     }
 
     #[test]

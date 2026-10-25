@@ -40,7 +40,7 @@ none of the three markers is also treated as raw evidence. A malformed file that
 carries a sidecar marker is still rejected; the hook has no bypass. Name raw
 evidence `<topic>.evidence.json` or `<topic>.measurements.json` (or keep it as
 `.txt`) so the intent is explicit. Cases:
-`tools/test_pre_commit_research_sidecar.py`.
+`tools/test_pre_commit_research_sidecar.sh`.
 
 ## Modes
 

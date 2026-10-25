@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "version": 188,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v188.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:a9a9da0d9c9356d24033ac7a505f360354711cad0f420ed694f96da7aada2040",
+      "sites": [
+        {
+          "anchor": "a run recorded before V188 simply has none.",
+          "replacement": "a run recorded before V${VERSION} simply has none.",
+          "scope": "unit"
+        },
+        {
+          "anchor": "fn migrate_v188(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 188 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 188)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:b81076109ed365858569fd0fe3478f1bf12211f83cd8f4cb83dd2da13079ffed",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 188;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 188 && target < 188 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 188,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsi-common/src/cohort_settlement.rs",
+      "path_template": "crates/rsi-common/src/cohort_settlement.rs",
+      "source_blob": "sha256:0e1a520fc7bb5965bdfad54f344e1396ca6fae2502c18706238414dd441f4d8e",
+      "sites": [
+        {
+          "anchor": "for a run recorded before V188.",
+          "replacement": "for a run recorded before V${VERSION}.",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/cohort_settlement.rs",
+      "path_template": "crates/rsid-store/src/store/cohort_settlement.rs",
+      "source_blob": "sha256:59394b4527d312f5e32065c7254f4a96a88eb50744c80c6e1c608c0f9e02c4b6",
+      "sites": [
+        {
+          "anchor": "run recorded before V188 has none.",
+          "replacement": "run recorded before V${VERSION} has none.",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "docs/agents/rsid-rpc-contracts.md",
+      "path_template": "docs/agents/rsid-rpc-contracts.md",
+      "source_blob": "sha256:64eceb75882dbf170c48f0c4554958be6c41275542738c0802ed67879f48d845",
+      "sites": [
+        {
+          "anchor": "(#149, V188 `source_worktree_settlement_unproven_survivors`)",
+          "replacement": "(#149, V${VERSION} `source_worktree_settlement_unproven_survivors`)",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

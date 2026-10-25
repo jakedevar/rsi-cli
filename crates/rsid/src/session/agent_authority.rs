@@ -56,6 +56,7 @@ mod tests {
         ] {
             assert!(ACTIONS.contains(&(action, Capability::LeadControl)));
         }
+        assert!(ACTIONS.contains(&(Action::WithdrawQueuedCreate, Capability::SessionCreate)));
         assert_eq!(OPERATOR_DELEGATION_METHODS.len(), 4);
         assert_eq!(STORAGE_CONTROL_OPERATOR_METHODS.len(), 2);
         assert_eq!(DAEMON_SETTINGS_OPERATOR_METHODS.len(), 1);
@@ -68,6 +69,7 @@ mod tests {
         let manager = permitted_updates(&work_only, true, false);
         assert!(manager.contains(&"work"));
         assert!(manager.contains(&"stage"));
+        assert!(manager.contains(&"request_withdraw"));
         assert!(!manager.contains(&"request"));
         assert!(!manager.contains(&"request_review"));
         assert!(!manager.contains(&"integration"));
@@ -75,6 +77,7 @@ mod tests {
         let lead = permitted_updates(&work_only, false, true);
         assert!(lead.contains(&"stage"));
         assert!(lead.contains(&"request"));
+        assert!(!lead.contains(&"request_withdraw"));
         assert!(!lead.contains(&"work"));
         assert!(!lead.contains(&"ownership"));
 

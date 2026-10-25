@@ -1,6 +1,126 @@
 use super::*;
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+mod host_tuning;
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn main_push_consent_is_operator_only_and_writes_exact_local_grant() {
+    let mut fixture = recursive_dag_rpc_fixture();
+    fixture.server.git_push_consent_dir = fixture._dir.path().join("git-push-consents");
+    let params = serde_json::json!({
+        "idempotency_key": Uuid::new_v4(),
+        "remote_url": "git@example.invalid:team/project.git",
+        "ref": "refs/heads/main",
+        "target_sha": "a".repeat(40),
+        "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        "operator_note": "Approve this exact main push once",
+    });
+    assert!(!agent_gate::is_allowed_for_attributed_caller(
+        "AuthorizeMainPush"
+    ));
+    assert!(!agent_gate::AGENT_VERBS.contains(&"AuthorizeMainPush"));
+    assert!(!agent_gate::READ_VERBS.contains(&"AuthorizeMainPush"));
+    let mut request = RpcRequest::new("AuthorizeMainPush", params.clone());
+    request.session_token = Some("synthetic-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected attributed refusal");
+    };
+    assert!(response.error.is_some());
+    assert!(!fixture.server.git_push_consent_dir.exists());
+    // Also fence a handler called without the normal dispatch gate.
+    assert!(
+        fixture
+            .server
+            .handle_authorize_main_push(&request)
+            .await
+            .is_err()
+    );
+    request.session_token = None;
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected operator response");
+    };
+    let grant = response.result.expect("operator grant succeeds");
+    for key in [
+        "remote_url",
+        "ref",
+        "target_sha",
+        "expires_at",
+        "operator_note",
+    ] {
+        assert_eq!(grant[key], params[key]);
+    }
+    assert_eq!(grant["version"], 1);
+    let id = Uuid::parse_str(grant["id"].as_str().unwrap()).unwrap();
+    let path = fixture
+        .server
+        .git_push_consent_dir
+        .join(format!("{id}.json"));
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(persisted, grant);
+    let replay = fixture
+        .server
+        .handle_authorize_main_push(&request)
+        .await
+        .unwrap();
+    assert_eq!(replay, grant);
+    request.params["target_sha"] = serde_json::json!("b".repeat(40));
+    assert!(
+        fixture
+            .server
+            .handle_authorize_main_push(&request)
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn main_push_consent_validates_scope_expiry_sha_and_operator_words() {
+    let fixture = recursive_dag_rpc_fixture();
+    let valid = serde_json::json!({
+        "idempotency_key": Uuid::new_v4(),
+        "remote_url": "git@example.invalid:team/project.git",
+        "ref": "refs/heads/main",
+        "target_sha": "a".repeat(40),
+        "expires_at": (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+        "operator_note": "Approve this exact main push once",
+    });
+    for (key, value) in [
+        ("ref", serde_json::json!("refs/heads/rolling")),
+        ("remote_url", serde_json::json!("")),
+        ("remote_url", serde_json::json!("remote\nother")),
+        ("target_sha", serde_json::json!("0".repeat(40))),
+        ("target_sha", serde_json::json!("A".repeat(40))),
+        ("target_sha", serde_json::json!("a".repeat(39))),
+        (
+            "expires_at",
+            serde_json::json!((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+        ),
+        (
+            "expires_at",
+            serde_json::json!((chrono::Utc::now() + chrono::Duration::hours(25)).to_rfc3339()),
+        ),
+        ("operator_note", serde_json::json!(" ")),
+        ("unknown", serde_json::json!(true)),
+    ] {
+        let mut params = valid.clone();
+        params[key] = value;
+        let request = RpcRequest::new("AuthorizeMainPush", params);
+        let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+        else {
+            panic!("expected validation response");
+        };
+        assert!(response.error.is_some(), "must refuse invalid {key}");
+    }
+    assert!(!fixture.server.git_push_consent_dir.exists());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn agent_schema_refusal_includes_nested_limit_without_changing_rpc_code() {
     let fixture = recursive_dag_rpc_fixture();
@@ -2050,6 +2170,7 @@ fn test_delete_session_params_parsing() {
 fn test_launch_session_params_mapping() {
     let params = LaunchSessionParams {
         completion_gates: None,
+        agent_role: None,
         query: "Hello".to_string(),
         title: None,
         working_dir: Some(std::path::PathBuf::from("/tmp")),
@@ -2126,6 +2247,9 @@ fn test_launch_session_params_mapping() {
         topology_iteration: 0,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     };
 
     assert_eq!(config.query, "Hello");
@@ -4758,6 +4882,7 @@ async fn manager_rpc_appointment_is_operator_only() {
         "GetGlobalManagerBudget",
         "GetManagerNodeWorkspace",
         "GetFleetOverview",
+        "GetGlobalDashboard",
         "RevokeGlobalManager",
         "RequestOperatorRestart",
         "GetOperatorRestart",
@@ -4864,6 +4989,93 @@ async fn operator_rpc_appoints_a_manager_with_its_policy_atomically() {
     assert_eq!(stored["revoked"], false);
 }
 
+/// #3417: one save of a provider grant with bench ticked also turns the daemon
+/// setting `bench.enabled` on (persisted, live), and a later save without the
+/// tick never turns it back off.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn saving_a_provider_grant_with_bench_ticked_turns_bench_enabled_on() {
+    use rsi_common::harness_manager_v2::{ConfigureHarnessManagerPolicyRequestV2, ManagerPolicyV2};
+    use rsi_common::provider_grant::ManagerProviderGrantV2;
+    use rsi_common::types::{SessionKind, SessionProvider};
+    let fixture = recursive_dag_rpc_fixture();
+    let project = issue_rpc_project_id();
+    let owner = Uuid::new_v4();
+    {
+        let store = fixture.manager.store().lock().await;
+        let mut session = mk_agent_test_session(owner, SessionKind::Standard, None, None);
+        session.project_id = Some(project);
+        store.insert_session(&session).unwrap();
+    }
+    let appointed = call_rpc(&fixture.server, "ConfigureHarnessManager", serde_json::json!({
+        "project_id": project, "session_id": owner, "epic_ids": null, "group_ids": [], "expected_row_version": 0
+    }))
+    .await;
+    assert!(appointed.error.is_none(), "{:?}", appointed.error);
+    let grant = |enable_bench| ManagerProviderGrantV2 {
+        provider: SessionProvider::OpenRouter,
+        budget_usd: 100.0,
+        expires_at: None,
+        efforts: vec!["high".into()],
+        enable_bench,
+        granted_at: None,
+    };
+    let save = |version: i64, key: &str, enable_bench: bool| {
+        serde_json::json!(ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: project,
+            expected_scope_version: 1,
+            expected_policy_version: version,
+            idempotency_key: key.into(),
+            policy: ManagerPolicyV2 {
+                provider_grants: vec![grant(enable_bench)],
+                ..Default::default()
+            },
+        })
+    };
+    assert!(!fixture.runtime_config.bench_enabled());
+    // A grant without the tick leaves the setting alone.
+    let first = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerPolicy",
+        save(0, "g1", false),
+    )
+    .await;
+    assert!(first.error.is_none(), "{:?}", first.error);
+    assert!(!fixture.runtime_config.bench_enabled());
+    // The tick turns it on in the same save, live and persisted.
+    let second = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerPolicy",
+        save(1, "g2", true),
+    )
+    .await;
+    assert!(second.error.is_none(), "{:?}", second.error);
+    assert!(fixture.runtime_config.bench_enabled());
+    assert_eq!(
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .get_daemon_setting("bench.enabled")
+            .unwrap()
+            .as_deref(),
+        Some("true")
+    );
+    // The daemon stamped the spend baseline the client did not send.
+    let saved = &second.result.as_ref().unwrap()["policy"]["provider_grants"][0];
+    assert!(saved["granted_at"].is_string(), "{saved}");
+    // Dropping the tick later never turns the setting off.
+    let third = call_rpc(
+        &fixture.server,
+        "ConfigureHarnessManagerPolicy",
+        save(2, "g3", false),
+    )
+    .await;
+    assert!(third.error.is_none(), "{:?}", third.error);
+    assert!(fixture.runtime_config.bench_enabled());
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn operator_rpc_lists_configures_and_revokes_area_node() {
@@ -4886,9 +5098,9 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
         let store = fixture.manager.store().lock().await;
         for (id, kind, parent) in [
             (owner, SessionKind::Standard, None),
-            (area_seat, SessionKind::Standard, None),
             (group, SessionKind::Group, None),
             (epic, SessionKind::Epic, Some(group)),
+            (area_seat, SessionKind::Task, Some(epic)),
         ] {
             let mut session = mk_agent_test_session(id, kind, parent, None);
             session.project_id = Some(project);
@@ -5024,6 +5236,36 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
             area_seat,
         )
         .await;
+    // A delegated Task seat can arm health without borrowing the PM's scope.
+    let mut wake = RpcRequest::new(
+        "AgentScheduleWake",
+        serde_json::json!({
+            "mode":"when", "message":"area health", "when":{"health_anomaly":{}}
+        }),
+    );
+    wake.session_token =
+        Some("de08940a07b092bcd9c8eb719d6168383be6551d57d610a35100379e97673389".into());
+    let HandleResult::Response(armed) = fixture.server.handle_request_inner(&wake).await else {
+        panic!("expected health wake response");
+    };
+    assert!(armed.error.is_none(), "{:?}", armed.error);
+    {
+        let store = fixture.manager.store().lock().await;
+        let spec = rsi_common::health_anomaly::HealthAnomalySpec {
+            project: Some(project),
+            ..Default::default()
+        };
+        let scope = crate::health_anomaly::Scope::live(&store, Some(area_seat), &spec).unwrap();
+        assert_eq!(scope.projects(), &[project]);
+        assert_eq!(scope.area_seat(), Some(area_seat));
+        assert!(!scope.is_fleet_wide());
+        assert!(
+            store
+                .agent_authority_projection(area_seat)
+                .unwrap()
+                .is_manager
+        );
+    }
     let mut escalate = RpcRequest::new(
         "AgentManagerEscalate",
         serde_json::json!({
@@ -5078,6 +5320,29 @@ async fn operator_rpc_lists_configures_and_revokes_area_node() {
     };
     assert!(sent.error.is_none(), "{:?}", sent.error);
     assert_eq!(sent.result.unwrap()[0]["ruling"], "Use the shared slot");
+    let revoked = call_rpc(
+        &fixture.server,
+        "RevokeManagerNode",
+        serde_json::json!({
+            "project_id":project,"node_id":delegated["node_id"],
+            "expected_grant_version":delegated["grant_version"],
+            "expected_authority_epoch":delegated["authority_epoch"],
+            "idempotency_key":"task-area-revoke"
+        }),
+    )
+    .await;
+    assert!(revoked.error.is_none(), "{:?}", revoked.error);
+    let store = fixture.manager.store().lock().await;
+    let scope = crate::health_anomaly::Scope::live(
+        &store,
+        Some(area_seat),
+        &rsi_common::health_anomaly::HealthAnomalySpec {
+            project: Some(project),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(scope.projects().is_empty());
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -5938,8 +6203,23 @@ async fn manager_rpc_lead_notify_reaches_busy_manager_inbox() {
     )
     .await;
     let inbox: AgentManagerInboxResultV1 = serde_json::from_value(inbox.result.unwrap()).unwrap();
-    assert_eq!(inbox.messages.len(), 1);
-    assert_eq!(inbox.messages[0].message_id, receipt.message_id);
+    // #3363: the first routine read already returned the notice, so the refused
+    // and forged notifies above (which persist nothing) leave a routine read empty.
+    assert!(inbox.messages.is_empty(), "{:?}", inbox.messages);
+    // The audit replay still shows the whole history: the one notice, once.
+    let history = invoke(
+        &fixture.server,
+        "05dd8bde1b57f395eb438ad36560e99369bf3edb42ef2deb36a53d0e547ecc82",
+        "AgentManagerInbox",
+        serde_json::json!({"include_sent": true}),
+    )
+    .await;
+    assert!(history.error.is_none(), "{:?}", history.error);
+    let history: AgentManagerInboxResultV1 =
+        serde_json::from_value(history.result.unwrap()).unwrap();
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(history.messages[0].message_id, receipt.message_id);
+    assert_eq!(history.messages[0].message, "Checks passed; commit abc123");
     {
         let store = fixture.manager.store().lock().await;
         let replacement_id = Uuid::new_v4();
@@ -6920,22 +7200,6 @@ async fn archive_session_rpc_reaches_private_cleanup_and_replays_one_projection(
         serde_json::json!({"session_id": session_id}),
     )
     .await;
-    // macOS has no `/proc/self/mountinfo` or `llistxattr` quarantine proof
-    // (`settlement mount inventory read failed`), so the private cleanup
-    // cannot prove its quarantine there. The explicit macOS outcome is the
-    // retryable `proof_unavailable` refusal; the rest of the flow is Linux only.
-    if cfg!(target_os = "macos") {
-        let error = response
-            .error
-            .as_ref()
-            .expect("macOS archive proof is unavailable");
-        assert_eq!(error.code, -32071, "{error:?}");
-        assert_eq!(error.message, "archive_cleanup_proof_unavailable");
-        let data = error.data.as_ref().expect("typed archive error data");
-        assert_eq!(data["safe_code"], "proof_unavailable");
-        assert_eq!(data["retryable"], true);
-        return;
-    }
     assert!(
         response.error.is_none(),
         "RPC archive error: {:?}",
@@ -8791,9 +9055,9 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
             "method: {method}"
         );
     }
-    // #1750: `handoff` is an allowed AgentUpdateIssue field on the RPC/CLI
-    // transport. A lead is not an Issue-bound worker, so the request clears the
-    // decoder and is refused by authority, never as an unknown field.
+    // #1750/#3052: `handoff` is an allowed AgentUpdateIssue field on the
+    // RPC/CLI transport. A lead appends it as a note to an Issue it governs: an
+    // append-only record that leaves the Issue row and its event log untouched.
     {
         let mut request = RpcRequest::new(
             "AgentUpdateIssue",
@@ -8809,7 +9073,13 @@ async fn agent_issue_rpc_lead_can_get_while_generic_issue_get_stays_denied() {
         else {
             panic!("expected handoff AgentUpdateIssue response");
         };
-        assert_agent_issue_error_code(&response, "authority_denied");
+        assert!(response.error.is_none(), "{response:?}");
+        let receipt: rsi_common::types::AgentIssueHandoffReceiptV1 =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(receipt.issue_id, issue.id);
+        assert_eq!(receipt.handoff_sequence, 1);
+        assert_eq!(receipt.handoff_bytes, "complete handoff".len() as i64);
+        assert!(!receipt.deduplicated);
     }
     {
         let store = fixture.manager.store().lock().await;
@@ -13840,6 +14110,61 @@ async fn agent_schedule_wake_binds_wake_session_id_from_token_ignoring_params() 
     assert_eq!(jobs[0].wake_mode, rsi_common::types::WakeMode::Resume);
 }
 
+/// #170: the mode `when` reply says the wake is pending and arrives later as a
+/// new turn, so a caller never reads `next_fire_at` (the arming instant for a
+/// jobs predicate) as a delivery.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn agent_schedule_wake_when_reply_says_nothing_has_been_delivered() {
+    use rsi_common::types::SessionKind;
+
+    let fixture = recursive_dag_rpc_fixture();
+    let caller_id = Uuid::new_v4();
+    let job_id = {
+        let store = fixture.manager.store().lock().await;
+        store
+            .insert_session(&mk_agent_test_session(
+                caller_id,
+                SessionKind::Task,
+                None,
+                None,
+            ))
+            .expect("insert caller session");
+        crate::scheduler::wake_when_tests::insert_job(&store, caller_id, "169-exact")
+    };
+    let token = "5d0c6f3e9a1b47c28e4f0a6b3c9d2e1f7a8b5c4d3e2f1a0b9c8d7e6f5a4b3c2d".to_string();
+    fixture
+        .manager
+        .register_agent_token(token.clone(), caller_id)
+        .await;
+    let mut request = RpcRequest::new(
+        "AgentScheduleWake",
+        serde_json::json!({
+            "message": "job done: read it",
+            "mode": "when",
+            "when": {"jobs_terminal": [job_id]},
+        }),
+    );
+    request.session_token = Some(token.into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let result = response.result.expect("result");
+    assert_eq!(result["wake_session_id"], caller_id.to_string());
+    assert_eq!(result["delivered"], false);
+    assert_eq!(
+        result["delivery"],
+        rsi_common::wake_predicate::WAKE_WHEN_ARMED_DELIVERY
+    );
+    let job = {
+        let store = fixture.manager.store().lock().await;
+        store.get_agent_job(job_id).unwrap().unwrap().job
+    };
+    assert_eq!(job.state, rsi_common::agent_jobs::JobState::Running);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
 #[tokio::test]
 async fn agent_schedule_wake_fresh_persists_bound_origin() {
@@ -18090,6 +18415,211 @@ async fn cloud_spend_rpc_reports_spend_and_cap_edits_reach_the_caps_file() {
     )
     .await;
     assert!(rejected.error.is_some());
+}
+
+/// #3154: arming the OpenRouter spend cap takes a fresh probe and records the
+/// account usage as the baseline (stop line = baseline + cap); a cap that
+/// cannot get a baseline is not armed; the cap, baseline and arming time are
+/// durable and restore after a restart; changing an armed cap keeps its
+/// baseline; 0 turns it off; the baseline rows are not operator-writable and a
+/// batch cannot arm; the Settings row reads the state from `GetDaemonConfig`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn openrouter_spend_cap_arming_takes_a_fresh_baseline_and_survives_a_restart() {
+    use crate::provider_status::{OpenRouterApi, ProviderStatusService};
+    use crate::vault::check::ProbeOutcome;
+    use crate::vault::secret::SecretString;
+    use crate::vault::{VaultHandleBuilder, VaultSettings};
+    use std::sync::atomic::AtomicBool;
+
+    struct Account {
+        usage_micro: std::sync::atomic::AtomicI64,
+        down: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl OpenRouterApi for Account {
+        async fn key(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Unsupported
+        }
+        async fn credits(&self, _secret: &SecretString) -> ProbeOutcome {
+            if self.down.load(Ordering::SeqCst) {
+                return ProbeOutcome::Connect;
+            }
+            let usage = self.usage_micro.load(Ordering::SeqCst) as f64 / 1e6;
+            ProbeOutcome::Http {
+                status: 200,
+                body: format!(r#"{{"data":{{"total_credits":615.0,"total_usage":{usage}}}}}"#)
+                    .into_bytes(),
+            }
+        }
+    }
+
+    let fixture = recursive_dag_rpc_fixture();
+    let account = Arc::new(Account {
+        usage_micro: std::sync::atomic::AtomicI64::new(514_968_000),
+        down: AtomicBool::new(true),
+    });
+    let service: &'static ProviderStatusService = Box::leak(Box::new(ProviderStatusService::new(
+        account.clone(),
+        std::time::Duration::from_secs(60),
+    )));
+    let enforcer = crate::openrouter_spend::SpendEnforcer {
+        service,
+        vault: VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+            .env(|name| (name == "OPEN_ROUTER").then(|| "sk-or-test-arm-key-0003".to_string()))
+            .open()
+            .unwrap(),
+        config: Arc::clone(&fixture.server.runtime_config),
+        store: fixture.manager.store().clone(),
+    };
+    let server = &fixture.server;
+    let cap_value = serde_json::json!(100);
+
+    // No baseline, no arming: the cap stays off and nothing is persisted.
+    let refused = server
+        .update_openrouter_spend_cap_with(&cap_value, &enforcer)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("openrouter_spend_cap_probe_failed"),
+        "{refused}"
+    );
+    assert_eq!(server.runtime_config.openrouter_spend_config().cap_usd, 0.0);
+    assert_eq!(
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .get_daemon_setting("openrouter_spend_cap_usd")
+            .unwrap(),
+        None
+    );
+
+    // The account answers: arming records its usage at that moment.
+    account.down.store(false, Ordering::SeqCst);
+    let armed = server
+        .update_openrouter_spend_cap_with(&cap_value, &enforcer)
+        .await
+        .unwrap();
+    assert_eq!(armed["spend_cap"]["state"], "ok");
+    assert_eq!(armed["spend_cap"]["cap_usd"], 100.0);
+    let stop_line = armed["spend_cap"]["stop_line_usd"].as_f64().unwrap();
+    assert!((stop_line - 614.968).abs() < 1e-6, "{stop_line}");
+    let config = server.runtime_config.openrouter_spend_config();
+    let (baseline, armed_at) = config.baseline.unwrap();
+    assert!((baseline - 514.968).abs() < 1e-6);
+    {
+        let store = fixture.manager.store().lock().await;
+        assert_eq!(
+            store
+                .get_daemon_setting("openrouter_spend_cap_usd")
+                .unwrap()
+                .as_deref(),
+            Some("100")
+        );
+        assert!(
+            store
+                .get_daemon_setting("openrouter_spend_baseline_usd")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_daemon_setting("openrouter_spend_armed_at")
+                .unwrap()
+                .is_some()
+        );
+        // A restart restores the whole ceiling from the durable rows.
+        let restarted = RuntimeConfig::from_config(&crate::config::Config::default());
+        crate::store::daemon_settings::apply_persisted_runtime_config(&store, &restarted).unwrap();
+        let back = restarted.openrouter_spend_config();
+        assert_eq!(back.cap_usd, 100.0);
+        assert_eq!(back.baseline, Some((baseline, armed_at)));
+    }
+
+    // Changing an armed cap keeps the baseline: the spend so far stays counted.
+    account.usage_micro.store(540_000_000, Ordering::SeqCst);
+    server
+        .update_openrouter_spend_cap_with(&serde_json::json!(60), &enforcer)
+        .await
+        .unwrap();
+    let changed = server.runtime_config.openrouter_spend_config();
+    assert_eq!(changed.cap_usd, 60.0);
+    assert_eq!(changed.baseline, Some((baseline, armed_at)));
+
+    // The Settings row reads cap, spent, remainder and state.
+    let config = call_rpc(server, "GetDaemonConfig", serde_json::Value::Null)
+        .await
+        .result
+        .expect("GetDaemonConfig succeeds");
+    assert_eq!(config["openrouter_spend_cap_usd"], 60);
+    assert_eq!(config["openrouter_spend"]["cap_usd"], 60.0);
+    assert_eq!(config["openrouter_spend"]["warn_pct"], 80);
+    assert!(
+        config["openrouter_spend_status"]
+            .as_str()
+            .unwrap()
+            .contains("$60.00")
+    );
+
+    // Off forgets the baseline and persists that.
+    server
+        .update_openrouter_spend_cap_with(&serde_json::json!(0), &enforcer)
+        .await
+        .unwrap();
+    assert!(
+        server
+            .runtime_config
+            .openrouter_spend_config()
+            .baseline
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .store()
+            .lock()
+            .await
+            .get_daemon_setting("openrouter_spend_armed_at")
+            .unwrap()
+            .as_deref(),
+        Some("")
+    );
+
+    // The derived rows are not operator-writable, and a batch cannot arm.
+    for field in ["openrouter_spend_baseline_usd", "openrouter_spend_armed_at"] {
+        let rejected = call_rpc(
+            server,
+            "UpdateDaemonConfig",
+            serde_json::json!({ "field": field, "value": 0 }),
+        )
+        .await;
+        assert!(rejected.error.is_some(), "{field}");
+    }
+    let batch = call_rpc(
+        server,
+        "UpdateDaemonConfig",
+        serde_json::json!({ "updates": [
+            { "field": "openrouter_spend_cap_usd", "value": 5 },
+            { "field": "openrouter_spend_warn_pct", "value": 70 },
+        ]}),
+    )
+    .await;
+    assert!(batch.error.is_some(), "a batch cannot arm the cap");
+    assert_eq!(server.runtime_config.openrouter_spend_config().cap_usd, 0.0);
+    assert_eq!(server.runtime_config.openrouter_spend_config().warn_pct, 80);
+    // The warn percent alone is an ordinary durable setting.
+    let warn = call_rpc(
+        server,
+        "UpdateDaemonConfig",
+        serde_json::json!({ "field": "openrouter_spend_warn_pct", "value": 70 }),
+    )
+    .await;
+    assert!(warn.error.is_none(), "{:?}", warn.error);
+    assert_eq!(server.runtime_config.openrouter_spend_config().warn_pct, 70);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -22548,6 +23078,36 @@ async fn fleet_operator_rpc_returns_typed_bounded_snapshot() {
     assert_eq!(snapshot.totals.len(), 3);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn global_dashboard_operator_rpc_returns_typed_snapshot_and_rejects_bad_windows() {
+    let fixture = recursive_dag_rpc_fixture();
+    let request = RpcRequest::new("GetGlobalDashboard", serde_json::json!({"window": "7d"}));
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let snapshot: rsi_common::global_dashboard::GlobalDashboard =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(snapshot.window, "7d");
+    assert_eq!(snapshot.window_seconds, 7 * 86400);
+    let request = RpcRequest::new("GetGlobalDashboard", serde_json::Value::Null);
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    let snapshot: rsi_common::global_dashboard::GlobalDashboard =
+        serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(snapshot.window, "24h", "the window defaults to 24h");
+    let request = RpcRequest::new("GetGlobalDashboard", serde_json::json!({"window": "30d"}));
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response");
+    };
+    assert!(response.error.is_some(), "an unknown window is refused");
+}
+
 /// #1626: `project_created` is daemon-global, so a stream subscribed for any
 /// session receives it, and it carries its own bus type.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -22685,4 +23245,74 @@ async fn provider_launch_overrides_write_is_operator_only_validated_and_typed() 
             "a refused write changes nothing"
         );
     }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[tokio::test]
+async fn clear_provider_usage_hold_is_operator_only_and_preserves_other_provider() {
+    use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
+    use rsi_common::types::SessionProvider;
+    assert!(!agent_gate::AGENT_VERBS.contains(&"ClearProviderUsageHold"));
+    assert!(!agent_gate::READ_VERBS.contains(&"ClearProviderUsageHold"));
+    let fixture = recursive_dag_rpc_fixture();
+    {
+        let store = fixture.server.session_manager.store().lock().await;
+        for provider in [SessionProvider::Claude, SessionProvider::Codex] {
+            store
+                .upsert_provider_rate_limit_snapshot(
+                    &ProviderRateLimitSnapshot {
+                        provider,
+                        status: None,
+                        rate_limit_type: None,
+                        overage_status: None,
+                        is_using_overage: false,
+                        observed_at: chrono::Utc::now(),
+                        stale_reason: None,
+                        windows: vec![ProviderRateLimitWindow {
+                            window_key: "seven_day".into(),
+                            utilization: 1.0,
+                            resets_at_epoch: Some(
+                                (chrono::Utc::now() + chrono::Duration::days(4)).timestamp(),
+                            ),
+                        }],
+                    },
+                    None,
+                )
+                .unwrap();
+        }
+    }
+    let params = serde_json::json!({"provider": "Claude"});
+    let mut request = RpcRequest::new("ClearProviderUsageHold", params.clone());
+    request.session_token = Some("synthetic-token".into());
+    let HandleResult::Response(response) = fixture.server.handle_request_inner(&request).await
+    else {
+        panic!("expected response")
+    };
+    assert_eq!(response.error.unwrap().code, INVALID_PARAMS);
+    assert!(
+        fixture
+            .server
+            .session_manager
+            .store()
+            .lock()
+            .await
+            .provider_usage_window_hold_until(SessionProvider::Claude, chrono::Utc::now())
+            .unwrap()
+            .is_some()
+    );
+    let response = call_rpc(&fixture.server, "ClearProviderUsageHold", params).await;
+    assert_eq!(response.result.unwrap()["cleared"], true);
+    let store = fixture.server.session_manager.store().lock().await;
+    assert_eq!(
+        store
+            .provider_usage_window_hold_until(SessionProvider::Claude, chrono::Utc::now())
+            .unwrap(),
+        None
+    );
+    assert!(
+        store
+            .provider_usage_window_hold_until(SessionProvider::Codex, chrono::Utc::now())
+            .unwrap()
+            .is_some()
+    );
 }

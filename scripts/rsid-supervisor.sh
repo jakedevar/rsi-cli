@@ -24,18 +24,42 @@ if [[ -z ${RSI_LISTEN_FD+x} && ${LISTEN_PID:-} == "$$" ]]; then
     esac
 fi
 child_pid=
+last_child_pid=
+unannounced=0
 stopping=0
 restart_window_seconds=3600
 if [[ -n ${HOME:-} ]]; then
     default_restart_budget_file=$HOME/.rsi/deploy-restart-budget
     default_shutdown_marker=$HOME/.rsi/shutdown-begun
     default_incident_file=$HOME/.rsi/forced-shutdown-incident
+    default_intended_stop_file=$HOME/.rsi/intended-stop
 else
     default_restart_budget_file=/tmp/rsi-deploy-restart-budget
     default_shutdown_marker=/tmp/rsi-shutdown-begun
     default_incident_file=/tmp/rsi-forced-shutdown-incident
+    # #3507: never a predictable shared /tmp path. The per-user runtime directory
+    # (0700, owner only) when there is one; otherwise no announcement is honoured
+    # and the stop is judged unannounced (fail closed).
+    if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR ]]; then
+        default_intended_stop_file=$XDG_RUNTIME_DIR/rsi/intended-stop
+    else
+        default_intended_stop_file=
+    fi
 fi
 restart_budget_file=${RSID_SUPERVISOR_RESTART_BUDGET_FILE:-$default_restart_budget_file}
+# #3492: the restart history this supervisor holds, published beside the budget
+# snapshot so the daemon's deploy admission, the health wake and the TUI judge
+# the same budget (`limit=`, `window=`, one `restart=<epoch>` per restart,
+# `backoff_until=<epoch>` while it waits out an exhausted budget).
+# With no HOME (and no explicit budget file) there is no private directory to
+# publish into, so nothing is published rather than writing a shared /tmp path.
+restarts_file=${RSID_SUPERVISOR_RESTARTS_FILE:-}
+if [[ -z $restarts_file && ( -n ${HOME:-} || -n ${RSID_SUPERVISOR_RESTART_BUDGET_FILE:-} ) ]]; then
+    restarts_file=$(dirname "$restart_budget_file")/supervisor-restarts
+fi
+# An exhausted budget never ends the supervisor (that left no rsid at all): it
+# waits for room, at most this long, then restarts the daemon.
+exhausted_backoff_max_seconds=${RSID_SUPERVISOR_EXHAUSTED_BACKOFF_MAX_SECONDS:-900}
 # Shutdown backstop (#2561). The daemon writes `pid=<its pid> reason=<code>` to
 # the marker when a shutdown begins (its path reaches the daemon as
 # RSID_SHUTDOWN_MARKER, which the daemon then removes from its environment so no
@@ -48,6 +72,15 @@ restart_budget_file=${RSID_SUPERVISOR_RESTART_BUDGET_FILE:-$default_restart_budg
 # daemon start surfaces it to the manager), and takes the exit-75 path.
 shutdown_marker=${RSID_SUPERVISOR_SHUTDOWN_MARKER:-$default_shutdown_marker}
 incident_file=${RSID_SUPERVISOR_INCIDENT_FILE:-$default_incident_file}
+# #3433: a daemon that ends on a SIGINT/SIGTERM nobody announced is restarted,
+# not treated as an intended stop (a stop through this supervisor, a deploy, an
+# operator drain or restart never gets there). Whoever stops the daemon on
+# purpose by signalling it directly (scripts/install-release.sh) first appends
+# `pid=<daemon pid> reason=<code>` to this file, which is the announcement. The
+# settle window lets a `systemctl stop`, which signals the whole unit, deliver
+# its SIGTERM to this supervisor too before the exit is judged.
+intended_stop_file=${RSID_SUPERVISOR_INTENDED_STOP_FILE:-$default_intended_stop_file}
+unannounced_settle_seconds=${RSID_SUPERVISOR_UNANNOUNCED_SETTLE_SECONDS:-2}
 poll_seconds=${RSID_SUPERVISOR_POLL_SECONDS:-1}
 term_wait_seconds=${RSID_SUPERVISOR_TERM_WAIT_SECONDS:-5}
 default_shutdown_grace_seconds=120
@@ -86,6 +119,24 @@ load_restart_budget() {
 load_restart_budget
 restart_times=()
 read -r -a restart_times <<< "${RSID_SUPERVISOR_RESTART_TIMES:-}"
+
+# #3492: write the restart history (atomically) for the daemon and the TUI. A
+# failure only costs them the shared view, never a restart.
+publish_restarts() {
+    local backoff_until=${1:-} tmp restarted_at
+    [[ -n $restarts_file ]] || return 0
+    mkdir -p "$(dirname "$restarts_file")" 2>/dev/null || return 0
+    tmp=$restarts_file.tmp.$$
+    {
+        printf 'limit=%s\nwindow=%s\n' "$max_restarts_per_window" "$restart_window_seconds"
+        for restarted_at in ${restart_times[@]+"${restart_times[@]}"}; do
+            printf 'restart=%s\n' "$restarted_at"
+        done
+        if [[ -n $backoff_until ]]; then printf 'backoff_until=%s\n' "$backoff_until"; fi
+    } > "$tmp" 2>/dev/null && mv -f "$tmp" "$restarts_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    return 0
+}
+publish_restarts
 # #1045: a deploy swaps the new binary in, leaves the old one as
 # `<real path>.prev`, writes `<real path>.deploy-inflight` and exits 75. Only
 # with that marker present, if the binary started after the restart dies within
@@ -194,6 +245,92 @@ record_forced_shutdown() {
         || echo "could not record the forced shutdown in $incident_file" >&2
 }
 
+# #3433: append one line for the next daemon start to surface (the same file
+# and surfacing as a forced shutdown, #2561).
+record_incident() {
+    local trigger=$1 signal=$2 pid=$3
+    mkdir -p "$(dirname "$incident_file")" 2>/dev/null || true
+    printf 'forced_at=%s trigger=%s grace_seconds=0 pid=%s signal=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$trigger" "$pid" "$signal" >> "$incident_file" \
+        || echo "could not record the incident in $incident_file" >&2
+}
+
+# #3433: true when this daemon announced a signal-driven shutdown nobody
+# announced beforehand. The daemon writes its marker (`pid=<pid> reason=ctrl_c`
+# or `reason=sigterm`, plus `sender_pid=`) when it receives SIGINT or SIGTERM;
+# any other reason (an operator drain, ...) is an intended stop. An
+# announcement in $intended_stop_file naming the daemon, written no earlier
+# than this launch, makes the signal intended and is consumed here. Sets
+# unannounced_signal and unannounced_sender.
+unannounced_signal=
+unannounced_sender=
+
+# #3507: an announcement is honoured only from a regular file (never a symlink)
+# that this uid owns with mode 0600 or stricter; anything else is ignored, so
+# another user's or a planted file can never excuse an unannounced stop. An
+# empty path (no private location on this host) honours nothing. Prints why when
+# an existing file is refused. stat -c is GNU, stat -f is BSD/macOS.
+intended_stop_file_trusted() {
+    local file=$1 owner mode
+    [[ -n $file ]] || return 1
+    [[ -e $file || -L $file ]] || return 1
+    if [[ -L $file || ! -f $file ]]; then
+        echo "ignoring intended-stop announcement $file: not a regular file" >&2
+        return 1
+    fi
+    owner=$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file" 2>/dev/null) || owner=
+    mode=$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file" 2>/dev/null) || mode=
+    if [[ $owner != "$(id -u)" ]]; then
+        echo "ignoring intended-stop announcement $file: not owned by this user" >&2
+        return 1
+    fi
+    if [[ ! $mode =~ ^[0-7]{3,4}$ ]] || (( (8#$mode & ~8#600) != 0 )); then
+        echo "ignoring intended-stop announcement $file: mode $mode is looser than 0600" >&2
+        return 1
+    fi
+    return 0
+}
+unannounced_signal_stop() {
+    local line reason= pid= sender= marker_mtime intent_line intent_mtime
+    unannounced_signal=
+    unannounced_sender=
+    [[ -e $shutdown_marker ]] || return 1
+    IFS= read -r line < "$shutdown_marker" 2>/dev/null || true
+    [[ $line =~ (^|[[:space:]])pid=([0-9]+)([[:space:]]|$) ]] && pid=${BASH_REMATCH[2]}
+    [[ $line =~ (^|[[:space:]])reason=([a-z_]+)([[:space:]]|$) ]] && reason=${BASH_REMATCH[2]}
+    [[ $line =~ (^|[[:space:]])sender_pid=([0-9]+)([[:space:]]|$) ]] && sender=${BASH_REMATCH[2]}
+    [[ $pid == "$child_pid" ]] || return 1
+    case $reason in
+        ctrl_c) unannounced_signal=INT ;;
+        sigterm) unannounced_signal=TERM ;;
+        *) return 1 ;;
+    esac
+    unannounced_sender=${sender:-unknown}
+    if intended_stop_file_trusted "$intended_stop_file"; then
+        intent_mtime=$(stat -c %Y "$intended_stop_file" 2>/dev/null \
+            || stat -f %m "$intended_stop_file" 2>/dev/null || echo 0)
+        while IFS= read -r intent_line || [[ -n $intent_line ]]; do
+            if [[ $intent_line =~ (^|[[:space:]])pid=${child_pid}([[:space:]]|$) ]] \
+                && ((intent_mtime >= started_at)); then
+                rm -f "$intended_stop_file"
+                return 1
+            fi
+        done < "$intended_stop_file"
+    fi
+    return 0
+}
+
+# Let a stop that signals the whole unit reach this supervisor before judging
+# a daemon exit; ends early once the supervisor is told to stop.
+settle_unannounced() {
+    local slices=$((${unannounced_settle_seconds%%.*} * 10)) i
+    for ((i = 0; i < slices; i++)); do
+        [[ $stopping -eq 0 ]] || return 0
+        sleep 0.1 &
+        wait $! 2>/dev/null || true
+    done
+}
+
 # Sleep without delaying a trap: `wait` returns as soon as a signal arrives.
 # Where bash has `wait -n` (4.3+) the nap also ends the moment the daemon exits,
 # so a quick exit is never delayed by the poll interval.
@@ -290,6 +427,28 @@ supervise_child() {
     done
 }
 
+# Keep only the restarts still inside the window (needs $now).
+prune_restart_times() {
+    local restarted_at recent=()
+    # #2936: `${a[@]+"${a[@]}"}` keeps an empty array legal under `set -u` on
+    # bash 3.2 (macOS /bin/bash), where expanding an empty array is an error.
+    for restarted_at in ${restart_times[@]+"${restart_times[@]}"}; do
+        if ((now - restarted_at < restart_window_seconds)); then
+            recent+=("$restarted_at")
+        fi
+    done
+    restart_times=(${recent[@]+"${recent[@]}"})
+}
+
+# Wait out an exhausted budget; a stop signal ends the wait at once.
+exhausted_backoff() {
+    local waited_from=$SECONDS
+    while ((SECONDS - waited_from < $1)) && [[ $stopping -eq 0 ]]; do
+        sleep 1 &
+        wait $! 2>/dev/null || true
+    done
+}
+
 if ((shutdown_backstop == 0)); then
     echo "rsid shutdown backstop is unsupported on this platform (no process-group kill); a wedged shutdown needs a manual kill" >&2
 fi
@@ -311,6 +470,17 @@ while :; do
     supervise_child
     wait "$child_pid"
     status=$?
+    unannounced=0
+    if [[ $stopping -eq 0 && $status -eq 0 && $forced_exit -eq 0 ]] && unannounced_signal_stop; then
+        settle_unannounced
+        if [[ $stopping -eq 0 ]]; then
+            unannounced=1
+            # The restart follows the exit-75 path and its bounded budget.
+            status=75
+            echo "rsid stopped by an unannounced SIG${unannounced_signal} (sender pid ${unannounced_sender}; see daemon.log); restarting it" >&2
+            record_incident "unannounced_signal" "$unannounced_signal" "$child_pid"
+        fi
+    fi
     if [[ $stopping -eq 1 ]]; then
         # wait can return early when a signal fires; finish reaping the child.
         wait "$child_pid" 2>/dev/null || true
@@ -329,6 +499,7 @@ while :; do
             status=75
         fi
     fi
+    last_child_pid=$child_pid
     child_pid=
     recover_pending_database
     if [[ $status -ne 75 ]]; then
@@ -371,20 +542,28 @@ while :; do
     # child. Read the daemon-published snapshot for every restart decision.
     load_restart_budget
     now=$(date +%s)
-    recent=()
-    # #2936: `${a[@]+"${a[@]}"}` keeps an empty array legal under `set -u` on
-    # bash 3.2 (macOS /bin/bash), where expanding an empty array is an error.
-    for restarted_at in ${restart_times[@]+"${restart_times[@]}"}; do
-        if ((now - restarted_at < restart_window_seconds)); then
-            recent+=("$restarted_at")
-        fi
-    done
-    restart_times=(${recent[@]+"${recent[@]}"})
+    prune_restart_times
     if ((${#restart_times[@]} >= max_restarts_per_window)); then
-        echo "rsid watchdog restart budget exhausted ($max_restarts_per_window in $restart_window_seconds seconds)" >&2
-        exit 75
+        # #3492: past the budget the supervisor WAITS for room (the oldest restart
+        # leaving the window, at most the cap below) and then restarts the daemon;
+        # exiting left the host with no rsid at all. The wait is published for the
+        # TUI and deploy admission, and an incident tells the next daemon start to
+        # notify the operator and the manager.
+        frees_in=$((restart_times[${#restart_times[@]} - max_restarts_per_window] + restart_window_seconds - now))
+        if ((frees_in < 1)); then frees_in=1; fi
+        if ((frees_in > exhausted_backoff_max_seconds)); then frees_in=$exhausted_backoff_max_seconds; fi
+        record_incident "restart_budget_exhausted" "${unannounced_signal:-none}" "$last_child_pid"
+        echo "rsid watchdog restart budget exhausted ($max_restarts_per_window in $restart_window_seconds seconds); not exiting: restarting the daemon in ${frees_in}s" >&2
+        publish_restarts $((now + frees_in))
+        exhausted_backoff "$frees_in"
+        if [[ $stopping -eq 1 ]]; then
+            exit 0
+        fi
+        now=$(date +%s)
+        prune_restart_times
     fi
     restart_times+=("$now")
+    publish_restarts
     if deploy_requested_exit "$status"; then
         # #2355: the daemon asked for this exit-75 (it wrote the deploy marker
         # during this run), so there is no crash to back off from. The restart

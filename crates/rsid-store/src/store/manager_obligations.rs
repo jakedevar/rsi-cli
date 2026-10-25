@@ -71,6 +71,19 @@ pub(crate) fn transfer_manager_obligations_on(
     successor: Uuid,
     backstop_follows: bool,
 ) -> Result<ObligationsMoved> {
+    transfer_seat_obligations_on(conn, predecessor, successor, backstop_follows, true)
+}
+
+/// Shared publication path for manager seats and rotating Epic leads. Lead
+/// rotation carries its own resume/predicate obligations, leaving terminal
+/// watches on their existing routes (the scheduler follows published tips).
+pub(crate) fn transfer_seat_obligations_on(
+    conn: &Connection,
+    predecessor: Uuid,
+    successor: Uuid,
+    backstop_follows: bool,
+    terminal_watches_follow: bool,
+) -> Result<ObligationsMoved> {
     if conn.is_autocommit() {
         return Err(DaemonError::Store(
             "manager obligation transfer requires a transaction".into(),
@@ -86,44 +99,46 @@ pub(crate) fn transfer_manager_obligations_on(
     let target = successor.to_string();
     let stamp = stamp();
     let mut moved = ObligationsMoved::default();
-    let owned: Vec<(String, String)> = {
-        let mut statement = conn.prepare(
-            "SELECT j.id, j.wake_mode FROM scheduled_jobs j
+    if terminal_watches_follow {
+        let owned: Vec<(String, String)> = {
+            let mut statement = conn.prepare(
+                "SELECT j.id, j.wake_mode FROM scheduled_jobs j
              WHERE j.enabled=1 AND j.wake_session_id=?1 AND j.wake_mode LIKE 'on_terminal:%'
                AND NOT EXISTS(SELECT 1 FROM harness_manager_watches w WHERE w.job_id=j.id)
              ORDER BY j.id",
-        )?;
-        statement
-            .query_map([&old], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<_, _>>()?
-    };
-    for (job, mode) in owned {
-        // One terminal fires one wake: a watch the successor already holds on
-        // the same session wins and this duplicate is disabled instead.
-        let held: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
-             WHERE enabled=1 AND wake_session_id=?1 AND wake_mode=?2)",
-            params![target, mode],
-            |r| r.get(0),
-        )?;
-        let changed = if held {
-            conn.execute(
-                "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1 AND enabled=1",
-                params![job, stamp],
-            )?
-        } else {
-            conn.execute(
-                "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
-                 WHERE id=?1 AND enabled=1 AND wake_session_id=?4",
-                params![job, target, stamp, old],
-            )?
+            )?;
+            statement
+                .query_map([&old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?
         };
-        moved.watches += usize::from(changed == 1 && !held);
-    }
-    // Earlier hops of the same slot's lineage too: a watch armed before this
-    // change shipped may still sit on a seat retired several handovers ago.
-    for hop in slot_lineage_on(conn, predecessor)? {
-        follow_slot_watches_on(conn, hop, successor, &stamp)?;
+        for (job, mode) in owned {
+            // One terminal fires one wake: a watch the successor already holds on
+            // the same session wins and this duplicate is disabled instead.
+            let held: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM scheduled_jobs
+             WHERE enabled=1 AND wake_session_id=?1 AND wake_mode=?2)",
+                params![target, mode],
+                |r| r.get(0),
+            )?;
+            let changed = if held {
+                conn.execute(
+                    "UPDATE scheduled_jobs SET enabled=0,updated_at=?2 WHERE id=?1 AND enabled=1",
+                    params![job, stamp],
+                )?
+            } else {
+                conn.execute(
+                    "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+                 WHERE id=?1 AND enabled=1 AND wake_session_id=?4",
+                    params![job, target, stamp, old],
+                )?
+            };
+            moved.watches += usize::from(changed == 1 && !held);
+        }
+        // Earlier hops of the same slot's lineage too: a watch armed before this
+        // change shipped may still sit on a seat retired several handovers ago.
+        for hop in slot_lineage_on(conn, predecessor)? {
+            follow_slot_watches_on(conn, hop, successor, &stamp)?;
+        }
     }
     // #1572: only the settling owner moves; the deploy keeps the request
     // identity (`request_session_id`) its key was recorded under, so a key the
@@ -151,9 +166,18 @@ pub(crate) fn transfer_manager_obligations_on(
     // predicates name no job. A terminal job row is immutable, so its owner
     // stays the first seat it ran under: it is seat-neutral here, or the wait
     // would stop following the seat after one hop (#2483).
+    // #482: the successor's existing bootstrap/history is the new fence
+    // baseline, not operator input after the predecessor armed this wait.
+    // Retry state belongs to the displaced delivery target: re-evaluate now
+    // rather than inheriting its potentially ten-minute refusal backoff.
     moved.wakes += conn.execute(
         concat!(
-            "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3
+            "UPDATE scheduled_jobs SET wake_session_id=?2,updated_at=?3,
+               next_fire_at=min(next_fire_at,?3),
+               schedule_json=json_set(
+                 json_remove(schedule_json,'$.continuation_retry'),
+                 '$.self_wake_transfer',json_object('owner',?2,'event_sequence',
+                   (SELECT coalesce(max(sequence),0) FROM conversation_events WHERE session_id=?2)))
              WHERE enabled=1 AND wake_mode='resume' AND wake_session_id=?1 AND ",
             not_protected!(),
             " AND json_valid(schedule_json)
@@ -190,12 +214,23 @@ pub(crate) fn transfer_manager_obligations_on(
             " AND NOT (json_valid(schedule_json)
                        AND json_extract(schedule_json,'$.wake_when') IS NOT NULL)
                AND name NOT LIKE 'keepalive-%' AND name NOT LIKE 'background-process-%'
+               AND (?4 IS NULL OR id<>?4)
                AND NOT EXISTS(SELECT 1 FROM scheduled_jobs held
                               WHERE held.enabled=1 AND held.wake_mode='resume'
                                 AND held.wake_session_id=?2 AND held.name=scheduled_jobs.name
                                 AND held.name<>'agent-wake')"
         ),
-        params![old, target, stamp],
+        params![
+            old,
+            target,
+            stamp,
+            (!terminal_watches_follow).then(|| {
+                crate::store_support::schedule_wake_job::deterministic_program_guard_job_id(
+                    predecessor,
+                )
+                .to_string()
+            })
+        ],
     )?;
     Ok(moved)
 }
@@ -405,6 +440,7 @@ pub(crate) mod test_support {
             armed_at: chrono::Utc::now(),
             deadline: None,
             repo_dir: None,
+            delivered_shas: Vec::new(),
         }
     }
 

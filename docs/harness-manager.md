@@ -348,10 +348,11 @@ Budgets section.
 | Grant Group / Grant Group by ID | Select existing project Groups (at most 32). Enter an ID if it is not cached in the session list. |
 | Allow root Group creation | Separate root-creation opt-in; also requires Topology. |
 | Created container / session quota | Persistent creation ceilings: 0–64 containers and 0–1024 sessions. Defaults are zero. Policy edits do not reset scope usage. Manager workers, `retry_lead`, `replace_lead` and root successions consume the session quota. DB-native reviewer launches do not; they stay bounded by per-work review rounds and the active session limit. A blocked or revoked operation that never created its session is not charged (queued, running, failed and uncertain operations are). |
-| Active session limit | 1–100, default 4; applies alongside existing provider/Model Control admission. |
+| Active session limit | 1–100, default 4; applies alongside existing provider/Model Control admission. It caps the worker sessions the manager launches: the manager's own seat lineage (the current tip, a predecessor still `Running` while it rotates out, a succession candidate) fills no slot and its own calls are never refused by it (#235); a root succession's candidate is admitted at full worker capacity too (#241), while pause and spend still refuse it. A seat a portfolio node appoints still counts against that node's caps. |
 | Tier-2 minimum reviewer | Local, Standard (default), or Premium. Enter cycles the value. A work row marked `risk_tier: "tier2"` requires a DB-native reviewer at or above this model tier; use Tier-2 for authority, custody, and migration changes. The field is saved through the same operator policy RPC as the other budgets. |
 | Provider active limits | Optional 1–64 ceiling per provider. Blank removes the override and uses the overall policy. |
 | Allowed launches | An empty `allowed_launches` list fails closed. An appointed project PM with an empty own list falls back to its ancestor portfolio grant's effective launch list through `manager_effective_launches`; a seat with no portfolio ancestor, including a satellite seat, has no fallback (#1748). Adding entries restricts launches to those choices (up to 64) and enables intent recovery to choose among them, subject to its other gates. Use the provider/model catalog picker and that model's supported effort choices, or retain exact values under Exact launch tuples. An entry with an explicit effort admits exactly that effort. An entry with the default (no) effort admits any effort for its provider and model, never another provider or model (#1905); when RSI knows the model's effort ladder, only efforts on it (#1953). Enter on Remove deletes that draft choice; removing the last entry restores the empty-list behavior above. Use currently configured valid model/effort values. |
+| Provider grants | One operator action per paid provider (#3417): `provider_grants` on the project policy, edited on the Policy screen under "Provider grants · operator spend" (`:manager board`, `p`). A grant names a provider, a USD budget, an optional UTC expiry, the efforts it allows and a bench tick. While it has budget left and is unexpired, any model of that provider is launchable at those efforts with no exact `allowed_launches` tuple (it expands to a visible `Provider/*/effort` entry that every ancestor's list still narrows), and `bench` jobs that bill the provider are admitted, bounded by what the grant has left and without the armed OpenRouter account cap. The daemon charges the settled `estimated_cost_usd` of that provider since the grant's first save (`granted_at`, daemon-assigned and kept across raises); at the budget a launch or bench job is refused `manager_v2_provider_grant_exhausted` naming the grant, the spend and the row that raises it, and exactly one operator to-do is filed (one per budget, so a raise re-arms it). An expired grant behaves like no grant (`manager_v2_provider_grant_expired`), and an effort outside it is refused `manager_v2_provider_grant_effort`. Exact `allowed_launches` tuples are unchanged and keep working beside a grant. Saving a grant with the bench tick also turns the daemon setting `bench.enabled` on (it never turns it off); the screen shows `bench.enabled` and each grant's live spend ("OpenRouter: $12.40 of $100 used, expires 2026-12-01") beside it. Operator-only: `ConfigureHarnessManagerPolicy` and the Policy screen write it; agent verbs and delegated or handed-down policies carry none (`manager_v2_provider_grant_operator_only`); agents read the grants and spend in the `provider_grants` list of the Inspect Resources row. |
 | Recovery attempt limit | 0–32 persisted attempts; default zero disables automatic recovery allowance. Existing retry owners and kill-switches still apply. |
 | Retry delay | 1–86400 seconds, default 60. Waiting for a due time remains an outstanding obligation. |
 | Request timeout | 30–604800 seconds, default 900. Expiration records a blocker/recovery obligation, never invented completion. |
@@ -372,7 +373,16 @@ its exact `prepared_id` and `target_digest` to
 `AgentManagerCommitPreparedControl` with a stable idempotency key. Read the
 returned `operation_id` with `AgentManagerGetAction` to confirm the outcome.
 The prepared action resolves current scope and target fences; a stale result
-needs a fresh prepare. Lead assignment is a separate `assign_lead` action.
+needs a fresh prepare. `create_session` creates a worker. To recover a lost
+Epic lead, use `replace_lead` directly with the observed lead fence, query and
+launch choice; do not create a worker and then race a separate `assign_lead`.
+It also accepts an empty lead slot or an archived/deleted lead. An empty slot
+forks from published `origin/rolling`; a retained predecessor uses the normal
+handover source. The replacement's session and custody are durable before its
+lead pointer is published, and publication precedes token mint and provider
+dispatch, so its first authority catalog includes `epic_lead`. A launch failure
+retains the replacement as the recoverable lead. A competing assignment is
+never overwritten. Policy, human approval and custody gates still apply.
 
 ```json
 {"operation":{"action":"create_session","parent_id":"<epic-uuid>","kind":"Task","query":"Implement the assigned work","launch":{"provider":"Codex","model":"gpt-6-sol","effort":"medium"}}}
@@ -553,8 +563,25 @@ Health (see [Health section](#health-section)). Use `j`/`k` to select a row, Pag
 to scroll its details, `n`/`p` for cursor pages, `o` to open the selected row's session,
 and `r` to refresh from page one.
 The manager-wide Resources row reports `active_sessions`, pending operations,
-spend and `created_sessions` `{used, limit, remaining}` against the saved
-`max_created_sessions` (the count creation admission charges).
+spend and `created_sessions` `{used, limit, remaining, window_hours,
+next_free_at, lifetime_total, summary}` against the saved `max_created_sessions`
+(the count creation admission charges). The quota is a refilling allowance
+(#3416): `used` counts the sessions the seat lineage created in the last
+`created_sessions_window_hours` (default 24; a policy saved without the field
+reads as 24), `summary` reads "N of M created in the last 24 h; next slot frees
+at HH:MM", and `lifetime_total` is the informational all-time count that is never
+compared with the limit. A succession inherits the grant and the predecessor's
+in-window creations still count, so rotating never clears the cap; the oldest
+creation leaving the window frees a slot with no operator action. New grants,
+presets and pushed satellite policies start at 256 per 24 h. The window is
+operator-edited on the Policy screen ("Created session window (hours)"); agent
+verbs cannot change it.
+`counted_session_ids` lists the sessions `active_sessions` counts against
+`max_active_sessions`, `excluded_manager_seat_ids` the live sessions of the
+manager's own seat lineage it does not count, and `active_basis` states the rule
+(#235). A `manager_v2_concurrency_capacity` refusal names the same two lists:
+`manager_v2_concurrency_capacity: active_sessions=<n> max_active_sessions=<m>
+counted=[...] excluded_manager_seat=[...]` (at most 16 ids each, then `+N more`).
 Workers and Topology page across every legal direct Epic child with bounded indexed
 reads. Their cursors retain an insertion horizon while each page checks current
 scope and parentage. Refresh to include later insertions or rows moved behind the
@@ -1270,7 +1297,8 @@ pass limits: the params carry no threshold, and daemon settings
 (`UpdateDaemonConfig`) stay operator-only. The pass runs under the trigger
 labels `manager_dry_run`, `manager_actual` and `preview`.
 Below the high watermark a finished worker's `target/` waits for the idle TTL
-(or a landed HEAD, #1684). At or above it the TTL no longer applies: the pass
+(or a landed HEAD or published queue entry, #1684, or a final handoff whose
+HEAD is on a pushed origin branch, hub #3026). At or above it the TTL no longer applies: the pass
 examines the newest finished workers first, including ones that finished after
 an earlier pressure pass moved on (#1737), and reclaims each unless a live
 consumer (enabled wake, restart intent, manager seat, queued or running job)
@@ -1291,8 +1319,8 @@ and the `:manager policy` "Daemon settings · manager bounds" rows edit them
 `sandbox_build_cache_reclaim_low_watermark_pct`, each with the daemon's own hard
 range that the operator's bounds must sit inside. `host_load_admission_threshold`,
 `rolling_queue_batch_size` (#1977), `governor_build_slots`,
-`governor_lander_slots`, `rolling_queue_full_qa_interval_mins` (#2123) and `hub_build_cpu_percent` (#2119) carry
-built-in default bounds (`8..=64`, `1..=8`, `1..=4`, `1..=5`, `30..=240` and `10..=50`; the last four are lower-only: their max is the registry default) that apply while the operator sets none; an explicit operator bound
+`governor_lander_slots`, `rolling_queue_full_qa_interval_mins` (#2123), `rolling_queue_gate_timeout_mins` (hub #3846; `45..=180`, hard range 30..=1440) and `hub_build_cpu_percent` (#2119) carry
+built-in default bounds (`8..=64`, `1..=8`, `1..=4`, `1..=5`, `30..=240`, `45..=180` and `10..=50`, in the order the keys are listed; `governor_build_slots`, `governor_lander_slots`, `rolling_queue_full_qa_interval_mins` and `hub_build_cpu_percent` are lower-only: their max is the registry default, while `rolling_queue_gate_timeout_mins` may raise the gate above its default of 60 up to 180) that apply while the operator sets none; an explicit operator bound
 replaces and may narrow them. The TUI row shows `default 8-64` while a default
 applies; blank restores that default, and `off` (stored as the `0-0` bound
 entry, valid only for keys with defaults) makes the key not adjustable (#1997). Spend policy, credentials,

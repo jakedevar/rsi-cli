@@ -122,6 +122,18 @@ fn inbox(store: &Store, caller: Uuid) -> AgentManagerInboxResultV1 {
         .unwrap()
 }
 
+fn full_inbox(store: &Store, caller: Uuid) -> AgentManagerInboxResultV1 {
+    store
+        .manager_inbox(
+            caller,
+            &AgentManagerInboxRequestV1 {
+                fields: AgentManagerInboxFieldsV1::Full,
+                ..AgentManagerInboxRequestV1::default()
+            },
+        )
+        .unwrap()
+}
+
 fn send(store: &Store, manager: Uuid, epic: Uuid, key: &str) -> HarnessManagerMessageReceiptV1 {
     store
         .manager_send(
@@ -245,8 +257,16 @@ fn lead_notice_follows_manager_and_lead_rotation() {
     );
     let lead = rotate(&f.store, f.leads[0]);
     f.store.set_lead_session(f.epics[0], Some(lead)).unwrap();
+    // #3363: the successor already read it, so a routine read omits it, but
+    // the full history stays addressable.
     assert!(
-        inbox(&f.store, manager)
+        !inbox(&f.store, manager)
+            .messages
+            .iter()
+            .any(|m| m.message_id == receipt.message_id)
+    );
+    assert!(
+        full_inbox(&f.store, manager)
             .messages
             .iter()
             .any(|m| m.message_id == receipt.message_id)
@@ -270,6 +290,60 @@ fn lead_notice_follows_manager_and_lead_rotation() {
         .unwrap();
     assert_eq!(message.recipient_session_id, manager);
     assert_eq!(message.sender_session_id, lead);
+}
+
+/// #3363: informational lead mail is returned once per manager principal; it
+/// survives seat succession as read, new mail still arrives, and the history
+/// stays readable on request.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn informational_lead_notice_is_returned_once_across_succession_3363() {
+    let f = fixture();
+    let first = f
+        .store
+        .manager_lead_notice(f.leads[0], "status one", "r1")
+        .unwrap();
+    let ids = |read: &AgentManagerInboxResultV1| {
+        read.messages
+            .iter()
+            .map(|m| m.message_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&inbox(&f.store, f.manager)), vec![first.message_id]);
+    assert!(inbox(&f.store, f.manager).messages.is_empty());
+
+    // A successor seat does not re-pay the already read mail.
+    let successor = rotate(&f.store, f.manager);
+    assert!(inbox(&f.store, successor).messages.is_empty());
+
+    // New mail arrives once, alone.
+    let second = f
+        .store
+        .manager_lead_notice(f.leads[0], "status two", "r2")
+        .unwrap();
+    assert_eq!(ids(&inbox(&f.store, successor)), vec![second.message_id]);
+    assert!(inbox(&f.store, successor).messages.is_empty());
+
+    // Explicit history reads still return everything.
+    assert_eq!(
+        ids(&full_inbox(&f.store, successor)),
+        vec![first.message_id, second.message_id]
+    );
+    let sent = f
+        .store
+        .manager_inbox(
+            successor,
+            &AgentManagerInboxRequestV1 {
+                include_sent: true,
+                ..AgentManagerInboxRequestV1::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ids(&sent), vec![first.message_id, second.message_id]);
+
+    // The sender's acknowledgement view is unaffected.
+    assert_eq!(inbox(&f.store, f.leads[0]).messages.len(), 2);
+    assert_eq!(inbox(&f.store, f.leads[0]).messages.len(), 2);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]

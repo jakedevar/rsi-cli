@@ -70,7 +70,9 @@ fn judged(
         Err(unverified) => {
             let outcome = match unverified.reason {
                 Reason::NewFailures => JobEvidenceOutcome::Red,
-                Reason::Incomplete => JobEvidenceOutcome::Incomplete,
+                // A candidate/sandbox/unstamped tool copy is tool-under-test evidence,
+                // never green or baseline-red (#3793).
+                Reason::Incomplete | Reason::UntrustedTool => JobEvidenceOutcome::Incomplete,
                 // The receipt names another commit: the job did not test this one.
                 Reason::StaleHead => return Err(refused("manager_v2_job_evidence_head_mismatch")),
                 Reason::NoReceipt => {

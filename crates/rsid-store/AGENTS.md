@@ -19,17 +19,46 @@ Facts that bite:
   worker runs `--refresh` (run it locally only to see the pin or to clear an old
   conflict over markers; a source that already carries its own pin lands as before).
   N is the rolling tip's schema head (the highest `vNNN.rs`) + 1; the tooling verifies it.
+  Every new migration also carries one `tools/provisional-migrations/*.json` declaration in
+  the same source (format: that README). It is what lets the merge queue assign the final
+  number at landing: when another queued source takes N first, a declared migration is
+  renumbered to the next free head, and an undeclared collision is refused
+  `queue_migration_out_of_order`. Recover by adding a complete provisional declaration
+  for the source's existing number, committing it, and submitting the new SHA for
+  re-enqueue. The queue's lander runs `scripts/repo-guard rolling-migration-renumber` to assign
+  the final number and gate the transformed candidate; workers never renumber by hand.
+  The renumber tool refuses a collision without a declaration with
+  `one new provisional site declaration is required`.
+  Every `files[]` entry of that declaration has exactly the four keys `path`,
+  `path_template`, `source_blob` and `sites` (each site exactly `anchor`, `replacement`,
+  `scope`); for an unversioned file such as `store/tests.rs`, `path_template` equals
+  `path`. A missing key is refused with the declaration, file entry and key named by
+  `scripts/repo-guard released-migrations` (scoped-test and the pre-push guard run it) and by
+  the renumber tool, even when the source needs no renumber (#3304).
+  A Store test assertion of the provisional schema head is a version site with
+  `scope: "head"`. The renumber path requires declared Store helpers/test files
+  to be pinned; for a new unpinned module, put the version constant in already
+  pinned `store/tests.rs`, declare that constant's site, and reference it from
+  the new module. See the README example.
   A slice built on a reviewed-but-unlanded sibling migration may skip its number by naming it in
-  `pending_predecessors` of its `tools/provisional-migrations/*.json` declaration (#1285; see that README).
-  Renumbering (a migration lands with a different `N` than committed): rename the file and
-  its `if version < N` block, and move
-  `REWIND_TEARDOWN_COVERED_THROUGH`, its rewind step and its `MIGRATION_ALTERED_OBJECTS`
-  entry to match the new head. Released migrations are immutable. Add the rewind teardown,
+  `pending_predecessors` of that declaration only when the sibling's migration is absent
+  from the source tree (#1285). If the source contains both complete migrations,
+  an origin/rolling-based `--transform` cannot preflight them as one unit (#545):
+  the PM lands the sibling first, then the worker merges rolling and validates the
+  remaining unit. See that README's "Preflight when the source contains an unlanded
+  sibling" for the sequence and the deferred-pin base limitation.
+  To let the lander renumber, declare the versioned filename with `path_template` and
+  its `if version < N` gate, `REWIND_TEARDOWN_COVERED_THROUGH`, its rewind step and its
+  `MIGRATION_ALTERED_OBJECTS` entry as version sites with the appropriate `unit` or
+  `head` scope (see the README).
+  Released migrations are immutable. Add the rewind teardown,
   the fixture/replay assertions and any replay-pin exemptions, then run
-  `tools/check-released-migrations.py`. `build.rs` collects the files and hashes
+  `scripts/repo-guard released-migrations`. `build.rs` collects the files and hashes
   `src/store` for the test schema template.
-  Migration author checklist (the rolling guard `python3 tools/check-released-migrations.py`
-  fails without the first two; run it before reporting migration verification done):
+  Migration author checklist (the rolling guard `scripts/repo-guard released-migrations
+  origin/rolling HEAD` fails without the first two; run it before reporting migration
+  verification done. Name the base: after you merge `origin/rolling` the bare form's default
+  base `HEAD^` is your own commit and reports a false FAIL, #151):
   1. In `store/tests.rs` add the rewind teardown beside the V80/V81/V82/V90/V91 fixtures,
      extend `assert_fixture_matches_claimed_version` and `assert_post_v77_chain_replayed`,
      then bump `REWIND_TEARDOWN_COVERED_THROUGH` to the new head.
@@ -50,7 +79,9 @@ Facts that bite:
   4. The slow tier (#2270): the released-migration history tests named in
      `.config/slow-tier.toml` are left out of the default nextest profiles and run when a diff
      touches `store/migrations/`, the pin file, the runner or such a test, and in the full QA.
-     Run `make test-slow-tier` after a migration change. A new heavy history test (over about
+     Run `make test-slow-tier` after a migration change (it needs cargo-nextest; on a host
+     without it the `scoped_test` job covers the slow tier, which it runs in full when a
+     migration changed, #152). A new heavy history test (over about
      2 s in `make test-timings`) is added to that file by name, then `python3
      scripts/check-touched-shards --write-slow-tier-filter` regenerates the nextest filter.
      Membership is by subject (#2298): only a test that rewinds, upgrades or replays a
@@ -91,9 +122,9 @@ Facts that bite:
   "test-shard-store-01"))]` names a shard declared in this crate's `Cargo.toml`.
   The shard names are shared with `rsid`; `scripts/run-rsid-test-shards.sh`
   runs one shard across both packages and
-  `python3 scripts/check-rsid-test-shards.py --require-gates` checks them.
+  `scripts/repo-guard rsid-test-shards --require-gates` checks them.
 - Released migration regions (`RSI-RELEASED-MIGRATION-BEGIN/END`) are
-  byte-immutable; `python3 tools/check-released-migrations.py` guards them.
+  byte-immutable; `scripts/repo-guard released-migrations` guards them.
 - Stored `ToolResult` bodies are capped (#2373): `insert_event_in_transaction`, the
   one writer of `conversation_events`, stores an over-cap body as head + marker + tail
   (`rsid-core tool_result_cap`, operator setting `tool_result_storage_cap_kib`, default 32

@@ -8,8 +8,12 @@
 //! `/proc`), so a killed client never leaks a slot: every call reaps leases
 //! and waiters whose holder is gone.
 //!
-//! The gates keep the cargo-slot semantics exactly:
-//! * disk: `/` must have at least `min_free_disk_gb` free;
+//! The gates apply cargo-slot policy:
+//! * disk: physical free on `/` must always meet `min_free_disk_gb`. With
+//!   running growth reservations, free must also meet the floor after reserving
+//!   those leases' and the newcomer's remaining target growth. Verified reuse
+//!   reduces only the newcomer's growth. Without running reservations, a lone
+//!   newcomer does not project its own growth, preserving cold-build liveness;
 //! * load: the 1-minute load must be below `max_load` (0 = 1.25 x cores);
 //! * memory: `MemAvailable` at least `min_avail_mem_gb`, and the workers
 //!   slice's anonymous + shmem memory (from `memory.stat`, never
@@ -29,6 +33,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const GIB: f64 = 1_073_741_824.0;
+
+mod disk_growth;
+pub(crate) mod own_target;
 
 /// A queued (not yet granted) ticket that has not been polled for this long is
 /// dropped: its client is gone or wedged.
@@ -66,6 +73,10 @@ pub struct ResourceSample {
     pub cores: u32,
     pub disk_free_gb: f64,
     pub mem_available_gb: f64,
+    /// Free swap in GiB; counted as headroom by the projected memory gate
+    /// (hub #3629). `0.0` where there is no swap or no source.
+    #[serde(default)]
+    pub swap_free_gb: f64,
     /// Anonymous + shmem memory of the workers slice; `None` when the cgroup
     /// file is unreadable (the gate then passes, as cargo-slot did).
     pub workers_slice_anon_gb: Option<f64>,
@@ -79,6 +90,14 @@ pub enum BlockReason {
         free_gb: f64,
         min_gb: u64,
     },
+    DiskGrowth {
+        free_gb: f64,
+        projected_free_gb: f64,
+        min_gb: u64,
+        #[serde(default)]
+        requested_growth_gb: f64,
+        holders: Vec<DiskGrowthHolder>,
+    },
     Load {
         load1: f64,
         max: u32,
@@ -86,6 +105,16 @@ pub enum BlockReason {
     MemoryAvailable {
         available_gb: f64,
         min_gb: u64,
+    },
+    /// Memory headroom (`MemAvailable` + free swap) minus what recently started
+    /// heavy builds are still expected to claim, and this request's own heavy
+    /// reserve, is below `min_avail_mem_gb` (hub #3629).
+    MemoryProjected {
+        headroom_gb: f64,
+        projected_gb: f64,
+        min_gb: u64,
+        reserved_gb: f64,
+        requested_gb: f64,
     },
     WorkersSlice {
         used_gb: f64,
@@ -95,11 +124,76 @@ pub enum BlockReason {
         class: AdmissionClass,
         in_use: u32,
         cap: u32,
+        /// Who holds the class's leases (#618): a waiter can tell a busy pool
+        /// from a wedged holder. Empty from a peer that predates the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        holders: Vec<SlotHolder>,
     },
     QueueAhead {
         class: AdmissionClass,
         ahead: u32,
     },
+}
+
+/// A queued waiter the host disk floor alone holds (#625).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskStalledWaiter {
+    /// The `rsi-job-<id>.service` unit the waiting client runs in, when `/proc`
+    /// names one (Linux); a waiter outside a job unit has none.
+    pub unit: Option<String>,
+    /// Seconds the floor has held it continuously.
+    pub stalled_secs: u64,
+}
+
+/// A queued waiter the host disk floor holds now (#582).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiskHeldWaiter {
+    /// The `rsi-job-<id>.service` unit the waiting client runs in, when `/proc`
+    /// names one.
+    pub unit: Option<String>,
+    /// When the floor first held this waiter (#644): the identity of one hold.
+    pub held_since: DateTime<Utc>,
+    /// Free GiB on the build filesystem at the governor sample.
+    pub free_gb: f64,
+    /// The configured floor in GiB.
+    pub min_gb: u64,
+}
+
+/// One lease holding a class slot, as a waiter sees it (#618).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SlotHolder {
+    pub lease_id: Uuid,
+    pub pid: u32,
+    pub label: Option<String>,
+    /// Seconds since the lease was granted.
+    pub held_secs: u64,
+    /// The systemd unit the holder runs in (`rsi-job-<job id>.service`), when
+    /// `/proc` names one: it maps the lease to a job and its owner session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+impl SlotHolder {
+    fn describe(&self) -> String {
+        format!(
+            "{} pid {} ({}{}) for {}s",
+            self.lease_id,
+            self.pid,
+            self.label.as_deref().unwrap_or("cargo unit"),
+            self.unit
+                .as_deref()
+                .map_or_else(String::new, |unit| format!(", unit {unit}")),
+            self.held_secs
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiskGrowthHolder {
+    pub lease_id: Uuid,
+    pub pid: u32,
+    pub label: Option<String>,
+    pub remaining_gb: f64,
 }
 
 impl BlockReason {
@@ -108,7 +202,34 @@ impl BlockReason {
     pub fn describe(&self) -> String {
         match self {
             Self::Disk { free_gb, min_gb } => {
-                format!("only {free_gb:.0} GB free on / (< {min_gb}); waiting for space")
+                format!(
+                    "only {}; waiting for space",
+                    crate::host_pressure::disk_floor_detail(*free_gb, *min_gb)
+                )
+            }
+            Self::DiskGrowth {
+                free_gb,
+                projected_free_gb,
+                min_gb,
+                requested_growth_gb,
+                holders,
+            } => {
+                let holders: Vec<String> = holders
+                    .iter()
+                    .map(|holder| {
+                        format!(
+                            "{} pid {} ({}) reserves {:.1} GiB",
+                            holder.lease_id,
+                            holder.pid,
+                            holder.label.as_deref().unwrap_or("cargo unit"),
+                            holder.remaining_gb
+                        )
+                    })
+                    .collect();
+                format!(
+                    "projected free on / {projected_free_gb:.1} GiB (currently {free_gb:.1} GiB), floor {min_gb} GiB; requested growth {requested_growth_gb:.1} GiB; running reservations [{}]; waiting for space",
+                    holders.join(", ")
+                )
             }
             Self::Load { load1, max } => format!("load {load1:.1} >= {max}; waiting"),
             Self::MemoryAvailable {
@@ -117,11 +238,30 @@ impl BlockReason {
             } => {
                 format!("memory low (available {available_gb:.0} GB < {min_gb}); waiting")
             }
+            Self::MemoryProjected {
+                headroom_gb,
+                projected_gb,
+                min_gb,
+                reserved_gb,
+                requested_gb,
+            } => format!(
+                "projected memory headroom {projected_gb:.1} GiB (MemAvailable + free swap {headroom_gb:.1} GiB, floor {min_gb} GiB; running heavy builds reserve {reserved_gb:.1} GiB, this request {requested_gb:.1} GiB); waiting"
+            ),
             Self::WorkersSlice { used_gb, max_gb } => {
                 format!("workers slice uses {used_gb:.0} GB anon+shmem (>= {max_gb}); waiting")
             }
-            Self::Slots { class, in_use, cap } => {
-                format!("all {cap} {} slots busy ({in_use} in use)", class.as_str())
+            Self::Slots {
+                class,
+                in_use,
+                cap,
+                holders,
+            } => {
+                let busy = format!("all {cap} {} slots busy ({in_use} in use)", class.as_str());
+                if holders.is_empty() {
+                    return busy;
+                }
+                let holders: Vec<String> = holders.iter().map(SlotHolder::describe).collect();
+                format!("{busy}; held by {}", holders.join(", "))
             }
             Self::QueueAhead { class, ahead } => {
                 format!("{ahead} {} request(s) queued ahead", class.as_str())
@@ -183,6 +323,9 @@ pub struct QueueEntryView {
     pub pid: u32,
     pub label: Option<String>,
     pub enqueued_at: DateTime<Utc>,
+    /// Start of the current disk-floor hold, excluding earlier slot/load waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_wait_started_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,7 +367,10 @@ struct Waiter {
     holder: Holder,
     label: Option<String>,
     enqueued_at: DateTime<Utc>,
+    disk_wait_started_at: Option<DateTime<Utc>>,
     last_polled: Instant,
+    disk_credit_gb: f64,
+    growth: disk_growth::Usage,
 }
 
 struct Lease {
@@ -233,6 +379,7 @@ struct Lease {
     holder: Holder,
     label: Option<String>,
     granted_at: DateTime<Utc>,
+    growth: disk_growth::Usage,
 }
 
 #[derive(Default)]
@@ -251,6 +398,7 @@ pub struct Governor {
     /// Current identity of a pid, or `None` when it is gone. A lease is live
     /// only while this equals the identity recorded at acquire time.
     resolve_holder: HolderFn,
+    growth_probe: Box<dyn Fn(Holder) -> disk_growth::Usage + Send + Sync>,
     /// A disk-floor stall was already logged this episode (#932).
     disk_warned: std::sync::atomic::AtomicBool,
 }
@@ -263,6 +411,7 @@ impl Governor {
             sample,
             sample_last_updated: None,
             resolve_holder,
+            growth_probe: Box::new(|_| disk_growth::Usage::default()),
             disk_warned: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -276,11 +425,18 @@ impl Governor {
     }
 
     fn new_cached_host(resolve_holder: HolderFn) -> Self {
-        Self::new_cached(
-            Box::new(sample_host),
+        let growth = Arc::new(disk_growth::Probe::default());
+        let refresh_growth = Arc::clone(&growth);
+        let mut governor = Self::new_cached(
+            Box::new(move || {
+                refresh_growth.refresh();
+                sample_host()
+            }),
             resolve_holder,
             Duration::from_millis(500),
-        )
+        );
+        governor.growth_probe = Box::new(move |holder| growth.usage(holder));
+        governor
     }
 
     fn new_cached(
@@ -293,6 +449,7 @@ impl Governor {
             cores: 1,
             disk_free_gb: 0.0,
             mem_available_gb: 0.0,
+            swap_free_gb: 0.0,
             workers_slice_anon_gb: None,
         }));
         let refresh_sample = Arc::clone(&sample);
@@ -353,6 +510,23 @@ impl Governor {
         policy: &GovernorPolicy,
         params: &AcquireParams,
     ) -> Result<AcquireOutcome, String> {
+        self.acquire_with_disk_credit(policy, params, 0.0)
+    }
+
+    /// The caller has verified a running job's own target. Reuse reduces only
+    /// this ticket's growth estimate; physical free space and other reservations
+    /// always retain their full values.
+    pub(crate) fn acquire_with_disk_credit(
+        &self,
+        policy: &GovernorPolicy,
+        params: &AcquireParams,
+        disk_credit_gb: f64,
+    ) -> Result<AcquireOutcome, String> {
+        let disk_credit_gb = if disk_credit_gb.is_finite() {
+            disk_credit_gb.clamp(0.0, 2.0_f64.min(policy.min_free_disk_gb as f64 / 2.0))
+        } else {
+            0.0
+        };
         let sample = (self.sample)();
         let sample_is_fresh = self.sample_is_fresh();
         if sample.disk_free_gb >= policy.min_free_disk_gb as f64 {
@@ -369,7 +543,11 @@ impl Governor {
                 });
             }
             if let Some(waiter) = state.queue.iter_mut().find(|w| w.ticket == ticket) {
+                if waiter.holder.pid != params.pid && disk_credit_gb > 0.0 {
+                    return Err("ticket holder does not match credited job pid".into());
+                }
                 waiter.last_polled = Instant::now();
+                waiter.disk_credit_gb = disk_credit_gb;
             } else {
                 return Err("unknown or expired ticket; acquire again without ticket_id".into());
             }
@@ -382,7 +560,10 @@ impl Governor {
                 holder,
                 label: params.label.as_ref().map(|l| l.chars().take(200).collect()),
                 enqueued_at: Utc::now(),
+                disk_wait_started_at: None,
                 last_polled: Instant::now(),
+                disk_credit_gb,
+                growth: (self.growth_probe)(holder),
             });
         }
         let ticket = params.ticket_id.unwrap_or_else(|| {
@@ -391,7 +572,7 @@ impl Governor {
                 .back()
                 .map_or_else(Uuid::nil, |waiter| waiter.ticket)
         });
-        Self::admit(&mut state, policy, &sample, sample_is_fresh);
+        self.admit(&mut state, policy, &sample, sample_is_fresh);
         if let Some(lease) = state.leases.get(&ticket) {
             return Ok(AcquireOutcome::Granted {
                 lease_id: lease.id,
@@ -400,7 +581,15 @@ impl Governor {
         }
         let (class, position) = Self::position_of(&state, ticket)
             .ok_or_else(|| "ticket vanished during admission".to_string())?;
-        let reason = Self::reason_for(&state, policy, &sample, class, position, sample_is_fresh);
+        let reason = Self::reason_for(
+            &state,
+            policy,
+            &sample,
+            ticket,
+            class,
+            position,
+            sample_is_fresh,
+        );
         self.note_disk_stall(policy, &sample, &reason);
         Ok(AcquireOutcome::Queued {
             ticket_id: ticket,
@@ -425,8 +614,10 @@ impl Governor {
         reason: &BlockReason,
     ) {
         use std::sync::atomic::Ordering;
-        if matches!(reason, BlockReason::Disk { .. })
-            && !self.disk_warned.swap(true, Ordering::Relaxed)
+        if matches!(
+            reason,
+            BlockReason::Disk { .. } | BlockReason::DiskGrowth { .. }
+        ) && !self.disk_warned.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 free_gb = sample.disk_free_gb,
@@ -453,8 +644,54 @@ impl Governor {
         state.queue.retain(|w| w.ticket != lease_id);
         existed |= state.queue.len() != before;
         self.reap(&mut state);
-        Self::admit(&mut state, policy, &sample, sample_is_fresh);
+        self.admit(&mut state, policy, &sample, sample_is_fresh);
         existed
+    }
+
+    /// #625: the queued waiters held only by the host disk floor, with how long
+    /// each has been held. Empty while any lease holds a slot: a holder can still
+    /// finish and free space, so that wait stays the long one. With no holder
+    /// nothing frees the floor but the host, so a caller may settle such a wait
+    /// early. Reads the live state without sampling or admitting.
+    pub fn disk_stalled_waiters(&self) -> Vec<DiskStalledWaiter> {
+        let mut state = self.state();
+        self.reap(&mut state);
+        if !state.leases.is_empty() {
+            return Vec::new();
+        }
+        let now = Utc::now();
+        state
+            .queue
+            .iter()
+            .filter_map(|w| {
+                let since = w.disk_wait_started_at?;
+                Some(DiskStalledWaiter {
+                    unit: job_unit_of_pid(w.holder.pid),
+                    stalled_secs: u64::try_from((now - since).num_seconds()).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// #582: every queued waiter the host disk floor holds right now, with the
+    /// sampled free space and the floor, so a job's owner can read why it waits.
+    /// Unlike [`Self::disk_stalled_waiters`] a slot holder does not hide it: the
+    /// wait is reported whenever the floor is what blocks the waiter.
+    pub fn disk_held_waiters(&self, policy: &GovernorPolicy) -> Vec<DiskHeldWaiter> {
+        let snapshot = self.snapshot(policy);
+        snapshot
+            .queue
+            .iter()
+            .filter_map(|entry| {
+                let held_since = entry.disk_wait_started_at?;
+                Some(DiskHeldWaiter {
+                    unit: job_unit_of_pid(entry.pid),
+                    held_since,
+                    free_gb: snapshot.sample.disk_free_gb,
+                    min_gb: policy.min_free_disk_gb,
+                })
+            })
+            .collect()
     }
 
     /// Current policy margins, leases and queue.
@@ -463,7 +700,7 @@ impl Governor {
         let sample_is_fresh = self.sample_is_fresh();
         let mut state = self.state();
         self.reap(&mut state);
-        Self::admit(&mut state, policy, &sample, sample_is_fresh);
+        self.admit(&mut state, policy, &sample, sample_is_fresh);
         let count = |class| {
             u32::try_from(state.leases.values().filter(|l| l.class == class).count())
                 .unwrap_or(u32::MAX)
@@ -495,6 +732,7 @@ impl Governor {
                     pid: w.holder.pid,
                     label: w.label.clone(),
                     enqueued_at: w.enqueued_at,
+                    disk_wait_started_at: w.disk_wait_started_at,
                 }
             })
             .collect();
@@ -521,11 +759,33 @@ impl Governor {
 
     /// Grant slots to queue heads, FIFO within each class.
     fn admit(
+        &self,
         state: &mut State,
         policy: &GovernorPolicy,
         sample: &ResourceSample,
         sample_is_fresh: bool,
     ) {
+        for lease in state.leases.values_mut() {
+            lease.growth = (self.growth_probe)(lease.holder);
+        }
+        for waiter in &mut state.queue {
+            waiter.growth = (self.growth_probe)(waiter.holder);
+        }
+        let now = Utc::now();
+        let growth = growth_holders(state);
+        let mem_reserved_gb = heavy_mem_reserved_gb(state);
+        for waiter in &mut state.queue {
+            let disk_held = sample_is_fresh
+                && matches!(
+                    waiter_block(policy, sample, waiter, &growth, mem_reserved_gb),
+                    Some(BlockReason::Disk { .. } | BlockReason::DiskGrowth { .. })
+                );
+            if disk_held {
+                waiter.disk_wait_started_at.get_or_insert(now);
+            } else {
+                waiter.disk_wait_started_at = None;
+            }
+        }
         let mut blocked: Vec<AdmissionClass> = Vec::new();
         let mut index = 0;
         while index < state.queue.len() {
@@ -534,10 +794,24 @@ impl Governor {
                 index += 1;
                 continue;
             }
-            if sample_is_fresh && global_block(policy, sample, class).is_some() {
-                blocked.push(class);
-                index += 1;
-                continue;
+            if sample_is_fresh {
+                if let Some(reason) = waiter_block(
+                    policy,
+                    sample,
+                    &state.queue[index],
+                    &growth_holders(state),
+                    heavy_mem_reserved_gb(state),
+                ) {
+                    if matches!(
+                        reason,
+                        BlockReason::Disk { .. } | BlockReason::DiskGrowth { .. }
+                    ) {
+                        state.queue[index].disk_wait_started_at.get_or_insert(now);
+                    }
+                    blocked.push(class);
+                    index += 1;
+                    continue;
+                }
             }
             let in_use = class_in_use(state, class);
             if in_use >= class_cap(policy, class) {
@@ -554,6 +828,7 @@ impl Governor {
                         holder: waiter.holder,
                         label: waiter.label,
                         granted_at: Utc::now(),
+                        growth: (self.growth_probe)(waiter.holder),
                     },
                 );
             }
@@ -575,11 +850,21 @@ impl Governor {
         state: &State,
         policy: &GovernorPolicy,
         sample: &ResourceSample,
+        ticket: Uuid,
         class: AdmissionClass,
         position: u32,
         sample_is_fresh: bool,
     ) -> BlockReason {
-        if sample_is_fresh && let Some(reason) = global_block(policy, sample, class) {
+        if sample_is_fresh
+            && let Some(waiter) = state.queue.iter().find(|waiter| waiter.ticket == ticket)
+            && let Some(reason) = waiter_block(
+                policy,
+                sample,
+                waiter,
+                &growth_holders(state),
+                heavy_mem_reserved_gb(state),
+            )
+        {
             return reason;
         }
         if position > 0 {
@@ -592,8 +877,176 @@ impl Governor {
             class,
             in_use: class_in_use(state, class),
             cap: class_cap(policy, class),
+            holders: slot_holders(state, class),
         }
     }
+}
+
+fn waiter_block(
+    policy: &GovernorPolicy,
+    sample: &ResourceSample,
+    waiter: &Waiter,
+    growth: &[DiskGrowthHolder],
+    mem_reserved_gb: f64,
+) -> Option<BlockReason> {
+    // A snapshot/release may admit another ticket. Never reuse old filesystem
+    // evidence indefinitely when its caller has stopped polling.
+    let credit = if waiter.last_polled.elapsed() <= Duration::from_secs(5) {
+        waiter.disk_credit_gb
+    } else {
+        0.0
+    };
+    // The physical floor is independent of reuse and estimated future growth.
+    let physical = global_block(policy, sample, waiter.class);
+    if matches!(physical, Some(BlockReason::Disk { .. })) {
+        return physical;
+    }
+    if physical.is_none()
+        && let Some(projected) = memory_projection_block(policy, sample, waiter, mem_reserved_gb)
+    {
+        return Some(projected);
+    }
+    let reserved_gb: f64 = growth.iter().map(|holder| holder.remaining_gb).sum();
+    // Preserve lone-build liveness above the hard physical floor. Project the
+    // requester's growth only when protecting another lease's reservation.
+    if reserved_gb <= 0.0 {
+        return physical;
+    }
+    // The background probe may already have deducted this target's allocated
+    // bytes. Use whichever evidence shows more reuse, never count it twice.
+    let measured_reuse_gb = waiter.growth.current_bytes as f64 / GIB;
+    let additional_reuse_gb = (credit - measured_reuse_gb).max(0.0);
+    let requested_growth_gb = (waiter.growth.remaining_gb() - additional_reuse_gb).max(0.0);
+    let projected_free_gb = sample.disk_free_gb - reserved_gb - requested_growth_gb;
+    if projected_free_gb < policy.min_free_disk_gb as f64 {
+        return Some(BlockReason::DiskGrowth {
+            free_gb: sample.disk_free_gb,
+            projected_free_gb,
+            min_gb: policy.min_free_disk_gb,
+            requested_growth_gb,
+            holders: growth.to_vec(),
+        });
+    }
+    physical
+}
+
+fn growth_holders(state: &State) -> Vec<DiskGrowthHolder> {
+    let mut holders: Vec<_> = state
+        .leases
+        .values()
+        .filter_map(|lease| {
+            let remaining_gb = lease.growth.remaining_gb();
+            (remaining_gb > 0.0).then(|| DiskGrowthHolder {
+                lease_id: lease.id,
+                pid: lease.holder.pid,
+                label: lease.label.clone(),
+                remaining_gb,
+            })
+        })
+        .collect();
+    holders.sort_by_key(|holder| holder.lease_id);
+    holders
+}
+
+/// Memory a freshly started heavy build (an `rsid` test or workspace compile)
+/// is expected to claim beyond what `MemAvailable` shows at admission: the
+/// hub saw four concurrent `rsid --test` compiles at 3.7-10.3 GB RSS each
+/// (hub #3629). A constant: the operator tunes the floor it is projected
+/// against (`governor_min_avail_mem_gb`), not the estimate.
+const HEAVY_BUILD_RESERVE_GB: f64 = 8.0;
+
+/// A granted heavy build's reserve decays linearly to zero over this long, by
+/// which time its real usage is in `MemAvailable`.
+const HEAVY_BUILD_RAMP_SECS: f64 = 600.0;
+
+/// Whether a cargo command line compiles the big `rsid` test binary or the
+/// whole workspace. Matches `-p rsid`, `--package rsid` (also `=` forms) or
+/// `--workspace` together with a test-building word, and the rustc form
+/// `--crate-name rsid ... --test`. The fast `check` lane is never heavy.
+fn is_heavy_build(class: AdmissionClass, label: Option<&str>) -> bool {
+    let Some(label) = label else {
+        return false;
+    };
+    if class == AdmissionClass::Check {
+        return false;
+    }
+    let tokens: Vec<&str> = label.split_whitespace().collect();
+    let names_package = tokens
+        .windows(2)
+        .any(|pair| matches!(pair[0], "-p" | "--package" | "--crate-name") && pair[1] == "rsid")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "-p=rsid" | "--package=rsid" | "--crate-name=rsid"));
+    let wide = tokens.contains(&"--workspace");
+    let builds_tests = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "test" | "nextest" | "--tests" | "--test" | "--all-targets" | "--no-run"
+        )
+    });
+    (names_package || wide) && builds_tests
+}
+
+/// Memory still owed by granted heavy builds: each reserves
+/// [`HEAVY_BUILD_RESERVE_GB`] at grant, decaying over [`HEAVY_BUILD_RAMP_SECS`].
+fn heavy_mem_reserved_gb(state: &State) -> f64 {
+    let now = Utc::now();
+    state
+        .leases
+        .values()
+        .filter(|lease| is_heavy_build(lease.class, lease.label.as_deref()))
+        .map(|lease| {
+            let age = (now - lease.granted_at).num_milliseconds() as f64 / 1000.0;
+            HEAVY_BUILD_RESERVE_GB * (1.0 - age / HEAVY_BUILD_RAMP_SECS).clamp(0.0, 1.0)
+        })
+        .sum()
+}
+
+/// The projected memory gate: `MemAvailable` plus free swap, less the reserve
+/// of running heavy builds and of this request when it is heavy, must still
+/// meet `min_avail_mem_gb`. Silent (`None`) when nothing is reserved, so the
+/// plain physical floor in [`global_block`] stays the only memory rule for
+/// light work and a lone light job is never held by a projection.
+fn memory_projection_block(
+    policy: &GovernorPolicy,
+    sample: &ResourceSample,
+    waiter: &Waiter,
+    reserved_gb: f64,
+) -> Option<BlockReason> {
+    let requested_gb = if is_heavy_build(waiter.class, waiter.label.as_deref()) {
+        HEAVY_BUILD_RESERVE_GB
+    } else {
+        0.0
+    };
+    if reserved_gb + requested_gb <= 0.0 {
+        return None;
+    }
+    let headroom_gb = sample.mem_available_gb + sample.swap_free_gb.max(0.0);
+    let projected_gb = headroom_gb - reserved_gb - requested_gb;
+    if projected_gb >= policy.min_avail_mem_gb as f64 {
+        return None;
+    }
+    Some(BlockReason::MemoryProjected {
+        headroom_gb,
+        projected_gb,
+        min_gb: policy.min_avail_mem_gb,
+        reserved_gb,
+        requested_gb,
+    })
+}
+
+/// Free swap in GiB from `/proc/meminfo`; `0.0` when unreadable or absent.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_swap_free_gb() -> f64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|body| meminfo_kib(&body, "SwapFree:"))
+        .map_or(0.0, |kib| kib as f64 * 1024.0 / GIB)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_swap_free_gb() -> f64 {
+    0.0
 }
 
 /// The class whose lease holders explain a slot or queue wait (#1591).
@@ -636,6 +1089,51 @@ fn holders_note(state: &State, class: Option<AdmissionClass>) -> String {
         String::new()
     };
     format!("; held by {}{tail}", shown.join(", "))
+}
+
+/// The leases holding `class` slots, longest-held first.
+fn slot_holders(state: &State, class: AdmissionClass) -> Vec<SlotHolder> {
+    let now = Utc::now();
+    let mut holders: Vec<SlotHolder> = state
+        .leases
+        .values()
+        .filter(|l| l.class == class)
+        .map(|l| SlotHolder {
+            lease_id: l.id,
+            pid: l.holder.pid,
+            label: l.label.clone(),
+            held_secs: u64::try_from((now - l.granted_at).num_seconds()).unwrap_or(0),
+            unit: job_unit_of_pid(l.holder.pid),
+        })
+        .collect();
+    holders.sort_by(|a, b| {
+        b.held_secs
+            .cmp(&a.held_secs)
+            .then(a.lease_id.cmp(&b.lease_id))
+    });
+    holders
+}
+
+/// The `rsi-job-<id>.service` unit a process runs in, from its cgroup.
+#[cfg(target_os = "linux")]
+fn job_unit_of_pid(pid: u32) -> Option<String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    unit_in_cgroup(&cgroup)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn job_unit_of_pid(_pid: u32) -> Option<String> {
+    None
+}
+
+/// The innermost `rsi-job-*.service` path segment in `/proc/<pid>/cgroup` text.
+#[cfg(any(target_os = "linux", test))]
+fn unit_in_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .flat_map(|line| line.rsplit('/'))
+        .find(|segment| segment.starts_with("rsi-job-") && segment.ends_with(".service"))
+        .map(str::to_string)
 }
 
 fn class_in_use(state: &State, class: AdmissionClass) -> u32 {
@@ -796,13 +1294,41 @@ pub fn anon_shmem_bytes(memory_stat: &str) -> u64 {
         .sum()
 }
 
+/// One `/proc/meminfo` field in KiB (`key` includes the trailing colon).
 #[cfg(target_os = "linux")]
-fn mem_available_kib(meminfo: &str) -> Option<u64> {
+fn meminfo_kib(meminfo: &str, key: &str) -> Option<u64> {
     meminfo
         .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .find_map(|line| line.strip_prefix(key))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|value| value.parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn mem_available_kib(meminfo: &str) -> Option<u64> {
+    meminfo_kib(meminfo, "MemAvailable:")
+}
+
+/// Swap in use as a percentage of total swap from a `/proc/meminfo` body;
+/// `None` when the host has no swap or the fields are missing.
+#[cfg(target_os = "linux")]
+pub(crate) fn swap_used_pct_of(meminfo: &str) -> Option<f64> {
+    let total = meminfo_kib(meminfo, "SwapTotal:").filter(|total| *total > 0)?;
+    let free = meminfo_kib(meminfo, "SwapFree:")?;
+    Some(total.saturating_sub(free) as f64 * 100.0 / total as f64)
+}
+
+/// Swap use (percent) now; `None` where there is no swap or no source.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_swap_used_pct() -> Option<f64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|body| swap_used_pct_of(&body))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_swap_used_pct() -> Option<f64> {
+    None
 }
 
 fn workers_slice_stat_path() -> std::path::PathBuf {
@@ -830,7 +1356,7 @@ fn read_load1() -> f64 {
 
 /// Available memory in GiB; `f64::MAX` (the gate passes) when unreadable.
 #[cfg(target_os = "linux")]
-fn read_mem_available_gb() -> f64 {
+pub(crate) fn read_mem_available_gb() -> f64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|body| mem_available_kib(&body))
@@ -839,7 +1365,7 @@ fn read_mem_available_gb() -> f64 {
 
 /// macOS: `vm_stat` free + inactive + speculative pages (#2937).
 #[cfg(not(target_os = "linux"))]
-fn read_mem_available_gb() -> f64 {
+pub(crate) fn read_mem_available_gb() -> f64 {
     crate::host_memory::read_available_bytes().map_or(f64::MAX, |bytes| bytes as f64 / GIB)
 }
 
@@ -858,6 +1384,7 @@ fn sample_host() -> ResourceSample {
         cores,
         disk_free_gb,
         mem_available_gb,
+        swap_free_gb: read_swap_free_gb(),
         workers_slice_anon_gb,
     }
 }
@@ -906,8 +1433,9 @@ mod tests {
         ResourceSample {
             load1: 1.0,
             cores: 32,
-            disk_free_gb: 100.0,
+            disk_free_gb: 200.0,
             mem_available_gb: 64.0,
+            swap_free_gb: 0.0,
             workers_slice_anon_gb: Some(2.0),
         }
     }
@@ -950,6 +1478,533 @@ mod tests {
             label: None,
             ticket_id: None,
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn heavy_req(pid: u32) -> AcquireParams {
+        AcquireParams {
+            label: Some("cargo test -p rsid --lib --no-run".into()),
+            ..req(AdmissionClass::Build, pid)
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn repoll(ticket_id: Uuid, pid: u32) -> AcquireParams {
+        AcquireParams {
+            ticket_id: Some(ticket_id),
+            ..req(AdmissionClass::Build, pid)
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn heavy_builds_are_recognised_from_the_cargo_command_line() {
+        let heavy = |class, label: &str| is_heavy_build(class, Some(label));
+        let build = AdmissionClass::Build;
+        assert!(heavy(build, "cargo test -p rsid --lib"));
+        assert!(heavy(build, "cargo test --package=rsid --no-run"));
+        assert!(heavy(build, "cargo test --workspace"));
+        assert!(heavy(build, "rustc --crate-name rsid --test"));
+        assert!(!heavy(build, "cargo build -p rsid-store"));
+        assert!(!heavy(build, "cargo test -p rsid-store --lib"));
+        assert!(!heavy(AdmissionClass::Check, "cargo test -p rsid --lib"));
+        assert!(!is_heavy_build(build, None));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn heavy_build_is_held_by_projected_memory_and_admitted_once_headroom_returns() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|s| s.mem_available_gb = 30.0);
+        assert!(matches!(
+            governor.acquire(&policy, &heavy_req(1)).unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+        // 30 GiB available, 8 reserved by the running heavy build and 8 more
+        // for this one leaves 14 GiB, below the 16 GiB floor: held.
+        let AcquireOutcome::Queued {
+            ticket_id, reason, ..
+        } = governor.acquire(&policy, &heavy_req(2)).unwrap()
+        else {
+            panic!("second heavy build must be held below the projected floor");
+        };
+        let BlockReason::MemoryProjected {
+            projected_gb,
+            reserved_gb,
+            requested_gb,
+            min_gb,
+            ..
+        } = reason
+        else {
+            panic!("expected MemoryProjected, got {reason:?}");
+        };
+        assert_eq!(min_gb, policy.min_avail_mem_gb);
+        assert!((requested_gb - HEAVY_BUILD_RESERVE_GB).abs() < f64::EPSILON);
+        assert!(reserved_gb > 7.9 && reserved_gb <= HEAVY_BUILD_RESERVE_GB);
+        assert!(projected_gb < policy.min_avail_mem_gb as f64);
+        // More available memory admits it.
+        world.set(|s| s.mem_available_gb = 40.0);
+        assert!(matches!(
+            governor.acquire(&policy, &repoll(ticket_id, 2)).unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn free_swap_counts_toward_the_projected_memory_headroom() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|s| s.mem_available_gb = 30.0);
+        governor.acquire(&policy, &heavy_req(1)).unwrap();
+        let AcquireOutcome::Queued { ticket_id, .. } =
+            governor.acquire(&policy, &heavy_req(2)).unwrap()
+        else {
+            panic!("held without swap");
+        };
+        world.set(|s| s.swap_free_gb = 10.0);
+        assert!(matches!(
+            governor.acquire(&policy, &repoll(ticket_id, 2)).unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_lone_light_job_is_never_held_by_the_projection_and_a_ramped_reserve_expires() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        // The plain floor still admits a light job when nothing is reserved.
+        world.set(|s| s.mem_available_gb = 16.0);
+        assert!(matches!(
+            governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+        world.set(|s| s.mem_available_gb = 30.0);
+        governor.acquire(&policy, &heavy_req(2)).unwrap();
+        let AcquireOutcome::Queued {
+            ticket_id, reason, ..
+        } = governor.acquire(&policy, &heavy_req(3)).unwrap()
+        else {
+            panic!("held while the first heavy build ramps up");
+        };
+        assert!(matches!(reason, BlockReason::MemoryProjected { .. }));
+        // Once the first heavy build is past its ramp its reserve is gone.
+        for lease in governor.state().leases.values_mut() {
+            lease.granted_at = Utc::now() - chrono::Duration::seconds(700);
+        }
+        assert!(matches!(
+            governor.acquire(&policy, &repoll(ticket_id, 3)).unwrap(),
+            AcquireOutcome::Granted { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn swap_use_is_read_from_proc_meminfo() {
+        let meminfo = "MemAvailable: 1024 kB\nSwapTotal: 1000 kB\nSwapFree: 150 kB\n";
+        assert_eq!(meminfo_kib(meminfo, "SwapFree:"), Some(150));
+        let used = swap_used_pct_of(meminfo).expect("swap present");
+        assert!((used - 85.0).abs() < 1e-9);
+        assert_eq!(swap_used_pct_of("SwapTotal: 0 kB\nSwapFree: 0 kB\n"), None);
+        assert_eq!(swap_used_pct_of("MemAvailable: 1 kB\n"), None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn second_build_reserves_running_targets_remaining_growth() {
+        let (world, mut governor) = World::new();
+        governor.growth_probe = Box::new(|_| disk_growth::Usage {
+            expected_bytes: 22 * 1_073_741_824,
+            current_bytes: 4 * 1_073_741_824,
+        });
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| sample.disk_free_gb = 65.0);
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        let (ticket, _, reason) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 2))
+                .unwrap(),
+        );
+        assert!(matches!(
+            reason,
+            BlockReason::DiskGrowth {
+                projected_free_gb: 29.0,
+                ..
+            }
+        ));
+        world.set(|sample| sample.disk_free_gb = 66.0);
+        // Exactly at the projected floor is sufficient; the running unit keeps
+        // its lease throughout the hold and the newcomer is never cancelled.
+        granted(&poll(&governor, &policy, ticket, AdmissionClass::Build));
+        assert_eq!(governor.snapshot(&policy).build_in_use, 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn lone_cold_build_is_admitted_at_or_above_the_physical_floor() {
+        for class in [
+            AdmissionClass::Build,
+            AdmissionClass::Check,
+            AdmissionClass::Lander,
+        ] {
+            for free in [30.0, 30.1, 41.0] {
+                let (world, mut governor) = World::new();
+                governor.growth_probe = Box::new(|_| disk_growth::Usage {
+                    expected_bytes: 96 * 1_073_741_824,
+                    current_bytes: 0,
+                });
+                let policy = GovernorPolicy::LINUX_DEFAULT;
+                world.set(|sample| sample.disk_free_gb = free);
+                let lease = granted(&governor.acquire(&policy, &req(class, 1)).unwrap());
+                assert_eq!(governor.snapshot(&policy).leases[0].lease_id, lease);
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn growth_hold_names_the_holder_and_projected_free_space() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| sample.disk_free_gb = 67.0);
+        let holder = granted(
+            &governor
+                .acquire(
+                    &policy,
+                    &AcquireParams {
+                        label: Some("scoped_test holder unit".into()),
+                        ..req(AdmissionClass::Build, 1)
+                    },
+                )
+                .unwrap(),
+        );
+        let outcome = governor
+            .acquire(&policy, &req(AdmissionClass::Build, 2))
+            .unwrap();
+        let (ticket, _, reason) = queued(&outcome);
+        let BlockReason::DiskGrowth {
+            projected_free_gb,
+            holders,
+            ..
+        } = reason
+        else {
+            panic!("expected a growth hold");
+        };
+        assert_eq!(projected_free_gb, 19.0);
+        assert_eq!(holders[0].lease_id, holder);
+        assert_eq!(holders[0].pid, 1);
+        assert_eq!(holders[0].label.as_deref(), Some("scoped_test holder unit"));
+        let AcquireOutcome::Queued { message, .. } = outcome else {
+            panic!("expected queued")
+        };
+        assert!(message.contains("projected free on / 19.0 GiB"));
+        assert!(message.contains(&holder.to_string()));
+        assert!(message.contains("pid 1 (scoped_test holder unit)"));
+        assert!(message.contains("requested growth 24.0 GiB"));
+        assert!(
+            governor.snapshot(&policy).queue[0]
+                .disk_wait_started_at
+                .is_some()
+        );
+        // Release, rather than cancellation, lets the queued unit run alone.
+        assert!(governor.release(&policy, holder));
+        granted(&poll(&governor, &policy, ticket, AdmissionClass::Build));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn unknown_growth_reserves_the_conservative_default_across_classes() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| sample.disk_free_gb = 77.0);
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        let (_, _, reason) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Check, 2))
+                .unwrap(),
+        );
+        assert!(
+            matches!(reason, BlockReason::DiskGrowth { projected_free_gb: 29.0, ref holders, .. } if holders[0].remaining_gb == 24.0)
+        );
+        world.set(|sample| sample.disk_free_gb = 78.0);
+        assert_eq!(governor.snapshot(&policy).check_in_use, 1);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn growth_projection_sums_every_running_cargo_lease() {
+        let (world, mut governor) = World::new();
+        governor.growth_probe = Box::new(|_| disk_growth::Usage {
+            expected_bytes: 22 * 1_073_741_824,
+            current_bytes: 4 * 1_073_741_824,
+        });
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| sample.disk_free_gb = 83.0);
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 2))
+                .unwrap(),
+        );
+        let (_, _, reason) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Check, 3))
+                .unwrap(),
+        );
+        assert!(
+            matches!(reason, BlockReason::DiskGrowth { projected_free_gb: 29.0, ref holders, .. } if holders.len() == 2)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn admission_batch_charges_each_new_lease_before_granting_the_next() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| {
+            sample.disk_free_gb = 67.0;
+            sample.load1 = 1000.0;
+        });
+        let (first, _, _) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        let (second, _, _) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 2))
+                .unwrap(),
+        );
+        world.set(|sample| sample.load1 = 1.0);
+        let snapshot = governor.snapshot(&policy);
+        assert_eq!(snapshot.leases[0].lease_id, first);
+        assert_eq!(snapshot.queue[0].ticket_id, second);
+        assert!(snapshot.queue[0].disk_wait_started_at.is_some());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn own_target_reuse_never_admits_below_the_physical_floor() {
+        for free in [28.3, (30.0 * GIB - 1.0) / GIB] {
+            for credit in [0.0, 2.0] {
+                let (world, governor) = World::new();
+                let policy = GovernorPolicy::LINUX_DEFAULT;
+                world.set(|sample| sample.disk_free_gb = free);
+                // Even a caller supplying the maximum discount cannot change the
+                // physical floor; the real RPC offers no reuse below it.
+                let (_, _, reason) = queued(
+                    &governor
+                        .acquire_with_disk_credit(&policy, &req(AdmissionClass::Build, 1), credit)
+                        .unwrap(),
+                );
+                assert_eq!(
+                    reason,
+                    BlockReason::Disk {
+                        free_gb: free,
+                        min_gb: 30
+                    }
+                );
+                assert_eq!(
+                    crate::host_pressure::own_target_credit_gb(free, 30, 8 * 1_073_741_824),
+                    0.0
+                );
+                assert_eq!(governor.snapshot(&policy).build_in_use, 0);
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn own_target_reuse_lowers_only_the_requesting_jobs_growth() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|sample| sample.disk_free_gb = 76.0);
+        let holder = granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        let request = req(AdmissionClass::Build, 2);
+        let (ticket, _, reason) = queued(&governor.acquire(&policy, &request).unwrap());
+        assert!(matches!(reason, BlockReason::DiskGrowth {
+            projected_free_gb: 28.0, requested_growth_gb: 24.0, ref holders, ..
+        } if holders[0].lease_id == holder && holders[0].remaining_gb == 24.0));
+        // Own-target reuse lowers the requested 24-GiB estimate to 22 GiB,
+        // preserving the holder's full reservation and the 30-GiB floor.
+        let credit = crate::host_pressure::own_target_credit_gb(76.0, 30, 8 * 1_073_741_824);
+        assert_eq!(credit, 2.0);
+        granted(
+            &governor
+                .acquire_with_disk_credit(
+                    &policy,
+                    &AcquireParams {
+                        ticket_id: Some(ticket),
+                        ..request
+                    },
+                    credit,
+                )
+                .unwrap(),
+        );
+        let (_, _, reason) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Check, 3))
+                .unwrap(),
+        );
+        assert!(matches!(reason, BlockReason::DiskGrowth {
+            requested_growth_gb: 24.0, ref holders, ..
+        } if holders.len() == 2));
+        let snapshot = governor.snapshot(&policy);
+        assert_eq!(snapshot.sample.disk_free_gb, 76.0);
+        assert_eq!(snapshot.build_in_use, 2);
+        assert_eq!(snapshot.check_in_use, 0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn own_target_reuse_does_not_count_measured_target_bytes_twice() {
+        let (world, mut governor) = World::new();
+        governor.growth_probe = Box::new(|_| disk_growth::Usage {
+            expected_bytes: 24 * 1_073_741_824,
+            current_bytes: 8 * 1_073_741_824,
+        });
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        world.set(|sample| sample.disk_free_gb = 60.0);
+        let (_, _, reason) = queued(
+            &governor
+                .acquire_with_disk_credit(&policy, &req(AdmissionClass::Build, 2), 2.0)
+                .unwrap(),
+        );
+        assert!(matches!(
+            reason,
+            BlockReason::DiskGrowth {
+                projected_free_gb: 28.0,
+                requested_growth_gb: 16.0,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn own_target_reuse_at_the_floor_cannot_offset_another_lease() {
+        let (world, mut governor) = World::new();
+        // The requester needs one GiB; the running holder still needs 24 GiB.
+        governor.growth_probe = Box::new(|holder| disk_growth::Usage {
+            expected_bytes: if holder.pid == 1 { 24 } else { 1 } * 1_073_741_824,
+            current_bytes: 0,
+        });
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        world.set(|sample| sample.disk_free_gb = 53.0);
+        let request = req(AdmissionClass::Check, 2);
+        let (ticket, _, reason) = queued(
+            &governor
+                .acquire_with_disk_credit(&policy, &request, 2.0)
+                .unwrap(),
+        );
+        assert!(matches!(reason, BlockReason::DiskGrowth {
+            projected_free_gb: 29.0, requested_growth_gb: 0.0, ref holders, ..
+        } if holders[0].remaining_gb == 24.0));
+        world.set(|sample| sample.disk_free_gb = 30.0);
+        let request = AcquireParams {
+            ticket_id: Some(ticket),
+            ..request
+        };
+        queued(&governor.acquire(&policy, &request).unwrap());
+        world.set(|sample| sample.disk_free_gb = 54.0);
+        // With the holder still running, a cold estimate holds. Reuse saturates
+        // at zero and permits exactly the projected floor without extra space.
+        let (_, _, reason) = queued(&governor.acquire(&policy, &request).unwrap());
+        assert!(matches!(
+            reason,
+            BlockReason::DiskGrowth {
+                projected_free_gb: 29.0,
+                ..
+            }
+        ));
+        granted(
+            &governor
+                .acquire_with_disk_credit(&policy, &request, 2.0)
+                .unwrap(),
+        );
+        assert_eq!(governor.snapshot(&policy).sample.disk_free_gb, 54.0);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn own_target_reuse_keeps_memory_and_fifo_gates_and_expires() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        world.set(|sample| {
+            sample.disk_free_gb = 76.0;
+            sample.mem_available_gb = 0.0;
+        });
+        let (ticket, _, reason) = queued(
+            &governor
+                .acquire_with_disk_credit(&policy, &req(AdmissionClass::Build, 2), 2.0)
+                .unwrap(),
+        );
+        assert!(matches!(reason, BlockReason::MemoryAvailable { .. }));
+        governor.state().queue[0].last_polled = Instant::now() - Duration::from_secs(6);
+        world.set(|sample| sample.mem_available_gb = 64.0);
+        assert_eq!(governor.snapshot(&policy).build_in_use, 1);
+        // Expired evidence restores the full requested growth estimate.
+        let (_, _, reason) = queued(
+            &governor
+                .acquire(
+                    &policy,
+                    &AcquireParams {
+                        ticket_id: Some(ticket),
+                        ..req(AdmissionClass::Build, 2)
+                    },
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            reason,
+            BlockReason::DiskGrowth {
+                requested_growth_gb: 24.0,
+                ..
+            }
+        ));
+        let (_, position, _) = queued(
+            &governor
+                .acquire_with_disk_credit(&policy, &req(AdmissionClass::Build, 3), 2.0)
+                .unwrap(),
+        );
+        assert_eq!(position, 1);
+        assert_eq!(governor.snapshot(&policy).build_in_use, 1);
     }
 
     fn poll(
@@ -1040,13 +2095,27 @@ mod tests {
         let (t3, pos3, why3) = queued(&g.acquire(&p, &req(AdmissionClass::Build, 3)).unwrap());
         let (t4, pos4, why4) = queued(&g.acquire(&p, &req(AdmissionClass::Build, 4)).unwrap());
         assert_eq!(pos3, 0);
-        assert_eq!(
-            why3,
-            BlockReason::Slots {
-                class: AdmissionClass::Build,
-                in_use: 2,
-                cap: 2
-            }
+        // #618: the reason names who holds the slots, longest-held first.
+        let BlockReason::Slots {
+            class,
+            in_use,
+            cap,
+            holders,
+        } = &why3
+        else {
+            panic!("expected Slots, got {why3:?}");
+        };
+        assert_eq!((*class, *in_use, *cap), (AdmissionClass::Build, 2, 2));
+        let held_pids: std::collections::BTreeSet<u32> = holders.iter().map(|h| h.pid).collect();
+        assert_eq!(held_pids, [1, 2].into());
+        let text = why3.describe();
+        assert!(
+            text.contains("all 2 build slots busy (2 in use); held by "),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("pid {}", 1)) && text.contains("pid 2"),
+            "{text}"
         );
         assert_eq!(pos4, 1);
         assert_eq!(
@@ -1069,6 +2138,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// #618: a lease's unit is read from its cgroup path; a pid outside a job
+    /// unit names none, and a busy-pool reason with no holders stays terse.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn slot_holder_unit_comes_from_the_cgroup_path() {
+        let cgroup = "0::/user.slice/user-1000.slice/user@1000.service/rsi-build.slice/rsi-job-0a1b2c3d-0000-4000-8000-000000000001.service\n";
+        assert_eq!(
+            unit_in_cgroup(cgroup).as_deref(),
+            Some("rsi-job-0a1b2c3d-0000-4000-8000-000000000001.service")
+        );
+        assert_eq!(unit_in_cgroup("0::/user.slice/session-3.scope\n"), None);
+        let bare = BlockReason::Slots {
+            class: AdmissionClass::Build,
+            in_use: 1,
+            cap: 1,
+            holders: Vec::new(),
+        };
+        assert_eq!(bare.describe(), "all 1 build slots busy (1 in use)");
+        let held = BlockReason::Slots {
+            class: AdmissionClass::Build,
+            in_use: 1,
+            cap: 1,
+            holders: vec![SlotHolder {
+                lease_id: Uuid::nil(),
+                pid: 77,
+                label: Some("cargo test".into()),
+                held_secs: 90,
+                unit: Some("rsi-job-x.service".into()),
+            }],
+        };
+        let text = held.describe();
+        assert!(
+            text.contains("pid 77 (cargo test, unit rsi-job-x.service) for 90s"),
+            "{text}"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -1110,7 +2216,8 @@ mod tests {
             BlockReason::Slots {
                 class: AdmissionClass::Check,
                 in_use: 1,
-                cap: 1
+                cap: 1,
+                ..
             }
         ));
         assert!(g.release(&p, check));
@@ -1160,6 +2267,26 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn disk_wait_reports_exact_bytes_when_free_gib_rounds_to_the_floor() {
+        let (w, mut g) = World::new();
+        g.growth_probe = Box::new(|_| disk_growth::Usage {
+            expected_bytes: 24 * 1_073_741_824,
+            current_bytes: 24 * 1_073_741_824,
+        });
+        let p = GovernorPolicy::LINUX_DEFAULT;
+        w.set(|s| s.disk_free_gb = (30.0 * GIB - 1.0) / GIB);
+        let outcome = g.acquire(&p, &req(AdmissionClass::Build, 1)).unwrap();
+        let (ticket, _, reason) = queued(&outcome);
+        assert_eq!(
+            reason.describe(),
+            "only 30.0 GiB (32212254719 bytes) free on /, floor 30 GiB (32212254720 bytes); waiting for space"
+        );
+        w.set(|s| s.disk_free_gb = 30.0);
+        granted(&poll(&g, &p, ticket, AdmissionClass::Build));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn each_host_gate_blocks_with_its_reason() {
         let p = GovernorPolicy::LINUX_DEFAULT;
         let cases: Vec<(Box<dyn Fn(&mut ResourceSample)>, &str)> = vec![
@@ -1185,6 +2312,83 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn disk_wait_tracks_the_continuous_hold_and_resets_on_other_gates() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        world.set(|s| s.load1 = 40.0);
+        let (ticket, _, _) = queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        assert_eq!(
+            governor.snapshot(&policy).queue[0].disk_wait_started_at,
+            None
+        );
+        world.set(|s| {
+            *s = healthy();
+            s.disk_free_gb = 27.0;
+        });
+        let snapshot = governor.snapshot(&policy);
+        let since = snapshot.queue[0].disk_wait_started_at.unwrap();
+        assert_eq!(
+            governor.snapshot(&policy).queue[0].disk_wait_started_at,
+            Some(since)
+        );
+        // Queue age is unrelated to the disk hold's age.
+        let earlier = Utc::now() - chrono::Duration::minutes(40);
+        governor.state().queue[0].disk_wait_started_at = Some(earlier);
+        let snapshot = governor.snapshot(&policy);
+        let build = crate::rolling_queue::satellite_qa::BuildGate::from_snapshot(&snapshot);
+        assert!(build.disk_wait_seconds.unwrap() >= 2400);
+        assert_eq!(build.disk_floor_gib, policy.min_free_disk_gb);
+        assert_eq!(
+            build.disk_free_bytes,
+            Some(27 * rsi_common::satellite_qa::GIB_BYTES)
+        );
+        world.set(|s| {
+            *s = healthy();
+            s.load1 = 40.0;
+        });
+        assert_eq!(
+            governor.snapshot(&policy).queue[0].disk_wait_started_at,
+            None
+        );
+        world.set(|s| *s = healthy());
+        granted(&poll(&governor, &policy, ticket, AdmissionClass::Build));
+    }
+
+    /// #625: a waiter held only by the disk floor is reported with its hold's
+    /// age, but not while a lease holds a slot (that holder may free space).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn disk_stalled_waiters_need_the_floor_alone_and_no_slot_holder() {
+        let (world, governor) = World::new();
+        let policy = GovernorPolicy::LINUX_DEFAULT;
+        // Healthy host: pid 1 takes a slot.
+        let lease = granted(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 1))
+                .unwrap(),
+        );
+        world.set(|s| s.disk_free_gb = 26.9);
+        queued(
+            &governor
+                .acquire(&policy, &req(AdmissionClass::Build, 2))
+                .unwrap(),
+        );
+        governor.snapshot(&policy);
+        let earlier = Utc::now() - chrono::Duration::minutes(40);
+        governor.state().queue[0].disk_wait_started_at = Some(earlier);
+        assert!(governor.disk_stalled_waiters().is_empty());
+        // The holder leaves: only the floor holds the waiter, for ~40 minutes.
+        assert!(governor.release(&policy, lease));
+        let stalled = governor.disk_stalled_waiters();
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        assert!(stalled[0].stalled_secs >= 2400);
+    }
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn gate_thresholds_are_the_cargo_slot_boundaries() {
@@ -1270,6 +2474,7 @@ mod tests {
                 cores: 8,
                 disk_free_gb: 99.0,
                 mem_available_gb: 99.0,
+                swap_free_gb: 0.0,
                 workers_slice_anon_gb: None,
             }),
             Box::new(move |pid| {
@@ -1374,14 +2579,33 @@ mod tests {
         std::path::Path::new(rsi_common::manifest_dir!()).join("../../scripts/cargo-slot")
     }
 
+    /// The `rsi-repo-guard` the script's helper subcommands run (#465: the governor client,
+    /// probes and ticket head moved out of inline interpreter code). Built once through the
+    /// repo shim with the test's own cargo setup; `None` when it cannot be built.
+    fn guard_bin() -> Option<std::path::PathBuf> {
+        static BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        BIN.get_or_init(|| {
+            let shim =
+                std::path::Path::new(rsi_common::manifest_dir!()).join("../../scripts/repo-guard");
+            let out = Command::new(shim)
+                .arg("--bin")
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let path = std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            (out.status.success() && path.is_file()).then_some(path)
+        })
+        .clone()
+    }
+
     fn tools_available() -> bool {
-        ["ionice", "flock", "python3"].iter().all(|tool| {
+        ["ionice", "flock"].iter().all(|tool| {
             Command::new("sh")
                 .args(["-c", &format!("command -v {tool}")])
                 .stdout(Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success())
-        })
+        }) && guard_bin().is_some()
     }
 
     /// Serve `AcquireAdmission`/`ReleaseAdmission` on `socket` with `governor`,
@@ -1429,6 +2653,10 @@ mod tests {
         command
             .args(args)
             .env("HOME", home)
+            .env(
+                "RSI_REPO_GUARD_BIN",
+                guard_bin().expect("tools_available checked the guard"),
+            )
             .env("RSI_DAEMON_SOCKET_PATH", socket)
             .env("RSI_CARGO_MIN_FREE_GB", "0")
             .env("RSI_CARGO_MAX_LOAD", "100000")

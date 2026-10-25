@@ -14,7 +14,6 @@ use rsi_common::model_control::{
     InvocationOwner, ModelInvocationPurpose, ModelInvocationStatus, ModelUsageConfidence,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Maximum estimated tokens per batch (chars / 4 approximation).
 const BATCH_MAX_TOKENS: usize = 8000;
@@ -46,7 +45,7 @@ const BATCH_TIMEOUT_LOCAL_MS: u64 = 600_000;
 
 #[derive(Clone)]
 pub struct EmbeddingControl {
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<rsid_core::store_lock::Mutex<Store>>,
     pub event_bus: Arc<EventBus>,
     pub owner: InvocationOwner,
     pub provider: String,
@@ -665,7 +664,7 @@ mod tests {
     }
 
     fn make_control(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         provider: &str,
         backend: &str,
         model: &str,
@@ -686,7 +685,7 @@ mod tests {
 
     fn make_local_test_control() -> EmbeddingControl {
         make_control(
-            Arc::new(Mutex::new(
+            Arc::new(rsid_core::store_lock::Mutex::new(
                 Store::open_in_memory().expect("model-control store"),
             )),
             "Local",
@@ -696,7 +695,7 @@ mod tests {
         )
     }
 
-    async fn invocation_row_count(store: &Arc<Mutex<Store>>) -> usize {
+    async fn invocation_row_count(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> usize {
         let guard = store.lock().await;
         guard
             .conn
@@ -706,7 +705,9 @@ mod tests {
             .expect("count model invocations") as usize
     }
 
-    async fn latest_invocation_state(store: &Arc<Mutex<Store>>) -> (String, Option<String>) {
+    async fn latest_invocation_state(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> (String, Option<String>) {
         let guard = store.lock().await;
         guard
             .conn
@@ -1093,7 +1094,9 @@ mod tests {
     #[tokio::test]
     async fn denied_embedding_query_does_not_execute_provider_future() {
         let provider = CountingProvider::new("remote-test");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "OpenAI",
@@ -1115,7 +1118,9 @@ mod tests {
     #[tokio::test]
     async fn successful_embedding_batch_settles_one_completed_row() {
         let provider = CountingProvider::new("ollama");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "Local",
@@ -1147,7 +1152,9 @@ mod tests {
         // (63e18e15), so without the fix every subsequent identical request
         // is permanently denied.
         let provider = CountingProvider::new("ollama");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "Local",
@@ -1192,7 +1199,9 @@ mod tests {
         // content back to back (initial index, then two consecutive
         // cache-loss reindexes) and requires all three to succeed.
         let provider = CountingProvider::new("ollama");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "Local",
@@ -1242,7 +1251,9 @@ mod tests {
         // the genuine concurrent-duplicate protection this admission guard
         // exists for, and retrying it would double-spend on a request that
         // may still be in flight.
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "Local",
@@ -1321,7 +1332,9 @@ mod tests {
         // without the fix every session in the reindex fails, exactly as
         // observed live (sessions_indexed=36 vs sessions_failed=1278).
         let provider = MockEmbeddingProvider::new(4);
-        let control_store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let control_store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&control_store),
             "Local",
@@ -1374,7 +1387,9 @@ mod tests {
     #[tokio::test]
     async fn embedding_retry_budget_defaults_to_single_attempt() {
         let provider = CountingProvider::with_batch_error("ollama", "server returned 500");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let control = make_control(
             Arc::clone(&store),
             "Local",

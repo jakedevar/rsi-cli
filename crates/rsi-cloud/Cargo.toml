@@ -1,0 +1,48 @@
+[package]
+name = "rsi-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Spend safety net for the AWS cloud gate and spot pool: spend guard, orphan watchdog and pool lease state (replaces the Python cloud-spend/cloud-watchdog/cloud-pool-state scripts, #3767)"
+
+[lib]
+name = "rsi_cloud"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsi-cloud"
+path = "src/main.rs"
+
+# Test fixture only: stands in for terraform, aws and ssh when the pool script
+# runs under test. Never installed (install-release names its --bin list).
+[[bin]]
+name = "rsi-cloud-fakes"
+path = "src/bin/rsi-cloud-fakes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "rsi-cloud-sweep-fake"
+path = "src/bin/rsi-cloud-sweep-fake.rs"
+test = false
+doc = false
+
+[dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+flate2 = "1"
+quick-xml = { version = "=0.38.4", features = ["serialize"] }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+ring = "0.17"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+rsi-common = { path = "../rsi-common" }
+tempfile = "3"
+
+[lints]
+workspace = true

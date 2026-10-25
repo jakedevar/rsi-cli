@@ -327,7 +327,7 @@ async fn child_heal_publishes_session_heal_scheduled_event() {
         )
         .unwrap();
     child.parent_id = Some(parent.id);
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(store));
     let bus = std::sync::Arc::new(EventBus::new(16));
     let mut events = bus.subscribe();
     crate::store::session_transient_heal::heal_failed_session(&store, &bus, child.id).await;

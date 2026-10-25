@@ -159,9 +159,31 @@ pub(super) fn statx_of(fd: RawFd) -> Statx {
     }
 }
 
-// Non-Linux kernels cannot supply Linux mount IDs. Keep scratch unproven:
-// substituting a device number would miss same-device bind mounts.
-#[cfg(not(target_os = "linux"))]
+// macOS and FreeBSD keep a birth time in `fstat` (`st_birthtime`) but no Linux
+// mount ID. Keep the mount unproven: substituting a device number would miss
+// same-device bind mounts. The birth time lets scratch directories be
+// registered (#166).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub(super) fn statx_of(fd: RawFd) -> Statx {
+    match fstat(fd) {
+        Ok(stat) => Statx {
+            mount: None,
+            btime: Some(birth_nanos(&stat)),
+        },
+        Err(_) => Statx::default(),
+    }
+}
+
+/// Birth time of `stat` in nanoseconds since the epoch.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[allow(clippy::unnecessary_cast)] // time_t/c_long widths differ per target
+fn birth_nanos(stat: &FileStat) -> i128 {
+    i128::from(stat.st_birthtime as i64) * 1_000_000_000 + i128::from(stat.st_birthtime_nsec as i64)
+}
+
+// Other kernels (Windows has no `fd`-based path here at all) keep no birth time
+// and cannot supply Linux mount IDs: scratch stays unproven.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 pub(super) fn statx_of(_fd: RawFd) -> Statx {
     Statx::default()
 }
@@ -263,11 +285,49 @@ pub(super) fn pin_child(parent: &Pinned, name: &str) -> io::Result<Pinned> {
 /// user, and either closed to group and other writes or sticky (so only an
 /// entry's owner can rename it). Ownership by the daemon user does not excuse
 /// an open mode.
-const fn ancestor_authentic(pinned: &Pinned, uid: u32) -> bool {
-    let owner_ok = pinned.uid == 0 || pinned.uid == uid;
+fn ancestor_authentic(pinned: &Pinned, uid: u32) -> bool {
+    let owner_ok =
+        pinned.uid == 0 || pinned.uid == uid || unmapped_owner_trusted_in_tests(pinned.uid);
     let open_write = pinned.mode & 0o022 != 0;
     let sticky = pinned.mode & 0o1000 != 0;
     owner_ok && (!open_write || sticky)
+}
+
+/// Test builds only (#3671): `scoped_test` runs the suite in a one-id user
+/// namespace (`unshare --user --map-user=<uid>`), where host root's directories
+/// (`/`, `/tmp`, `/dev/shm`) are unmapped and `stat` reports them as the kernel
+/// overflow uid. Production never runs in such a namespace and keeps refusing
+/// any ancestor owned by neither root nor the daemon user, so only a test build
+/// whose own namespace does not map uid 0 reads the overflow owner as root.
+#[cfg(test)]
+fn unmapped_owner_trusted_in_tests(owner: u32) -> bool {
+    use std::sync::OnceLock;
+    static OVERFLOW: OnceLock<Option<u32>> = OnceLock::new();
+    let overflow = *OVERFLOW.get_or_init(|| {
+        let maps_root = std::fs::read_to_string("/proc/self/uid_map")
+            .map(|map| {
+                map.lines().any(|line| {
+                    let mut fields = line.split_whitespace();
+                    let inside = fields.next().and_then(|v| v.parse::<u64>().ok());
+                    let _outside = fields.next();
+                    let count = fields.next().and_then(|v| v.parse::<u64>().ok());
+                    matches!((inside, count), (Some(inside), Some(count)) if inside == 0 && count > 0)
+                })
+            })
+            .unwrap_or(true);
+        if maps_root {
+            return None;
+        }
+        std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    });
+    overflow == Some(owner)
+}
+
+#[cfg(not(test))]
+const fn unmapped_owner_trusted_in_tests(_owner: u32) -> bool {
+    false
 }
 
 /// Open `root` one component at a time with `O_NOFOLLOW`, authenticating every

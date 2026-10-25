@@ -44,6 +44,18 @@ struct SeatThread: Sendable, Equatable {
         items = (page.items + items.filter { !fresh.contains($0.id) }).sorted(by: ConversationItem.newerFirst)
     }
 
+    /// The hub's delivery state of the operator message `event` shows: by the
+    /// hub id on the item, else by the key the phone sent (hub #3797).
+    func deliveryState(of event: ChatEvent) -> String? {
+        operatorMessages.first { record in
+            if let id = event.operatorMessageId, record.messageId == id { return true }
+            if let key = event.idempotencyKey, let echoed = record.idempotencyKey {
+                return key.lowercased() == echoed.lowercased()
+            }
+            return false
+        }?.state
+    }
+
     /// Append an older page fetched with `olderCursor`.
     mutating func appendOlderPage(_ page: ConversationPage) {
         let known = Set(items.map(\.id))
@@ -60,17 +72,22 @@ struct SeatThread: Sendable, Equatable {
 @Observable
 final class ManagerChat {
     let project: String
+    /// The gateway host this chat reads and writes for.
+    let host: String
+    /// Where sent messages wait until the hub has them (#505).
+    let outbox: Outbox
     private let client: RemoteClient
     private let onSeats: @MainActor (ProjectSeatsList) -> Void
-    private let newKey: () -> String
 
     private(set) var seats: ProjectSeats?
     var role: SeatRole = .projectManager
     private(set) var threads: [SeatRole: SeatThread] = [:]
     var drafts: [SeatRole: MessageDraft] = [:]
     /// Messaging is off: the gateway said so (`messages_enabled: false`, hub
-    /// #2988) or refused a send while the seat is listed (an older gateway).
-    private(set) var messagingOff = false
+    /// #2988) or refused a queued message while the seat is listed (an older
+    /// gateway).
+    private var flagOff = false
+    var messagingOff: Bool { flagOff || heldForMessagingOff }
     /// The gateway's `messages_enabled`, nil until a seat list carries it.
     private(set) var messagesEnabled: Bool?
 
@@ -81,14 +98,15 @@ final class ManagerChat {
 
     init(
         project: String, seats: ProjectSeats?, client: RemoteClient,
-        onSeats: @escaping @MainActor (ProjectSeatsList) -> Void = { _ in },
-        newKey: @escaping () -> String = { UUID().uuidString.lowercased() }
+        host: String = "", outbox: Outbox = Outbox(store: MemoryOutboxStore()),
+        onSeats: @escaping @MainActor (ProjectSeatsList) -> Void = { _ in }
     ) {
         self.project = project
         self.seats = seats
         self.client = client
         self.onSeats = onSeats
-        self.newKey = newKey
+        self.host = host
+        self.outbox = outbox
     }
 
     var seat: ManagerSeat? { seats?.seat(role) }
@@ -113,7 +131,7 @@ final class ManagerChat {
     func update(messagesEnabled: Bool?) {
         guard let messagesEnabled else { return }
         self.messagesEnabled = messagesEnabled
-        messagingOff = !messagesEnabled
+        flagOff = !messagesEnabled
     }
 
     // MARK: Reading
@@ -132,6 +150,8 @@ final class ManagerChat {
             threads[role] = thread
             backoff.succeeded()
         } catch {
+            // The pane went away mid-read: nothing failed.
+            if error.error == .cancelled { return }
             backoff.failed(retryAfter: error.retryAfter)
             var thread = threads[role].flatMap { $0.seat == seat.sessionId ? $0 : nil }
                 ?? SeatThread(seat: seat.sessionId)
@@ -165,7 +185,7 @@ final class ManagerChat {
         current.loadingOlder = false
         if let page, current.olderCursor == cursor {
             current.appendOlderPage(page)
-        } else if let failure {
+        } else if let failure, failure != .cancelled {
             current.olderError = failure
         }
         threads[role] = current
@@ -201,78 +221,54 @@ final class ManagerChat {
 
     // MARK: Sending
 
-    /// Send (or retry the frozen attempt of) the selected seat's draft.
-    func send() async {
-        let role = self.role
-        guard let seat else { return }
-        var draft = drafts[role] ?? MessageDraft()
-        let request: MessageRequest
-        do {
-            request = try draft.begin(project: project, seat: seat.sessionId, newKey: newKey)
-        } catch {
-            draft.finish(.failure(error as? MessageError ?? MessageError(.invalid, "\(error)")))
-            drafts[role] = draft
-            return
-        }
-        drafts[role] = draft
-        let result: Result<MessageReceipt, MessageError>
-        do throws(MessageError) {
-            result = .success(try await client.sendMessage(request))
-        } catch {
-            result = .failure(await refine(error, seat: request.seat))
-        }
-        var finished = drafts[role] ?? draft
-        finished.finish(result)
-        drafts[role] = finished
-        switch result {
-        case .success:
-            // A send that queued proves messaging is on.
-            messagingOff = false
-            if messagesEnabled == false { messagesEnabled = true }
-            await refresh()
-        case .failure(let error) where error.kind == .messagingOff:
-            messagingOff = true
-        case .failure:
-            break
-        }
-    }
-
-    /// Give up on an unknown attempt.
-    func discard() {
+    /// Save the selected seat's draft in the outbox and start sending it. The
+    /// box is empty again at once; the outbox keeps the message until the hub
+    /// has it, however long that takes (#505). Nothing is saved for a text the
+    /// gateway would refuse; the reason shows on the draft.
+    @discardableResult
+    func send() -> OutboxMessage? {
+        guard let seat else { return nil }
         var draft = self.draft
-        draft.discard()
-        self.draft = draft
-    }
-
-    /// A bare 403 names no reason. Re-list the seats: a seat that is still
-    /// listed leaves the `allow_messages` switch as the reason (this client
-    /// always sends the exact Origin and its session's CSRF); a seat that is
-    /// gone is a rotation. A 404 or `seat_not_live` also re-lists.
-    private func refine(_ error: MessageError, seat: String) async -> MessageError {
-        switch error.kind {
-        case .forbidden:
-            switch await relist(seat: seat) {
-            // A gateway that reports messaging on refused for another reason.
-            case true? where messagesEnabled == true: return error
-            case true?: return .messagingOff()
-            case false?: return .seatChanged(status: error.status)
-            case nil: return error
-            }
-        case .seatChanged:
-            await relist(seat: seat)
-            return error
-        default:
-            return error
+        do {
+            let message = try outbox.enqueue(
+                host: host, project: project, role: role.rawValue, seat: seat.sessionId, text: draft.text)
+            draft.text = ""
+            draft.problem = nil
+            self.draft = draft
+            return message
+        } catch {
+            draft.problem = error.message
+            self.draft = draft
+            return nil
         }
     }
 
-    /// The delivery line for a send receipt: its state as the conversation's
-    /// `operator_messages` reports it now, else the receipt's own.
-    func delivery(of receipt: MessageReceipt) -> (text: String, tone: AnswerTone) {
-        let state = thread?.operatorMessages.first { $0.messageId == receipt.messageId }?.state
-            ?? receipt.state
+    /// This project's outbox messages on this host, newest first.
+    var outgoing: [OutboxMessage] { outbox.messages(host: host, project: project) }
+
+    /// Messages held because the hub has messaging switched off.
+    private var heldForMessagingOff: Bool {
+        outgoing.contains {
+            $0.state == .queued && $0.lastErrorKind == MessageErrorKind.messagingOff.rawValue
+        }
+    }
+
+    /// The hub accepted a message from this chat: messaging is on.
+    func accepted() {
+        flagOff = false
+        if messagesEnabled == false { messagesEnabled = true }
+        Task { await refresh() }
+    }
+
+    /// The delivery line for a message in the outbox, with its state as the
+    /// conversation's `operator_messages` reports it now, else the hub's own
+    /// at acceptance.
+    func delivery(of message: OutboxMessage) -> (text: String, tone: AnswerTone)? {
+        guard message.state == .delivered, let accepted = message.hubState else { return nil }
+        let state =
+            thread?.operatorMessages.first { $0.describes(message) }?.state ?? accepted
         let (text, tone) = describeDelivery(state)
-        let replay = receipt.deduplicated ? "Already queued earlier under this key; not sent twice. " : ""
+        let replay = message.deduplicated ? "Already queued earlier under the same id; not sent twice. " : ""
         return (replay + text, tone)
     }
 }

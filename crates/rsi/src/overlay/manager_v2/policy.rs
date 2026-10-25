@@ -13,6 +13,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     path::PathBuf,
 };
+mod grants;
 mod preview;
 pub mod usage;
 use crate::{app::App, types::OverlayState};
@@ -73,8 +74,24 @@ pub enum Field {
     CreateGroups,
     Containers,
     Sessions,
+    /// #3416: the rolling window `max_created_sessions` counts over.
+    SessionsWindow,
+    /// #3417: expander row of the operator provider spend grants.
+    ProviderGrants,
+    /// The USD budget of the grant for `PROVIDERS[i]`; blank removes it.
+    GrantBudget(usize),
+    GrantEfforts(usize),
+    GrantExpiry(usize),
+    /// Tick: saving the grant also turns the daemon setting `bench.enabled` on.
+    GrantBench(usize),
+    /// Read-only live spend line of the grant for `PROVIDERS[i]`.
+    GrantStatus(usize),
+    /// Read-only `bench.enabled` daemon setting, shown beside the grants.
+    BenchSetting,
     Concurrency,
     Tier2Reviewer,
+    /// Expander row of the provider-limit rows (#3418).
+    ProviderLimits,
     ProviderLimit(usize),
     LaunchProvider(usize),
     LaunchModel(usize),
@@ -97,6 +114,12 @@ pub struct PolicyState {
     pub draft: ManagerPolicyV2,
     pub touched: BTreeSet<ManagerPolicyField>,
     pub advanced_open: bool,
+    /// #3418: every provider-limit row is listed; collapsed, only the limits
+    /// that are set (plus the expander row) are.
+    pub provider_limits_open: bool,
+    /// #3417: every provider is listed for a grant; collapsed, only the
+    /// providers that have one (plus the expander row) are.
+    pub provider_grants_open: bool,
     pub preview_open: bool,
     pub picker: Option<ManagerLaunchPickerState>,
     pub catalog_request: Option<ManagerCatalogRequest>,
@@ -133,6 +156,7 @@ pub enum Section {
     Presets,
     Budgets,
     Launches,
+    ProviderGrants,
     Authority,
     Scope,
     Recovery,
@@ -143,13 +167,14 @@ impl Section {
     #[must_use]
     pub const fn title(self) -> &'static str {
         match self {
-            Self::Presets => "Authority · presets",
-            Self::Budgets => "Budgets",
-            Self::Authority => "Authority · mode and grants",
+            Self::Presets => "Presets · each replaces mode and grants",
+            Self::Budgets => "Budgets and limits",
+            Self::Authority => "Mode and grants",
             Self::Scope => "Scope",
             Self::Recovery => "Recovery",
             Self::DaemonSettings => "Daemon settings · manager bounds",
-            Self::Launches => "Launches",
+            Self::Launches => "Allowed models",
+            Self::ProviderGrants => "Provider grants · operator spend",
             Self::Preview => "Effective preview · read-only",
         }
     }
@@ -181,6 +206,11 @@ pub struct PolicyRow {
     /// Client-side validation error for the draft value (mirrors
     /// `ManagerPolicyV2::validate`).
     pub error: Option<String>,
+    /// Sub-header the row is listed under (the provider of a launch choice).
+    pub group: Option<String>,
+    /// A yes/no row draws as a `[x]` checklist item; `value` stays
+    /// `true`/`false`.
+    pub check: Option<bool>,
 }
 
 /// Inclusive numeric bounds mirrored from `ManagerPolicyV2::validate`
@@ -189,6 +219,7 @@ pub struct PolicyRow {
 pub const fn numeric_bounds(field: Field) -> Option<(u32, u32)> {
     Some(match field {
         Field::Sessions => (0, 1024),
+        Field::SessionsWindow => (1, 8760),
         Field::Containers => (0, 64),
         Field::Concurrency => (1, 100),
         Field::ProviderLimit(_) => (1, 64),
@@ -207,6 +238,7 @@ const MAX_LAUNCHES: usize = rsi_common::global_manager::GLOBAL_MANAGER_MAX_LAUNC
 fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
     Some(match field {
         Field::Sessions => p.max_created_sessions.to_string(),
+        Field::SessionsWindow => p.created_sessions_window_hours.to_string(),
         Field::Containers => p.max_created_containers.to_string(),
         Field::Concurrency => p.max_active_sessions.to_string(),
         Field::Tier2Reviewer => format!("{:?}", p.minimum_tier2_reviewer_tier),
@@ -228,6 +260,10 @@ fn scalar_value(p: &ManagerPolicyV2, field: Field) -> Option<String> {
         Field::Retries => p.max_recovery_attempts.to_string(),
         Field::RetryDelay => p.retry_delay_seconds.to_string(),
         Field::Deadline => p.request_timeout_seconds.to_string(),
+        Field::GrantBudget(_)
+        | Field::GrantEfforts(_)
+        | Field::GrantExpiry(_)
+        | Field::GrantBench(_) => return grants::grant_field_value(p, field),
         _ => return None,
     })
 }
@@ -298,15 +334,134 @@ pub(crate) fn capability_label(capability: ManagerCapabilityV2) -> String {
     }
 }
 
+/// What a preset line says it changes, from the grants it applies.
+fn preset_effect(preset: ManagerPolicyPreset) -> String {
+    let grants = manager_preset_grants(preset);
+    match preset {
+        ManagerPolicyPreset::Custom => {
+            "Keep the draft exactly as edited · opens the raw launch rows".into()
+        }
+        ManagerPolicyPreset::Observe => {
+            "Monitor mode · no write grants · watches and reports only".into()
+        }
+        _ if grants.len() == CAPABILITIES.len() => format!(
+            "Execute mode · all {} grants, including Git, Topology, Automation and Deploy",
+            CAPABILITIES.len()
+        ),
+        _ => {
+            let withheld = withheld_grants(preset);
+            format!(
+                "Execute mode · {} of {} grants · withholds {}{}",
+                grants.len(),
+                CAPABILITIES.len(),
+                withheld
+                    .iter()
+                    .take(2)
+                    .map(|c| capability_label(*c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match withheld.len().saturating_sub(2) {
+                    0 => String::new(),
+                    more => format!(" +{more} more"),
+                }
+            )
+        }
+    }
+}
+
+/// Grants a preset leaves off.
+fn withheld_grants(preset: ManagerPolicyPreset) -> Vec<ManagerCapabilityV2> {
+    let grants = manager_preset_grants(preset);
+    CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| !grants.contains(c))
+        .collect()
+}
+
+/// The preset row's help line; names every withheld grant.
+fn preset_help(preset: ManagerPolicyPreset) -> String {
+    match preset {
+        ManagerPolicyPreset::Custom => {
+            "Keep the draft as edited and show the raw launch tuple rows".into()
+        }
+        _ => {
+            let withheld = withheld_grants(preset);
+            format!(
+                "Replace mode and grants with this preset; explicit limits are kept{}",
+                if withheld.is_empty() || preset == ManagerPolicyPreset::Observe {
+                    String::new()
+                } else {
+                    format!(
+                        " · withholds {}",
+                        withheld
+                            .iter()
+                            .map(|c| capability_label(*c))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            )
+        }
+    }
+}
+
+/// Provider order of a launch choice (unknown providers last).
+fn provider_rank(provider: SessionProvider) -> usize {
+    PROVIDERS
+        .iter()
+        .position(|p| *p == provider)
+        .unwrap_or(PROVIDERS.len())
+}
+
 impl PolicyState {
+    /// Allowed launch choices grouped by provider: each provider once, in
+    /// provider order, with the indices (into `allowed_launches`) of its
+    /// choices in stored order.
+    #[must_use]
+    pub fn launches_by_provider(&self) -> Vec<(SessionProvider, Vec<usize>)> {
+        let mut groups: Vec<(SessionProvider, Vec<usize>)> = vec![];
+        for (i, choice) in self.draft.allowed_launches.iter().enumerate() {
+            match groups.iter_mut().find(|(p, _)| *p == choice.provider) {
+                Some((_, indices)) => indices.push(i),
+                None => groups.push((choice.provider, vec![i])),
+            }
+        }
+        groups.sort_by_key(|(p, _)| provider_rank(*p));
+        groups
+    }
+    /// `Claude 6 · Codex 5` for the draft's allowed launches.
+    #[must_use]
+    pub fn launch_counts(&self) -> String {
+        self.launches_by_provider()
+            .iter()
+            .map(|(p, indices)| format!("{p:?} {}", indices.len()))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+    /// Provider limits are listed when expanded, or when this one is set,
+    /// changed or invalid.
+    fn provider_limit_listed(&self, i: usize) -> bool {
+        self.provider_limits_open
+            || self
+                .draft
+                .provider_limits
+                .iter()
+                .any(|l| l.provider == PROVIDERS[i])
+            || self.modified(Field::ProviderLimit(i))
+            || self.field_error(Field::ProviderLimit(i)).is_some()
+    }
     pub fn rows(&self) -> Vec<PolicyRow> {
         let mut rows = vec![];
         let mut section = Section::Presets;
         let d = &self.draft;
+        let group = std::cell::RefCell::new(None::<String>);
         let mut push =
             |section: Section, field: Field, label: &str, value: String, description: &str| {
                 let kind = match field {
-                    Field::Detail(_) => RowKind::ReadOnly,
+                    Field::Detail(_) | Field::GrantStatus(_) | Field::BenchSetting => {
+                        RowKind::ReadOnly
+                    }
                     Field::Mode
                     | Field::Paused
                     | Field::Capability(_)
@@ -314,17 +469,30 @@ impl PolicyState {
                     | Field::Group(_)
                     | Field::CreateGroups
                     | Field::Tier2Reviewer
-                    | Field::LaunchProvider(_) => RowKind::Toggle,
+                    | Field::LaunchProvider(_)
+                    | Field::GrantBench(_) => RowKind::Toggle,
                     Field::Preset(_)
                     | Field::Suggestions
                     | Field::Advanced
                     | Field::Preview
+                    | Field::ProviderLimits
+                    | Field::ProviderGrants
                     | Field::EditLaunch(_)
                     | Field::RemoveLaunch(_)
                     | Field::AddLaunch
                     | Field::AddRawLaunch => RowKind::Action,
                     _ => RowKind::Edit,
                 };
+                let check = matches!(
+                    field,
+                    Field::Paused
+                        | Field::Capability(_)
+                        | Field::Epic(_)
+                        | Field::Group(_)
+                        | Field::CreateGroups
+                        | Field::GrantBench(_)
+                )
+                .then(|| value == "true");
                 rows.push(PolicyRow {
                     field,
                     label: label.into(),
@@ -338,6 +506,8 @@ impl PolicyState {
                         .then(|| scalar_value(&self.opened_draft, field))
                         .flatten(),
                     error: self.field_error(field),
+                    group: group.borrow().clone(),
+                    check,
                 });
             };
 
@@ -351,16 +521,8 @@ impl PolicyState {
                 section,
                 Field::Preset(preset),
                 preset.label(),
-                if preset == ManagerPolicyPreset::Custom {
-                    "Keep exact draft; show exact launch tuples".into()
-                } else {
-                    "Apply permissions to draft; preserve explicit limits".into()
-                },
-                if preset == ManagerPolicyPreset::Custom {
-                    "Keep the draft as edited and show the raw launch tuple rows"
-                } else {
-                    "Replace mode and grants with this preset; explicit limits are kept"
-                },
+                preset_effect(preset),
+                &preset_help(preset),
             );
         }
         let suggestions = self.suggestions();
@@ -377,13 +539,21 @@ impl PolicyState {
                 "Raise the zero limits that block the chosen permissions",
             );
         }
+
         section = Section::Budgets;
         push(
             section,
             Field::Sessions,
             "Created session quota",
             d.max_created_sessions.to_string(),
-            "Lifetime sessions the manager may create in this scope; DB-native reviews are not counted",
+            "Sessions the manager seat lineage may create per window below; the oldest creation leaving the window frees a slot, so rotation never resets it; DB-native reviews are not counted",
+        );
+        push(
+            section,
+            Field::SessionsWindow,
+            "Created session window (hours)",
+            d.created_sessions_window_hours.to_string(),
+            "Rolling window the session quota counts over (1-8760 hours; 24 by default)",
         );
         push(
             section,
@@ -414,8 +584,30 @@ impl PolicyState {
                 .map_or_else(|| "uncapped".into(), |v| v.to_string()),
             "Manager USD spend cap; blank removes the cap",
         );
-
+        push(
+            section,
+            Field::ProviderLimits,
+            "Provider limits",
+            {
+                let set = d
+                    .provider_limits
+                    .iter()
+                    .map(|l| format!("{:?} {}", l.provider, l.max_active))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                match (set.is_empty(), self.provider_limits_open) {
+                    (true, false) => "none set · Enter to set one".into(),
+                    (true, true) => "none set · Enter collapse".into(),
+                    (false, false) => format!("{set} · Enter to show every provider"),
+                    (false, true) => format!("{set} · Enter collapse"),
+                }
+            },
+            "Per-provider active ceilings; a provider without one inherits the active session limit",
+        );
         for (i, p) in PROVIDERS.iter().enumerate() {
+            if !self.provider_limit_listed(i) {
+                continue;
+            }
             push(
                 section,
                 Field::ProviderLimit(i),
@@ -427,46 +619,44 @@ impl PolicyState {
                 "Per-provider active ceiling; blank inherits the active session limit",
             );
         }
+
         section = Section::Launches;
-        for (i, choice) in d.allowed_launches.iter().enumerate() {
-            push(
-                section,
-                Field::EditLaunch(i),
-                &format!("Launch {} · {:?}/{}", i + 1, choice.provider, choice.model),
-                format!(
-                    "{} · {} · Enter catalog",
-                    choice.effort_label(),
-                    self.choice_status(choice)
-                ),
-                "Enter opens the provider/model catalog for this choice",
-            );
-            push(
-                section,
-                Field::RemoveLaunch(i),
-                &format!("Remove launch {}", i + 1),
-                if d.allowed_launches.len() == 1 {
-                    "Enter remove → manual any; automatic recovery held"
-                } else {
-                    "Enter remove"
-                }
-                .into(),
-                "Remove this launch restriction",
-            );
-        }
         push(
             section,
             Field::AddLaunch,
             "Allowed models",
             if d.allowed_launches.is_empty() {
-                "Manual: any valid choice · automatic recovery: held · Enter to restrict".into()
+                "Not restricted: any manual choice · automatic recovery: held · Enter to restrict"
+                    .into()
             } else {
                 format!(
-                    "Restricted to {} exact choices · Enter catalog",
+                    "Restricted to {} exact choices · Enter adds · x removes the focused one",
                     d.allowed_launches.len()
                 )
             },
             "Restrict launches to exact catalog choices; an empty list allows valid manual launches but holds automatic intent recovery",
         );
+        for (provider, indices) in self.launches_by_provider() {
+            *group.borrow_mut() = Some(format!("{provider:?} · {}", indices.len()));
+            for i in indices {
+                let choice = &d.allowed_launches[i];
+                push(
+                    section,
+                    Field::EditLaunch(i),
+                    &choice.model,
+                    [
+                        Some(choice.effort_label().to_string()),
+                        self.choice_note(choice),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                    "Enter opens the provider/model catalog for this choice; x removes it",
+                );
+            }
+        }
+        *group.borrow_mut() = None;
         push(
             section,
             Field::Advanced,
@@ -512,6 +702,67 @@ impl PolicyState {
             );
         }
 
+        section = Section::ProviderGrants;
+        push(
+            section,
+            Field::ProviderGrants,
+            "Provider grants",
+            self.grants_summary(),
+            "One operator grant per paid provider: while it has budget left, any model of that provider is launchable at its efforts and bench jobs may bill it, with no exact allowed-model tuple; the daemon charges settled cost against it",
+        );
+        for (i, p) in PROVIDERS.iter().enumerate() {
+            if !self.grant_listed(i) {
+                continue;
+            }
+            let has = grants::grant_of(d, i).is_some();
+            push(
+                section,
+                Field::GrantBudget(i),
+                &format!("{p:?} grant budget (USD)"),
+                grants::grant_field_value(d, Field::GrantBudget(i)).unwrap_or_default(),
+                "Total USD agents may spend on this provider since the grant was first saved; a raise keeps the spend so far; blank removes the grant",
+            );
+            if has {
+                push(
+                    section,
+                    Field::GrantStatus(i),
+                    &format!("{p:?} spend"),
+                    self.grant_status_text(i),
+                    "Settled cost charged against the grant so far (refresh with 5); at the budget new launches and bench jobs on this provider are refused and one operator to-do is filed",
+                );
+                push(
+                    section,
+                    Field::GrantEfforts(i),
+                    &format!("{p:?} grant efforts"),
+                    grants::grant_field_value(d, Field::GrantEfforts(i)).unwrap_or_default(),
+                    "Comma-separated efforts a launch under the grant may use (for example high, medium); another effort is refused naming the grant",
+                );
+                push(
+                    section,
+                    Field::GrantExpiry(i),
+                    &format!("{p:?} grant expiry"),
+                    grants::grant_field_value(d, Field::GrantExpiry(i)).unwrap_or_default(),
+                    "UTC date or RFC 3339 time after which the grant behaves like no grant; blank means no expiry",
+                );
+                push(
+                    section,
+                    Field::GrantBench(i),
+                    &format!("{p:?} bench jobs"),
+                    grants::grant_field_value(d, Field::GrantBench(i)).unwrap_or_default(),
+                    "Also turns the daemon setting bench.enabled on at save",
+                );
+            }
+        }
+        if !d.provider_grants.is_empty() || self.provider_grants_open {
+            push(
+                section,
+                Field::BenchSetting,
+                "bench.enabled (daemon setting)",
+                self.bench_setting_text(),
+                "The daemon setting bench jobs need; a grant with bench ticked turns it on at save, and Settings can still turn it off",
+            );
+        }
+
         section = Section::Authority;
         push(
             section,
@@ -531,7 +782,7 @@ impl PolicyState {
             push(
                 section,
                 Field::Capability(i),
-                &format!("Grant {}", capability_label(*c)),
+                &capability_label(*c),
                 d.capabilities.contains(c).to_string(),
                 capability_description(*c),
             );
@@ -660,6 +911,9 @@ impl PolicyState {
         };
         match field {
             Field::Sessions => d.max_created_sessions != o.max_created_sessions,
+            Field::SessionsWindow => {
+                d.created_sessions_window_hours != o.created_sessions_window_hours
+            }
             Field::Containers => d.max_created_containers != o.max_created_containers,
             Field::Concurrency => d.max_active_sessions != o.max_active_sessions,
             Field::Tier2Reviewer => d.minimum_tier2_reviewer_tier != o.minimum_tier2_reviewer_tier,
@@ -683,6 +937,10 @@ impl PolicyState {
             | Field::LaunchModel(i)
             | Field::LaunchEffort(i) => d.allowed_launches.get(i) != o.allowed_launches.get(i),
             Field::AddLaunch => d.allowed_launches != o.allowed_launches,
+            Field::GrantBudget(_)
+            | Field::GrantEfforts(_)
+            | Field::GrantExpiry(_)
+            | Field::GrantBench(_) => grants::grant_field_modified(d, o, field),
             _ => false,
         }
     }
@@ -692,6 +950,7 @@ impl PolicyState {
         let d = &self.draft;
         let value = match field {
             Field::Sessions => Some(u32::from(d.max_created_sessions)),
+            Field::SessionsWindow => Some(u32::from(d.created_sessions_window_hours)),
             Field::Containers => Some(u32::from(d.max_created_containers)),
             Field::Concurrency => Some(u32::from(d.max_active_sessions)),
             Field::ProviderLimit(i) => d
@@ -729,6 +988,9 @@ impl PolicyState {
         }
         if value.is_some() {
             return None;
+        }
+        if matches!(field, Field::GrantBudget(_) | Field::GrantEfforts(_)) {
+            return self.grant_field_error(field);
         }
         match field {
             Field::Spend => d
@@ -780,7 +1042,16 @@ impl PolicyState {
                 self.preview_open = !self.preview_open;
                 return;
             }
-            Field::Detail(_) => return,
+            Field::ProviderLimits => {
+                self.provider_limits_open = !self.provider_limits_open;
+                return;
+            }
+            Field::ProviderGrants => {
+                self.provider_grants_open = !self.provider_grants_open;
+                return;
+            }
+            Field::Detail(_) | Field::GrantStatus(_) | Field::BenchSetting => return,
+            Field::GrantBench(i) => self.toggle_grant_bench(i),
             Field::Suggestions => {
                 if let Some(profile) = self.classification().permission_profile {
                     let fields = self
@@ -872,6 +1143,7 @@ impl PolicyState {
                         "uncapped",
                         "Enter UUID",
                         "not adjustable",
+                        "none",
                     ]
                     .contains(&value.as_str())
                         || (matches!(field, Field::SettingBound(_))
@@ -905,6 +1177,7 @@ impl PolicyState {
         match field {
             Field::Containers => self.draft.max_created_containers = number()?,
             Field::Sessions => self.draft.max_created_sessions = number()?,
+            Field::SessionsWindow => self.draft.created_sessions_window_hours = number()?,
             Field::Concurrency => self.draft.max_active_sessions = number()?,
             Field::Retries => self.draft.max_recovery_attempts = number()?,
             Field::RetryDelay => self.draft.retry_delay_seconds = bounded()?,
@@ -983,6 +1256,9 @@ impl PolicyState {
                     self.draft.daemon_setting_bounds.push(bound);
                 }
             }
+            Field::GrantBudget(_) | Field::GrantEfforts(_) | Field::GrantExpiry(_) => {
+                self.apply_grant_text(field, value)?;
+            }
             Field::LaunchModel(i) => {
                 if value.is_empty() {
                     return Err("Enter an exact model id.".into());
@@ -1037,7 +1313,7 @@ impl Field {
             Self::Group(_) | Self::AddGroup => ManagerPolicyField::GroupIds,
             Self::CreateGroups => ManagerPolicyField::AllowCreateGroups,
             Self::Containers => ManagerPolicyField::CreatedContainers,
-            Self::Sessions => ManagerPolicyField::CreatedSessions,
+            Self::Sessions | Self::SessionsWindow => ManagerPolicyField::CreatedSessions,
             Self::Concurrency => ManagerPolicyField::ActiveSessions,
             Self::Tier2Reviewer => ManagerPolicyField::Tier2Reviewer,
             Self::ProviderLimit(_) => ManagerPolicyField::ProviderLimits,
@@ -1339,6 +1615,8 @@ pub(super) async fn load(
         draft: policy,
         touched: BTreeSet::new(),
         advanced_open: false,
+        provider_limits_open: false,
+        provider_grants_open: false,
         preview_open: true,
         picker: None,
         catalog_request: None,
@@ -1488,6 +1766,13 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                 state.start_catalog_request(socket);
             }
         }
+        KeyCode::Char('x') | KeyCode::Delete => {
+            if let Some(Field::EditLaunch(i)) = rows.get(state.selected).map(|r| r.field) {
+                state.activate(Field::RemoveLaunch(i));
+                let len = state.rows().len();
+                state.selected = state.selected.min(len.saturating_sub(1));
+            }
+        }
         KeyCode::Char('s') => {
             if let Err(e) = state.draft.validate() {
                 // Point at the first invalid row instead of a bare code.
@@ -1523,6 +1808,11 @@ pub(super) async fn handle_key(app: &mut App, key: KeyEvent) {
                         state.usage_quota = Some(state.draft.max_created_sessions);
                         state.bump_usage_generation();
                         state.idempotency_key = Uuid::new_v4().to_string();
+                        // #3417: the saved grants' spend and the bench setting
+                        // the save may have turned on.
+                        if !state.draft.provider_grants.is_empty() {
+                            state.start_usage(socket.clone());
+                        }
                     }
                 }
                 Err(e) => {

@@ -105,6 +105,105 @@ impl Store {
             .collect()
     }
 
+    /// #604: whether the review worker `reader` may read (`AgentGetJob`, read
+    /// only) the verification job `job_id`, owned by `owner`. True only when
+    /// all of these hold, and every other case is false (the verb then answers
+    /// `job_not_found`, so it is no oracle for foreign jobs):
+    /// - `reader`'s latest Issue-bound launch carries `review_of` = N, naming an
+    ///   Issue of its own project;
+    /// - `owner` is one of the implementer sessions launched on Issue N (the
+    ///   sessions [`Self::evidence_workers`] reads, the ones the review's
+    ///   handoff was copied from);
+    /// - the job is a `scoped_test` verification job of that owner; and
+    /// - it is the owner's newest `scoped_test` job, or its id appears in
+    ///   Issue N's body or newest [`BOUND_HANDOFF_SCAN_MAX`] handoff records.
+    ///
+    /// The id scan is a membership test; it never follows or runs anything.
+    /// Observation only: ownership, cancel and wake authority are unchanged.
+    pub(crate) fn review_worker_may_read_job(
+        &self,
+        reader: Uuid,
+        job_id: Uuid,
+        owner: Uuid,
+    ) -> Result<bool> {
+        let conn = &self.conn;
+        let launch: Option<(String, Option<i64>)> = conn
+            .query_row(
+                "SELECT o.project_id, json_extract(o.payload_json,'$.issue_binding.review_of')
+                 FROM harness_manager_v2_operations o
+                 WHERE o.kind=?1 AND o.target_session_id=?2
+                   AND o.state IN ('running','succeeded')
+                 ORDER BY o.rowid DESC LIMIT 1",
+                params![ACTION_KIND, reader.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((project, Some(reviewed))) = launch else {
+            return Ok(false);
+        };
+        let Ok(project) = Uuid::parse_str(&project) else {
+            return Ok(false);
+        };
+        let reviewed_issue: Option<(String, String)> = conn
+            .query_row(
+                "SELECT id, body FROM issues WHERE project_id=?1 AND display_number=?2",
+                params![project.to_string(), reviewed],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((reviewed_id, body)) = reviewed_issue else {
+            return Ok(false);
+        };
+        let Ok(reviewed_id) = Uuid::parse_str(&reviewed_id) else {
+            return Ok(false);
+        };
+        if !Self::evidence_workers(conn, project, reviewed_id)?.contains(&owner) {
+            return Ok(false);
+        }
+        let newest: Option<String> = conn
+            .query_row(
+                "SELECT id FROM agent_jobs
+                 WHERE owner_session_id=?1 AND kind='test'
+                   AND json_type(params_json,'$.scoped_test')='object'
+                 ORDER BY sequence DESC LIMIT 1",
+                params![owner.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = job_id.to_string();
+        if newest.as_deref() == Some(id.as_str()) {
+            return Ok(true);
+        }
+        let verification: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_jobs
+             WHERE id=?1 AND owner_session_id=?2 AND kind='test'
+               AND json_type(params_json,'$.scoped_test')='object')",
+            params![id, owner.to_string()],
+            |row| row.get(0),
+        )?;
+        if !verification {
+            return Ok(false);
+        }
+        if body.to_ascii_lowercase().contains(&id) {
+            return Ok(true);
+        }
+        let mut statement = conn.prepare(
+            "SELECT body FROM issue_handoffs WHERE issue_id=?1 ORDER BY sequence DESC LIMIT ?2",
+        )?;
+        let handoffs = statement
+            .query_map(
+                params![
+                    reviewed_id.to_string(),
+                    super::issue_worker::BOUND_HANDOFF_SCAN_MAX
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(handoffs
+            .iter()
+            .any(|handoff| handoff.to_ascii_lowercase().contains(&id)))
+    }
+
     /// The `RESULT` line of the newest assistant message of `worker` that has
     /// one among its last few messages (provider diagnostics skipped, #1089).
     fn evidence_result_line(conn: &Connection, worker: Uuid) -> Result<Option<String>> {
@@ -311,7 +410,10 @@ impl Store {
         let Some((id, source, state, filters_json, outcome_json, finished_at)) = row else {
             return Ok(None);
         };
-        let filters: Vec<String> = serde_json::from_str(&filters_json).unwrap_or_default();
+        let filters: Vec<String> = rsi_common::rolling_queue::split_filters_state(
+            serde_json::from_str(&filters_json).unwrap_or_default(),
+        )
+        .0;
         let outcome: serde_json::Value = outcome_json
             .as_deref()
             .and_then(|text| serde_json::from_str(text).ok())

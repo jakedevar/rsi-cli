@@ -2548,12 +2548,8 @@ async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
         manager.active.write().await.insert(session_id, tracked);
 
         let held = manager.active.write().await;
-        let queued = Arc::new(tokio::sync::Notify::new());
-        let queued_wait = queued.notified();
         let active_for_writer = Arc::clone(&manager.active);
-        let queued_for_writer = Arc::clone(&queued);
-        let writer = tokio::spawn(async move {
-            queued_for_writer.notify_one();
+        let writer = async move {
             let mut active = active_for_writer.write().await;
             let tracked = active.get_mut(&session_id).expect("matching active row");
             match intent {
@@ -2562,10 +2558,13 @@ async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
                 "interrupt" => tracked.interrupt_requested = true,
                 _ => unreachable!("fixed intent matrix"),
             }
-        });
-        queued_wait.await;
+        };
+        tokio::pin!(writer);
+        // Polling to Pending while the lock is held proves the writer is in
+        // the fair lock's queue. A notification before write().await does not.
+        assert!(futures::poll!(writer.as_mut()).is_pending());
 
-        let finalizer = tokio::spawn(SessionManager::finalize_session(
+        let finalizer = SessionManager::finalize_session(
             session_id,
             7,
             TerminalFinalizeDecision::completed(),
@@ -2577,13 +2576,13 @@ async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
             None,
             Arc::clone(&manager.runtime_config),
             None,
-        ));
+        );
+        tokio::pin!(finalizer);
+        // Queue the finalizer behind the writer before either can proceed.
+        assert!(futures::poll!(finalizer.as_mut()).is_pending());
         drop(held);
-        writer.await.expect("queued lifecycle writer");
-        let decision = finalizer
-            .await
-            .expect("finalizer task")
-            .expect("durable finalization");
+        let ((), decision) = tokio::join!(writer, finalizer);
+        let decision = decision.expect("durable finalization");
 
         let expected = match intent {
             "archive" => TerminalFinalizeDecision::completed(),
@@ -2600,7 +2599,7 @@ async fn queued_lifecycle_intent_wins_at_atomic_finalization_boundary() {
 }
 
 struct PersistedWatchLauncher {
-    store: std::sync::Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: std::sync::Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     watched: Uuid,
     wake_target: Uuid,
     deliveries: std::sync::atomic::AtomicUsize,
@@ -4150,6 +4149,8 @@ async fn unrecognized_stream_event_is_diagnosed_once_and_yields_no_conversation_
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tool_progress_and_provider_error_are_classified_and_an_unknown_type_still_warns() {
+    use std::sync::atomic::Ordering;
+
     let (dispatch, records) = unrecognized_event_capture();
     let recorded_line = |line: &str| -> StreamEvent {
         let data: serde_json::Value = serde_json::from_str(line).expect("recorded line");
@@ -4179,21 +4180,42 @@ async fn tool_progress_and_provider_error_are_classified_and_an_unknown_type_sti
         },
     ];
 
+    // The provider has exited successfully with these frames buffered. Leaving
+    // the fake process alive makes completion depend on the monitor's natural
+    // exit and interrupt grace periods, then SIGKILL escalation (#565).
     let mut fixture = start_scripted_monitor_with_dispatch(
         SessionProvider::Claude,
         false,
         events,
-        true,
+        false,
         0,
         Some(dispatch),
     )
     .await;
-    wait_for_scripted_result_boundary(&fixture, "assistant text after the classified events").await;
+    // EOF plus the exited process allow deterministic completion. Joining the
+    // monitor proves the buffered frames were drained and finalization ended;
+    // the shared timeout is only a hang guard, not a teardown timing assertion.
     drop(fixture.provider_tx.take());
-    tokio::time::timeout(std::time::Duration::from_secs(5), &mut fixture.monitor)
+    tokio::time::timeout(SCRIPTED_MONITOR_WAIT, &mut fixture.monitor)
         .await
         .expect("monitor drains the scripted stream")
         .expect("monitor task");
+
+    assert_eq!(fixture.process.interrupt_count.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.process.kill_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(fixture.session_id)
+            .expect("load session")
+            .expect("session")
+            .status,
+        SessionStatus::Completed,
+        "the exited provider's buffered stream completes successfully"
+    );
 
     assert_eq!(
         diagnosed_event_types(&records, fixture.session_id),
@@ -5921,7 +5943,7 @@ async fn remote_selected_session_owner_preserves_saved_and_runtime_only_identity
     let completed_id = Uuid::new_v4();
     {
         let store = manager.store.lock().await;
-        let at = chrono::Utc::now().to_rfc3339();
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         store.conn.execute(
             "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'Remote','#000000',?2,?2)",
             rusqlite::params![project.to_string(), at],
@@ -6299,12 +6321,12 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .await
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(4096);
+    // No live native writer makes that source Unavailable, never a failed page.
     page.send_json_line(&mut writer, |result| {
-        matches!(
-            result,
-            Err(crate::remote_read::ReadError::SourceUnavailable
-                | crate::remote_read::ReadError::Busy)
-        )
+        result.is_ok_and(|page| {
+            page.items.is_empty()
+                && page.coverage[4].state == rsi_common::remote_read::CoverageStateV1::Unavailable
+        })
     })
     .await
     .unwrap();
@@ -6339,13 +6361,7 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(65536);
     selected_page
-        .send_json_line(&mut writer, |result| {
-            matches!(
-                result,
-                Err(crate::remote_read::ReadError::SourceUnavailable
-                    | crate::remote_read::ReadError::Busy)
-            )
-        })
+        .send_json_line(&mut writer, |result| result.is_ok())
         .await
         .unwrap();
     drop(writer);
@@ -6353,8 +6369,10 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     reader.read_to_end(&mut bytes).await.unwrap();
     assert!(serde_json::from_slice::<bool>(&bytes).unwrap());
 
-    // A signed position from a present writer cannot be resumed after this
-    // manager observes the writer as missing, even though Store is readable.
+    // A signed position from a writer with no rows resumes when this manager
+    // observes no writer at all: there is no runtime row to skip, and the native
+    // source stays Unavailable in coverage. A position over live rows would carry
+    // a different witness and be refused as stale.
     use crate::remote_read::{
         DecisionsPositionV1, NativeRuntimeApprovalListSnapshot, NativeRuntimeApprovalListState,
         PendingCandidate, PendingKey, PendingPagePosition, PendingPageSelection,
@@ -6421,12 +6439,7 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(4096);
     completed
-        .send_json_line(&mut writer, |result| {
-            matches!(
-                result,
-                Err(crate::remote_read::ReadError::SourceUnavailable)
-            )
-        })
+        .send_json_line(&mut writer, |result| result.is_ok())
         .await
         .unwrap();
     drop(writer);
@@ -6448,15 +6461,9 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .await
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(4096);
-    page.send_json_line(&mut writer, |result| {
-        matches!(
-            result,
-            Err(crate::remote_read::ReadError::SourceUnavailable
-                | crate::remote_read::ReadError::Busy)
-        )
-    })
-    .await
-    .unwrap();
+    page.send_json_line(&mut writer, |result| result.is_ok())
+        .await
+        .unwrap();
     drop(writer);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).await.unwrap();
@@ -6492,15 +6499,9 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .await
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(4096);
-    page.send_json_line(&mut writer, |result| {
-        matches!(
-            result,
-            Err(crate::remote_read::ReadError::SourceUnavailable
-                | crate::remote_read::ReadError::Busy)
-        )
-    })
-    .await
-    .unwrap();
+    page.send_json_line(&mut writer, |result| result.is_ok())
+        .await
+        .unwrap();
     drop(writer);
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).await.unwrap();
@@ -6521,13 +6522,7 @@ async fn remote_initial_saved_decisions_owner_reports_eight_sources() {
     .unwrap();
     let (mut writer, mut reader) = tokio::io::duplex(4096);
     routed
-        .send_json_line(&mut writer, |result| {
-            matches!(
-                result,
-                Err(crate::remote_read::ReadError::SourceUnavailable
-                    | crate::remote_read::ReadError::Busy)
-            )
-        })
+        .send_json_line(&mut writer, |result| result.is_ok())
         .await
         .unwrap();
     drop(writer);
@@ -11316,4 +11311,75 @@ async fn completed_parent_project_and_pin_writes_mirror_the_store_stamp_258() {
     let kept = manager.completed.read().await[&other_id].session.clone();
     assert!(kept.pinned_at.is_some());
     assert_eq!(kept.updated_at, stale_stamp);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn remote_decisions_waiting_session_with_pending_approval_returns_decision() {
+    use tokio::io::AsyncReadExt;
+
+    let (manager, _dir) = manager();
+    let manager = std::sync::Arc::new(manager);
+    let project = Uuid::new_v4();
+    let session = Uuid::new_v4();
+    let approval = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO projects(id,name,color,created_at,updated_at) VALUES(?1,'Remote','#000000',?2,?2)",
+                rusqlite::params![project.to_string(), at],
+            )
+            .unwrap();
+        store.conn.execute(
+            "INSERT INTO sessions(id,query,working_dir,status,created_at,updated_at,project_id,is_eval)
+             VALUES(?1,'waiting','/waiting','WaitingApproval',?2,?2,?3,0)",
+            rusqlite::params![session.to_string(), at, project.to_string()],
+        ).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals(id,session_id,tool_name,tool_input,status,created_at)
+             VALUES(?1,?2,'Bash','{\"command\":\"ls\"}','Pending',?3)",
+                rusqlite::params![approval.to_string(), session.to_string(), at],
+            )
+            .unwrap();
+    }
+    let request: rsi_common::remote_read::ReadRequestV1 =
+        serde_json::from_value(serde_json::json!({
+            "method":"RemoteGetDecisionsV1",
+            "params":{"project_id":project,"session_id":session,"limit":16}
+        }))
+        .unwrap();
+    let limiter = crate::remote_read::RemoteReadLimiter::with_deadline(
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
+    );
+    let page = crate::remote_read::spawn_decisions_read(
+        &limiter,
+        std::sync::Arc::clone(&manager.store),
+        manager,
+        std::sync::Arc::new(crate::remote_read::RemoteCursorSigner::new(Uuid::new_v4())),
+        request,
+        project,
+        [7; 32],
+        Uuid::new_v4(),
+    )
+    .unwrap()
+    .await
+    .unwrap();
+    let (mut writer, mut reader) = tokio::io::duplex(65536);
+    page.send_json_line(&mut writer, |result| {
+        result.expect("waiting session decisions response")
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    let response: rsi_common::remote_read::DecisionsResponseV1 =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(response.items.len(), 1);
 }

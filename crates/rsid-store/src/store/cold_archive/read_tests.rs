@@ -836,14 +836,25 @@ fn invariance_session(fx: &Fx) -> Uuid {
     ];
     let mut referenced = 0;
     for (sequence, kind, role, created) in rows {
+        // #86: rows 3 and 4 move to the archive naming a pasted image.
+        let image = if sequence == 4 {
+            " /h/.rsi/paste/rsid/moved.png"
+        } else {
+            ""
+        };
+        let input = match (kind, sequence) {
+            ("ToolUse", 3) => Some(r#"{"file_path":"/h/moved-input.webp"}"#),
+            ("ToolUse", _) => Some(r#"{"cmd":"ls"}"#),
+            _ => None,
+        };
         let id = fx.event_at(
             sid,
             sequence,
             kind,
             role,
-            &format!("{kind} {sequence} {}", "payload ".repeat(50)),
+            &format!("{kind} {sequence} {}{image}", "payload ".repeat(50)),
             Some("Bash"),
-            (kind == "ToolUse").then_some(r#"{"cmd":"ls"}"#),
+            input,
             created,
         );
         fx.provenance(sid, id, "provider_other");
@@ -1079,6 +1090,41 @@ fn probes() -> Vec<(&'static str, fn(&Store, Uuid) -> String)> {
             let bundle = store.export_portable_bundle(&[]).unwrap();
             format!("{:?}", bundle.left_behind.get("conversation_events"))
         }),
+        // #86: the texts the paste retention scan reads from conversation
+        // events, live and archived, of every session.
+        probe!("paste_reference_texts", |store, _id| {
+            use crate::store::PasteReferenceSource;
+            let mut texts = Vec::new();
+            for source in [
+                PasteReferenceSource::ConversationEvents,
+                PasteReferenceSource::ArchivedConversationEvents,
+            ] {
+                let mut after = 0;
+                while let Some(next) = store
+                    .paste_reference_scan_chunk(source, after, 2, &mut |text: &str| {
+                        texts.push(text.to_string());
+                    })
+                    .unwrap()
+                {
+                    after = next;
+                }
+            }
+            texts.sort();
+            texts.join("|")
+        }),
+        // #86 (hub #3322): the event high-water mark of the paste reference
+        // scan, the newest live row of any session.
+        probe!("paste_reference_event_mark", |store, _id| {
+            store
+                .conn
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM conversation_events",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                .to_string()
+        }),
     ]
 }
 
@@ -1118,6 +1164,17 @@ fn cold_archive_reader_invariance() {
         before[fk_probe_index]
     );
 
+    let paste_index = names
+        .iter()
+        .position(|name| *name == "paste_reference_texts")
+        .unwrap();
+    assert!(
+        before[paste_index].contains("/h/.rsi/paste/rsid/moved.png")
+            && before[paste_index].contains("/h/moved-input.webp"),
+        "the rows that move name pasted images: {}",
+        before[paste_index]
+    );
+
     let moved = run(&fx);
     for (index, name) in names.iter().enumerate() {
         assert_eq!(
@@ -1135,4 +1192,292 @@ fn cold_archive_reader_invariance() {
     }
     // The rows are back exactly where they were.
     assert_eq!(fx.live_counts().0, live_before.0);
+}
+
+/// #86 (hub #3322 finding 3): the paste reference scan reads a moved session
+/// under its bound, and refuses one whose archive record is over it (even when
+/// the index row understates the size) before it is decompressed, naming the
+/// session.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn the_paste_reference_scan_bounds_an_archive_before_decompressing_it() {
+    let fx = Fx::new();
+    let sid = fx.cold_session(SessionStatus::Archived, 40, 4);
+    stage_and_move(&fx, sid);
+    super::reader::cache_forget(&sid.to_string());
+    let mut seen = 0;
+    fx.store
+        .cold_reference_scan_session(0, PASTE_REFERENCE_ARCHIVE_MAX_RAW_BYTES, &mut |_| seen += 1)
+        .unwrap();
+    assert_eq!(seen, 8, "every archived row under the bound");
+
+    fx.store
+        .conn
+        .execute(
+            "UPDATE cold_archive_sessions SET raw_bytes=0, compressed_bytes=0 WHERE session_id=?1",
+            [sid.to_string()],
+        )
+        .unwrap();
+    let mut seen = 0;
+    let refused = fx
+        .store
+        .cold_reference_scan_session(0, 1, &mut |_| seen += 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains(OVER_BOUND_CODE), "{refused}");
+    assert!(refused.contains(&sid.to_string()), "{refused}");
+    assert_eq!(seen, 0);
+}
+
+/// #86 (hub #3332 finding F3b): when the index row and the archive record both
+/// understate a large stored payload, the bounded read refuses it from the
+/// payload's `LENGTH()` alone, before the blob is selected: the read returns
+/// only sizes, and the paste reference scan fails closed naming the session.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn an_understated_payload_is_refused_before_the_blob_is_read() {
+    const BOUND: i64 = 64 * 1024;
+    const STORED: i64 = 1024 * 1024;
+    let fx = Fx::new();
+    let sid = fx.cold_session(SessionStatus::Archived, 40, 4);
+    stage_and_move(&fx, sid);
+    super::reader::cache_forget(&sid.to_string());
+    let file = fx.archive_paths().remove(0);
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER chunks_append_only_update;
+             UPDATE chunks SET payload = zeroblob({STORED}), raw_bytes = 1
+             WHERE table_name = 'conversation_events';"
+        ))
+        .unwrap();
+    }
+    fx.store
+        .conn
+        .execute(
+            "UPDATE cold_archive_sessions SET raw_bytes=0, compressed_bytes=0 WHERE session_id=?1",
+            [sid.to_string()],
+        )
+        .unwrap();
+
+    let conn = super::writer::open_archive_readonly(&file).unwrap();
+    let chunk_id: i64 = conn
+        .query_row(
+            "SELECT chunk_id FROM chunks WHERE table_name = 'conversation_events'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    match super::writer::read_chunk_bounded(&conn, chunk_id, BOUND).unwrap() {
+        Some(super::writer::BoundedChunk::Over {
+            raw_bytes,
+            payload_bytes,
+        }) => assert_eq!((raw_bytes, payload_bytes), (1, STORED)),
+        other => panic!("expected the sizes alone, got {other:?}"),
+    }
+    drop(conn);
+
+    let mut seen = 0;
+    let refused = fx
+        .store
+        .cold_reference_scan_session(0, BOUND, &mut |_| seen += 1)
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains(OVER_BOUND_CODE), "{refused}");
+    assert!(refused.contains(&sid.to_string()), "{refused}");
+    assert_eq!(seen, 0);
+}
+
+/// #178: text zstd cannot shrink much (hex of a fixed pseudo-random sequence),
+/// so a chunk of a few such rows has a payload of several stream buffers.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+fn noise(seed: u64, bytes: usize) -> String {
+    let mut state = seed;
+    let mut out = String::with_capacity(bytes + 16);
+    while out.len() < bytes {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        out.push_str(&format!("{:016x}", state ^ (state >> 29)));
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// #178: an archived session of eight 40 KiB tool results (about 320 KiB raw),
+/// the fourth naming the pasted image `named`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+fn large_cold_session(fx: &Fx, named: &str) -> Uuid {
+    let sid = fx.session(SessionStatus::Archived, 40);
+    fx.event(sid, 1, "Message", Some("User"), "start", 41);
+    for sequence in 2..10 {
+        let mut content = noise(u64::try_from(sequence).unwrap(), 40 * 1024);
+        if sequence == 5 {
+            content.push_str(&format!(" see @/home/op/.rsi/paste/rsid/{named}"));
+        }
+        fx.event(sid, sequence, "ToolResult", None, &content, 41);
+    }
+    fx.event(sid, 10, "Message", Some("Assistant"), "done", 41);
+    sid
+}
+
+/// #178: every archived text the paste reference scan passes on for the first
+/// archived session, under the current bound.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+fn archived_reference_texts(store: &Store) -> crate::error::Result<Vec<String>> {
+    let mut texts = Vec::new();
+    store.paste_reference_scan_chunk(
+        crate::store::PasteReferenceSource::ArchivedConversationEvents,
+        0,
+        1,
+        &mut |text: &str| texts.push(text.to_string()),
+    )?;
+    Ok(texts)
+}
+
+/// #178: an archived session over the paste scan's bound is no longer refused:
+/// it is streamed (the payload read a buffer at a time, one row held), and the
+/// scan passes on exactly the texts the whole-chunk read does, so the image it
+/// names is found and an image it does not name is not.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn the_paste_reference_scan_streams_an_archive_over_its_bound_in_bounded_pieces() {
+    const BOUND: i64 = 64 * 1024;
+    let named = format!("{}.png", "a".repeat(64));
+    let unnamed = format!("{}.png", "b".repeat(64));
+    let fx = Fx::new();
+    let sid = large_cold_session(&fx, &named);
+    assert_eq!(stage_and_move(&fx, sid).events, 8);
+    super::reader::cache_forget(&sid.to_string());
+    let row = fx.row(sid).unwrap();
+    assert!(
+        row.raw_bytes > 4 * BOUND && row.compressed_bytes > 2 * BOUND,
+        "{} raw, {} compressed",
+        row.raw_bytes,
+        row.compressed_bytes
+    );
+
+    let whole = archived_reference_texts(&fx.store).unwrap();
+    let _ = stream_stats::take();
+    let streamed = {
+        let _bound = override_paste_reference_archive_bound_for_test(BOUND);
+        archived_reference_texts(&fx.store).unwrap()
+    };
+    let stats = stream_stats::take();
+
+    assert_eq!(
+        streamed, whole,
+        "the streamed scan sees what the whole read sees"
+    );
+    assert_eq!(streamed.len(), 1, "{streamed:?}");
+    assert!(streamed[0].contains(&named), "the named image is found");
+    assert!(!streamed[0].contains(&unnamed));
+    assert_eq!(stats.rows, 8, "{stats:?}");
+    assert!(
+        stats.payload_reads >= 2,
+        "the payload is read in pieces: {stats:?}"
+    );
+    assert!(
+        stats.largest_payload_read <= super::format::STREAM_BUFFER_BYTES,
+        "{stats:?}"
+    );
+    assert!(
+        i64::try_from(stats.largest_row).unwrap() <= BOUND,
+        "one row at a time: {stats:?}"
+    );
+}
+
+/// #178 (hub review of ca787eab7): the unbounded read of an oversized archive
+/// is not done by the chunk read that runs under the store lock. The step
+/// returns the stream instead, reads nothing itself, and the stream, run
+/// with no store in hand, passes on the same texts.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn an_oversized_archive_is_returned_as_a_stream_to_run_without_the_store() {
+    let named = format!("{}.png", "a".repeat(64));
+    let fx = Fx::new();
+    let sid = large_cold_session(&fx, &named);
+    stage_and_move(&fx, sid);
+    super::reader::cache_forget(&sid.to_string());
+    let _bound = override_paste_reference_archive_bound_for_test(64 * 1024);
+    let _ = stream_stats::take();
+
+    let mut during_step = Vec::new();
+    let step = fx
+        .store
+        .paste_reference_scan_step(
+            crate::store::PasteReferenceSource::ArchivedConversationEvents,
+            0,
+            1,
+            &mut |text: &str| during_step.push(text.to_string()),
+        )
+        .unwrap();
+
+    assert!(step.next.is_some());
+    assert!(during_step.is_empty(), "the step read no archived row");
+    assert_eq!(
+        stream_stats::take().rows,
+        0,
+        "the step opened no archive stream"
+    );
+    let stream = step.stream.expect("the oversized archive is deferred");
+    let mut streamed = Vec::new();
+    stream
+        .run(&mut |text: &str| streamed.push(text.to_string()))
+        .unwrap();
+    assert_eq!(streamed.len(), 1, "{streamed:?}");
+    assert!(streamed[0].contains(&named));
+}
+
+/// #178: a single streamed row over the bound still fails the scan closed,
+/// naming the session.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn a_streamed_row_over_the_paste_scan_bound_fails_closed_naming_the_session() {
+    let fx = Fx::new();
+    let sid = large_cold_session(&fx, &format!("{}.png", "a".repeat(64)));
+    stage_and_move(&fx, sid);
+    let _bound = override_paste_reference_archive_bound_for_test(16 * 1024);
+
+    let refused = archived_reference_texts(&fx.store).unwrap_err().to_string();
+
+    assert!(refused.contains(OVER_BOUND_CODE), "{refused}");
+    assert!(refused.contains(&sid.to_string()), "{refused}");
+}
+
+/// #178: the streamed rows are checked against the chunk's length and digest
+/// once the stream ends; a stream whose digest differs from the one the index
+/// and the record agree on fails the scan as unavailable.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+#[test]
+fn a_streamed_archive_whose_digest_differs_fails_the_scan_closed() {
+    let wrong = "f".repeat(64);
+    let fx = Fx::new();
+    let sid = large_cold_session(&fx, &format!("{}.png", "a".repeat(64)));
+    stage_and_move(&fx, sid);
+    let file = fx.archive_paths().remove(0);
+    {
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute_batch(&format!(
+            "DROP TRIGGER chunks_append_only_update;
+             UPDATE chunks SET raw_sha256 = '{wrong}' WHERE table_name = 'conversation_events';"
+        ))
+        .unwrap();
+    }
+    fx.store
+        .conn
+        .execute(
+            "UPDATE cold_archive_sessions SET events_sha256 = ?1 WHERE session_id = ?2",
+            params![wrong, sid.to_string()],
+        )
+        .unwrap();
+    let _bound = override_paste_reference_archive_bound_for_test(64 * 1024);
+
+    let refused = archived_reference_texts(&fx.store).unwrap_err().to_string();
+
+    assert!(refused.contains(UNAVAILABLE_CODE), "{refused}");
+    assert!(
+        refused.contains("cold_archive_verify_sha_mismatch"),
+        "{refused}"
+    );
 }

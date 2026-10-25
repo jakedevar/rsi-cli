@@ -87,3 +87,39 @@ For the drill, launch a **replacement host in the same Availability Zone** with 
 Use the module's stop-when-idle option for temporary use only after verifying its idle signal matches your workload. Active sessions, interactive shells, provider processes and enabled daemon wakes keep the host on; `/srv/rsi/.keep-running` is a manual hold. You can also stop the EC2 instance from the AWS console and restart it later. Stopped volumes and retained backups still cost money.
 
 Before teardown, stop `rsid`, take a quiesced snapshot, verify the snapshot completed and record its ID outside Terraform state. Then, from `infra/aws/example`, run `terraform destroy` with the same profile, Region, backend and nonsecret variables used for apply. The data-volume resource is configured to take a final snapshot on deletion; retain and verify that snapshot before deleting any backups. The managed S3 backup bucket has `force_destroy=true`: `terraform destroy` deletes its objects and all versions. Export any needed archives to separate storage first. The final EBS snapshot is retained outside Terraform state. Confirm the post-destroy inventory: EC2 instance, public IPv4, VPC, unattached volumes, snapshots, S3 objects, IAM roles, alarms and budget. Delete retained snapshots and backups only after a successful restore drill and an explicit data-retention decision. No destroy was run during preparation.
+
+## Ephemeral spot gate host
+
+The persistent host above is separate from `infra/aws/gate`, the ephemeral spot host that `scripts/cloud-gate.sh` and `scripts/cloud-sweep.sh` apply and destroy per run. It is spot only (max $0.75/h, about $0.62/h observed), reserves its worst-case cost in the spend ledger before apply, stays inside the daemon settings `cloud_spend_daily_cap_usd` and `cloud_spend_stop_line_usd`, and carries an `rsi:expires-at` tag. See `infra/aws/README.md` ("Ephemeral remote gate host"). The `cloud_gate` job kind is not used; `cloud_sweep` runs `make rolling-library-qa` on it.
+
+Sweep reporting uses `rsi-cloud sweep-report SHA STARTED FINISHED RESULT_DIR SEED_FILE`
+for `QA.md`, and `rsi-cloud sweep-json SHA STARTED FINISHED RESULT_DIR RUNNER`
+for the v1 `report.json` (`RUNNER` is `nextest` or the legacy `cargo-test`).
+The remote sweep builds this binary from the exact swept checkout before QA.
+Collection uses the installed binary (or `RSI_CLOUD_BIN`) to run
+`rsi-cloud sweep-verdict RESULT_DIR [--snapshot FILE] [--classifier BIN]`,
+which appends the mechanical `VERDICT GREEN|RED|INCOMPLETE SHA new=N` line.
+The daemon supplies its trusted installed binary beside the embedded scripts.
+
+## Warm spot pool (#3460 S4b)
+
+`infra/aws/pool` and `scripts/cloud-pool.sh` keep up to six spot hosts warm for the daemon to place `scoped_test` and QA runs on (the placement is S4c/S4d; this change only creates, renews and destroys the hosts and keeps the books). Each host is a `c7i.8xlarge` spot instance in `us-west-1a` with a one-time request capped at $0.75/h, terminate on interruption; a one-time spot instance also terminates when its guest shuts down, so the hosts set no `instance_initiated_shutdown_behavior` (AWS refuses to modify it on spot instances, #3977). It borrows the gate module's VPC, public subnet and SSH-only security group and attaches no instance profile, so the pool adds no IAM, security-group or network exposure. Every instance and its root volume carries `Service=rsi-pool` and an `rsi:expires-at` tag that equals the lease expiry, so the orphan sweep (`rsi-cloud watchdog`) also covers it. The module holds the limit itself (`var.hosts` accepts at most six `pool-1`..`pool-6` slots, the subnet must be in `us-west-1a`, `spot_max_price_usd` cannot exceed the $0.75 the lease reservation is priced at and `root_volume_gib` cannot exceed the reserved 200 GiB); `infra/aws/pool/pool.tftest.hcl` checks all of these with a mocked provider. There is no sccache bucket for the trial; instead the bootstrap points the `rsi` user's cargo `target-dir` at `/srv/rsi-pool/target` on the root volume, so a host's builds stay warm for the whole lease and die with it.
+
+```sh
+scripts/cloud-pool.sh up 3        # make the pool 3 hosts (1-6; the total, so up 3 twice is a no-op)
+scripts/cloud-pool.sh status      # leases, time left, idle time, reservation ids (no AWS call)
+scripts/cloud-pool.sh touch [pool-N]   # a job was placed (S4c/S4d); every host without an argument
+scripts/cloud-pool.sh reap        # one maintenance pass: renew, expire, idle exit, spot loss
+scripts/cloud-pool.sh down        # destroy everything and settle every reservation
+```
+
+Leases live in `~/.rsi/cloud/pool.json` (`status --json` prints it): per slot the host (`ec2-user@IP`), instance id, lease start and expiry, reservation id, `last_job_at`, and `renewal` (`scheduled` or `refused`). State is `~/.rsi/cloud/pool.tfstate`; the SSH key pair comes from `pool.tfvars` or else `gate.tfvars`. `reap` is not scheduled by this change: run it every few minutes (S4c/S4d call it each placement cycle); a pool nobody reaps still ends at the guest shutdown and the orphan sweep, with a worst case no higher than its reservations.
+
+**Spend guarantees**, per host and per 12 h lease, with the same ledger and the same daemon caps (`cloud_spend_daily_cap_usd`, `cloud_spend_stop_line_usd`) as the gate:
+
+- `up` runs the stop-line/daily-cap check, then `rsi-cloud spend reserve` for each new host (12 h x the $0.7813/h worst case = $9.3756, never the on-demand price) BEFORE `terraform apply`. It is all or nothing: a refusal at either cap exits 4, hands back what it already reserved (`released` lines) and applies nothing. More than six hosts exits 2 before anything is reserved.
+- A lease is renewed only by a fresh reservation for the NEXT 12 h at the same rate, taken in the last hour of the lease and counted from the old expiry. After that the guest shutdown timer and the tags move (any failure releases the new reservation), and the ended lease is settled in full by a `Pool lease ...: est compute $X ...; reservation <old id>` line. A reservation refused at the cap or stop line marks the lease `renewal=refused`: the host is not renewed and `reap` destroys it at its expiry.
+- `reap` destroys a host at its lease expiry, after 30 minutes with no placed job (`touch` is the placement signal; a fresh host counts from its ready time), or when AWS already took it back (`spot_interrupted`). Each destroy writes the `Gate window <id>: stop ... est compute $X ... reservation <id>` line that replaces the reservation with the actual cost. A destroy whose `terraform apply` fails keeps the lease and its reservation, and is retried by the next `reap`.
+- `down` runs `terraform destroy`, terminates any leftover `Service=rsi-pool` instance (and exits 1 if it found one), and settles every reservation. A failed destroy keeps the leases.
+- A crash anywhere leaves a reservation standing (never an uncounted host), the guest powers itself off at the lease end, and the orphan sweep terminates a host whose tag is 10 minutes past. AWS Budgets stay the external backstop.
+- Fleet worst case is `hosts x $0.7813 x 24 h`; at six hosts that is $112.5 per day, which the daily cap must allow before `up 6` is accepted.

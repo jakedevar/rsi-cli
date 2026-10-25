@@ -170,7 +170,10 @@ pub fn notify_failure_episodes(
 
 /// Sweep for new failure episodes every minute (#2454) and, every thirty
 /// minutes, file the Issues for graphs past [`CODEGRAPH_UNHEALTHY_NOTICE_SECS`].
-pub async fn run_codegraph_health_loop(handle: IndexHandle, store: Arc<tokio::sync::Mutex<Store>>) {
+pub async fn run_codegraph_health_loop(
+    handle: IndexHandle,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
+) {
     debug_assert!(CODEGRAPH_UNHEALTHY_NOTICE_SECS > 0);
     let mut issues = tokio::time::interval(SWEEP_INTERVAL);
     issues.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

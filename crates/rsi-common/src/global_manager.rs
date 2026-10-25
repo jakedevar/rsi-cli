@@ -101,7 +101,9 @@ pub struct GlobalManagerGrantV1 {
 pub struct ConfigureGlobalManagerRequestV1 {
     pub session_id: Uuid,
     pub project_ids: Vec<Uuid>,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub allowed_launches: Vec<ManagerLaunchChoiceV2>,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub project_policy: ManagerPolicyV2,
     /// The active grant's version, or 0 when none is active.
     pub expected_grant_version: i64,
@@ -181,6 +183,7 @@ pub struct GlobalPmSeatV1 {
     /// Resolved policy for this exact live seat and window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_budget: Option<crate::coordinator_budget::CoordinatorBudgetV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     pub updated_at: DateTime<Utc>,
     /// The project's manager scope version (`HarnessManagerConfigV1.row_version`).
@@ -203,6 +206,12 @@ pub struct GlobalPmPolicyV1 {
     pub revoked: bool,
     pub paused: bool,
     pub capabilities: Vec<ManagerCapabilityV2>,
+    /// #206: the PM's own creation caps (`max_created_sessions`, then
+    /// `max_created_containers`) as used/limit, counted exactly as its
+    /// `manager_v2_creation_limit` refusal counts them, with the refusal's
+    /// raise path. Read-only; empty on a revoked policy or an older daemon.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creation_caps: Vec<crate::manager_budget::CreationCapUsageV1>,
 }
 
 /// Issue counts of one project (archived Issues excluded).
@@ -271,7 +280,12 @@ pub struct GlobalSeatSessionV1 {
     /// Resolved policy for this exact live seat and window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_budget: Option<crate::coordinator_budget::CoordinatorBudgetV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// #3386: what this seat session's launch turn (the rotation child's first
+    /// turn) cost; `None` for a seat that was not a rotation child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_turn: Option<SeatLaunchTurnV1>,
     pub updated_at: DateTime<Utc>,
     pub pending_question: bool,
     /// #2667: the typed code of this seat's finally refused `succeed_manager`
@@ -300,8 +314,28 @@ pub struct SeatPredecessorV1 {
     pub provider: SessionProvider,
     pub model: Option<String>,
     pub context_fill_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// #3386: this earlier seat's launch-turn cost and tool-call count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_turn: Option<SeatLaunchTurnV1>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// #3386: the launch turn of a rotation successor (`session.rotate.child`),
+/// the turn that rehydrates the seat. Reported beside the seat so the cost of
+/// a rotation is a read, not a database query.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SeatLaunchTurnV1 {
+    /// Settled estimated cost of the launch invocation; `None` while it runs
+    /// or when no cost was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// `ToolUse` events the session wrote up to the end of the launch turn
+    /// (so far, while `settled` is false).
+    pub tool_calls: i64,
+    /// The launch invocation finished.
+    pub settled: bool,
 }
 
 /// One project of the workspace grant.
@@ -385,10 +419,14 @@ pub struct GlobalManagerMessageReceiptV1 {
 #[serde(deny_unknown_fields)]
 pub struct AgentGlobalAppointManagerRequestV1 {
     pub project_id: Uuid,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub launch: ManagerLaunchChoiceV2,
     pub query: String,
     pub idempotency_key: String,
-    /// Launch the PM in its own git worktree sandbox (default true).
+    /// Launch the seat in its own git worktree sandbox. A git-backed project
+    /// root always gives the seat one, whatever this says (#169); a non-git
+    /// root gives none unless `true` is asked, which is refused because no
+    /// worktree can be made there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
 }
@@ -450,6 +488,24 @@ mod tests {
             ..launch()
         });
         assert_eq!(request.validate(), Err(GLOBAL_MANAGER_INVALID_REQUEST));
+    }
+
+    #[test]
+    fn global_policy_writes_reject_additive_response_fields() {
+        let request = ConfigureGlobalManagerRequestV1 {
+            session_id: Uuid::new_v4(),
+            project_ids: vec![Uuid::new_v4()],
+            allowed_launches: vec![launch()],
+            project_policy: ManagerPolicyV2::default(),
+            expected_grant_version: 0,
+            idempotency_key: "strict-skew".into(),
+        };
+        let baseline = serde_json::to_value(request).unwrap();
+        for path in ["/project_policy", "/allowed_launches/0"] {
+            let mut newer = baseline.clone();
+            newer.pointer_mut(path).unwrap()["future_field"] = serde_json::json!(true);
+            assert!(serde_json::from_value::<ConfigureGlobalManagerRequestV1>(newer).is_err());
+        }
     }
 
     #[test]

@@ -336,6 +336,7 @@ mod tests {
 
     fn report(text: &str) -> SatelliteReportV1 {
         SatelliteReportV1 {
+            binaries_dir: None,
             report_id: Uuid::new_v4(),
             kind: SatelliteReportKindV1::Enqueue,
             text: text.into(),

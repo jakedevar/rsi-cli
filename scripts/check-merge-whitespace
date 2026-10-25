@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Whitespace check of a source as it would merge onto its base, with a conflict
+# reported in plain words (#96).
+#
+# usage: scripts/check-merge-whitespace [BASE] [HEAD]   (default: origin/rolling HEAD)
+#
+# The hand-written form `git diff --check BASE $(git merge-tree --write-tree BASE HEAD)`
+# fails with `fatal: ambiguous argument '100644'` when the merge conflicts, because
+# merge-tree then prints conflict lines after the tree id. This script names the
+# conflicting paths instead and runs `git diff --check` only on a clean merge.
+#
+# exit 0  merges cleanly, no whitespace errors
+# exit 1  merges cleanly, whitespace errors (printed by git diff --check)
+# exit 2  the merge conflicts (paths printed): merge BASE and resolve them first
+# exit 3  a revision cannot be resolved, or git merge-tree failed
+set -euo pipefail
+
+base="${1:-origin/rolling}"
+head="${2:-HEAD}"
+for rev in "$base" "$head"; do
+    if ! git rev-parse --verify --quiet "${rev}^{commit}" >/dev/null; then
+        echo "check-merge-whitespace: cannot resolve ${rev} (fetch it first)" >&2
+        exit 3
+    fi
+done
+
+set +e
+out="$(git merge-tree --write-tree --name-only --no-messages "$base" "$head")"
+rc=$?
+set -e
+tree="$(printf '%s\n' "$out" | head -n 1)"
+case "$rc" in
+    0) ;;
+    1)
+        echo "check-merge-whitespace: ${head} conflicts with ${base}; merge ${base} (never rebase) and resolve these paths first:" >&2
+        printf '%s\n' "$out" | sed -n '2,$p' | sed '/^$/d' | sort -u | sed 's/^/  /' >&2
+        exit 2
+        ;;
+    *)
+        echo "check-merge-whitespace: git merge-tree failed (exit ${rc}; it needs git 2.38 or newer)" >&2
+        exit 3
+        ;;
+esac
+
+if git diff --check "$base" "$tree"; then
+    echo "check-merge-whitespace: ${head} merges cleanly onto ${base}; no whitespace errors"
+else
+    echo "check-merge-whitespace: whitespace errors above (in ${head} as merged onto ${base})" >&2
+    exit 1
+fi

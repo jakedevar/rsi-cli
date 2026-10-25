@@ -16,7 +16,10 @@ import {
 import {
   actions, adminDialog, button, checkField, errorLine, inField, listBox, note, rowEl, secretField, show, showError, textField,
 } from './admin-dom.js';
+import { emptyText } from './empty-states.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
+import { loadView } from './view-load.js';
 
 // ---------- the write-only secret form ----------
 
@@ -60,20 +63,38 @@ function secretForm(title: string, hintText: string, send: (secret: string) => P
 interface KeysState { list: CredentialList | null; login: LoginState | null; contract: ContractState | null; at: number; armed: { slot: string; at: number } | null }
 let keys: KeysState = { list: null, login: null, contract: null, at: 0, armed: null };
 
-async function loadKeys(probe: boolean): Promise<string[]> {
+interface KeysRead { list: CredentialList | null; login: LoginState | null; contract: ContractState | null; errors: string[] }
+
+/** The three reads together. A read that fails leaves its part as `keep` has it (null when the dialog is opening) and names the error. */
+async function fetchKeys(probe: boolean, keep: Pick<KeysState, 'list' | 'login' | 'contract'> | null): Promise<KeysRead> {
   const errors: string[] = [];
   const [list, login, contract] = await Promise.all([
-    invoke<CredentialList>('list_provider_credentials').catch((e: unknown) => { errors.push(`keys: ${String(e)}`); return keys.list; }),
-    invoke<LoginState>('get_provider_login_state', { refresh: probe }).catch((e: unknown) => { errors.push(`login: ${String(e)}`); return keys.login; }),
-    invoke<ContractState>('get_provider_contract_state', { refresh: probe }).catch((e: unknown) => { errors.push(`contract: ${String(e)}`); return keys.contract; }),
+    invoke<CredentialList>('list_provider_credentials').catch((e: unknown) => { errors.push(`keys: ${String(e)}`); return keep?.list ?? null; }),
+    invoke<LoginState>('get_provider_login_state', { refresh: probe }).catch((e: unknown) => { errors.push(`login: ${String(e)}`); return keep?.login ?? null; }),
+    invoke<ContractState>('get_provider_contract_state', { refresh: probe }).catch((e: unknown) => { errors.push(`contract: ${String(e)}`); return keep?.contract ?? null; }),
   ]);
-  keys = { ...keys, list, login, contract };
-  return errors;
+  return { list, login, contract, errors };
 }
 
-export async function openProviderKeys(): Promise<void> {
-  const errors = await loadKeys(false);
-  if (!keys.list) { toast(`Failed to load provider keys: ${errors.join('; ')}`); return; }
+async function loadKeys(probe: boolean): Promise<string[]> {
+  const r = await fetchKeys(probe, keys);
+  keys = { ...keys, list: r.list, login: r.login, contract: r.contract };
+  return r.errors;
+}
+
+export function openProviderKeys(): Promise<void> {
+  return loadView({
+    key: 'admin-provider-keys', title: 'Provider keys', failed: 'Failed to load provider keys',
+    read: async () => {
+      const r = await fetchKeys(false, null);
+      if (!r.list) throw new Error(r.errors.join('; '));
+      return r;
+    },
+    open: (r) => { keys = { ...keys, list: r.list, login: r.login, contract: r.contract }; buildProviderKeys(r.errors); },
+  });
+}
+
+function buildProviderKeys(errors: string[]): void {
   const dlg = adminDialog('admin-keys-dialog', 'admin-provider-keys');
   const box = el('div', 'launch-form');
   const head = note();
@@ -104,6 +125,7 @@ export async function openProviderKeys(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     const r = sel();
     const slot = r?.kind === 'slot';
     for (const b2 of [setBtn, rotateBtn, clearBtn]) b2.disabled = !slot;
@@ -180,18 +202,19 @@ export async function openProviderKeys(): Promise<void> {
 
 let mcp: { servers: McpSummary[]; at: number } = { servers: [], at: 0 };
 
-export async function openMcpServers(): Promise<void> {
-  try {
-    const list = await invoke<{ servers: McpSummary[] }>('list_mcp_servers');
-    mcp = { servers: list.servers, at: Math.min(mcp.at, Math.max(0, list.servers.length - 1)) };
-  } catch (e) {
-    toast(`Failed to load MCP servers: ${String(e)}`);
-    return;
-  }
+export function openMcpServers(): Promise<void> {
+  return loadView({
+    key: 'admin-mcp', title: 'MCP servers', failed: 'Failed to load MCP servers',
+    read: () => invoke<{ servers: McpSummary[] }>('list_mcp_servers'),
+    open: (list) => { mcp = { servers: list.servers, at: Math.min(mcp.at, Math.max(0, list.servers.length - 1)) }; buildMcpServers(); },
+  });
+}
+
+function buildMcpServers(): void {
   const dlg = adminDialog('admin-mcp-dialog', 'admin-mcp');
   const box = el('div', 'launch-form');
   const ul = listBox('MCP servers');
-  const empty = note('No MCP servers. Press a to add one.');
+  const empty = note(emptyText('admin-mcp'));
   const err = errorLine();
   const addBtn = button('Add (a)');
   const editBtn = button('Edit (e)');
@@ -216,6 +239,7 @@ export async function openMcpServers(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     for (const b2 of [editBtn, toggleBtn, setBtn, rotateBtn, clearBtn]) b2.disabled = !sel();
   };
   const reload = (): void => { dlg.close(); void openMcpServers(); };

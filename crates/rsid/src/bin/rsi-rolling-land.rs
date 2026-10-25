@@ -3,7 +3,7 @@ use rsi_codegraph::impact::{RSID_SHARDS, is_rsid_shard_package, rsid_shard_packa
 use rsi_common::failure_signature::{Classification, Snapshot, classify, failure_text_for};
 use rsid::integration::{
     Candidate, CandidateKind, CommitIdentity, GuardCommand, GuardSpec, IntegrationConfig,
-    IntegrationError, Prepared, Refusal, discard_candidate, prepare_candidate, run_guard,
+    IntegrationError, Prepared, Refusal, discard_candidate, prepare_candidate, run_guard_with_env,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -22,21 +22,28 @@ use tokio::process::Command as TokioCommand;
 mod base_cache;
 #[path = "rsi-rolling-land/candidate_receipt.rs"]
 mod candidate_receipt;
+#[path = "rsi-rolling-land/known_red_timeout.rs"]
+mod known_red_timeout;
+#[path = "rsi-rolling-land/lander_env.rs"]
+mod lander_env;
 #[path = "rsi-rolling-land/landing_policy.rs"]
 mod landing_policy;
 #[path = "rsi-rolling-land/remote_gate.rs"]
 mod remote_gate;
 #[path = "rsi-rolling-land/stale_delta.rs"]
 mod stale_delta;
+#[path = "rsi-rolling-land/zero_tests.rs"]
+mod zero_tests;
 
 #[path = "rsi-rolling-land/canary.rs"]
 mod canary;
 #[path = "rsi-rolling-land/canary_runner.rs"]
 mod canary_runner;
+#[cfg(test)]
+#[path = "../provisional_fixture.rs"]
+mod provisional_fixture;
 #[path = "rsi-rolling-land/test_impact.rs"]
 mod test_impact;
-
-const PROVISIONAL_SCRIPT: &str = "tools/rolling-migration-renumber.py";
 
 #[derive(Debug, Clone)]
 struct ProvisionalLanding {
@@ -69,7 +76,7 @@ const DEFAULT_RETRY_TIMEOUT_SECS: u64 = 600;
 /// cache lock counts against this guard, so serialized landers need headroom.
 fn guard_timeout() -> Duration {
     guard_timeout_from(
-        std::env::var("RSI_LANDER_GUARD_TIMEOUT_SECS")
+        lander_env::var("RSI_LANDER_GUARD_TIMEOUT_SECS")
             .ok()
             .as_deref(),
     )
@@ -88,7 +95,7 @@ fn guard_timeout_from(value: Option<&str>) -> Duration {
 /// unparsable `RSI_LANDER_RETRY_TIMEOUT_SECS` keeps the 10-minute default.
 fn retry_timeout(guard_timeout: Duration) -> Duration {
     retry_timeout_from(
-        std::env::var("RSI_LANDER_RETRY_TIMEOUT_SECS")
+        lander_env::var("RSI_LANDER_RETRY_TIMEOUT_SECS")
             .ok()
             .as_deref(),
         guard_timeout,
@@ -194,7 +201,7 @@ const MAX_REGATED_STALE_RETRIES: usize = 2;
 /// `RSI_LANDER_MAX_REGATED_STALE_RETRIES` can only tighten the default, never
 /// raise it.
 fn max_regated_stale_retries() -> usize {
-    std::env::var("RSI_LANDER_MAX_REGATED_STALE_RETRIES")
+    lander_env::var("RSI_LANDER_MAX_REGATED_STALE_RETRIES")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .map_or(MAX_REGATED_STALE_RETRIES, |value| {
@@ -208,7 +215,7 @@ fn max_regated_stale_retries() -> usize {
 /// of times, while the time already spent plus the expected cost still fits.
 /// Without it the count budget above applies.
 fn regate_budget() -> Option<Duration> {
-    std::env::var("RSI_LANDER_REGATE_BUDGET_SECS")
+    lander_env::var("RSI_LANDER_REGATE_BUDGET_SECS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(Duration::from_secs)
@@ -221,7 +228,7 @@ fn regate_budget() -> Option<Duration> {
 /// those, so the published tip is the tree that was tested wherever it could
 /// differ. Manual landings keep the file-disjoint reuse of the whole gate.
 fn exact_gate_required() -> bool {
-    std::env::var("RSI_LANDER_EXACT_GATE").is_ok_and(|value| value.trim() == "1")
+    lander_env::var("RSI_LANDER_EXACT_GATE").is_ok_and(|value| value.trim() == "1")
 }
 
 /// How much of the earlier gate a remade candidate reused.
@@ -312,15 +319,6 @@ fn warm_bindings() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, (PathBuf,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Hub #3023: candidate worktree -> the desktop lane's Cargo target in the warm
-/// slot bound to it. Beside [`warm_bindings`] so that map keeps its shape.
-fn warm_desktop_bindings() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, PathBuf>> {
-    static BINDINGS: Mutex<BTreeMap<PathBuf, PathBuf>> = Mutex::new(BTreeMap::new());
-    BINDINGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 #[derive(Default)]
 struct TestGate {
     // An entry is reusable only for this exact rolling commit and command.
@@ -328,7 +326,7 @@ struct TestGate {
     // Preserve QA origin when a base result is reused again in this process.
     qa_cache_provenance: BTreeMap<(String, String), String>,
     base_reds: BTreeSet<String>,
-    /// Failure text per base red, when the base shard report was in-process.
+    /// Failure text per base red, from a base report or its persistent cache.
     base_red_texts: BTreeMap<String, String>,
     /// The test command that observed each base red (#2698).
     base_red_commands: BTreeMap<String, String>,
@@ -381,6 +379,9 @@ struct TestGate {
     // keyed by (commit, shard) and consumed once.
     remote_results: Mutex<RemoteShardResults>,
     scratch: Option<GateScratch>,
+    /// Fixture admission result, fixed across publication retries (#490).
+    #[cfg(test)]
+    scratch_override: Option<GateScratch>,
     disk_scratch_used: BTreeSet<String>,
     /// Base guards actually executed (cache misses) in this gate (#1132).
     base_runs: usize,
@@ -400,6 +401,8 @@ struct TestGate {
     check_steps: Vec<(String, u64)>,
     /// #2092: library selection evidence retained in the queue outcome.
     selection_evidence: String,
+    /// #3887: what the source touched, so a gate that runs no test command says so.
+    zero_test_scope: zero_tests::ZeroTestScope,
     /// Test guards whose green, proven candidate needed no base (#1244).
     base_skipped: usize,
     /// Test hook: run the prebuild even under `cfg(test)`.
@@ -616,7 +619,6 @@ impl TestGate {
                     outcome.worktree.clone(),
                     (slot.test_target(), slot.check_target()),
                 );
-                warm_desktop_bindings().insert(outcome.worktree.clone(), slot.desktop_target());
                 outcome.worktree
             }
             Err(error) => {
@@ -625,47 +627,9 @@ impl TestGate {
                 // is about to be released.
                 let targets = (slot.test_target(), slot.check_target());
                 warm_bindings().retain(|_, pair| *pair != targets);
-                let desktop = slot.desktop_target();
-                warm_desktop_bindings().retain(|_, target| *target != desktop);
                 self.warm = None;
                 worktree.to_path_buf()
             }
-        }
-    }
-
-    /// Hub #3023: name the warm slot and state of the desktop lane's Cargo
-    /// target before the lane runs.
-    fn announce_desktop_target(&self) {
-        match &self.warm {
-            Some(slot) => println!("{}", slot.desktop_evidence()),
-            None => println!("desktop_warm_target slot=none state=cold"),
-        }
-    }
-
-    /// Hub #3023: after the lane, whatever its result, drop the candidate's own
-    /// crates from the slot's desktop target, so only third-party artifacts
-    /// (fixed by `Cargo.lock`) reach the next gate, as the slot's mtime restore
-    /// gives the test targets only unchanged files. `worktree` is the bound
-    /// checkout the lane just ran in.
-    fn trim_desktop_target(&self, worktree: &Path) {
-        let Some(slot) = &self.warm else {
-            return;
-        };
-        // The Tauri crate and every workspace path-dependency crate in its
-        // closure (#354); registry artifacts stay.
-        let names = rsid::lander_warm_target::candidate_crate_names(
-            worktree,
-            Path::new("desktop/src-tauri/Cargo.toml"),
-        );
-        match slot.trim_desktop(&names) {
-            Ok(removed) => println!(
-                "desktop_warm_target slot={} trimmed={removed}",
-                slot.index()
-            ),
-            Err(error) => println!(
-                "desktop_warm_target slot={} trim_failed reason={error}",
-                slot.index()
-            ),
         }
     }
 
@@ -706,9 +670,9 @@ impl TestGate {
 
 /// Snapshot path: `RSI_KNOWN_FAILURES_SNAPSHOT`, else `$HOME/.rsi/qa/known-failures.v1.json`.
 fn known_failures_path() -> PathBuf {
-    std::env::var_os("RSI_KNOWN_FAILURES_SNAPSHOT").map_or_else(
+    lander_env::var_os("RSI_KNOWN_FAILURES_SNAPSHOT").map_or_else(
         || {
-            let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let home = lander_env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
             home.join(".rsi/qa/known-failures.v1.json")
         },
         PathBuf::from,
@@ -834,6 +798,24 @@ fn claimed_fix_still_red_message(names: &[String], why: &str) -> String {
         rsi_common::rolling_queue::QUEUE_CLAIMED_FIX_STILL_RED,
         names.join(", ")
     )
+}
+
+/// #3320: why claimed tests the gate never saw run green were not proven, and
+/// the next step that fits their kind. A Rust test needs a filter that selects
+/// it; no filter can select a Python test, so a Python claim is run by id.
+fn unproven_claim_next_step(unproven: &[String]) -> String {
+    const BASE: &str = "no candidate run of the gate ran it green";
+    let (python, rust): (Vec<_>, Vec<_>) = unproven.iter().partition(|name| is_python_claim(name));
+    let rust_step = "its selection did not select it; add a test filter that selects it";
+    let python_step = "the gate runs a claimed Python test by its full unittest id \
+        (scripts.tests.<module>.<Class>.<method>, or tools.tests.) when that test module \
+        exists on the candidate, and it did not pass; no test filter selects a Python test, \
+        so name the full id";
+    match (rust.is_empty(), python.is_empty()) {
+        (_, true) => format!("{BASE} ({rust_step})"),
+        (true, false) => format!("{BASE} ({python_step})"),
+        (false, false) => format!("{BASE} (Rust: {rust_step}; Python: {python_step})"),
+    }
 }
 
 /// The test names in a refusal built by `claimed_fix_still_red_message`.
@@ -1022,6 +1004,26 @@ impl LandFailure {
         failure
     }
 
+    /// Hub #3873: the gate could not read the remote `rolling` ref (`ls-remote`
+    /// or `fetch` failed after its retries). That is infrastructure, never a
+    /// verdict on the sources, so the queue requeues instead of bisecting. Only
+    /// a failure before publication qualifies, and one that also names a failing
+    /// test is a real red.
+    fn is_remote_read_failure(&self) -> bool {
+        const MARKERS: [&str; 6] = [
+            "cannot read remote rolling tip",
+            "remote rolling fetch failed (exit",
+            "remote rolling fetch timed out",
+            "remote rolling lookup timed out",
+            "cannot fetch remote rolling",
+            "cannot wait for remote rolling",
+        ];
+        self.state == PublicationState::NotPublished
+            && self.kind == FailureKind::General
+            && MARKERS.iter().any(|marker| self.message.contains(marker))
+            && failing_test_names(&self.message).is_empty()
+    }
+
     fn evidence_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("publication_status={}", self.state.label()),
@@ -1030,6 +1032,12 @@ impl LandFailure {
         ];
         if let Some(fence) = self.policy_fence {
             lines.push(format!("policy_fence={}", fence.label()));
+        }
+        if self.is_remote_read_failure() {
+            lines.push(format!(
+                "failure_class={}",
+                rsi_common::rolling_queue::LANDER_FAILURE_CLASS_REMOTE_READ
+            ));
         }
         if let Some(candidate) = &self.candidate {
             lines.push(format!("candidate_id={candidate}"));
@@ -1140,6 +1148,8 @@ fn main() {
         Some("--explain-selection") => std::process::exit(explain_selection_main()),
         _ => {}
     }
+    // #192: every knob and child environment below reads this one snapshot.
+    lander_env::init();
     let result = parse_args_from_env(std::env::args().skip(1))
         .map_err(|error| Box::new(LandFailure::from(error)))
         .and_then(|options| {
@@ -1283,7 +1293,7 @@ async fn land_until_cancelled(
 }
 
 fn parse_args_from_env(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
-    parse_args(args, std::env::var_os("CARGO_BUILD_JOBS").as_deref())
+    parse_args(args, lander_env::var_os("CARGO_BUILD_JOBS").as_deref())
 }
 
 fn parse_args(
@@ -1463,7 +1473,13 @@ async fn land_with_gate_ref(
     // or the canary builds a gate of its own.
     test_gate.claimed_fixes = options.fixes_tests.iter().cloned().collect();
     let cargo_target_dir = validate_cargo_target_dir()?;
+    #[cfg(not(test))]
     let selected_scratch = select_gate_scratch(&cargo_target_dir, options.tmpfs_min_free_gb)?;
+    #[cfg(test)]
+    let selected_scratch = match test_gate.scratch_override.take() {
+        Some(scratch) => scratch,
+        None => select_gate_scratch(&cargo_target_dir, options.tmpfs_min_free_gb)?,
+    };
     println!("gate_scratch={}", selected_scratch.report());
     test_gate.scratch = Some(selected_scratch);
     test_gate.started.get_or_insert_with(Instant::now);
@@ -1479,9 +1495,9 @@ async fn land_with_gate_ref(
     // taking disk (#1140: bounded, off the async executor).
     if LANDER_STARTUP_SWEEP_ENABLED {
         let parent = workspace_parent.clone();
-        if let Ok(swept) = tokio::task::spawn_blocking(move || {
+        if let Ok(swept) = tokio::task::spawn_blocking(lander_env::propagate(move || {
             rsid::agent_scratch_reclaim::sweep_lander_workspace(&parent)
-        })
+        }))
         .await
             && swept.reclaimed > 0
         {
@@ -1523,21 +1539,10 @@ async fn land_with_gate_ref(
             &private_repo.to_string_lossy(),
         ],
     )?;
-    // Preserve both committed guards without checking out the full source tree.
-    for script in [
-        "scripts/rolling-landing-guard.py",
-        "tools/check-released-migrations.py",
-    ] {
-        copy_committed_script(&private_repo, script)?;
-    }
-    if git_output(
-        &private_repo,
-        &["show", &format!("HEAD:{PROVISIONAL_SCRIPT}")],
-    )?
-    .status
-    .success()
-    {
-        copy_committed_script(&private_repo, PROVISIONAL_SCRIPT)?;
+    // Preserve the committed landing guard without checking out the full source
+    // tree. The released-migration guard is compiled into this binary (#361).
+    if !landing_policy::native_guard_installed() {
+        copy_committed_script(&private_repo, "scripts/rolling-landing-guard.py")?;
     }
     for pair in &mut options.accepted {
         if !pair.base.is_empty() {
@@ -1964,12 +1969,17 @@ fn resolve_accepted_base(repo: &Path, pair: &mut AcceptedPair, target: &str) -> 
     Ok(())
 }
 
+/// Whether the source ADDS a provisional migration declaration (#3337). A
+/// source that only edits or deletes an already released declaration appends no
+/// migration, so it is an ordinary source: counting it made the renumber tool
+/// refuse "provisional declaration has no appended migration".
 fn has_provisional_declaration(repo: &Path, pair: &AcceptedPair) -> Result<bool, String> {
     let output = git_output(
         repo,
         &[
             "diff",
             "--no-renames",
+            "--diff-filter=A",
             "--name-only",
             "-z",
             &pair.base,
@@ -1985,40 +1995,47 @@ fn has_provisional_declaration(repo: &Path, pair: &AcceptedPair) -> Result<bool,
         .any(|path| path.starts_with(b"tools/provisional-migrations/") && path.ends_with(b".json")))
 }
 
+/// The commit a provisional-tool step judges against: its `--target`, or the
+/// `target` its unit file records. Empty when neither names one, which an
+/// authenticated guard refuses.
+fn provisional_target(args: &[&str]) -> String {
+    let after = |flag: &str| -> Option<&str> {
+        args.iter()
+            .position(|arg| *arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .copied()
+    };
+    if let Some(target) = after("--target") {
+        return target.to_owned();
+    }
+    after("--unit-file")
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|unit| unit["target"].as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// One step of the provisional-migration tool, run as a bounded child of the
+/// lander (#361): the `rolling-migration-renumber` guard of the executable
+/// installed beside the lander, never a committed or candidate-authored tool.
+/// The child gets the lander environment without `GIT_*` and `RSI_*`.
 fn provisional_command(repo: &Path, args: &[&str]) -> Result<Value, String> {
-    let script = repo.join(PROVISIONAL_SCRIPT);
-    if !script.is_file() {
-        return Err(format!(
-            "committed provisional migration tool is missing: {}",
-            script.display()
-        ));
+    let target = provisional_target(args);
+    let mut argv = vec![
+        "--repo",
+        repo.to_str()
+            .ok_or("provisional repository path is not UTF-8")?,
+    ];
+    argv.extend_from_slice(args);
+    let run =
+        landing_policy::run_repo_guard(repo, &target, repo, "rolling-migration-renumber", &argv);
+    match run {
+        rsid::repo_guard_call::GuardRun::Exited {
+            code: 0, stdout, ..
+        } => serde_json::from_slice(&stdout)
+            .map_err(|error| format!("provisional migration tool returned invalid JSON: {error}")),
+        other => Err(format!("provisional migration refused: {}", other.reason())),
     }
-    let mut command = Command::new("python3");
-    command
-        .arg(&script)
-        .arg("--repo")
-        .arg(repo)
-        .args(args)
-        .current_dir(repo)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("PYTHONPATH")
-        .env_remove("PYTHONHOME");
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_") || key.to_string_lossy().starts_with("RSI_") {
-            command.env_remove(key);
-        }
-    }
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot start provisional migration tool: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "provisional migration refused: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("provisional migration tool returned invalid JSON: {error}"))
 }
 
 fn provisional_version(value: &Value, name: &str) -> Result<u32, String> {
@@ -2061,7 +2078,7 @@ pub(crate) fn is_test_red(error: &str) -> bool {
 }
 
 fn validate_cargo_target_dir() -> Result<PathBuf, String> {
-    let configured = std::env::var_os("CARGO_TARGET_DIR").ok_or_else(|| {
+    let configured = lander_env::var_os("CARGO_TARGET_DIR").ok_or_else(|| {
         "CARGO_TARGET_DIR must point to the current session's existing sandbox target directory"
             .to_string()
     })?;
@@ -2236,16 +2253,7 @@ async fn land_candidate(
                 .iter()
                 .find(|unit| unit.source == pair.source && unit.base == pair.base)
                 .map(|unit| unit.proof_path.as_path());
-            run_guard_pair_static(
-                repo,
-                options,
-                pair,
-                fetched_tip,
-                &candidate.oid,
-                false,
-                proof,
-            )
-            .await?;
+            run_guard_pair_static(repo, pair, fetched_tip, &candidate.oid, false, proof).await?;
         }
         return Ok(already_on_rolling_report(fetched_tip, test_gate, stale));
     }
@@ -2562,8 +2570,8 @@ fn touches_provisional_gate(
     current: &str,
     incoming_paths: &BTreeSet<Vec<u8>>,
 ) -> Result<bool, String> {
-    // Keep the fixed entries aligned with check-released-migrations.py's
-    // tracked_source_paths. Manifest sections supply its remaining paths.
+    // Keep the fixed entries aligned with `released_migrations::tracked_source_paths`.
+    // Manifest sections supply its remaining paths.
     let mut surface = BTreeSet::from([
         b"crates/rsid-store/src/store/mod.rs".to_vec(),
         b"crates/rsid-store/src/store/cohort_settlement.rs".to_vec(),
@@ -2573,8 +2581,6 @@ fn touches_provisional_gate(
         b"crates/rsid/src/store/cohort_settlement.rs".to_vec(),
         b"crates/rsid/src/store/tests.rs".to_vec(),
         b"tools/released-migrations.json".to_vec(),
-        b"tools/rolling-migration-renumber.py".to_vec(),
-        b"tools/check-released-migrations.py".to_vec(),
         b"scripts/rolling-landing-guard.py".to_vec(),
         b"scripts/run-rsid-test-shards.sh".to_vec(),
         b"scripts/rolling-shard-fingerprint.py".to_vec(),
@@ -2903,10 +2909,12 @@ async fn delta_reuse(
     let python = if verdict.python_everything {
         Vec::new()
     } else {
-        python_test_commands(worktree, fetched_tip, current).unwrap_or_else(|_| {
-            verdict.python_everything = true;
-            Vec::new()
-        })
+        python_test_commands(worktree, fetched_tip, current, &BTreeSet::new()).unwrap_or_else(
+            |_| {
+                verdict.python_everything = true;
+                Vec::new()
+            },
+        )
     };
     let python_selected = verdict.python_everything || !python.is_empty();
     let kind = if verdict.reuses_every_test() && !python_selected {
@@ -2935,7 +2943,7 @@ async fn delta_selected_filters(worktree: &Path, base: &str, head: &str) -> Opti
     if !script.is_file() {
         return None;
     }
-    let report = run_guard(
+    let report = run_guard_with_env(
         worktree,
         &GuardSpec {
             commands: vec![GuardCommand {
@@ -2958,6 +2966,7 @@ async fn delta_selected_filters(worktree: &Path, base: &str, head: &str) -> Opti
             env: BTreeMap::new(),
             output_tail_bytes: 1024 * 1024,
         },
+        lander_env::current().as_map(),
     )
     .await;
     parse_selector_filters(&report.commands.first()?.stdout_tail)
@@ -3270,7 +3279,7 @@ struct WorkspaceDependency {
 }
 
 fn workspace_metadata(worktree: &Path) -> Result<WorkspaceMetadata, String> {
-    let output = Command::new("cargo")
+    let output = lander_env::command("cargo")
         .args([
             "metadata",
             "--no-deps",
@@ -3371,16 +3380,8 @@ async fn run_guard_pair_with_proof(
     proof: Option<&Path>,
     test_gate: &mut TestGate,
 ) -> Result<(), String> {
-    let plan = run_guard_pair_static(
-        repo,
-        options,
-        pair,
-        fetched_tip,
-        candidate,
-        allow_lost_hunks,
-        proof,
-    )
-    .await?;
+    let plan =
+        run_guard_pair_static(repo, pair, fetched_tip, candidate, allow_lost_hunks, proof).await?;
     if let Some(worktree) = worktree {
         run_candidate_test_gate(
             repo,
@@ -3422,8 +3423,7 @@ async fn run_guard_pairs_once(
             .find(|unit| unit.source == pair.source && unit.base == pair.base)
             .map(|unit| unit.proof_path.as_path());
         any_proof |= proof.is_some();
-        let plan = run_guard_pair_static(repo, options, pair, fetched_tip, candidate, false, proof)
-            .await?;
+        let plan = run_guard_pair_static(repo, pair, fetched_tip, candidate, false, proof).await?;
         affected_crates.extend(plan.affected_crates);
     }
     let affected_crates = affected_crates.into_iter().collect::<Vec<_>>();
@@ -3440,26 +3440,24 @@ async fn run_guard_pairs_once(
     .await
 }
 
-/// The per-source checks that need no build: plan parse, lost hunks, guard
-/// status and the released-migration check. Returns the guard plan.
-async fn run_guard_pair_static(
+/// Stdout tail the plan-only guard run keeps (#3785). The guard prints a
+/// report that grows with its inputs; the plan JSON is parsed from this tail,
+/// so a tail shorter than the report starts mid-JSON and fails the gate.
+const GUARD_PLAN_TAIL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Arguments of the plan-only guard run. It never receives `--test-filter`
+/// (#3785): the plan reads no test command, and the guard echoes every filter
+/// into its report, so thousands of derived filters only bloat argv and stdout.
+fn plan_only_guard_args(
+    leading: Vec<String>,
     repo: &Path,
-    options: &Options,
     pair: &AcceptedPair,
     fetched_tip: &str,
     candidate: &str,
-    allow_lost_hunks: bool,
     proof: Option<&Path>,
-) -> Result<GuardPlan, String> {
-    let script = repo.join("scripts/rolling-landing-guard.py");
-    if !script.is_file() {
-        return Err(format!(
-            "landing guard script is missing: {}",
-            script.display()
-        ));
-    }
-    let args = vec![
-        script.to_string_lossy().into_owned(),
+) -> Vec<String> {
+    let mut args = leading;
+    args.extend([
         "--repo".into(),
         repo.to_string_lossy().into_owned(),
         "--base".into(),
@@ -3471,25 +3469,74 @@ async fn run_guard_pair_static(
         "--candidate".into(),
         candidate.into(),
         "--plan-only".into(),
-    ];
-    let mut args = args;
+    ]);
     if let Some(proof) = proof {
         args.extend(["--proof".into(), proof.to_string_lossy().into_owned()]);
     }
-    for filter in &options.test_filters {
-        args.extend(["--test-filter".into(), filter.clone()]);
-    }
-    let plan_report = run_guard(
+    args
+}
+
+/// Parse the guard's plan report. A failure names the byte count of the
+/// stdout it was given, so a truncated tail reads as one (#3785).
+fn parse_guard_plan(stdout: &str) -> Result<GuardPlan, String> {
+    serde_json::from_str(stdout).map_err(|error| {
+        format!(
+            "invalid landing guard plan: {error} (guard stdout tail is {} bytes; \
+             a tail at the {GUARD_PLAN_TAIL_BYTES}-byte capture limit is truncated)",
+            stdout.len()
+        )
+    })
+}
+
+/// The per-source checks that need no build: plan parse, lost hunks, guard
+/// status and the released-migration check. Returns the guard plan.
+async fn run_guard_pair_static(
+    repo: &Path,
+    pair: &AcceptedPair,
+    fetched_tip: &str,
+    candidate: &str,
+    allow_lost_hunks: bool,
+    proof: Option<&Path>,
+) -> Result<GuardPlan, String> {
+    // #361/#452: the trusted native guard runs the landing guard when one is
+    // installed; without it the committed legacy script still does until that
+    // script is deleted (#363).
+    let (program, leading) = if let Some(exe) = landing_policy::trusted_guard_exe(repo, fetched_tip)
+    {
+        (
+            exe.to_string_lossy().into_owned(),
+            vec!["rolling-landing-guard".to_owned()],
+        )
+    } else if landing_policy::native_guard_installed() {
+        return Err(format!(
+            "the installed rsi-repo-guard is not authenticated for target {fetched_tip}"
+        ));
+    } else {
+        let script = repo.join("scripts/rolling-landing-guard.py");
+        if !script.is_file() {
+            return Err(format!(
+                "landing guard script is missing: {}",
+                script.display()
+            ));
+        }
+        (
+            "python3".to_owned(),
+            vec![script.to_string_lossy().into_owned()],
+        )
+    };
+    let args = plan_only_guard_args(leading, repo, pair, fetched_tip, candidate, proof);
+    let plan_report = run_guard_with_env(
         repo,
         &GuardSpec {
             commands: vec![GuardCommand {
-                program: "python3".into(),
+                program,
                 args,
                 timeout: Duration::from_secs(120),
             }],
             env: BTreeMap::new(),
-            output_tail_bytes: 256 * 1024,
+            output_tail_bytes: GUARD_PLAN_TAIL_BYTES,
         },
+        lander_env::current().as_map(),
     )
     .await;
     let Some(plan_command) = plan_report.commands.first() else {
@@ -3519,9 +3566,9 @@ async fn run_guard_pair_static(
             plan_command.status
         ));
     } else {
-        serde_json::from_str(&plan_command.stdout_tail).map_err(|error| {
+        parse_guard_plan(&plan_command.stdout_tail).map_err(|error| {
             format!(
-                "{}; invalid landing guard plan: {error}; accepted pair {}:{} ({:?})",
+                "{}; {error}; accepted pair {}:{} ({:?})",
                 plan_command.stderr_tail.trim(),
                 pair.base,
                 pair.source,
@@ -3535,10 +3582,11 @@ async fn run_guard_pair_static(
     // Every cheap static guard refuses before any build or test runs (#1052).
     if !plan.lost_hunks.is_empty() && !allow_lost_hunks {
         return Err(format!(
-            "{}; rolling landing guard rejected accepted pair {}:{} before any test ran",
+            "{}; rolling landing guard rejected accepted pair {}:{} before any test ran{}",
             plan.lost_hunks.join("; "),
             pair.base,
-            pair.source
+            pair.source,
+            guard_refusal_evidence(repo, pair, fetched_tip, candidate)
         ));
     }
     if !plan_report.passed && (!allow_lost_hunks || plan.lost_hunks.is_empty()) {
@@ -3554,6 +3602,53 @@ async fn run_guard_pair_static(
         landing_policy::check_released_migrations(repo, repo, fetched_tip, candidate)?;
     }
     Ok(plan)
+}
+
+/// The inputs a refused guard pair needs to be replayed by hand (#3452): the
+/// lander's private clone and its candidate are discarded, so the refusal
+/// carries the guard's own arguments, every merge base of the source against
+/// the tip, and the command that rebuilds the candidate from the tip and the
+/// source. Best effort: a git failure only drops that part.
+fn guard_refusal_evidence(
+    repo: &Path,
+    pair: &AcceptedPair,
+    fetched_tip: &str,
+    candidate: &str,
+) -> String {
+    let merge_bases = git_text(repo, &["merge-base", "--all", &pair.source, fetched_tip])
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    format!(
+        " (guard argv: --base {base} --source {source} --target {fetched_tip} \
+         --candidate {candidate} --plan-only; merge bases of source and target: \
+         [{merge_bases}]; rebuild the candidate tree with \
+         `git merge-tree --write-tree {fetched_tip} {source}`)",
+        base = pair.base,
+        source = pair.source,
+    )
+}
+
+/// The queue-derived filters (#3615): read from the file the queue names, else
+/// the inline variable older queues set. A bad file is a typed refusal, never
+/// an empty set (which would read as caller-named filters).
+fn derived_gate_filters() -> Result<BTreeSet<String>, String> {
+    rsi_common::rolling_queue::read_derived_filters(
+        std::env::var_os(rsi_common::rolling_queue::DERIVED_FILTERS_FILE_ENV).as_deref(),
+        std::env::var(rsi_common::rolling_queue::DERIVED_FILTERS_INLINE_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// A digest of the derived set, small enough for a child's environment.
+fn derived_filters_digest(derived: &BTreeSet<String>) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    for filter in derived {
+        hash.update(filter.as_bytes());
+        hash.update([0]);
+    }
+    format!("sha256:{}", hex::encode(hash.finalize()))
 }
 
 /// The candidate's test gate: one run of the affected crates plus the
@@ -3577,8 +3672,15 @@ async fn run_candidate_test_gate(
     // #1243: a filter that provably selects no test would fail the gate only
     // after the build; refuse it first (the queue checks at enqueue, a manual
     // landing only here).
+    let derived = derived_gate_filters()?;
+    let strict: Vec<String> = options
+        .test_filters
+        .iter()
+        .filter(|filter| !derived.contains(*filter))
+        .cloned()
+        .collect();
     if let Some(filter) =
-        rsid::rolling_queue::filter_selecting_no_tests(worktree, candidate, &options.test_filters)
+        rsid::rolling_queue::filter_selecting_no_tests(worktree, candidate, &strict)
     {
         let hint = rsid::rolling_queue::no_test_filter_hint(
             worktree,
@@ -3615,6 +3717,11 @@ async fn run_candidate_test_gate(
     } else {
         workspace_metadata(worktree)?
     };
+    // #3887: record what this source touched for the zero-test warning.
+    let changed_paths =
+        git_text(worktree, &["diff", "--name-only", fetched_tip, candidate]).unwrap_or_default();
+    test_gate.zero_test_scope =
+        zero_tests::ZeroTestScope::from_diff(affected_crates, changed_paths.lines());
     // #2410: the daemon-side observers of a changed leaf crate live in rsid.
     let observed_crates = with_leaf_observers(affected_crates, &options.test_filters);
     let affected_crates = observed_crates.as_slice();
@@ -3703,9 +3810,25 @@ async fn run_candidate_test_gate(
             RSID_SHARDS.len()
         );
     }
-    spec.commands
-        .extend(python_test_commands(worktree, fetched_tip, candidate)?);
+    spec.commands.extend(python_test_commands(
+        worktree,
+        fetched_tip,
+        candidate,
+        &test_gate.claimed_fixes,
+    )?);
     test_gate.focused_filters = explicit_focused_filters(&options.test_filters, provisional);
+    for filter in &mut test_gate.focused_filters {
+        if derived.contains(&filter.label) {
+            filter.explicit = false;
+        }
+    }
+    // Only a digest rides in the guard commands' environment: the full set can
+    // pass the 128 KiB one-string cap and no child reads it (#3615). It still
+    // keys the receipt identity.
+    spec.env.insert(
+        "RSI_LANDER_DERIVED_FILTERS_SHA256".into(),
+        derived_filters_digest(&derived),
+    );
     run_affected_gate_receipted(
         repo,
         worktree,
@@ -3758,7 +3881,7 @@ fn lander_identity() -> Result<String, String> {
 }
 
 fn tool_version(worktree: &Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
+    let output = lander_env::command(program)
         .args(args)
         .current_dir(worktree)
         .output()
@@ -3800,6 +3923,12 @@ fn receipt_identity(
     let _ = writeln!(identity, "slow_tier={slow_tier:?}");
     let _ = writeln!(identity, "build_jobs={}", options.cargo_build_jobs);
     let _ = writeln!(identity, "filters={:?}", options.test_filters);
+    // An unreadable set already refused the gate before any identity is taken.
+    let _ = writeln!(
+        identity,
+        "derived_filters={:?}",
+        derived_gate_filters().unwrap_or_default()
+    );
     let _ = writeln!(identity, "disk_scratch={:?}", options.disk_scratch_shards);
     let _ = writeln!(identity, "claimed={claimed:?}");
     for (key, value) in &spec.env {
@@ -4075,12 +4204,12 @@ fn receipt_slot(
             .ok()
             .map(|text| PathBuf::from(text.trim()));
         let tool_inputs =
-            receipt_tool_inputs(&|name| std::env::var_os(name), spec, sysroot.as_deref());
+            receipt_tool_inputs(&|name| lander_env::var_os(name), spec, sysroot.as_deref());
         let identity = receipt_identity(
             &tree,
             base,
             candidate,
-            &receipt_inherited_env(std::env::vars_os()),
+            &receipt_inherited_env(lander_env::vars_os()),
             &tool_inputs,
             spec,
             options,
@@ -4163,6 +4292,13 @@ async fn run_affected_gate_receipted(
     gate: &mut TestGate,
     options: &Options,
 ) -> Result<(), String> {
+    // #3923: independent of Cargo selection and reuse. A cached Cargo verdict
+    // never substitutes for the shell lane's own typed receipt.
+    let shell_started = Instant::now();
+    let shell_result = run_shell_suite_gate(candidate_worktree, base, candidate, spec, gate).await;
+    gate.checks_secs += shell_started.elapsed().as_secs();
+    gate.record_check_step("shell-tests", shell_started.elapsed().as_secs());
+    shell_result?;
     let slot = receipt_slot(candidate_worktree, base, candidate, spec, gate, options);
     if let Some(slot) = &slot
         && let Some((outcome, age_secs)) =
@@ -4204,6 +4340,131 @@ async fn run_affected_gate_receipted(
         }
     }
     Ok(())
+}
+
+/// Select and execute shell suites through the trusted installed guard. The
+/// daemon package never links the guard crate, including for this lane.
+async fn run_shell_suite_gate(
+    worktree: &Path,
+    base: &str,
+    candidate: &str,
+    spec: &GuardSpec,
+    gate: &TestGate,
+) -> Result<(), String> {
+    #[cfg(not(test))]
+    let exe = landing_policy::trusted_guard_exe(worktree, base)
+        .ok_or_else(|| "no trusted rsi-repo-guard is installed for the shell gate".to_owned())?;
+    // Older lander fixtures stub the static guards independently. This lane
+    // crosses the real executable boundary unless a test supplies its own stub.
+    #[cfg(test)]
+    let exe = SHELL_GUARD_EXE
+        .with(|path| path.borrow().clone())
+        .unwrap_or_else(provisional_fixture::real_guard);
+
+    let mut env = spec.env.clone();
+    env.retain(|key, _| !rsid::integration::guard_withholds_env(key) && key != "TAP_SELECT");
+    if let Some(scratch) = &gate.scratch {
+        env.insert(
+            "TMPDIR".into(),
+            scratch.path().to_string_lossy().into_owned(),
+        );
+    }
+    let mut inherited = lander_env::vars_os()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    inherited.retain(|key, _| key != "TAP_SELECT");
+    let root = gate
+        .receipt_root
+        .clone()
+        .unwrap_or_else(|| worktree.parent().unwrap_or(worktree).join("gate-receipts"))
+        .join("shell-suites");
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("cannot create shell receipt directory: {error}"))?;
+    let logs = tempfile::Builder::new()
+        .prefix("gate-")
+        .tempdir_in(root)
+        .map_err(|error| format!("cannot allocate shell receipt: {error}"))?
+        .keep();
+    let path = logs.join("receipt.json");
+    let report = run_guard_with_env(
+        worktree,
+        &GuardSpec {
+            commands: vec![GuardCommand {
+                program: exe.to_string_lossy().into_owned(),
+                args: vec![
+                    "residual-lane".into(),
+                    "--base".into(),
+                    base.into(),
+                    "--head".into(),
+                    candidate.into(),
+                    "--repo".into(),
+                    worktree.to_string_lossy().into_owned(),
+                    "--receipt".into(),
+                    path.to_string_lossy().into_owned(),
+                    "--timeout-secs".into(),
+                    guard_timeout().as_secs().to_string(),
+                ],
+                // Leave time for the lane to reap its children and persist a red
+                // timeout receipt before the outer supervisor enforces its ceiling.
+                timeout: guard_timeout() + Duration::from_secs(10),
+            }],
+            env,
+            output_tail_bytes: GUARD_PLAN_TAIL_BYTES,
+        },
+        &inherited,
+    )
+    .await;
+    for command in &report.commands {
+        print!("{}", command.stdout_tail);
+        eprint!("{}", command.stderr_tail);
+    }
+    let receipt: Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| format!("shell suite gate has no receipt: {error}; {report:?}"))?,
+    )
+    .map_err(|error| format!("invalid shell gate receipt: {error}"))?;
+    println!("shell_gate_receipt={} {receipt}", path.display());
+    validate_shell_receipt(&receipt, base, candidate)?;
+    if !report.passed {
+        return Err(format!("shell suite guard failed: {report:?}"));
+    }
+    Ok(())
+}
+
+/// Check the transport envelope as well as every verdict: an exited guard or
+/// an affirmative top-level flag alone cannot turn a partial/red lane green.
+fn validate_shell_receipt(receipt: &Value, base: &str, candidate: &str) -> Result<(), String> {
+    let selected = receipt["selected"].as_array();
+    let entries = receipt["residual"].as_array();
+    let complete = selected.zip(entries).is_some_and(|(selected, entries)| {
+        selected.len() == entries.len()
+            && selected.iter().zip(entries).all(|(test, entry)| {
+                test.as_str().is_some_and(|path| !path.is_empty())
+                    && entry["test_file"] == *test
+                    && entry["status"] == "passed"
+                    && entry["completed"] == true
+                    && entry["executed_tests"]
+                        .as_u64()
+                        .is_some_and(|count| count > 0)
+                    && entry["exit_code"] == 0
+                    && entry["failed_tests"] == 0
+            })
+    });
+    if receipt["schema_version"] != 1
+        || receipt["base"] != base
+        || receipt["receipt_head"] != candidate
+        || receipt["ok"] != true
+        || !receipt.get("error").is_some_and(Value::is_null)
+        || !complete
+    {
+        return Err(format!("shell suite gate failed: {receipt}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static SHELL_GUARD_EXE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// #2546: the test-only omission applies to a gate executed in full for this
@@ -4329,310 +4590,16 @@ fn gate_selection_evidence(
     }
 }
 
-/// The Python suites and the desktop lane a candidate selects, in gate order.
-/// Both are strict candidate checks run before Cargo; the stale re-gate reuse
-/// treats them as one list (`GateReuse::python`).
+/// The Python suites a candidate selects, in gate order. They are strict
+/// candidate checks run before Cargo; the stale re-gate reuse treats them as one
+/// list (`GateReuse::python`).
 fn python_test_commands(
     worktree: &Path,
     base: &str,
     candidate: &str,
+    claimed: &BTreeSet<String>,
 ) -> Result<Vec<GuardCommand>, String> {
-    let mut commands = python_suite_commands(worktree, base, candidate)?;
-    commands.extend(desktop_test_commands(worktree, base, candidate)?);
-    Ok(commands)
-}
-
-/// Program and script of the desktop lane (hub #3001).
-const DESKTOP_GATE_SCRIPT: &str = "scripts/desktop-test-gate.py";
-/// The lane builds a Tauri app from a cold target on a fresh host, so it gets
-/// the longest guard budget; the candidate's own timeout still bounds it.
-const DESKTOP_GATE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-
-/// Trigger inputs the lander can name without the selector script: the static
-/// part of `trigger_inputs` in `scripts/desktop-test-gate.py` (`desktop` and its
-/// `OUTSIDE_INPUTS`; a test pins this list to the script's). It is only read when
-/// the candidate has no script; the fallback adds its manifest dependency closure.
-/// The whole root manifest is a conservative trigger, including workspace inheritance.
-const DESKTOP_STATIC_TRIGGER_INPUTS: [&str; 4] = [
-    "desktop",
-    "Cargo.toml",
-    "docs/keybindings.md",
-    "crates/rsi/src",
-];
-
-/// The desktop lane for a candidate that touches one of the desktop suite's
-/// inputs (hub #3001, #3042): the selector is `scripts/desktop-test-gate.py`,
-/// the same one scoped-test runs, so a worker's receipt and the queue gate
-/// agree on what a change owes. A diff that touches no input selects nothing.
-///
-/// The lane fails closed (#355): the script is the selector, so a candidate
-/// worktree without it cannot say what it owes. When the diff touches the
-/// script itself (a delete or rename) or a trigger input
-/// (including the manifest path-dependency closure), selection is an error naming the script
-/// and the gate refuses the entry; a tree without the script whose diff touches
-/// neither selects nothing.
-fn desktop_test_commands(
-    worktree: &Path,
-    base: &str,
-    candidate: &str,
-) -> Result<Vec<GuardCommand>, String> {
-    // The script owns the trigger inputs (`desktop/`, `docs/keybindings.md`,
-    // `crates/rsi/src` and the Cargo path dependencies of the Tauri crate), so
-    // no path filter here can drift from it.
-    if !worktree.join(DESKTOP_GATE_SCRIPT).is_file() {
-        return desktop_selector_missing(worktree, base, candidate);
-    }
-    let output = Command::new("python3")
-        .args([DESKTOP_GATE_SCRIPT, "--base", base, "--head", candidate])
-        .current_dir(worktree)
-        .output()
-        .map_err(|error| format!("cannot select the desktop lane: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot select the desktop lane: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let commands: Vec<Vec<String>> = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid desktop lane plan: {error}"))?;
-    commands
-        .into_iter()
-        .map(|args| {
-            let command = GuardCommand {
-                program: "python3".into(),
-                // `-B`: never write bytecode into the candidate worktree.
-                args: std::iter::once("-B".to_owned())
-                    .chain(args.into_iter().skip(1))
-                    .collect(),
-                timeout: DESKTOP_GATE_TIMEOUT,
-            };
-            if !is_desktop_test_guard(&command) {
-                return Err(format!("invalid desktop lane command: {command:?}"));
-            }
-            Ok(command)
-        })
-        .collect()
-}
-
-/// Conservative manifest closure for a candidate without its selector (#3136).
-/// Mirrors Python's missing_selector_inputs; shared fixtures pin both decisions.
-fn desktop_missing_selector_inputs(
-    repo: &Path,
-    candidate: &str,
-) -> Result<BTreeSet<String>, String> {
-    const MANIFEST: &str = "desktop/src-tauri/Cargo.toml";
-    fn read(repo: &Path, candidate: &str, path: &str) -> Option<String> {
-        git_text(repo, &["show", &format!("{candidate}:{path}")]).ok()
-    }
-    fn manifest(repo: &Path, candidate: &str, path: &str) -> Result<toml::Value, String> {
-        let text = read(repo, candidate, path).ok_or_else(|| format!("cannot read {path}"))?;
-        toml::from_str(&text).map_err(|error| format!("cannot parse {path}: {error}"))
-    }
-    fn directory_at(parent: &str, path: &str, allow_root: bool) -> Result<String, String> {
-        if path.starts_with('/') || path.contains(['\\', ':']) {
-            return Err(format!("unresolvable dependency path {path:?}"));
-        }
-        let mut parts = Vec::new();
-        let joined = format!("{parent}/{path}");
-        for part in joined.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts
-                        .pop()
-                        .ok_or_else(|| format!("dependency path leaves repository: {path}"))?;
-                }
-                _ => parts.push(part),
-            }
-        }
-        if parts.is_empty() && !allow_root {
-            return Err(format!("dependency path names repository root: {path}"));
-        }
-        Ok(parts.join("/"))
-    }
-    fn parent(path: &str) -> &str {
-        path.rsplit_once('/').map_or("", |(directory, _)| directory)
-    }
-    fn workspace_for(
-        repo: &Path,
-        candidate: &str,
-        path: &str,
-        value: &toml::Value,
-    ) -> Result<(String, toml::value::Table), String> {
-        let explicit = value
-            .get("package")
-            .and_then(|package| package.get("workspace"));
-        let mut directory = parent(path).to_owned();
-        if let Some(explicit) = explicit {
-            directory = directory_at(
-                &directory,
-                explicit.as_str().ok_or("invalid package.workspace")?,
-                true,
-            )?;
-        }
-        loop {
-            let workspace_path = if directory.is_empty() {
-                "Cargo.toml".to_owned()
-            } else {
-                format!("{directory}/Cargo.toml")
-            };
-            if read(repo, candidate, &workspace_path).is_some() {
-                let value = manifest(repo, candidate, &workspace_path)?;
-                if let Some(workspace) = value.get("workspace").and_then(toml::Value::as_table) {
-                    let dependencies = match workspace.get("dependencies") {
-                        Some(value) => value
-                            .as_table()
-                            .ok_or("invalid workspace.dependencies")?
-                            .clone(),
-                        None => toml::value::Table::new(),
-                    };
-                    return Ok((directory, dependencies));
-                }
-            }
-            if explicit.is_some() || directory.is_empty() {
-                return Err(format!("cannot resolve workspace for {path}"));
-            }
-            directory = parent(&directory).to_owned();
-        }
-    }
-    let mut inputs: BTreeSet<String> = DESKTOP_STATIC_TRIGGER_INPUTS
-        .iter()
-        .map(|s| (*s).into())
-        .collect();
-    if read(repo, candidate, MANIFEST).is_none() {
-        return Ok(inputs);
-    }
-    let mut queue = vec![MANIFEST.to_owned()];
-    let mut seen = BTreeSet::new();
-    while let Some(path) = queue.pop() {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let value = manifest(repo, candidate, &path)?;
-        fn dependency_tables<'a>(
-            value: &'a toml::Value,
-            tables: &mut Vec<&'a toml::value::Table>,
-        ) -> Result<(), String> {
-            for name in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                if let Some(value) = value.get(name) {
-                    tables.push(value.as_table().ok_or("invalid dependency table")?);
-                }
-            }
-            Ok(())
-        }
-        let mut tables = Vec::new();
-        dependency_tables(&value, &mut tables)?;
-        if let Some(workspace) = value.get("workspace") {
-            let workspace = workspace.as_table().ok_or("invalid workspace table")?;
-            if let Some(dependencies) = workspace.get("dependencies") {
-                tables.push(dependencies.as_table().ok_or("invalid dependency table")?);
-            }
-        }
-        if let Some(targets) = value.get("target") {
-            for target in targets.as_table().ok_or("invalid target table")?.values() {
-                if !target.is_table() {
-                    return Err("invalid target dependency table".into());
-                }
-                dependency_tables(target, &mut tables)?;
-            }
-        }
-        if let Some(patches) = value.get("patch") {
-            for patch in patches.as_table().ok_or("invalid patch table")?.values() {
-                tables.push(patch.as_table().ok_or("invalid patch dependency table")?);
-            }
-        }
-        if let Some(replace) = value.get("replace") {
-            tables.push(replace.as_table().ok_or("invalid replacement table")?);
-        }
-        for table in tables {
-            for (name, spec) in table {
-                let inherited;
-                let mut directory = parent(&path).to_owned();
-                let spec = if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
-                    let (workspace_dir, dependencies) =
-                        workspace_for(repo, candidate, &path, &value)?;
-                    directory = workspace_dir;
-                    inherited = dependencies
-                        .get(name)
-                        .ok_or_else(|| {
-                            format!("cannot resolve workspace dependency {name} in {path}")
-                        })?
-                        .clone();
-                    &inherited
-                } else {
-                    spec
-                };
-                if !spec.is_str() && !spec.is_table() {
-                    return Err(format!("invalid dependency {name} in {path}"));
-                }
-                if let Some(dependency_path) = spec.get("path") {
-                    let directory = directory_at(
-                        &directory,
-                        dependency_path.as_str().ok_or("invalid dependency path")?,
-                        false,
-                    )?;
-                    queue.push(format!("{directory}/Cargo.toml"));
-                    inputs.insert(directory);
-                }
-            }
-        }
-    }
-    Ok(inputs)
-}
-
-/// An absent selector cannot silently omit changes in the manifest closure.
-/// Check static paths first: delete/rename refusals do not depend on valid manifests.
-fn desktop_selector_missing(
-    worktree: &Path,
-    base: &str,
-    candidate: &str,
-) -> Result<Vec<GuardCommand>, String> {
-    let changed = changed_paths(worktree, base, candidate)?;
-    if changed.is_empty() {
-        return Ok(Vec::new());
-    }
-    let under = |path: &[u8], input: &str| {
-        let path = String::from_utf8_lossy(path);
-        path == input || path.starts_with(&format!("{input}/"))
-    };
-    let mut touched: Vec<_> = changed
-        .iter()
-        .filter(|path| {
-            under(path, DESKTOP_GATE_SCRIPT)
-                || DESKTOP_STATIC_TRIGGER_INPUTS
-                    .iter()
-                    .any(|input| under(path, input))
-        })
-        .collect();
-    if touched.is_empty() {
-        let inputs = desktop_missing_selector_inputs(worktree, candidate).map_err(|error| format!(
-            "cannot select the desktop lane: {DESKTOP_GATE_SCRIPT} is missing from the candidate; \
-             cannot establish desktop dependency closure: {error}"
-        ))?;
-        touched = changed
-            .iter()
-            .filter(|path| inputs.iter().any(|input| under(path, input)))
-            .collect();
-    }
-    let Some(first) = touched.first() else {
-        return Ok(Vec::new());
-    };
-    Err(format!(
-        "cannot select the desktop lane: {DESKTOP_GATE_SCRIPT} is missing from the candidate \
-         but the diff touches {} ({} path(s)); restore the script or land the change without it",
-        String::from_utf8_lossy(first),
-        touched.len()
-    ))
-}
-
-fn is_desktop_test_guard(command: &GuardCommand) -> bool {
-    command.program == "python3"
-        && command.args.first().is_some_and(|arg| arg == "-B")
-        && command
-            .args
-            .get(1)
-            .is_some_and(|arg| arg == DESKTOP_GATE_SCRIPT)
-        && command.args.get(2).is_some_and(|arg| arg == "--run")
+    python_suite_commands(worktree, base, candidate, claimed)
 }
 
 /// Wall-clock bound for one Python test command of the gate (#3018). A passing
@@ -4658,6 +4625,67 @@ fn python_suite_commands(
     worktree: &Path,
     base: &str,
     candidate: &str,
+    claimed: &BTreeSet<String>,
+) -> Result<Vec<GuardCommand>, String> {
+    let mut commands = changed_python_suite_commands(worktree, base, candidate)?;
+    // #3320: a claimed Python test is run whatever the diff selects, because no
+    // queue filter can select it (test filters are PACKAGE=FILTER for Cargo).
+    for claim in claimed {
+        let Some((file, runner)) = claimed_python_suite(worktree, claim) else {
+            continue;
+        };
+        if commands
+            .iter()
+            .any(|command| command.args.last().is_some_and(|last| *last == file))
+        {
+            continue;
+        }
+        commands.push(GuardCommand {
+            program: "python3".into(),
+            args: ["-B", "-m", runner, "-v"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain([file])
+                .collect(),
+            timeout: PYTHON_TEST_COMMAND_TIMEOUT,
+        });
+    }
+    Ok(commands)
+}
+
+/// The test module a claimed fix (#2167) names, as `(repo-relative file,
+/// runner)`, when it is a Python unittest id
+/// `scripts.tests.<module>.<Class>.<method>` (or `tools.tests.`) whose module
+/// exists on the candidate. A Rust name or a bare `Class.method` (no module to
+/// run) is `None`.
+fn claimed_python_suite(worktree: &Path, claimed: &str) -> Option<(String, &'static str)> {
+    let parts: Vec<&str> = claimed.split('.').collect();
+    let identifier =
+        |part: &&str| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if parts.len() < 3
+        || !matches!(parts[0], "scripts" | "tools")
+        || parts[1] != "tests"
+        || !parts.iter().all(identifier)
+    {
+        return None;
+    }
+    (3..=parts.len()).rev().find_map(|length| {
+        let file = format!("{}.py", parts[..length].join("/"));
+        worktree.join(&file).is_file().then_some((file, "unittest"))
+    })
+}
+
+/// Whether a claimed test name reads as a Python unittest id rather than a Rust
+/// path, for the refusal's next step.
+fn is_python_claim(claimed: &str) -> bool {
+    !claimed.contains("::") && claimed.contains('.')
+}
+
+/// The selection a diff owes, before any claimed test is added.
+fn changed_python_suite_commands(
+    worktree: &Path,
+    base: &str,
+    candidate: &str,
 ) -> Result<Vec<GuardCommand>, String> {
     let paths = changed_paths(worktree, base, candidate)?;
     // A path anywhere else (a committed manifest or lockfile a Python suite
@@ -4675,7 +4703,7 @@ fn python_suite_commands(
     {
         return Ok(Vec::new());
     }
-    let output = Command::new("python3")
+    let output = lander_env::command("python3")
         .args([
             "scripts/python-test-gate.py",
             "--base",
@@ -5125,7 +5153,10 @@ fn print_gate_environment_once(cwd: &Path, spec: &GuardSpec) {
     if PRINTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
-    let process_env: BTreeMap<String, String> = std::env::vars().collect();
+    let process_env: BTreeMap<String, String> = lander_env::vars_os()
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     println!(
         "{}",
         gate_environment_line(cwd, &spec.env, &process_env, &current_systemd_unit())
@@ -5246,7 +5277,7 @@ fn retry_failure_evidence(report: &rsid::integration::GuardCommandReport) -> Str
         // The lander does not know the queue log path; the refusal is stored
         // beside it, so name the log by role.
         evidence.push_str(&format!(
-            " (+{omitted} more lines; full output in the queue gate log)"
+            " (+{omitted} more lines; bounded output in the queue gate log)"
         ));
     }
     evidence
@@ -5530,6 +5561,27 @@ fn pin_gate_build_id(env: &mut BTreeMap<String, String>) {
         .or_insert_with(|| GATE_BUILD_ID.into());
 }
 
+/// Hub #3483: the complete selected-test inventory of one guard command, or
+/// `None` without a live known-red signature, a listable command or a clean
+/// listing.
+async fn list_selected_tests(
+    worktree: &Path,
+    spec: &GuardSpec,
+    command: &GuardCommand,
+    gate: &TestGate,
+) -> Option<BTreeSet<String>> {
+    let has_live_signature = gate
+        .known_failures
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.live_records().next().is_some());
+    if !has_live_signature {
+        return None;
+    }
+    let list = known_red_timeout::list_command(command, ShardTree::Worktree(worktree))?;
+    let report = run_one_guard(worktree, spec, &list).await.ok()?;
+    known_red_timeout::selected_tests(&report, spec.output_tail_bytes)
+}
+
 async fn run_one_guard(
     worktree: &Path,
     spec: &GuardSpec,
@@ -5571,38 +5623,20 @@ async fn run_one_guard(
             target.to_string_lossy().into_owned(),
         );
     }
-    if is_desktop_test_guard(command) {
-        // Hub #3001: the lane's Tauri Cargo target is its own tree beside the
-        // gate's targets (a Cargo tree, so the sandbox reclaim recognizes it),
-        // one per candidate worktree like the main target (no cross-candidate
-        // artifact reuse).
-        let parent = worktree.parent().ok_or("guard worktree has no parent")?;
-        let name = worktree
-            .file_name()
-            .ok_or("guard worktree has no file name")?
-            .to_string_lossy();
-        // Hub #3023: a candidate bound to a warm slot uses the slot's own desktop
-        // target instead, so its third-party crates survive between gates.
-        let warm = warm_desktop_bindings().get(worktree).cloned();
-        env.entry("DESKTOP_LANE_CARGO_TARGET".into())
-            .or_insert_with(|| {
-                warm.unwrap_or_else(|| parent.join(format!("{name}-desktop-tauri-target")))
-                    .to_string_lossy()
-                    .into_owned()
-            });
-    }
     let (executable, _filter_config) = nextest_filter_config(worktree, command)?;
-    let wrapped = slot_wrapped_command(
+    let wrapped = isolated_slot_command(
+        worktree,
         &executable,
-        std::env::var_os("RSI_LANDER_LOCAL_SLOT_WRAPPER").as_deref(),
+        lander_env::var_os("RSI_LANDER_LOCAL_SLOT_WRAPPER").as_deref(),
     );
-    let report = run_guard(
+    let report = run_guard_with_env(
         worktree,
         &GuardSpec {
             commands: vec![wrapped],
             env,
             output_tail_bytes: spec.output_tail_bytes,
         },
+        lander_env::current().as_map(),
     )
     .await;
     let mut report = report
@@ -5618,7 +5652,7 @@ async fn run_one_guard(
 }
 
 fn persist_guard_test_timings(worktree: &Path, report: &rsid::integration::GuardCommandReport) {
-    let Some(path) = std::env::var_os(rsid::integration::TEST_TIMINGS_ENV) else {
+    let Some(path) = lander_env::var_os(rsid::integration::TEST_TIMINGS_ENV) else {
         return;
     };
     static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5751,6 +5785,58 @@ fn nextest_filter_config(
     Ok((executable, Some(file)))
 }
 
+/// The helper that runs a test command in its own PID namespace (#3478).
+const PID_ISOLATE_SCRIPT: &str = "scripts/pid-isolate.py";
+
+/// A command that executes tests: cargo test/nextest, the shard runner and a
+/// Python suite. Static guards and git checks run as before.
+fn runs_tests(command: &GuardCommand) -> bool {
+    is_test_guard(command)
+        || is_python_test_guard(command)
+        || (command.program == "cargo" && command.args.first().is_some_and(|arg| arg == "nextest"))
+}
+
+/// #3478: a test the gate runs must not see or signal host processes. A Python
+/// test that ran `install-release.sh --link-only --now` found the real hub
+/// daemon with a host-wide `pgrep` and interrupted it in every gate (#3476).
+/// The candidate's `scripts/pid-isolate.py` starts the command in a user + PID
+/// namespace with a fresh `/proc` and prints `pid_isolation=namespaced` or
+/// `pid_isolation=unavailable reason=...` into the gate log; where the host
+/// refuses user namespaces it runs the command unwrapped, as before. A tree
+/// without the helper (a base side older than this change) is left alone.
+fn pid_isolated_command(worktree: &Path, command: &GuardCommand) -> Option<GuardCommand> {
+    if !cfg!(unix) || !runs_tests(command) || !worktree.join(PID_ISOLATE_SCRIPT).is_file() {
+        return None;
+    }
+    let mut args = Vec::with_capacity(command.args.len() + 2);
+    args.push("--".to_owned());
+    args.push(command.program.clone());
+    args.extend(command.args.iter().cloned());
+    Some(GuardCommand {
+        program: PID_ISOLATE_SCRIPT.into(),
+        args,
+        timeout: command.timeout,
+    })
+}
+
+/// The command as the lander executes it: the build slot (when a wrapper is
+/// set) stays outermost, because the slot queue reads host pids, and the PID
+/// namespace wraps only the command inside it.
+fn isolated_slot_command(
+    worktree: &Path,
+    command: &GuardCommand,
+    wrapper: Option<&std::ffi::OsStr>,
+) -> GuardCommand {
+    let slotted = slot_wrapped_command(command, wrapper);
+    let Some(isolated) = pid_isolated_command(worktree, command) else {
+        return slotted;
+    };
+    match wrapper.filter(|wrapper| !wrapper.is_empty()) {
+        Some(wrapper) if slotted != *command => run_under_slot(&isolated, wrapper),
+        _ => isolated,
+    }
+}
+
 /// A remote-gate run holds no desktop lander slot (#969), so each local
 /// build or test it still runs (non-shard crates, focused filters, isolated
 /// retries, base comparisons) takes a desktop build slot through
@@ -5765,6 +5851,11 @@ fn slot_wrapped_command(command: &GuardCommand, wrapper: Option<&std::ffi::OsStr
     if command.program != "cargo" && command.program != "scripts/run-rsid-test-shards.sh" {
         return command.clone();
     }
+    run_under_slot(command, wrapper)
+}
+
+/// `command` as the argument of the slot `wrapper`.
+fn run_under_slot(command: &GuardCommand, wrapper: &std::ffi::OsStr) -> GuardCommand {
     let mut args = Vec::with_capacity(command.args.len() + 1);
     args.push(command.program.clone());
     args.extend(command.args.iter().cloned());
@@ -5899,7 +5990,7 @@ fn reuse_spec(spec: &GuardSpec, reuse: &GateReuse) -> (GuardSpec, usize, usize) 
             commands.push(command.clone());
             continue;
         }
-        let keep = if is_python_test_guard(command) || is_desktop_test_guard(command) {
+        let keep = if is_python_test_guard(command) {
             verdict.python_everything || reuse.python.contains(command)
         } else if is_test_guard(command) {
             runs_test(command)
@@ -6032,7 +6123,7 @@ fn shard_fingerprint(
     shard: &str,
     jobs: u32,
 ) -> Result<String, String> {
-    let output = Command::new("python3")
+    let output = lander_env::command("python3")
         .arg(worktree.join("scripts/rolling-shard-fingerprint.py"))
         .args(["--sha", base, "--shard", shard, "--jobs", &jobs.to_string()])
         .current_dir(worktree)
@@ -6187,7 +6278,7 @@ fn base_cache_identity(
     if command.program != "cargo" || cargo_test_package(command).is_none() {
         return Ok(None);
     }
-    let Ok(rustc) = Command::new("rustc")
+    let Ok(rustc) = lander_env::command("rustc")
         .arg("-vV")
         .current_dir(candidate_worktree)
         .output()
@@ -6239,7 +6330,7 @@ async fn run_shard_or_local(
     let shard = shard.to_owned();
     let command = command.clone();
     let base_sha = base_sha.to_owned();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(lander_env::propagate(move || {
         remote
             .lock()
             .map_err(|_| "remote_missing_evidence: executor lock poisoned".to_string())?
@@ -6251,7 +6342,7 @@ async fn run_shard_or_local(
                 jobs,
                 &command,
             )
-    })
+    }))
     .await
     .map_err(|error| format!("remote_missing_evidence: executor task failed: {error}"))?;
     if let Ok(report) = &result {
@@ -6267,7 +6358,7 @@ const MAX_REMOTE_GATE_PARALLEL: usize = 8;
 /// clamped 1..8, default 4). Each run keeps its fingerprinted `--jobs`, so the
 /// value changes wall time, not the proof (#970).
 fn remote_gate_parallelism() -> usize {
-    parse_remote_gate_parallelism(std::env::var("RSI_REMOTE_GATE_PARALLEL").ok().as_deref())
+    parse_remote_gate_parallelism(lander_env::var("RSI_REMOTE_GATE_PARALLEL").ok().as_deref())
 }
 
 fn parse_remote_gate_parallelism(value: Option<&str>) -> usize {
@@ -6298,10 +6389,12 @@ where
             .await
             .map_err(|error| format!("remote_missing_evidence: scheduler closed: {error}"))?;
         let work = Arc::clone(&work);
-        handles.push(tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            work(item)
-        }));
+        handles.push(tokio::task::spawn_blocking(lander_env::propagate(
+            move || {
+                let _permit = permit;
+                work(item)
+            },
+        )));
     }
     let mut results = Vec::with_capacity(handles.len());
     for handle in handles {
@@ -6354,12 +6447,12 @@ async fn prefetch_remote_shards(
         let remote = Arc::clone(&remote);
         let candidate = candidate.clone();
         let base = base.to_owned();
-        let run = tokio::task::spawn_blocking(move || {
+        let run = tokio::task::spawn_blocking(lander_env::propagate(move || {
             remote
                 .lock()
                 .map_err(|_| "remote_missing_evidence: executor lock poisoned".to_string())?
                 .plan_full_shard(&sha, &candidate, &base, &shard, jobs, &command)
-        })
+        }))
         .await
         .map_err(|error| format!("remote_missing_evidence: executor task failed: {error}"))??;
         runs.push(run);
@@ -6424,7 +6517,7 @@ async fn run_base_guard(
     reported: &GuardCommand,
     gate: &mut TestGate,
     fingerprint_source: &Path,
-) -> Result<BaseTestEvidence, String> {
+) -> Result<(BaseTestEvidence, BTreeMap<String, String>), String> {
     if !gate.base_packages.contains_key(base) {
         let packages = base_workspace_packages(repo, base);
         gate.base_packages.insert(base.to_owned(), packages);
@@ -6434,7 +6527,7 @@ async fn run_base_guard(
         // A crate the candidate adds cannot run on the base, so it has no
         // base failures. The candidate side still runs and must pass.
         gate.base_absent_packages.insert(package.to_owned());
-        return Ok(BaseTestEvidence::Observed(BTreeSet::new()));
+        return Ok((BaseTestEvidence::Observed(BTreeSet::new()), BTreeMap::new()));
     }
     let base_worktree = ensure_base_worktree(repo, base, gate)?;
     if runs_e2e_target(command)
@@ -6450,7 +6543,7 @@ async fn run_base_guard(
         );
         println!("base_test_baseline_unavailable={entry}");
         gate.base_test_baseline_unavailable.insert(entry);
-        return Ok(BaseTestEvidence::CompilationUnavailable);
+        return Ok((BaseTestEvidence::CompilationUnavailable, BTreeMap::new()));
     }
     let report = run_shard_or_local(
         &base_worktree,
@@ -6582,7 +6675,7 @@ fn base_test_evidence(
     command: &GuardCommand,
     gate: &mut TestGate,
     report: &rsid::integration::GuardCommandReport,
-) -> Result<BaseTestEvidence, String> {
+) -> Result<(BaseTestEvidence, BTreeMap<String, String>), String> {
     let absent = base_absent_targets(command, report);
     if !absent.is_empty() {
         for target in absent {
@@ -6591,7 +6684,7 @@ fn base_test_evidence(
             gate.base_absent_log.push(target);
             gate.base_absent_targets.insert(entry);
         }
-        return Ok(BaseTestEvidence::Observed(BTreeSet::new()));
+        return Ok((BaseTestEvidence::Observed(BTreeSet::new()), BTreeMap::new()));
     }
     if baseline_compilation_failed(report) {
         if !base_test_inventory_known(
@@ -6611,9 +6704,10 @@ fn base_test_evidence(
         );
         println!("base_test_baseline_unavailable={entry}");
         gate.base_test_baseline_unavailable.insert(entry);
-        return Ok(BaseTestEvidence::CompilationUnavailable);
+        return Ok((BaseTestEvidence::CompilationUnavailable, BTreeMap::new()));
     }
-    record_base_failures(gate, report).map(BaseTestEvidence::Observed)
+    let (failures, texts) = record_base_failures(gate, report)?;
+    Ok((BaseTestEvidence::Observed(failures), texts))
 }
 
 /// A green status alone (or a zero-test run) does not prove selected tests ran
@@ -6643,15 +6737,17 @@ fn report_proves_tests_ran(report: &rsid::integration::GuardCommandReport) -> bo
 fn record_base_failures(
     gate: &mut TestGate,
     report: &rsid::integration::GuardCommandReport,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<(BTreeSet<String>, BTreeMap<String, String>), String> {
     let failures = base_failures_from_report(report)?;
     let output = format!("{}\n{}", report.stdout_tail, report.stderr_tail);
+    let mut texts = BTreeMap::new();
     for name in &failures {
-        gate.base_red_texts
-            .entry(name.clone())
-            .or_insert_with(|| failure_text_for(&output, name));
+        let text = failure_text_for(&output, name);
+        texts.insert(name.clone(), text.clone());
+        gate.base_red_texts.entry(name.clone()).or_insert(text);
     }
-    Ok(failures)
+    // Cache fills use this report's text, never the first-seen gate annotation.
+    Ok((failures, texts))
 }
 
 /// The reason the rsid shard script's static inventory check refused, when
@@ -6905,7 +7001,8 @@ fn package_test_build_commands(spec: &GuardSpec) -> Vec<GuardCommand> {
 fn prebuild_enabled(gate: &TestGate) -> bool {
     // Unit tests with fake cargo shims count invocations, so they opt in.
     gate.prebuild_forced
-        || (!cfg!(test) && std::env::var("RSI_LANDER_PREBUILD").map_or(true, |value| value != "0"))
+        || (!cfg!(test)
+            && lander_env::var("RSI_LANDER_PREBUILD").map_or(true, |value| value != "0"))
 }
 
 async fn prebuild_stream(
@@ -7030,6 +7127,22 @@ async fn run_affected_gate(
     if reduced.is_none() {
         gate.full_gate_secs = wall_secs;
     }
+    // #3887: a gate that ran no test command for testable changes is a warning the
+    // manager reads in the outcome; a stale re-gate reuses its earlier results.
+    let zero_tests = if reduced.is_none() {
+        gate.zero_test_scope.warning(shards)
+    } else {
+        None
+    };
+    if let Some(warning) = &zero_tests {
+        println!("{warning}");
+    }
+    let stale = format!(
+        "{stale}{}",
+        zero_tests
+            .map(|warning| format!(" {warning}"))
+            .unwrap_or_default()
+    );
     println!(
         "gate_timing=shards={shards} build_mode={} base_hits={} base_runs={} base_skipped={} prebuild_secs={} checks_secs={} release_check_secs={} candidate_secs={} base_secs={} wall_secs={wall_secs} test_threads={} thread_inputs={} check_steps={} {}{stale}",
         gate_build_mode(spec),
@@ -7143,43 +7256,6 @@ async fn run_affected_gate_inner(
         gate.checks_secs += checks_started.elapsed().as_secs();
         gate.record_check_step("python-tests", checks_started.elapsed().as_secs());
         result?;
-        // Hub #3001: a candidate that touches `desktop/` owes the desktop's own
-        // tests. The lane is strict (no base triage: a red desktop test or a
-        // missing runner refuses publication, never reads as green).
-        let desktop_checks = spec
-            .commands
-            .iter()
-            .filter(|command| is_desktop_test_guard(command))
-            .collect::<Vec<_>>();
-        let desktop_started = Instant::now();
-        if !desktop_checks.is_empty() {
-            gate.announce_desktop_target();
-        }
-        let ran_desktop = !desktop_checks.is_empty();
-        let result = async {
-            for command in desktop_checks {
-                let report = run_one_guard(candidate_worktree, spec, command).await?;
-                println!("{}", test_outcome_line("candidate", "desktop", Ok(&report)));
-                if report.status != rsid::integration::GuardStatus::Passed {
-                    return Err(format!(
-                        "desktop lane failed ({:?}) running {} {:?}: {} {}",
-                        report.status,
-                        report.program,
-                        report.args,
-                        report.stdout_tail,
-                        report.stderr_tail
-                    ));
-                }
-            }
-            Ok::<(), String>(())
-        }
-        .await;
-        if ran_desktop {
-            gate.trim_desktop_target(candidate_worktree);
-        }
-        gate.checks_secs += desktop_started.elapsed().as_secs();
-        gate.record_check_step("desktop-tests", desktop_started.elapsed().as_secs());
-        result?;
         prefetch_remote_shards(candidate_worktree, base, spec, gate).await?;
     }
     // #1244: the compile checks build into their own target (a different
@@ -7194,7 +7270,6 @@ async fn run_affected_gate_inner(
                     !is_static_guard(command)
                         && !is_test_guard(command)
                         && !is_python_test_guard(command)
-                        && !is_desktop_test_guard(command)
                 })
                 .collect()
         } else {
@@ -7233,13 +7308,27 @@ async fn run_affected_gate_inner(
     }
     // #1261/#1262: a focused filter that selects no test is refused once the
     // shared build exists and before any test runs, never as a test failure.
+    let mut resolved_spec = spec.clone();
     if let Some(command) = spec
         .commands
         .iter()
         .find(|command| rsid_lib_filterset(command).is_some())
     {
-        refuse_focused_filters_selecting_nothing(candidate_worktree, spec, command, gate).await?;
+        let (replacements, omit_shared) =
+            refuse_focused_filters_selecting_nothing(candidate_worktree, spec, command, gate)
+                .await?;
+        if omit_shared {
+            resolved_spec
+                .commands
+                .retain(|command| rsid_lib_filterset(command).is_none());
+        }
+        for command in replacements {
+            if !resolved_spec.commands.contains(&command) {
+                resolved_spec.commands.push(command);
+            }
+        }
     }
+    let spec = &resolved_spec;
     refuse_lib_filters_selecting_nothing(candidate_worktree, spec, gate).await?;
     // A compile-repair gate requires every selected candidate run to pass,
     // including runs whose individual baselines were runnable. Remember an
@@ -7248,12 +7337,12 @@ async fn run_affected_gate_inner(
     let mut compilation_unavailable = false;
     let mut repair_candidate_refusal = None;
     // Green, proven candidate runs whose base was not consulted (#1244).
-    let mut base_skipped: Vec<(&GuardCommand, GuardSpec, (String, String))> = Vec::new();
-    for command in spec.commands.iter().filter(|command| {
-        !is_static_guard(command)
-            && !is_python_test_guard(command)
-            && !is_desktop_test_guard(command)
-    }) {
+    let mut base_skipped: Vec<(&GuardCommand, GuardSpec)> = Vec::new();
+    for command in spec
+        .commands
+        .iter()
+        .filter(|command| !is_static_guard(command) && !is_python_test_guard(command))
+    {
         let mut scratch_spec = spec.clone();
         if let Some(scratch) = &gate.scratch {
             let scratch_path = command_scratch_path(
@@ -7281,17 +7370,64 @@ async fn run_affected_gate_inner(
             continue;
         }
         let key = (base.to_owned(), base_cache_command_key(command));
-        // #1244: the candidate runs first. The base is only consulted for a
-        // candidate that failed or did not prove a positive run: a green
-        // candidate has no failure the base could excuse, so building and
-        // running the base side would change nothing but the wall time.
+        // Hub #3483: a complete listing, rather than the timeout's partial
+        // output or a substring filter, is the authority for this exemption.
+        // Only an e2e target needs it before the candidate runs (to cap its
+        // timeout). Every other guard lists after a timeout, so a candidate
+        // that finishes pays no extra cargo invocation.
+        let mut selected = if runs_e2e_target(command) {
+            list_selected_tests(candidate_worktree, &scratch_spec, command, gate).await
+        } else {
+            None
+        };
+        let mut early_base = None;
+        let baseline_unavailable_before = gate.base_test_baseline_unavailable.clone();
+        if runs_e2e_target(command)
+            && known_red_timeout::all_known(selected.as_ref(), gate.known_failures.as_ref())
+        {
+            // Establish the base proof before shortening an e2e run. A live
+            // signature by itself never excuses a candidate timeout.
+            let started = Instant::now();
+            early_base = Some(
+                base_evidence_for(
+                    repo,
+                    candidate_worktree,
+                    base,
+                    &scratch_spec,
+                    command,
+                    gate,
+                    disk_scratch_shards,
+                    &key,
+                    selected.as_ref(),
+                )
+                .await,
+            );
+            gate.base_secs += started.elapsed().as_secs();
+        }
+        let timeout_reds = known_red_timeout::proven_reds(
+            selected.as_ref(),
+            early_base.as_ref().and_then(|result| result.as_ref().ok()),
+            gate.known_failures.as_ref(),
+            &gate.base_red_texts,
+            &gate.claimed_fixes,
+        );
+        let candidate_command =
+            known_red_timeout::candidate_command(command, timeout_reds.is_some());
+        if runs_e2e_target(command) && timeout_reds.is_some() {
+            println!(
+                "known_red_e2e_timeout_secs={}",
+                candidate_command.timeout.as_secs()
+            );
+        }
+        // #1244: ordinarily the candidate runs first; only an all-known-red
+        // e2e inventory establishes its base proof early (hub #3483).
         let candidate_started = Instant::now();
         let report = run_shard_or_local(
             candidate_worktree,
             candidate_worktree,
             base,
             &scratch_spec,
-            command,
+            &candidate_command,
             gate,
         )
         .await?;
@@ -7303,7 +7439,50 @@ async fn run_affected_gate_inner(
             "{}",
             test_outcome_line("candidate", &shard_name, Ok(&report))
         );
-        let candidate_failures = observed_test_failures(&report);
+        // Non-e2e guards have no timeout cap to establish in advance. Consult
+        // their base only if the candidate actually needs timeout attribution.
+        if report.status == rsid::integration::GuardStatus::TimedOut && !runs_e2e_target(command) {
+            selected = list_selected_tests(candidate_worktree, &scratch_spec, command, gate).await;
+        }
+        if report.status == rsid::integration::GuardStatus::TimedOut
+            && early_base.is_none()
+            && known_red_timeout::all_known(selected.as_ref(), gate.known_failures.as_ref())
+        {
+            let started = Instant::now();
+            early_base = Some(
+                base_evidence_for(
+                    repo,
+                    candidate_worktree,
+                    base,
+                    &scratch_spec,
+                    command,
+                    gate,
+                    disk_scratch_shards,
+                    &key,
+                    selected.as_ref(),
+                )
+                .await,
+            );
+            gate.base_secs += started.elapsed().as_secs();
+        }
+        let timeout_reds = known_red_timeout::proven_reds(
+            selected.as_ref(),
+            early_base.as_ref().and_then(|result| result.as_ref().ok()),
+            gate.known_failures.as_ref(),
+            &gate.base_red_texts,
+            &gate.claimed_fixes,
+        );
+        let candidate_failures = if report.status == rsid::integration::GuardStatus::TimedOut
+            && let Some(reds) = timeout_reds
+        {
+            println!(
+                "known_red_timeout names={}",
+                reds.iter().cloned().collect::<Vec<_>>().join(",")
+            );
+            Ok(reds)
+        } else {
+            observed_test_failures(&report)
+        };
         // Name the failures now, before the base side starts: the base run can
         // take as long as the candidate's and the log should not wait for it.
         match &candidate_failures {
@@ -7333,6 +7512,14 @@ async fn run_affected_gate_inner(
                     .cloned()
                     .collect();
                 if !still_red.is_empty() {
+                    println!(
+                        "{}",
+                        rsid::rolling_queue::gate_failure_excerpt_line(
+                            &still_red.join(", "),
+                            &report.stdout_tail,
+                            &report.stderr_tail,
+                        )
+                    );
                     return Err(claimed_fix_still_red_message(
                         &still_red,
                         &format!("the claimed fix still fails on the candidate ({shard_name})"),
@@ -7344,23 +7531,30 @@ async fn run_affected_gate_inner(
             && matches!(&candidate_failures, Ok(failures) if failures.is_empty())
             && report_proves_tests_ran(&report)
         {
+            // An optional early probe cannot make a positively green
+            // candidate's receipt unusable: its verdict never used the base.
+            gate.base_test_baseline_unavailable = baseline_unavailable_before;
             gate.base_skipped += 1;
-            base_skipped.push((command, scratch_spec, key));
+            base_skipped.push((command, scratch_spec));
             continue;
         }
         let base_started = Instant::now();
-        let base_evidence = base_evidence_for(
-            repo,
-            candidate_worktree,
-            base,
-            &scratch_spec,
-            command,
-            gate,
-            disk_scratch_shards,
-            &key,
-            candidate_failures.as_ref().ok(),
-        )
-        .await?;
+        let base_evidence = if let Some(evidence) = early_base {
+            evidence?
+        } else {
+            base_evidence_for(
+                repo,
+                candidate_worktree,
+                base,
+                &scratch_spec,
+                command,
+                gate,
+                disk_scratch_shards,
+                &key,
+                candidate_failures.as_ref().ok(),
+            )
+            .await?
+        };
         gate.base_secs += base_started.elapsed().as_secs();
         if let BaseTestEvidence::Observed(failures) = &base_evidence {
             gate.base_reds.extend(failures.iter().cloned());
@@ -7460,8 +7654,14 @@ async fn run_affected_gate_inner(
             let persistent: BTreeSet<_> =
                 retry_failures.difference(&base_failures).cloned().collect();
             if !persistent.is_empty() {
+                let excerpt = rsid::rolling_queue::gate_failure_excerpt_line(
+                    name,
+                    &retry.stdout_tail,
+                    &retry.stderr_tail,
+                );
                 if let Some(provenance) = gate.qa_cache_provenance.get(&key).cloned() {
                     if persistent.len() != 1 || !persistent.contains(name) {
+                        println!("{excerpt}");
                         return Err(format!(
                             "QA cached base {provenance} has unexpected isolated failures: {persistent:?}"
                         ));
@@ -7476,6 +7676,7 @@ async fn run_affected_gate_inner(
                             continue;
                         }
                         Ok(false) => {
+                            println!("{excerpt}");
                             return Err(new_failures_message(
                                 base,
                                 std::slice::from_ref(name),
@@ -7485,12 +7686,14 @@ async fn run_affected_gate_inner(
                             ));
                         }
                         Err(error) => {
+                            println!("{excerpt}");
                             return Err(format!(
                                 "QA cached base {provenance}; local base confirmation failed closed for {name}: {error}"
                             ));
                         }
                     }
                 }
+                println!("{excerpt}");
                 let retry_output = format!("{}\n{}", retry.stdout_tail, retry.stderr_tail);
                 let failing = persistent
                     .iter()
@@ -7526,22 +7729,31 @@ async fn run_affected_gate_inner(
     }
     // A compile repair (#1210) still needs every selected run green: when a
     // candidate run was red or unproven, a skipped green run's base must not
-    // be one that cannot compile. Only a red gate pays these base runs.
+    // be one that cannot compile. Probe compilation only: rerunning these
+    // green commands on base can double a wide gate for an unrelated red or
+    // zero-test target (#3839), and their test results change no comparison.
     if let Some(error) = repair_candidate_refusal
         && !compilation_unavailable
     {
-        for (command, scratch_spec, key) in &base_skipped {
+        for (command, scratch_spec) in &base_skipped {
+            let build = base_compile_probe(
+                command,
+                ShardTree::Revision {
+                    repo,
+                    revision: base,
+                },
+            )
+            .ok_or("base_compile_probe_unavailable: unrecognised test guard")?;
             let base_started = Instant::now();
-            let evidence = base_evidence_for(
+            println!("base_compile_probe={} {:?}", build.program, build.args);
+            let (evidence, _) = run_base_guard(
                 repo,
-                candidate_worktree,
                 base,
                 scratch_spec,
+                &build,
                 command,
                 gate,
-                disk_scratch_shards,
-                key,
-                None,
+                candidate_worktree,
             )
             .await?;
             gate.base_secs += base_started.elapsed().as_secs();
@@ -7560,7 +7772,7 @@ async fn run_affected_gate_inner(
     if !unproven.is_empty() {
         return Err(claimed_fix_still_red_message(
             &unproven,
-            "no candidate run of the gate ran it green (its selection did not select it); add a test filter that selects it",
+            &unproven_claim_next_step(&unproven),
         ));
     }
     if !gate.claimed_fixes.is_empty() {
@@ -7574,6 +7786,24 @@ async fn run_affected_gate_inner(
         );
     }
     Ok(())
+}
+
+/// Check whether a green candidate's test target compiles on base without
+/// running its tests. Keep target/features and discard libtest-only arguments.
+/// These probes establish compile-repair policy, never cached test outcomes.
+fn base_compile_probe(command: &GuardCommand, tree: ShardTree<'_>) -> Option<GuardCommand> {
+    let mut build = if shard_command_parts(command).is_some() {
+        direct_base_shard_command(command, tree)?
+    } else if cargo_test_package(command).is_some() || rsid_lib_filterset(command).is_some() {
+        command.clone()
+    } else {
+        return None;
+    };
+    if let Some(separator) = build.args.iter().position(|arg| arg == "--") {
+        build.args.truncate(separator);
+    }
+    build.args.push("--no-run".into());
+    Some(build)
 }
 
 /// Wall seconds of the compile checks (#2424): the release-build seconds
@@ -7882,9 +8112,14 @@ async fn run_narrowed_base(
     let mut unknown = BTreeSet::new();
     for name in failures {
         match known.get(name) {
-            Some(red) => {
-                if *red {
+            Some(outcome) => {
+                if outcome.red {
                     reds.insert(name.clone());
+                    if let Some(text) = &outcome.failure_text {
+                        gate.base_red_texts
+                            .entry(name.clone())
+                            .or_insert_with(|| text.clone());
+                    }
                 }
                 gate.base_reused.insert(format!("{base}:{name}:per-test"));
             }
@@ -7917,7 +8152,7 @@ async fn run_narrowed_base(
         }
     };
     gate.base_runs += 1;
-    let evidence = run_base_guard(
+    let (evidence, failure_texts) = run_base_guard(
         repo,
         base,
         scratch_spec,
@@ -7933,7 +8168,9 @@ async fn run_narrowed_base(
     if let Some(root) = cache_root.as_deref() {
         let green: BTreeSet<String> = ran.difference(&observed).cloned().collect();
         let red: BTreeSet<String> = observed.intersection(ran).cloned().collect();
-        if let Err(error) = base_cache::record_test_outcomes(root, base, class, &red, &green) {
+        if let Err(error) =
+            base_cache::record_test_outcomes(root, base, class, &red, &green, &failure_texts)
+        {
             // The cache only saves time; a failed write never fails a gate.
             println!("base_per_test_cache_unrecorded detail={error}");
         }
@@ -8030,6 +8267,11 @@ async fn base_evidence_for(
                         .insert(key.clone(), entry.provenance.clone());
                 }
                 note_cached_absent_targets(gate, base, &entry.absent_targets, &entry.provenance);
+                for (name, text) in entry.failure_texts {
+                    if entry.failures.contains(&name) {
+                        gate.base_red_texts.entry(name).or_insert(text);
+                    }
+                }
                 absent = entry.absent_targets;
                 BaseTestEvidence::Observed(entry.failures)
             } else {
@@ -8051,7 +8293,7 @@ async fn base_evidence_for(
                     .await;
                 }
                 gate.base_runs += 1;
-                let failures = run_base_guard(
+                let (failures, failure_texts) = run_base_guard(
                     repo,
                     base,
                     scratch_spec,
@@ -8074,7 +8316,8 @@ async fn base_evidence_for(
                             observed.clone(),
                             "lander",
                         )
-                        .with_absent_targets(absent.clone()),
+                        .with_absent_targets(absent.clone())
+                        .with_failure_texts(&failure_texts),
                     )?;
                 }
                 failures
@@ -8104,6 +8347,7 @@ async fn base_evidence_for(
                 candidate_worktree,
             )
             .await?
+            .0
         };
         if narrowed.is_none()
             && let BaseTestEvidence::Observed(observed) = &failures
@@ -8223,7 +8467,10 @@ fn affected_crate_guard_spec(
             for filter in package_filters {
                 let focused = if is_rsid_shard_package(package) {
                     rsid_family_filter_command(package, filter)?
-                } else if filter.starts_with("bin:") || filter.starts_with("test:") {
+                } else if filter.starts_with("bin:")
+                    || filter.starts_with("test:")
+                    || filter.starts_with("test(=")
+                {
                     if is_e2e_filter(filter) {
                         // #1596: build the rsid the harness spawns before the
                         // gated tests run; RSI_E2E=1 is set in the spec env.
@@ -8567,7 +8814,17 @@ fn cargo_guard_command(package: &str, filter: Option<&str>) -> GuardCommand {
         None => {
             args.push("--lib".into());
             if let Some(filter) = filter {
-                args.push(filter.into());
+                if let Some(exact) = filter
+                    .strip_prefix("test(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .filter(|s| s.starts_with('='))
+                {
+                    // Public-item consumers name exact library tests (#3408).
+                    // Keep these separate from the plain substring batch.
+                    atom = Some(exact);
+                } else {
+                    args.push(filter.into());
+                }
             }
         }
     }
@@ -8954,7 +9211,7 @@ fn slow_tier_for_gate(worktree: &Path, base: &str, candidate: &str) -> (SlowTier
         };
     }
     let script = worktree.join("scripts/check-touched-shards");
-    let output = Command::new("python3")
+    let output = lander_env::command("python3")
         // `-B`: never write bytecode into the candidate worktree.
         .arg("-B")
         .arg(&script)
@@ -9447,8 +9704,8 @@ fn combined_focused_atoms<'a>(filtersets: impl IntoIterator<Item = &'a str>) -> 
 struct FocusedFilter {
     label: String,
     filterset: String,
-    /// An explicitly requested filter is refused when it selects no test; a
-    /// touched-module atom only refuses when the whole run selects none.
+    /// Caller-named filters stay strict. Queue-derived shard filters may
+    /// widen to the full shard when their focused listing is empty.
     explicit: bool,
 }
 
@@ -9603,7 +9860,7 @@ fn focused_filters_selecting_nothing(
     }
     filters
         .iter()
-        .filter(|filter| filter.explicit)
+        .filter(|filter| filter.explicit || focused_filter_shard(filter).is_some())
         .filter(|filter| {
             FocusedMatch::parse(&filter.filterset)
                 .is_some_and(|matcher| !selected.iter().any(|name| matcher.matches(name)))
@@ -9612,8 +9869,16 @@ fn focused_filters_selecting_nothing(
         .collect()
 }
 
-/// #1262: after the shared prebuild and before any test runs, list what the
-/// combined focused run selects and refuse every filter that selects nothing.
+fn focused_filter_shard(filter: &FocusedFilter) -> Option<GuardCommand> {
+    let (package, value) = filter.label.split_once('=')?;
+    if !is_rsid_shard_package(package) {
+        return None;
+    }
+    rsid_shard_guard_command(value.strip_prefix("shard:")?).ok()
+}
+
+/// List the shared focused run before testing. Widen a proven derived-empty
+/// shard filter to its whole shard; handwritten empty filters stay refused.
 /// The cheap source pre-check (#1243) misses names that exist only as a file
 /// mounted elsewhere; the listing is the authority. A listing that cannot be
 /// read (a failed build reports itself in the run) refuses nothing.
@@ -9622,9 +9887,9 @@ async fn refuse_focused_filters_selecting_nothing(
     spec: &GuardSpec,
     command: &GuardCommand,
     gate: &TestGate,
-) -> Result<(), String> {
+) -> Result<(Vec<GuardCommand>, bool), String> {
     let Some(filterset) = rsid_lib_filterset(command) else {
-        return Ok(());
+        return Ok((Vec::new(), false));
     };
     let mut list_spec = spec.clone();
     if let Some(scratch) = &gate.scratch {
@@ -9642,7 +9907,7 @@ async fn refuse_focused_filters_selecting_nothing(
             report.status,
             filters.len()
         );
-        return Ok(());
+        return Ok((Vec::new(), false));
     };
     println!(
         "focused_list=selected={} filters={} atoms={} list_secs={}",
@@ -9664,10 +9929,29 @@ async fn refuse_focused_filters_selecting_nothing(
     if !unlisted.is_empty() {
         println!("focused_unlisted={}", unlisted.join(" "));
     }
-    let empty = focused_filters_selecting_nothing(&filters, &selected);
-    if empty.is_empty() {
-        return Ok(());
+    let mut empty = focused_filters_selecting_nothing(&filters, &selected);
+    let mut replacements = Vec::new();
+    let mut refused = Vec::new();
+    for label in empty.drain(..) {
+        let filter = filters.iter().find(|filter| filter.label == label).unwrap();
+        let Some(mut shard) = focused_filter_shard(filter) else {
+            refused.push(label);
+            continue;
+        };
+        if filter.explicit {
+            refused.push(label);
+            continue;
+        }
+        shard.args.truncate(4);
+        println!("focused_fallback=unfocused_shard filter={label}");
+        if !replacements.contains(&shard) {
+            replacements.push(shard);
+        }
     }
+    if refused.is_empty() {
+        return Ok((replacements, selected.is_empty()));
+    }
+    let empty = refused;
     let hint = rsid::rolling_queue::no_test_filter_hint(worktree, "HEAD", &empty);
     Err(format!(
         "test filter selects no test at the candidate, refused after the build and before any test ran: {}{hint}",
@@ -10366,7 +10650,7 @@ async fn remote_tip_once(repo: &Path, remote: &str) -> Result<Option<String>, St
 }
 
 fn remote_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
-    let mut command = TokioCommand::new("git");
+    let mut command = lander_env::tokio_command("git");
     command
         .current_dir(repo)
         .args([
@@ -10381,7 +10665,7 @@ fn remote_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
             "fetch.writeCommitGraph=false",
         ])
         .args(args);
-    for (key, _) in std::env::vars_os() {
+    for (key, _) in lander_env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") || key == "RSI_ROLLING_LANDER" {
             command.env_remove(key);
         }
@@ -10516,7 +10800,19 @@ fn git_is_ancestor(repo: &Path, older: &str, newer: &str) -> Result<bool, String
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git")
+    git_output_with_env(repo, args, &[])
+}
+
+/// [`git_output`] with `envs` set on the child only (never the process
+/// environment). Used where a commit must carry a fixed identity: the
+/// `GIT_AUTHOR_*`/`GIT_COMMITTER_*` variables an operator, a sweep or a CI host
+/// exports win over `-c user.name`/`-c user.email`.
+fn git_output_with_env(
+    repo: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> Result<Output, String> {
+    lander_env::command("git")
         .args([
             "--no-optional-locks",
             "-c",
@@ -10534,6 +10830,7 @@ fn git_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
         .arg(repo)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(envs.iter().copied())
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -10568,7 +10865,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Stdio;
+    use std::process::{Command, Stdio};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -11156,12 +11453,6 @@ fi"#,
             )
             .expect("executable shard script");
             fs::create_dir_all(repo.join("tools")).expect("tools dir");
-            fs::copy(
-                PathBuf::from(rsi_common::manifest_dir!())
-                    .join("../../tools/check-released-migrations.py"),
-                repo.join("tools/check-released-migrations.py"),
-            )
-            .expect("copy released guard");
             write(
                 &repo,
                 "tools/released-migrations.json",
@@ -11450,30 +11741,6 @@ exit 0
         assert_eq!(git_value(repo, &["status", "--porcelain=v1"]), "");
     }
 
-    struct ScopedCargoTarget(Option<std::ffi::OsString>);
-
-    impl ScopedCargoTarget {
-        fn set(path: &Path) -> Self {
-            let old = std::env::var_os("CARGO_TARGET_DIR");
-            // Fixture tests serialize environment changes through ENV_LOCK.
-            unsafe { std::env::set_var("CARGO_TARGET_DIR", path) };
-            Self(old)
-        }
-    }
-
-    impl Drop for ScopedCargoTarget {
-        fn drop(&mut self) {
-            // Restore before releasing Fixture's ENV_LOCK.
-            unsafe {
-                if let Some(old) = &self.0 {
-                    std::env::set_var("CARGO_TARGET_DIR", old);
-                } else {
-                    std::env::remove_var("CARGO_TARGET_DIR");
-                }
-            }
-        }
-    }
-
     /// The base-cache key `run_affected_gate` derives for a full shard
     /// command with no gate scratch, so tests seed entries at that exact key.
     fn spec_shard_cache_key(spec: &GuardSpec, fingerprint: &str) -> String {
@@ -11488,27 +11755,36 @@ exit 0
         .expect("spec env yields a cache key")
     }
 
-    fn use_fake_path(fixture: &Fixture) -> Option<std::ffi::OsString> {
-        let old = std::env::var_os("PATH");
-        let path = format!(
-            "{}:{}",
-            fixture.bin.display(),
-            old.as_deref().unwrap_or_default().to_string_lossy()
-        );
-        // Tests serialize all PATH changes through ENV_LOCK.
-        unsafe { std::env::set_var("PATH", path) };
-        old
+    /// Put the fixture's fake-bin directory first on the lander's `PATH` for
+    /// the current thread (#192): the lander's children resolve their
+    /// programs there, and the process `PATH` is left alone.
+    fn use_fake_path(fixture: &Fixture) -> lander_env::Scope {
+        with_lander_vars([("PATH", fake_path(fixture))])
     }
 
-    fn restore_path(old: Option<std::ffi::OsString>) {
-        // Tests serialize all PATH changes through ENV_LOCK.
-        unsafe {
-            if let Some(old) = old {
-                std::env::set_var("PATH", old);
-            } else {
-                std::env::remove_var("PATH");
-            }
-        }
+    fn fake_path(fixture: &Fixture) -> std::ffi::OsString {
+        let mut dirs = vec![fixture.bin.clone()];
+        dirs.extend(std::env::split_paths(
+            &lander_env::var_os("PATH").unwrap_or_default(),
+        ));
+        std::env::join_paths(dirs).expect("fixture PATH")
+    }
+
+    fn restore_path(scope: lander_env::Scope) {
+        drop(scope);
+    }
+
+    /// The current lander environment with `vars` set, installed for the
+    /// current thread until the scope drops (#192).
+    fn with_lander_vars<'a, V: AsRef<std::ffi::OsStr>>(
+        vars: impl IntoIterator<Item = (&'a str, V)>,
+    ) -> lander_env::Scope {
+        vars.into_iter()
+            .fold(
+                lander_env::current().as_ref().clone(),
+                |env, (name, value)| env.with_var(name, value.as_ref()),
+            )
+            .enter()
     }
 
     /// Commit an executable file (the fake shard script) on top of `parent`.
@@ -11790,6 +12066,415 @@ exit 0
             vec!["known_red=demo::red:#77:regression".to_string()]
         );
         assert!(known_red_lines(&gate.base_reds, &gate.base_red_texts, None).is_empty());
+    }
+
+    /// Hub #3483's one-test e2e guard: an actual whole-command timeout is
+    /// accepted only with complete selection and known, observed base reds.
+    #[tokio::test]
+    async fn known_red_guard_timeout_gate_fails_closed() {
+        const RED: &str = "fresh_install::test_e2e_fresh_install_appoint_project_manager";
+        for case in [
+            "known",
+            "mixed",
+            "unknown",
+            "base_green",
+            "claimed",
+            "candidate_green",
+            "green_prebuild_unavailable",
+            "non_e2e",
+            "non_e2e_green",
+            "cached_text",
+            "cached_old",
+            "cached_mismatch",
+        ] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn value() -> &'static str { \"candidate\" }\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("timeout-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let listing = match case {
+                "mixed" => {
+                    format!("{RED}: test\nfresh_install::green: test\n\n2 tests, 0 benchmarks")
+                }
+                "unknown" => "unavailable inventory".into(),
+                _ => format!("{RED}: test\n\n1 test, 0 benchmarks"),
+            };
+            let e2e = !case.starts_with("non_e2e");
+            let target = if e2e { "e2e_tui" } else { "ordinary" };
+            fixture.add_fake_cargo(&format!(
+                "if [ '{case}' = green_prebuild_unavailable ] && [ \"$1\" = build ] && [ \"$(/usr/bin/git rev-parse HEAD)\" = '{base}' ]; then echo 'error: linker failed' >&2; exit 1; fi\ncase \" $* \" in\n*' --list '*) printf '%s\\n' '{listing}'; exit 0;;\nesac\n\
+                 case \" $* \" in *' --test {target} '*)\n\
+                 oid=$(/usr/bin/git rev-parse HEAD)\n\
+                 if [ \"$oid\" = '{base}' ]; then\n\
+                   if [ '{case}' = candidate_green ]; then echo 'base infrastructure unavailable'; exit 1; fi\n\
+                   if [ '{case}' = base_green ]; then echo 'running 1 test'; echo 'test {RED} ... ok'; exit 0; fi\n\
+                   echo 'test {RED} ... FAILED'; echo 'fixture base failure'; exit 1\n\
+                 fi\n\
+                 if [ '{case}' = candidate_green ] || [ '{case}' = green_prebuild_unavailable ] || [ '{case}' = non_e2e_green ]; then echo 'running 1 test'; echo 'test {RED} ... ok'; exit 0; fi\n\
+                 echo 'running 1 test'; sleep 2;;\nesac",
+                base = fixture.base,
+            ));
+            let mut command = cargo_guard_command(
+                "demo",
+                Some(&format!("test:{target}:test(fresh_install::)")),
+            );
+            command.timeout = Duration::from_secs(1);
+            let spec = GuardSpec {
+                commands: vec![command.clone()],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16384,
+            };
+            let cache_root = fixture.root.path().join("timeout-cache");
+            let mut gate = TestGate::default();
+            if case == "known" || case.starts_with("cached_") {
+                gate.cache_root = Some(cache_root.clone());
+            }
+            gate.known_failures = Some(
+                serde_json::from_value(serde_json::json!({
+                    "schema_version": 1, "exported_at": "2026-10-21T00:00:00Z",
+                    "records": [{"record": {"test_id": RED,
+                        "matcher": {"contains": ["fixture base failure"]},
+                        "issue": 3431, "class": "env"}, "issue_status": "Open"}]
+                }))
+                .unwrap(),
+            );
+            if case == "claimed" {
+                gate.claimed_fixes.insert(RED.into());
+            }
+            let old_path = use_fake_path(&fixture);
+            if case.starts_with("cached_") {
+                let identity = base_cache_identity(
+                    &tree,
+                    &fixture.base,
+                    &command,
+                    &shard_env_class(&spec.env, "disk"),
+                )
+                .unwrap()
+                .unwrap();
+                let slot = base_cache::BaseShardSlot::acquire(
+                    &cache_root,
+                    &fixture.base,
+                    &identity.slot_label,
+                    &identity.slot_key,
+                )
+                .await
+                .unwrap();
+                let mut entry = base_cache::BaseShardEntry::new(
+                    &fixture.base,
+                    &identity.slot_label,
+                    &identity.slot_key,
+                    BTreeSet::from([RED.into()]),
+                    "fixture",
+                );
+                if case != "cached_old" {
+                    entry.failure_texts.insert(
+                        RED.into(),
+                        if case == "cached_mismatch" {
+                            "different failure".into()
+                        } else {
+                            "fixture base failure".into()
+                        },
+                    );
+                }
+                slot.write(&entry).unwrap();
+                // Empty evidence is omitted from JSON, exercising the old
+                // wire format and the serde default when the gate reads it.
+                assert_eq!(slot.read().unwrap(), Some(entry));
+            }
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            if matches!(case, "known" | "cached_text" | "non_e2e") {
+                result.expect("a timeout selecting only a known base red continues");
+                assert!(gate.base_reds.contains(RED));
+                assert_eq!(
+                    known_red_lines(
+                        &gate.base_reds,
+                        &gate.base_red_texts,
+                        gate.known_failures.as_ref()
+                    ),
+                    [format!("known_red={RED}:#3431:env")]
+                );
+                if case == "known" {
+                    // A fresh gate must restore the persisted text, and a
+                    // later run in that same gate must retain it in-process.
+                    let mut cached = TestGate {
+                        cache_root: Some(cache_root.clone()),
+                        known_failures: gate.known_failures.clone(),
+                        ..TestGate::default()
+                    };
+                    for _ in 0..2 {
+                        run_affected_gate(
+                            &fixture.repo,
+                            &tree,
+                            &fixture.base,
+                            &spec,
+                            &mut cached,
+                            &BTreeSet::new(),
+                        )
+                        .await
+                        .expect("cached signature evidence excuses the timeout");
+                        assert_eq!(cached.base_runs, 0);
+                        assert!(cached.base_red_texts[RED].contains("fixture base failure"));
+                    }
+                }
+            } else if matches!(
+                case,
+                "candidate_green" | "green_prebuild_unavailable" | "non_e2e_green"
+            ) {
+                result.expect("a green candidate needs no base exemption");
+                assert!(gate.green_is_reusable());
+                if case == "non_e2e_green" {
+                    assert_eq!(gate.base_runs, 0);
+                }
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("affected-crate guard failed (TimedOut)"),
+                    "{case}"
+                );
+            }
+            if case.starts_with("cached_") {
+                assert_eq!(gate.base_runs, 0, "{case} must use the prefilled slot");
+                assert!(!gate.base_reused.is_empty());
+            }
+            restore_path(old_path);
+        }
+    }
+
+    /// A non-e2e timeout can use a narrowed cache hit only when that outcome
+    /// carries the actual base signature; legacy names alone still refuse.
+    #[tokio::test]
+    async fn narrowed_cached_signature_excuses_only_known_red_timeouts() {
+        const RED: &str = "demo::shared_red";
+        for case in ["captured", "old", "mismatch"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn candidate() {}\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("narrow-timeout-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let listing = serde_json::json!({"rust-suites": {"demo": {"testcases": {
+                (RED): {"filter-match": {"status": "matches"}, "ignored": false}
+            }}}});
+            fixture.add_fake_cargo(&format!(
+                "case \" $* \" in *' --no-run '*) exit 0;; esac\n\
+                 if [ \"$1\" = nextest ] && [ \"$2\" = list ]; then printf '%s\\n' '{listing}'; exit 0; fi\n\
+                 if [ \"$1\" = nextest ]; then\n\
+                   if [ \"$(/usr/bin/git rev-parse HEAD)\" = '{base}' ]; then\n\
+                     echo '        FAIL [   0.010s] (1/1) rsid {RED}'; echo 'fixture base failure'; exit 100;\n\
+                   fi\n\
+                   echo 'running 1 test'; sleep 2;\n\
+                 fi",
+                base = fixture.base,
+            ));
+            let mut command = rsid_lib_filter_command("all()");
+            command.timeout = Duration::from_secs(1);
+            let spec = GuardSpec {
+                commands: vec![command.clone()],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16384,
+            };
+            let cache_root = fixture.root.path().join("narrow-timeout-cache");
+            let selected = BTreeSet::from([RED.to_owned()]);
+            let class = per_test_outcome_class(&command, &shard_env_class(&spec.env, "disk"));
+            let old_path = use_fake_path(&fixture);
+            if case == "captured" {
+                let mut fill = TestGate {
+                    cache_root: Some(cache_root.clone()),
+                    ..TestGate::default()
+                };
+                fill.base_red_texts
+                    .insert(RED.into(), "earlier command's annotation".into());
+                let key = (fixture.base.clone(), base_cache_command_key(&command));
+                let evidence = base_evidence_for(
+                    &fixture.repo,
+                    &tree,
+                    &fixture.base,
+                    &spec,
+                    &command,
+                    &mut fill,
+                    &BTreeSet::new(),
+                    &key,
+                    Some(&selected),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(evidence, BaseTestEvidence::Observed(names) if names == selected));
+                assert_eq!(fill.base_runs, 1);
+                assert!(
+                    base_cache::load_test_outcomes(&cache_root, &fixture.base, &class)[RED]
+                        .failure_text
+                        .as_ref()
+                        .unwrap()
+                        .contains("fixture base failure")
+                );
+            } else {
+                let texts = if case == "old" {
+                    BTreeMap::new()
+                } else {
+                    BTreeMap::from([(RED.into(), "different failure".into())])
+                };
+                // Empty text is omitted on disk, exactly the legacy format.
+                base_cache::record_test_outcomes(
+                    &cache_root,
+                    &fixture.base,
+                    &class,
+                    &selected,
+                    &BTreeSet::new(),
+                    &texts,
+                )
+                .unwrap();
+            }
+            let mut gate = TestGate {
+                cache_root: Some(cache_root),
+                known_failures: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "schema_version": 1, "exported_at": "2026-10-21T00:00:00Z",
+                        "records": [{"record": {"test_id": RED,
+                            "matcher": {"contains": ["fixture base failure"]},
+                            "issue": 3431, "class": "env"}, "issue_status": "Open"}]
+                    }))
+                    .unwrap(),
+                ),
+                ..TestGate::default()
+            };
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            assert_eq!(gate.base_runs, 0, "{case}: only the per-test cache answers");
+            assert_eq!(
+                gate.base_reused,
+                BTreeSet::from([format!("{}:{RED}:per-test", fixture.base)])
+            );
+            if case == "captured" {
+                result.expect("cached base signature excuses the all-known selection's timeout");
+                assert_eq!(gate.base_reds, selected);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("affected-crate guard failed (TimedOut)"),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// Shared test names cannot copy a gate's first-seen text into another
+    /// command's or another base's persistent full-result slot.
+    #[tokio::test]
+    async fn base_slots_persist_each_commands_own_failure_text() {
+        const RED: &str = "demo::shared_red";
+        let fixture = Fixture::new();
+        let other_base = fixture.commit(
+            &fixture.base,
+            "crates/demo/src/lib.rs",
+            "pub fn other_base() {}\n",
+            "other base",
+        );
+        fixture.add_fake_cargo(&format!(
+            "case \" $* \" in *' --test alpha '*) label=alpha;; *' --test beta '*) label=beta;; *) exit 0;; esac\n\
+             echo 'test {RED} ... FAILED'\n\
+             echo \"own-$label-$(/usr/bin/git rev-parse HEAD)\"; exit 1"
+        ));
+        let cache_root = fixture.root.path().join("own-text-cache");
+        let mut gate = TestGate {
+            cache_root: Some(cache_root.clone()),
+            ..TestGate::default()
+        };
+        let old_path = use_fake_path(&fixture);
+        for base in [&fixture.base, &other_base] {
+            for label in ["alpha", "beta"] {
+                let command =
+                    cargo_guard_command("demo", Some(&format!("test:{label}:test(demo::)")));
+                let spec = GuardSpec {
+                    commands: vec![command.clone()],
+                    env: BTreeMap::new(),
+                    output_tail_bytes: 16384,
+                };
+                let key = (base.clone(), base_cache_command_key(&command));
+                let evidence = base_evidence_for(
+                    &fixture.repo,
+                    &fixture.repo,
+                    base,
+                    &spec,
+                    &command,
+                    &mut gate,
+                    &BTreeSet::new(),
+                    &key,
+                    None,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(evidence, BaseTestEvidence::Observed(names) if names == BTreeSet::from([RED.into()]))
+                );
+                let identity = base_cache_identity(
+                    &fixture.repo,
+                    base,
+                    &command,
+                    &shard_env_class(&spec.env, "disk"),
+                )
+                .unwrap()
+                .unwrap();
+                let slot = base_cache::BaseShardSlot::acquire(
+                    &cache_root,
+                    base,
+                    &identity.slot_label,
+                    &identity.slot_key,
+                )
+                .await
+                .unwrap();
+                let entry = slot.read().unwrap().unwrap();
+                assert!(
+                    entry.failure_texts[RED].contains(&format!("own-{label}-{base}")),
+                    "{label} on {base}: {:?}",
+                    entry.failure_texts
+                );
+            }
+        }
+        restore_path(old_path);
+        assert_eq!(gate.base_runs, 4);
     }
 
     /// #1167: a shard retry spans `-p rsid -p rsid-store`; the package without
@@ -13129,11 +13814,40 @@ exit 0
         assert_eq!(receipt_files(&receipts), 0);
     }
 
+    /// Inject admission rather than asking the live host on each retry. The
+    /// fake cargo does no real build, so a private directory models admitted
+    /// tmpfs without requiring /dev/shm or depending on its current capacity.
+    fn receipt_reuse_gate(fixture: &Fixture, receipts: &Path, tmpfs_admitted: bool) -> TestGate {
+        let scratch = if tmpfs_admitted {
+            GateScratch::Tmpfs(tempfile::tempdir_in(fixture.root.path()).expect("fixture tmpfs"))
+        } else {
+            let path = fixture.root.path().join("disk-scratch");
+            fs::create_dir_all(&path).expect("fixture disk scratch");
+            GateScratch::Disk(path)
+        };
+        TestGate {
+            receipt_root: Some(receipts.to_path_buf()),
+            scratch_override: Some(scratch),
+            ..TestGate::default()
+        }
+    }
+
     /// #1312: publication fails after a green gate; the next invocation on the
     /// same content reuses the verdict, still publishes by fast-forward and
     /// still reports the original gate's evidence.
     #[tokio::test]
     async fn failed_publication_leaves_a_receipt_the_next_landing_reuses() {
+        for tmpfs_admitted in [true, false] {
+            failed_publication_leaves_a_receipt_the_next_landing_reuses_with_scratch(
+                tmpfs_admitted,
+            )
+            .await;
+        }
+    }
+
+    async fn failed_publication_leaves_a_receipt_the_next_landing_reuses_with_scratch(
+        tmpfs_admitted: bool,
+    ) {
         let fixture = Fixture::new();
         let source = fixture.commit(
             &fixture.base,
@@ -13177,10 +13891,7 @@ exit 0
         let old_path = use_fake_path(&fixture);
         let failed = land_with_gate(
             options(accepted.clone()),
-            TestGate {
-                receipt_root: Some(receipts.clone()),
-                ..TestGate::default()
-            },
+            receipt_reuse_gate(&fixture, &receipts, tmpfs_admitted),
         )
         .await;
         let failure = failed.expect_err("the push is declined");
@@ -13192,14 +13903,17 @@ exit 0
         fs::remove_file(&decline).expect("let the push through");
         let report = land_with_gate(
             options(accepted),
-            TestGate {
-                receipt_root: Some(receipts.clone()),
-                ..TestGate::default()
-            },
+            receipt_reuse_gate(&fixture, &receipts, tmpfs_admitted),
         )
         .await;
         restore_path(old_path);
         let report = report.expect("the reused verdict publishes");
+        let expected_class = if tmpfs_admitted { "tmpfs:" } else { "disk:" };
+        assert!(
+            report.gate_scratch.starts_with(expected_class),
+            "{}",
+            report.gate_scratch
+        );
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
             gated,
@@ -13221,6 +13935,17 @@ exit 0
     /// content. A retry after a declined publication still reuses the verdict.
     #[tokio::test]
     async fn failed_publication_of_a_merge_candidate_leaves_a_receipt_the_retry_reuses() {
+        for tmpfs_admitted in [true, false] {
+            failed_publication_of_a_merge_candidate_leaves_a_receipt_the_retry_reuses_with_scratch(
+                tmpfs_admitted,
+            )
+            .await;
+        }
+    }
+
+    async fn failed_publication_of_a_merge_candidate_leaves_a_receipt_the_retry_reuses_with_scratch(
+        tmpfs_admitted: bool,
+    ) {
         let fixture = Fixture::new();
         let source = fixture.commit(
             &fixture.base,
@@ -13263,10 +13988,7 @@ exit 0
             accepted,
             ..receipt_test_options(&fixture)
         };
-        let gate = || TestGate {
-            receipt_root: Some(receipts.clone()),
-            ..TestGate::default()
-        };
+        let gate = || receipt_reuse_gate(&fixture, &receipts, tmpfs_admitted);
         let old_path = use_fake_path(&fixture);
         let failed = land_with_gate(options(accepted.clone()), gate()).await;
         let failure = failed.expect_err("the push is declined");
@@ -13283,6 +14005,12 @@ exit 0
         let report = land_with_gate(options(accepted), gate()).await;
         restore_path(old_path);
         let report = report.expect("the reused verdict publishes");
+        let expected_class = if tmpfs_admitted { "tmpfs:" } else { "disk:" };
+        assert!(
+            report.gate_scratch.starts_with(expected_class),
+            "{}",
+            report.gate_scratch
+        );
         assert_ne!(
             report.candidate, first_candidate,
             "the retry made a different merge commit of the same content"
@@ -13333,7 +14061,11 @@ exit 0
             expected_tip: None,
             fixes_tests: Vec::new(),
         };
-        let key = |tree: &str, base: &str, candidate: &str, env: &BTreeMap<String, String>| {
+        let key = |tree: &str,
+                   base: &str,
+                   candidate: &str,
+                   env: &BTreeMap<String, String>,
+                   scratch: &str| {
             candidate_receipt::key_of(&receipt_identity(
                 tree,
                 base,
@@ -13342,7 +14074,7 @@ exit 0
                 "",
                 &spec_for(candidate, base),
                 &options,
-                "disk",
+                scratch,
                 SlowTier::Excluded,
                 &BTreeSet::new(),
                 "toolchain",
@@ -13350,14 +14082,22 @@ exit 0
             ))
         };
         let none = BTreeMap::new();
-        let original = key("tree-a", &base, &candidate, &none);
+        let original = key("tree-a", &base, &candidate, &none, "disk");
         assert_eq!(
             original,
-            key("tree-a", &base, &remade, &none),
+            key("tree-a", &base, &remade, &none, "disk"),
             "a re-made merge of the same tree and base is the same gate"
         );
-        assert_ne!(original, key("tree-b", &base, &candidate, &none));
-        assert_ne!(original, key("tree-a", &"c".repeat(40), &candidate, &none));
+        assert_ne!(
+            original,
+            key("tree-a", &base, &candidate, &none, "tmpfs"),
+            "a changed scratch class invalidates the receipt"
+        );
+        assert_ne!(original, key("tree-b", &base, &candidate, &none, "disk"));
+        assert_ne!(
+            original,
+            key("tree-a", &"c".repeat(40), &candidate, &none, "disk")
+        );
     }
 
     /// #2729: the inherited compiler, target and test settings are part of the
@@ -14243,8 +14983,7 @@ fi",
         ))
         .unwrap();
         drop(slot);
-        let previous = std::env::var_os("RSI_QA_HOST_CLASS");
-        unsafe { std::env::set_var("RSI_QA_HOST_CLASS", "desktop") };
+        let host_class = with_lander_vars([("RSI_QA_HOST_CLASS", "desktop")]);
         let mut desktop = TestGate {
             cache_root: Some(cache_root.clone()),
             ..TestGate::default()
@@ -14258,7 +14997,8 @@ fi",
             &BTreeSet::new(),
         )
         .await;
-        unsafe { std::env::set_var("RSI_QA_HOST_CLASS", "cloud") };
+        drop(host_class);
+        let host_class = with_lander_vars([("RSI_QA_HOST_CLASS", "cloud")]);
         let mut cloud = TestGate {
             cache_root: Some(cache_root),
             ..TestGate::default()
@@ -14272,13 +15012,7 @@ fi",
             &BTreeSet::new(),
         )
         .await;
-        unsafe {
-            if let Some(previous) = previous {
-                std::env::set_var("RSI_QA_HOST_CLASS", previous);
-            } else {
-                std::env::remove_var("RSI_QA_HOST_CLASS");
-            }
-        }
+        drop(host_class);
         first.expect("same host class may reuse exact QA base");
         second.expect("different host class recomputes base");
         assert!(
@@ -14491,6 +15225,89 @@ fi",
         );
     }
 
+    /// #3478: a gate test command runs in its own PID namespace, under the
+    /// build slot, and only when the tree under test ships the helper; static
+    /// guards, git checks and `cargo check` run as before.
+    #[test]
+    fn gate_test_commands_run_in_a_pid_namespace_inside_the_build_slot() {
+        let tree = tempfile::tempdir().unwrap();
+        let bare = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tree.path().join("scripts")).unwrap();
+        fs::write(
+            tree.path().join(PID_ISOLATE_SCRIPT),
+            "#!/usr/bin/env python3\n",
+        )
+        .unwrap();
+        let timeout = Duration::from_secs(60);
+        let command = |program: &str, args: &[&str]| GuardCommand {
+            program: program.into(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout,
+        };
+        let slot = std::ffi::OsStr::new("/home/op/.rsi/bin/cargo-slot");
+
+        let cargo = command("cargo", &["test", "-p", "demo", "--lib"]);
+        let isolated = isolated_slot_command(tree.path(), &cargo, None);
+        assert_eq!(isolated.program, PID_ISOLATE_SCRIPT);
+        assert_eq!(
+            isolated.args,
+            ["--", "cargo", "test", "-p", "demo", "--lib"]
+        );
+        assert_eq!(isolated.timeout, timeout);
+
+        let slotted = isolated_slot_command(tree.path(), &cargo, Some(slot));
+        assert_eq!(slotted.program, "/home/op/.rsi/bin/cargo-slot");
+        assert_eq!(
+            slotted.args,
+            [
+                PID_ISOLATE_SCRIPT,
+                "--",
+                "cargo",
+                "test",
+                "-p",
+                "demo",
+                "--lib"
+            ]
+        );
+
+        let shard = rsid_shard_guard_command("store-01:test(one_test)").unwrap();
+        let slotted_shard = isolated_slot_command(tree.path(), &shard, Some(slot));
+        assert_eq!(slotted_shard.program, "/home/op/.rsi/bin/cargo-slot");
+        assert_eq!(
+            slotted_shard.args[..3],
+            [PID_ISOLATE_SCRIPT, "--", "scripts/run-rsid-test-shards.sh"]
+        );
+
+        let python = command(
+            "python3",
+            &["-B", "-m", "unittest", "-v", "scripts/tests/test_x.py"],
+        );
+        let isolated_python = isolated_slot_command(tree.path(), &python, Some(slot));
+        assert_eq!(
+            isolated_python.program, PID_ISOLATE_SCRIPT,
+            "no cargo slot for Python"
+        );
+        assert_eq!(isolated_python.args[..3], ["--", "python3", "-B"]);
+
+        for unchanged in [
+            command("cargo", &["check", "-p", "demo"]),
+            command("git", &["diff", "--check"]),
+            command("python3", &["scripts/check-store-boundary.py"]),
+        ] {
+            assert_eq!(
+                isolated_slot_command(tree.path(), &unchanged, None),
+                unchanged
+            );
+        }
+        // A tree without the helper (a base side older than this change) runs the
+        // command exactly as before.
+        assert_eq!(isolated_slot_command(bare.path(), &cargo, None), cargo);
+        assert_eq!(
+            isolated_slot_command(bare.path(), &cargo, Some(slot)),
+            slot_wrapped_command(&cargo, Some(slot))
+        );
+    }
+
     #[tokio::test]
     async fn slot_wrapped_local_command_reports_the_gate_command() {
         let fixture = Fixture::new();
@@ -14506,7 +15323,7 @@ fi",
         fs::set_permissions(&wrapper, permissions).unwrap();
         fixture.add_fake_cargo("echo 'test demo::ok ... ok'");
         let old_path = use_fake_path(&fixture);
-        unsafe { std::env::set_var("RSI_LANDER_LOCAL_SLOT_WRAPPER", &wrapper) };
+        let slot_wrapper = with_lander_vars([("RSI_LANDER_LOCAL_SLOT_WRAPPER", &wrapper)]);
         let command = cargo_guard_command("demo", None);
         let report = run_one_guard(
             &fixture.repo,
@@ -14518,7 +15335,7 @@ fi",
             &command,
         )
         .await;
-        unsafe { std::env::remove_var("RSI_LANDER_LOCAL_SLOT_WRAPPER") };
+        drop(slot_wrapper);
         restore_path(old_path);
         let report = report.unwrap();
         assert!(
@@ -14539,8 +15356,7 @@ fi",
         let record = fixture.root.path().join("guard-child-env.txt");
         fixture.add_fake_cargo(&format!("env > '{}'", record.display()));
         let old_path = use_fake_path(&fixture);
-        let previous = std::env::var_os("RSI_PROCESS_OWNERSHIP_NAMESPACE");
-        unsafe { std::env::set_var("RSI_PROCESS_OWNERSHIP_NAMESPACE", "lander-custody") };
+        let namespace = with_lander_vars([("RSI_PROCESS_OWNERSHIP_NAMESPACE", "lander-custody")]);
         let report = run_one_guard(
             &fixture.repo,
             &GuardSpec {
@@ -14551,12 +15367,7 @@ fi",
             &cargo_guard_command("demo", None),
         )
         .await;
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("RSI_PROCESS_OWNERSHIP_NAMESPACE", value),
-                None => std::env::remove_var("RSI_PROCESS_OWNERSHIP_NAMESPACE"),
-            }
-        }
+        drop(namespace);
         restore_path(old_path);
         assert_eq!(
             report.unwrap().status,
@@ -14569,6 +15380,63 @@ fi",
                 .any(|line| line.starts_with("RSI_PROCESS_OWNERSHIP_NAMESPACE=")),
             "the lander RSI_* environment leaked into the guard child"
         );
+    }
+
+    /// #192: the lander's children get its explicit environment, never the
+    /// process environment: a fake `git` on the explicit `PATH` is the one
+    /// that runs, and it sees the explicit value, also on a `spawn_blocking`
+    /// thread the environment was carried to.
+    #[tokio::test]
+    async fn lander_children_get_the_explicit_environment_not_the_process_one() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let record = root.path().join("git-env.txt");
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{RSI_LANDER_ENV_PROBE_192:-unset}}\" >> '{}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &lander_env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let scope = with_lander_vars([
+            ("PATH", path.as_os_str()),
+            ("RSI_LANDER_ENV_PROBE_192", std::ffi::OsStr::new("explicit")),
+        ]);
+        let output = git_output(root.path(), &["status"]).expect("the fake git starts");
+        assert!(output.status.success());
+        let repo = root.path().to_path_buf();
+        let blocking = tokio::task::spawn_blocking(lander_env::propagate(move || {
+            git_output(&repo, &["status"])
+        }))
+        .await
+        .unwrap()
+        .expect("the fake git starts on the blocking thread");
+        assert!(blocking.status.success());
+        drop(scope);
+        assert_eq!(fs::read_to_string(&record).unwrap(), "explicit\nexplicit\n");
+        assert_eq!(std::env::var_os("RSI_LANDER_ENV_PROBE_192"), None);
+    }
+
+    /// #192, #3391: with no test environment installed, the lander environment
+    /// is the process environment reduced to the allowlist, so production
+    /// children inherit what the gate needs and no credential.
+    #[test]
+    fn the_default_lander_environment_is_the_allowlisted_process_environment() {
+        let unscoped = std::thread::spawn(lander_env::current).join().unwrap();
+        let process: BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+            rsid::lander_env_policy::filter(std::env::vars_os())
+                .into_iter()
+                .collect();
+        assert_eq!(unscoped.as_map(), &process);
+        assert!(process.contains_key(std::ffi::OsStr::new("PATH")));
     }
 
     /// #970: the remote gate runs shards concurrently, bounded and in input
@@ -14703,7 +15571,7 @@ fi",
         let flooded = retry_failure_evidence(&flood);
         assert!(flooded.len() <= 2048, "{}", flooded.len());
         assert!(
-            flooded.contains("more lines; full output in the queue gate log)"),
+            flooded.contains("more lines; bounded output in the queue gate log)"),
             "{flooded}"
         );
     }
@@ -14873,7 +15741,7 @@ fi",
         );
         // 33 message lines (panic line, opener, 30 sites, closer); 4 kept, 29 cut.
         assert!(
-            evidence.ends_with("(+29 more lines; full output in the queue gate log)"),
+            evidence.ends_with("(+29 more lines; bounded output in the queue gate log)"),
             "{evidence}"
         );
     }
@@ -15352,10 +16220,10 @@ fi",
         );
         fixture.add_fake_cargo("true");
         let old_path = use_fake_path(&fixture);
-        unsafe {
-            std::env::set_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "1");
-            std::env::set_var("RSI_LANDER_EXACT_GATE", "1");
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "1"),
+            ("RSI_LANDER_EXACT_GATE", "1"),
+        ]);
         let result = fixture
             .land_expecting(
                 vec![AcceptedPair {
@@ -15365,10 +16233,7 @@ fi",
                 &fixture.base,
             )
             .await;
-        unsafe {
-            std::env::remove_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES");
-            std::env::remove_var("RSI_LANDER_EXACT_GATE");
-        }
+        drop(knobs);
         restore_path(old_path);
         let report = result.expect("the advance is charged and the fetched tip is gated");
         assert_eq!(
@@ -15413,7 +16278,7 @@ fi",
         );
         fixture.add_fake_cargo("true");
         let old_path = use_fake_path(&fixture);
-        unsafe { std::env::set_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "0") };
+        let knobs = with_lander_vars([("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "0")]);
         let result = fixture
             .land_expecting(
                 vec![AcceptedPair {
@@ -15423,7 +16288,7 @@ fi",
                 &fixture.base,
             )
             .await;
-        unsafe { std::env::remove_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES") };
+        drop(knobs);
         restore_path(old_path);
         let failure = result.expect_err("no budget remains for the advance");
         assert_eq!(failure.state, PublicationState::NotPublished, "{failure:?}");
@@ -15465,6 +16330,101 @@ fi",
             report.stale_retries.is_empty(),
             "{:?}",
             report.stale_retries
+        );
+    }
+
+    /// #3785: the plan-only guard run never carries the derived test filters.
+    #[test]
+    fn plan_only_guard_args_carry_no_test_filters() {
+        let pair = AcceptedPair {
+            base: "b".repeat(40),
+            source: "s".repeat(40),
+        };
+        let args = plan_only_guard_args(
+            vec!["/repo/scripts/rolling-landing-guard.py".to_owned()],
+            Path::new("/repo"),
+            &pair,
+            "tip",
+            "cand",
+            Some(Path::new("/proof.json")),
+        );
+        assert!(args.contains(&"--plan-only".to_owned()), "{args:?}");
+        assert!(args.contains(&"--proof".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--test-filter"), "{args:?}");
+    }
+
+    /// #3785: a plan report of a source with 10000+ derived filters (the guard
+    /// echoes one `test_commands` string per filter) is far larger than the old
+    /// 256 KiB tail, and still parses through the lander's capture.
+    ///
+    /// hub #3795: the fixture prints the plan file with `cat`, which does not
+    /// exist on Windows, so the test is unix-only. The lander's guard capture
+    /// is program-agnostic; the tail-size behaviour it proves is the same on
+    /// every platform.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn guard_plan_larger_than_the_old_tail_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "a".repeat(40);
+        let candidate = "c".repeat(40);
+        let commands = (0..12_000)
+            .map(|index| {
+                format!(
+                    "cargo test -p rsid --lib shard:session-02:test(=session::topology_ops::tests::case_{index})"
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = serde_json::json!({
+            "outcome": "candidate",
+            "accepted_source": source,
+            "candidate": candidate,
+            "lost_hunks": [],
+            "affected_crates": ["rsid"],
+            "test_commands": commands,
+            "tests_executed": false,
+        });
+        let text = serde_json::to_string_pretty(&report).unwrap();
+        assert!(text.len() > 256 * 1024, "fixture is large: {}", text.len());
+        let file = dir.path().join("plan.json");
+        fs::write(&file, &text).unwrap();
+        let run = |tail: usize| {
+            let file = file.clone();
+            let dir = dir.path().to_path_buf();
+            async move {
+                run_guard_with_env(
+                    &dir,
+                    &GuardSpec {
+                        commands: vec![GuardCommand {
+                            program: "cat".into(),
+                            args: vec![file.to_string_lossy().into_owned()],
+                            timeout: Duration::from_secs(30),
+                        }],
+                        env: BTreeMap::new(),
+                        output_tail_bytes: tail,
+                    },
+                    lander_env::current().as_map(),
+                )
+                .await
+            }
+        };
+        let kept = run(GUARD_PLAN_TAIL_BYTES).await;
+        let plan = parse_guard_plan(&kept.commands[0].stdout_tail)
+            .expect("a large plan report parses from the lander's tail");
+        assert_eq!(plan.accepted_source, source);
+        assert_eq!(plan.candidate, candidate);
+        assert_eq!(plan.affected_crates, vec!["rsid".to_owned()]);
+
+        // The old 256 KiB tail cut the report mid-JSON; the error says how
+        // many bytes it was handed instead of only "invalid plan".
+        let cut = run(256 * 1024).await;
+        let error = match parse_guard_plan(&cut.commands[0].stdout_tail) {
+            Ok(_) => panic!("a truncated tail must not parse"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("invalid landing guard plan")
+                && error.contains(&format!("{} bytes", cut.commands[0].stdout_tail.len())),
+            "{error}"
         );
     }
 
@@ -15614,6 +16574,201 @@ fi",
         );
     }
 
+    /// Exercise the production receipted gate with a committed shell diff and
+    /// optional selected Rust test. No Python tooling or fixtures are involved.
+    async fn shell_gate_regression(changed: &str, rust: bool, red: bool) {
+        let _lock = env_lock();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| provisional_fixture::git(&repo, args);
+        git(&["init", "-q"]);
+        let suite = "scripts/tests/test_shell_tests.sh";
+        // The wrapper observes both its legacy shell test and that test's subject.
+        let body = "# suite-gate: tap\n# test_widget.sh covers widget.sh\nprintf '1..1\\nok 1 - wrapper case\\n'\n";
+        write(&repo, suite, body);
+        write(
+            &repo,
+            "scripts/tests/test_widget.sh",
+            "# legacy exit-status test\nexit 0\n",
+        );
+        write(&repo, "scripts/widget.sh", "exit 0\n");
+        write(&repo, "crates/demo/src/lib.rs", "pub fn value() {}\n");
+        git(&[
+            "add",
+            "scripts/tests/test_shell_tests.sh",
+            "scripts/tests/test_widget.sh",
+            "scripts/widget.sh",
+            "crates/demo/src/lib.rs",
+        ]);
+        git(&["commit", "-qm", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        if red {
+            // Exit zero deliberately: TAP owns the verdict, not the shell status.
+            write(
+                &repo,
+                suite,
+                "# suite-gate: tap\nprintf '1..1\\nnot ok 1 - deliberate red\\n'\n",
+            );
+        } else {
+            let contents = fs::read_to_string(repo.join(changed)).unwrap();
+            write(&repo, changed, &format!("{contents}# changed\n"));
+        }
+        if rust {
+            write(
+                &repo,
+                "crates/demo/src/lib.rs",
+                "pub fn value() { let _changed = 1; }\n",
+            );
+        }
+        git(&[
+            "add",
+            "scripts/tests/test_shell_tests.sh",
+            changed,
+            "crates/demo/src/lib.rs",
+        ]);
+        git(&["commit", "-qm", "candidate"]);
+        let candidate = git(&["rev-parse", "HEAD"]);
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        let cargo = bin.join("cargo");
+        fs::write(&cargo, "#!/bin/sh\nprintf 'test tests::selected_rust ... ok\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'\nprintf ran > rust-ran\n").unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let _environment = lander_env::LanderEnv::from_process_vars(std::env::vars_os())
+            .with_var("PATH", path)
+            .with_var("RSI_PID_ISOLATION", "off")
+            .enter();
+        let guard = root.path().join("guard-stub");
+        let real = provisional_fixture::real_guard();
+        // Deliberately exit zero even for a red receipt: the lander must
+        // inspect the typed verdict independently of the guard exit status.
+        fs::write(&guard, format!(
+            "#!/bin/sh\n[ \"$1\" = residual-lane ] || exit 93\nprintf '%s\\n' \"$@\" > '{}'\n'{}' \"$@\"\nexit 0\n",
+            root.path().join("guard-args").display(), real.display(),
+        )).unwrap();
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o755)).unwrap();
+        struct RestoreShellGuard;
+        impl Drop for RestoreShellGuard {
+            fn drop(&mut self) {
+                SHELL_GUARD_EXE.with(|path| *path.borrow_mut() = None);
+            }
+        }
+        SHELL_GUARD_EXE.with(|path| *path.borrow_mut() = Some(guard));
+        let _guard = RestoreShellGuard;
+        let mut gate = TestGate {
+            receipt_root: Some(root.path().join("receipts")),
+            ..TestGate::default()
+        };
+        let options = Options {
+            repo: repo.clone(),
+            remote: "origin".into(),
+            accepted: Vec::new(),
+            test_filters: Vec::new(),
+            cargo_build_jobs: 1,
+            remote_gate: None,
+            tmpfs_min_free_gb: 12,
+            disk_scratch_shards: BTreeSet::new(),
+            expected_tip: None,
+            fixes_tests: Vec::new(),
+        };
+        let spec = GuardSpec {
+            commands: if rust {
+                vec![cargo_guard_command("demo", Some("tests::selected_rust"))]
+            } else {
+                vec![]
+            },
+            env: BTreeMap::new(),
+            output_tail_bytes: 16 * 1024,
+        };
+        let result = run_affected_gate_receipted(
+            &repo, &repo, &base, &candidate, &spec, &mut gate, &options,
+        )
+        .await;
+        let args = fs::read_to_string(root.path().join("guard-args")).unwrap();
+        assert!(args.lines().any(|arg| arg == candidate), "{args}");
+        assert!(args.lines().any(|arg| arg == base), "{args}");
+        let logs = fs::read_dir(root.path().join("receipts/shell-suites"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(logs.join("receipt.json")).unwrap()).unwrap();
+        assert_eq!(receipt["receipt_head"], candidate);
+        assert_eq!(receipt["selected"], serde_json::json!([suite]));
+        assert_eq!(receipt["residual"][0]["test_file"], suite);
+        assert_eq!(receipt["residual"][0]["executed_tests"], 1);
+        let log = fs::read_to_string(logs.join("residual-0.log")).unwrap();
+        assert!(log.contains("1..1"), "{log}");
+        if red {
+            let error = result.expect_err("a red shell suite must refuse the gate");
+            assert!(error.contains(suite), "{error}");
+            assert_eq!(receipt["ok"], false);
+            assert_eq!(receipt["residual"][0]["status"], "failed");
+            assert_eq!(receipt["residual"][0]["exit_code"], 0);
+            assert_eq!(receipt["residual"][0]["failed_tests"], 1);
+        } else {
+            result.expect("selected shell suites pass alongside any Rust filters");
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["residual"][0]["status"], "passed");
+            if rust {
+                assert_eq!(fs::read_to_string(repo.join("rust-ran")).unwrap(), "ran");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_only_diff_runs_tap_suite_at_gate() {
+        shell_gate_regression("scripts/tests/test_shell_tests.sh", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn rust_and_changed_shell_test_run_wrapper_at_gate() {
+        shell_gate_regression("scripts/tests/test_widget.sh", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn rust_and_changed_covered_script_run_wrapper_at_gate() {
+        shell_gate_regression("scripts/widget.sh", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn failing_shell_suite_refuses_gate_with_typed_receipt() {
+        shell_gate_regression("scripts/tests/test_shell_tests.sh", true, true).await;
+    }
+
+    #[test]
+    fn shell_receipt_requires_matching_identity_and_complete_green_results() {
+        let green = serde_json::json!({
+            "schema_version": 1, "base": "base", "receipt_head": "head",
+            "ok": true, "error": null, "selected": ["scripts/tests/test_suite.sh"],
+            "residual": [{"test_file": "scripts/tests/test_suite.sh", "status": "passed",
+                "completed": true, "executed_tests": 1, "failed_tests": 0, "exit_code": 0}],
+        });
+        validate_shell_receipt(&green, "base", "head").unwrap();
+        let mut red = green.clone();
+        red["residual"][0]["status"] = "failed".into();
+        assert!(validate_shell_receipt(&red, "base", "head").is_err());
+        let mut partial = green.clone();
+        partial["residual"] = serde_json::json!([]);
+        assert!(validate_shell_receipt(&partial, "base", "head").is_err());
+        assert!(validate_shell_receipt(&green, "base", "other-head").is_err());
+        assert!(validate_shell_receipt(&green, "other-base", "head").is_err());
+        for field in ["completed", "executed_tests", "failed_tests", "exit_code"] {
+            let mut malformed = green.clone();
+            malformed["residual"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(validate_shell_receipt(&malformed, "base", "head").is_err());
+        }
+    }
+
     /// #1606: Python failures refuse a scripts/tools landing, and successful
     /// suites and pure docs landings need no Cargo invocation at all. #3205: a
     /// path outside scripts/tools that a suite names runs that suite too.
@@ -15700,361 +16855,6 @@ fi",
         }
     }
 
-    /// Hub #3001: a candidate that touches `desktop/` owes the desktop lane, a
-    /// red lane refuses publication (strict: no base triage), and a candidate
-    /// elsewhere never starts it. The fixture's `scripts/desktop-test-gate.py`
-    /// is a stub speaking the real script's two modes (selection, `--run`);
-    /// the script owns selection, so the lander starts it for every candidate
-    /// and a keybindings change owes the lane too (#3042).
-    #[tokio::test]
-    async fn desktop_gate_runs_the_lane_only_for_desktop_changes_and_a_red_lane_refuses() {
-        for (changed, contents, lane_runs, passes) in [
-            ("desktop/src/lane_probe.ts", "// changed\n", true, true),
-            ("desktop/verdict.txt", "fail\n", true, false),
-            ("docs/keybindings.md", "# keys\n", true, true),
-            ("docs/widget.md", "# changed\n", false, true),
-            ("scripts/widget.py", "# changed\n", false, true),
-        ] {
-            let fixture = Fixture::new();
-            let log = fixture.root.path().join("desktop-runs");
-            let stub = format!(
-                "import json, os, sys\nfrom pathlib import Path\nif '--run' in sys.argv:\n    Path({:?}).write_text(os.environ.get('DESKTOP_LANE_CARGO_TARGET', 'unset'))\n    sys.exit(0 if Path('desktop/verdict.txt').read_text().strip() == 'pass' else 1)\nimport subprocess\nbase, head = sys.argv[sys.argv.index('--base') + 1], sys.argv[sys.argv.index('--head') + 1]\nnames = subprocess.run(['git', 'diff', '--name-only', base, head, '--', 'desktop', 'docs/keybindings.md', 'crates/rsi/src'], capture_output=True, text=True, check=True).stdout.split()\nprint(json.dumps([[sys.executable, 'scripts/desktop-test-gate.py', '--run', '--repo', '.']] if names else []))\n",
-                log.to_str().unwrap(),
-            );
-            write(&fixture.repo, "scripts/desktop-test-gate.py", &stub);
-            write(&fixture.repo, "desktop/verdict.txt", "pass\n");
-            git_run(
-                &fixture.repo,
-                &["add", "scripts/desktop-test-gate.py", "desktop/verdict.txt"],
-            );
-            git_run(&fixture.repo, &["commit", "-qm", "Desktop lane stub"]);
-            git_run(&fixture.repo, &["push", "-q", "origin", "rolling"]);
-            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-            let source = fixture.commit(&base, changed, contents, "source");
-            let cargo = fixture.bin.join("cargo");
-            fs::write(&cargo, "#!/bin/sh\necho 'unexpected cargo' >&2\nexit 99\n").unwrap();
-            fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-            let old_path = use_fake_path(&fixture);
-            let result = fixture
-                .land(vec![AcceptedPair {
-                    base: base.clone(),
-                    source,
-                }])
-                .await;
-            restore_path(old_path);
-            assert_eq!(log.is_file(), lane_runs, "{changed}: lane ran or not");
-            if !passes {
-                let failure = result.expect_err("a red desktop lane refuses landing");
-                assert!(
-                    failure.message.contains("desktop lane failed"),
-                    "{failure:?}"
-                );
-                assert_eq!(
-                    git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
-                    base
-                );
-                continue;
-            }
-            let report = result.unwrap_or_else(|error| panic!("{changed}: {error:?}"));
-            assert_eq!(
-                git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
-                report.published_tip
-            );
-            if lane_runs {
-                let target = fs::read_to_string(&log).unwrap();
-                assert!(target.ends_with("-desktop-tauri-target"), "{target}");
-            }
-        }
-    }
-
-    /// A detached worktree on `base` with `edits` committed on top (`None`
-    /// removes the file); returns the worktree and the candidate commit.
-    fn desktop_candidate(
-        fixture: &Fixture,
-        base: &str,
-        edits: &[(&str, Option<&str>)],
-    ) -> (PathBuf, String) {
-        let path = fixture
-            .root
-            .path()
-            .join(format!("candidate-{}", uuid::Uuid::new_v4()));
-        git_run(
-            &fixture.repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "--detach",
-                path.to_str().unwrap(),
-                base,
-            ],
-        );
-        for (file, contents) in edits {
-            match contents {
-                Some(contents) => write(&path, file, contents),
-                None => fs::remove_file(path.join(file)).unwrap(),
-            }
-            git_run(&path, &["add", "-A", "--", file]);
-        }
-        git_run(&path, &["commit", "-q", "-m", "candidate"]);
-        let oid = git_value(&path, &["rev-parse", "HEAD"]);
-        (path, oid)
-    }
-
-    /// One shared case table pins Python and the lander, including the real selector
-    /// for root-manifest triggers and the Rust fallback when both trees lack it.
-    #[test]
-    fn desktop_selection_matches_the_shared_cases() {
-        let scripts = PathBuf::from(rsi_common::manifest_dir!()).join("../../scripts");
-        let table: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(scripts.join("tests/fixtures/desktop-selection.json")).unwrap(),
-        )
-        .unwrap();
-        let selector = fs::read_to_string(scripts.join("desktop-test-gate.py")).unwrap();
-        for case in table["cases"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap();
-            let fixture = Fixture::new();
-            let mut files = table["files"].as_object().unwrap().clone();
-            files.extend(case["overrides"].as_object().unwrap().clone());
-            if case["selector"] != "absent" {
-                files.insert(DESKTOP_GATE_SCRIPT.into(), selector.clone().into());
-            }
-            for (path, contents) in &files {
-                if let Some(contents) = contents.as_str() {
-                    write(&fixture.repo, path, contents);
-                    git_run(&fixture.repo, &["add", "--", path]);
-                } else if fixture.repo.join(path).exists() {
-                    git_run(&fixture.repo, &["rm", "--", path]);
-                }
-            }
-            git_run(&fixture.repo, &["commit", "-qm", "selection fixture"]);
-            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-            let mut edits = vec![(case["path"].as_str().unwrap(), case["contents"].as_str())];
-            if case["selector"] == "rename" {
-                edits.push(("scripts/renamed.py", Some(selector.as_str())));
-            }
-            let (worktree, candidate) = desktop_candidate(&fixture, &base, &edits);
-            let result = desktop_test_commands(&worktree, &base, &candidate);
-            match case["expected"].as_str().unwrap() {
-                "refused" => {
-                    let error = result.expect_err(name);
-                    assert!(error.contains(DESKTOP_GATE_SCRIPT), "{name}: {error}");
-                }
-                "selected" => {
-                    let commands = result.unwrap_or_else(|error| panic!("{name}: {error}"));
-                    assert_eq!(commands.len(), 1, "{name}");
-                    assert!(is_desktop_test_guard(&commands[0]), "{name}");
-                }
-                "empty" => assert!(
-                    result
-                        .unwrap_or_else(|error| panic!("{name}: {error}"))
-                        .is_empty(),
-                    "{name}"
-                ),
-                other => panic!("unknown expectation: {other}"),
-            }
-        }
-    }
-
-    /// The queue runs the same lane as scoped-test: its typed locked-update refusal
-    /// must remain a failed guard with the repair instruction in the queue's report.
-    #[tokio::test]
-    async fn stale_desktop_lock_refuses_the_lander_with_the_refresh_instruction() {
-        let fixture = Fixture::new();
-        let script = fs::read_to_string(
-            PathBuf::from(rsi_common::manifest_dir!()).join("../../scripts/desktop-test-gate.py"),
-        )
-        .unwrap();
-        // Stub only the external npm/Cargo processes, keeping the real selector, private
-        // staging, lane verdict and CLI result. Cargo's real resolution is covered by unittest.
-        let script = script.replace(
-            "if __name__ == \"__main__\":",
-            r#"def fixture_step(command, cwd, env, name):
-    if name == 'cargo test':
-        assert command == ['cargo', 'test', '--locked']
-        return 101, ['error: cannot update the lock file desktop/src-tauri/Cargo.lock because --locked was passed\n']
-    return 0, ['# tests 1\n'] if name == 'npm test' else []
-
-if __name__ == "__main__":
-"#,
-        ).replace("run_lane(repo)", "run_lane(repo, step=fixture_step, status=lambda: None)");
-        write(&fixture.repo, DESKTOP_GATE_SCRIPT, &script);
-        write(
-            &fixture.repo,
-            "desktop/src-tauri/Cargo.toml",
-            "[workspace]\n",
-        );
-        git_run(
-            &fixture.repo,
-            &[
-                "add",
-                "--",
-                DESKTOP_GATE_SCRIPT,
-                "desktop/src-tauri/Cargo.toml",
-            ],
-        );
-        git_run(&fixture.repo, &["commit", "-qm", "desktop lock fixture"]);
-        let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-        let (worktree, candidate) = desktop_candidate(
-            &fixture,
-            &base,
-            &[("desktop/src/lock_probe.ts", Some("// changed\n"))],
-        );
-        let commands = desktop_test_commands(&worktree, &base, &candidate).unwrap();
-        assert_eq!(commands.len(), 1);
-        let report = run_guard(
-            &worktree,
-            &GuardSpec {
-                commands,
-                env: BTreeMap::new(),
-                output_tail_bytes: 16 * 1024,
-            },
-        )
-        .await;
-        assert_eq!(report.commands.len(), 1);
-        assert_eq!(
-            report.commands[0].status,
-            rsid::integration::GuardStatus::Failed { code: Some(1) }
-        );
-        let output = &report.commands[0].stdout_tail;
-        assert!(output.contains("desktop_lock_stale"), "{output}");
-        assert!(
-            output.contains("refresh desktop/src-tauri/Cargo.lock"),
-            "{output}"
-        );
-    }
-
-    /// #355: a candidate worktree without the selector script cannot say what
-    /// the desktop lane owes, so a diff that touches a trigger input or the
-    /// script itself is an error naming the script; any other diff selects
-    /// nothing.
-    #[test]
-    fn a_missing_desktop_selector_fails_closed_only_when_the_diff_needs_it() {
-        for changed in [
-            "desktop/src/lane_probe.ts",
-            "docs/keybindings.md",
-            "crates/rsi/src/ui/mod.rs",
-        ] {
-            let fixture = Fixture::new();
-            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-            let (worktree, candidate) =
-                desktop_candidate(&fixture, &base, &[(changed, Some("// changed\n"))]);
-            assert!(!worktree.join(DESKTOP_GATE_SCRIPT).exists());
-            let error = desktop_test_commands(&worktree, &base, &candidate)
-                .expect_err(&format!("{changed}: a missing script fails closed"));
-            assert!(error.contains(DESKTOP_GATE_SCRIPT), "{changed}: {error}");
-            assert!(error.contains(changed), "{changed}: {error}");
-            let error = python_test_commands(&worktree, &base, &candidate)
-                .expect_err("the gate's command list carries the refusal");
-            assert!(error.contains(DESKTOP_GATE_SCRIPT), "{error}");
-        }
-        for changed in [
-            "docs/widget.md",
-            "scripts/widget.py",
-            "crates/rsi/Cargo.toml",
-        ] {
-            let fixture = Fixture::new();
-            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-            let (worktree, candidate) =
-                desktop_candidate(&fixture, &base, &[(changed, Some("# changed\n"))]);
-            let commands = desktop_test_commands(&worktree, &base, &candidate)
-                .unwrap_or_else(|error| panic!("{changed}: {error}"));
-            assert!(commands.is_empty(), "{changed}: selects nothing");
-        }
-    }
-
-    /// #355: deleting or renaming the selector is itself refused, even when no
-    /// other trigger input changed.
-    #[test]
-    fn deleting_or_renaming_the_desktop_selector_is_refused_by_name() {
-        for rename in [false, true] {
-            let fixture = Fixture::new();
-            write(&fixture.repo, DESKTOP_GATE_SCRIPT, "print('[]')\n");
-            git_run(&fixture.repo, &["add", DESKTOP_GATE_SCRIPT]);
-            git_run(&fixture.repo, &["commit", "-qm", "Desktop lane stub"]);
-            let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-            let mut edits = vec![(DESKTOP_GATE_SCRIPT, None)];
-            if rename {
-                edits.push((
-                    "scripts/desktop-test-gate-renamed.py",
-                    Some("print('[]')\n"),
-                ));
-            }
-            let (worktree, candidate) = desktop_candidate(&fixture, &base, &edits);
-            let error = desktop_test_commands(&worktree, &base, &candidate)
-                .expect_err("a candidate without the selector is refused");
-            assert!(
-                error.contains(DESKTOP_GATE_SCRIPT),
-                "rename={rename}: {error}"
-            );
-        }
-    }
-
-    /// #355: the merge queue refuses the entry (it does not publish) when the
-    /// candidate changes a desktop file and carries no selector script.
-    #[tokio::test]
-    async fn the_gate_refuses_a_desktop_change_without_the_selector_script() {
-        let fixture = Fixture::new();
-        let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
-        let source = fixture.commit(&base, "desktop/src/lane_probe.ts", "// changed\n", "source");
-        let result = fixture
-            .land(vec![AcceptedPair {
-                base: base.clone(),
-                source,
-            }])
-            .await;
-        let failure = result.expect_err("a desktop change without the selector is refused");
-        assert!(failure.message.contains(DESKTOP_GATE_SCRIPT), "{failure:?}");
-        assert_eq!(
-            git_value(&fixture.bare, &["rev-parse", "refs/heads/rolling"]),
-            base
-        );
-    }
-
-    /// The static list the lander falls back to is the script's own.
-    #[test]
-    fn the_static_desktop_trigger_inputs_are_the_scripts() {
-        let script = fs::read_to_string(
-            PathBuf::from(rsi_common::manifest_dir!()).join("../../scripts/desktop-test-gate.py"),
-        )
-        .unwrap();
-        let line = script
-            .lines()
-            .find(|line| line.starts_with("OUTSIDE_INPUTS = ("))
-            .expect("OUTSIDE_INPUTS in the gate script");
-        let listed: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
-        assert_eq!(
-            [&["desktop"][..], &listed[..]].concat(),
-            DESKTOP_STATIC_TRIGGER_INPUTS
-        );
-    }
-
-    #[test]
-    fn the_desktop_guard_is_its_own_kind_of_guard() {
-        let lane = GuardCommand {
-            program: "python3".into(),
-            args: ["-B", DESKTOP_GATE_SCRIPT, "--run", "--repo", "."]
-                .map(String::from)
-                .to_vec(),
-            timeout: DESKTOP_GATE_TIMEOUT,
-        };
-        assert!(is_desktop_test_guard(&lane));
-        assert!(!is_python_test_guard(&lane));
-        assert!(!is_static_guard(&lane));
-        let selection = GuardCommand {
-            args: ["-B", DESKTOP_GATE_SCRIPT, "--base", "a"]
-                .map(String::from)
-                .to_vec(),
-            ..lane.clone()
-        };
-        assert!(!is_desktop_test_guard(&selection));
-        let other = GuardCommand {
-            program: "cargo".into(),
-            ..lane
-        };
-        assert!(!is_desktop_test_guard(&other));
-    }
-
     /// #2576: lands a candidate through the Python gate. `base_suite` is the
     /// committed `scripts/tests/test_widget.py`; the candidate edits
     /// `scripts/widget.py` (the suite is selected through its stem), or the
@@ -16063,6 +16863,17 @@ if __name__ == "__main__":
         base_suite: &str,
         candidate_suite: Option<&str>,
         fixes: &[&str],
+    ) -> (Fixture, String, Result<LandReport, LandFailure>) {
+        land_python_candidate_with(base_suite, candidate_suite, fixes, &[]).await
+    }
+
+    /// `land_python_candidate` with more committed files (#3320: a second test
+    /// module the candidate's diff does not select).
+    async fn land_python_candidate_with(
+        base_suite: &str,
+        candidate_suite: Option<&str>,
+        fixes: &[&str],
+        extra_files: &[(&str, &str)],
     ) -> (Fixture, String, Result<LandReport, LandFailure>) {
         let fixture = Fixture::new();
         fs::copy(
@@ -16079,6 +16890,10 @@ if __name__ == "__main__":
                 "scripts/tests/test_widget.py",
             ],
         );
+        for (path, text) in extra_files {
+            write(&fixture.repo, path, text);
+            git_run(&fixture.repo, &["add", path]);
+        }
         git_run(&fixture.repo, &["commit", "-qm", "Python coverage"]);
         git_run(&fixture.repo, &["push", "-q", "origin", "rolling"]);
         let base = git_value(&fixture.repo, &["rev-parse", "HEAD"]);
@@ -16290,6 +17105,89 @@ if __name__ == "__main__":
         result.expect("a claimed Python fix that runs green lands");
     }
 
+    /// #3320: a claimed Python test in a module the diff does not select is run
+    /// by the gate itself: green lands, red refuses, and a test that is not in
+    /// the module is refused with the Python next step (no filter exists).
+    #[tokio::test]
+    async fn python_gate_runs_the_module_of_a_claimed_python_test() {
+        let guard = python_suite("");
+        let guard_files = [("scripts/tests/test_guard.py", guard.as_str())];
+        let claim = "scripts.tests.test_guard.Test.test_green";
+        let (fixture, _base, result) =
+            land_python_candidate_with(&python_suite(""), None, &[claim], &guard_files).await;
+        // A fixture holds the environment lock until it drops.
+        drop(fixture);
+        result.expect("a claimed Python test outside the diff's selection runs green and lands");
+
+        let red = python_suite("    def test_red(self):\n        self.assertEqual(1, 2)\n");
+        let red_files = [("scripts/tests/test_guard.py", red.as_str())];
+        let (fixture, _base, result) = land_python_candidate_with(
+            &python_suite(""),
+            None,
+            &["scripts.tests.test_guard.Test.test_red"],
+            &red_files,
+        )
+        .await;
+        drop(fixture);
+        let failure = result.expect_err("a claimed Python test that is red refuses");
+        assert!(
+            failure
+                .message
+                .contains(rsi_common::rolling_queue::QUEUE_CLAIMED_FIX_STILL_RED),
+            "{failure:?}"
+        );
+        assert!(failure.message.contains("test_red"), "{failure:?}");
+
+        let (_fixture, _base, result) = land_python_candidate_with(
+            &python_suite(""),
+            None,
+            &["scripts.tests.test_guard.Test.test_missing"],
+            &guard_files,
+        )
+        .await;
+        let failure = result.expect_err("a claimed Python test that does not exist is unproven");
+        assert!(
+            failure.message.contains("full unittest id")
+                && !failure.message.contains("add a test filter"),
+            "{failure:?}"
+        );
+    }
+
+    /// #3320: the claimed module resolves only for a real unittest id under
+    /// scripts/tests or tools/tests; the refusal's next step follows the kind.
+    #[test]
+    fn a_claimed_python_test_resolves_to_its_module_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "scripts/tests/test_guard.py", "");
+        write(dir.path(), "tools/tests/sub/test_deep.py", "");
+        write(dir.path(), "scripts/other.py", "");
+        let resolve = |claim: &str| claimed_python_suite(dir.path(), claim);
+        assert_eq!(
+            resolve("scripts.tests.test_guard.Test.test_one"),
+            Some(("scripts/tests/test_guard.py".to_owned(), "unittest"))
+        );
+        assert_eq!(
+            resolve("tools.tests.sub.test_deep.Test.test_one"),
+            Some(("tools/tests/sub/test_deep.py".to_owned(), "unittest"))
+        );
+        for none in [
+            "Test.test_one",
+            "scripts.other.Test.test_one",
+            "scripts.tests.test_absent.Test.test_one",
+            "scripts.tests..test_guard.Test.test_one",
+            "demo::tests::red",
+        ] {
+            assert_eq!(resolve(none), None, "{none}");
+        }
+        let python = unproven_claim_next_step(&["scripts.tests.test_guard.Test.t".to_owned()]);
+        assert!(python.contains("full unittest id"), "{python}");
+        assert!(!python.contains("add a test filter"), "{python}");
+        let rust = unproven_claim_next_step(&["demo::tests::red".to_owned()]);
+        assert!(rust.contains("add a test filter that selects it"), "{rust}");
+        let both = unproven_claim_next_step(&["demo::red".to_owned(), "a.b.c".to_owned()]);
+        assert!(both.contains("Rust:") && both.contains("Python:"), "{both}");
+    }
+
     /// #2583: a claimed Python fix that passes in a suite which also holds a
     /// base-shared red is proven green, so the landing is not refused as unproven.
     #[tokio::test]
@@ -16388,23 +17286,18 @@ if __name__ == "__main__":
             bare = fixture.bare.display(),
         ));
         let old_path = use_fake_path(&fixture);
-        // Tests serialize all environment changes through ENV_LOCK.
-        unsafe {
-            std::env::set_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "1");
-            if exact_gate {
-                std::env::set_var("RSI_LANDER_EXACT_GATE", "1");
-            }
+        let mut vars = vec![("RSI_LANDER_MAX_REGATED_STALE_RETRIES", "1")];
+        if exact_gate {
+            vars.push(("RSI_LANDER_EXACT_GATE", "1"));
         }
+        let knobs = with_lander_vars(vars);
         let result = fixture
             .land(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source: source.clone(),
             }])
             .await;
-        unsafe {
-            std::env::remove_var("RSI_LANDER_MAX_REGATED_STALE_RETRIES");
-            std::env::remove_var("RSI_LANDER_EXACT_GATE");
-        }
+        drop(knobs);
         restore_path(old_path);
         let tested = fs::read_to_string(&log).unwrap();
         (fixture, source, advances, tested, result)
@@ -16533,21 +17426,17 @@ if __name__ == "__main__":
             bare = fixture.bare.display(),
         ));
         let old_path = use_fake_path(&fixture);
-        // Tests serialize all environment changes through ENV_LOCK.
-        unsafe {
-            std::env::set_var("RSI_LANDER_EXACT_GATE", "1");
-            std::env::set_var("RSI_LANDER_REGATE_BUDGET_SECS", budget);
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_EXACT_GATE", "1"),
+            ("RSI_LANDER_REGATE_BUDGET_SECS", budget),
+        ]);
         let result = fixture
             .land(vec![AcceptedPair {
                 base: fixture.base.clone(),
                 source,
             }])
             .await;
-        unsafe {
-            std::env::remove_var("RSI_LANDER_EXACT_GATE");
-            std::env::remove_var("RSI_LANDER_REGATE_BUDGET_SECS");
-        }
+        drop(knobs);
         restore_path(old_path);
         let tested = fs::read_to_string(&log).unwrap();
         (fixture, advances, tested, result)
@@ -16710,20 +17599,17 @@ if __name__ == "__main__":
             bare = fixture.bare.display(),
         ));
         let old_path = use_fake_path(&fixture);
-        unsafe {
-            std::env::set_var("RSI_LANDER_EXACT_GATE", "1");
-            std::env::set_var("RSI_LANDER_REGATE_BUDGET_SECS", "3600");
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_EXACT_GATE", "1"),
+            ("RSI_LANDER_REGATE_BUDGET_SECS", "3600"),
+        ]);
         let result = fixture
             .land(vec![AcceptedPair {
                 base: setup.clone(),
                 source,
             }])
             .await;
-        unsafe {
-            std::env::remove_var("RSI_LANDER_EXACT_GATE");
-            std::env::remove_var("RSI_LANDER_REGATE_BUDGET_SECS");
-        }
+        drop(knobs);
         restore_path(old_path);
         let report = result.expect("each overlapping advance is re-gated within the budget");
         assert_eq!(&report.fetched_tip, advances.last().unwrap());
@@ -16798,20 +17684,17 @@ if __name__ == "__main__":
             bare = fixture.bare.display(),
         ));
         let old_path = use_fake_path(&fixture);
-        unsafe {
-            std::env::set_var("RSI_LANDER_EXACT_GATE", "1");
-            std::env::set_var("RSI_LANDER_REGATE_BUDGET_SECS", "1");
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_EXACT_GATE", "1"),
+            ("RSI_LANDER_REGATE_BUDGET_SECS", "1"),
+        ]);
         let result = fixture
             .land(vec![AcceptedPair {
                 base: setup.clone(),
                 source,
             }])
             .await;
-        unsafe {
-            std::env::remove_var("RSI_LANDER_EXACT_GATE");
-            std::env::remove_var("RSI_LANDER_REGATE_BUDGET_SECS");
-        }
+        drop(knobs);
         restore_path(old_path);
         let failure = result.expect_err("the gate cannot run again inside one second");
         assert_eq!(failure.state, PublicationState::NotPublished, "{failure:?}");
@@ -17215,6 +18098,58 @@ if __name__ == "__main__":
     }
 
     #[test]
+    fn only_an_added_declaration_makes_a_source_provisional() {
+        let root = TempDir::new().unwrap();
+        let repo = root.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        let declaration = repo.join("tools/provisional-migrations/released.json");
+        fs::create_dir_all(declaration.parent().unwrap()).unwrap();
+        fs::write(&declaration, "{}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let base = git(&["rev-parse", "HEAD"]);
+
+        fs::write(&declaration, "{\"path_template\": \"x\"}\n").unwrap();
+        git(&["commit", "-q", "-am", "repair released declaration"]);
+        let repaired = git(&["rev-parse", "HEAD"]);
+        let pair = AcceptedPair {
+            base: base.clone(),
+            source: repaired,
+        };
+        assert!(!has_provisional_declaration(repo, &pair).unwrap());
+
+        git(&["rm", "-q", "tools/provisional-migrations/released.json"]);
+        git(&["commit", "-q", "-m", "drop released declaration"]);
+        let dropped = AcceptedPair {
+            base: base.clone(),
+            source: git(&["rev-parse", "HEAD"]),
+        };
+        assert!(!has_provisional_declaration(repo, &dropped).unwrap());
+
+        let added = repo.join("tools/provisional-migrations/new.json");
+        fs::create_dir_all(added.parent().unwrap()).unwrap();
+        fs::write(&added, "{}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "add declaration"]);
+        let adding = AcceptedPair {
+            base,
+            source: git(&["rev-parse", "HEAD"]),
+        };
+        assert!(has_provisional_declaration(repo, &adding).unwrap());
+    }
+
+    #[test]
     fn provisional_plain_merge_accepts_already_landed_migration_on_stale_retry() {
         let already_landed = serde_json::json!({
             "renumber_noop": true,
@@ -17229,119 +18164,128 @@ if __name__ == "__main__":
         assert!(!provisional_plain_merge(&serde_json::json!({}), false));
     }
 
+    /// #452: the stale-retry fixture of `provisional_stale_retry_regenerates_or_refuses_proof`,
+    /// built in Rust with the real `rsi-repo-guard` (the Python builder #361 removed).
+    /// Returns the source repository, then `(destination clone, bare remote, base, tip, source, incoming)`;
+    /// `destination` is what the lander lands in, `incoming` is what lands on the
+    /// remote while the candidate's gate runs.
     fn provisional_stale_fixture(
         fixture: &Fixture,
+        guard: &Path,
         change: &str,
-    ) -> (PathBuf, PathBuf, String, String, String, String) {
+    ) -> (
+        provisional_fixture::Provisional,
+        PathBuf,
+        PathBuf,
+        String,
+        String,
+        String,
+        String,
+    ) {
+        use provisional_fixture::{Provisional, git};
+        let protected_path = "crates/rsid-store/src/store/protected_fixture.rs";
+        let protected_text = "// RSI-RELEASED-MIGRATION-BEGIN: fixture-section\n// pinned\n// RSI-RELEASED-MIGRATION-END: fixture-section\n";
+        let shards = "#!/bin/sh\noid=$(/usr/bin/git rev-parse HEAD)\nprintf '%s\\n' \"$oid\" >> \"$LANDER924_LOG\"\nif [ \"$oid\" != \"$LANDER924_BASE\" ] && [ ! -e \"$LANDER924_MARKER\" ]; then\n  : > \"$LANDER924_MARKER\"\n  if [ \"$LANDER924_CHANGE\" = proof ]; then\n    : > \"$LANDER924_PROOF_FAIL\"\n  fi\n  /usr/bin/git -C \"$LANDER924_REPO\" push -q origin \"$LANDER924_INCOMING:refs/heads/rolling\" || exit 43\nfi\nexit 0\n";
+        let case = Provisional::new(
+            guard,
+            &[
+                (protected_path, protected_text, false),
+                ("scripts/run-rsid-test-shards.sh", shards, true),
+            ],
+        );
+        let source = case.source("alpha", "");
+        git(
+            &case.repo,
+            &["update-ref", "refs/heads/source-for-landing", &source],
+        );
+        // #1655: a source already at rolling head + 1 lands as is and has no
+        // proof to go stale. Another provisional unit lands first, so alpha
+        // (declared V130) is renumbered to V131 and a stale retry has a proof to
+        // regenerate or refuse. `advance` is the opposite: alpha starts at head
+        // + 1 (a no-op) and only a stale advance of the head renumbers it.
+        let tip = if change == "advance" {
+            case.base.clone()
+        } else {
+            case.candidate(&case.source("zero", ""), &case.base).1
+        };
+        git(
+            &case.repo,
+            &["update-ref", "refs/heads/tip-for-landing", &tip],
+        );
+        let incoming = if matches!(change, "version" | "advance") {
+            case.candidate(&case.source("beta", ""), &tip).1
+        } else {
+            let worktree = case.root.path().join("incoming");
+            git(
+                &case.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "--detach",
+                    worktree.to_str().unwrap(),
+                    &tip,
+                ],
+            );
+            let filename = match change {
+                "store" => "crates/rsid-store/src/store/mod.rs",
+                "catalog" => "tools/released-migrations.json",
+                "cohort" => "crates/rsid-store/src/store/cohort_settlement.rs",
+                "protected" => protected_path,
+                _ => "incoming.txt",
+            };
+            match change {
+                "store" | "catalog" => {
+                    let path = worktree.join(filename);
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                "cohort" | "protected" => {
+                    let path = worktree.join(filename);
+                    let text = fs::read_to_string(&path).unwrap();
+                    fs::write(&path, format!("{text}// incoming\n")).unwrap();
+                }
+                _ => write(&worktree, filename, "incoming\n"),
+            }
+            git(&worktree, &["add", filename]);
+            git(&worktree, &["commit", "-q", "-m", "incoming"]);
+            git(&worktree, &["rev-parse", "HEAD"])
+        };
+        git(
+            &case.repo,
+            &["update-ref", "refs/heads/incoming-for-landing", &incoming],
+        );
         let repo = fixture.root.path().join(format!("migration-{change}"));
         let bare = fixture.root.path().join(format!("migration-{change}.git"));
-        let setup = r#"
-import importlib.util, json, pathlib, shutil, subprocess, sys
-root, destination, bare = map(pathlib.Path, sys.argv[1:4])
-change = sys.argv[4]
-spec = importlib.util.spec_from_file_location('migration_test', root / 'scripts/tests/test_rolling_migration_renumber.py')
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-case = module.ProvisionalMigrationTest('test_two_v130_sources_land_as_v130_v131_with_exact_parents_and_proofs')
-case.setUp()
-repo = case.repo
-for name in ('scripts/rolling-landing-guard.py', 'tools/check-released-migrations.py', 'tools/rolling-migration-renumber.py'):
-    case.write(repo, name, (root / name).read_text())
-case.write(repo, 'Cargo.toml', '[workspace]\nmembers = ["crates/rsid"]\nresolver = "2"\n')
-protected_path = 'crates/rsid-store/src/store/protected_fixture.rs'
-protected_text = '// RSI-RELEASED-MIGRATION-BEGIN: fixture-section\n// pinned\n// RSI-RELEASED-MIGRATION-END: fixture-section\n'
-case.write(repo, protected_path, protected_text)
-inventory = module.RENUMBER.guard.inventory({
-    module.RENUMBER.STORE: case.base_store(),
-    'crates/rsid-store/src/store/cohort_settlement.rs': '',
-    'crates/rsid-store/src/store/tests.rs': case.base_tests(),
-    protected_path: protected_text,
-})
-case.write(repo, module.RENUMBER.MANIFEST, json.dumps(inventory, indent=2) + '\n')
-case.write(repo, 'scripts/run-rsid-test-shards.sh', '''#!/bin/sh
-oid=$(/usr/bin/git rev-parse HEAD)
-printf '%s\\n' "$oid" >> "$LANDER924_LOG"
-if [ "$oid" != "$LANDER924_BASE" ] && [ ! -e "$LANDER924_MARKER" ]; then
-  : > "$LANDER924_MARKER"
-  if [ "$LANDER924_CHANGE" = proof ]; then
-    private=$(/usr/bin/git rev-parse --git-common-dir)
-    printf '%s\\n' 'raise SystemExit(43)' > "${private%/.git}/tools/rolling-migration-renumber.py"
-  fi
-  /usr/bin/git -C "$LANDER924_REPO" push -q origin "$LANDER924_INCOMING:refs/heads/rolling" || exit 43
-fi
-exit 0
-''')
-(repo / 'scripts/run-rsid-test-shards.sh').chmod(0o755)
-case.git(repo, 'add', '.')
-case.git(repo, 'commit', '-q', '-m', 'landing support')
-case.base = case.git(repo, 'rev-parse', 'HEAD')
-source = case.source('alpha')
-case.git(repo, 'update-ref', 'refs/heads/source-for-landing', source)
-# #1655: a source already at rolling head + 1 lands as is and has no proof to
-# go stale. Another provisional unit lands first, so alpha (declared V130) must
-# be renumbered to V131 and a stale retry has a proof to regenerate or refuse.
-# `advance` is the opposite: alpha starts at head + 1 (a no-op) and only a stale
-# advance of the head forces its renumbering.
-tip = case.base if change == 'advance' else case.candidate(case.source('zero'), case.base)[1]
-case.git(repo, 'update-ref', 'refs/heads/tip-for-landing', tip)
-if change in ('version', 'advance'):
-    second = case.source('beta')
-    _, incoming = case.candidate(second, tip)
-else:
-    worktree = pathlib.Path(case.temp.name) / 'incoming'
-    case.git(repo, 'worktree', 'add', '-q', '--detach', str(worktree), tip)
-    if change == 'store':
-        filename = 'crates/rsid-store/src/store/mod.rs'
-        (worktree / filename).chmod(0o755)
-    elif change == 'catalog':
-        filename = 'tools/released-migrations.json'
-        (worktree / filename).chmod(0o755)
-    elif change in ('renumber_tool', 'released_tool', 'guard_tool', 'cohort', 'protected'):
-        filename = {
-            'renumber_tool': 'tools/rolling-migration-renumber.py',
-            'released_tool': 'tools/check-released-migrations.py',
-            'guard_tool': 'scripts/rolling-landing-guard.py',
-            'cohort': 'crates/rsid-store/src/store/cohort_settlement.rs',
-            'protected': protected_path,
-        }[change]
-        comment = '# incoming\n' if change.endswith('tool') else '// incoming\n'
-        case.write(worktree, filename, (worktree / filename).read_text() + comment)
-    else:
-        filename = 'incoming.txt'
-        case.write(worktree, filename, 'incoming\n')
-    case.git(worktree, 'add', filename)
-    case.git(worktree, 'commit', '-q', '-m', 'incoming')
-    incoming = case.git(worktree, 'rev-parse', 'HEAD')
-case.git(repo, 'update-ref', 'refs/heads/incoming-for-landing', incoming)
-subprocess.run(['git', 'init', '--bare', '-q', str(bare)], check=True)
-case.git(repo, 'push', '-q', str(bare), f'{tip}:refs/heads/rolling')
-subprocess.run(['git', 'clone', '-q', str(repo), str(destination)], check=True)
-case.git(destination, 'remote', 'set-url', 'origin', str(bare))
-print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': incoming}))
-"#;
-        let output = Command::new("python3")
-            .arg("-c")
-            .arg(setup)
-            .arg(PathBuf::from(rsi_common::manifest_dir!()).join("../.."))
-            .arg(&repo)
-            .arg(&bare)
-            .arg(change)
-            .output()
-            .expect("migration fixture script");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        git(
+            fixture.root.path(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
         );
-        let details: Value = serde_json::from_slice(&output.stdout).expect("fixture details");
-        (
-            repo,
-            bare,
-            details["base"].as_str().unwrap().into(),
-            details["tip"].as_str().unwrap().into(),
-            details["source"].as_str().unwrap().into(),
-            details["incoming"].as_str().unwrap().into(),
-        )
+        git(
+            &case.repo,
+            &[
+                "push",
+                "-q",
+                bare.to_str().unwrap(),
+                &format!("{tip}:refs/heads/rolling"),
+            ],
+        );
+        git(
+            fixture.root.path(),
+            &[
+                "clone",
+                "-q",
+                case.repo.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repo,
+            &["remote", "set-url", "origin", bare.to_str().unwrap()],
+        );
+        let base = case.base.clone();
+        // The source repository keeps the objects and worktrees alive: the
+        // caller holds `case` for the landing.
+        (case, repo, bare, base, tip, source, incoming)
     }
 
     #[tokio::test]
@@ -17350,9 +18294,6 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "disjoint",
             "store",
             "catalog",
-            "renumber_tool",
-            "released_tool",
-            "guard_tool",
             "cohort",
             "protected",
             "version",
@@ -17360,10 +18301,26 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "advance",
         ] {
             let fixture = Fixture::new();
-            let (repo, bare, base, tip, source, incoming) =
-                provisional_stale_fixture(&fixture, change);
+            let real = provisional_fixture::real_guard();
+            let (_case, repo, bare, base, tip, source, incoming) =
+                provisional_stale_fixture(&fixture, &real, change);
             let marker = fixture.root.path().join("advanced-once");
             let log = fixture.root.path().join("tested-commits");
+            let proof_fail = fixture.root.path().join("proof-fails");
+            // The lander runs this wrapper as the trusted guard; once the gate
+            // has marked the failure, a renumber proof fails like a changed tool.
+            let wrapper = fixture.root.path().join("rsi-repo-guard");
+            fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = rolling-migration-renumber ] && [ -e '{}' ]; then\n  echo 'injected renumber failure' >&2\n  exit 43\nfi\nexec '{}' \"$@\"\n",
+                    proof_fail.display(),
+                    real.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+            let _guard = landing_policy::use_guard_exe(&wrapper);
             let metadata = serde_json::json!({
                 "workspace_members": ["rsid", "rsid-store"],
                 "packages": [
@@ -17380,17 +18337,19 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             let mut permissions = fs::metadata(&cargo).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&cargo, permissions).unwrap();
-            for (key, value) in [
+            let old_path = use_fake_path(&fixture);
+            let knobs = with_lander_vars([
                 ("LANDER924_LOG", log.to_string_lossy().into_owned()),
                 ("LANDER924_MARKER", marker.to_string_lossy().into_owned()),
+                (
+                    "LANDER924_PROOF_FAIL",
+                    proof_fail.to_string_lossy().into_owned(),
+                ),
                 ("LANDER924_BASE", tip.clone()),
                 ("LANDER924_REPO", repo.to_string_lossy().into_owned()),
                 ("LANDER924_INCOMING", incoming.clone()),
                 ("LANDER924_CHANGE", change.to_owned()),
-            ] {
-                unsafe { std::env::set_var(key, value) };
-            }
-            let old_path = use_fake_path(&fixture);
+            ]);
             let result = land(Options {
                 repo: repo.clone(),
                 remote: "origin".into(),
@@ -17407,16 +18366,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
                 fixes_tests: Vec::new(),
             })
             .await;
-            for key in [
-                "LANDER924_LOG",
-                "LANDER924_MARKER",
-                "LANDER924_BASE",
-                "LANDER924_REPO",
-                "LANDER924_INCOMING",
-                "LANDER924_CHANGE",
-            ] {
-                unsafe { std::env::remove_var(key) };
-            }
+            drop(knobs);
             restore_path(old_path);
             if change == "version" || change == "proof" {
                 let failure = result.expect_err("stale proof must refuse");
@@ -17427,14 +18377,16 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
                     } else {
                         "provisional migration refused"
                     }),
-                    "{failure:?}"
+                    "{change}: {failure:?}"
                 );
                 assert_eq!(
                     git_value(&bare, &["rev-parse", "refs/heads/rolling"]),
                     incoming
                 );
             } else {
-                let report = result.expect("stale provisional migration publishes");
+                let report = result.unwrap_or_else(|failure| {
+                    panic!("{change}: stale provisional migration must publish: {failure:?}")
+                });
                 assert_eq!(report.fetched_tip, incoming);
                 assert_eq!(report.provisional.len(), 1);
                 assert_eq!(report.provisional[0].proof["target"], incoming);
@@ -17451,9 +18403,9 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
     }
 
     #[test]
-    fn committed_released_guard_replaces_dirty_worktree_copy() {
+    fn committed_landing_guard_replaces_dirty_worktree_copy() {
         let fixture = Fixture::new();
-        let script = "tools/check-released-migrations.py";
+        let script = "scripts/rolling-landing-guard.py";
         let committed = git_output(&fixture.repo, &["show", &format!("HEAD:{script}")])
             .expect("committed script");
         write(&fixture.repo, script, "raise SystemExit(0)\n");
@@ -17480,26 +18432,57 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         };
         let _lock = env_lock();
         let root = tempfile::tempdir().expect("temp root");
+        // A host that exports a git identity (the cloud sweep does, #4012) must not
+        // change who the pin commit is attributed to (#4018).
+        let _identity = with_lander_vars([
+            ("GIT_AUTHOR_NAME", "rsi-sweep"),
+            ("GIT_AUTHOR_EMAIL", "rsi-sweep@invalid"),
+            ("GIT_COMMITTER_NAME", "rsi-sweep"),
+            ("GIT_COMMITTER_EMAIL", "rsi-sweep@invalid"),
+        ]);
+        // The real guard is a separate executable with its own native suite in
+        // `rsi-repo-guards`; this stand-in keeps the lander side under test: the
+        // pin commit, its identity and parent, and what a failing refresh or
+        // check does. It refuses an edited released block.
+        let guard = root.path().join("rsi-repo-guard");
+        fs::write(
+            &guard,
+            r#"#!/bin/sh
+PATH=/usr/bin:/bin:$PATH
+[ "$1" = released-migrations ] || { echo "unexpected guard $1" >&2; exit 2; }
+shift
+store=crates/rsid-store/src/store/mod.rs
+if [ "$1" = --refresh ]; then
+  grep -q migrate_v1_edited "$store" && { echo "released block edited" >&2; exit 1; }
+  head=$(sed -n "s/.*LATEST_SCHEMA_VERSION: i32 = \([0-9]*\);.*/\1/p" "$store")
+  blocks="\"1\":\"pin-1\""
+  [ "$head" -ge 2 ] && blocks="$blocks,\"2\":\"pin-2\""
+  printf "{\"schema_version\":1,\"latest_schema_version\":%s,\"blocks\":{%s}}\n" "$head" "$blocks" > tools/released-migrations.json
+  exit 0
+fi
+git show "$2:$store" | grep -q migrate_v1_edited && { echo "released block edited" >&2; exit 1; }
+exit 0
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o755)).unwrap();
+        let _guard = landing_policy::use_guard_exe(&guard);
         let repo = root.path().join("repo");
         fs::create_dir_all(&repo).expect("repository directory");
         git_run(&repo, &["init", "-q", "-b", "rolling"]);
         fs::create_dir_all(repo.join("tools")).expect("tools dir");
-        fs::copy(
-            PathBuf::from(rsi_common::manifest_dir!())
-                .join("../../tools/check-released-migrations.py"),
-            repo.join("tools/check-released-migrations.py"),
-        )
-        .expect("copy released guard");
         write(&repo, STORE, &store(1, "migrate_v1"));
         git_run(&repo, &["add", "."]);
         git_run(&repo, &["commit", "-q", "-m", "base"]);
         // Bootstrap the base's pin the way a released tree already has one.
-        let pinned = Command::new("python3")
-            .args(["tools/check-released-migrations.py", "--refresh", "HEAD"])
-            .current_dir(&repo)
-            .output()
-            .expect("bootstrap refresh");
-        assert!(pinned.status.success(), "{pinned:?}");
+        let pinned = landing_policy::run_repo_guard(
+            &repo,
+            "HEAD",
+            &repo,
+            "released-migrations",
+            &["--refresh", "HEAD"],
+        );
+        assert!(pinned.success(), "{}", pinned.reason());
         git_run(&repo, &["add", "tools/released-migrations.json"]);
         git_run(&repo, &["commit", "-q", "-m", "pin base"]);
         let base = git_value(&repo, &["rev-parse", "HEAD"]);
@@ -17640,11 +18623,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         );
         // The released-migration script has its own fixture suite. This fixture
         // isolates the landing policy's migration-number rule.
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(0)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(0);
         let check = |source: &str, proved: &[u32]| {
             landing_policy::check_with_proof(
                 &fixture.repo,
@@ -17693,11 +18672,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "impl Store {}\n",
             "migration 125 without a gate",
         );
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(0)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(0);
         let check = |source: &str| {
             landing_policy::check_with_proof(&fixture.repo, fixture.root.path(), &v124, source, &[])
         };
@@ -17739,11 +18714,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "migration 125 without a gate",
         );
         let unanchored = fixture.commit(&bare_v125, &file(126), &gate(126), "migration 126");
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(0)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(0);
         let check = |source: &str| {
             landing_policy::check_with_proof(&fixture.repo, fixture.root.path(), &v124, source, &[])
         };
@@ -17821,11 +18792,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
                 "impl Store {{\n    fn migrate_v{version:03}(&self, version: i32) {{\n        if version < {version} {{\n        }}\n    }}\n}}\n"
             )
         };
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(0)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(0);
         let check = |target: &str, source: &str| {
             landing_policy::check_with_proof(
                 &fixture.repo,
@@ -19840,6 +20807,72 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         }
     }
 
+    /// A derived empty selection widens to its full shard. Caller-named
+    /// empties retain the pre-test refusal, even beside a matching filter.
+    #[tokio::test]
+    async fn derived_empty_focused_filter_runs_its_whole_shard_and_explicit_empty_refuses() {
+        for explicit in [false, true] {
+            let fixture = Fixture::new();
+            let tree = fixture.root.path().join("empty-focused-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &fixture.base,
+                ],
+            );
+            let listing = fixture.root.path().join("listing.json");
+            fs::write(&listing, nextest_listing(&[])).unwrap();
+            let runs = fixture.root.path().join("runs");
+            fixture.add_fake_cargo(&format!(
+                "case \"$1 $2\" in\n 'nextest list') cat '{}';;\n 'nextest run') echo unexpected-focused-run >> '{}'; exit 101;;\nesac",
+                listing.display(), runs.display(),
+            ));
+            let script = tree.join("scripts/run-rsid-test-shards.sh");
+            fs::create_dir_all(script.parent().unwrap()).unwrap();
+            fs::write(&script, format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho '        PASS [   0.010s] (1/1) rsid fixture::test'\necho '     Summary [   0.010s] 1 test run: 1 passed, 0 skipped'\n", runs.display(),
+            )).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut filters =
+                explicit_focused_filters(&["rsid=shard:other-02:test(fixture)".into()], false);
+            filters[0].explicit = explicit;
+            let mut gate = TestGate {
+                focused_filters: filters,
+                ..TestGate::default()
+            };
+            let spec = GuardSpec {
+                commands: vec![rsid_lib_filter_command("test(fixture)")],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            if explicit {
+                assert!(result.unwrap_err().contains("test filter selects no test"));
+                assert_eq!(fs::read_to_string(&runs).unwrap_or_default(), "");
+            } else {
+                result.expect("the gate runs the whole shard instead of the empty focused run");
+                assert_eq!(
+                    fs::read_to_string(&runs).unwrap(),
+                    "shard other-02 --jobs 4\n"
+                );
+            }
+        }
+    }
+
     /// #1596: an `e2e_tui` filter would no-op without `RSI_E2E=1` and a built
     /// rsid, so the gate sets the flag and prebuilds rsid, only for that filter.
     #[test]
@@ -19874,6 +20907,45 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         let other = plan(&["rsi=test:flow".into()]);
         assert_eq!(other.env.get("RSI_E2E"), None);
         assert!(!rendered(&other).iter().any(|c| c.contains("build")));
+    }
+
+    #[test]
+    fn public_item_observers_run_exact_library_tests_in_the_gate() {
+        let command = cargo_guard_command("rsi", Some("test(=consumer::tests::shape)"));
+        assert_eq!(
+            command.args,
+            [
+                "test",
+                "-p",
+                "rsi",
+                "--lib",
+                "--",
+                "--test-threads=4",
+                "consumer::tests::shape",
+                "--exact"
+            ]
+        );
+        assert_eq!(cargo_lib_filters(&command), None);
+        let spec = affected_crate_guard_spec(
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            &["rsi".into()],
+            &[
+                "rsi=test(=consumer::tests::shape)".into(),
+                "rsi=other::tests".into(),
+            ],
+            false,
+            &rsid_family_metadata(),
+            4,
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(spec.commands.contains(&command));
+        assert!(
+            spec.commands
+                .contains(&cargo_guard_command("rsi", Some("other::tests")))
+        );
     }
 
     /// #1282: the plain lib filters of another package run in one libtest
@@ -20408,6 +21480,166 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         );
     }
 
+    #[test]
+    fn base_compile_probes_preserve_targets_without_running_tests() {
+        let target = base_compile_probe(
+            &cargo_guard_command("demo", Some("test:small:test(=small::red)")),
+            ShardTree::Static,
+        )
+        .unwrap();
+        assert_eq!(target.program, "cargo");
+        assert_eq!(
+            target.args,
+            ["test", "-p", "demo", "--test", "small", "--no-run"]
+        );
+        for command in [
+            cargo_guard_command("demo", Some("green")),
+            rsid_lib_filter_command("all()"),
+            rsid_shard_guard_command("store-01").unwrap(),
+        ] {
+            let probe = base_compile_probe(&command, ShardTree::Static).unwrap();
+            assert_eq!(probe.program, "cargo");
+            assert!(probe.args.contains(&"--no-run".into()), "{probe:?}");
+            assert!(probe.args.contains(&"--lib".into()), "{probe:?}");
+            assert_eq!(probe.timeout, command.timeout);
+        }
+        let shard = base_compile_probe(
+            &rsid_shard_guard_command("store-01").unwrap(),
+            ShardTree::Static,
+        )
+        .unwrap();
+        assert!(
+            shard
+                .args
+                .windows(2)
+                .any(|pair| pair == ["--features", "test-shard-store-01"])
+        );
+        assert_eq!(
+            base_compile_probe(&cargo_check_command("demo"), ShardTree::Static),
+            None
+        );
+    }
+
+    /// #3839: a red or empty small target must not make a proven-green wide
+    /// selection execute all its tests again on base. The late compile-repair
+    /// check still probes that target's compilation without caching test proof.
+    #[tokio::test]
+    async fn a_red_or_empty_target_only_compiles_green_selections_on_base() {
+        for scenario in ["shared-red", "empty"] {
+            let fixture = Fixture::new();
+            let candidate = fixture.commit(
+                &fixture.base,
+                "crates/demo/src/lib.rs",
+                "pub fn candidate() {}\n",
+                "candidate",
+            );
+            let tree = fixture.root.path().join("wide-candidate");
+            git_run(
+                &fixture.repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    tree.to_str().unwrap(),
+                    &candidate,
+                ],
+            );
+            let runs = fixture.root.path().join("wide-runs");
+            fixture.add_fake_cargo(&format!(
+                r#"oid=$(/usr/bin/git rev-parse HEAD)
+printf '%s %s\n' "$oid" "$*" >> '{runs}'
+case " $* " in
+  *' --no-run '*) exit 0;;
+esac
+case "$1 $2" in
+  'nextest list') exit 0;;
+  'nextest run')
+    if [ "$oid" = '{base}' ]; then
+      echo 'FAIL [ 0.01s] rsid unrelated::base_red'
+      exit 100
+    fi
+    echo 'Summary [ 0.01s] 10000 tests run: 10000 passed, 0 skipped'
+    exit 0;;
+esac
+if [ '{scenario}' = empty ]; then
+  echo 'running 0 tests'
+  echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out'
+  exit 0
+fi
+echo 'running 1 test'
+echo 'test small::shared_red ... FAILED'
+exit 101
+"#,
+                runs = runs.display(),
+                base = fixture.base,
+            ));
+            let wide = rsid_lib_filter_command("all()");
+            let small = cargo_guard_command("demo", Some("test:small"));
+            let spec = GuardSpec {
+                commands: vec![wide.clone(), small.clone()],
+                env: BTreeMap::new(),
+                output_tail_bytes: 16 * 1024,
+            };
+            let mut gate = TestGate::default();
+            let old_path = use_fake_path(&fixture);
+            let result = run_affected_gate(
+                &fixture.repo,
+                &tree,
+                &fixture.base,
+                &spec,
+                &mut gate,
+                &BTreeSet::new(),
+            )
+            .await;
+            restore_path(old_path);
+            result.expect("a shared red or empty target preserves a green wide run");
+            let ran = fs::read_to_string(runs).unwrap();
+            let candidate_at = ran
+                .lines()
+                .position(|line| line == format!("{} {}", candidate, wide.args.join(" ")))
+                .unwrap();
+            let base_at = ran
+                .lines()
+                .position(|line| line.starts_with(&fixture.base))
+                .unwrap();
+            assert!(
+                candidate_at < base_at,
+                "the wide source selection runs first: {ran}"
+            );
+            let base_runs: Vec<_> = ran
+                .lines()
+                .filter(|line| line.starts_with(&fixture.base))
+                .collect();
+            let probe = base_compile_probe(&wide, ShardTree::Static).unwrap();
+            assert_eq!(
+                base_runs,
+                [
+                    format!("{} {}", fixture.base, guard_command_line(&small)),
+                    format!("{} {}", fixture.base, guard_command_line(&probe)),
+                ]
+                .map(|line| line.replacen("cargo ", "", 1)),
+                "{ran}"
+            );
+            assert_eq!(gate.base_skipped, 1);
+            assert_eq!(
+                gate.base_runs, 1,
+                "only the small target runs tests on base"
+            );
+            assert_eq!(
+                gate.base_cache.keys().cloned().collect::<Vec<_>>(),
+                vec![(fixture.base.clone(), base_cache_command_key(&small))]
+            );
+            assert_eq!(
+                gate.base_reds,
+                if scenario == "shared-red" {
+                    BTreeSet::from(["small::shared_red".into()])
+                } else {
+                    BTreeSet::new()
+                }
+            );
+        }
+    }
+
     /// #1525: the base side of a red run names exactly the candidate's failing
     /// tests; shapes it cannot narrow keep the full command.
     #[test]
@@ -20647,11 +21879,22 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             &class,
             &names(&["a::red"]),
             &names(&["a::green"]),
+            &BTreeMap::from([("a::red".into(), "own red text".into())]),
         )
         .unwrap();
         let loaded = base_cache::load_test_outcomes(root.path(), &tip, &class);
         assert_eq!(
-            loaded,
+            loaded["a::red"].failure_text.as_deref(),
+            Some("own red text")
+        );
+        let colours = |outcomes: BTreeMap<String, base_cache::TestOutcome>| {
+            outcomes
+                .into_iter()
+                .map(|(name, outcome)| (name, outcome.red))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            colours(loaded),
             BTreeMap::from([
                 ("a::red".to_string(), true),
                 ("a::green".to_string(), false)
@@ -20668,10 +21911,11 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             &class,
             &names(&["a::green"]),
             &names(&[]),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
-            base_cache::load_test_outcomes(root.path(), &tip, &class),
+            colours(base_cache::load_test_outcomes(root.path(), &tip, &class)),
             BTreeMap::from([("a::red".to_string(), true)]),
             "a flipped outcome is forgotten"
         );
@@ -20894,112 +22138,6 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         );
         assert!(manifest.is_file(), "the successful build phase is recorded");
         warm_bindings().remove(&build_tree);
-    }
-
-    /// Hub #3023: the desktop lane of a gate that leased a warm slot builds into
-    /// the slot's own desktop target. The candidate's crates are trimmed after
-    /// every run, the third-party artifacts stay for the next gate (state `warm`),
-    /// and the step's seconds are in the `gate_timing` check steps.
-    #[tokio::test]
-    async fn a_warm_slot_keeps_the_desktop_target_between_gates_and_trims_the_candidate() {
-        let fixture = Fixture::new();
-        add_fake_rustc(&fixture);
-        let marks = fixture.root.path().join("desktop-marks");
-        let stub = format!(
-            "import os, sys\nfrom pathlib import Path\nif '--run' not in sys.argv:\n    sys.exit(2)\ntarget = Path(os.environ['DESKTOP_LANE_CARGO_TARGET'])\ntauri = target / 'debug/deps/libtauri-0123456789abcdef.rlib'\nwith open({:?}, 'a') as log:\n    log.write(f\"{{target}} {{'warm' if tauri.exists() else 'cold'}}\\n\")\n(target / 'debug/deps').mkdir(parents=True, exist_ok=True)\ntauri.write_text('tauri')\n(target / 'debug/deps/rsi_desktop_lib-0123456789abcdef.d').write_text('candidate')\n",
-            marks.to_str().unwrap(),
-        );
-        let with_script = fixture.commit(
-            &fixture.base,
-            "scripts/desktop-test-gate.py",
-            &stub,
-            "desktop lane stub",
-        );
-        let candidate = fixture.commit(
-            &with_script,
-            "desktop/src-tauri/Cargo.toml",
-            "[package]\nname = \"rsi-desktop\"\n\n[lib]\nname = \"rsi_desktop_lib\"\n",
-            "desktop crate",
-        );
-        let tree = fixture.root.path().join("desktop-warm-candidate");
-        git_run(
-            &fixture.repo,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                tree.to_str().unwrap(),
-                &candidate,
-            ],
-        );
-        let warm_root = fixture.root.path().join(rsid::lander_warm_target::WARM_DIR);
-        let slot = rsid::lander_warm_target::WarmSlot::acquire(&warm_root, 1).expect("slot");
-        let desktop_target = slot.desktop_target();
-        let spec = GuardSpec {
-            commands: vec![GuardCommand {
-                program: "python3".into(),
-                args: ["-B", DESKTOP_GATE_SCRIPT, "--run", "--repo", "."]
-                    .map(String::from)
-                    .to_vec(),
-                timeout: Duration::from_secs(60),
-            }],
-            env: BTreeMap::new(),
-            output_tail_bytes: 16 * 1024,
-        };
-        let mut gate = TestGate {
-            warm: Some(slot),
-            ..TestGate::default()
-        };
-        let old_path = use_fake_path(&fixture);
-        let mut results = Vec::new();
-        for _ in 0..2 {
-            results.push(
-                run_affected_gate(
-                    &fixture.repo,
-                    &tree,
-                    &fixture.base,
-                    &spec,
-                    &mut gate,
-                    &BTreeSet::new(),
-                )
-                .await,
-            );
-        }
-        restore_path(old_path);
-        for result in results {
-            result.expect("the warm desktop gate passes");
-        }
-        let runs = fs::read_to_string(&marks).unwrap();
-        assert_eq!(
-            runs.lines().collect::<Vec<_>>(),
-            [
-                format!("{} cold", desktop_target.display()),
-                format!("{} warm", desktop_target.display()),
-            ],
-            "the second gate finds the first gate's third-party artifacts"
-        );
-        assert!(
-            desktop_target
-                .join("debug/deps/libtauri-0123456789abcdef.rlib")
-                .is_file()
-        );
-        assert!(
-            !desktop_target
-                .join("debug/deps/rsi_desktop_lib-0123456789abcdef.d")
-                .exists(),
-            "the candidate's own crate is trimmed after the lane"
-        );
-        let timing = check_steps_evidence(&gate.check_steps);
-        assert!(
-            timing
-                .split(',')
-                .filter(|step| step.starts_with("desktop-tests@"))
-                .count()
-                == 2,
-            "{timing}"
-        );
-        warm_bindings().remove(&warm_root.join("slot-0/source"));
-        warm_desktop_bindings().remove(&warm_root.join("slot-0/source"));
     }
 
     /// #2467: a gate whose compile check fails leaves the slot without a
@@ -21467,11 +22605,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "pin facts",
         );
         let source = fixture.commit(&base, protected, "edited\n", "change pinned facts");
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(2)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(2);
         let error = landing_policy::check_with_proof(
             &fixture.repo,
             fixture.root.path(),
@@ -21500,11 +22634,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "pub const LATEST_SCHEMA_VERSION: i32 = 125;\n",
             "lower schema",
         );
-        write(
-            fixture.root.path(),
-            "tools/check-released-migrations.py",
-            "import sys\nsys.exit(0)\n",
-        );
+        let _released_guard = landing_policy::stub_released_guard(0);
         let error = landing_policy::check_with_proof(
             &fixture.repo,
             fixture.root.path(),
@@ -21679,24 +22809,15 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         );
         fixture.add_fake_cargo("");
         let old_path = use_fake_path(&fixture);
-        let old_git_dir = std::env::var_os("GIT_DIR");
-        unsafe {
-            std::env::set_var("GIT_DIR", fixture.root.path().join("not-a-git-dir"));
-        }
+        let knobs = with_lander_vars([("GIT_DIR", fixture.root.path().join("not-a-git-dir"))]);
         let result = fixture
             .land(vec![AcceptedPair {
                 base: fixture.base[..12].to_string(),
                 source: source[..12].to_string(),
             }])
             .await;
+        drop(knobs);
         restore_path(old_path);
-        unsafe {
-            if let Some(old_git_dir) = old_git_dir {
-                std::env::set_var("GIT_DIR", old_git_dir);
-            } else {
-                std::env::remove_var("GIT_DIR");
-            }
-        }
         let report = result.expect("landing succeeds");
         assert_eq!(report.candidate, source);
         assert_eq!(report.kind, CandidateKind::FastForward);
@@ -21931,13 +23052,13 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         // publish without running it, and the runner's single gate is green.
         fixture.add_fake_cargo(&format!("pwd -P >> '{}'", gate_log.display()));
         let old_path = use_fake_path(&fixture);
-        // Tests serialize all environment changes through ENV_LOCK (held by
-        // the fixture).
-        unsafe {
-            std::env::set_var("RSI_LANDER_CANARY_MODE", "handoff");
-            std::env::set_var("RSI_ROLLING_CANARY_DIR", &registry_root);
-            std::env::set_var("RSI_LANDER_CANARY_SPAWN", "0");
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_CANARY_MODE", std::ffi::OsStr::new("handoff")),
+            ("RSI_ROLLING_CANARY_DIR", registry_root.as_os_str()),
+            ("RSI_LANDER_CANARY_SPAWN", std::ffi::OsStr::new("0")),
+            // The sweep exports CARGO_BUILD_JOBS=16, above the lander ceiling (#4012).
+            ("CARGO_BUILD_JOBS", std::ffi::OsStr::new("2")),
+        ]);
         let first_source = fixture.commit(
             &fixture.base,
             "crates/demo/src/first.rs",
@@ -21980,11 +23101,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             .verdict(&second.published_tip)
             .expect("verdict read");
         let gate_runs = fs::read_to_string(&gate_log).unwrap_or_default();
-        unsafe {
-            std::env::remove_var("RSI_LANDER_CANARY_MODE");
-            std::env::remove_var("RSI_ROLLING_CANARY_DIR");
-            std::env::remove_var("RSI_LANDER_CANARY_SPAWN");
-        }
+        drop(knobs);
         restore_path(old_path);
 
         let registry_text = registry_root.display().to_string();
@@ -22033,13 +23150,13 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "echo 'test demo::red ... FAILED'; exit 1",
         );
         let old_path = use_fake_path(&fixture);
-        // Tests serialize all environment changes through ENV_LOCK (held by
-        // the fixture).
-        unsafe {
-            std::env::set_var("RSI_LANDER_CANARY_MODE", "handoff");
-            std::env::set_var("RSI_ROLLING_CANARY_DIR", &registry_root);
-            std::env::set_var("RSI_LANDER_CANARY_SPAWN", "0");
-        }
+        let knobs = with_lander_vars([
+            ("RSI_LANDER_CANARY_MODE", std::ffi::OsStr::new("handoff")),
+            ("RSI_ROLLING_CANARY_DIR", registry_root.as_os_str()),
+            ("RSI_LANDER_CANARY_SPAWN", std::ffi::OsStr::new("0")),
+            // The sweep exports CARGO_BUILD_JOBS=16, above the lander ceiling (#4012).
+            ("CARGO_BUILD_JOBS", std::ffi::OsStr::new("2")),
+        ]);
         let source = fixture.commit(
             &fixture.base,
             "crates/demo/src/lib.rs",
@@ -22064,11 +23181,7 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         let verdict = registry
             .verdict(&landed.published_tip)
             .expect("verdict read");
-        unsafe {
-            std::env::remove_var("RSI_LANDER_CANARY_MODE");
-            std::env::remove_var("RSI_ROLLING_CANARY_DIR");
-            std::env::remove_var("RSI_LANDER_CANARY_SPAWN");
-        }
+        drop(knobs);
         restore_path(old_path);
 
         assert_eq!(summary.gates_run, 1);
@@ -22904,7 +24017,8 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
         let fixture = Fixture::new_in(&parent);
         let target = fixture.repo.join("target");
         fs::create_dir(&target).expect("sandbox-local Cargo target");
-        let _target_env = ScopedCargoTarget::set(&target);
+        // #192: the lander's CARGO_TARGET_DIR, for this thread only.
+        let _target_env = with_lander_vars([("CARGO_TARGET_DIR", &target)]);
         let source = fixture.commit(
             &fixture.base,
             "crates/demo/src/lib.rs",
@@ -23018,11 +24132,8 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             marker.display(), fixture.bare.display(), marker.display(),
         ));
         let old_path = use_fake_path(&fixture);
-        let old_git_dir = std::env::var_os("GIT_DIR");
         // The remote read/push subprocesses must ignore this inherited repo override.
-        unsafe {
-            std::env::set_var("GIT_DIR", fixture.root.path().join("not-a-git-dir"));
-        }
+        let knobs = with_lander_vars([("GIT_DIR", fixture.root.path().join("not-a-git-dir"))]);
         let result = fixture
             .land(vec![
                 AcceptedPair {
@@ -23035,14 +24146,8 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
                 },
             ])
             .await;
+        drop(knobs);
         restore_path(old_path);
-        unsafe {
-            if let Some(old_git_dir) = old_git_dir {
-                std::env::set_var("GIT_DIR", old_git_dir);
-            } else {
-                std::env::remove_var("GIT_DIR");
-            }
-        }
         let report = result.expect("overlapping ancestor advance is regated");
         assert_eq!(report.fetched_tip, intermediate);
         assert!(
@@ -23109,6 +24214,31 @@ print(json.dumps({'base': case.base, 'tip': tip, 'source': source, 'incoming': i
             "network recovery must reuse the green candidate gate"
         );
         assert_eq!(git_value(&fixture.bare, &["rev-parse", TARGET]), source);
+    }
+
+    #[test]
+    fn a_failed_remote_read_is_reported_as_infrastructure_and_a_red_gate_is_not() {
+        let class_line = format!(
+            "failure_class={}",
+            rsi_common::rolling_queue::LANDER_FAILURE_CLASS_REMOTE_READ
+        );
+        for message in [
+            "cannot read remote rolling tip: git ls-remote exited 128",
+            "remote rolling fetch failed (exit 128)",
+            "remote rolling lookup timed out after 30s",
+        ] {
+            let failure = LandFailure::from(message.to_string());
+            assert!(failure.evidence_lines().contains(&class_line), "{message}");
+        }
+        let red = LandFailure::from(format!(
+            "{NEW_FAILURES_PREFIX}abc: demo::red; cannot read remote rolling tip"
+        ));
+        assert!(!red.evidence_lines().contains(&class_line));
+        let plain = LandFailure::from("demo::red failed".to_string());
+        assert!(!plain.evidence_lines().contains(&class_line));
+        let mut published = LandFailure::from("cannot read remote rolling tip".to_string());
+        published.state = PublicationState::Unknown;
+        assert!(!published.evidence_lines().contains(&class_line));
     }
 
     #[tokio::test]

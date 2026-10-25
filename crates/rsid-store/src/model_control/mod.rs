@@ -1,5 +1,11 @@
 pub mod call_control;
 pub(crate) mod cost;
+#[cfg(any(test, feature = "test-seam"))]
+pub use cost::clear_discovered_prices;
+pub use cost::{
+    DiscoveredPrice, ModelPrice, discovered_price, discovered_prices_fetched_at, price_for_model,
+    publish_discovered_prices,
+};
 pub(crate) mod live_calls;
 pub mod registry;
 pub mod retry;
@@ -20,7 +26,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::sync::Mutex;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -755,7 +760,7 @@ pub fn classify_error_class(error: &DaemonError) -> String {
 }
 
 async fn admit_invocation_through_store_channel(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ModelAdmissionRequest,
     event_bus: &Arc<EventBus>,
     channel: AdmissionStoreChannel,
@@ -911,7 +916,7 @@ async fn admit_invocation_through_store_channel(
 }
 
 pub async fn admit_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ModelAdmissionRequest,
     event_bus: &Arc<EventBus>,
 ) -> Result<AdmissionDecision> {
@@ -920,7 +925,7 @@ pub async fn admit_invocation(
 
 /// Internal launch context only; no RPC/agent DTO can supply this witness.
 pub async fn admit_launch_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ModelAdmissionRequest,
     event_bus: &Arc<EventBus>,
     launch_origin: Option<&crate::store::manager_resources::ManagerResourceLaunchOrigin>,
@@ -945,7 +950,7 @@ pub async fn admit_launch_invocation(
 }
 
 pub async fn admit_capacity_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: ModelAdmissionRequest,
     event_bus: &Arc<EventBus>,
 ) -> Result<CapacityAdmissionDecision> {
@@ -981,7 +986,7 @@ pub async fn admit_capacity_invocation(
 /// invocation never acquired provider execution. Once the session exists,
 /// replay adopts that row instead and this function refuses to mint authority.
 pub async fn resume_unexecuted_closure_launch_admission(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: &ModelAdmissionRequest,
     invocation_id: Uuid,
 ) -> Result<AdmissionPermit> {
@@ -1036,7 +1041,7 @@ pub async fn resume_unexecuted_closure_launch_admission(
 /// provider-effect boundary. Once the row exists, replay adopts or terminally
 /// settles that incarnation and this function refuses to mint authority.
 pub async fn resume_unexecuted_agent_successor_admission(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: &ModelAdmissionRequest,
     invocation_id: Uuid,
 ) -> Result<AdmissionPermit> {
@@ -1085,7 +1090,7 @@ pub async fn resume_unexecuted_agent_successor_admission(
 }
 
 pub async fn resume_unexecuted_capacity_delivery_admission(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: &ModelAdmissionRequest,
     invocation_id: Uuid,
 ) -> Result<AdmissionPermit> {
@@ -1142,7 +1147,7 @@ pub async fn resume_unexecuted_capacity_delivery_admission(
 }
 
 pub async fn deny_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     request: &ModelAdmissionRequest,
     reason: &str,
     event_bus: &Arc<EventBus>,
@@ -1183,7 +1188,7 @@ pub async fn deny_invocation(
 }
 
 pub async fn complete_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     permit: &AdmissionPermit,
     completion: InvocationCompletion,
     event_bus: &Arc<EventBus>,
@@ -1192,7 +1197,7 @@ pub async fn complete_invocation(
 }
 
 pub async fn complete_invocation_by_id(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     invocation_id: Uuid,
     completion: InvocationCompletion,
     event_bus: &Arc<EventBus>,
@@ -1248,7 +1253,7 @@ fn complete_invocation_locked(
 }
 
 pub async fn request_invocation_cancellation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: &ModelControlRuntime,
     event_bus: &Arc<EventBus>,
     invocation_id: Uuid,
@@ -1284,7 +1289,7 @@ pub async fn request_invocation_cancellation(
 }
 
 pub async fn apply_policy_transition(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime: &ModelControlRuntime,
     event_bus: &Arc<EventBus>,
     mode: ModelControlMode,
@@ -1334,7 +1339,7 @@ pub async fn apply_policy_transition(
 }
 
 pub async fn settle_result<T>(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     permit: &AdmissionPermit,
     completion: InvocationCompletion,
     result: Result<T>,
@@ -1627,7 +1632,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn reserved_closure_launch_resumes_only_pre_session_exact_admission() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let events = Arc::new(EventBus::new(8));
         let session_id = Uuid::new_v4();
         let request = session_launch_request("closure.source:reserved", session_id);
@@ -1694,7 +1701,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn catalog_only_purpose_cannot_acquire_an_admission_permit() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let mut request = session_launch_request("catalog-only", Uuid::new_v4());
         request.purpose = ModelInvocationPurpose::ModelDiscoveryClaudeProbe;
@@ -1709,7 +1718,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn missing_expected_usage_is_denied_before_admission() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let mut request = session_launch_request("missing-usage", Uuid::new_v4());
         request.expected_usage = None;
@@ -1736,7 +1747,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn paid_background_is_denied_by_default() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let request = ModelAdmissionRequest {
             purpose: ModelInvocationPurpose::DreamConsolidation,
@@ -1774,7 +1787,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn local_background_is_admitted_in_normal_mode() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let request = ModelAdmissionRequest {
             purpose: ModelInvocationPurpose::DreamConsolidation,
@@ -1824,7 +1839,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn remote_model_with_colon_is_not_treated_as_local() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let request = ModelAdmissionRequest {
             purpose: ModelInvocationPurpose::SessionLaunchFresh,
@@ -1865,7 +1882,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn concurrent_child_admissions_respect_explicit_tree_bounds() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let root_request = ModelAdmissionRequest {
             purpose: ModelInvocationPurpose::SessionLaunchFresh,
@@ -2106,7 +2125,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn duplicate_admission_and_completion_emit_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let mut rx = bus.subscribe();
         let session_id = Uuid::new_v4();
@@ -2154,7 +2175,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn cancellation_request_emits_bus_event_and_signal_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let runtime = ModelControlRuntime::default_normal();
         let mut rx = bus.subscribe();
@@ -2272,7 +2295,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn concurrent_cloned_permits_claim_exactly_one_cli_execution() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,
@@ -2321,7 +2346,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn one_admission_cannot_cross_or_repeat_execution_boundaries() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let mut request = purpose_request(
             ModelInvocationPurpose::DialecticQuery,
@@ -2398,7 +2425,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn purpose_rejects_an_unregistered_runtime_route_before_consumption() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,
@@ -2427,7 +2456,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[tokio::test]
     async fn claimed_cli_route_cannot_cross_to_another_registered_cli_sink() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,

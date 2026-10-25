@@ -8,7 +8,7 @@ import { vendorTerminal } from './vendor-terminal.mjs';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dist = join(root, 'dist');
 mkdirSync(dist, { recursive: true });
-for (const f of ['index.html', 'styles.css', 'detail.css', 'lifecycle.css', 'terminal.css']) {
+for (const f of ['index.html', 'styles.css', 'layout.css', 'detail.css', 'lifecycle.css', 'terminal.css']) {
   copyFileSync(join(root, 'static', f), join(dist, f));
 }
 vendorTerminal(root, dist);

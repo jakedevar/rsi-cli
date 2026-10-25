@@ -814,7 +814,9 @@ impl Store {
     /// `cloud_sweep` / `cloud_gate` job does not block (#1177): it runs in a
     /// transient `systemd-run --user` unit that is a sibling of rsid, so a
     /// restart does not kill it, and the job runner's startup poll reconciles
-    /// it and still delivers the owner's resume wake. Local `test`, `build` and
+    /// it and still delivers the owner's resume wake. A `bench` job (#3181)
+    /// never blocks either: its unit is a sibling of rsid that runs for hours,
+    /// and the trials a restart interrupts are rerun once. Local `test`, `build` and
     /// `landing` jobs still block. Idle and
     /// `WaitingApproval` sessions do not block; the caller's own session and
     /// unscoped (parentless) sessions are not workers.
@@ -830,8 +832,20 @@ impl Store {
         caller: Uuid,
         workers_block: bool,
     ) -> Result<Vec<&'static str>> {
+        self.deploy_quiet_blockers_surviving(caller, workers_block, &[])
+    }
+
+    /// [`Self::deploy_quiet_blockers_with`] where the running jobs in `surviving`
+    /// do not block (#3554): an `interrupt_workers` deploy lets ordinary test
+    /// jobs run across its restart, so they are no reason to wait.
+    pub fn deploy_quiet_blockers_surviving(
+        &self,
+        caller: Uuid,
+        workers_block: bool,
+        surviving: &[Uuid],
+    ) -> Result<Vec<&'static str>> {
         Ok(self
-            .quiet_blocker_subjects(caller, workers_block)?
+            .quiet_blocker_subjects(caller, workers_block, surviving)?
             .into_iter()
             .map(|(kind, _, _)| kind)
             .collect())
@@ -845,8 +859,18 @@ impl Store {
         caller: Uuid,
         workers_block: bool,
     ) -> Result<Vec<DeployBlockerV1>> {
+        self.deploy_quiet_blocker_details_surviving(caller, workers_block, &[])
+    }
+
+    /// [`Self::deploy_quiet_blocker_details_with`] without the `surviving` jobs.
+    pub fn deploy_quiet_blocker_details_surviving(
+        &self,
+        caller: Uuid,
+        workers_block: bool,
+        surviving: &[Uuid],
+    ) -> Result<Vec<DeployBlockerV1>> {
         Ok(self
-            .quiet_blocker_subjects(caller, workers_block)?
+            .quiet_blocker_subjects(caller, workers_block, surviving)?
             .into_iter()
             .map(|(kind, subjects, total)| DeployBlockerV1 {
                 kind: kind.to_string(),
@@ -861,6 +885,7 @@ impl Store {
         &self,
         caller: Uuid,
         workers_block: bool,
+        surviving: &[Uuid],
     ) -> Result<Vec<(&'static str, Vec<DeployBlockerSubjectV1>, u32)>> {
         // Static SQL only: the p2_07 protected-writer audit (#392) must be able
         // to prove these reads write nothing.
@@ -902,15 +927,16 @@ impl Store {
                 .collect::<Result<Vec<_>>>()?;
             blockers.push(("landing_in_progress", subjects, total));
         }
+        // The running jobs are few (a handful of units), so the survivors are
+        // filtered here rather than in SQL, which must stay a static string.
         let mut stmt = self.conn.prepare(
-            "SELECT id, kind, owner_session_id, started_at, COUNT(*) OVER () \
+            "SELECT id, kind, owner_session_id, started_at \
              FROM agent_jobs WHERE state='running' \
-             AND kind NOT IN ('cloud_sweep','cloud_gate') ORDER BY sequence LIMIT ?1",
+             AND kind NOT IN ('cloud_sweep','cloud_gate','bench') ORDER BY sequence",
         )?;
-        let mut total = 0_u32;
+        let surviving: Vec<String> = surviving.iter().map(Uuid::to_string).collect();
         let jobs = stmt
-            .query_map([CAP], |row| {
-                total = u32::try_from(row.get::<_, i64>(4)?).unwrap_or(u32::MAX);
+            .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -918,10 +944,15 @@ impl Store {
                     row.get::<_, Option<String>>(3)?,
                 ))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(id, ..)| !surviving.contains(id))
+            .collect::<Vec<_>>();
+        let total = u32::try_from(jobs.len()).unwrap_or(u32::MAX);
         if !jobs.is_empty() {
             let subjects = jobs
                 .into_iter()
+                .take(DEPLOY_BLOCKER_SUBJECTS_MAX)
                 .map(|(id, kind, owner, since)| {
                     Ok(DeployBlockerSubjectV1 {
                         job_id: Some(uuid(id, "job")?),
@@ -952,34 +983,33 @@ impl Store {
         Ok(blockers)
     }
 
-    /// #2190: the quiet-point blockers a deploy cannot preempt: an admitted or
-    /// gating queue landing (`landing_in_progress`) and a running local job that
-    /// is not a `test` job (`job_running`: a `build` or `landing` job). A running
-    /// `test` job is preemptible (it is stopped after its grace) and so is a
-    /// worker mid-turn (`interrupt_workers`), so neither is listed. While this is
-    /// non-empty, stopping test jobs gains the deploy nothing.
-    pub fn deploy_unpreemptible_blockers(&self) -> Result<Vec<&'static str>> {
-        // Static SQL only: the p2_07 protected-writer audit (#392).
-        let landing: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM rolling_queue_entries \
-             WHERE state IN ('admitted','gating'))",
-            [],
-            |row| row.get(0),
-        )?;
-        let job: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_jobs WHERE state='running' \
-             AND kind NOT IN ('cloud_sweep','cloud_gate','test'))",
-            [],
-            |row| row.get(0),
-        )?;
-        let mut blockers = Vec::new();
-        if landing {
-            blockers.push("landing_in_progress");
+    /// #3554: record that the running jobs `jobs` keep running across deploy
+    /// `id`'s restart (an `interrupt_workers` deploy stops no ordinary test job:
+    /// the new daemon re-adopts the unit and settles it once). The deploy is kept
+    /// under `survived_deploy` in the job's params, like `requeued_by_deploy`
+    /// (#2278), so no schema changes. Only a job still `running` is marked, and
+    /// only while the deploy is `restarting`. Returns the ids actually marked.
+    pub fn record_agent_deploy_surviving_jobs(&self, id: Uuid, jobs: &[Uuid]) -> Result<Vec<Uuid>> {
+        let mut marked = Vec::new();
+        for job in jobs {
+            let changed = self.conn.execute(
+                "UPDATE agent_jobs SET params_json=json_set(params_json,'$.survived_deploy',?2), \
+                 row_version=row_version+1 WHERE id=?1 AND state='running' \
+                 AND EXISTS(SELECT 1 FROM agent_deploys WHERE id=?2 AND state='restarting')",
+                params![job.to_string(), id.to_string()],
+            )?;
+            if changed == 1 {
+                marked.push(*job);
+            }
         }
-        if job {
-            blockers.push("job_running");
-        }
-        Ok(blockers)
+        Ok(marked)
+    }
+
+    /// #3554: the jobs deploy `id` let run across its restart, oldest first, as
+    /// [`Self::record_agent_deploy_surviving_jobs`] marked them; a job that
+    /// finished before the restart was never marked.
+    pub fn deploy_surviving_jobs(&self, id: Uuid) -> Result<Vec<Uuid>> {
+        surviving_jobs_conn(&self.conn, id)
     }
 
     /// #1461: the worker sessions the quiet gate counts as mid-turn (the
@@ -1082,10 +1112,29 @@ fn interrupted_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
     ))
 }
 
+/// #3554: the jobs deploy `id` marked as running across its restart.
+fn surviving_jobs_conn(conn: &rusqlite::Connection, id: Uuid) -> Result<Vec<Uuid>> {
+    let ids = conn
+        .prepare(
+            "SELECT id FROM agent_jobs \
+             WHERE json_extract(params_json,'$.survived_deploy')=?1 ORDER BY sequence",
+        )?
+        .query_map([id.to_string()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ids.iter()
+        .map(|id| {
+            Uuid::parse_str(id)
+                .map_err(|error| DaemonError::Store(format!("surviving job id: {error}")))
+        })
+        .collect()
+}
+
 /// #2048: the settle wake's account of the verification jobs the deploy
 /// stopped after its grace (empty when none), read in the settling transaction.
 /// #2278: a stopped test job is requeued under its own id, so the note names the
 /// requeued jobs apart from the ones that settled `interrupted_by_deploy`.
+/// #3554: an ordinary test job is no longer stopped; the jobs that kept running
+/// across the restart are named too, with how to read their wake.
 fn cancelled_jobs_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
     let stopped = tx
         .prepare(
@@ -1101,7 +1150,15 @@ fn cancelled_jobs_note(tx: &Transaction<'_>, id: Uuid) -> Result<String> {
         )?
         .query_map([id.to_string()], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let surviving = surviving_jobs_conn(tx, id)?;
     let mut note = String::new();
+    if !surviving.is_empty() {
+        let surviving: Vec<String> = surviving.iter().map(Uuid::to_string).collect();
+        note.push_str(&format!(
+            " Running test jobs were not stopped: their units kept running across the restart and the new daemon re-adopted them; your wake for each fires once, when the job ends, #3554: {}.",
+            surviving.join(", ")
+        ));
+    }
     if !requeued.is_empty() {
         note.push_str(&format!(
             " Running test jobs stopped after the grace were requeued under the same id, owner and wake and rerun on the new daemon; your wake for each fires once, when the rerun ends, #2278: {}.",

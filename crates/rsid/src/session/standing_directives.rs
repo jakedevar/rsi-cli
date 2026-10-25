@@ -45,6 +45,7 @@ impl AgentControlHandle {
                 scope,
                 text,
                 provenance,
+                kind,
                 expires_in_secs,
                 idempotency_key,
             } => store.standing_directive_set(
@@ -52,7 +53,8 @@ impl AgentControlHandle {
                 &StandingDirectiveSetInput {
                     scope,
                     text: &text,
-                    provenance: Some(&provenance),
+                    provenance: provenance.as_deref(),
+                    kind,
                     expires_in_secs,
                     idempotency_key: &idempotency_key,
                 },

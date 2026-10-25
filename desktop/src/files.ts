@@ -20,7 +20,7 @@ import {
 } from './files-edit-model.js';
 import { autoPairEdit, pastedText, selectionRows, shiftSigns, skipHidden, type TextEdit } from './files-editor-model.js';
 import { type Ops, type OpsHost, createOps } from './files-ops.js';
-import { el, toast } from './dom.js';
+import { el, renderMessage, toast } from './dom.js';
 import { filesApi } from './files-api.js';
 import {
   DIRECTORY_ENTRIES, DRAWER_DEFAULT, type DirEntry, FileTree, type FileRead, type FileRoot, GUTTER_CHARS, type GutterSign,
@@ -45,6 +45,7 @@ import { selected, state, uiChanged } from './state.js';
 import { focusOwnsKey, paneKeyAllowed } from './modal-gate.js';
 import { currentPlatform, isVimKeysOn } from './vimkeys.js';
 import { editorOf, enterInsert, enterNormal, modeOf, prepareForTyping, vimKey } from './vim-field.js';
+import { syncListbox } from './listbox-a11y.js';
 
 interface Ctx {
   root: FileRoot;
@@ -317,7 +318,7 @@ function build(): NonNullable<typeof ui> {
   dclose.type = 'button';
   dclose.dataset.action = 'files-explorer';
   dhead.append(title, flags, dclose);
-  const treeEl = el('ul', 'files-tree');
+  const treeEl = el('ul', 'files-tree focus-list'); // the shared focused-list ring (local #320)
   treeEl.tabIndex = 0;
   treeEl.setAttribute('role', 'tree');
   treeEl.setAttribute('aria-label', 'Project files');
@@ -378,6 +379,7 @@ function build(): NonNullable<typeof ui> {
   const pinput = el('input', 'files-picker-input');
   pinput.type = 'text';
   pinput.placeholder = 'Find file…';
+  pinput.setAttribute('aria-label', 'File name to find');
   pinput.spellcheck = false;
   pinput.autocomplete = 'off';
   const pstatus = el('div', 'files-picker-status');
@@ -505,6 +507,7 @@ function renderTree(): void {
     }
     const e = row.entry;
     li.dataset.path = e.path;
+    li.dataset.key = e.path;
     li.setAttribute('role', 'treeitem');
     if (e.kind === 'dir') li.setAttribute('aria-expanded', String(row.expanded));
     li.classList.add(e.kind);
@@ -524,6 +527,7 @@ function renderTree(): void {
   }
   u.tree.replaceChildren(...items);
   u.tree.querySelector<HTMLElement>('.files-row.selected')?.scrollIntoView({ block: 'nearest' });
+  syncListbox(u.tree, u.tree);
 }
 
 function treeRows(): number {
@@ -902,7 +906,7 @@ async function renderPreview(): Promise<void> {
     previewCurrent = -1;
     if (search) markPreview(search.pattern);
   } catch (e) {
-    if (viewer === v) u.preview.textContent = `Markdown rendering unavailable: ${String(e)}`;
+    if (viewer === v) renderMessage(u.preview, `Markdown rendering unavailable: ${String(e)}`);
   }
 }
 
@@ -1644,6 +1648,7 @@ function renderPicker(): void {
     const li = el('li', i === p.selected ? 'files-pick selected' : 'files-pick');
     li.dataset.index = String(i);
     li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(i === p.selected));
     const hits = new Set(r.hits);
     let run = '';
     let hot = false;
@@ -1658,6 +1663,7 @@ function renderPicker(): void {
   });
   u.plist.replaceChildren(...items);
   u.plist.querySelector<HTMLElement>('.files-pick.selected')?.scrollIntoView({ block: 'nearest' });
+  syncListbox(u.plist, u.pinput, { label: 'Files' });
 }
 
 function pickOpen(): void {
@@ -1842,23 +1848,23 @@ const CSS = `
 .files-ln { width: var(--files-ln, 3ch); flex: none; text-align: right; padding-right: 1ch; color: var(--subtext); opacity: 0.7; user-select: none; }
 .files-line.cursor .files-ln { opacity: 1; color: var(--text); }
 .files-text { padding-right: 2ch; }
-.files-fold { width: 1.5ch; flex: none; color: var(--overlay0, var(--subtext)); cursor: pointer; user-select: none; }
+.files-fold { width: 1.5ch; flex: none; color: var(--muted); cursor: pointer; user-select: none; }
 .files-fold-summary { color: var(--subtext); font-style: italic; }
 .files-text .v-match { background: color-mix(in srgb, var(--yellow) 30%, transparent); }
-.files-text .v-current { background: var(--yellow); color: var(--base); }
+.files-text .v-current { background: var(--yellow); color: var(--on-yellow); }
 .files-text .v-bracket { background: color-mix(in srgb, var(--mauve) 35%, transparent); }
 .files-viewer.focused .files-text .v-cursor { outline: 1px solid var(--text); background: var(--surface2, var(--surface1)); }
 .files-preview { flex: 1; overflow: auto; padding: 12px 20px; outline: none; }
 .files-preview[hidden] { display: none; }
 .files-preview mark.v-match { background: color-mix(in srgb, var(--yellow) 30%, transparent); color: inherit; }
-.files-preview mark.v-current { background: var(--yellow); color: var(--base); }
+.files-preview mark.v-current { background: var(--yellow); color: var(--on-yellow); }
 .hl-keyword { color: var(--mauve); }
 .hl-function { color: var(--blue); }
 .hl-string, .hl-code { color: var(--green); }
 .hl-number, .hl-constant { color: var(--peach); }
 .hl-type, .hl-attribute { color: var(--yellow); }
 .hl-variable { color: var(--red); }
-.hl-comment { color: var(--overlay0, var(--subtext)); font-style: italic; }
+.hl-comment { color: var(--muted); font-style: italic; }
 .hl-operator { color: var(--sky, var(--teal)); }
 .hl-property { color: var(--lavender, var(--blue)); }
 .hl-punctuation { color: var(--overlay2, var(--subtext)); }

@@ -25,6 +25,34 @@ fn text_content(ta: &TextArea<'_>) -> String {
     ta.lines().join("\n")
 }
 
+fn surface_key(surface: &mut crate::input_surface::InputSurface, code: KeyCode) {
+    let config = crate::input_surface::InputSurfaceConfig {
+        pass_through_unhandled: false,
+        available_commands: &[],
+        working_dir: None,
+        submit_on_enter: false,
+        standard_editing: false,
+    };
+    assert!(matches!(
+        crate::input_surface::handle_key(surface, key(code), &config),
+        crate::input_surface::InputAction::Consumed
+    ));
+}
+
+fn change_and_escape(text: &str, col: usize, command: &str) -> String {
+    let mut surface = crate::input_surface::InputSurface::default();
+    *surface.textarea = make_textarea(text);
+    motions::move_cursor_to(&mut surface.textarea, 0, col);
+    for ch in command.chars() {
+        surface_key(&mut surface, KeyCode::Char(ch));
+    }
+    assert_eq!(surface.mode, crate::types::PopupMode::Insert);
+    surface_key(&mut surface, KeyCode::Char('X'));
+    surface_key(&mut surface, KeyCode::Esc);
+    assert_eq!(surface.mode, crate::types::PopupMode::Normal);
+    text_content(&surface.textarea)
+}
+
 // ========================
 // Existing Phase 1 tests
 // ========================
@@ -221,7 +249,143 @@ fn test_cw_deletes_word_and_enters_insert() {
     let action = handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char('w')), None);
 
     assert_eq!(action, VimAction::EnteredInsert);
-    assert_eq!(ta.lines().join(""), "world");
+    assert_eq!(ta.lines().join(""), " world");
+}
+
+#[test]
+fn test_cw_last_word_preserves_line_break() {
+    for first_line in ["hello world", "hello a", "a", "hello café"] {
+        let col = first_line
+            .chars()
+            .position(|ch| ch == ' ')
+            .map_or(0, |c| c + 1);
+        let prefix: String = first_line.chars().take(col).collect();
+        for suffix in ["", "\nsecond line"] {
+            let text = format!("{first_line}{suffix}");
+            assert_eq!(
+                change_and_escape(&text, col, "cw"),
+                format!("{prefix}X{suffix}"),
+                "cw on {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_cw_keeps_following_spaces_and_word_boundaries() {
+    for (text, col, expected) in [
+        ("hello world  \nsecond line", 6, "hello X  \nsecond line"),
+        ("hello world", 0, "X world"),
+        ("hello world", 4, "hellX world"),
+        ("one   two\nsecond line", 3, "oneXtwo\nsecond line"),
+        ("one_two.rest\nsecond line", 0, "X.rest\nsecond line"),
+        ("one...rest\nsecond line", 3, "oneXrest\nsecond line"),
+    ] {
+        assert_eq!(change_and_escape(text, col, "cw"), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn test_counted_cw_changes_through_last_word_end() {
+    for command in ["2cw", "c2w"] {
+        assert_eq!(
+            change_and_escape("one two three\nsecond line", 0, command),
+            "X three\nsecond line"
+        );
+        assert_eq!(
+            change_and_escape("one two\nsecond line", 0, command),
+            "X\nsecond line"
+        );
+    }
+}
+
+#[test]
+fn test_cw_and_word_change_share_line_end_boundaries() {
+    for suffix in ["", "\n  second.line"] {
+        for command in ["$cw", "$cW"] {
+            assert_eq!(
+                change_and_escape(&format!("one two.three{suffix}"), 0, command),
+                format!("one two.threX{suffix}"),
+                "{command} with suffix {suffix:?}"
+            );
+        }
+        for command in ["2cW", "c2W"] {
+            assert_eq!(
+                change_and_escape(&format!("one.two three.four  {suffix}"), 0, command),
+                format!("X  {suffix}"),
+                "{command} with suffix {suffix:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dollar_stops_on_last_character_and_x_deletes_it() {
+    for first_line in ["hello world", "hello a", "a", "hello café", ""] {
+        let len = first_line.chars().count();
+        let shortened: String = first_line.chars().take(len.saturating_sub(1)).collect();
+        for suffix in ["", "\nsecond line"] {
+            let mut ta = make_textarea(&format!("{first_line}{suffix}"));
+            let mut state = VimState::default();
+            for _ in 0..2 {
+                handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char('$')), None);
+                assert_eq!(ta.cursor(), (0, len.saturating_sub(1)), "{first_line:?}");
+            }
+            // x on an empty line is a separate motion edge case; this test pins $ there.
+            if len > 0 {
+                handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char('x')), None);
+                assert_eq!(text_content(&ta), format!("{shortened}{suffix}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn test_operator_dollar_still_includes_last_character() {
+    for suffix in ["", "\nsecond line"] {
+        let text = format!("hello world{suffix}");
+        assert_eq!(
+            change_and_escape(&text, 6, "c$"),
+            format!("hello X{suffix}")
+        );
+        let mut ta = make_textarea(&text);
+        let mut state = VimState::default();
+        motions::move_cursor_to(&mut ta, 0, 6);
+        for ch in ['d', '$'] {
+            handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char(ch)), None);
+        }
+        assert_eq!(text_content(&ta), format!("hello {suffix}"));
+    }
+}
+
+#[test]
+fn test_ce_retains_inclusive_word_end_semantics() {
+    for suffix in ["", "\nsecond line"] {
+        assert_eq!(
+            change_and_escape(&format!("hello world{suffix}"), 6, "ce"),
+            format!("hello X{suffix}")
+        );
+        assert_eq!(
+            change_and_escape(&format!("hello a{suffix}"), 6, "ce"),
+            if suffix.is_empty() {
+                "hello X"
+            } else {
+                "hello X line"
+            }
+        );
+    }
+}
+
+#[test]
+fn test_append_end_keeps_insert_position_after_last_character() {
+    for first_line in ["hello world", "hello a", "a", "hello café", ""] {
+        for suffix in ["", "\nsecond line"] {
+            assert_eq!(
+                change_and_escape(&format!("{first_line}{suffix}"), 0, "A"),
+                format!("{first_line}X{suffix}")
+            );
+        }
+    }
 }
 
 #[test]
@@ -1326,4 +1490,308 @@ fn test_find_matching_bracket_all_empty_lines_between() {
     assert_eq!(result, Some((0, 0)));
     let result = find_matching_bracket_pos(&lines, 0, 0);
     assert_eq!(result, Some((4, 0)));
+}
+
+// WORD motions share the lowercase motion path, with punctuation kept in the
+// same run. Check cursor positions in both normal and visual mode.
+#[test]
+fn test_word_motions_normal_and_visual() {
+    let cases = [
+        ("foo.bar baz", (0, 0), "W", (0, 8)),
+        ("foo.bar baz", (0, 8), "B", (0, 0)),
+        ("foo.bar baz", (0, 5), "B", (0, 0)),
+        ("foo.bar baz", (0, 0), "E", (0, 6)),
+        ("foo.bar baz", (0, 6), "E", (0, 10)),
+        ("a-b  c", (0, 0), "W", (0, 5)),
+        ("a-b  c", (0, 5), "B", (0, 0)),
+        ("a-b  c", (0, 0), "E", (0, 2)),
+        ("  foo.bar  baz  ", (0, 0), "W", (0, 2)),
+        ("  foo.bar  baz  ", (0, 0), "E", (0, 8)),
+        ("  foo.bar  baz  ", (0, 13), "B", (0, 11)),
+        ("a-b\tc.d", (0, 0), "W", (0, 4)),
+        ("é-猫 baz", (0, 0), "E", (0, 2)),
+        ("é-猫 baz", (0, 0), "W", (0, 4)),
+        ("foo.bar baz qux!", (0, 0), "2W", (0, 12)),
+        ("foo.bar baz qux!", (0, 12), "2B", (0, 0)),
+        ("foo.bar baz qux!", (0, 0), "2E", (0, 10)),
+        ("foo.bar  \n  baz-qux", (0, 0), "W", (1, 2)),
+        ("foo.bar  \n  baz-qux", (1, 2), "B", (0, 0)),
+        ("foo.bar  \n  baz-qux", (0, 6), "E", (1, 8)),
+        ("foo.bar\n\nbaz-qux", (0, 0), "W", (1, 0)),
+        ("foo.bar\n\nbaz-qux", (0, 0), "2W", (2, 0)),
+        ("foo.bar\n\nbaz-qux", (2, 0), "B", (1, 0)),
+        ("foo.bar\n\nbaz-qux", (2, 0), "2B", (0, 0)),
+        ("foo.bar\n\nbaz-qux", (0, 6), "E", (2, 6)),
+        ("foo.bar", (0, 0), "W", (0, 6)),
+        ("foo.bar", (0, 6), "3E", (0, 6)),
+        ("foo.bar  ", (0, 6), "E", (0, 8)),
+        ("foo.bar  ", (0, 6), "W", (0, 8)),
+        ("foo.bar", (0, 0), "B", (0, 0)),
+        ("", (0, 0), "W", (0, 0)),
+        ("", (0, 0), "B", (0, 0)),
+        ("", (0, 0), "E", (0, 0)),
+        ("   ", (0, 0), "W", (0, 2)),
+        ("   ", (0, 0), "E", (0, 2)),
+        // Lowercase punctuation boundaries stay unchanged.
+        ("foo.bar baz", (0, 0), "w", (0, 3)),
+        ("foo.bar baz", (0, 6), "b", (0, 4)),
+        ("foo.bar baz", (0, 0), "e", (0, 2)),
+    ];
+    for visual in [false, true] {
+        for (text, start, keys, expected) in cases {
+            let mut ta = make_textarea(text);
+            let mut state = VimState::default();
+            move_cursor_to(&mut ta, start.0, start.1);
+            if visual {
+                handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char('v')), None);
+            }
+            for ch in keys.chars() {
+                assert_eq!(
+                    handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char(ch)), None),
+                    VimAction::Consumed,
+                    "{text:?} {keys} visual={visual}",
+                );
+            }
+            assert_eq!(ta.cursor(), expected, "{text:?} {keys} visual={visual}");
+            assert_eq!(text_content(&ta), text);
+            assert_eq!(state.visual, visual.then_some(VisualMode::Char));
+        }
+    }
+}
+
+#[test]
+fn test_word_operator_changes_preserve_whitespace_and_line_ends() {
+    let cases = [
+        ("foo.bar baz", (0, 0), "cW", " baz", (0, 0)),
+        ("foo.bar baz", (0, 3), "cW", "foo baz", (0, 3)),
+        ("foo.bar baz", (0, 6), "cW", "foo.ba baz", (0, 6)),
+        ("a-b  c", (0, 0), "cW", "  c", (0, 0)),
+        ("a-b  c", (0, 2), "cW", "a-  c", (0, 2)),
+        ("a-b  c", (0, 0), "cE", "  c", (0, 0)),
+        ("a-b  c", (0, 2), "cE", "a-", (0, 2)),
+        ("x  y", (0, 0), "cW", "  y", (0, 0)),
+        ("  foo.bar baz", (0, 0), "cW", "foo.bar baz", (0, 0)),
+        ("  foo.bar baz", (0, 0), "cE", " baz", (0, 0)),
+        ("foo.bar  ", (0, 0), "cW", "  ", (0, 0)),
+        ("foo.bar\nnext.line", (0, 0), "cW", "\nnext.line", (0, 0)),
+        (
+            "foo.bar\nnext.line",
+            (0, 6),
+            "cW",
+            "foo.ba\nnext.line",
+            (0, 6),
+        ),
+        (
+            "foo.bar  \nnext.line",
+            (0, 0),
+            "cW",
+            "  \nnext.line",
+            (0, 0),
+        ),
+        ("foo.bar", (0, 0), "cW", "", (0, 0)),
+        ("foo.bar", (0, 6), "cW", "foo.ba", (0, 6)),
+        ("foo.bar", (0, 6), "cE", "foo.ba", (0, 6)),
+        ("foo.bar baz qux!", (0, 0), "c2W", " qux!", (0, 0)),
+        ("foo.bar baz qux!", (0, 0), "2cW", " qux!", (0, 0)),
+        ("foo.bar baz qux!", (0, 6), "c2W", "foo.ba qux!", (0, 6)),
+        ("foo.bar baz qux!", (0, 0), "c2E", " qux!", (0, 0)),
+        ("foo.bar\n  baz-qux tail", (0, 0), "c2W", " tail", (0, 0)),
+        ("foo.bar\n\nbaz-qux tail", (0, 0), "c2W", " tail", (0, 0)),
+        ("foo.bar baz", (0, 8), "cB", "baz", (0, 0)),
+        ("é-猫 baz", (0, 0), "cW", " baz", (0, 0)),
+        ("", (0, 0), "cW", "", (0, 0)),
+    ];
+    for (text, start, keys, expected, cursor) in cases {
+        let mut ta = make_textarea(text);
+        let mut state = VimState::default();
+        move_cursor_to(&mut ta, start.0, start.1);
+        let mut action = VimAction::Consumed;
+        for ch in keys.chars() {
+            action = handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char(ch)), None);
+        }
+        assert_eq!(action, VimAction::EnteredInsert, "{text:?} {keys}");
+        assert_eq!(text_content(&ta), expected, "{text:?} {keys}");
+        assert_eq!(ta.cursor(), cursor, "{text:?} {keys}");
+        assert_eq!(state.pending_operator, None);
+    }
+}
+
+#[test]
+fn test_word_delete_and_yank_operators() {
+    let cases = [
+        (
+            "foo.bar baz",
+            (0, 0),
+            "W",
+            "foo.bar ",
+            "baz",
+            (0, 0),
+            (0, 8),
+        ),
+        (
+            "foo.bar baz",
+            (0, 0),
+            "E",
+            "foo.bar",
+            " baz",
+            (0, 0),
+            (0, 7),
+        ),
+        ("a-b  c", (0, 0), "W", "a-b  ", "c", (0, 0), (0, 5)),
+        ("a-b  c", (0, 5), "B", "a-b  ", "c", (0, 0), (0, 0)),
+        (
+            "foo.bar baz qux!",
+            (0, 0),
+            "2W",
+            "foo.bar baz ",
+            "qux!",
+            (0, 0),
+            (0, 12),
+        ),
+        (
+            "foo.bar baz qux!",
+            (0, 0),
+            "2E",
+            "foo.bar baz",
+            " qux!",
+            (0, 0),
+            (0, 11),
+        ),
+        (
+            "foo.bar baz qux!",
+            (0, 12),
+            "2B",
+            "foo.bar baz ",
+            "qux!",
+            (0, 0),
+            (0, 0),
+        ),
+        ("  foo.bar", (0, 0), "W", "  ", "foo.bar", (0, 0), (0, 2)),
+        ("foo.bar  ", (0, 0), "W", "foo.bar  ", "", (0, 0), (0, 9)),
+        ("foo.bar", (0, 0), "W", "foo.bar", "", (0, 0), (0, 7)),
+        ("foo.bar", (0, 6), "E", "r", "foo.ba", (0, 6), (0, 7)),
+        (
+            "foo.bar\n  baz",
+            (0, 0),
+            "W",
+            "foo.bar",
+            "\n  baz",
+            (0, 0),
+            (0, 7),
+        ),
+        (
+            "foo.bar\n  baz",
+            (0, 6),
+            "W",
+            "r",
+            "foo.ba\n  baz",
+            (0, 6),
+            (0, 7),
+        ),
+        (
+            "foo.bar\n  baz",
+            (0, 0),
+            "2W",
+            "foo.bar\n  baz",
+            "",
+            (0, 0),
+            (1, 5),
+        ),
+        (
+            "foo.bar\n  baz",
+            (1, 2),
+            "B",
+            "foo.bar\n  ",
+            "baz",
+            (0, 0),
+            (0, 0),
+        ),
+    ];
+    for op in ['d', 'y'] {
+        for (text, start, motion, yank, deleted, delete_cursor, yank_cursor) in cases {
+            let mut ta = make_textarea(text);
+            let mut state = VimState::default();
+            move_cursor_to(&mut ta, start.0, start.1);
+            for ch in std::iter::once(op).chain(motion.chars()) {
+                assert_eq!(
+                    handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char(ch)), None),
+                    VimAction::Consumed,
+                );
+            }
+            assert_eq!(ta.yank_text(), yank, "{text:?} {op}{motion}");
+            assert_eq!(text_content(&ta), if op == 'y' { text } else { deleted });
+            assert_eq!(
+                ta.cursor(),
+                if op == 'y' {
+                    yank_cursor
+                } else {
+                    delete_cursor
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn test_visual_word_motion_extends_selection() {
+    for (start, keys, expected, cursor) in [
+        ((0, 0), "vWd", "baz qux!", (0, 0)),
+        ((0, 0), "v2Wc", "qux!", (0, 0)),
+        ((0, 12), "v2Bd", "qux!", (0, 0)),
+    ] {
+        let mut ta = make_textarea("foo.bar baz qux!");
+        let mut state = VimState::default();
+        move_cursor_to(&mut ta, start.0, start.1);
+        for ch in keys.chars() {
+            handle_vim_normal(&mut ta, &mut state, key(KeyCode::Char(ch)), None);
+        }
+        assert_eq!(text_content(&ta), expected);
+        assert_eq!(ta.cursor(), cursor);
+        assert_eq!(state.visual, None);
+    }
+}
+
+#[test]
+fn test_word_change_through_shared_input_surface() {
+    use crate::input_surface::{InputAction, InputSurface, InputSurfaceConfig, handle_key};
+    use crate::types::PopupMode;
+
+    for pass_through_unhandled in [false, true] {
+        let config = InputSurfaceConfig {
+            pass_through_unhandled,
+            available_commands: &[],
+            working_dir: None,
+            submit_on_enter: false,
+            standard_editing: false,
+        };
+        for (text, start, command, expected, cursor) in [
+            ("foo.bar baz", 0, "cW", "X baz", (0, 1)),
+            ("foo.bar\nnext.line", 0, "cW", "X\nnext.line", (0, 1)),
+            (
+                "foo.bar  \nnext.line",
+                6,
+                "cW",
+                "foo.baX  \nnext.line",
+                (0, 7),
+            ),
+            ("foo.bar baz tail", 0, "c2W", "X tail", (0, 1)),
+        ] {
+            let mut surface = InputSurface::default();
+            *surface.textarea = make_textarea(text);
+            surface.mode = PopupMode::Normal;
+            move_cursor_to(&mut surface.textarea, 0, start);
+            for ch in command.chars() {
+                assert!(matches!(
+                    handle_key(&mut surface, key(KeyCode::Char(ch)), &config),
+                    InputAction::Consumed,
+                ));
+            }
+            assert_eq!(surface.mode, PopupMode::Insert);
+            handle_key(&mut surface, key(KeyCode::Char('X')), &config);
+            handle_key(&mut surface, key(KeyCode::Esc), &config);
+            assert_eq!(surface.mode, PopupMode::Normal);
+            assert_eq!(text_content(&surface.textarea), expected);
+            assert_eq!(surface.textarea.cursor(), cursor);
+        }
+    }
 }

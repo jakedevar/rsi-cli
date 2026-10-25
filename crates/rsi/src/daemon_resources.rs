@@ -212,6 +212,10 @@ pub struct DaemonResourceSample {
     pub uptime_secs: Option<u64>,
     pub rss_bytes: Option<u64>,
     pub heap_in_use_bytes: Option<u64>,
+    /// Highest resident size since the daemon started (#3491).
+    pub rss_peak_bytes: Option<u64>,
+    /// How old `heap_in_use_bytes` is; the daemon samples it once a minute.
+    pub heap_age_secs: Option<u64>,
     pub persistence_queue_depth: usize,
     pub persistence_queue_capacity: usize,
     pub last_command_duration_ms: u64,
@@ -251,6 +255,8 @@ impl DaemonResourceSample {
             uptime_secs,
             rss_bytes: memory.map(|memory| memory.rss_bytes),
             heap_in_use_bytes: memory.and_then(|memory| memory.heap_in_use_bytes),
+            rss_peak_bytes: memory.and_then(|memory| memory.rss_peak_bytes),
+            heap_age_secs: memory.and_then(|memory| memory.heap_sample_age_secs),
             persistence_queue_depth: health.persistence_queue_depth,
             persistence_queue_capacity: health.persistence_queue_capacity,
             last_command_duration_ms: health.last_command_duration_ms,
@@ -327,6 +333,26 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// A heap sample older than this is labelled with its age: it refreshes on the
+/// daemon's 60 s trim timer, so a younger one is current enough to read as live.
+pub const HEAP_STALE_AFTER_SECS: u64 = 90;
+
+/// `peak 2.8G` when the daemon once held clearly more than it holds now, so a
+/// start-up spike that was freed shows as history instead of as current use
+/// (#3491). Nothing when the peak is the present size.
+#[must_use]
+pub fn peak_note(rss_bytes: u64, peak_bytes: Option<u64>) -> Option<String> {
+    let peak = peak_bytes?;
+    (peak > rss_bytes.saturating_add(rss_bytes / 4)).then(|| format!("peak {}", format_bytes(peak)))
+}
+
+/// `3m old` for a heap sample past [`HEAP_STALE_AFTER_SECS`].
+#[must_use]
+pub fn heap_age_note(age_secs: Option<u64>) -> Option<String> {
+    let age = age_secs.filter(|age| *age >= HEAP_STALE_AFTER_SECS)?;
+    Some(format!("{} old", format_uptime(age)))
+}
+
 /// `3d4h`, `3h12m`, `12m`, `<1m`.
 #[must_use]
 pub fn format_uptime(secs: u64) -> String {
@@ -367,6 +393,8 @@ mod tests {
             uptime_secs: None,
             rss_bytes: None,
             heap_in_use_bytes: None,
+            rss_peak_bytes: None,
+            heap_age_secs: None,
             persistence_queue_depth: 0,
             persistence_queue_capacity: 0,
             last_command_duration_ms: 0,
@@ -397,6 +425,8 @@ mod tests {
             uptime_secs: None,
             rss_bytes: None,
             heap_in_use_bytes: None,
+            rss_peak_bytes: None,
+            heap_age_secs: None,
             persistence_queue_depth: 0,
             persistence_queue_capacity: 0,
             last_command_duration_ms: 0,
@@ -452,5 +482,27 @@ mod tests {
         assert_eq!(after.start_ticks, counters.start_ticks);
         let spent = after.cpu_ticks - counters.cpu_ticks;
         assert!(spent >= 15, "250 ms of CPU is ~25 ticks, read {spent}");
+    }
+
+    #[test]
+    fn peak_note_shows_only_a_peak_clearly_above_the_present_size_3491() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            peak_note(357 * MIB, Some(2_817_788 * 1024)).as_deref(),
+            Some("peak 2.7G")
+        );
+        assert_eq!(peak_note(357 * MIB, Some(380 * MIB)), None);
+        assert_eq!(peak_note(357 * MIB, None), None);
+    }
+
+    #[test]
+    fn heap_age_note_labels_only_a_stale_sample_3491() {
+        assert_eq!(heap_age_note(None), None);
+        assert_eq!(heap_age_note(Some(59)), None);
+        assert_eq!(
+            heap_age_note(Some(HEAP_STALE_AFTER_SECS)).as_deref(),
+            Some("1m old")
+        );
+        assert_eq!(heap_age_note(Some(200)).as_deref(), Some("3m old"));
     }
 }

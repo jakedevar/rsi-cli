@@ -157,6 +157,9 @@ test('widgets: switches, choices, text editors, read-only and partial rows', () 
   assert.equal(row('built_in_theme').widget.type, 'local');
   assert.equal(row('theme_roles').widget.type, 'local');
   assert.equal(row('cloud_spend_status').widget.type, 'display');
+  assert.equal(row('open_router_spend_status').widget.type, 'display');
+  assert.equal(row('open_router_spend_cap').widget.type, 'text-editor');
+  assert.equal(row('open_router_spend_warn_pct').widget.type, 'choice');
   // Gap sweep G4: the slots row opens the admin Provider keys overlay (values stay write-only there).
   assert.deepEqual(row('provider_credential_slots').widget, { type: 'local', local: 'provider-keys' });
   assert.deepEqual(row('budget_policies').widget, { type: 'local', local: 'budgets' });
@@ -169,8 +172,8 @@ test('widgets: switches, choices, text editors, read-only and partial rows', () 
 
 test('the Vim keys toggle lives in Workspace › Editing Mode', () => {
   const rows = sectionRows('editing_mode', {});
-  assert.deepEqual(rows.map((r) => r.label), ['Editing mode', 'Vim keys (this desktop)']);
-  assert.deepEqual(rows[1].widget, { type: 'local', local: 'vim-keys' });
+  assert.deepEqual(rows.map((r) => r.label), ['Vim keys in this window', 'Text editing in the TUI (Standard or Vim)']);
+  assert.deepEqual(rows[0].widget, { type: 'local', local: 'vim-keys' });
 });
 
 test('text values: numbers are parsed, editors trim, oversize is refused', () => {
@@ -249,4 +252,27 @@ test('search needs every term and wraps', () => {
   const last = all[all.length - 1];
   assert.equal(nextMatch(all, last, 1).wrapped, true);
   assert.deepEqual(nextMatch(all, last, 1).match, all[0]);
+});
+
+test('the benchmark job rows sit in Benchmarks with a switch, a 1-8 choice and a text editor (#3181)', () => {
+  const rows = sectionRows('benchmarks', {
+    'bench.docker_hosts': '',
+    'bench.enabled': false,
+    'bench.max_concurrency': 4,
+    'bench.laptop_host': 'arch-laptop',
+  });
+  const byId = Object.fromEntries(rows.map((row) => [row.id, row]));
+  assert.equal(byId.bench_enabled.field, 'bench.enabled');
+  assert.equal(byId.bench_enabled.widget.type, 'switch');
+  assert.equal(byId.bench_max_concurrency.field, 'bench.max_concurrency');
+  assert.equal(byId.bench_max_concurrency.widget.type, 'choice');
+  assert.deepEqual(byId.bench_max_concurrency.widget.options, ['1', '2', '3', '4', '5', '6', '7', '8']);
+  assert.equal(byId.bench_laptop_host.field, 'bench.laptop_host');
+  assert.equal(byId.bench_laptop_host.widget.type, 'text-editor');
+  assert.equal(byId.bench_laptop_host.widget.editor.field, 'bench.laptop_host');
+  // The docker host allowlist of #3176 stays beside them.
+  assert.equal(byId.bench_docker_hosts.widget.type, 'text-editor');
+  for (const id of ['bench_enabled', 'bench_max_concurrency', 'bench_laptop_host']) {
+    assert.equal(SETTINGS_ROWS.find((row) => row.id === id)?.section, 'benchmarks');
+  }
 });

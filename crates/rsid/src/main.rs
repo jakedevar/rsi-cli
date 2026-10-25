@@ -33,6 +33,21 @@ const OPERATOR_DRAIN_LIMIT: Duration = Duration::from_secs(30);
 /// blocks until every `spawn_blocking` task returns, and a blocking read of a
 /// provider child's pipe can outlive the daemon by minutes.
 const RUNTIME_DROP_GRACE: Duration = Duration::from_secs(2);
+/// Stack of every tokio worker thread (#3431). The default 2 MiB overflowed
+/// ("thread 'tokio-runtime-worker' has overflowed its stack") in an unoptimized
+/// daemon on the session launch/continue path, whose nested async state
+/// machines are polled inline on the worker. Stack pages are mapped lazily, so
+/// the larger limit costs address space, not resident memory.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// The daemon's multi-thread runtime, with worker stacks sized by
+/// `WORKER_STACK_BYTES`.
+fn build_daemon_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK_BYTES)
+        .build()
+}
 
 async fn shutdown_stage<F: std::future::Future>(
     subsystem: &'static str,
@@ -168,9 +183,7 @@ fn main() -> Result<()> {
     // that would otherwise take their own arenas first (#997).
     rsid::process_memory::configure_allocator();
     let startup = prepare_daemon()?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let runtime = build_daemon_runtime()?;
     run_to_bounded_exit(runtime, Box::pin(run_daemon(startup)))
 }
 
@@ -303,7 +316,14 @@ fn prepare_daemon() -> Result<DaemonStartup> {
     previous_umask.restore();
 
     // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // The fmt layer writes to stdout. launchd/systemd point that at a file, so
+    // colour escapes only belong on an interactive terminal (#240).
+    tracing_subscriber::fmt()
+        .with_ansi(log_ansi_enabled(
+            std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()),
+        ))
+        .init();
 
     // Route panics through tracing so they land in the same sink as everything
     // else instead of writing an unstructured line to raw stderr and vanishing
@@ -366,6 +386,13 @@ fn prepare_daemon() -> Result<DaemonStartup> {
         db = %db_path.display(),
         "Acquired daemon single-instance lease"
     );
+
+    // #3480: journal this boot beside the socket so a restart loop is visible.
+    // After the lease, so a second instance that is refused leaves no record.
+    rsid::daemon_lifecycle::set_journal_path(rsid::daemon_lifecycle::journal_path_beside(
+        &config.socket_path,
+    ));
+    rsid::daemon_lifecycle::journal_record_start();
 
     // Bridge the first guarded rollout: an already-running legacy binary does
     // not hold the new file lease. A connectable socket is positive incumbent
@@ -574,12 +601,17 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         &rsi_common::identity::data_path("deploy-restart-budget", "deploy-restart-budget"),
         &runtime_config,
     )?;
-    // #1036: publish the operator's spend caps for scripts/cloud-spend.py.
+    // #1036: publish the operator's spend caps for rsi-cloud spend.
     if let Err(error) = rsid::cloud_spend::write_caps_file(
         &rsid::cloud_spend::default_cloud_dir(),
         &runtime_config.cloud_spend_caps(),
     ) {
         warn!(%error, "could not write the remote-gate spend caps file");
+    }
+    // #3154: with an OpenRouter spend cap armed, take the first usage probe
+    // before sessions are restored (restored sessions are judged against it).
+    if runtime_config.openrouter_spend_config().cap_usd > 0.0 {
+        rsid::openrouter_spend::prime_probe().await;
     }
     if persisted_daemon_settings > 0 {
         config.apply_runtime_config_snapshot(&runtime_config);
@@ -599,6 +631,8 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
             .load(std::sync::atomic::Ordering::Relaxed),
     )
     .await;
+    // #3999: keep the slice's MemoryHigh following the operator's own memory use.
+    rsid::build_budget::spawn_memory_watch();
 
     // #694 K1: open the provider key vault after the persisted
     // `vault.*` settings are applied. A vault whose directory or file mode is
@@ -699,8 +733,20 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         Arc::clone(&runtime_config),
         config.sandbox_base.clone(),
     )?;
+    rsid::session_start_preamble::initialize(session_manager.store());
     if let Some(runtime) = &_codegraph_runtime {
         session_manager.set_codegraph_handle(runtime.handle().clone());
+    }
+    // Hub #3315: the built-in "RSI home" project, where global and portfolio
+    // manager seats run. Idempotent; a failure leaves those seats in their
+    // coverage project, as before, and never stops the daemon.
+    match dirs::home_dir() {
+        Some(home) => {
+            if let Err(error) = session_manager.ensure_home_project(home).await {
+                warn!(%error, "home project was not registered");
+            }
+        }
+        None => warn!("no home directory: home project was not registered"),
     }
 
     spans.mark("session_manager_new");
@@ -783,6 +829,39 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
             false
         }
     };
+    // #3178: bench trials in flight at a restart become `infra_interrupted` and
+    // are never resumed (the restart journal below cannot spend for them: a
+    // model call of a task that is not running is refused), and every active
+    // bench run gets its adapter socket back.
+    {
+        let bench = rsid::bench::BenchService::new(
+            Arc::clone(session_manager.store()),
+            Arc::new(rsid::bench::DaemonBenchHost::new(
+                Arc::clone(&session_manager),
+                Arc::clone(&runtime_config),
+            )),
+            rsid::bench::default_root(),
+        );
+        match bench.restore().await {
+            Ok(0) => {}
+            Ok(count) => warn!(count, "Bench trials interrupted by the restart"),
+            Err(error) => warn!(error = %error, "Bench run restore failed"),
+        }
+        // #4013: group the finished trials that launched at the project root
+        // before #3992. Idempotent; one cheap query when nothing is left.
+        match bench.group_orphan_trials().await {
+            Ok(0) => {}
+            Ok(count) => warn!(count, "Bench trials grouped into their run's Group"),
+            Err(error) => warn!(error = %error, "Bench trial backfill failed"),
+        }
+        rsid::bench::install_global(bench);
+        // #3181: the gates of the `bench` job kind read the operator settings and
+        // the spend cap through the same installed pieces.
+        rsid::agent_jobs::install_bench_job_ports(
+            Arc::clone(&runtime_config),
+            Arc::clone(session_manager.store()),
+        );
+    }
     // The exact journal owns graceful interruptions. Claim it after
     // invocation and custody restore, before schedulers or watch dispatch.
     // Only the claim runs here: the claimed intents stay durable (journal-owned
@@ -892,7 +971,9 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                 rsid::rolling_queue::run_rolling_queue_loop(
                     Arc::clone(session_manager.store()),
                     Arc::clone(&runtime_config),
-                    rsid::rolling_queue::LanderLauncher::discover().with_build_slice(),
+                    rsid::rolling_queue::LanderLauncher::discover()
+                        .with_build_slice()
+                        .with_compile_probe(),
                     session_manager.deploy_drain(),
                     session_manager.host_load(),
                 ),
@@ -928,6 +1009,15 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                     Arc::clone(session_manager.store()),
                     rsid::agent_jobs::platform_job_runtime(),
                     session_manager.deploy_drain(),
+                ),
+            ));
+            // #644: a disk-floor hold that persists is told to its owner and the
+            // manager once; no model polling, floor and job timeout unchanged.
+            tokio::spawn(after_request_ready(
+                readiness_rx.clone(),
+                rsid::agent_jobs::run_disk_hold_watch_loop(
+                    Arc::clone(session_manager.store()),
+                    Arc::clone(&runtime_config),
                 ),
             ));
         },
@@ -1453,6 +1543,11 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         Arc::clone(session_manager.store()),
         Arc::clone(&runtime_config),
     );
+    rsid::start_satellite_enqueue_intake(
+        Arc::clone(session_manager.store()),
+        session_manager.agent_control(),
+        Arc::clone(&runtime_config),
+    );
 
     spans.mark("compile_engine_and_warmup");
     let mut rpc_server = RpcServer::new(
@@ -1590,6 +1685,10 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
     )));
     // #1333: the andon files one kaizen Issue per repeating friction signature.
     tokio::spawn(rsid::friction::run_andon_loop(Arc::clone(&session_manager)));
+    // #3789: import external harness reports filed as GitHub Issues (outbound `gh` only).
+    tokio::spawn(rsid::external_report_sync::run_sync_loop(Arc::clone(
+        &session_manager,
+    )));
     // #2246: a project graph stuck Degraded or Failed for over 24 hours gets one Issue.
     if let Some(runtime) = &_codegraph_runtime {
         tokio::spawn(rsid::codegraph::run_codegraph_health_loop(
@@ -1603,6 +1702,13 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         session_manager.store().clone(),
         Arc::clone(session_manager.event_bus()),
         Arc::clone(&runtime_config),
+    ));
+    // #3154: while an OpenRouter spend cap is armed, keep the account-usage
+    // probe fresh so the launch backstop and the warn notice judge a current
+    // figure (idle while no cap is armed).
+    tokio::spawn(rsid::openrouter_spend::run_spend_probe_loop(
+        Arc::clone(&runtime_config),
+        session_manager.store().clone(),
     ));
     // #1337: the CPU-time andon per agent-owned process tree.
     tokio::spawn(rsid::cpu_andon::run_cpu_andon_loop(
@@ -1751,6 +1857,11 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                 if let Err(error) = succession_runtime.resettle_tier_mail().await {
                     warn!(error = %error, "Tier mail settlement pass deferred");
                 }
+                // #3390: launch ready `dispatch:auto` Issues into their
+                // starter without a manager turn.
+                if let Err(error) = succession_runtime.dispatch_auto_issues().await {
+                    warn!(error = %error, "Issue auto-dispatch pass deferred");
+                }
             }
         });
     }
@@ -1813,7 +1924,8 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
     // recorded creating, 72 h old, unheld, in authenticated unmounted roots,
     // holding no dirty or unpublished git work; bounded per pass. Runs on a
     // blocking thread, first pass after ten minutes.
-    tokio::spawn(async {
+    let scratch_store = Arc::clone(session_manager.store());
+    tokio::spawn(async move {
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + std::time::Duration::from_secs(600),
             std::time::Duration::from_secs(3600),
@@ -1821,10 +1933,19 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
+            // #646: the open jobs let a build target whose worktree is gone go
+            // at once; an unreadable store keeps the age floor.
+            let open_jobs =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), scratch_store.lock())
+                    .await
+                {
+                    Ok(store) => rsid::agent_scratch_reclaim::open_jobs(&store),
+                    Err(_) => None,
+                };
             // #1150: deletion is on after the hardened core's final check
             // (registry pruning stays off; see agent_scratch_reclaim).
-            let _ = tokio::task::spawn_blocking(|| {
-                rsid::agent_scratch_reclaim::run_and_log(false, "periodic")
+            let _ = tokio::task::spawn_blocking(move || {
+                rsid::agent_scratch_reclaim::run_and_log_with_jobs(false, "periodic", open_jobs)
             })
             .await;
         }
@@ -1833,6 +1954,14 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
     // local #120 (hub #3103): the project-file trash keeps the TUI's 7-day
     // rule; one bounded pass at start, later passes follow trash writes.
     tokio::task::spawn_blocking(rsid::prune_project_file_trash_at_start);
+
+    // local #86: an image UploadPasteImage stored that nothing ever named is
+    // removed 7 days after its last upload; a named one only under the opt-in
+    // setting paste_retention_referenced_days. One bounded pass at start,
+    // later passes follow uploads (rsid::paste_retention).
+    tokio::spawn(rsid::paste_retention::prune_paste_images_at_start(
+        std::sync::Arc::clone(session_manager.store()),
+    ));
 
     spans.mark("post_authority_services");
     info!(
@@ -1977,6 +2106,7 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         session_manager.cold_archive_lifecycle(),
     ));
     tokio::spawn(Arc::clone(&session_manager).run_cold_archive_loop());
+    tokio::spawn(Arc::clone(&session_manager).run_error_disposition_loop());
 
     let mut watchdog = Some(rsid::watchdog::start_watchdog(
         config.socket_path.clone(),
@@ -1991,8 +2121,10 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
     )?);
 
     // Main loop
-    let ctrl_c = signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // #3433: SIGINT is registered eagerly (what `ctrl_c()` does on first poll),
+    // so the sender-capture handler installed below chains to a live runtime
+    // handler instead of being replaced when the first `select!` polls it.
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
 
     // SIGTERM is what process supervisors actually send (`systemctl stop`,
     // bare `kill`, `docker stop`). Without an explicit handler its default
@@ -2003,6 +2135,8 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
     // the standard "stop the daemon" case. `Signal::recv` is cancel-safe, so
     // losing this branch to another `select!` arm cannot drop a signal.
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    // #3433: after both handlers exist, record who sends SIGINT/SIGTERM.
+    rsid::signal_sender::install_shutdown_signal_capture();
     // #2936: after the SIGTERM handler exists, so the watch's signal drains.
     #[cfg(target_os = "macos")]
     rsid::supervisor_shutdown::spawn_supervisor_parent_watch();
@@ -2025,11 +2159,15 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
         tokio::select! {
             _ = drain_request_tick.tick(), if drain_deadline.is_none() => {
                 if session_manager.drain_restart_requested() {
+                    let first_request = operator_drain_started.is_none();
                     let started = *operator_drain_started.get_or_insert_with(|| {
                         info!("Operator DRAIN restart requested; status reads remain available during the wait");
                         rsid::supervisor_shutdown::mark_shutdown_begun("drain_restart");
                         tokio::time::Instant::now()
                     });
+                    if first_request {
+                        rsid::daemon_lifecycle::journal_record_stop(session_manager.store(), "drain_restart").await;
+                    }
                     shutdown_deadline = started + OPERATOR_DRAIN_LIMIT + SHUTDOWN_LIMIT;
                     // Complete when nothing is active, when every active session
                     // waits only on a call the daemon is serving (a turn that
@@ -2065,9 +2203,15 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                     warn!(%error, "Operator message dispatch deferred");
                 }
             }
-            _ = &mut ctrl_c, if drain_deadline.is_none() => {
+            _ = sigint.recv(), if drain_deadline.is_none() => {
                 info!("Received shutdown signal (Ctrl+C)");
-                rsid::supervisor_shutdown::mark_shutdown_begun("ctrl_c");
+                let sender = rsid::signal_sender::take_sender(true);
+                rsid::supervisor_shutdown::mark_shutdown_begun_from(
+                    "ctrl_c",
+                    sender.as_ref().map(|sender| sender.pid),
+                );
+                rsid::supervisor_shutdown::log_shutdown_signal("SIGINT", sender.as_ref());
+                rsid::daemon_lifecycle::journal_record_stop(session_manager.store(), "ctrl_c").await;
                 hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
@@ -2078,10 +2222,22 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                 drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
                 rpc_server.begin_connection_drain();
                 info!(connections = connections.len(), "Connection drain started");
+                rsid::supervisor_shutdown::record_shutdown_signal(
+                    session_manager.store(),
+                    "SIGINT",
+                    sender.as_ref(),
+                )
+                .await;
             }
             _ = sigterm.recv(), if drain_deadline.is_none() => {
                 info!("Received shutdown signal (SIGTERM)");
-                rsid::supervisor_shutdown::mark_shutdown_begun("sigterm");
+                let sender = rsid::signal_sender::take_sender(false);
+                rsid::supervisor_shutdown::mark_shutdown_begun_from(
+                    "sigterm",
+                    sender.as_ref().map(|sender| sender.pid),
+                );
+                rsid::supervisor_shutdown::log_shutdown_signal("SIGTERM", sender.as_ref());
+                rsid::daemon_lifecycle::journal_record_stop(session_manager.store(), "sigterm").await;
                 hard_shutdown_requested = true;
                 shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_LIMIT;
                 session_manager.begin_restart_drain();
@@ -2092,6 +2248,12 @@ async fn run_daemon(startup: DaemonStartup) -> Result<()> {
                 drain_deadline = Some(tokio::time::Instant::now() + CONNECTION_DRAIN_LIMIT);
                 rpc_server.begin_connection_drain();
                 info!(connections = connections.len(), "Connection drain started");
+                rsid::supervisor_shutdown::record_shutdown_signal(
+                    session_manager.store(),
+                    "SIGTERM",
+                    sender.as_ref(),
+                )
+                .await;
             }
             () = async {
                 if let Some(deadline) = deadline_snapshot {
@@ -2314,8 +2476,42 @@ async fn process_spawn_request(
     }
 }
 
+/// Whether the tracing fmt layer may emit ANSI colour escapes: only when the
+/// sink is an interactive terminal and `NO_COLOR` is not set (#240).
+fn log_ansi_enabled(sink_is_terminal: bool, no_color: bool) -> bool {
+    sink_is_terminal && !no_color
+}
+
 #[cfg(test)]
 mod tests {
+    /// #3431: a worker thread of the daemon runtime has room for a stack the
+    /// default 2 MiB would overflow (aborting the process).
+    #[test]
+    fn daemon_runtime_workers_have_a_deep_stack() {
+        #[inline(never)]
+        fn burn(depth: usize) -> usize {
+            let frame = [depth as u8; 1024];
+            let below = if depth == 0 { 0 } else { burn(depth - 1) };
+            std::hint::black_box(&frame);
+            below + usize::from(frame[0] != 7)
+        }
+        let runtime = super::build_daemon_runtime().expect("runtime");
+        // ~4 MiB of frames: beyond the 2 MiB tokio default, inside 16 MiB.
+        let used = runtime
+            .block_on(async { tokio::spawn(async { burn(4096) }).await })
+            .expect("worker task");
+        assert!(used > 0);
+    }
+
+    /// #240: a file sink (launchd `daemon.log`) never gets ANSI escapes.
+    #[test]
+    fn log_ansi_follows_the_sink_and_no_color() {
+        assert!(!super::log_ansi_enabled(false, false));
+        assert!(!super::log_ansi_enabled(false, true));
+        assert!(super::log_ansi_enabled(true, false));
+        assert!(!super::log_ansi_enabled(true, true));
+    }
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -2479,10 +2675,7 @@ mod tests {
     #[ignore = "fixture entry point for the isolated real-daemon startup test"]
     fn sr2_real_daemon_fixture_process() {
         let startup = prepare_daemon().expect("single-threaded fixture startup");
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("fixture runtime");
+        let runtime = build_daemon_runtime().expect("fixture runtime");
         if std::env::var_os("RSI_TEST_STUCK_BLOCKING_TASK").is_some() {
             // Stands in for a blocking read of a provider child's pipe.
             runtime.spawn_blocking(|| std::thread::sleep(Duration::from_secs(600)));
@@ -3505,9 +3698,7 @@ mod tests {
             !prepare_body.contains("thread::"),
             "prepare stays single-threaded"
         );
-        let tracing_init = prepare_body
-            .find("tracing_subscriber::fmt::init()")
-            .unwrap();
+        let tracing_init = prepare_body.find("tracing_subscriber::fmt()").unwrap();
         let first_line = prepare_body.find("\"rsid starting...\"").unwrap();
         assert!(tracing_init < first_line);
         assert!(
@@ -3615,6 +3806,7 @@ mod tests {
             "run_rolling_queue_loop(",
             "run_deploy_loop(",
             "run_agent_jobs_loop(",
+            "run_disk_hold_watch_loop(",
             "replay_c5_autofile_pending()",
         ] {
             let at = body.find(spawn).unwrap_or_else(|| panic!("{spawn}"));
@@ -3887,7 +4079,7 @@ async fn init_memory_system(
     use rsid::memory::worker::spawn_memory_worker;
 
     let memory_store = MemoryStore::open(&memory_config.db_path)?;
-    let main_store = Arc::new(tokio::sync::Mutex::new(rsid::store::Store::open(
+    let main_store = Arc::new(rsid_core::store_lock::Mutex::new(rsid::store::Store::open(
         main_db_path,
     )?));
 

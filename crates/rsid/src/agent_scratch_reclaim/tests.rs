@@ -4163,3 +4163,431 @@ fn cargo_cache_proof_accepts_cross_compile_and_tool_layouts_and_requires_a_marke
         b"retain"
     );
 }
+
+// ---- #3261: registered manager build targets under `build-targets` ----
+
+/// A `build-targets` root inside the fixture root and a config that scans only
+/// it, the way the standard config lists `<data dir>/build-targets`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+fn build_targets_cfg(fx: &Fx, min_age: Duration) -> (PathBuf, ScratchConfig) {
+    let parent = fx.root().join("build-targets");
+    let mut cfg = fx.config(RootKind::CargoTarget, min_age);
+    cfg.roots = vec![(parent.clone(), RootKind::CargoTarget)];
+    (parent, cfg)
+}
+
+/// A registered manager build target holding a cargo `debug/` tree.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+fn registered_build_target(fx: &Fx, parent: &Path) -> PathBuf {
+    let source = tempdir_keeping_btime();
+    let target = cargo_targets::manager_target_in(parent, fx.registry(), source.path()).unwrap();
+    fs::create_dir_all(target.join("debug/deps")).unwrap();
+    fs::write(target.join("debug/deps/dep.rlib"), vec![1u8; 16384]).unwrap();
+    target
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+fn unpublished_repo(repo: &Path) {
+    fs::create_dir_all(repo).unwrap();
+    git(repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(repo, &["add", "a.txt"]);
+    git(repo, &["commit", "-q", "-m", "local only"]);
+}
+
+/// The Issue's case: an idle registered build target whose only repository is a
+/// test fixture is reclaimed, and the pass names it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn idle_build_target_with_only_fixture_repos_is_reclaimed_and_reported() {
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, OLD);
+    let target = registered_build_target(&fx, &parent);
+    unpublished_repo(&target.join("rsid-test-fixtures/registered-recovery-repo-x"));
+    unpublished_repo(&target.join("slice8-codex-provider-fixtures/nested/repo"));
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 1, "{report:?}");
+    assert!(!target.exists());
+    assert_eq!(report.build_targets_total, 1);
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Reclaim, "{named:?}");
+    assert_eq!(named.reason, "reclaimable");
+    assert!(named.bytes.unwrap() > 0, "{named:?}");
+    assert_eq!(
+        named.name,
+        target.file_name().unwrap().to_string_lossy(),
+        "{named:?}"
+    );
+}
+
+/// Only a top-level `*-fixtures` directory is exempt: unpublished history
+/// anywhere else in a target still keeps it, with the reason on record.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn unpublished_repo_outside_fixture_dirs_still_pins_a_build_target() {
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, OLD);
+    let target = registered_build_target(&fx, &parent);
+    unpublished_repo(&target.join("debug/not-a-fixture/repo"));
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.kept_unpublished, 1, "{report:?}");
+    assert!(target.join("debug/not-a-fixture/repo/a.txt").exists());
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Unpublished, "{named:?}");
+    assert_eq!(named.reason, "unpublished_git_history");
+    assert!(
+        named.bytes.unwrap() > 0,
+        "kept targets are measured: {named:?}"
+    );
+}
+
+/// A target idle for less than the age floor is kept, and the report says how
+/// long it has been idle and how big it is, so the manager can see what pins it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn young_build_target_is_named_with_idle_age_and_bytes() {
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, MIN_AGE);
+    let target = registered_build_target(&fx, &parent);
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(target.exists());
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Young, "{named:?}");
+    assert_eq!(named.reason, "idle_below_age_floor");
+    assert!(named.idle_secs.unwrap() < 60, "{named:?}");
+    assert!(named.bytes.unwrap() > 0, "{named:?}");
+}
+
+/// One bounded log line per build target, carrying the reason; a kept target is
+/// not starved of its line by the unrelated candidates that fill the generic
+/// "could not prove" slots.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn every_build_target_gets_one_bounded_log_line_with_its_reason() {
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut report = ScratchReport::default();
+    for index in 0..(MAX_BUILD_TARGET_LOG_LINES + 3) {
+        report.note_build_target(
+            &format!("rsi-build-{index:02}"),
+            Decision::Unpublished,
+            Some(4096),
+            Some(7 * 86_400 * 1_000_000_000),
+        );
+    }
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || log_build_targets("periodic", &report));
+
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let lines = text
+        .lines()
+        .filter(|line| line.contains("build target decision trigger"))
+        .count();
+    assert_eq!(lines, MAX_BUILD_TARGET_LOG_LINES, "{text}");
+    assert!(
+        text.contains("reason=\"unpublished_git_history\""),
+        "{text}"
+    );
+    assert!(text.contains("idle_secs=604800"), "{text}");
+    assert!(text.contains("target=rsi-build-00"), "{text}");
+    assert!(text.contains("unlogged=3"), "{text}");
+}
+
+/// The storage preview splits bytes into live (held), reclaimable and kept.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn build_target_status_counts_live_reclaimable_and_kept_bytes() {
+    use rsi_common::sandbox_storage::SandboxBuildTargetState as State;
+    let mut report = ScratchReport::default();
+    assert!(build_targets::status_from(&report).is_none());
+    report.note_build_target("rsi-build-live", Decision::Held, Some(900), Some(0));
+    report.note_build_target("rsi-build-idle", Decision::Reclaim, Some(300), Some(10));
+    report.note_build_target("rsi-build-new", Decision::Young, Some(70), Some(5));
+    report.note_build_target("rsi-build-git", Decision::Unpublished, None, None);
+
+    let status = build_targets::status_from(&report).unwrap();
+
+    assert_eq!(status.total_count, 4);
+    assert_eq!(status.live_bytes, 900);
+    assert_eq!(status.reclaimable_bytes, 300);
+    assert_eq!(status.kept_bytes, 70);
+    let by_name = |name: &str| status.entries.iter().find(|e| e.name == name).unwrap();
+    assert_eq!(by_name("rsi-build-live").state, State::Live);
+    assert_eq!(by_name("rsi-build-idle").state, State::Reclaimable);
+    assert_eq!(by_name("rsi-build-new").reason, "idle_below_age_floor");
+    assert_eq!(by_name("rsi-build-git").state, State::Kept);
+    assert_eq!(status.entries[0].name, "rsi-build-live", "largest first");
+    status.validate_wire().unwrap();
+}
+
+/// A dry run over a real registered target feeds the same status, and deletes
+/// nothing.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn dry_run_status_reports_an_idle_target_as_reclaimable_without_deleting() {
+    use rsi_common::sandbox_storage::SandboxBuildTargetState as State;
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, OLD);
+    let target = registered_build_target(&fx, &parent);
+
+    let report = run(&cfg, later(), true);
+    let status = build_targets::status_from(&report).unwrap();
+
+    assert!(target.exists());
+    assert_eq!(status.entries[0].state, State::Reclaimable, "{status:?}");
+    assert!(status.reclaimable_bytes > 0, "{status:?}");
+    assert_eq!(status.live_bytes, 0);
+}
+
+// ---- #646: a build target whose source worktree is gone ----
+
+/// A registered build target for a worktree the test keeps or removes, under
+/// the age floor with the open-job list the caller supplies.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+fn owned_build_target(fx: &Fx, parent: &Path, worktree: &Path) -> PathBuf {
+    let target = cargo_targets::manager_target_in(parent, fx.registry(), worktree).unwrap();
+    fs::create_dir_all(target.join("debug/deps")).unwrap();
+    fs::write(target.join("debug/deps/dep.rlib"), vec![1u8; 16384]).unwrap();
+    target
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn orphaned_terminal_build_target_is_reclaimed_under_the_age_floor() {
+    let fx = Fx::new();
+    let (parent, mut cfg) = build_targets_cfg(&fx, MIN_AGE);
+    cfg.open_jobs = Some(Vec::new());
+    let worktree = fx.root().join("qa-gone");
+    fs::create_dir_all(&worktree).unwrap();
+    let canonical = worktree.canonicalize().unwrap();
+    let target = owned_build_target(&fx, &parent, &worktree);
+    fs::remove_dir_all(&worktree).unwrap();
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 1, "{report:?}");
+    assert!(!target.exists());
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Reclaim, "{named:?}");
+    assert_eq!(
+        named.worktree.as_deref(),
+        Some(canonical.to_string_lossy().as_ref()),
+        "{named:?}"
+    );
+    assert_eq!(named.job_id, None);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn build_target_with_an_existing_worktree_keeps_the_age_floor_and_names_it() {
+    let fx = Fx::new();
+    let (parent, mut cfg) = build_targets_cfg(&fx, MIN_AGE);
+    cfg.open_jobs = Some(Vec::new());
+    let worktree = fx.root().join("qa-present");
+    fs::create_dir_all(&worktree).unwrap();
+    let canonical = worktree.canonicalize().unwrap();
+    let target = owned_build_target(&fx, &parent, &worktree);
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(target.exists());
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Young, "{named:?}");
+    assert_eq!(named.reason, "idle_below_age_floor");
+    assert_eq!(
+        named.worktree.as_deref(),
+        Some(canonical.to_string_lossy().as_ref())
+    );
+    let status = build_targets::status_from(&report).unwrap();
+    assert_eq!(status.entries[0].worktree, named.worktree);
+    status.validate_wire().unwrap();
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn build_target_of_a_gone_worktree_with_an_open_job_is_kept_and_names_the_job() {
+    let fx = Fx::new();
+    let (parent, mut cfg) = build_targets_cfg(&fx, MIN_AGE);
+    let worktree = fx.root().join("qa-job");
+    fs::create_dir_all(worktree.join("sub")).unwrap();
+    let canonical = worktree.canonicalize().unwrap();
+    let target = owned_build_target(&fx, &parent, &worktree);
+    fs::remove_dir_all(&worktree).unwrap();
+    cfg.open_jobs = Some(vec![OpenJob {
+        id: "job-1".to_string(),
+        cwd: canonical.join("sub"),
+    }]);
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(target.exists());
+    let named = &report.build_targets[0];
+    assert_eq!(named.decision, Decision::Young, "{named:?}");
+    assert_eq!(named.job_id.as_deref(), Some("job-1"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn build_target_of_a_gone_worktree_is_kept_while_the_open_jobs_are_unknown() {
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, MIN_AGE);
+    assert!(cfg.open_jobs.is_none());
+    let worktree = fx.root().join("qa-unknown");
+    fs::create_dir_all(&worktree).unwrap();
+    let target = owned_build_target(&fx, &parent, &worktree);
+    fs::remove_dir_all(&worktree).unwrap();
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(target.exists());
+    assert_eq!(report.build_targets[0].decision, Decision::Young);
+}
+
+/// A seat's registered QA target holding a cargo `debug/` tree.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+fn seat_qa_build_target(fx: &Fx, parent: &Path, seat: &Path) -> PathBuf {
+    let target = cargo_targets::seat_qa_target_in(parent, fx.registry(), seat).unwrap();
+    fs::create_dir_all(target.join("debug/deps")).unwrap();
+    fs::write(target.join("debug/deps/dep.rlib"), vec![1u8; 16384]).unwrap();
+    target
+}
+
+/// Hub #3870 b: every QA worktree of one seat builds in the seat's one warm
+/// target, so a second head finds the first head's dependencies; another seat
+/// gets its own, and neither is a per-worktree target.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn qa_worktrees_of_one_seat_share_a_target_and_two_seats_do_not() {
+    let fx = Fx::new();
+    let (parent, _cfg) = build_targets_cfg(&fx, MIN_AGE);
+    let seat = fx.root().join("seat-a");
+    let other_seat = fx.root().join("seat-b");
+    fs::create_dir_all(&seat).unwrap();
+    fs::create_dir_all(&other_seat).unwrap();
+
+    let first = seat_qa_build_target(&fx, &parent, &seat);
+    // The second QA worktree of the same seat resolves to the same directory
+    // and finds the warm dependency the first one built.
+    let again = cargo_targets::seat_qa_target_in(&parent, fx.registry(), &seat).unwrap();
+    assert_eq!(first, again);
+    assert!(again.join("debug/deps/dep.rlib").is_file());
+
+    let other = cargo_targets::seat_qa_target_in(&parent, fx.registry(), &other_seat).unwrap();
+    assert_ne!(first, other);
+    let per_worktree = cargo_targets::manager_target_in(&parent, fx.registry(), &seat).unwrap();
+    assert_ne!(first, per_worktree);
+    assert!(
+        first
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("rsi-build-"),
+        "the pass still lists a seat target as a build target"
+    );
+}
+
+/// Single writer: a QA build holds the target's admission lock for its whole
+/// run, so a second QA build of the same seat is serialised behind it and runs
+/// once the first ends.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn a_second_qa_build_of_the_seat_waits_for_the_target_admission_lock() {
+    let fx = Fx::new();
+    let (parent, _cfg) = build_targets_cfg(&fx, MIN_AGE);
+    let seat = fx.root().join("seat-a");
+    fs::create_dir_all(&seat).unwrap();
+    let target = seat_qa_build_target(&fx, &parent, &seat);
+    let same = cargo_targets::seat_qa_target_in(&parent, fx.registry(), &seat).unwrap();
+    assert_eq!(target, same);
+
+    let first = crate::release_target::take_admission(&target)
+        .unwrap()
+        .expect("the first QA build takes the lock");
+    assert!(
+        crate::release_target::take_admission(&same)
+            .unwrap()
+            .is_none(),
+        "a concurrent second QA build must wait"
+    );
+    drop(first);
+    assert!(
+        crate::release_target::take_admission(&same)
+            .unwrap()
+            .is_some(),
+        "the second QA build runs once the first ended"
+    );
+}
+
+/// The warm target outlives the QA worktrees it served while the seat exists
+/// (age floor applies), and is reclaimable at once when the seat is gone.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn seat_qa_target_is_kept_while_the_seat_lives_and_reclaimed_when_it_is_gone() {
+    let fx = Fx::new();
+    let (parent, mut cfg) = build_targets_cfg(&fx, MIN_AGE);
+    cfg.open_jobs = Some(Vec::new());
+    let seat = fx.root().join("seat-a");
+    fs::create_dir_all(&seat).unwrap();
+    let canonical = seat.canonicalize().unwrap();
+    let target = seat_qa_build_target(&fx, &parent, &seat);
+
+    let live = run_pass(&cfg);
+    assert_eq!(live.reclaimed, 0, "{live:?}");
+    assert!(target.exists(), "a live seat keeps its warm target");
+    let named = &live.build_targets[0];
+    assert_eq!(named.decision, Decision::Young, "{named:?}");
+    assert_eq!(named.reason, "idle_below_age_floor");
+
+    fs::remove_dir_all(&seat).unwrap();
+    let gone = run_pass(&cfg);
+    assert_eq!(gone.reclaimed, 1, "{gone:?}");
+    assert!(!target.exists());
+    assert_eq!(
+        gone.build_targets[0].worktree.as_deref(),
+        Some(canonical.to_string_lossy().as_ref())
+    );
+}
+
+/// A gone seat's target is still fenced like any other: unknown open jobs keep
+/// the age floor.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+#[test]
+fn seat_qa_target_of_a_gone_seat_is_kept_while_the_open_jobs_are_unknown() {
+    let fx = Fx::new();
+    let (parent, cfg) = build_targets_cfg(&fx, MIN_AGE);
+    assert!(cfg.open_jobs.is_none());
+    let seat = fx.root().join("seat-a");
+    fs::create_dir_all(&seat).unwrap();
+    let target = seat_qa_build_target(&fx, &parent, &seat);
+    fs::remove_dir_all(&seat).unwrap();
+
+    let report = run_pass(&cfg);
+
+    assert_eq!(report.reclaimed, 0, "{report:?}");
+    assert!(target.exists());
+}

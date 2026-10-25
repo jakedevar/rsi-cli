@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub(crate) async fn create_program(
@@ -213,6 +212,9 @@ pub(crate) async fn launch_source(
         topology_iteration: 0,
         closure_selector: Some(selector),
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     };
     let root_session_id = manager
         .launch_reserved_closure_source(
@@ -256,7 +258,7 @@ pub(crate) async fn record_evidence(
 }
 
 async fn record_evidence_with_store(
-    store: &Arc<Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     request: RecordClosureEvidenceRequestV1,
 ) -> Result<ClosureEvidenceResultV1> {
     #[cfg(test)]
@@ -277,7 +279,7 @@ struct ClosureEvidencePrecommitBarrier {
 }
 
 async fn record_evidence_with_store_inner(
-    store: &Arc<Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     request: RecordClosureEvidenceRequestV1,
     #[cfg(test)] precommit_barrier: Option<ClosureEvidencePrecommitBarrier>,
 ) -> Result<ClosureEvidenceResultV1> {
@@ -1040,7 +1042,7 @@ mod tests {
 
     struct EvidenceFixture {
         _tempdir: tempfile::TempDir,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         repository: PathBuf,
         source_worktree: PathBuf,
         evidence_worktree: PathBuf,
@@ -1373,7 +1375,7 @@ mod tests {
             };
             Self {
                 _tempdir: tempdir,
-                store: Arc::new(Mutex::new(store)),
+                store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
                 repository,
                 source_worktree,
                 evidence_worktree,

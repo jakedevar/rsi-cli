@@ -88,6 +88,8 @@ export const SLICE: SliceSpec<NavActionId> = {
   order: 36,
   actions: NAV_ACTIONS,
   rules: NAV_RULES,
+  // routeNavKey (nav-model.ts), run from the window keydown listener in actions/nav-run.ts; C-w arms h/j/k/l.
+  rawKeys: ['C-d', 'C-u', 'C-f', 'C-b', 'C-w'],
   keys: NAV_KEYS,
   commands: NAV_COMMANDS,
 };

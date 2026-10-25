@@ -7,7 +7,6 @@
 use crate::store::Store;
 use rsi_common::harness_tool_policy::HarnessToolPolicy;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// The policy `session_id` launches under. Read-only: a policy row is written
@@ -21,7 +20,7 @@ use uuid::Uuid;
 /// continued or rotated session therefore needs no copy of its ancestor's row.
 /// A read failure yields the fail-closed policy.
 pub(super) async fn resolve_launch_tool_policy(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     parent: Option<Uuid>,
     explicit: Option<&HarnessToolPolicy>,
@@ -54,7 +53,7 @@ pub(super) async fn resolve_launch_tool_policy(
 /// Record an explicit or spawn-inherited policy for `session_id`. The session
 /// row must already exist (foreign key); an existing row is kept.
 pub(super) async fn persist_launch_tool_policy(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     policy: &HarnessToolPolicy,
 ) -> crate::error::Result<()> {
@@ -77,11 +76,16 @@ mod tests {
         }
     }
 
-    fn store() -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    fn store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
+        Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ))
     }
 
-    async fn session(store: &Arc<Mutex<Store>>, continued_from: Option<Uuid>) -> Uuid {
+    async fn session(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        continued_from: Option<Uuid>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let mut row = crate::session::agent_verbs::tests::test_session(
             id,

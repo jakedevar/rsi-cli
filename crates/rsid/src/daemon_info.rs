@@ -16,6 +16,12 @@ use std::time::Instant;
 /// Commit SHA embedded by `build.rs` (`RSI_BUILD_SHA` or `git rev-parse HEAD`).
 pub const BUILD_SHA: &str = env!("RSI_BUILD_SHA");
 
+/// Harness source digest of `BUILD_SHA`, embedded by `build.rs` (#3192): a sha256 over the git
+/// tree or blob ids of the paths in `rsi-common/data/harness_source_paths.txt`, or
+/// `unavailable:<sha>` when git could not say. It changes only when the harness code does, not on
+/// every redeploy, which keeps a benchmark baseline comparable across builds.
+pub const HARNESS_SOURCE_DIGEST: &str = env!("RSI_HARNESS_SOURCE_DIGEST");
+
 /// Process-lifetime facts, captured once at startup.
 pub struct DaemonInfoService {
     started_at: DateTime<Utc>,

@@ -78,8 +78,9 @@ impl Store {
                 ")
              SELECT mi.id, mi.session_id, mi.created_at, mi.input_tokens, mi.output_tokens,
                     mi.cache_read_tokens, mi.cache_creation_tokens,
-                    CASE WHEN mi.session_id IS NULL THEN mi.estimated_cost_usd
-                         ELSE ci.cost_increment_usd END
+                    ",
+                "CASE WHEN rsi_billing_mode(mi.provider,mi.model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))='subscription' THEN 0.0 ELSE CASE WHEN mi.session_id IS NULL THEN mi.estimated_cost_usd ELSE ci.cost_increment_usd END END",
+                "
              FROM model_invocations mi
              LEFT JOIN (",
                 crate::model_control::cost::cost_increment_for_ids_sql!(),
@@ -510,6 +511,13 @@ mod tests {
     fn test_store() -> (tempfile::TempDir, Store) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_test_fixture(&dir.path().join("metrics.db")).unwrap();
+        // These dollar metrics regressions model a metered API login.
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
+        store
+            .set_daemon_setting("codex_billing_mode", "metered_api")
+            .unwrap();
         (dir, store)
     }
 

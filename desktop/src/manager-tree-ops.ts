@@ -37,7 +37,8 @@ function impact(ctx: TreeContext, r: TreeRow): string {
 }
 
 async function confirmAndSend(title: string, lines: string[], destructive: boolean, rpc: string, send: (confirm: boolean) => Promise<unknown>, ctx: TreeContext, done: string): Promise<void> {
-  if (!(await ask({ title, lines: [...lines, rpc], ok: destructive ? 'Send (y)' : 'Send', destructive }))) return;
+  // Plain words first; the RPC and the versions it expects sit under Details (local #223).
+  if (!(await ask({ title, lines, details: rpc, ok: destructive ? 'Send (y)' : 'Send', destructive }))) return;
   try {
     if ((await withCapConfirm(title, send)) !== null) toast(done, true);
   } catch (e) {

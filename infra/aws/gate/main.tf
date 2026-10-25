@@ -2,6 +2,13 @@
 # remote gate, destroy; keep no build volumes or snapshots). Drive it with
 # scripts/cloud-gate.sh, which always destroys on exit.
 #
+# Spot only (#3460): a one-time spot request capped at var.spot_max_price_usd
+# (AWS never bills an hour above it, so scripts/cloud-gate.sh can reserve the
+# run's worst case in the spend ledger before this applies), terminated on
+# interruption; the host carries an rsi:expires-at tag that the orphan sweep
+# enforces. Never on-demand: the instance type below is the only one the
+# rsi-cloud-terraform IAM policy allows, and it passed a spot dry run.
+#
 # The host borrows the persistent rsid-host network (VPC, public subnet and
 # the security group whose only ingress is the operator's SSH /32), so it adds
 # no network exposure. It has no secrets and no data volume: the root volume
@@ -29,16 +36,32 @@ data "aws_ssm_parameter" "ami" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
 
+locals {
+  # scripts/cloud-gate.sh passes the exact expiry it reserved; a bare apply
+  # falls back to now plus the guest lifetime.
+  expires_at = var.expires_at != "" ? var.expires_at : timeadd(timestamp(), "${var.max_lifetime_minutes}m")
+}
+
 resource "aws_instance" "gate" {
-  ami                                  = data.aws_ssm_parameter.ami.value
-  instance_type                        = var.instance_type
-  subnet_id                            = data.aws_subnet.shared.id
-  vpc_security_group_ids               = [data.aws_security_group.shared.id]
-  associate_public_ip_address          = true
-  key_name                             = var.ssh_key_name
-  instance_initiated_shutdown_behavior = "terminate"
-  iam_instance_profile                 = var.sccache_bucket == "" ? null : var.instance_profile_name
-  user_data_replace_on_change          = true
+  ami                         = data.aws_ssm_parameter.ami.value
+  instance_type               = var.instance_type
+  subnet_id                   = data.aws_subnet.shared.id
+  vpc_security_group_ids      = [data.aws_security_group.shared.id]
+  associate_public_ip_address = true
+  key_name                    = var.ssh_key_name
+  # No instance_initiated_shutdown_behavior: AWS refuses to modify it on spot
+  # instances (UnsupportedOperation, #3977) and a one-time spot instance
+  # terminates on guest shutdown anyway.
+  iam_instance_profile        = var.sccache_bucket == "" ? null : var.instance_profile_name
+  user_data_replace_on_change = true
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      max_price                      = tostring(var.spot_max_price_usd)
+      instance_interruption_behavior = "terminate"
+      spot_instance_type             = "one-time"
+    }
+  }
   user_data = templatefile("${path.module}/bootstrap.sh.tftpl", {
     max_lifetime_minutes = var.max_lifetime_minutes
     run_as               = var.run_as
@@ -59,5 +82,9 @@ resource "aws_instance" "gate" {
     volume_size           = var.root_volume_gib
     delete_on_termination = true
   }
-  tags = { Name = "rsi-remote-gate", Service = "rsi-remote-gate" }
+  tags = { Name = "rsi-remote-gate", Service = "rsi-remote-gate", "rsi:expires-at" = local.expires_at }
+  lifecycle {
+    # timestamp() moves on every plan; the tag is set once, at create.
+    ignore_changes = [tags["rsi:expires-at"]]
+  }
 }

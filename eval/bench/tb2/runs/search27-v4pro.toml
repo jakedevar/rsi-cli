@@ -1,0 +1,17 @@
+# Run config (#3135, #3685): batch 4 of the published-numbers plan. Same 27 oracle-solvable search
+# tasks and k=1 as search27-flash.toml, run with deepseek/deepseek-v4-pro at a $0.55 per-task cap, to compare with
+# the deepseek-v4.1-flash row. Concurrency 3. Submit with budget_usd 15. Needs allowed_launches
+# for (OpenRouter, deepseek/deepseek-v4-pro, high).
+schema_version = 1
+name = "search27-v4pro"
+description = "RSI harness, deepseek/deepseek-v4-pro, 27 search tasks (oracle-solvable), k=1"
+host = "ssh://arch-laptop"
+tasks = ["break-filter-js-from-html", "code-from-image", "constraints-scheduling", "db-wal-recovery", "dna-assembly", "extract-elf", "extract-moves-from-video", "feal-differential-cryptanalysis", "financial-document-processor", "fix-git", "git-leak-recovery", "git-multibranch", "headless-terminal", "hf-model-inference", "merge-diff-arc-agi-task", "multi-source-data-merger", "openssl-selfsigned-cert", "password-recovery", "path-tracing-reverse", "polyglot-rust-c", "pytorch-model-recovery", "raman-fitting", "regex-chess", "sparql-university", "sqlite-with-gcov", "torch-pipeline-parallelism", "winning-avg-corewars"]
+k = 1
+concurrency = 3
+
+[agent]
+kind = "rsi"
+model = "deepseek/deepseek-v4-pro"
+effort = "high"
+per_task_cap_usd = 0.55

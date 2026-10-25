@@ -1,0 +1,6 @@
+error: could not compile `rsid` (lib test)
+SCOPED_DIAG "error: could not compile `rsid` (lib test)"
+Caused by:
+  process didn't exit successfully: `rsi-build-rustc rustc --crate-name rsid` (signal: 15, SIGTERM: termination signal)
+{"reason":"build-finished","success":false}
+SCOPED_PHASE build_failed

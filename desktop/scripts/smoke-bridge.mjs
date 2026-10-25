@@ -38,6 +38,18 @@ export function redactConfig(v, depth = 0) {
 }
 
 const refuse = (why) => { throw new Error(why); };
+/** managers.rs `SECTIONS`: `ManagerInspectSectionV2` in its serde spelling. */
+const MANAGER_SECTIONS = ['overview', 'workers', 'work', 'requests', 'decisions', 'topology', 'resources', 'actions', 'events', 'archive', 'health',
+  'migration_allocations', 'satellites', 'friction', 'rulings'];
+const boundedInt = (name, v, min, max) => {
+  if (!Number.isInteger(v) || v < min || v > max) throw new Error(`${name} must be ${min}..=${max}`);
+  return v;
+};
+/** managers.rs `cursor`: a short text without NUL. */
+const cursorText = (name, v, max) => {
+  if (typeof v !== 'string' || !v || v.length > max || v.includes('\0')) throw new Error(`${name} is malformed`);
+  return v;
+};
 const history = (a) => {
   const p = { project_id: uuid('project_id', a?.projectId), issue_id: uuid('issue_id', a?.issueId) };
   if (a?.afterSequence != null) p.after_sequence = a.afterSequence;
@@ -131,11 +143,45 @@ export const READ_COMMANDS = {
     wrap: (health) => ({ socket: 'daemon.sock', connected: true, health }),
     fallback: (e) => ({ socket: 'daemon.sock', connected: false, error: String(e.message) }),
   },
+  // The newer-build notice reads this on a 30 s cadence (local #322): build_sha and local_build.
+  get_daemon_build: { method: 'GetDaemonInfo', params: () => ({}) },
   list_projects: { method: 'ListProjects', params: none },
   list_sessions: { method: 'ListSessions', params: none },
   list_archived_sessions: { method: 'ListArchivedSessions', params: (a) => (a?.projectId ? { project_id: a.projectId } : null) },
   get_session: { method: 'GetSession', params: (a) => ({ session_id: uuid('session_id', a?.sessionId) }) },
   list_labels: { method: 'ListLabels', params: none },
+  // Reads the app makes the moment a view opens (local #298). Left off this table they were treated as writes and answered
+  // null, so the view failed with "Cannot read properties of null" instead of showing itself. Each mirrors src-tauri/src.
+  list_mcp_servers: { method: 'ListMcpServers', params: none },
+  list_satellite_peers: { method: 'ListSatellitePeers', params: none },
+  get_satellite_scope_status: { method: 'GetSatelliteScopeStatus', params: none },
+  get_satellite_inbound_policy: { method: 'GetSatelliteInboundPolicy', params: none },
+  list_hub_satellite_sessions: {
+    method: 'ListHubSatelliteSessions',
+    params: (a) => ({ peer_id: uuid('peer_id', a?.peerId), offset: boundedInt('offset', a?.offset ?? 0, 0, 1_000_000), limit: 30 }),
+  },
+  list_legacy_scratch: { method: 'ListLegacyScratch', params: none },
+  list_source_worktree_cohorts: { method: 'ListSourceWorktreeCohorts', params: () => ({}) },
+  list_source_worktree_settlement_runs: { method: 'ListSourceWorktreeSettlementRuns', params: () => ({}) },
+  get_source_worktree_settlement_run: { method: 'GetSourceWorktreeSettlementRun', params: (a) => ({ run_id: uuid('run_id', a?.runId) }) },
+  get_drain_restart_status: { method: 'GetDrainRestartStatus', params: () => ({}) },
+  list_skills: { method: 'ListSkills', params: () => ({ user: true, max_entries: 256 }) },
+  get_skill: { method: 'GetSkill', params: (a) => ({ user: true, name: cursorText('name', a?.name, 128) }) },
+  list_prompt_files: { method: 'ListPromptFiles', params: () => ({}) },
+  get_prompt_file: { method: 'GetPromptFile', params: (a) => ({ name: cursorText('name', a?.name, 128) }) },
+  fleet_overview: { method: 'GetFleetOverview', params: () => ({}) },
+  portfolio_nodes_list: { method: 'ListPortfolioNodes', params: (a) => ({ include_revoked: !!a?.includeRevoked }) },
+  manager_nodes_list: {
+    method: 'ListManagerNodes',
+    params: (a) => ({ project_id: uuid('project_id', a?.projectId), after_node_id: a?.after ? uuid('after_node_id', a.after) : null, limit: 50 }),
+  },
+  friction_rollup: { method: 'ListFrictionRollup', params: (a) => (a?.windowHours == null ? {} : { window_hours: boundedInt('window_hours', a.windowHours, 1, 720) }) },
+  operator_escalations: { method: 'ListOperatorEscalations', params: (a) => ({ include_closed: !!a?.includeClosed, undelivered_after: null }) },
+  operator_restart_status: { method: 'GetOperatorRestart', params: () => ({}) },
+  get_entity_card: {
+    method: 'GetEntityCard',
+    params: (a) => ({ entity_type: cursorText('entity_type', a?.entityType, 64), entity_id: cursorText('entity_id', a?.entityId, 128) }),
+  },
   remote_get_status: { method: 'RemoteGetStatus', params: none },
   list_scheduled_jobs: {
     method: 'ListScheduledJobs',
@@ -169,6 +215,20 @@ export const READ_COMMANDS = {
   graph_list_workflows: { method: 'ListWorkflows', params: (a) => (a?.projectId ? { project_id: uuid('project_id', a.projectId) } : {}) },
   graph_get_workflow: { method: 'GetWorkflowDefinition', params: (a) => ({ workflow_id: uuid('workflow_id', a?.workflowId) }) },
   graph_get_execution: { method: 'GetWorkflowExecution', params: (a) => ({ execution_id: uuid('execution_id', a?.executionId) }) },
+  // The recursive DAG browser's reads (src-tauri/src/graphs.rs dag_* and graph_list_recursive); its controls are writes and stay out.
+  graph_list_recursive: { method: 'ListRecursiveTaskGraphs', params: (a) => ({ project_id: a?.projectId ? uuid('project_id', a.projectId) : null, include_quarantined: !!a?.includeQuarantined }) },
+  dag_get_graph: { method: 'GetRecursiveTaskGraph', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId) }) },
+  dag_operational_status: { method: 'GetRecursiveDagOperationalStatus', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId) }) },
+  dag_scheduler_runs: { method: 'ListRecursiveSchedulerRuns', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), limit: 12, include_terminal: true }) },
+  dag_scheduler_run: { method: 'GetRecursiveSchedulerRun', params: (a) => ({ run_id: uuid('run_id', a?.runId) }) },
+  dag_run_events: { method: 'ListRecursiveSchedulerRunEvents', params: (a) => ({ run_id: uuid('run_id', a?.runId), limit: 80 }) },
+  dag_cancellations: { method: 'ListRecursiveCancellationRequests', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), limit: 24 }) },
+  dag_recovery_status: { method: 'GetRecursiveRecoveryStatus', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId) }) },
+  dag_stale_heartbeats: { method: 'ListStaleRecursiveLiveAttemptHeartbeats', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), limit: 24 }) },
+  dag_live_recovery: { method: 'GetRecursiveLiveRecoveryStatus', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), include_recovery_pending: true, include_deferred_graph: true }) },
+  dag_live_attempts: { method: 'ListRecursiveLiveAttempts', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), include_terminal: true, include_status: true, limit: 24 }) },
+  dag_validations: { method: 'ListRecursiveLiveOutputValidationResults', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), include_issues: true, limit: 24 }) },
+  dag_artifacts: { method: 'ListRecursiveExecutionArtifactSummaries', params: (a) => ({ graph_id: uuid('graph_id', a?.graphId), limit: 24, include_total: false, ...(a?.cursor ? { cursor: String(a.cursor) } : {}) }) },
   list_issue_handoffs: { method: 'ListIssueHandoffs', params: (a) => history(a) },
   list_provider_credentials: { method: 'ListProviderCredentials', params: none, wrap: (l) => redactCredentialList(l) },
   get_provider_login_state: { method: 'GetProviderLoginState', params: (a) => (a?.refresh ? refuse('a refresh runs the provider CLI') : null) },
@@ -191,6 +251,41 @@ export const READ_COMMANDS = {
       if (a?.sinceSequence != null) p.since_sequence = a.sinceSequence;
       return p;
     },
+  },
+  // The manager surfaces (src-tauri/src/managers.rs builders): the tree, the board, the policy and scope forms, the global
+  // manager grant, workspace and budget panel, and the dashboard. Each only reads; every write sits behind WRITE_COMMANDS.
+  manager_tree: { method: 'GetManagerTree', params: (a) => {
+    const limit = boundedInt('limit', a?.limit, 1, 200);
+    return a?.after == null ? { limit } : { limit, after: cursorText('after', a.after, 128) };
+  } },
+  harness_manager_get: { method: 'GetHarnessManager', params: (a) => ({ project_id: uuid('project_id', a?.projectId) }) },
+  harness_manager_policy_get: { method: 'GetHarnessManagerPolicy', params: (a) => ({ project_id: uuid('project_id', a?.projectId) }) },
+  // The Tauri handler pins the page bound (SCOPE_MAX_LIMIT) itself.
+  harness_manager_scope_page: { method: 'ListHarnessManagerScope', params: (a) => {
+    const p = { project_id: uuid('project_id', a?.projectId), limit: 64 };
+    if (a?.afterId != null) p.after_id = uuid('after_id', a.afterId);
+    return p;
+  } },
+  harness_manager_state: { method: 'GetHarnessManagerState', params: (a) => {
+    if (!MANAGER_SECTIONS.includes(a?.section)) throw new Error(`section must be one of ${MANAGER_SECTIONS.join(', ')}`);
+    const query = { section: a.section, limit: boundedInt('limit', a?.limit, 1, 128) };
+    if (a?.cursor != null) query.cursor = cursorText('cursor', a.cursor, 512);
+    return { project_id: uuid('project_id', a?.projectId), query };
+  } },
+  global_manager_get: { method: 'GetGlobalManager', params: () => ({}) },
+  global_manager_workspace: { method: 'GetGlobalManagerWorkspace', params: () => ({}) },
+  global_manager_budget: { method: 'GetGlobalManagerBudget', params: (a) => (a?.nodeId == null ? {} : { node_id: uuid('node_id', a.nodeId) }) },
+  global_dashboard: { method: 'GetGlobalDashboard', params: (a) => {
+    if (!['1h', '24h', '7d'].includes(a?.window)) throw new Error('window must be one of 1h, 24h, 7d');
+    return { window: a.window };
+  } },
+  // The Trash browser and the session model picker (lifecycle.rs, detail.rs).
+  list_deleted_sessions: { method: 'ListDeletedSessions', params: (a) => (a?.projectId ? { project_id: uuid('project_id', a.projectId) } : {}) },
+  get_session_model_switch_options: { method: 'GetSessionModelSwitchOptions', params: (a) => ({ session_id: uuid('session_id', a?.sessionId) }) },
+  // budgets.rs reads the model-control status with no recent rows and keeps only the mode and the policies.
+  budget_policies: {
+    method: 'GetModelControlStatus', params: () => ({ recent_limit: 0 }),
+    wrap: (status) => ({ mode: status?.mode, policies: status?.policies ?? [] }),
   },
 };
 
@@ -344,6 +439,12 @@ export const WRITE_COMMANDS = {
   },
 };
 
+const MANUAL_SECTIONS = [
+  { title: 'Getting started', html: '<h1>Getting started</h1><p>Press <code>n</code> to start a session, <code>Enter</code> to open one, <code>?</code> for help.</p><table><tr><th>Key</th><th>Does</th></tr><tr><td><code>j</code> / <code>k</code></td><td>Move down or up the session list</td></tr><tr><td><code>/</code></td><td>Filter sessions</td></tr></table>' },
+  { title: 'Sessions', html: '<h1>Sessions</h1><p>A session is one conversation with a provider. Send a message, answer a question, or stop a turn from the session view.</p><ul><li>Archive keeps a session out of the way.</li><li>Restore brings it back.</li></ul>' },
+  { title: 'Settings', html: '<h1>Settings</h1><p>Open Actions and choose Settings to change a setting. Changes apply to the running rsid.</p>' },
+];
+
 /** Commands answered by the shim itself with no daemon traffic (no backend state to read). */
 export const LOCAL_COMMANDS = {
   live_link: () => false,
@@ -351,16 +452,34 @@ export const LOCAL_COMMANDS = {
   set_app_menu: () => null,
   sync_menu_state: () => null,
   set_attention_count: () => null,
+  // notify_session posts a macOS notification (src-tauri/src/notify.rs, local #294); a headless page posts none, and the smoke must never reach the desktop.
+  notify_session: () => null,
+  // notify_permission reads macOS's notification permission and open_notification_settings opens System Settings (local #300); a headless page has neither, so it reports unknown and opens nothing.
+  notify_permission: () => 'unknown',
+  open_notification_settings: () => null,
+  // set_window_theme only themes the native title bar (src-tauri/src/window_theme.rs, local #283); a headless page has none.
+  set_window_theme: () => null,
   // boot_report only prints the boot line to the process log (src-tauri/src/boot.rs); the page keeps it in data-boot-report.
   boot_report: () => null,
-  // render_markdown is a pure Rust function (markdown.rs); the shim escapes the text instead, which is innerHTML-safe.
-  render_markdown: (a) => (Array.isArray(a?.texts) ? a.texts : []).map((t) => `<p>${escapeHtml(String(t)).replace(/\n/g, '<br>')}</p>`),
+  // render_markdown is a pure Rust function (markdown.rs); the shim renders a small subset instead (paragraphs, bullet and numbered
+  // lists, fenced code, `code` and **bold**), escaping first so the output is innerHTML-safe (local #313).
+  render_markdown: (a) => (Array.isArray(a?.texts) ? a.texts : []).map((t) => renderMarkdownSubset(String(t))),
   // The embedded terminal's PTY is Tauri-only. These stubs open no shell and run nothing: they let the overlay render.
   pty_spawn: () => ({ id: 'smoke-pty', cwd: '/' }),
   pty_write: () => null,
   pty_resize: () => null,
   pty_kill: () => true,
+  // The native folder chooser (dialog.rs) cannot open in a headless page; the stub answers like a person who picked a folder (local #271).
+  // manual_sections renders the embedded manual (commandmode.rs); the shim answers a short manual of the same shape ({ title, html }).
+  manual_sections: () => MANUAL_SECTIONS,
+  // The manager policy planners are pure Rust (manager_ops.rs); the shim answers the common case: a plain execute policy, no suggestions.
+  choose_folder: () => '/tmp/rsi-smoke-picked-folder',
   providers: () => ['Claude', 'Codex', 'Pioneer', 'OpenRouter', 'Bedrock', 'Local', 'Antigravity', 'CodexAppServer', 'Harness'],
+  // Start rsid (src-tauri/src/service.rs, local #232) asks launchd or systemd to start the installed rsid.
+  // The smoke starts nothing: it reports no installed service unless a first-run scenario overrides it.
+  daemon_service: () => ({ kind: 'not-installed', manager: 'launchd', looked: ['~/Library/LaunchAgents/dev.rsi.rsid.plist'] }),
+  start_daemon: () => { throw new Error('no installed rsid service was found (the smoke starts nothing)'); },
+  restart_daemon: () => { throw new Error('no installed rsid service was found (the smoke restarts nothing)'); },
 };
 
 /**
@@ -389,12 +508,16 @@ function carriesSecret(v, depth = 0) {
  * `call(method, params)` performs the daemon request. `record(entry)` receives every decision:
  * { cmd, method?, outcome: 'forwarded' | 'local' | 'refused' | 'error', reason? }.
  */
-export function createBridge({ call, record = () => {}, isolated = null }) {
+export function createBridge({ call, record = () => {}, isolated = null, local = {} }) {
   // Write mode needs the socket of an isolated rsid this run started; anything else throws here, at construction.
   if (isolated !== null) assertIsolatedSocket(isolated.socket);
   return {
     async invoke(cmd, args) {
-      if (Object.hasOwn(LOCAL_COMMANDS, cmd)) { record({ cmd, outcome: 'local' }); return LOCAL_COMMANDS[cmd](args); }
+      if (Object.hasOwn(LOCAL_COMMANDS, cmd)) {
+        record({ cmd, outcome: 'local' });
+        // `local` lets a first-run scenario answer a shim-local command its own way (only names already in LOCAL_COMMANDS).
+        return (Object.hasOwn(local, cmd) ? local[cmd] : LOCAL_COMMANDS[cmd])(args);
+      }
       const writable = isolated !== null && Object.hasOwn(WRITE_COMMANDS, cmd);
       const entry = writable ? WRITE_COMMANDS[cmd] : Object.hasOwn(READ_COMMANDS, cmd) ? READ_COMMANDS[cmd] : null;
       const method = entry ? (typeof entry.method === 'function' ? entry.method(args) : entry.method) : null;
@@ -425,15 +548,83 @@ export function createBridge({ call, record = () => {}, isolated = null }) {
   };
 }
 
-/** The script injected before the app: the only Tauri surface the frontend uses. */
+/**
+ * A minimal Markdown subset for the shim: blank-line paragraphs, `-`/`*`/`1.` lists, fenced code, inline `code` and **bold**. Every
+ * piece of text is escaped before any tag is added. Not a Markdown engine: markdown.rs is the real one; this only keeps a screenshot from
+ * showing raw `-`, `**` and backticks that a reader could mistake for a rendering bug.
+ */
+export function renderMarkdownSubset(text) {
+  const inline = (t) => escapeHtml(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  const out = [];
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
+  let para = [];
+  let list = null;
+  const flush = () => {
+    if (para.length) out.push(`<p>${para.map(inline).join('<br>')}</p>`);
+    if (list) out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join('')}</${list.tag}>`);
+    para = [];
+    list = null;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^```/.test(line)) {
+      flush();
+      const code = [];
+      for (i++; i < lines.length && !/^```/.test(lines[i]); i++) code.push(lines[i]);
+      out.push(`<pre><code>${escapeHtml(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const item = /^\s*(?:([-*])|(\d+)[.)])\s+(.*)$/.exec(line);
+    if (item) {
+      const tag = item[1] ? 'ul' : 'ol';
+      if (list && list.tag !== tag) flush();
+      if (para.length) flush();
+      list ??= { tag, items: [] };
+      list.items.push(item[3]);
+    } else if (!line.trim()) flush();
+    else {
+      if (list) flush();
+      para.push(line);
+    }
+  }
+  flush();
+  return out.join('');
+}
+
+/** How many times the shim sends one invoke before it reports the transport failure (local #621). */
+export const SHIM_ATTEMPTS = 4;
+
+/**
+ * The script injected before the app: the only Tauri surface the frontend uses.
+ *
+ * Under CPU contention headless Chrome cancels requests of a live document before they reach the network stack ("TypeError:
+ * Failed to fetch", ERR_ABORTED with `canceled`; the net-log shows no failed request, local #621/#623). Only the page's
+ * transport fails; the bridge never saw the call. Each invoke therefore carries a call id and is re-sent on such a rejection:
+ * the server runs a call id at most once and replays its answer, so a retried write cannot run twice. A rejection that
+ * persists through every attempt is thrown, and each retry is kept in `__smokeInvokeRetries` for the failure report.
+ */
 export function shimSource(token) {
   return `(() => {
   const TOKEN = ${JSON.stringify(token)};
+  const ATTEMPTS = ${SHIM_ATTEMPTS};
+  const RUN = Math.random().toString(36).slice(2, 10);
+  let calls = 0;
   const invoke = async (cmd, args) => {
-    const r = await fetch('/__invoke', { method: 'POST', headers: { 'content-type': 'application/json', 'x-smoke-token': TOKEN }, body: JSON.stringify({ cmd, args: args ?? null }) });
-    const j = await r.json();
-    if (j.error) throw j.error;
-    return j.result;
+    const call = RUN + '-' + (++calls);
+    for (let attempt = 1; ; attempt++) {
+      let j;
+      try {
+        const r = await fetch('/__invoke', { method: 'POST', headers: { 'content-type': 'application/json', 'x-smoke-token': TOKEN, 'x-smoke-call': call }, body: JSON.stringify({ cmd, args: args ?? null }) });
+        j = await r.json();
+      } catch (e) {
+        if (attempt >= ATTEMPTS) throw e;
+        (globalThis.__smokeInvokeRetries ??= []).push({ cmd, attempt, error: String(e), at: Math.round(performance.now()) });
+        await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+        continue;
+      }
+      if (j.error) throw j.error;
+      return j.result;
+    }
   };
   globalThis.__TAURI__ = { core: { invoke }, event: { listen: async () => () => {} } };
 })();`;

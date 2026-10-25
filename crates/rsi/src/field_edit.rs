@@ -648,7 +648,7 @@ mod tests {
                 KeyModifiers::CONTROL
             ),
             FieldKey::Ignored,
-            "no selection: Ctrl-C keeps its global meaning"
+            "no selection: Ctrl-C is left to the global hint"
         );
     }
 

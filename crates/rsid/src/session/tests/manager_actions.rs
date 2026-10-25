@@ -8,6 +8,7 @@ use rsi_common::harness_manager::{
 use rsi_common::harness_manager_v2::*;
 use rsi_common::types::Project;
 
+mod error_detail;
 mod fence;
 mod host_load;
 mod launch_liveness;
@@ -1437,18 +1438,31 @@ async fn prepared_manager_action_refuses_changed_lead_without_journal_effect() {
     assert_eq!(actions, 0);
 }
 
-/// A manager that reaches for `replace_lead` on an Epic that never had a lead
-/// must be told to use `create_session` + `assign_lead`, not handed a generic
-/// source refusal it cannot act on.
+/// A missing published source names the repair and the single-call lead path.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
-async fn prepared_replace_lead_without_current_lead_names_create_session_path() {
+async fn prepared_replace_lead_without_published_source_names_repair_path() {
     let p = pilot().await;
+    let unavailable_repository = p._dir.path().join("unavailable-repository");
+    std::fs::create_dir(&unavailable_repository).unwrap();
+    // Disk-backed fixtures live beneath the sandbox's target directory.
+    // An unborn repository stops Git discovering the enclosing worktree HEAD.
+    git(&unavailable_repository, &["init", "-q"]);
     p.manager
         .store
         .lock()
         .await
         .set_lead_session(p.epic, None)
+        .unwrap();
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET working_dir=?2 WHERE id=?1",
+            rusqlite::params![p.epic.to_string(), unavailable_repository.to_str().unwrap()],
+        )
         .unwrap();
     let error = p
         .manager
@@ -1469,8 +1483,135 @@ async fn prepared_replace_lead_without_current_lead_names_create_session_path() 
         .unwrap_err();
     assert_eq!(
         crate::session::manager_actions::safe_action_error(&error),
-        "manager_v2_replace_lead_requires_lead_use_create_session"
+        "manager_v2_replace_lead_source_unavailable"
     );
+    assert!(error.to_string().contains("retry replace_lead"));
+}
+
+/// #3907: one replacement action recovers an empty or archived lead slot.
+/// Read the authority catalog at the first provider effect, while the action
+/// runner is still paused before confirmation/final assignment.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_lost_lead_replacement_has_epic_lead_authority_from_first_turn() {
+    for retained_archived_pointer in [None, Some(false), Some(true)] {
+        let p = pilot().await;
+        let origin = rolling_checkout_with_origin(&p);
+        let fresh = advance_origin_rolling(&p, &origin);
+        {
+            let store = p.manager.store.lock().await;
+            if retained_archived_pointer.is_some() {
+                store
+                    .update_session_status(p.lead, SessionStatus::Archived)
+                    .unwrap();
+            }
+            if retained_archived_pointer != Some(true) {
+                store.set_lead_session(p.epic, None).unwrap();
+            }
+        }
+        let receipt = admit_replace_lead(&p, "recover-lost-lead").await;
+        let child = receipt.target_session_id.unwrap();
+        let process = super::super::launch::install_controller_candidate_test_process(child);
+        let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
+            child,
+            super::super::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+        );
+        let execution = p.execute();
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => panic!("replacement missed its first-turn boundary: {result:?}"),
+            reached = reached => reached.unwrap(),
+        }
+        assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 1);
+        let catalog = p
+            .manager
+            .agent_control()
+            .agent_get_authority_catalog(child, Default::default())
+            .await
+            .unwrap();
+        assert!(catalog.roles.iter().any(|role| role == "epic_lead"));
+        {
+            let store = p.manager.store.lock().await;
+            let successor = store.get_session(child).unwrap().unwrap();
+            assert_eq!(successor.parent_id, Some(p.epic));
+            assert!(rsi_common::is_leaf_kind(successor.session_kind));
+            assert_eq!(
+                store.get_session(p.epic).unwrap().unwrap().lead_session_id,
+                Some(child)
+            );
+            if retained_archived_pointer != Some(true) {
+                assert_eq!(
+                    git(&successor.sandbox_root.unwrap(), &["rev-parse", "HEAD"]),
+                    fresh
+                );
+            }
+            // A real first turn can write before provider confirmation.
+            manager_program_event(
+                &store,
+                child,
+                1,
+                Some(Role::Assistant),
+                "lead started".into(),
+            );
+        }
+        resume.send(()).unwrap();
+        execution.await.unwrap();
+        assert_eq!(
+            p.receipt(receipt.operation_id).await.state,
+            ManagerActionStateV2::Succeeded
+        );
+        super::super::launch::drop_controller_candidate_test_stream(child);
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_lost_lead_replacement_preserves_a_competing_assignment() {
+    let p = pilot().await;
+    let _origin = rolling_checkout_with_origin(&p);
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_lead_session(p.epic, None)
+        .unwrap();
+    let receipt = admit_replace_lead(&p, "recover-racing-lead").await;
+    let child = receipt.target_session_id.unwrap();
+    let _process = super::super::launch::install_controller_candidate_test_process(child);
+    let (reached, resume) = super::super::launch::install_controller_candidate_test_pause(
+        child,
+        super::super::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+    );
+    let execution = p.execute();
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => panic!("replacement missed its race boundary: {result:?}"),
+        reached = reached => reached.unwrap(),
+    }
+    p.manager
+        .store
+        .lock()
+        .await
+        .set_lead_session(p.epic, Some(p.lead))
+        .unwrap();
+    resume.send(()).unwrap();
+    let error = execution.await.unwrap_err();
+    assert_eq!(
+        crate::session::manager_actions::safe_action_error(&error),
+        "manager_v2_lead_changed"
+    );
+    assert_eq!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(p.epic)
+            .unwrap()
+            .unwrap()
+            .lead_session_id,
+        Some(p.lead)
+    );
+    super::super::launch::drop_controller_candidate_test_stream(child);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -6427,6 +6568,108 @@ async fn creation_budget_charges_queued_and_uncertain_but_not_uncreated_blocked_
     );
     // The refusal journaled nothing, so it charged nothing.
     assert_eq!(pilot_created_usage(&p).await, 4);
+}
+
+/// #206: the PM's created-sessions cap is visible before the wall. The
+/// `manager_creation_cap_near` health condition fires at exactly 80% (4 of 5)
+/// and not below, from the counter the `manager_v2_creation_limit` refusal
+/// uses, and `AgentManagerOverview` shows the same used/limit and raise path
+/// the refusal prints.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn creation_cap_warning_and_overview_read_the_refusal_counter() {
+    use crate::health_anomaly::{Scope, Sustain, collect_store_facts, evaluate};
+    use rsi_common::health_anomaly::{HealthAnomalySpec, KIND_MANAGER_CREATION_CAP_NEAR};
+
+    let mut p = pilot().await;
+    let version = pilot_session_quota(&mut p, 5).await;
+    let near = |p: &Pilot| {
+        let store = p.manager.store.try_lock().unwrap();
+        let facts =
+            collect_store_facts(&store, &Scope::project(p.project), chrono::Utc::now()).unwrap();
+        let inputs = crate::health_anomaly::Inputs {
+            store: facts,
+            ..Default::default()
+        };
+        evaluate(
+            &inputs,
+            &rsid_core::health_thresholds::HealthThresholds::default(),
+            &HealthAnomalySpec::default(),
+            &mut Sustain::default(),
+            chrono::Utc::now(),
+        )
+        .into_iter()
+        .filter(|condition| condition.kind == KIND_MANAGER_CREATION_CAP_NEAR)
+        .collect::<Vec<_>>()
+    };
+    for n in 0..3 {
+        pilot_seed(
+            &p,
+            pilot_worker(&p, &format!("charged {n}")),
+            ManagerActionStateV2::Uncertain,
+            Some(Uuid::new_v4()),
+        )
+        .await;
+    }
+    assert_eq!(pilot_created_usage(&p).await, 3);
+    assert!(near(&p).is_empty(), "60% is below the warning");
+    pilot_seed(
+        &p,
+        pilot_worker(&p, "charged 3"),
+        ManagerActionStateV2::Uncertain,
+        Some(Uuid::new_v4()),
+    )
+    .await;
+    let found = near(&p);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(
+        found[0].subject,
+        format!("{}:max_created_sessions", p.project)
+    );
+    assert!(
+        found[0]
+            .detail
+            .starts_with("cap=max_created_sessions used=4 limit=5 "),
+        "{found:?}"
+    );
+
+    pilot_control(&p, version, "last-slot", pilot_worker(&p, "admitted"))
+        .await
+        .unwrap();
+    let error = pilot_control(&p, version, "over-cap", pilot_worker(&p, "refused"))
+        .await
+        .unwrap_err();
+    let refusal = rsi_common::manager_budget::CreationCapRefusalV1::parse(&error.to_string())
+        .expect("typed creation refusal");
+    let caps = {
+        let store = p.manager.store.lock().await;
+        let config = store.get_harness_manager(p.project).unwrap().unwrap();
+        store.manager_own_creation_caps(&config).unwrap()
+    };
+    let sessions = &caps[0];
+    assert_eq!(
+        (sessions.cap_field.as_str(), sessions.used, sessions.limit),
+        (refusal.cap_field.as_str(), refusal.used, refusal.limit)
+    );
+    assert_eq!((sessions.used, sessions.limit), (5, 5));
+    assert_eq!(sessions.raise_in, refusal.raise_in);
+    assert_eq!(caps[1].cap_field, "max_created_containers");
+    assert_eq!(caps[1].limit, i64::from(p.policy.max_created_containers));
+    assert!(near(&p)[0].detail.contains(&refusal.raise_in));
+
+    let overview = p
+        .manager
+        .agent_control()
+        .agent_manager_overview(p.owner, Default::default())
+        .await
+        .unwrap();
+    let row = overview
+        .projects
+        .iter()
+        .find(|row| row.overview.project_id == p.project)
+        .expect("the PM's own project row");
+    let policy = row.overview.policy.as_ref().expect("the PM policy");
+    assert_eq!(policy.creation_caps, caps);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

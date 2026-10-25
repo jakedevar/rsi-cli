@@ -203,7 +203,7 @@ test('the Tauri commands forward one daemon method each and are in the handler l
   for (const cmd of ['memory_search', 'ai_command', 'ai_chat', 'query_memory', 'get_entity_card', 'set_entity_card']) {
     assert.match(handlers, new RegExp(`assist::${cmd}\\b`));
   }
-  assert.match(readFileSync(here('../src-tauri/src/lib.rs'), 'utf8'), /^pub mod assist;$/m);
+  assert.match(readFileSync(here('../src-tauri/src/modules.generated.rs'), 'utf8'), /^pub mod assist;$/m);
   // The webview calls them with the argument names the Rust side takes.
   const ts = readFileSync(here('../src/assist.ts'), 'utf8');
   assert.match(ts, /invoke<unknown>\('memory_search', \{ query: q \}\)/);

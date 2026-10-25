@@ -224,12 +224,42 @@
     "cmd:manager-restart": {
       "status": "done",
       "location": "src/manager-cmds.ts, src/manager-cmds-model.ts, src/managers.ts, src/actions/managers.ts, src-tauri/src/manager_ops.rs",
-      "note": "status / now / cancel send GetOperatorRestart, ForceOperatorRestart and CancelOperatorRestart and toast the TUI's summary (waiting for a landing + N turns, release by …)"
+      "note": "status / now / cancel send GetOperatorRestart, ForceOperatorRestart and CancelOperatorRestart and toast the TUI's summary (waiting for a landing + N turns, release by \u2026)"
     },
     "module:ui/overlay/grant_editor.rs": {
       "status": "done",
       "location": "src/managers.ts, src/managers-model.ts, src/manager-tree-ops.ts, src/manager-launch.ts, src/mgr-form.ts, src-tauri/src/manager_ops.rs",
       "note": "the grant editor behind n: preset (applies and reopens on the result), mode, one check per capability, created containers / sessions, active sessions, spend ceiling and the launches (the global grant's list, at least one; a PM's own allowlist), checked by ManagerPolicyV2::validate before anything launches"
+    },
+    "key:gd": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "gd opens the Global Dashboard over GetGlobalDashboard (gd again refreshes); j/k/g/G move, Enter/l open the project, Tab the conversation (#3366)"
+    },
+    "cmd:dashboard": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": ":dashboard (and :gd) opens the Global Dashboard over GetGlobalDashboard (#3366)"
+    },
+    "overlay:global-dashboard-gd-dashboard": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "the overlay's keys: j/k/g/G move, Enter/l open the project, w window, s sort, t pane, i type, n start the top-level manager (the gm launch-and-appoint dialog is the confirm), Tab conversation, gm, r refresh, Esc/q close (#3366)"
+    },
+    "overlay-ref:global-dashboard": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "the Global Dashboard view: a row per project (home first) with a TOTAL row, live agents by role and provider, tokens, cost, Issue flow, landings and QA, a visible incomplete badge, the detail band and the top-level manager pane (#3366)"
+    },
+    "module:ui/overlay/global_dashboard.rs": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "rendered as an HTML table with plain-words column titles, the detail band and the conversation pane; the TUI's formatting and ordering are ported in dashboard-model.ts (#3366)"
+    },
+    "module:ui/overlay/global_dashboard_tests.rs": {
+      "status": "done",
+      "location": "src/dashboard.ts, src/dashboard-model.ts, src/managers-api.ts, src/actions/managers.ts, src-tauri/src/managers.rs",
+      "note": "tests/dashboard.test.mjs covers the same rules from a fixture GetGlobalDashboard response (#3366)"
     }
   }
 }

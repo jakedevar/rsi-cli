@@ -18,6 +18,8 @@ pub const MANAGER_ISSUE_WORKER_MAX_BRIEF_BYTES: usize = 24_576;
 
 /// Stable refusal code for a malformed request.
 pub const MANAGER_ISSUE_WORKER_INVALID_REQUEST: &str = "manager_issue_worker_invalid_request";
+/// #527: review brief assembly and predecessor continuation are separate launch modes.
+pub const MANAGER_ISSUE_WORKER_REVIEW_CONTINUATION_CONFLICT: &str = "manager_issue_worker_invalid_request: review_of and continue_from are mutually exclusive; omit continue_from to launch a fresh review with the latest implementer handoff";
 /// #315: the scope holds no single live Epic to default to. The message
 /// continues `: <candidates>` (see [`MANAGER_ISSUE_WORKER_PARENT_CANDIDATES_MAX`]).
 pub const MANAGER_ISSUE_WORKER_PARENT_REQUIRED: &str = "manager_issue_worker_parent_required";
@@ -72,8 +74,12 @@ pub struct AgentManagerLaunchIssueWorkerRequestV1 {
     /// The Issue's display number in the caller's project.
     pub issue: i64,
     /// The worker's task text. The Issue text is not pasted: the worker reads
-    /// its own Issue with `AgentGetIssue`.
+    /// its own Issue with `AgentGetIssue`. Selectors in this admitted field
+    /// grant same-project reads; the whole daemon-compiled query is not scanned.
+    /// Dependencies mentioned only in copied records must be explicitly
+    /// selected here or in `related` to grant their live reads.
     pub brief: String,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub launch: ManagerLaunchChoiceV2,
     /// The Epic the worker is created under. Optional when the manager's
     /// scope holds exactly one live Epic; otherwise the refusal
@@ -82,7 +88,9 @@ pub struct AgentManagerLaunchIssueWorkerRequestV1 {
     pub parent_epic_id: Option<Uuid>,
     pub idempotency_key: String,
     /// #1195: where the worker's sandbox branches from; omitted means a fresh
-    /// `origin/rolling` base.
+    /// `origin/rolling` base, except `review_of` defaults to the latest
+    /// implementer handoff's declared commit when available. An explicit
+    /// source always wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_source: Option<ManagerSandboxSourceV1>,
     /// #1235: the target project of a global manager seat acting inside its
@@ -95,7 +103,7 @@ pub struct AgentManagerLaunchIssueWorkerRequestV1 {
     /// committed sandbox `HEAD` (uncommitted work is reported, not copied),
     /// inherits its lineage and display identity, and its brief starts with
     /// the predecessor's final message and the Issue's latest handoff.
-    /// Exclusive with `sandbox_source`.
+    /// Exclusive with `sandbox_source` and `review_of`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_from: Option<Uuid>,
     /// Explicit manager delegation of bounded QA shard jobs (#1520).
@@ -104,9 +112,17 @@ pub struct AgentManagerLaunchIssueWorkerRequestV1 {
     pub qa_lane: bool,
     /// #1590: the implementer Issue (display number, same project) this
     /// launch reviews. The daemon copies that Issue's text and latest handoff
-    /// into the worker's brief, so the bound reviewer (who may read only its
-    /// own Issue) sees the complete handoff and landing filters without a
-    /// manager pasting (and truncating) them. Not inherited by a continuation.
+    /// into the worker's brief, so the bound reviewer sees the complete handoff
+    /// and landing filters without a manager pasting (and truncating) them.
+    /// This alone grants no reverse live read of the implementer Issue; an
+    /// explicit selector in `brief` or `related` can independently grant it.
+    /// References only in copied records grant no additional reads.
+    /// Without sandbox_source, the
+    /// latest handoff's declared commit pins the reviewer sandbox when available
+    /// locally; otherwise it stays on rolling and the brief disallows jobs for
+    /// missing source tests. Explicit unknown sandbox_source commits are refused.
+    /// Exclusive with `continue_from`; omit `continue_from` to launch a fresh
+    /// review with the latest handoff. Not inherited by a continuation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_of: Option<i64>,
     /// #218: same-project Issues (display numbers) whose COMPLETE text and
@@ -114,6 +130,7 @@ pub struct AgentManagerLaunchIssueWorkerRequestV1 {
     /// context, like `review_of` but any number of them. Each is also readable
     /// live with `AgentGetIssue` for as long as the binding lives. The copy is
     /// a snapshot at launch; one too large for the brief is named, never cut.
+    /// References only in these copied records grant no additional reads.
     /// Writes, status changes and handoffs stay on the bound `issue`. Not
     /// inherited by a continuation (the reads are). A plain relaunch of the same
     /// Issue adds the related Issues of its earlier launches (#275).
@@ -127,14 +144,16 @@ fn is_false(value: &bool) -> bool {
 
 impl AgentManagerLaunchIssueWorkerRequestV1 {
     /// # Errors
-    /// A stable refusal code.
+    /// A stable refusal code, with the conflicting fields and fix for a review continuation.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.review_of.is_some() && self.continue_from.is_some() {
+            return Err(MANAGER_ISSUE_WORKER_REVIEW_CONTINUATION_CONFLICT);
+        }
         if let Some(source) = &self.sandbox_source {
             source.validate()?;
         }
         let valid = self.issue >= 1
             && self.review_of.is_none_or(|n| n >= 1 && n != self.issue)
-            && (self.review_of.is_none() || self.continue_from.is_none())
             && self.related.len() <= MANAGER_ISSUE_WORKER_RELATED_MAX
             && self.related.iter().all(|n| *n >= 1 && *n != self.issue)
             && self
@@ -378,7 +397,10 @@ mod tests {
         }
         let mut both = review;
         both.continue_from = Some(Uuid::from_u128(1));
-        assert_eq!(both.validate(), Err(MANAGER_ISSUE_WORKER_INVALID_REQUEST));
+        let refusal = both.validate().unwrap_err();
+        assert_eq!(refusal, MANAGER_ISSUE_WORKER_REVIEW_CONTINUATION_CONFLICT);
+        assert!(refusal.contains("review_of and continue_from are mutually exclusive"));
+        assert!(refusal.contains("omit continue_from"));
     }
 
     #[test]

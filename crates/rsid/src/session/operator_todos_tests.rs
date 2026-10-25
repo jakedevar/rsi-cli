@@ -16,7 +16,7 @@ use rsi_common::types::{Project, SessionKind, SessionProvider, SessionStatus};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 struct Fixture {
     control: AgentControlHandle,

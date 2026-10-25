@@ -1,7 +1,7 @@
 # The binaries the e2e_tui harness needs on disk before its tests run (#1651,
 # #1637). This is the ONLY definition of the e2e prebuild: scripts/scoped-test
 # and the rsi-rolling-land gate (crates/rsid/src/bin/rsi-rolling-land.rs) both
-# read it, and scripts/tests/test_e2e_prebuild_single_definition.py enforces
+# read it, and scripts/tests/test_e2e_prebuild_single_definition.sh enforces
 # that. One "PACKAGE BINARY" pair per line; add a new sibling here only.
 #
 # `cargo test -p rsi --test e2e_tui` builds rsi itself. The daemon the harness

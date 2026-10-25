@@ -26,8 +26,9 @@ satellite `{{SATELLITE_NAME}}`, repository `{{REPO}}`. A hub (installation
 3. **Results.** When an item finishes or is blocked, `AgentReportToHub` kind
    `result` (one line: item, SHA or reason). Read `AgentGetDaemonInfo`
    `hub_reports` for each report's fate; never re-send a pending `enqueue`.
-   `satellite_report_hub_unreachable` or `satellite_report_queue_full` means wait
-   and fold results into one line.
+   A receipt with `reason: hub_not_pulling` means the hub is not fetching yet; the
+   report stays queued and goes out in order, so do not re-send it.
+   `satellite_report_queue_full` means wait and fold results into one line.
 4. **Never restart your own rsid** (no `rsid-quiet-restart.sh`, no supervisor
    relaunch). Deploy route (#171): stage with
    `scripts/install-release.sh --stage-dir ~/.rsi/staging/bin-<sha>` (new or empty

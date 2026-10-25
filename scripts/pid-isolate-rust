@@ -1,0 +1,6 @@
+#!/bin/sh
+# Staged shared namespace helper (#433). Never build before admission.
+set -eu
+script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
+bin=$("$script_dir/repo-guard" --existing-bin)
+exec "$bin" pid-isolate "$@"

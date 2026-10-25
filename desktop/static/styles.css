@@ -1,11 +1,16 @@
 /* Catppuccin Mocha, matching the TUI palette. */
 :root {
-  color-scheme: dark;
+  color-scheme: dark; accent-color: var(--blue);
   --base: #1e1e2e; --mantle: #181825; --crust: #11111b;
   --surface0: #313244; --surface1: #45475a; --overlay0: #6c7086;
   --text: #cdd6f4; --subtext: #a6adc8;
+  --focus-ring: var(--blue); /* the one keyboard-focus cue (local #320): >= 3:1 on base, mantle and surface0 in every built-in theme (tests/contrast.test.mjs) */
+  --muted: #9ca0b8; /* secondary text: >= 4.5:1 on base, mantle and surface0; --overlay0 is for borders and dots only */
   --blue: #89b4fa; --green: #a6e3a1; --yellow: #f9e2af; --red: #f38ba8;
   --mauve: #cba6f7; --peach: #fab387; --teal: #94e2d5;
+  /* Text on a filled accent; a theme or an override sets whichever reaches 4.5:1 (theme-model.ts onColor). */
+  --on-blue: var(--crust); --on-green: var(--crust); --on-yellow: var(--crust); --on-red: var(--crust);
+  --on-mauve: var(--crust); --on-peach: var(--crust); --on-teal: var(--crust);
   --mono: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
 }
 * { box-sizing: border-box; }
@@ -32,8 +37,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .btn:hover { background: var(--surface1); }
 .btn:disabled { opacity: .5; cursor: default; }
-.btn.primary { background: var(--blue); color: var(--crust); border-color: var(--blue); }
+.btn.primary { background: var(--blue); color: var(--on-blue); border-color: var(--blue); }
 .btn.danger { color: var(--red); }
+.btn.danger:hover { background: var(--red); color: var(--on-red); border-color: var(--red); } /* red text on --surface1 is 3.7:1 in Light */
 .layout { flex: 1; display: flex; min-height: 0; }
 .sidebar {
   width: 340px; min-width: 260px; display: flex; flex-direction: column;
@@ -52,8 +58,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .session-item:hover { background: var(--surface0); }
 .session-item.selected { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
 .session-item .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-item .age { font-size: 11px; color: var(--overlay0); }
+.session-item .age { font-size: 11px; color: var(--muted); }
 .session-item .sub { grid-column: 2 / 4; font-size: 11px; color: var(--subtext); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-item.st-Completed .label { color: var(--muted); }
+.session-item.st-Completed .dot { background: var(--overlay0); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--overlay0); }
 .st-Running .dot, .dot.st-Running { background: var(--green); }
 .st-Starting .dot, .dot.st-Starting { background: var(--teal); }
@@ -62,7 +70,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .st-Interrupted .dot, .dot.st-Interrupted { background: var(--peach); }
 .st-Completed .dot, .dot.st-Completed { background: var(--blue); }
 .detail { flex: 1; display: flex; min-width: 0; }
-.empty { margin: auto; color: var(--overlay0); }
+.empty { margin: auto; color: var(--muted); }
 .session-view { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 .session-view[hidden] { display: none; }
 .session-head {
@@ -73,7 +81,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .meta { font-size: 12px; color: var(--subtext); display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .meta .mono { font-family: var(--mono); }
 .head-actions { display: flex; gap: 8px; align-items: flex-start; }
-.events { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+.events { overflow-anchor: none; flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
 .events.hide-tools .ev-tool, .events.hide-tools .ev-result { display: none; }
 .ev { border-radius: 8px; padding: 8px 12px; white-space: pre-wrap; word-break: break-word; max-width: 100%; }
 .ev-user { background: var(--surface0); border-left: 3px solid var(--blue); }
@@ -106,16 +114,39 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: var(--surface0); color: var(--subtext); border: 1px solid var(--surface1); cursor: pointer; opacity: 0;
 }
 .md pre:hover .copy-code, .copy-code:focus { opacity: 1; }
-.ev-time { font-size: 10px; color: var(--overlay0); display: block; margin-bottom: 2px; }
+.ev-time { font-size: 10px; color: var(--muted); display: block; margin-bottom: 2px; }
 .more { align-self: center; }
 .composer { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--surface0); background: var(--mantle); }
+.composer { flex-wrap: wrap; }
 .composer textarea { flex: 1; resize: vertical; min-height: 44px; }
+.composer-actions { display: flex; gap: 8px; align-self: flex-end; }
+.attach-tray { flex: 0 0 100%; display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.attach-tray[hidden] { display: none; }
+.attach-chip { display: flex; align-items: center; gap: 6px; max-width: 220px; padding: 3px 4px 3px 3px; border: 1px solid var(--surface1); border-radius: 8px; background: var(--surface0); }
+.attach-thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 5px; background: var(--base); }
+.attach-thumb[hidden] { display: none; }
+.attach-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.attach-remove { border: 0; background: transparent; color: var(--subtext); cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 6px; border-radius: 6px; }
+.attach-remove:hover, .attach-remove:focus-visible { background: var(--surface1); color: var(--text); }
+.session-view.drop-target { outline: 2px dashed var(--blue); outline-offset: -6px; }
 .toast {
   position: fixed; bottom: 16px; right: 16px; max-width: 480px; padding: 10px 14px; border-radius: 8px;
   background: var(--surface0); border: 1px solid var(--red); color: var(--text); white-space: pre-wrap;
 }
 .toast.ok { border-color: var(--green); }
+.toast .toast-action { margin-left: 12px; }
 .toast { z-index: 12; }
+/* A popover (top layer, above open modal dialogs; local #245): undo the UA popover box so it sits bottom-right as before. */
+.toast[popover] { top: auto; left: auto; margin: 0; overflow: visible; width: auto; height: auto; }
+.first-run-card {
+  position: fixed; top: 56px; right: 16px; z-index: 11; max-width: 380px; padding: 12px 16px; border-radius: 10px;
+  background: var(--base); border: 1px solid var(--blue); color: var(--text); box-shadow: 0 6px 24px rgba(0,0,0,.35);
+}
+.first-run-card h2 { margin: 0 0 6px; font-size: 15px; }
+.first-run-card p { margin: 0 0 8px; font-size: 13px; }
+.first-run-card .first-run-note { color: var(--subtext); font-size: 12px; }
+.first-run-card .actions { display: flex; gap: 8px; justify-content: flex-end; }
+.next-step { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 dialog { background: var(--base); color: var(--text); border: 1px solid var(--surface1); border-radius: 10px; width: min(720px, 92vw); padding: 0; }
 dialog::backdrop { background: rgba(0,0,0,.5); }
 .launch-form { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; }
@@ -123,10 +154,21 @@ dialog::backdrop { background: rgba(0,0,0,.5); }
 .launch-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--subtext); }
 .launch-form label.check { flex-direction: row; align-items: center; gap: 8px; }
 .launch-form .row { display: flex; gap: 10px; }
+.launch-form .folder-field { display: flex; gap: 6px; align-items: stretch; }
+.launch-form .folder-field input { flex: 1; min-width: 0; }
 .launch-form .row label { flex: 1; }
 .launch-form .row label.grow { flex: 2; }
 .launch-form textarea { color: var(--text); font-size: 14px; resize: vertical; }
 .actions { display: flex; justify-content: flex-end; gap: 8px; }
+/* A one-line text field that wraps (form-field.ts, desktop #317): it grows with its text up to a few lines, then scrolls. */
+textarea.line-field { display: block; width: 100%; box-sizing: border-box; resize: none; overflow-y: auto; max-height: 9em; line-height: 1.35; overflow-wrap: anywhere; white-space: pre-wrap; }
+.line-status { font: 11px var(--mono, monospace); color: var(--subtext); text-align: right; }
+.line-status[data-state=refused] { color: var(--red, #f38ba8); text-align: left; }
+/* The editing mode is shown in the field's border while Vim keys are on (the TUI's mode in the field border). */
+:is(dialog.issue-dialog, dialog.pick-form-dialog) :is(textarea, input)[data-vim-mode=insert] { border-color: var(--green, #a6e3a1); }
+:is(dialog.issue-dialog, dialog.pick-form-dialog) :is(textarea, input)[data-vim-mode=normal] { border-color: var(--peach, #fab387); }
+:is(dialog.issue-dialog, dialog.pick-form-dialog) :is(textarea, input)[data-vim-mode=visual],
+:is(dialog.issue-dialog, dialog.pick-form-dialog) :is(textarea, input)[data-vim-mode=visual-line] { border-color: var(--mauve, #cba6f7); }
 
 /* Session tree + archived toggle */
 .view-toggle { display: flex; gap: 0; padding: 10px 10px 0; }
@@ -138,17 +180,21 @@ dialog::backdrop { background: rgba(0,0,0,.5); }
 .view-toggle .seg:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
 .view-toggle .seg.active { background: var(--surface0); color: var(--text); box-shadow: inset 0 -2px var(--blue); }
 .session-item { grid-template-columns: 12px 10px 1fr auto auto; }
-.session-item .twisty { width: 12px; color: var(--overlay0); text-align: center; cursor: pointer; user-select: none; }
+.session-item .twisty { width: 12px; color: var(--muted); text-align: center; cursor: pointer; user-select: none; }
 .session-item .sub { grid-column: 2 / -1; }
 .session-item .count {
   font-size: 11px; color: var(--subtext); background: var(--surface0); border-radius: 8px; padding: 0 6px;
 }
 .session-item.container .label { font-weight: 600; }
 .session-empty { padding: 12px; color: var(--subtext); }
+.session-empty-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .composer.readonly { opacity: 0.55; }
 /* Operator attention: approvals banner, badge, pause state. */
 .approval-banner { padding: 10px 16px; border-bottom: 1px solid var(--yellow); background: var(--mantle); max-height: 45%; overflow-y: auto; }
 .approval-banner[hidden] { display: none; }
+/* After an answer: the next session that waits for you, or that none does (local #312). */
+.next-waiting { display: flex; flex: none; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 16px; border-bottom: 1px solid var(--yellow); background: var(--mantle); }
+.next-waiting[hidden] { display: none; }
 .approval { display: flex; flex-direction: column; gap: 8px; border-left: 3px solid var(--yellow); padding-left: 12px; }
 .approval-title { font-weight: 600; color: var(--yellow); }
 .approval-header { font-size: 11px; text-transform: uppercase; color: var(--subtext); }
@@ -157,12 +203,20 @@ dialog::backdrop { background: rgba(0,0,0,.5); }
 .approval-desc { color: var(--subtext); font-size: 12px; }
 .approval textarea { width: 100%; resize: vertical; background: var(--surface0); border: 1px solid var(--surface1); border-radius: 6px; padding: 6px 8px; margin-top: 4px; }
 .approval-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.attn-badge { grid-column: 1 / -1; font-size: 11px; font-weight: 600; color: var(--crust); background: var(--yellow); border-radius: 8px; padding: 0 8px; justify-self: start; }
+.approval-note { font-size: 12px; color: var(--subtext); text-align: right; }
+.attn-badge { grid-column: 1 / -1; font-size: 11px; font-weight: 600; color: var(--on-yellow); background: var(--yellow); border-radius: 8px; padding: 0 8px; justify-self: start; }
 .session-item.attn { box-shadow: inset 3px 0 var(--yellow); }
 .pause-state { font-size: 12px; color: var(--peach); align-self: center; }
 dialog.confirm { width: min(440px, 92vw); }
+dialog.confirm h3 { margin: 0 0 8px; }
+dialog.confirm .confirm-detail { margin: 2px 0; font-size: 12px; color: var(--subtext); overflow-wrap: anywhere; }
+dialog.confirm:focus { outline: none; }
 /* Vim keys: list cursor, which-key hint and the : command line. */
 .session-item.cursor { outline: 1px dashed var(--mauve); outline-offset: -2px; }
+/* Local #226: the list is one tab stop; while it has focus the cursor row shows a solid 2px ring (blue on the base: well over 3:1). */
+.session-list:focus { outline: none; }
+.session-list:focus .session-item[aria-selected="true"] { outline: 2px solid var(--blue); outline-offset: -2px; }
+.session-list:focus:not(:has(.session-item[aria-selected="true"])) { outline: 2px solid var(--blue); outline-offset: -2px; }
 .keyhint {
   position: fixed; left: 16px; bottom: 16px; max-width: min(900px, calc(100vw - 32px)); max-height: 50vh; overflow: auto;
   padding: 10px 14px; border-radius: 8px; background: var(--crust); border: 1px solid var(--surface1); font-size: 12px; z-index: 10;
@@ -179,7 +233,7 @@ dialog.confirm { width: min(440px, 92vw); }
 }
 .cmdline-caret { display: inline-block; width: 7px; height: 1.1em; vertical-align: text-bottom; background: var(--text); margin-left: 1px; }
 .cmdline-completions { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--subtext); font-size: 12px; }
-.cmdline-completions .sel { color: var(--crust); background: var(--blue); border-radius: 3px; padding: 0 4px; }
+.cmdline-completions .sel { color: var(--on-blue); background: var(--blue); border-radius: 3px; padding: 0 4px; }
 .cmdline-completions:empty { display: none; }
 /* Command palette (Ctrl-K / Cmd-K): every registry action with its keys. */
 dialog.palette {
@@ -196,7 +250,7 @@ dialog.palette[open] { display: flex; }
 }
 .palette-item.sel { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
 .palette-item.disabled { opacity: .5; }
-.palette-group { font-size: 11px; color: var(--overlay0); text-transform: uppercase; }
+.palette-group { font-size: 11px; color: var(--muted); text-transform: uppercase; }
 .palette-main { display: flex; flex-direction: column; min-width: 0; }
 .palette-title mark { background: none; color: var(--blue); font-weight: 600; }
 .palette-detail { font-size: 12px; color: var(--subtext); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -209,10 +263,18 @@ dialog.palette[open] { display: flex; }
 /* Slice 4 (hub #3006): session list tools, pickers, forms, label chips. */
 .list-tools { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0; }
 .list-tools .btn { padding: 2px 8px; font-size: 12px; }
-.list-scope { padding: 6px 12px 0; font-size: 11px; color: var(--overlay0); }
+.list-scope { padding: 6px 12px 0; font-size: 11px; color: var(--muted); }
 .label-head { padding: 6px 12px 3px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--mauve); background: var(--crust); border-bottom: 1px solid var(--surface0); }
 .label-chip { grid-column: 2 / 4; justify-self: start; font-size: 10px; padding: 0 6px; border-radius: 8px; color: var(--crust); background: var(--chip, var(--mauve)); }
 .ev.search-hit { outline: 2px solid var(--yellow); outline-offset: 1px; }
+/* The conversation find bar (local #307): between the header and the transcript, so it never covers the message box. */
+.find-bar { display: flex; align-items: center; gap: 8px; padding: 6px 16px; background: var(--mantle); border-bottom: 1px solid var(--surface1); }
+.find-bar[hidden] { display: none; }
+.find-bar input { flex: 1; min-width: 120px; max-width: 360px; box-sizing: border-box; background: var(--base); color: var(--text); border: 1px solid var(--surface1); border-radius: 6px; padding: 5px 8px; }
+.find-bar input[aria-invalid="true"] { border-color: var(--red); }
+.find-count { min-width: 64px; color: var(--subtext0, var(--text)); font-size: 13px; }
+mark.find-hit { background: color-mix(in srgb, var(--yellow) 35%, transparent); color: inherit; border-radius: 2px; }
+mark.find-hit.current { background: var(--yellow); color: var(--on-yellow); }
 dialog.pick { background: var(--mantle); color: var(--text); border: 1px solid var(--surface1); border-radius: 10px; padding: 14px 16px; min-width: 380px; max-width: 560px; }
 dialog.pick::backdrop { background: rgba(0, 0, 0, .45); }
 dialog.pick h2 { margin: 0 0 10px; font-size: 15px; color: var(--mauve); }
@@ -221,18 +283,18 @@ dialog.pick input[type="text"] { width: 100%; box-sizing: border-box; background
 .pick-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
 .pick-item.sel, .pick-item:hover { background: var(--surface0); }
 .pick-mark { width: 12px; color: var(--green); }
-.pick-detail { margin-left: auto; font-size: 11px; color: var(--overlay0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
-.pick-empty { padding: 8px; color: var(--overlay0); }
+.pick-detail { margin-left: auto; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%; }
+.pick-empty { padding: 8px; color: var(--muted); }
 .swatch { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .pick-actions { display: flex; gap: 6px; justify-content: flex-end; margin-bottom: 6px; }
-.pick-hint { font-size: 11px; color: var(--overlay0); }
+.pick-hint { font-size: 11px; color: var(--muted); }
 .color-row { display: flex; gap: 6px; }
 .color-radio { appearance: none; width: 18px; height: 18px; border-radius: 50%; background: var(--sw); border: 2px solid transparent; cursor: pointer; margin: 0; }
 .color-radio:checked { border-color: var(--text); }
 .color-radio:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 dialog.pick .form-error { color: var(--red); font-size: 12px; margin: 4px 0; }
 .info-rows { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0 0 10px; font-size: 13px; }
-.info-rows dt { color: var(--overlay0); }
+.info-rows dt { color: var(--muted); }
 .info-rows dd { margin: 0; word-break: break-word; font-family: var(--mono); }
 /* Issues workspace (hub #3010). */
 .layout[hidden], .issues[hidden], .issues-retry[hidden] { display: none; }
@@ -249,12 +311,17 @@ dialog.pick .form-error { color: var(--red); font-size: 12px; margin: 4px 0; }
 .chip { font-size: 11px; color: var(--subtext); background: var(--surface0); border-radius: 8px; padding: 1px 8px; }
 .meta.err { color: var(--red); }
 .issues-retry {
-  background: var(--yellow); color: var(--crust); border: 0; padding: 6px 14px; text-align: left; cursor: pointer;
+  background: var(--yellow); color: var(--on-yellow); border: 0; padding: 6px 14px; text-align: left; cursor: pointer;
 }
 .issues-body { flex: 1; display: flex; min-height: 0; }
 .issues-listpane { width: 46%; min-width: 320px; display: flex; flex-direction: column; border-right: 1px solid var(--surface0); }
 .issues-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; }
-.issues-list:focus { outline: none; }
+/* Local #320: one focused-pane cue. A pane that takes focus itself (.focus-pane) gets the ring; a list (.focus-list) puts it on
+   its current row, or on the whole list while nothing is current. The same blue ring as the session list. */
+.focus-pane:focus, .focus-pane:focus-within { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.focus-list:focus { outline: none; }
+.focus-list:focus > [aria-selected="true"] { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.focus-list:focus:not(:has(> [aria-selected="true"])) { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
 .issue-item {
   display: grid; grid-template-columns: auto auto 1fr auto; gap: 8px; align-items: baseline;
   padding: 6px 12px; cursor: pointer; border-bottom: 1px solid var(--surface0);
@@ -270,16 +337,27 @@ dialog.pick .form-error { color: var(--red); font-size: 12px; margin: 4px 0; }
 .issue-item .iready { grid-column: 3 / -1; font-size: 11px; color: var(--subtext); }
 .issue-item.ready .iready { color: var(--green); }
 .issue-item.blocked .iready { color: var(--yellow); }
-.issue-item.done .ititle { color: var(--overlay0); }
+.issue-item.done .ititle { color: var(--muted); }
 .issues-pager { display: flex; justify-content: space-between; padding: 8px 12px; border-top: 1px solid var(--surface0); }
 .issues-empty { padding: 14px; color: var(--subtext); }
 .issues-inspector { flex: 1; overflow-y: auto; padding: 14px 18px; }
-.issues-inspector:focus { outline: none; }
 .iv-head h2 { margin: 0 0 8px; font-size: 16px; }
+.iv-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .iv-meta { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 16px; margin-bottom: 10px; }
 .kv { display: flex; gap: 8px; font-size: 12px; }
 .kv .k { color: var(--subtext); min-width: 62px; }
 .iv-body { white-space: pre-wrap; word-break: break-word; font: 13px/1.5 var(--mono); background: var(--mantle); border-radius: 6px; padding: 10px 12px; margin: 0 0 12px; }
+.iv-bodybox { margin: 0 0 12px; }
+.iv-bodybox .iv-body { margin-bottom: 0; }
+.iv-raw-toggle { margin: 0 0 6px; font-size: 12px; padding: 2px 10px; }
+.iv-raw-toggle[aria-pressed="true"] { background: var(--surface0); color: var(--text); box-shadow: inset 0 -2px var(--blue); }
+.iv-md { white-space: normal; font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; overflow-wrap: anywhere; min-width: 0; }
+.iv-md .md.md-pending { white-space: pre-wrap; }
+.iv-md .md pre, .iv-md .md pre code { overflow-wrap: normal; word-break: normal; }
+.iv-md .md pre { max-width: 100%; overflow-x: auto; }
+.iv-md .md img { max-width: 100%; }
+.iv-empty { color: var(--subtext); }
+.iv-raw { overflow-x: auto; }
 .iv-tabs { display: flex; margin-bottom: 8px; }
 .iv-tabs .seg { background: var(--base); color: var(--subtext); border: 1px solid var(--surface1); padding: 4px 12px; cursor: pointer; font: inherit; }
 .iv-tabs .seg.active { background: var(--surface0); color: var(--text); }
@@ -292,7 +370,11 @@ dialog.pick .form-error { color: var(--red); font-size: 12px; margin: 4px 0; }
 dialog.issue-dialog { width: min(640px, 94vw); max-height: 90vh; overflow-y: auto; }
 .form-intro { margin: 0; white-space: pre-wrap; color: var(--subtext); font-size: 13px; }
 .form-fields { display: flex; flex-direction: column; gap: 10px; }
-.ff small { color: var(--overlay0); }
+.ff small { color: var(--muted); }
+fieldset.ff.checks { border: 0; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+fieldset.ff.checks legend { padding: 0; margin-bottom: 4px; }
+fieldset.ff.checks small { flex-basis: 100%; }
+fieldset.ff.checks label.check { display: inline-flex; align-items: center; gap: 6px; }
 .issue-dialog .form-error { color: var(--red); white-space: pre-wrap; font-size: 13px; margin: 0; }
 .stale-bar { display: flex; gap: 8px; }
 
@@ -303,7 +385,90 @@ dialog.issue-dialog { width: min(640px, 94vw); max-height: 90vh; overflow-y: aut
 .empty[data-onboarding="daemon-down"] .onboard-title,
 .empty[data-onboarding="backend-error"] .onboard-title { color: var(--red); }
 .empty .onboard-actions { display: flex; gap: 8px; margin-top: 16px; }
+.empty .onboard-start-status { margin-top: 12px; }
+.empty .onboard-developer { margin-top: 16px; color: var(--subtext); }
+.empty .onboard-developer summary { cursor: pointer; margin-bottom: 8px; }
 .boot-banner { padding: 8px 14px; background: var(--surface0); border-bottom: 2px solid var(--red); color: var(--red); font-size: 13px; }
 .boot-banner[hidden] { display: none; }
+/* The daemon-down help over whatever is open (local #266). Hidden while the card in #empty is on screen: one copy. */
+.daemon-banner { padding: 8px 14px; background: var(--surface0); border-bottom: 2px solid var(--red); max-height: 40vh; overflow-y: auto; }
+.daemon-banner[hidden], body:has(.layout:not([hidden]) #empty:not([hidden])) .daemon-banner { display: none; }
+.daemon-banner-head { font-weight: 600; }
+.daemon-banner-line, .daemon-banner .onboard-start-status { margin-top: 4px; color: var(--subtext); line-height: 1.4; }
+.daemon-banner-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.daemon-banner .btn { color: var(--text); }
+.daemon-banner .btn.primary { color: var(--crust); }
+.build-notice { padding: 8px 14px; background: var(--surface0); border-bottom: 2px solid var(--peach); max-height: 40vh; overflow-y: auto; }
+.build-notice[hidden] { display: none; }
+.build-notice-head { font-weight: 600; }
+.build-notice-line { margin-top: 4px; color: var(--subtext); line-height: 1.4; overflow-wrap: anywhere; }
+.build-notice-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.build-notice .btn { color: var(--text); }
+.build-notice .btn.primary { color: var(--crust); }
+.daemon-banner-more { margin-top: 6px; color: var(--subtext); }
+.daemon-banner-more summary { cursor: pointer; }
+.daemon-banner-more .onboard-line { margin: 6px 0 0; line-height: 1.4; }
+.conn[data-help] { cursor: pointer; text-decoration: underline; }
+.stale-note, .pending-archive-chip { color: var(--subtext); font-style: italic; }
 .empty .btn { color: var(--text); }
-.empty .btn.primary { color: var(--crust); }
+.empty .btn.primary { color: var(--on-blue); }
+
+/* Plain-word help under a form field, and the project hints in the launch dialog. */
+.field-hint { display: block; margin-top: 2px; font-size: 12px; font-weight: normal; line-height: 1.4; color: var(--subtext); }
+.launch-hint { margin: 2px 0 0; font-size: 12px; line-height: 1.4; color: var(--subtext); }
+.launch-hint:empty { display: none; }
+.launch-form .model-field { display: flex; gap: 6px; align-items: center; }
+.launch-form .model-field input { flex: 1; min-width: 0; }
+.launch-project-hint { display: flex; gap: 8px; align-items: center; margin: 4px 0 0; font-size: 12px; line-height: 1.4; color: var(--subtext); }
+/* One error presentation (errors-model.ts, local #207): the plain sentence, then the raw error. */
+.err-details { margin-top: 6px; font-size: 11px; color: var(--subtext); }
+.err-details summary { cursor: pointer; user-select: none; }
+.err-details .err-raw {
+  margin: 4px 0; padding: 6px 8px; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  background: var(--mantle); border: 1px solid var(--surface1); border-radius: 4px; user-select: text;
+}
+.issues-load-error .btn { margin-top: 6px; }
+.meta .status-chip { font-weight: 600; color: var(--text); }
+.meta-secondary { margin-top: 2px; align-items: center; }
+.btn.link { background: none; border: none; padding: 0 2px; color: var(--accent, var(--subtext)); text-decoration: underline; cursor: pointer; font-size: 12px; }
+.head-details { flex-basis: 100%; }
+.head-details summary { cursor: pointer; }
+.head-details .detail-row { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
+.head-details .detail-label { min-width: 70px; }
+.head-details .mono { overflow-wrap: anywhere; }
+
+/* The "AI work is stopped" banner (local #224): shown while the model-control mode is not normal. */
+.ai-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 8px 14px; background: var(--surface0); border-bottom: 2px solid var(--yellow, var(--red)); color: var(--text); font-size: 13px; }
+.ai-banner[hidden] { display: none; }
+.ai-banner-text { font-weight: 600; }
+.ai-banner-error { flex-basis: 100%; color: var(--red); }
+
+/* The status card for a Failed or Interrupted session (local #225) and error events in the transcript. */
+.outcome-card { display: flex; flex-direction: column; gap: 6px; padding: 10px 16px; background: var(--mantle); border-bottom: 1px solid var(--surface0); border-left: 3px solid var(--overlay0); font-size: 13px; }
+.outcome-card[hidden] { display: none; }
+.outcome-failed { border-left-color: var(--red); }
+.outcome-interrupted { border-left-color: var(--yellow); }
+.outcome-title { font-weight: 600; }
+.outcome-failed .outcome-title { color: var(--red); }
+.outcome-interrupted .outcome-title { color: var(--yellow); }
+.outcome-error { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; color: var(--red); }
+.outcome-error-label { color: var(--subtext); }
+.outcome-steps { display: flex; flex-wrap: wrap; gap: 8px; }
+.outcome-next { color: var(--subtext); font-size: 12px; }
+.ev-error { color: var(--red); border-left: 3px solid var(--red); }
+/* A runtime error after boot (Issue #295): a dismissible corner notice, never in the layout flow, so the composer stays on screen. */
+.runtime-notice {
+  position: fixed; bottom: 16px; left: 16px; right: auto; top: auto; z-index: 12; margin: 0; padding: 10px 14px; border-radius: 8px;
+  width: auto; height: auto; max-width: min(420px, calc(100vw - 32px)); max-height: 40vh; overflow: auto;
+  background: var(--surface0); border: 1px solid var(--red); color: var(--text); font-size: 13px;
+}
+.runtime-notice[hidden] { display: none; }
+.runtime-notice-head { display: flex; gap: 10px; align-items: flex-start; }
+.runtime-notice-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.runtime-notice-repeat { color: var(--subtext); }
+.runtime-notice-dismiss { flex: 0 0 auto; }
+
+/* "Jump to latest (N new)" floats over the bottom-right of the conversation (local #306); the slot adds no height. */
+.jump-slot { position: relative; height: 0; flex: none; z-index: 5; }
+.jump-latest { position: absolute; right: 24px; bottom: 12px; box-shadow: 0 2px 8px rgba(0, 0, 0, .35); }
+.jump-latest[hidden] { display: none; }

@@ -203,17 +203,20 @@ async fn idle_interrupt_and_archive_never_signal_a_disarmed_exited_handle() {
     exec::end_turn(&registry);
     finalize(&manager, session_id, TerminalFinalizeDecision::completed()).await;
 
-    // The leader exits while the session idles: its group is killed once, under
-    // the pinning zombie, and the retained unread handle is disarmed.
+    // The leader exits while the session idles and the retained unread handle
+    // is disarmed. Linux kills its group once, under the pinning zombie
+    // (`WNOWAIT`); other platforms cannot observe an exit without reaping it, so
+    // they reap and disarm with no group kill (`LeaderObservation::Reaped`, #193).
+    let exit_kills = if cfg!(target_os = "linux") { 1 } else { 0 };
     assert!(wait_for_enabled_wakes(&manager, session_id, 1).await);
-    assert_eq!(sent_to(pgid), 1);
+    assert_eq!(sent_to(pgid), exit_kills);
     assert!(exec::has_process(&registry, process).await);
 
     // Operator interrupt of the idle session, then archive: neither signals.
     let _ = manager.interrupt_session(session_id).await;
     assert_eq!(
         sent_to(pgid),
-        1,
+        exit_kills,
         "idle interrupt sent a signal to a disarmed handle"
     );
     manager
@@ -223,7 +226,7 @@ async fn idle_interrupt_and_archive_never_signal_a_disarmed_exited_handle() {
     let _ = manager.archive_session(session_id).await;
     assert_eq!(
         sent_to(pgid),
-        1,
+        exit_kills,
         "archive sent a signal to a disarmed handle"
     );
 }

@@ -5,8 +5,9 @@
 
 use super::navigation::{clip_at_char_boundary, failure, optional_uint};
 use super::{HarnessTool, ToolContext, ToolExecutionMode, is_system_blocked};
-use crate::paths::resolve_sandboxed_path;
+use crate::paths::resolve_path_in_scope;
 use crate::types::ToolResult;
+use rsi_common::harness_tool_policy::FilePathScope;
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
@@ -27,6 +28,12 @@ const MAX_READ_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Room kept for the footer inside the output budget.
 const FOOTER_RESERVE_BYTES: usize = 128;
 
+/// The system blocklist protects the host; a task-environment session runs in
+/// a disposable container whose `/etc` and `/usr/lib` the task legitimately edits.
+fn system_blocked(path: &Path, scope: FilePathScope) -> bool {
+    scope == FilePathScope::WorkingDir && is_system_blocked(path)
+}
+
 pub struct ReadFileTool;
 
 impl ReadFileTool {
@@ -34,6 +41,7 @@ impl ReadFileTool {
         &self,
         args: serde_json::Value,
         working_dir: &Path,
+        scope: FilePathScope,
         max_output_bytes: usize,
     ) -> ToolResult {
         let path_str = args
@@ -56,7 +64,7 @@ impl ReadFileTool {
             Err(message) => return failure(message),
         };
 
-        let resolved = match resolve_sandboxed_path(working_dir, path_str) {
+        let resolved = match resolve_path_in_scope(working_dir, path_str, scope) {
             Ok(p) => p,
             Err(e) => {
                 return ToolResult {
@@ -67,7 +75,7 @@ impl ReadFileTool {
             }
         };
 
-        if is_system_blocked(&resolved) {
+        if system_blocked(&resolved, scope) {
             return ToolResult {
                 success: false,
                 output: String::new(),
@@ -211,7 +219,7 @@ impl HarnessTool for ReadFileTool {
     }
 
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult {
-        self.execute_limited(args, working_dir, MAX_READ_BYTES)
+        self.execute_limited(args, working_dir, FilePathScope::WorkingDir, MAX_READ_BYTES)
             .await
     }
 
@@ -227,7 +235,12 @@ impl HarnessTool for ReadFileTool {
                 output: String::new(),
                 error_msg: Some("Tool execution cancelled".into()),
             },
-            result = self.execute_limited(args, &context.working_dir, context.policy.max_output_bytes) => result,
+            result = self.execute_limited(
+                args,
+                &context.working_dir,
+                context.policy.file_paths,
+                context.policy.max_output_bytes,
+            ) => result,
         }
     }
 }
@@ -250,6 +263,30 @@ impl HarnessTool for WriteFileTool {
     }
 
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult {
+        self.write_in_scope(args, working_dir, FilePathScope::WorkingDir)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolResult {
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => failure("Tool execution cancelled"),
+            result = self.write_in_scope(args, &context.working_dir, context.policy.file_paths) => result,
+        }
+    }
+}
+
+impl WriteFileTool {
+    async fn write_in_scope(
+        &self,
+        args: serde_json::Value,
+        working_dir: &Path,
+        scope: FilePathScope,
+    ) -> ToolResult {
         let path_str = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -259,7 +296,7 @@ impl HarnessTool for WriteFileTool {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
 
-        let resolved = match resolve_sandboxed_path(working_dir, path_str) {
+        let resolved = match resolve_path_in_scope(working_dir, path_str, scope) {
             Ok(p) => p,
             Err(e) => {
                 return ToolResult {
@@ -270,7 +307,7 @@ impl HarnessTool for WriteFileTool {
             }
         };
 
-        if is_system_blocked(&resolved) {
+        if system_blocked(&resolved, scope) {
             return ToolResult {
                 success: false,
                 output: String::new(),
@@ -686,6 +723,30 @@ impl HarnessTool for EditFileTool {
     }
 
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult {
+        self.edit_in_scope(args, working_dir, FilePathScope::WorkingDir)
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: serde_json::Value,
+        context: &ToolContext,
+    ) -> ToolResult {
+        tokio::select! {
+            biased;
+            _ = context.cancel.cancelled() => failure("Tool execution cancelled"),
+            result = self.edit_in_scope(args, &context.working_dir, context.policy.file_paths) => result,
+        }
+    }
+}
+
+impl EditFileTool {
+    async fn edit_in_scope(
+        &self,
+        args: serde_json::Value,
+        working_dir: &Path,
+        scope: FilePathScope,
+    ) -> ToolResult {
         let path_str = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -698,12 +759,12 @@ impl HarnessTool for EditFileTool {
             Err(message) => return failure(message),
         };
 
-        let resolved = match resolve_sandboxed_path(working_dir, path_str) {
+        let resolved = match resolve_path_in_scope(working_dir, path_str, scope) {
             Ok(p) => p,
             Err(e) => return failure(format!("Path error: {e}")),
         };
 
-        if is_system_blocked(&resolved) {
+        if system_blocked(&resolved, scope) {
             return failure("Edit of system path blocked");
         }
 
@@ -1114,6 +1175,124 @@ mod tests {
                 .output
                 .contains("of 200]\n[more lines: call with offset=")
         );
+    }
+
+    fn scoped_context(working_dir: &Path, scope: FilePathScope) -> ToolContext {
+        ToolContext {
+            session_id: None,
+            working_dir: working_dir.to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            event_sink: None,
+            policy: super::super::ToolPolicy {
+                file_paths: scope,
+                ..super::super::ToolPolicy::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_a_new_file_at_an_absolute_path_inside_working_dir() {
+        let temp = disk_backed_working_dir("session-harness-file-abs-new-");
+        let target = temp.path().canonicalize().unwrap().join("pkg/x.py");
+        let result = WriteFileTool
+            .execute(
+                serde_json::json!({"path": target.to_str().unwrap(), "content": "print(1)\n"}),
+                temp.path(),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error_msg);
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "print(1)\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_file_refusal_outside_working_dir_names_it_and_suggests_relative() {
+        let temp = disk_backed_working_dir("session-harness-file-abs-out-");
+        let outside = disk_backed_working_dir("session-harness-file-abs-other-");
+        let target = outside.path().join("x.py");
+        let result = WriteFileTool
+            .execute_with_context(
+                serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+                &scoped_context(temp.path(), FilePathScope::WorkingDir),
+            )
+            .await;
+        assert!(!result.success);
+        let message = result.error_msg.unwrap();
+        let canon_wd = temp.path().canonicalize().unwrap();
+        assert!(
+            message.contains(&canon_wd.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains("relative to the working directory"),
+            "{message}"
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn task_environment_scope_lets_the_file_tools_reach_outside_working_dir() {
+        let temp = disk_backed_working_dir("session-harness-file-env-wd-");
+        let outside = disk_backed_working_dir("session-harness-file-env-out-");
+        let target = outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("nested/app.conf");
+        let path = target.to_str().unwrap();
+        let context = scoped_context(temp.path(), FilePathScope::TaskEnvironment);
+
+        let wrote = WriteFileTool
+            .execute_with_context(
+                serde_json::json!({"path": path, "content": "a=1\n"}),
+                &context,
+            )
+            .await;
+        assert!(wrote.success, "{:?}", wrote.error_msg);
+        let edited = EditFileTool
+            .execute_with_context(
+                serde_json::json!({"path": path, "old_string": "a=1", "new_string": "a=2"}),
+                &context,
+            )
+            .await;
+        assert!(edited.success, "{:?}", edited.error_msg);
+        let read = ReadFileTool
+            .execute_with_context(serde_json::json!({"path": path}), &context)
+            .await;
+        assert!(read.success, "{:?}", read.error_msg);
+        assert!(read.output.contains("a=2"), "{}", read.output);
+
+        // The default scope stays contained for the same call.
+        let contained = ReadFileTool
+            .execute_with_context(
+                serde_json::json!({"path": path}),
+                &scoped_context(temp.path(), FilePathScope::WorkingDir),
+            )
+            .await;
+        assert!(!contained.success);
+    }
+
+    #[tokio::test]
+    async fn task_environment_scope_lifts_the_host_system_blocklist() {
+        let temp = disk_backed_working_dir("session-harness-file-env-blocked-");
+        let args = serde_json::json!({"path": "/proc/self/cmdline"});
+        let contained = ReadFileTool
+            .execute_with_context(
+                args.clone(),
+                &scoped_context(temp.path(), FilePathScope::WorkingDir),
+            )
+            .await;
+        assert!(!contained.success);
+        assert!(!system_blocked(
+            Path::new("/etc/hosts"),
+            FilePathScope::TaskEnvironment
+        ));
+        assert!(system_blocked(
+            Path::new("/etc/hosts"),
+            FilePathScope::WorkingDir
+        ));
     }
 
     #[tokio::test]

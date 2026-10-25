@@ -194,6 +194,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unmatched_model_sink_hints_name_the_registration_each_kind_accepts() {
+        for (kind, source, hint) in [
+            (
+                "CliSpawn",
+                "fn run() { Command::new(\"git\").spawn(); }",
+                "a model CLI launch needs an EXECUTION_BOUNDARIES row instead",
+            ),
+            (
+                "ProviderChat",
+                "fn run() { provider.chat(request); }",
+                "must pass the `execution` capability bound from an admitted request's \
+                 `into_parts()`, or needs an EXECUTION_BOUNDARIES row with \
+                 PrimitiveKind::ProviderChat in crates/rsid-store/src/model_control/registry.rs",
+            ),
+            (
+                "AppServerModelRequest",
+                "fn run() { client.send_codex_app_server(payload); }",
+                "needs an EXECUTION_BOUNDARIES row with PrimitiveKind::AppServerModelRequest \
+                 in crates/rsid-store/src/model_control/registry.rs",
+            ),
+            (
+                "RawHttpSend",
+                "fn run() { request.send(); }",
+                "build it with .post(...) or .get(...) in the same item, or send a model \
+                 request through AdmittedHttpRequest::send",
+            ),
+        ] {
+            let root = fixture_root(kind);
+            write(&root, "crates/rsid/src/provider.rs", source);
+            let error = validate_repository(input(&root, vec![], vec![], vec![]))
+                .expect_err("unregistered sink must explain its registration");
+            for expected in [
+                format!("crates/rsid/src/provider.rs:run: {kind} sink joins 0 contracts"),
+                hint.to_string(),
+                "see \"Model-control registry\" in crates/rsid-store/AGENTS.md".to_string(),
+            ] {
+                assert!(
+                    error.contains(&expected),
+                    "{kind}: missing {expected}: {error}"
+                );
+            }
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
     fn valid_http_source() -> &'static str {
         r#"
 use crate::model_control::ModelExecutionCapability;

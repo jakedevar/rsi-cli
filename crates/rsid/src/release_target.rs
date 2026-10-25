@@ -34,7 +34,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rsi_common::agent_jobs::JobParams;
+use rsi_common::agent_jobs::{BuildCommand, JobParams};
 
 use crate::shared_target_prune::try_lock_exclusive;
 
@@ -84,6 +84,51 @@ pub fn release_target_dir() -> PathBuf {
 #[must_use]
 pub fn uses_release_target(params: &JobParams, owner_is_manager: bool) -> bool {
     owner_is_manager && matches!(params, JobParams::Build(build) if build.release)
+}
+
+/// #3993, #4045: a manager's package-scoped or workspace release build cannot
+/// stage a deploy. Every manager release build shares [`release_target_dir`],
+/// and nine package-scoped jobs in a row left only the last two members'
+/// binaries in `release/` (the install script then refused the missing
+/// `rsid`). A `workspace:true` release build compiles every crate in one Cargo
+/// invocation, which unifies `rsi-repo-guards`' `serde_json/preserve_order`
+/// into `rsid` and changes Maps and starter digests. The aggregate
+/// `release_members` build compiles every member in its own invocation under
+/// one slot and proves coverage in its receipt, so both shapes are refused with
+/// that pointer. The aggregate request, dev builds, `check` builds and every
+/// worker's build are not affected.
+///
+/// # Errors
+/// The refusal text (`field: fix`) when `params` is a manager's package-scoped
+/// or workspace release build.
+pub fn refuse_per_member_release(params: &JobParams, owner_is_manager: bool) -> Result<(), String> {
+    let JobParams::Build(build) = params else {
+        return Ok(());
+    };
+    if !owner_is_manager || !build.release || !build.release_members.is_empty() {
+        return Ok(());
+    }
+    if build.package.is_some() {
+        return Err(
+            "params.package: a manager's per-package release build cannot stage a deploy: \
+             the shared release target keeps only the last members' binaries. Submit one \
+             build with command:\"build\", release:true, sha and \
+             release_members:[{package,bins},...] (omit package, bins and workspace) \
+             instead; see procedures.md \"Deploys\""
+                .into(),
+        );
+    }
+    if build.workspace && build.command == BuildCommand::Build {
+        return Err(
+            "params.workspace: a manager's workspace release build cannot stage a deploy: \
+             Cargo unifies rsi-repo-guards' serde_json/preserve_order into rsid. Submit one \
+             build with command:\"build\", release:true, sha and \
+             release_members:[{package,bins},...] (omit package, bins and workspace) \
+             instead; see procedures.md \"Deploys\""
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// The target directory one job builds in: the shared release target for a
@@ -369,6 +414,7 @@ mod tests {
 
     fn build(release: bool) -> JobParams {
         JobParams::Build(BuildJobParams {
+            release_members: Vec::new(),
             command: BuildCommand::Build,
             package: None,
             workspace: true,
@@ -377,9 +423,59 @@ mod tests {
             no_default_features: false,
             features: Vec::new(),
             shards: Vec::new(),
+            bins: Vec::new(),
             cpu_quota_percent: None,
             sha: None,
         })
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_managers_per_package_release_build_is_refused_and_points_to_release_members() {
+        let with = |release: bool, package: Option<&str>, members: bool| {
+            let JobParams::Build(mut p) = build(release) else {
+                unreachable!()
+            };
+            p.workspace = package.is_none();
+            p.package = package.map(str::to_string);
+            if members {
+                p.release_members = vec![rsi_common::agent_jobs::ReleaseBuildMember {
+                    package: "rsid".into(),
+                    bins: vec!["rsid".into()],
+                }];
+                p.package = None;
+            }
+            JobParams::Build(p)
+        };
+        let refused = refuse_per_member_release(&with(true, Some("rsid"), false), true)
+            .expect_err("a manager's package release build is refused");
+        assert!(refused.contains("release_members"), "{refused}");
+        // The aggregate request, a dev build and a worker's own release build
+        // are unaffected.
+        assert!(refuse_per_member_release(&with(true, None, true), true).is_ok());
+        assert!(refuse_per_member_release(&with(false, Some("rsid"), false), true).is_ok());
+        assert!(refuse_per_member_release(&with(true, Some("rsid"), false), false).is_ok());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn a_managers_workspace_release_build_is_refused_and_points_to_release_members() {
+        let workspace = |release: bool, command: BuildCommand| {
+            let JobParams::Build(mut p) = build(release) else {
+                unreachable!()
+            };
+            p.command = command;
+            JobParams::Build(p)
+        };
+        let refused = refuse_per_member_release(&workspace(true, BuildCommand::Build), true)
+            .expect_err("a manager's workspace release build is refused");
+        assert!(refused.contains("release_members"), "{refused}");
+        assert!(refused.contains("params.workspace"), "{refused}");
+        // Dev builds, check builds and a worker's workspace release build stay
+        // allowed.
+        assert!(refuse_per_member_release(&workspace(false, BuildCommand::Build), true).is_ok());
+        assert!(refuse_per_member_release(&workspace(true, BuildCommand::Check), true).is_ok());
+        assert!(refuse_per_member_release(&workspace(true, BuildCommand::Build), false).is_ok());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]

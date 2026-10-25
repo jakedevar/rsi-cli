@@ -3,18 +3,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::App;
-use crate::claude_config;
 use crate::types::OverlayState;
 
-/// Open the SKILL.md preview overlay for the given user skill name.
-pub fn open_skill_preview(app: &mut App, name: &str) {
-    let content = match claude_config::read_skill_content(name) {
-        Ok(s) => s,
-        Err(e) => {
-            app.notify_error(format!("Failed to read SKILL.md: {}", e));
-            return;
-        }
-    };
+/// Open the SKILL.md preview overlay on `content`, the text the daemon's
+/// `GetSkill` returned for user skill `name`.
+pub fn open_skill_preview(app: &mut App, name: &str, content: String) {
     app.overlay = OverlayState::SkillPreview {
         name: name.to_string(),
         content,

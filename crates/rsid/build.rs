@@ -1,37 +1,39 @@
-/// Full commit SHA embedded as `RSI_BUILD_SHA` for `AgentGetDaemonInfo`
-/// (#1045). `RSI_BUILD_SHA` in the build environment wins (release builds from
-/// a source tarball, merge-queue gate builds); otherwise `git rev-parse HEAD`;
-/// otherwise `unknown`.
-///
-/// A pinned id never consults git, so nothing in the repository can change it
-/// and the script must not rerun when `HEAD` moves (#2508): a warm lander slot
-/// re-clones the candidate at every gate, which rewrites `.git/HEAD`, and a
-/// rerun makes Cargo recompile this crate and everything above it.
-fn emit_build_sha() {
-    println!("cargo:rerun-if-env-changed=RSI_BUILD_SHA");
-    if let Some(sha) = std::env::var("RSI_BUILD_SHA")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        println!("cargo:rustc-env=RSI_BUILD_SHA={sha}");
-        return;
-    }
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .filter(|text| !text.is_empty())
-    };
-    for path in ["HEAD", "logs/HEAD"] {
-        if let Some(found) = git(&["rev-parse", "--git-path", path]) {
-            println!("cargo:rerun-if-changed={found}");
+/// The digest code is shared with `rsi-common`; it depends on `std` and `sha2` only.
+#[allow(dead_code)]
+#[path = "../rsi-common/src/harness_source_digest.rs"]
+mod harness_source_digest;
+
+#[path = "../rsi-common/build_support/build_identity.rs"]
+mod build_identity;
+
+/// The harness source digest of the build commit, embedded as `RSI_HARNESS_SOURCE_DIGEST`
+/// (#3192): a sha256 over the git tree or blob ids, at `sha`, of the paths in
+/// `crates/rsi-common/data/harness_source_paths.txt`. A redeploy that leaves those paths alone
+/// keeps the digest, so a benchmark baseline measured on an earlier build stays comparable. When
+/// git cannot say (no repository, an unknown commit, uncommitted changes under a listed path) the
+/// value is `unavailable:<sha>`, which the paired compare never accepts.
+fn emit_harness_source_digest(sha: &str, pinned: bool) {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()),
+    );
+    let repo = manifest.join("../..");
+    println!("cargo:rerun-if-changed=../rsi-common/data/harness_source_paths.txt");
+    if !pinned {
+        // An unpinned build describes the working tree, so an edit under a listed path must
+        // re-evaluate the dirty check. A pinned build is a fixed commit and must not rerun when
+        // files move (see `emit_build_sha`).
+        if let Ok(paths) = harness_source_digest::parse_path_list(harness_source_digest::PATH_LIST)
+        {
+            for entry in paths {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    repo.join(entry.git_path()).display()
+                );
+            }
         }
     }
-    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=RSI_BUILD_SHA={sha}");
+    let digest = harness_source_digest::embedded_source_digest(&repo, sha);
+    println!("cargo:rustc-env=RSI_HARNESS_SOURCE_DIGEST={digest}");
 }
 
 /// Main worktree of the repo this binary is built from, embedded as
@@ -91,7 +93,9 @@ fn refuse_e2e_seed_in_release() {
 fn main() {
     refuse_test_seam_in_release();
     refuse_e2e_seed_in_release();
-    emit_build_sha();
+    println!("cargo:rerun-if-changed=../rsi-common/build_support/build_identity.rs");
+    let (build_sha, pinned) = build_identity::emit_build_sha();
+    emit_harness_source_digest(&build_sha, pinned);
     emit_build_main_worktree();
     // Get the SQLite include directory from the bundled libsqlite3-sys crate.
     // This provides sqlite3.h / sqlite3ext.h needed by the sqlite-vec extension.

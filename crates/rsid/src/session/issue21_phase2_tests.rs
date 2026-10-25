@@ -1022,7 +1022,7 @@ mod p2_07_gate_permit_spine {
     const RELEASED_INVENTORY: &str = "tools/released-migrations.json";
 
     /// The `RSI-RELEASED-MIGRATION-BEGIN/END: name` region, markers included,
-    /// exactly as `tools/check-released-migrations.py` hashes it.
+    /// exactly as `released_migrations` in `rsi-repo-guards` hashes it.
     fn released_migration_region(source: &str, name: &str) -> Option<String> {
         let begin = format!("// RSI-RELEASED-MIGRATION-BEGIN: {name}");
         let end = format!("// RSI-RELEASED-MIGRATION-END: {name}");
@@ -3948,7 +3948,7 @@ mod p2_07_gate_permit_spine {
                 syn::Expr::MethodCall(value)
                     if matches!(
                         semantic_ident(&value.method).as_str(),
-                        "as_str" | "to_owned" | "to_string"
+                        "as_str" | "to_owned" | "to_string" | "into"
                     ) =>
                 {
                     self.evaluate(&value.receiver, bindings, scope, depth + 1)
@@ -7738,6 +7738,82 @@ mod p2_07_gate_permit_spine {
         Ok(vec![canonical_target])
     }
 
+    /// True when an item-position `include!` is a proven test-only mount of a
+    /// shared fixture owned by a workspace-sibling crate (#586).
+    ///
+    /// The caller only asks for items that are already proven test-only
+    /// (`attributes_require_test`, which holds only when no cfg valuation can
+    /// compile the item outside `cfg(test)`). The target must be a
+    /// non-symlink `.rs` regular file whose canonical path is under
+    /// `<workspace>/crates/<other crate>/src/`, where `<workspace>/crates/<this
+    /// crate>/src` is `source_root`. Anything else (outside `crates/`, this
+    /// crate's own tree, a symlinked file or directory, a non-Rust file, a
+    /// generated-migrations form, or any non-literal argument) returns `false`
+    /// so the strict `include_targets` confinement reports it.
+    ///
+    /// Weakening risk: the mounted file is not parsed or scanned, exactly like
+    /// an in-root test-only file, which is traversed but never emitted as a
+    /// production unit. A protected writer reachable only through such a mount
+    /// is therefore invisible to the scan; that is sound only because the mount
+    /// is `cfg(test)`-only. The same file included from a production item still
+    /// fails closed in `include_targets`.
+    fn is_test_only_sibling_include(
+        invocation: &syn::Macro,
+        declaring_source: &std::path::Path,
+        source_root: &std::path::Path,
+    ) -> bool {
+        if !path_is_semantic_ident(&invocation.path, "include")
+            || is_generated_store_migrations_include(invocation)
+        {
+            return false;
+        }
+        let Ok(literal) = syn::parse2::<syn::LitStr>(invocation.tokens.clone()) else {
+            return false;
+        };
+        let target = declaring_source
+            .parent()
+            .unwrap_or(source_root)
+            .join(literal.value());
+        let Ok(metadata) = std::fs::symlink_metadata(&target) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return false;
+        }
+        if target.extension().is_none_or(|extension| extension != "rs") {
+            return false;
+        }
+        let (Ok(canonical_root), Ok(canonical_target)) =
+            (source_root.canonicalize(), target.canonicalize())
+        else {
+            return false;
+        };
+        if canonical_target.starts_with(&canonical_root) {
+            return false;
+        }
+        let Some(own_crate) = canonical_root.parent() else {
+            return false;
+        };
+        let Some(crates_dir) = own_crate.parent() else {
+            return false;
+        };
+        if canonical_root.file_name() != Some(std::ffi::OsStr::new("src"))
+            || crates_dir.file_name() != Some(std::ffi::OsStr::new("crates"))
+        {
+            return false;
+        }
+        let Ok(relative) = canonical_target.strip_prefix(crates_dir) else {
+            return false;
+        };
+        let mut components = relative.components();
+        let (Some(sibling), Some(src)) = (components.next(), components.next()) else {
+            return false;
+        };
+        sibling.as_os_str() != own_crate.file_name().unwrap_or_default()
+            && src.as_os_str() == "src"
+            && components.next().is_some()
+    }
+
     /// Expression-position includes splice one expression, so exactly one
     /// target is legal there.
     fn include_target(
@@ -7920,6 +7996,15 @@ mod p2_07_gate_permit_spine {
                     }
                 }
                 syn::Item::Macro(invocation) => {
+                    if !item_production
+                        && is_test_only_sibling_include(
+                            &invocation.mac,
+                            declaring_source,
+                            source_root,
+                        )
+                    {
+                        continue;
+                    }
                     for target in include_targets(&invocation.mac, declaring_source, source_root)? {
                         traverse_source(
                             root,
@@ -9889,6 +9974,116 @@ mod p2_07_gate_permit_spine {
         );
     }
 
+    /// #586: a `cfg(test)`-only mount of a workspace-sibling test fixture is
+    /// accepted, while every production escape, and every test-only mount that
+    /// is not a plain `.rs` file under `crates/<sibling>/src`, stays refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn test_only_sibling_include_is_accepted_but_production_and_unbounded_escapes_are_refused() {
+        const INSERT: &str = "INSERT INTO agent_message_provider_effect_permits DEFAULT VALUES";
+        let workspace = tempfile::tempdir().expect("create workspace");
+        let own_src = workspace.path().join("crates/own/src");
+        let sibling_src = workspace.path().join("crates/sibling/src");
+        std::fs::create_dir_all(&own_src).expect("create own src");
+        std::fs::create_dir_all(&sibling_src).expect("create sibling src");
+        std::fs::write(
+            sibling_src.join("fixture.rs"),
+            format!(
+                "fn fixture(conn: &rusqlite::Connection) {{ conn.execute(\"{INSERT}\", []); }}\n"
+            ),
+        )
+        .expect("write sibling fixture");
+        std::fs::write(
+            workspace.path().join("crates/sibling/build.rs"),
+            "fn main() {}\n",
+        )
+        .expect("write sibling build script");
+        let scan = |lib: &str| {
+            std::fs::write(own_src.join("lib.rs"), lib).expect("write own lib");
+            scan_crate_production_writers(&own_src)
+        };
+
+        // Test-only mounts below `#[cfg(test)]` resolve the sibling fixture and
+        // contribute no production writer.
+        for lib in [
+            "#[cfg(test)] mod fixtures { include!(\"../../sibling/src/fixture.rs\"); }\n",
+            "#[cfg(test)] include!(\"../../sibling/src/fixture.rs\");\n",
+        ] {
+            let accepted = scan(lib).expect("a test-only sibling fixture mount must be accepted");
+            assert!(accepted.report.dynamic_rejections.is_empty(), "{lib}");
+            assert!(accepted.report.writers.is_empty(), "{lib}");
+        }
+
+        // Production code still may not leave the crate source root.
+        for lib in [
+            "include!(\"../../sibling/src/fixture.rs\");\n",
+            "mod fixtures { include!(\"../../sibling/src/fixture.rs\"); }\n",
+            "#[cfg(not(test))] include!(\"../../sibling/src/fixture.rs\");\n",
+            "#[cfg(any(test, feature = \"x\"))] include!(\"../../sibling/src/fixture.rs\");\n",
+        ] {
+            let error = scan(lib)
+                .err()
+                .unwrap_or_else(|| panic!("production escape must be refused: {lib}"));
+            assert!(error.contains("escapes source root"), "{lib}: {error}");
+        }
+
+        // A test-only mount is bounded to `crates/<sibling>/src/**/*.rs`.
+        let outside = tempfile::tempdir().expect("create outside tree");
+        std::fs::write(outside.path().join("outside.rs"), "fn outside() {}\n")
+            .expect("write outside fixture");
+        std::os::unix::fs::symlink(
+            outside.path().join("outside.rs"),
+            sibling_src.join("linked.rs"),
+        )
+        .expect("link sibling fixture");
+        std::os::unix::fs::symlink(outside.path(), sibling_src.join("linked_dir"))
+            .expect("link sibling directory");
+        std::fs::write(own_src.join("local.txt"), "fn local() {}\n").expect("write text");
+        std::fs::write(sibling_src.join("fixture.txt"), "fn text() {}\n").expect("write text");
+        let absolute = outside
+            .path()
+            .join("outside.rs")
+            .to_str()
+            .expect("UTF-8 outside path")
+            .to_string();
+        for refused in [
+            "../../sibling/build.rs".to_string(),
+            "../../sibling/src/linked.rs".to_string(),
+            "../../sibling/src/linked_dir/outside.rs".to_string(),
+            "../../sibling/src/fixture.txt".to_string(),
+            "../../sibling/src/missing.rs".to_string(),
+            "../../sibling/src".to_string(),
+            "../../../outside.rs".to_string(),
+            absolute,
+        ] {
+            let lib = format!("#[cfg(test)] include!({refused:?});\n");
+            let error = scan(&lib)
+                .err()
+                .unwrap_or_else(|| panic!("unbounded test-only mount must be refused: {refused}"));
+            assert!(!error.is_empty(), "{refused}");
+        }
+
+        // Outside a `crates/<crate>/src` layout there is no workspace to bound.
+        let loose = tempfile::tempdir().expect("create loose tree");
+        let loose_src = loose.path().join("own/src");
+        std::fs::create_dir_all(&loose_src).expect("create loose src");
+        std::fs::create_dir_all(loose.path().join("sibling/src")).expect("create loose sibling");
+        std::fs::write(
+            loose.path().join("sibling/src/fixture.rs"),
+            "fn fixture() {}\n",
+        )
+        .expect("write loose fixture");
+        std::fs::write(
+            loose_src.join("lib.rs"),
+            "#[cfg(test)] include!(\"../../sibling/src/fixture.rs\");\n",
+        )
+        .expect("write loose lib");
+        let error = scan_crate_production_writers(&loose_src)
+            .err()
+            .expect("a layout without crates/<crate>/src must keep source confinement");
+        assert!(error.contains("escapes source root"), "{error}");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[test]
     fn scanner_unions_absolute_path_edges_and_rejects_escape_or_symlink_targets() {
@@ -10329,9 +10524,16 @@ mod p2_07_gate_permit_spine {
     fn scanner_vec_clauses_keep_every_pushed_fragment_visible() {
         for (addition, expected_rejections, expected_writers) in [
             ("\"i.status='Open'\".to_string()", 0, 0),
+            ("\"i.status='Open'\".into()", 0, 0),
             ("unknown.to_string()", 1, 0),
+            ("unknown.into()", 1, 0),
             (
                 "\"agent_message_provider_effect_permits DEFAULT VALUES\".to_string()",
+                0,
+                1,
+            ),
+            (
+                "\"agent_message_provider_effect_permits DEFAULT VALUES\".into()",
                 0,
                 1,
             ),
@@ -10364,6 +10566,12 @@ mod p2_07_gate_permit_spine {
                 "{report:#?}"
             );
             assert_eq!(report.writers.len(), expected_writers, "{report:#?}");
+            if addition == "unknown.into()" {
+                assert!(
+                    report.dynamic_rejections[0].contains("opaque dynamic SQL"),
+                    "a runtime .into() receiver must remain opaque: {report:#?}"
+                );
+            }
         }
     }
 
@@ -14143,7 +14351,7 @@ fn separate_stores_do_not_share_a_delivery_boot_identity() {
 /// mail that was already dispatched.
 ///
 /// The seam under test is the real `SessionManager::new`, and the handle read is
-/// the very `Arc<Mutex<Store>>` the monitor locks at its result boundary
+/// the very `Arc<rsid_core::store_lock::Mutex<Store>>` the monitor locks at its result boundary
 /// (`monitor.rs:2296`) — not a fresh `Store` that merely resembles it.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
 #[tokio::test]
@@ -14842,7 +15050,7 @@ async fn global_quarantine_caps_seal_once_across_sessions_and_restart() {
         );
     }
 
-    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let plane = Arc::new(AppServerControlPlane::new());
     let now = Instant::now();
     plane.register_attempt(&first, CorrelationStateV1::CorrelationPending, now);
@@ -14990,7 +15198,7 @@ async fn a_latch_lost_to_a_crash_seals_once_and_never_becomes_provider_death() {
 
     let store = Store::open_in_memory().expect("open V81 store");
     let fence = app_server_claimed_fixture(&store, "crash-lost");
-    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
 
     // The daemon crashed before the worker ever ran: nothing is durable yet.
     assert_eq!(
@@ -15071,7 +15279,7 @@ async fn a_correlated_attempt_supersedes_a_pending_seal_instead_of_being_overwri
         )
         .expect("a legitimate correlation fill must be admitted");
 
-    let store = Arc::new(tokio::sync::Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let plane = Arc::new(AppServerControlPlane::new());
     plane.register_attempt(
         &fence,
@@ -18291,7 +18499,7 @@ async fn non_epic_parent_with_lead_pointer_does_not_grant_authority() {
     use rsi_common::agent_coordination::AgentMessageErrorCodeV1;
 
     async fn insert_row(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         id: Uuid,
         kind: SessionKind,
         parent_id: Option<Uuid>,
@@ -18314,7 +18522,7 @@ async fn non_epic_parent_with_lead_pointer_does_not_grant_authority() {
         }
     }
 
-    async fn message_rows(store: &Arc<tokio::sync::Mutex<Store>>) -> i64 {
+    async fn message_rows(store: &Arc<rsid_core::store_lock::Mutex<Store>>) -> i64 {
         store
             .lock()
             .await

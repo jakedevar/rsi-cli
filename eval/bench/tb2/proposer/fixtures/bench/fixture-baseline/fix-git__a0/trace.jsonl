@@ -1,0 +1,10 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Recover the lost commit on the repository in the working directory.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"pwd && ls -la && git status"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"/app\n.git\nnotes.txt\nOn branch master","success":true},"seq":2}
+{"args":{"command":"git reflog | head -5"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"a1b2c3d HEAD@{0}: checkout: moving to master\n9f8e7d6 HEAD@{1}: commit: add notes","success":true},"seq":4}
+{"args":{"command":"git cherry-pick 9f8e7d6"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"[master 4c5d6e7] add notes","success":true},"seq":6}
+{"args":{"command":"git log --oneline | head -3"},"kind":"tool_call","name":"shell","seq":7}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"4c5d6e7 add notes\na1b2c3d init","success":true},"seq":8}
+{"kind":"model_response","response":{"content":"Restored the commit with git reflog and cherry-pick, then checked git log.","stop_reason":"stop","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":9}

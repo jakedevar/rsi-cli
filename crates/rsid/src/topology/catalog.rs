@@ -682,6 +682,7 @@ mod tests {
                 cores: 8,
                 disk_free_gb: *sample.lock().unwrap(),
                 mem_available_gb: 1000.0,
+                swap_free_gb: 0.0,
                 workers_slice_anon_gb: None,
             }),
             Box::new(|pid| {

@@ -62,6 +62,8 @@ pub struct GitTool {
     timeout: Duration,
     session_id: Option<uuid::Uuid>,
     invocation_id: Option<uuid::Uuid>,
+    /// #3165: the custody scan guards only commands inside this base.
+    sandbox_base: std::path::PathBuf,
 }
 
 impl Default for GitTool {
@@ -70,6 +72,7 @@ impl Default for GitTool {
             timeout: Duration::from_secs(DEFAULT_GIT_TIMEOUT_SECS),
             session_id: None,
             invocation_id: None,
+            sandbox_base: rsi_common::boundary_mail_hook::sandbox_base(),
         }
     }
 }
@@ -81,6 +84,13 @@ impl GitTool {
             invocation_id,
             ..Self::default()
         }
+    }
+
+    /// Test seam: the directory the custody scan treats as the sandbox base.
+    #[cfg(test)]
+    pub(super) fn with_sandbox_base(mut self, base: &Path) -> Self {
+        self.sandbox_base = base.to_path_buf();
+        self
     }
 
     async fn execute_with_cancel(
@@ -104,6 +114,7 @@ impl GitTool {
             invocation_id: self.invocation_id,
             working_dir,
             cancel,
+            sandbox_base: &self.sandbox_base,
         };
         if let Some(refusal) = custody_guard::check_git_args(&parts, &probe).await {
             return custody_guard::refused_result(refusal);
@@ -344,6 +355,35 @@ mod tests {
         );
     }
 
+    /// #3165: outside the sandbox base `git stash` runs; inside it is refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[tokio::test]
+    async fn git_tool_custody_scan_applies_only_inside_the_sandbox_base() {
+        use super::custody_guard::test_support::{git, repo};
+        let sandbox_base = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_base.path().join("session");
+        std::fs::create_dir(&sandbox).unwrap();
+        let scratch = repo();
+        let dir = scratch.path();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let tool = GitTool::default().with_sandbox_base(sandbox_base.path());
+        let result = tool
+            .execute(serde_json::json!({"args": "stash"}), dir)
+            .await;
+        assert!(result.success, "{:?} {}", result.error_msg, result.output);
+        assert!(git(dir, &["stash", "list"]).contains("WIP"));
+        let result = tool
+            .execute(serde_json::json!({"args": "stash"}), &sandbox)
+            .await;
+        assert!(!result.success);
+        assert!(
+            result
+                .error_msg
+                .unwrap_or_default()
+                .starts_with("custody_git_refused: ")
+        );
+    }
+
     /// S6 (#2256): the git tool refuses the same custody commands as the shell
     /// tools, with the hard rule named, before git runs.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
@@ -355,7 +395,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
         std::fs::write(dir.join("sentinel.txt"), "keep\n").unwrap();
         let head = git(dir, &["rev-parse", "HEAD"]);
-        let tool = GitTool::default();
+        let tool = GitTool::default().with_sandbox_base(dir);
         for (args, rule) in [
             ("stash", "hard rule 9"),
             ("stash pop", "hard rule 9"),
@@ -468,6 +508,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             session_id: None,
             invocation_id: None,
+            sandbox_base: rsi_common::boundary_mail_hook::sandbox_base(),
         };
 
         let result = tool

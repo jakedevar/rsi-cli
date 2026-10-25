@@ -15,6 +15,10 @@ name = "rsi-rolling-land"
 path = "src/bin/rsi-rolling-land.rs"
 
 [[bin]]
+name = "rsi-bench-resolve"
+path = "src/bin/rsi-bench-resolve.rs"
+
+[[bin]]
 name = "rsi-db-snapshot"
 path = "src/bin/rsi-db-snapshot.rs"
 
@@ -59,6 +63,7 @@ dotenvy = { workspace = true }
 thiserror = { workspace = true }
 which = { workspace = true }
 nix = { workspace = true }
+portable-pty = { workspace = true }
 rusqlite = { workspace = true, features = ["load_extension", "functions", "blob", "hooks"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 anyhow = "1"
@@ -100,6 +105,7 @@ cap-std = "4"
 dhat = { version = "0.3", optional = true }
 # Optional: tokio-console subscriber (Phase 0.6) — enabled via `tokio-console` feature
 console-subscriber = { version = "0.4", optional = true }
+rsi-eval = { version = "0.1.0", path = "../rsi-eval" }
 
 # `fs` (hub #3143-#3151): handle-relative no-follow opens, identity stats and
 # the no-replace rename (renameat2 / renameatx_np) of the project-file writes.
@@ -108,8 +114,11 @@ rustix = { workspace = true, features = ["fs"] }
 
 [build-dependencies]
 cc = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
+rsi-cloud = { path = "../rsi-cloud" }
+rsi-repo-guards = { path = "../rsi-repo-guards", default-features = false }
 rusqlite = { workspace = true, features = ["backup"] }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

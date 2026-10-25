@@ -1,0 +1,15 @@
+#!/bin/sh
+# Staged Python-free scoped-test entry (#423). Not the canonical scripts/scoped-test:
+# no caller switches here until hub #3621's trusted materialization and a Linux
+# acceptance run. Never builds before admission; a daemon build job must have
+# prepared a current rsi-repo-guard and its sibling rsi-scoped-test. The runner's
+# worker re-verifies its compiled source stamp against the checkout it runs from.
+set -eu
+script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
+bin=$("$script_dir/repo-guard" --existing-bin)
+runner=$(dirname "$bin")/rsi-scoped-test
+[ -f "$runner" ] && [ -x "$runner" ] || {
+  echo "scoped-test: a prebuilt rsi-scoped-test beside $bin is required" >&2
+  exit 2
+}
+exec "$runner" "$@"

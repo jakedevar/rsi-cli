@@ -48,7 +48,7 @@ pub(crate) mod seam {
     }
 
     pub(crate) async fn run(
-        store: &tokio::sync::Mutex<crate::store::Store>,
+        store: &rsid_core::store_lock::Mutex<crate::store::Store>,
         caller: Uuid,
         point: &'static str,
     ) {

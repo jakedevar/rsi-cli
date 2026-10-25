@@ -118,6 +118,82 @@ class SourceInventoryTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
+    def test_platform_predicates_only_exclude_provably_unavailable_tests(self) -> None:
+        cases = {
+            "not(unix)": (True, True, False),
+            "all(test, not(unix))": (True, True, False),
+            "unix": (False, False, True),
+            'target_os = "linux"': (False, True, True),
+            'not(target_os = "macos")': (False, True, False),
+            'target_family = "unix"': (False, False, True),
+            'any(unix, target_os = "windows")': (False, False, False),
+            'all(test, not(any(unix, target_os = "windows")))': (True, True, True),
+            'all(not(unix), feature = "optional")': (True, True, False),
+            'any(not(unix), feature = "optional")': (False, False, False),
+            'not(feature = "optional")': (False, False, False),
+            'not(all(unix, target_arch = "aarch64"))': (False, False, False),
+            'all(test, not(unix),)': (True, True, False),
+            "not(unix, windows)": (False, False, False),
+            "not(unix))": (False, False, False),
+        }
+        for index, (target_os, family) in enumerate(
+            (("linux", "unix"), ("macos", "unix"), ("windows", "windows"))
+        ):
+            with mock.patch.object(checker, "HOST_TARGET_OS", target_os), mock.patch.object(
+                checker, "HOST_TARGET_FAMILY", family
+            ):
+                for predicate, expected in cases.items():
+                    with self.subTest(target_os=target_os, predicate=predicate):
+                        self.assertEqual(checker.host_excluded(f"#[cfg({predicate})]"), expected[index])
+
+    def test_non_unix_item_and_module_tests_are_optional_but_native_tests_are_required(self) -> None:
+        # Mirror #497: one non-Unix item and two non-Unix inline module tests.
+        self.write_source(
+            "lib.rs",
+            '#[cfg(not(unix))]\n' + source_test("unsupported_listing")
+            + '#[cfg(all(test, not(unix)))]\nmod unsupported {\n'
+            + "\n".join("    " + line for line in (
+                source_test("unsupported_read") + source_test("unsupported_write")
+            ).splitlines())
+            + '\n}\n#[cfg(unix)]\nmod native;\n'
+            + '#[cfg(all(test, not(unix)))]\nmod portable;\n'
+            + '#[cfg(any(not(unix), feature = "optional"))]\n' + source_test("unknown_feature")
+            + source_test("everywhere"),
+        )
+        self.write_test("native.rs", "native_test")
+        self.write_test("portable.rs", "portable_test")
+        self.write_source("inner.rs", '#![cfg(not(unix))]\n' + source_test("inner_portable"))
+        lists = self.root / "lists"
+        lists.mkdir()
+        runtime = lists / "store-01.json"
+
+        def write_runtime(names: set[str]) -> None:
+            runtime.write_text(json.dumps({"rust-suites": {"rsid": {
+                "binary-id": "rsid",
+                "testcases": {f"tests::{name}": {
+                    "ignored": False, "filter-match": {"status": "matches"}
+                } for name in names},
+            }}}))
+
+        with mock.patch.object(checker, "HOST_TARGET_OS", "linux"), mock.patch.object(
+            checker, "HOST_TARGET_FAMILY", "unix"
+        ):
+            packages = checker.read_shard_packages()
+            manifest, gated = checker.source_inventory(packages, True)
+            self.assertEqual(gated, 8)
+            self.assertEqual(set(checker.PLATFORM_CONDITIONAL_NAMES["store-01"]), {
+                "unsupported_listing", "unsupported_read", "unsupported_write",
+                "portable_test", "inner_portable",
+            })
+            required = {"native_test", "everywhere", "unknown_feature"}
+            write_runtime(required)
+            checker.check_runtime(lists, manifest, packages, ["store-01"])
+            for name in required:
+                with self.subTest(missing=name):
+                    write_runtime(required - {name})
+                    with self.assertRaisesRegex(ValueError, "runtime/static test identities differ"):
+                        checker.check_runtime(lists, manifest, packages, ["store-01"])
+
     def mount_fixture(self, remote_answers: str) -> None:
         self.write_source("lib.rs", "pub mod store;\n")
         self.write_source("store/mod.rs", "mod pending_questions;\n")
@@ -169,6 +245,53 @@ class SourceInventoryTests(unittest.TestCase):
         }
         root = f"{src}lib.rs"
         self.assertEqual(checker.mounted_sources(files, root), set(touched["mount_closure"](files, root)))
+
+    def test_opt_in_mount_excluding_the_declared_shard_fails_even_with_runtime_exception(self) -> None:
+        self.write_source("lib.rs", '#[cfg(feature = "dev-fixtures")]\npub mod gated;\n')
+        self.write_test("gated.rs", "fixture_test")
+        checker.CONDITIONAL_RUNTIME_NAMES["store-01"] = {"fixture_test"}
+        manifest, _ = checker.source_inventory(checker.read_shard_packages(), True)
+        with self.assertRaisesRegex(ValueError, "fixture_test declares shard store-01.*enclosing module cfg"):
+            checker.check_shard_module_mounts(manifest)
+        error = io.StringIO()
+        with mock.patch.object(sys, "argv", ["checker", "--require-gates"]), contextlib.redirect_stderr(error):
+            self.assertEqual(checker.main(), 1)
+        self.assertIn("enclosing module cfg", error.getvalue())
+        self.write_source("lib.rs", '#[cfg(any(feature = "dev-fixtures", all(test, feature = "test-shard-store-01")))]\npub mod gated;\n')
+        checker.check_shard_module_mounts(manifest)
+
+    def test_nested_inline_path_include_and_inner_feature_cfgs_are_checked(self) -> None:
+        for mount, extra in (
+            ('#[cfg(feature = "opt-in")]\nmod wrapper {\n    #[path = "../gated.rs"]\n    mod gated;\n}\n', {}),
+            ('#[cfg(\n    all(test, feature = "opt-in")\n)]\n#[path = "gated.rs"]\nmod named;\n', {}),
+            ('#[cfg(feature = "opt-in")]\ninclude!("gated.rs");\n', {}),
+            ('mod parent;\n', {"parent.rs": '#[cfg(feature = "opt-in")]\n#[path = "gated.rs"]\nmod child;\n'}),
+            ('mod gated;\n', {"gated.rs": '#![cfg(feature = "opt-in")]\n' + source_test("fixture_test")}),
+            ('#[cfg(feature = "opt-in")]\nmod inline {\n' + source_test("fixture_test") + '}\n', {}),
+        ):
+            with self.subTest(mount=mount):
+                for path in self.source.rglob("*.rs"):
+                    path.unlink()
+                self.write_source("lib.rs", mount)
+                if "mod inline" not in mount:
+                    self.write_test("gated.rs", "fixture_test")
+                for path, text in extra.items():
+                    self.write_source(path, text)
+                manifest, _ = checker.source_inventory(checker.read_shard_packages(), True)
+                with self.assertRaisesRegex(ValueError, "enclosing module cfg"):
+                    checker.check_shard_module_mounts(manifest)
+
+    def test_platform_and_deliberately_disabled_fixtures_are_not_feature_mount_mismatches(self) -> None:
+        for gate in ('#[cfg(target_os = "macos")]', '#[cfg(not(unix))]', '#[cfg(any())]'):
+            self.write_source("lib.rs", gate + '\nmod gated;\n')
+            self.write_test("gated.rs", "fixture_test")
+            manifest, _ = checker.source_inventory(checker.read_shard_packages(), True)
+            checker.check_shard_module_mounts(manifest)
+        # A different shard in an enclosing gate also needs correct feature wiring.
+        self.write_source("lib.rs", '#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]\nmod gated;\n')
+        manifest, _ = checker.source_inventory(checker.read_shard_packages(), True)
+        with self.assertRaisesRegex(ValueError, "enclosing module cfg"):
+            checker.check_shard_module_mounts(manifest)
 
     def test_two_branches_add_tests_to_same_shard_and_merge_cleanly(self) -> None:
         self.git("init", "-q")
@@ -227,6 +350,30 @@ class SourceInventoryTests(unittest.TestCase):
         path.write_text(gate.splitlines()[0] + "\n" + gate)
         with self.assertRaisesRegex(ValueError, "duplicate shard gates"):
             checker.source_inventory(checker.read_shard_packages(), require_gates=True)
+
+    def test_ungated_test_message_names_the_gate_line_and_shard(self) -> None:
+        packages = checker.read_shard_packages()
+        gate = 'cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-%s"))'
+        new = self.source / "new.rs"
+        new.write_text("#[test]\nfn ungated_test() {}\n")
+        with self.assertRaises(ValueError) as caught:
+            checker.source_inventory(packages, require_gates=True)
+        message = str(caught.exception)
+        self.assertIn("new.rs:1: ungated test blocks a bounded lib harness", message)
+        self.assertIn("#[" + gate % "other-01" + "]", message)  # a new file defaults to other-01
+        self.assertIn("use super::*", message)
+        self.assertIn("directly above `#[test]`", message)
+
+        # A file with gated tests suggests the shard they use, with the test's indentation (4 message spaces + 4).
+        new.write_text(
+            "mod t {\n    " + source_test("a", "store-02").replace("\n#[", "\n    #[").replace("\nfn", "\n    fn")
+            + "    #[test]\n    fn ungated_test() {}\n}\n"
+        )
+        with self.assertRaises(ValueError) as caught:
+            checker.source_inventory(packages, require_gates=True)
+        message = str(caught.exception)
+        self.assertIn("\n        #[" + gate % "store-02" + "]", message)
+        self.assertIn("other tests use", message)
 
     def test_a_malformed_shard_gate_is_refused_with_the_fix_not_called_ungated(self) -> None:
         gate = 'any(not(feature = "test-shard-mode"), feature = "test-shard-store-01")'

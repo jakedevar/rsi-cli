@@ -30,9 +30,22 @@ use rsi_common::manager_issue_worker::{
     text_references_issue,
 };
 use rsi_common::rpc::{AgentUpdateIssueRequestV1, AgentUpdateIssueStatusRequestV1};
-use rsi_common::types::{Issue, IssueStatus, SessionKind, SessionStatus};
+use rsi_common::types::{Issue, IssueStatus, Session, SessionKind, SessionStatus};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
+
+/// #3688: what the daemon must create so a manager with no live Epic in a
+/// project-wide scope can launch its first Issue worker. See
+/// [`Store::issue_worker_default_container_plan`].
+#[derive(Debug, Clone)]
+pub struct DefaultIssueWorkerContainersV1 {
+    pub project_id: Uuid,
+    /// The project's oldest live top-level Group; the Epic goes under it. When
+    /// `None`, a default Group is created first.
+    pub existing_group: Option<Uuid>,
+    /// The caller's own (already validated) working directory.
+    pub working_dir: std::path::PathBuf,
+}
 
 /// The admitted launch and the Issue as the call left it.
 #[derive(Debug, Clone)]
@@ -46,10 +59,10 @@ pub struct ManagerIssueWorkerAdmission {
     pub skipped_related: Vec<i64>,
 }
 
-/// #218: how many of the bound Issue's newest handoff records a read check
-/// scans for `#N` selectors. A bound Issue holds a handful; the bound keeps the
-/// check cheap, and a selector older than this is simply not granted.
-const BOUND_HANDOFF_SCAN_MAX: i64 = 64;
+/// #218, #466: how many of the bound Issue's newest handoff records a read check
+/// scans for Issue or session selectors. A bound Issue holds a handful; the
+/// bound keeps the check cheap; an older selector is simply not granted.
+pub(super) const BOUND_HANDOFF_SCAN_MAX: i64 = 64;
 
 /// #218: the read scope one Issue-bound launch journals in its binding: the
 /// `related` Issues the manager attached and the selectors its brief named.
@@ -101,7 +114,7 @@ impl Store {
     /// The `(project, Issue)` a worker was bound to by a launch that created
     /// it (`running` or `succeeded` action). Read-only; used for the worker's
     /// own-Issue read authority and its catalog projection. "Latest" is
-    /// admission order (`rowid`, #1322), as in
+    /// admission order (`id`, #1322), as in
     /// [`Self::live_issue_binding_for_worker_on`].
     pub(crate) fn bound_issue_for_worker_on(
         conn: &Connection,
@@ -603,6 +616,138 @@ impl Store {
             .transpose()
     }
 
+    /// #471/#466: a transcript stays private to manager authority even after
+    /// rotation, revocation or reappointment. Classify from durable appointments
+    /// and grants, never titles or live authority. UNION makes the continuation
+    /// walk cycle-safe; walking both ways also protects an earlier transcript
+    /// when a later continuation was appointed to a seat.
+    fn is_manager_seat_session(&self, session: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "WITH RECURSIVE lineage(id,continued_from) AS (
+               SELECT id,continued_from FROM sessions WHERE id=?1
+               UNION
+               SELECT s.id,s.continued_from FROM sessions s JOIN lineage l
+                 ON s.id=l.continued_from OR s.continued_from=l.id
+             ), seats(id) AS (
+               SELECT manager_session_id FROM harness_manager_scopes
+               UNION SELECT manager_session_id FROM harness_manager_retired_appointments
+               UNION SELECT seat_session_id FROM global_manager_grants
+             )
+             SELECT EXISTS(SELECT 1 FROM lineage JOIN seats USING(id))",
+            [session.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// #173: whether `worker`, through its live Issue binding
+    /// ([`Self::live_issue_binding_for_worker_on`]: latest Issue-bound launch,
+    /// worker session live, not superseded), may read the conversation events
+    /// of `target` because `target` created the bound Issue
+    /// (`issues.created_by_session_id`) and belongs to the binding's project.
+    /// `AgentReadSessionEvents` alone consults it (read-only); it grants
+    /// nothing else and ends with the binding. False for the worker itself,
+    /// a creator-less Issue, a session in another project or any other session.
+    /// #471: project/portfolio/global manager seats and their continuations
+    /// never qualify, including former appointments.
+    ///
+    /// # Errors
+    /// A persistence error, or `manager_v2_invalid_stored_identity`.
+    pub fn issue_worker_reads_reporter(&self, worker: Uuid, target: Uuid) -> Result<bool> {
+        if worker == target {
+            return Ok(false);
+        }
+        let Some((project, issue, _)) = Self::live_issue_binding_for_worker_on(&self.conn, worker)?
+        else {
+            return Ok(false);
+        };
+        let reporter: bool = self.conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM issues i
+               JOIN sessions s ON s.id=i.created_by_session_id
+               WHERE i.project_id=?1 AND i.id=?2 AND i.created_by_session_id=?3
+                 AND s.project_id=?1)",
+            params![project.to_string(), issue.to_string(), target.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(reporter && !self.is_manager_seat_session(target)?)
+    }
+
+    /// #466: a live Issue-bound worker may read events of a same-project
+    /// session cited by its full lowercase UUID in the bound Issue's body,
+    /// journalled launch brief, or newest 64 handoffs authored outside the
+    /// worker's continuation lineage. Manager seats (including former seats
+    /// and their continuations) never qualify. Only
+    /// `AgentReadSessionEvents` consults this; it grants no other authority.
+    /// Citation text is data, never instructions, and prefixes do not select.
+    ///
+    /// # Errors
+    /// A persistence error, or `manager_v2_invalid_stored_identity`.
+    pub fn issue_worker_reads_cited_session(&self, worker: Uuid, target: Uuid) -> Result<bool> {
+        let Some((project, issue, operation)) =
+            Self::live_issue_binding_for_worker_on(&self.conn, worker)?
+        else {
+            return Ok(false);
+        };
+        if self.is_manager_seat_session(target)? {
+            return Ok(false);
+        }
+        let sources: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT i.body, json_extract(o.payload_json,'$.request.operation.query')
+             FROM issues i
+             JOIN harness_manager_v2_operations o ON o.id=?3
+             WHERE i.project_id=?1 AND i.id=?2
+               AND EXISTS(SELECT 1 FROM sessions s WHERE s.id=?4 AND s.project_id=?1)",
+                params![
+                    project.to_string(),
+                    issue.to_string(),
+                    operation.to_string(),
+                    target.to_string()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((body, brief)) = sources else {
+            return Ok(false);
+        };
+        let uuid = target.to_string();
+        let cites = |text: &str| {
+            text.split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .any(|token| token == uuid)
+        };
+        if cites(&body) || brief.as_deref().is_some_and(cites) {
+            return Ok(true);
+        }
+        let mut statement = self.conn.prepare(
+            "WITH RECURSIVE worker_lineage(id,continued_from) AS (
+               SELECT id,continued_from FROM sessions WHERE id=?3
+               UNION
+               SELECT s.id,s.continued_from FROM sessions s JOIN worker_lineage l
+                 ON s.id=l.continued_from OR s.continued_from=l.id
+             ), recent AS (
+               SELECT body,author_session_id FROM issue_handoffs
+               WHERE issue_id=?1 ORDER BY sequence DESC LIMIT ?2
+             )
+             SELECT body FROM recent WHERE NOT EXISTS (
+               SELECT 1 FROM worker_lineage WHERE id=recent.author_session_id)",
+        )?;
+        let handoffs = statement.query_map(
+            params![
+                issue.to_string(),
+                BOUND_HANDOFF_SCAN_MAX,
+                worker.to_string()
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        for handoff in handoffs {
+            if cites(&handoff?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// #247: whether `worker` still holds an unfinished Issue assignment, so a
     /// terminal-looking session (a manager-halted `Interrupted` worker whose
     /// tree is clean and already in Git) is paused work, not finished work.
@@ -651,13 +796,13 @@ impl Store {
         Ok(!self.latest_turn_reported(worker)?)
     }
 
-    /// #315: the Epic a launch without `parent_epic_id` goes under when the
-    /// scope holds several Epics. Exactly one live Epic (of this project, not
-    /// archived or deleted) in the scope is an unambiguous parent. Otherwise
-    /// the refusal keeps its stable code and lists the live scope Epics, newest
-    /// first and capped, so the next call can name one. Only Epics in the
-    /// caller's own scope are read, so a foreign Epic is never listed.
-    fn default_issue_worker_parent(&self, project_id: Uuid, scope: &[Uuid]) -> Result<Uuid> {
+    /// The live Epics (id, title, kind) of `project_id` inside `scope`, newest
+    /// first. Archived and deleted Epics and Epics outside `scope` never appear.
+    fn live_scope_epics(
+        &self,
+        project_id: Uuid,
+        scope: &[Uuid],
+    ) -> Result<Vec<(String, String, String)>> {
         let scope: std::collections::HashSet<String> = scope.iter().map(Uuid::to_string).collect();
         let mut statement = self.conn.prepare(
             "SELECT id, COALESCE(NULLIF(title,''), substr(query,1,80)), session_kind
@@ -677,7 +822,103 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .filter(|(id, _, _)| scope.contains(id))
-            .collect::<Vec<_>>();
+            .collect();
+        Ok(live)
+    }
+
+    /// #3688: the first launch of a manager whose scope is the whole project
+    /// and holds no live Epic needs no operator or global-manager round trip:
+    /// the daemon provisions the default Epic (under the project's live
+    /// top-level Group, or a new default Group when there is none) before the
+    /// launch is admitted. A project-wide scope covers both automatically, so
+    /// no scope or policy row changes. Returns `None` when the launch names its
+    /// own parent, the caller is not a manager with a live project-wide scope
+    /// and grant, or a live scope Epic exists; the ordinary admission then
+    /// answers (and refuses) as before. A scope that lists Groups or Epics
+    /// explicitly is the operator's deliberate limit and is never widened.
+    ///
+    /// # Errors
+    /// Store or registered-repository failures; authority refusals are left
+    /// to admission.
+    pub fn issue_worker_default_container_plan(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerLaunchIssueWorkerRequestV1,
+    ) -> Result<Option<DefaultIssueWorkerContainersV1>> {
+        use rsi_common::harness_manager::HarnessManagerScopeModeV1;
+        if request.parent_epic_id.is_some() {
+            return Ok(None);
+        }
+        let config = match self.resolve_manager_caller(caller, request.project_id) {
+            Ok(ManagerCallerV1::Legacy {
+                config,
+                is_manager: true,
+            }) => config,
+            Ok(ManagerCallerV1::Global(authority)) => authority.config,
+            _ => return Ok(None),
+        };
+        if config.scope_mode != HarnessManagerScopeModeV1::Project {
+            return Ok(None);
+        }
+        if self
+            .get_harness_manager_policy(config.project_id)?
+            .is_none_or(|grant| grant.revoked)
+        {
+            return Ok(None);
+        }
+        if !self
+            .live_scope_epics(config.project_id, &config.epic_ids)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let existing_group: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE project_id=?1 AND session_kind='Group' AND parent_id IS NULL
+                   AND status NOT IN ('Archived','Deleted')
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
+                [config.project_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let existing_group = existing_group
+            .map(|id| {
+                Uuid::parse_str(&id).map_err(|_| refused("manager_v2_invalid_stored_identity"))
+            })
+            .transpose()?;
+        Ok(Some(DefaultIssueWorkerContainersV1 {
+            project_id: config.project_id,
+            existing_group,
+            working_dir: self.manager_action_project_repository(config.project_id)?,
+        }))
+    }
+
+    /// Write containers [`Self::issue_worker_default_container_plan`] asked for,
+    /// each with its tag rows, inside the caller's open transaction (#3786): the
+    /// launch admission owns the transaction, so a later refusal rolls them back.
+    fn insert_default_issue_worker_containers_tx(&self, containers: &[Session]) -> Result<()> {
+        for session in containers {
+            self.insert_session(session)?;
+            for tag in &session.tags {
+                self.conn.execute(
+                    "INSERT INTO session_tags(session_id,tag) VALUES(?1,?2)",
+                    params![session.id.to_string(), tag],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// #315: the Epic a launch without `parent_epic_id` goes under when the
+    /// scope holds several Epics. Exactly one live Epic (of this project, not
+    /// archived or deleted) in the scope is an unambiguous parent. Otherwise
+    /// the refusal keeps its stable code and lists the live scope Epics, newest
+    /// first and capped, so the next call can name one. Only Epics in the
+    /// caller's own scope are read, so a foreign Epic is never listed.
+    fn default_issue_worker_parent(&self, project_id: Uuid, scope: &[Uuid]) -> Result<Uuid> {
+        let live = self.live_scope_epics(project_id, scope)?;
         if let [(only, _, _)] = live.as_slice() {
             return Uuid::parse_str(only)
                 .map_err(|_| refused("manager_v2_invalid_stored_identity"));
@@ -695,6 +936,13 @@ impl Store {
             })
             .collect::<Vec<_>>()
             .join("; ");
+        if live.is_empty() {
+            // #3540: nothing to name. Say how an Epic comes to exist instead of
+            // asking for a parent_epic_id the manager cannot supply.
+            return Err(refused(&format!(
+                "{MANAGER_ISSUE_WORKER_PARENT_REQUIRED}: no live Epic in your scope (0 live); create one with create_container (an Epic goes under a Group in your scope; a top-level Group needs allow_create_groups), or ask the operator or the global manager to add a Group or Epic to your scope or grant allow_create_groups (a manager whose scope is the whole project gets a default Epic created by its first launch)"
+            )));
+        }
         Err(refused(&format!(
             "{MANAGER_ISSUE_WORKER_PARENT_REQUIRED}: set parent_epic_id to one live Epic in your scope ({} live, newest first{}): {}",
             live.len(),
@@ -703,7 +951,7 @@ impl Store {
             } else {
                 String::new()
             },
-            if listed.is_empty() { "none" } else { &listed },
+            listed,
         )))
     }
 
@@ -735,10 +983,11 @@ impl Store {
                 return Err(refused("manager_v2_scope_denied"));
             }
         };
-        let parent_id = match (request.parent_epic_id, config.epic_ids.as_slice()) {
-            (Some(epic), _) => epic,
-            (None, [only]) => *only,
-            (None, _) => self.default_issue_worker_parent(config.project_id, &config.epic_ids)?,
+        // #3540: a lone scope Epic that is archived or deleted is no parent; the
+        // live check names it as "0 live" instead of an opaque scope refusal.
+        let parent_id = match request.parent_epic_id {
+            Some(epic) => epic,
+            None => self.default_issue_worker_parent(config.project_id, &config.epic_ids)?,
         };
         let n = request.issue;
         let query = format!(
@@ -773,7 +1022,20 @@ impl Store {
         caller: Uuid,
         request: &AgentManagerLaunchIssueWorkerRequestV1,
     ) -> Result<ManagerIssueWorkerAdmission> {
-        self.enqueue_issue_worker_inner(caller, request, None, None)
+        self.enqueue_issue_worker_inner(caller, request, None, None, &[])
+    }
+
+    /// [`Self::enqueue_manager_issue_worker`] that also creates the default
+    /// containers of [`Self::issue_worker_default_container_plan`] (#3688) in
+    /// the admission's own transaction (#3786): a refusal of the capability,
+    /// the Issue or any later admission check leaves no Group or Epic behind.
+    pub fn enqueue_manager_issue_worker_provisioning(
+        &self,
+        caller: Uuid,
+        request: &AgentManagerLaunchIssueWorkerRequestV1,
+        containers: &[Session],
+    ) -> Result<ManagerIssueWorkerAdmission> {
+        self.enqueue_issue_worker_inner(caller, request, None, None, containers)
     }
 
     /// Shared admission. `capacity_retry` is the daemon's own relaunch of a
@@ -786,6 +1048,7 @@ impl Store {
         request: &AgentManagerLaunchIssueWorkerRequestV1,
         capacity_retry: Option<(ManagerActionV2, CapacityRetryV1)>,
         inherited: Option<LaunchReadScope>,
+        new_containers: &[Session],
     ) -> Result<ManagerIssueWorkerAdmission> {
         request.validate().map_err(refused)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -806,6 +1069,7 @@ impl Store {
             Some(request.issue),
         )
         .map_err(|_| unavailable())?;
+        self.insert_default_issue_worker_containers_tx(new_containers)?;
         let (retry_operation, retry_meta) = match capacity_retry {
             Some((operation, meta)) => (Some(operation), Some(meta)),
             None => (None, None),
@@ -825,6 +1089,13 @@ impl Store {
         let plain_launch = retry_operation.is_none()
             && request.continue_from.is_none()
             && request.review_of.is_none();
+        let mut review_source_commit = match retry_meta.as_ref().filter(|meta| !meta.continued) {
+            Some(meta) => self.conn.query_row(
+                "SELECT json_extract(payload_json,'$.issue_binding.review_source_commit') FROM harness_manager_v2_operations WHERE id=?1",
+                [meta.predecessor_operation.to_string()], |row| row.get::<_, Option<String>>(0),
+            ).optional()?.flatten(),
+            None => None,
+        };
         let mut reused_prior = false;
         if retry_operation.is_none() {
             self.ensure_related_replay(
@@ -912,12 +1183,13 @@ impl Store {
                     self.manager_issue_worker_control_request(caller, request, &request.brief)?;
                 // A replay reuses the journalled brief: the reviewed Issue's
                 // handoff may have grown since.
-                if let Some(operation) = self.prior_review_operation(
+                if let Some((operation, source_commit)) = self.prior_review_operation(
                     issue_authority.project_id,
                     &request.idempotency_key,
                     reviewed,
                 )? {
                     reused_prior = true;
+                    review_source_commit = source_commit;
                     control.operation = replayed_operation(
                         &control.operation,
                         operation,
@@ -959,6 +1231,42 @@ impl Store {
                         reviewed_id,
                     );
                     let (records, _) = Self::issue_handoffs_page_tx(&tx, reviewed_id, 2)?;
+                    if request.sandbox_source.is_none() {
+                        review_source_commit = text_and_handoff(&reviewed_issue, stored.as_ref())
+                            .1
+                            .and_then(review_handoff_commit);
+                    }
+                    let mut unresolved_commit = None;
+                    if let Some(commit) = review_source_commit.as_ref()
+                        && let ManagerActionV2::CreateSession { parent_id, .. } = &control.operation
+                    {
+                        let source = self
+                            .get_session(*parent_id)?
+                            .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+                        let source = self.manager_action_project_source(&source)?;
+                        let root = self.manager_action_source_root(&source)?;
+                        // A handoff is advisory: a satellite or unfetched
+                        // commit must not acquire the strict refusal semantics
+                        // of the manager's explicit sandbox_source request.
+                        if crate::sandbox::git_worktree::require_commit_object_bounded(
+                            &root, commit,
+                        )
+                        .is_err()
+                        {
+                            unresolved_commit = review_source_commit.take();
+                        }
+                    }
+                    let inferred_source = review_source_commit
+                        .clone()
+                        .map(ManagerSandboxSourceV1::Commit);
+                    let mut source_note = review_sandbox_note(
+                        request.sandbox_source.as_ref().or(inferred_source.as_ref()),
+                    );
+                    if let Some(commit) = unresolved_commit {
+                        source_note.push_str(&format!(
+                            " The handoff's declared source commit {commit} could not be resolved in the local repository; using origin/rolling."
+                        ));
+                    }
                     let brief = review_brief(
                         &reviewed_issue,
                         stored.as_ref(),
@@ -966,6 +1274,7 @@ impl Store {
                         &evidence,
                         &gate,
                         &request.brief,
+                        &source_note,
                     );
                     control = self.manager_issue_worker_control_request(caller, request, &brief)?;
                 }
@@ -1088,6 +1397,7 @@ impl Store {
             display_number: request.issue,
             continue_from: request.continue_from,
             review_of: request.review_of,
+            review_source_commit,
             related: scope.related,
             brief_refs: scope.brief_refs,
             carried_related: carried_related.clone(),
@@ -1245,20 +1555,21 @@ impl Store {
         project: Uuid,
         idempotency_key: &str,
         reviewed: i64,
-    ) -> Result<Option<ManagerActionV2>> {
-        let raw: Option<String> = self
+    ) -> Result<Option<(ManagerActionV2, Option<String>)>> {
+        let raw: Option<(String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT json_extract(payload_json,'$.request.operation')
+                "SELECT json_extract(payload_json,'$.request.operation'),
+                        json_extract(payload_json,'$.issue_binding.review_source_commit')
                  FROM harness_manager_v2_operations
                  WHERE kind=?1 AND project_id=?2 AND idempotency_key=?3
                    AND json_extract(payload_json,'$.issue_binding.review_of')=?4
                  ORDER BY rowid DESC LIMIT 1",
                 params![ACTION_KIND, project.to_string(), idempotency_key, reviewed],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        raw.map(|json| serde_json::from_str(&json).map_err(Into::into))
+        raw.map(|(json, source)| Ok((serde_json::from_str(&json)?, source)))
             .transpose()
     }
 
@@ -1542,6 +1853,58 @@ impl Store {
         )))
     }
 
+    /// #481: held launches re-prove their bound Issue before sandbox or provider
+    /// effects. Once an effect started, its existing settlement owns cleanup.
+    pub(super) fn require_issue_worker_launch_live(
+        &self,
+        operation: &ManagerActionOperationV2,
+    ) -> Result<()> {
+        if operation.effect_started {
+            return Ok(());
+        }
+        let Some(binding) = operation.context.issue_binding.as_ref() else {
+            return Ok(());
+        };
+        let live: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issues WHERE id=?1 AND project_id=?2
+             AND archived_at IS NULL AND status IN ('Open','InProgress'))",
+            params![
+                binding.issue_id.to_string(),
+                operation.project_id.to_string()
+            ],
+            |row| row.get(0),
+        )?;
+        if !live {
+            return Err(unavailable());
+        }
+        Ok(())
+    }
+
+    /// A launch with no session has no terminal event left to watch. Disable
+    /// any pending watches in the same transaction that releases its binding.
+    pub(super) fn retire_unstarted_issue_worker_watch_on(
+        &self,
+        operation: &ManagerActionOperationV2,
+    ) -> Result<()> {
+        let Some(worker) = operation
+            .receipt
+            .target_session_id
+            .filter(|_| operation.context.issue_binding.is_some())
+        else {
+            return Ok(());
+        };
+        if self.get_session(worker)?.is_some() {
+            return Ok(());
+        }
+        let jobs = self
+            .list_enabled_terminal_watches()?
+            .into_iter()
+            .filter(|job| job.wake_mode == rsi_common::types::WakeMode::OnTerminal(worker))
+            .map(|job| job.id)
+            .collect::<Vec<_>>();
+        crate::store::scheduled_jobs::disable_scheduled_jobs_conn(&self.conn, &jobs)
+    }
+
     /// #1553: the Issue note an Issue-bound launch leaves when it ends without a
     /// worker (`failed`, `blocked` or `revoked`). The launch's own note said a
     /// worker was launched; without this the Issue keeps claiming a worker
@@ -1597,7 +1960,7 @@ impl Store {
         if authority.project_id != operation.project_id {
             return Ok(false);
         }
-        let Some(prior) =
+        let Some(mut prior) =
             Self::get_issue_in_project_tx(&tx, operation.project_id, binding.issue_id)?
         else {
             return Ok(false);
@@ -1606,6 +1969,50 @@ impl Store {
             || !matches!(prior.status, IssueStatus::Open | IssueStatus::InProgress)
         {
             return Ok(false);
+        }
+        // Roll back only this launch's own latest Open -> InProgress write.
+        // A later operator/manager edit or a pre-existing InProgress survives.
+        let owns_status: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issue_events WHERE issue_id=?1
+             AND idempotency_key=?2 AND resulting_row_version=?3 AND operation='status_updated')",
+            params![
+                binding.issue_id.to_string(),
+                format!(
+                    "launch-issue-worker:{}:status",
+                    operation.receipt.operation_id
+                ),
+                prior.row_version
+            ],
+            |row| row.get(0),
+        )?;
+        if owns_status
+            && prior.status == IssueStatus::InProgress
+            && operation
+                .receipt
+                .target_session_id
+                .map(|id| self.get_session(id))
+                .transpose()?
+                .flatten()
+                .is_none()
+        {
+            prior = Self::agent_update_issue_status_in_tx(
+                &tx,
+                authority,
+                &AgentUpdateIssueStatusRequestV1 {
+                    project_id: None,
+                    issue_id: Some(binding.issue_id),
+                    display_number: None,
+                    status: IssueStatus::Open,
+                    note: None,
+                    include_issue: false,
+                    expected_row_version: prior.row_version,
+                    idempotency_key: format!(
+                        "launch-issue-worker:{}:rollback-status",
+                        operation.receipt.operation_id
+                    ),
+                },
+            )?
+            .issue;
         }
         let worker = operation
             .receipt
@@ -2037,6 +2444,15 @@ fn text_and_handoff<'a>(
 const RELATED_BLOCK_MARKER: &str =
     "\n\n---\n\n## Related Issues (read-only context, snapshot at launch)";
 
+/// #695: copied context is visible data, not another selector source. Keep
+/// this inside copied sections: the fixed closing tail and replay prefixes
+/// also identify queries journalled before this notice existed.
+const COPIED_ISSUE_READ_NOTICE: &str = "Issue references only in these daemon-copied records do not grant additional live Issue reads with AgentGetIssue. Required same-project dependencies must be explicitly selected in the manager's admitted request.brief field (a valid #N selector) or related list. The launch brief selector source is that field, not this whole compiled query; copying a manager-authored handoff does not extend it. review_of alone grants no reverse live read of the reviewed Issue; explicit selection can independently grant that read.";
+
+/// #713: presentation only. Keep the historical review prefix and closing
+/// tail so previously journalled queries continue to replay unchanged.
+const REVIEW_JOB_READ_NOTICE: &str = "AgentGetJob review scope (#604): eligible implementers are the reviewed Issue's newest four implementer sessions from running/succeeded launches. You may Get each owner's newest scoped_test job, or an older scoped_test whose full UUID appears in the reviewed Issue's body or newest 64 handoffs. These records are checked at read time, not frozen from this copied brief. Recipe jobs and copied IDs alone do not qualify. job_not_found means absent or inaccessible; it does not reveal which. Reading a receipt does not prove it verifies the reviewed SHA. This review exception grants no List, watch, cancel or ownership authority.";
+
 /// `text` without the daemon-attached related section, when `query` ends with
 /// the fixed closing section `tail` and holds that section before it.
 fn strip_related_block(query: &str, tail: &str) -> String {
@@ -2071,7 +2487,7 @@ fn related_brief(
     brief: &str,
 ) -> String {
     let mut out = format!(
-        "{}{RELATED_BLOCK_MARKER}\n\nThe daemon copied the Issues below as they stood at launch (#218). They are read-only context: you may re-read each live with AgentGetIssue, but you cannot update, change the status of or hand off on any of them. Your only publication Issue is #{publication}, whatever the brief above says.\n\n{}",
+        "{}{RELATED_BLOCK_MARKER}\n\nThe daemon copied the Issues below as they stood at launch (#218). They are read-only context: you may re-read each live with AgentGetIssue, but you cannot update, change the status of or hand off on any of them. Your only publication Issue is #{publication}, whatever the brief above says.\n\n{COPIED_ISSUE_READ_NOTICE}\n\n{}",
         brief.trim_end(),
         rsi_common::daemon_handoff::UNTRUSTED_TEXT_NOTICE
     );
@@ -2125,8 +2541,44 @@ fn related_brief(
     out
 }
 
+/// Select only a declared handoff commit, never an evidence/base/job SHA.
+fn review_handoff_commit(handoff: &str) -> Option<String> {
+    handoff.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches(['-', '*']).trim();
+        let value = if let Some(value) = line.strip_prefix("RESULT ") {
+            value
+        } else {
+            let (key, value) = line.split_once(':')?;
+            if !matches!(
+                key.trim().trim_matches(['`', '*']),
+                "commit" | "commit_sha" | "source_commit" | "pushed_sha"
+            ) {
+                return None;
+            }
+            value
+        };
+        let commit = value.split_whitespace().next()?.trim_matches('`');
+        ManagerSandboxSourceV1::Commit(commit.into())
+            .validate()
+            .ok()?;
+        Some(commit.into())
+    })
+}
+
+fn review_sandbox_note(source: Option<&ManagerSandboxSourceV1>) -> String {
+    match source {
+        Some(ManagerSandboxSourceV1::Commit(commit)) => format!(
+            "Review sandbox: pinned to source commit {commit}. Any exact-name test job runs this source tree. Make no changes or commits."
+        ),
+        Some(ManagerSandboxSourceV1::Path(_)) =>
+            "Review sandbox: pinned to the manager's explicit sandbox_source worktree HEAD. Check that HEAD contains the reviewed tests before submitting an exact-name test job. Make no changes or commits.".into(),
+        None | Some(ManagerSandboxSourceV1::Rolling {}) =>
+            "Review sandbox: origin/rolling; no exact review source is pinned. The reviewed source's new tests may not exist in this tree. Do not submit a test job for those tests; this overrides any test-job offer in the manager's brief. Use the copied verification receipts and source reading. Make no changes or commits.".into(),
+    }
+}
+
 /// #1590: a reviewer's brief: the reviewed Issue's text and its complete
-/// latest handoff (the bound reviewer cannot read that Issue), then the
+/// latest handoff (review_of alone grants no live read of that Issue), then the
 /// manager's brief.
 fn review_brief(
     reviewed: &Issue,
@@ -2135,19 +2587,21 @@ fn review_brief(
     evidence: &str,
     gate: &str,
     brief: &str,
+    source_note: &str,
 ) -> String {
     let (text, handoff) = text_and_handoff(reviewed, stored);
     let header = format!(
-        "You review the work of Issue #{} (\"{}\", status {:?}). You cannot read that Issue: the daemon copied its text and latest handoff below (#1590). Check them against the committed code the manager names, use the handoff's test filters and landing filters and the landing gate block below (the queue's derived filters and gate result: do not re-run what it shows ran), and report on this Issue.\n\n{}",
+        "You review the work of Issue #{} (\"{}\", status {:?}). The daemon copied its text and latest handoff below (#1590). Check them against the committed code the manager names, use the handoff's test filters and landing filters and the landing gate block below (the queue's derived filters and gate result: do not re-run what it shows ran), and report on this Issue.\n\n{COPIED_ISSUE_READ_NOTICE}\n\n{}",
         reviewed.display_number,
         reviewed.title.replace('\n', " "),
         reviewed.status,
         rsi_common::daemon_handoff::UNTRUSTED_TEXT_NOTICE
     );
+    let header = format!("{header}\n\n{REVIEW_JOB_READ_NOTICE}\n\n{source_note}");
     let text_block = quoted_head_tail(text, REVIEW_ISSUE_TEXT_MAX);
     // #2157: an empty handoff, or one that names no scoped_test run, leaves the
-    // reviewer no verification record (it cannot read the implementer's Issue
-    // or jobs): add what the daemon holds, bounded, and name what it lacks.
+    // copied brief without a verification record. Add what the daemon holds,
+    // bounded, alongside the limited live scoped_test Get access described above.
     let evidence_block = if handoff.is_some_and(handoff_names_verification) {
         String::new()
     } else {
@@ -2213,7 +2667,7 @@ fn revision_brief(reviewed: &Issue, reviews: &[Issue], brief: &str) -> String {
         return brief.to_string();
     }
     let mut out = format!(
-        "{}\n\n---\n\nIssue #{} was reviewed. The daemon copied the latest review of each review Issue below (#1845); you may read those review Issues, and the Issues your own Issue and launch reference (#218), with AgentGetIssue (read-only); publish to your own Issue only.\n\n{}",
+        "{}\n\n---\n\nIssue #{} was reviewed. The daemon copied the latest review of each review Issue below (#1845); you may read those review Issues, and the Issues your own Issue and launch reference (#218), with AgentGetIssue (read-only); publish to your own Issue only.\n\n{COPIED_ISSUE_READ_NOTICE}\n\n{}",
         brief.trim(),
         reviewed.display_number,
         rsi_common::daemon_handoff::UNTRUSTED_TEXT_NOTICE
@@ -2312,6 +2766,35 @@ mod tests {
     use super::*;
     use crate::test_support::make_test_session;
     use rsi_common::types::NewIssue;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn review_commit_uses_declared_source_instead_of_other_evidence() {
+        let sha = "a".repeat(40);
+        for field in ["commit", "commit_sha", "source_commit", "pushed_sha"] {
+            assert_eq!(
+                review_handoff_commit(&format!(
+                    "base: {}\n- {field}: `{sha}` (pushed)\njob: {}",
+                    "b".repeat(40),
+                    "c".repeat(40)
+                )),
+                Some(sha.clone())
+            );
+        }
+        assert_eq!(
+            review_handoff_commit(&format!("RESULT {sha} implemented")),
+            Some(sha)
+        );
+        assert_eq!(
+            review_handoff_commit(&format!(
+                "base_commit: {}\njob: {}",
+                "b".repeat(40),
+                "c".repeat(40)
+            )),
+            None
+        );
+        assert_eq!(review_handoff_commit("commit: invalid"), None);
+    }
 
     /// A store with one Issue, a manager session and two live (Running)
     /// worker sessions A and B, all in the seeded test project.
@@ -2584,6 +3067,63 @@ mod tests {
         }
     }
 
+    /// #695/#713: replay a pre-notice compiled query verbatim, rather than
+    /// recompiling copied sections with the new notice or rejecting the key.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn copied_context_notice_preserves_legacy_compiled_query_replays() {
+        let parent_id = Uuid::new_v4();
+        let operation = |query: String| ManagerActionV2::CreateSession {
+            parent_id,
+            kind: SessionKind::Task,
+            query,
+            launch: rsi_common::harness_manager_v2::ManagerLaunchChoiceV2 {
+                provider: rsi_common::types::SessionProvider::Codex,
+                model: "gpt-5".into(),
+                effort: None,
+            },
+            sandbox_source: None,
+        };
+        let brief = "Do it.";
+        let tail = "\n\nYou are bound to Issue #7: closing.";
+        let fresh = operation(format!("{brief}{tail}"));
+        // These are the historical wrapper shapes, without the new notice.
+        // Include both an old revision and related block in one query.
+        let old_review = format!(
+            "You review the work of Issue #8 (\"work\", status Open). You cannot read that Issue: the daemon copied its text and latest handoff below (#1590).\n\n## Issue #8 text\n\n> Intent.\n\n## Issue #8 latest handoff\n\n> RESULT original\n\n---\n\n{brief}{tail}"
+        );
+        // #713 must also accept a query admitted after #695's copied-context
+        // notice, before the job-scope notice. Keep its original text intact.
+        let copied_context_review = format!(
+            "You review the work of Issue #8 (\"work\", status Open). The daemon copied its text and latest handoff below (#1590).\n\n{COPIED_ISSUE_READ_NOTICE}\n\n## Issue #8 latest handoff\n\n> scoped_test original\n\n---\n\n{brief}{tail}"
+        );
+        let old_revision = format!(
+            "{brief}\n\n---\n\nIssue #7 was reviewed. The daemon copied the latest review of each review Issue below (#1845).\n\n## Review Issue #8 latest review\n\n> REVIEW original{RELATED_BLOCK_MARKER}\n\n### Related Issue #9\n\n> Original context{tail}"
+        );
+        let old_related = format!(
+            "{brief}{RELATED_BLOCK_MARKER}\n\n### Related Issue #9\n\n> Original context{tail}"
+        );
+        for (query, shape) in [
+            (old_review, ReplayBrief::Review(8)),
+            (copied_context_review, ReplayBrief::Review(8)),
+            (old_revision, ReplayBrief::Plain(7)),
+            (old_related, ReplayBrief::Plain(7)),
+        ] {
+            let prior = operation(query.clone());
+            let expected = serde_json::to_value(&prior).unwrap();
+            let replay = replayed_operation(&fresh, prior, brief, shape).unwrap();
+            assert_eq!(serde_json::to_value(&replay).unwrap(), expected);
+            let ManagerActionV2::CreateSession {
+                query: replayed, ..
+            } = replay
+            else {
+                panic!("expected the stored create_session operation");
+            };
+            assert_eq!(replayed, query);
+        }
+    }
+
     /// #218: a related Issue is copied with its complete text and latest
     /// handoff (end markers included), or named when it does not fit, never cut;
     /// the section is inserted before the closing section and a replay strips it.
@@ -2695,7 +3235,7 @@ mod tests {
         let brief_of = |reviewed: &Issue| {
             let evidence = Store::review_verification_evidence(&store.conn, project, issue_id);
             let gate = Store::review_landing_gate_evidence(&store.conn, project, issue_id);
-            review_brief(reviewed, None, &[], &evidence, &gate, "Review it.")
+            review_brief(reviewed, None, &[], &evidence, &gate, "Review it.", "")
         };
 
         // No implementer session: the brief says so instead of saying nothing.
@@ -2879,6 +3419,7 @@ mod tests {
             &evidence,
             &gate,
             "Review it.",
+            "",
         );
         assert!(
             !named.contains("verification evidence (daemon-read)"),
@@ -2947,7 +3488,7 @@ mod tests {
         let body = issue(format!(
             "Build it.\n\n## Handoff 1\n{full}\n\n## Handoff 2\n{correction}"
         ));
-        let brief = review_brief(&body, None, &[], "evidence", "gate", "Review it.");
+        let brief = review_brief(&body, None, &[], "evidence", "gate", "Review it.", "");
         assert!(preceding(&brief), "{brief}");
         assert!(
             brief.contains("> landing filters: -E 'test(foo)'"),
@@ -2972,7 +3513,8 @@ mod tests {
             &[],
             "e",
             "g",
-            "Review it."
+            "Review it.",
+            ""
         )));
 
         // A correction with nothing before it has nothing to copy.
@@ -2983,7 +3525,8 @@ mod tests {
             &[],
             "e",
             "g",
-            "Review it."
+            "Review it.",
+            ""
         )));
 
         // Stored records: the next lower record precedes the newest.
@@ -3003,6 +3546,7 @@ mod tests {
             "e",
             "g",
             "Review it.",
+            "",
         );
         assert!(preceding(&brief), "{brief}");
         assert!(
@@ -3019,6 +3563,7 @@ mod tests {
             "e",
             "g",
             "Review it.",
+            "",
         );
         assert!(
             brief.contains("> landing filters: -E 'test(foo)'"),
@@ -3027,7 +3572,7 @@ mod tests {
 
         // A body correction after a stored record: the record precedes it.
         let body_newer = issue(format!("Build it.\n\n## Handoff 2\n{correction}"));
-        let brief = review_brief(&body_newer, None, &[first], "e", "g", "Review it.");
+        let brief = review_brief(&body_newer, None, &[first], "e", "g", "Review it.", "");
         assert!(
             brief.contains("> landing filters: -E 'test(foo)'"),
             "{brief}"
@@ -3410,6 +3955,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn stranded_worker_note_names_owned_jobs_and_spares_pending_or_reported_workers() {
+        use rsi_common::agent_worker_roster::WorkerRosterStateV1;
         use rsi_common::types::{
             ConversationEvent, EventType, Recurrence, Role, ScheduleSpec, ScheduledJob, WakeMode,
         };
@@ -3439,6 +3985,10 @@ mod tests {
             let session = store.get_session(id).unwrap().unwrap();
             store.worker_terminal_watch_pending(&session).unwrap()
         };
+        let roster_state = || {
+            let session = store.get_session(bound).unwrap().unwrap();
+            store.worker_roster_state(&session).unwrap().unwrap().0
+        };
         let say = |sequence: i32, role: Role, content: &str| {
             store
                 .insert_event(&ConversationEvent {
@@ -3462,6 +4012,7 @@ mod tests {
         say(1, Role::Assistant, "waiting on my tests");
         assert_eq!(note(bound).as_deref(), Some("no-result: stranded"));
         assert!(!pending(bound));
+        assert_eq!(roster_state(), WorkerRosterStateV1::Stranded);
         // An unbound worker is never flagged.
         assert_eq!(note(unbound), None);
 
@@ -3470,10 +4021,10 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                r#"INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
                     log_path,status_path,state,created_at,row_version)
-                 VALUES(?1,?2,'test','{}','/tmp','rsi-job-unit','/tmp/l','/tmp/s','running',
-                    '2026-10-01T00:00:00.000000000Z',1)",
+                 VALUES(?1,?2,'test','{"wake":"none"}','/tmp','rsi-job-unit','/tmp/l','/tmp/s','running',
+                    '2026-10-01T00:00:00.000000000Z',1)"#,
                 params![job.to_string(), bound.to_string()],
             )
             .unwrap();
@@ -3487,6 +4038,31 @@ mod tests {
             !pending(bound),
             "a running unit without a wake still flags stranding"
         );
+        assert_eq!(roster_state(), WorkerRosterStateV1::Stranded);
+
+        // #501: owner-wake jobs park the worker before settlement creates its
+        // resume wake, including queued jobs and the default owner policy.
+        for state in ["queued", "running"] {
+            for policy in [r#"{}"#, r#"{"wake":"owner"}"#] {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE agent_jobs SET state=?2, params_json=?3 WHERE id=?1",
+                        params![job.to_string(), state, policy],
+                    )
+                    .unwrap();
+                assert_eq!(note(bound), None, "{state} {policy}");
+                assert!(pending(bound), "{state} {policy}");
+                assert_eq!(roster_state(), WorkerRosterStateV1::ParkedOnJob);
+            }
+        }
+        store
+            .conn
+            .execute(
+                r#"UPDATE agent_jobs SET params_json='{"wake":"none"}' WHERE id=?1"#,
+                [job.to_string()],
+            )
+            .unwrap();
 
         // An enabled wake of its own means the report is pending.
         let now = chrono::Utc::now();
@@ -3513,6 +4089,31 @@ mod tests {
         store.insert_scheduled_job(&wake).unwrap();
         assert_eq!(note(bound), None);
         assert!(pending(bound));
+
+        // An explicit jobs_terminal wake also parks a wake:none job.
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET schedule_json=json_set(schedule_json,
+                    '$.wake_when',json(?2)) WHERE id=?1",
+                params![
+                    wake.id.to_string(),
+                    serde_json::json!({"predicate": {"jobs_terminal": [job]}}).to_string()
+                ],
+            )
+            .unwrap();
+        for state in ["queued", "running"] {
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET state=?2 WHERE id=?1",
+                    params![job.to_string(), state],
+                )
+                .unwrap();
+            assert_eq!(note(bound), None, "{state} with jobs_terminal wake");
+            assert!(pending(bound), "{state} with jobs_terminal wake");
+            assert_eq!(roster_state(), WorkerRosterStateV1::ParkedOnJob);
+        }
         // A daemon predicate wake also holds the watch across interim turns.
         store.conn.execute(
             "UPDATE scheduled_jobs SET wake_mode='fresh', schedule_json=json_set(schedule_json,'$.wake_when',json('{}')) WHERE id=?1",

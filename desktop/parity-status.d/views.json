@@ -62,9 +62,9 @@
       "note": "Ctrl-Enter launches; Ctrl-O or Tab (normal) flips to the settings side; Ctrl-M the model dropdown; Ctrl-E steps the effort along the model's ladder; Ctrl-B toggles the git-worktree sandbox (LaunchSession sandbox); ? (normal) help; Ctrl-Q closes keeping the draft; Ctrl-Y compiles and Ctrl-Shift-G corrects into a preview, a / d accept or discard; Ctrl-Alt-A AI command (Ctrl-A stays select-all) and Ctrl-Shift-A AI chat; Ctrl-V pastes (images become @path, G1); the vim keys are G1's editor; a header row shows dir, model, effort bars, sandbox and the planned manager. Substitute: the desktop has one New session dialog and no tabs or splits, so Ctrl-T / Ctrl-S launch into the list, and Ctrl-J / Ctrl-K and Space N say there are no stacked prompts (the draft stays)"
     },
     "overlay-ref:new-session-settings": {
-      "status": "substitute",
+      "status": "done",
       "location": "src/prompts.ts, src/prompt-model.ts, src/launch.ts, src-tauri/src/prompts.rs",
-      "note": "j/k, h/l, Space/Enter on Model, Effort, Sandbox, Manager (needs a project), Scope (whole project, then each live Group with its live Epics), Policy (Observe, Execute, Full project control); Ctrl-E / Ctrl-B / Ctrl-M / Ctrl-Enter / Ctrl-T / Ctrl-S / ? / Ctrl-Q; Ctrl-O / Tab / Esc flip back. The appointment runs after the launch is accepted through one ConfigureHarnessManagerWithPolicy (the preset applied by rsi_common's own preset code, fenced by GetHarnessManager / GetHarnessManagerPolicy); a refusal is a notice and the session stays launched. Substitute for the grant page: p (or Enter on Grant) opens the full manager policy editor (:manager policy) on the granted policy right after the appointment, instead of editing it inside the prompt"
+      "note": "j/k, h/l, Space/Enter on Model, Effort, Sandbox, Manager (needs a project), Scope (whole project, then each live Group with its live Epics), Policy (Observe, Execute, Full project control); Ctrl-E / Ctrl-B / Ctrl-M / Ctrl-Enter / Ctrl-T / Ctrl-S / ? / Ctrl-Q; Ctrl-O / Tab / Esc flip back. Planning a manager reads the project's saved grant (GetHarnessManagerPolicy, GrantContextState); the Launch button and every launch path wait with 'Loading saved grant…' until it loads, a failed read says so and p retries (block_unloaded_grant). The appointment runs after the launch is accepted through one ConfigureHarnessManagerWithPolicy fenced by GetHarnessManager / GetHarnessManagerPolicy: it re-grants the saved grant (Policy shows 'Saved grant') unless Policy was stepped, else the preset applied by rsi_common's own preset code (#3270, #204); a refusal is a notice and the session stays launched. p (or Enter on Grant) opens the full manager policy editor (:manager policy) on the granted policy right after the appointment"
     },
     "overlay-ref:input-modal": {
       "status": "done",
@@ -139,7 +139,7 @@
     "overlay-ref:skill-preview": {
       "status": "done",
       "location": "src/skills.ts, src/skills-model.ts, src/actions/promptcreator-run.ts, src-tauri/src/input.rs",
-      "note": "the Skill Preview reads SKILL.md through rsid (GetSkill user:true, hub #3062; the TUI calls the same rsi_common::input_assets::read_skill): j/k, Ctrl-D/U, g/G scroll, q/Esc close back to the skills list"
+      "note": "the Skill Preview reads SKILL.md through rsid (GetSkill user:true, hub #3062; the TUI calls the same GetSkill, #91): j/k, Ctrl-D/U, g/G scroll, q/Esc close back to the skills list"
     }
   }
 }

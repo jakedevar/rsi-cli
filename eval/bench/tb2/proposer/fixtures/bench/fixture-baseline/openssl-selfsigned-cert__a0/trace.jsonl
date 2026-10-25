@@ -1,0 +1,8 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Create a self-signed certificate and put the files where the task says.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj /CN=localhost"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"writing new private key to 'key.pem'","success":true},"seq":2}
+{"args":{"command":"ls -la"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"cert.pem\nkey.pem","success":true},"seq":4}
+{"args":{"command":"openssl x509 -in cert.pem -noout -subject"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"subject=CN = localhost","success":true},"seq":6}
+{"kind":"model_response","response":{"content":"Generated the key and certificate in the working directory.","stop_reason":"stop","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":7}

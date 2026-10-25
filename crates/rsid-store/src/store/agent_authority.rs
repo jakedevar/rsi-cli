@@ -53,6 +53,7 @@ pub const ACTIONS: &[(Action, Capability)] = &[
     (Action::DeleteContainer, Capability::Topology),
     (Action::RestoreContainer, Capability::Topology),
     (Action::CreateSession, Capability::SessionCreate),
+    (Action::WithdrawQueuedCreate, Capability::SessionCreate),
     (Action::AssignLead, Capability::LeadAssign),
     (Action::Integrate, Capability::GitEffect),
     (Action::ArchiveSession, Capability::SessionControl),
@@ -132,6 +133,12 @@ const UPDATES: &[(&str, Capability, Option<Capability>, UpdateRole)] = &[
         UpdateRole::Either,
     ),
     ("request", Capability::WorkPlan, None, UpdateRole::Lead),
+    (
+        "request_withdraw",
+        Capability::WorkPlan,
+        None,
+        UpdateRole::Manager,
+    ),
     ("decision", Capability::WorkPlan, None, UpdateRole::Either),
     // #1415: a delegated manager's ruling on a non-gate decision record, and
     // the owning manager's withdrawal of its own.
@@ -204,6 +211,7 @@ pub struct VerbRights {
     pub prepared: bool,
     pub topology_manager: bool,
     pub deploy: bool,
+    pub host_preset: bool,
     pub global_manager: bool,
     /// #1626: an Execute-mode, unpaused project manager or portfolio seat may
     /// register and edit projects inside its coverage.
@@ -288,6 +296,7 @@ pub fn permitted_verb(verb: Verb, rights: &VerbRights) -> bool {
         Verb::RequestDeploy | Verb::PushSatelliteManagerPolicy | Verb::ReseatSatelliteManager => {
             rights.deploy
         }
+        Verb::SwitchHostPreset => rights.host_preset,
         Verb::ManagerWorkView => rights.managed_worker,
         Verb::ManagerProgress | Verb::ManagerInspect | Verb::ManagerGetAction
             if rights.portfolio_reader =>
@@ -565,16 +574,20 @@ impl Store {
                 epic.session_kind == SessionKind::Epic && epic.lead_session_id.is_none()
             });
 
+        let area = self.manager_area_authority_current(caller).ok().flatten();
+        pending &= area.is_none();
         let config = session
             .project_id
             .map(|project| self.get_harness_manager(project))
             .transpose()?
             .flatten();
+        let config = area.as_ref().map(|a| a.config.clone()).or(config);
         let grant = session
             .project_id
             .map(|project| self.get_harness_manager_policy(project))
             .transpose()?
             .flatten();
+        let grant = area.as_ref().map(|a| a.grant.clone()).or(grant);
         let is_manager = config
             .as_ref()
             .is_some_and(|c| c.current_session_id == Some(caller));
@@ -588,7 +601,8 @@ impl Store {
         let active_grant = grant.as_ref().filter(|g| {
             !g.revoked
                 && config.as_ref().is_some_and(|c| {
-                    g.manager_session_id == c.manager_session_id && g.scope_version == c.row_version
+                    (area.is_some() || g.manager_session_id == c.manager_session_id)
+                        && g.scope_version == c.row_version
                 })
         });
         let manager_grant = active_grant.filter(|_| is_manager);
@@ -816,6 +830,7 @@ impl Store {
             control: !control_actions.is_empty(),
             prepared: !prepared_actions.is_empty(),
             deploy: has(Capability::Deploy) || global_has(Capability::Deploy),
+            host_preset: execute.is_some() || global_executes,
             topology_manager: manager_grant
                 .is_some_and(|g| g.policy.capabilities.contains(&Capability::Automation))
                 || global_has(Capability::Automation),

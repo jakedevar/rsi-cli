@@ -59,7 +59,7 @@ if [ -f "$HOME/.config/rsi-ios/env" ]; then
     . "$HOME/.config/rsi-ios/env"
 fi
 
-for tool in xcodegen xcodebuild xcrun python3; do
+for tool in xcodegen xcodebuild xcrun jq; do
     command -v "$tool" > /dev/null 2>&1 || { echo "dev-install: $tool not found" >&2; exit 2; }
 done
 
@@ -71,16 +71,8 @@ mask() {
 xcode_team() {
     plutil -extract IDEProvisioningTeamByIdentifier json -o - \
         "$HOME/Library/Preferences/com.apple.dt.Xcode.plist" 2> /dev/null \
-        | python3 -I -c '
-import json, sys
-try:
-    accounts = json.load(sys.stdin)
-except ValueError:
-    sys.exit(0)
-teams = [t for ts in accounts.values() for t in ts if t.get("isFreeProvisioningTeam")]
-if teams:
-    print(teams[0]["teamID"])
-' || true
+        | jq -r '[.[]?[]? | select(.isFreeProvisioningTeam == true) | .teamID][0] // empty' \
+            2> /dev/null || true
 }
 
 team="${RSI_IOS_TEAM_ID:-}"
@@ -106,27 +98,16 @@ find_device() {
         rm -f "$json"
         return 0
     fi
-    NETWORK_FIRST="$network_first" python3 -I - "$json" << 'EOF' || true
-import json, os, sys
-with open(sys.argv[1]) as handle:
-    devices = json.load(handle).get("result", {}).get("devices", [])
-network_first = os.environ.get("NETWORK_FIRST") == "1"
-for d in devices:
-    hw = d.get("hardwareProperties", {})
-    conn = d.get("connectionProperties", {})
-    if hw.get("platform") != "iOS" or hw.get("reality") != "physical":
-        continue
-    if conn.get("pairingState") != "paired":
-        continue
-    transport = conn.get("transportType")
-    tunnel = conn.get("tunnelState")
-    reachable = transport == "wired" or tunnel == "connected"
-    if network_first:
-        reachable = reachable or transport == "localNetwork"
-    if reachable:
-        print(d["identifier"])
-        break
-EOF
+    jq -r --argjson network_first "$network_first" '
+        [.result.devices[]?
+         | select(.hardwareProperties.platform == "iOS"
+                  and .hardwareProperties.reality == "physical"
+                  and .connectionProperties.pairingState == "paired")
+         | select(.connectionProperties.transportType == "wired"
+                  or .connectionProperties.tunnelState == "connected"
+                  or ($network_first == 1
+                      and .connectionProperties.transportType == "localNetwork"))
+         | .identifier][0] // empty' "$json" 2> /dev/null || true
     rm -f "$json"
 }
 

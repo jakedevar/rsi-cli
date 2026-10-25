@@ -20,7 +20,7 @@ import {
   chunkInput, clampGrid, exited, gridFor, isRunning, isToggleChord, keyForPty, modeLabel, overlayRect, overlayTitle,
   remove, resizeStep, routeTerminalKey, runningPtys, spawnFailed, spawned, terminalKey, toggle,
 } from '../terminal-model.js';
-import { currentPlatform } from '../vimkeys.js';
+import { currentPlatform, isVimKeysOn } from '../vimkeys.js';
 import { SLICE, type TerminalActionId, type TerminalSnapshot } from './terminal-spec.js';
 import { focusOwnsKey } from '../modal-gate.js';
 
@@ -138,8 +138,10 @@ async function viewFor(key: string): Promise<View> {
 
 /** xterm's key hook: true lets xterm send the key to the shell. */
 function onTermKey(view: View, ev: KeyboardEvent): boolean {
-  if (ev.type !== 'keydown') return st.mode === 'insert' && ev.key !== 'Escape';
-  const r = routeTerminalKey(st.mode, ev, currentPlatform(), view.term.rows);
+  const vim = isVimKeysOn();
+  if (!vim && st.mode !== 'insert') setMode('insert'); // the switch went off while in normal mode
+  if (ev.type !== 'keydown') return !vim || (st.mode === 'insert' && ev.key !== 'Escape');
+  const r = routeTerminalKey(st.mode, ev, currentPlatform(), view.term.rows, vim);
   switch (r.kind) {
     case 'pty': return true;
     case 'native': return false;
@@ -157,9 +159,12 @@ function scroll(term: Terminal, s: Scroll): void {
 }
 
 function setMode(mode: TermMode): void {
+  const vim = isVimKeysOn();
+  if (!vim) mode = 'insert'; // no modal layer without Vim keys
   st = { ...st, mode };
   const m = part('terminal-mode');
-  m.textContent = modeLabel(mode);
+  m.textContent = modeLabel(mode, vim);
+  m.hidden = !vim;
   m.classList.toggle('normal', mode === 'normal');
   // Typing returns to the live prompt.
   if (mode === 'insert' && st.visible) views.get(st.visible)?.term.scrollToBottom();
@@ -358,6 +363,8 @@ export function initTerminal(): void {
     ev.stopPropagation();
     dispatch('toggle-terminal', { source: 'key' });
   }, { capture: true });
+  // Flipping the Vim keys switch with the overlay open: drop a leftover normal mode, follow the label.
+  window.addEventListener('rsi:vim-keys', () => { if (overlay) setMode(st.mode); });
   window.addEventListener('resize', () => { if (st.visible) { placeOverlay(); fitVisible(); } });
   // A reload drops the panes; take their shells with them (the backend also kills all on window close).
   window.addEventListener('pagehide', () => {

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run one rsi-rolling-land gate on an ephemeral AWS host, then destroy it.
+# Run one rsi-rolling-land gate (or --run COMMAND) on an ephemeral AWS SPOT host,
+# then destroy it. Spot only, inside the daemon spend caps (#3460).
 #
 #   scripts/cloud-gate.sh [--instance-type TYPE] [--keep-for-debug] -- LANDER_ARGS...
 #   scripts/cloud-gate.sh [options] --run -- COMMAND...
@@ -9,15 +10,26 @@
 # --remote-gate-* flags. Operator rule 2026-09-28: apply, one remote gate,
 # destroy, no build volumes or snapshots kept. The EXIT trap always runs
 # terraform destroy and then checks AWS for leftover gate instances. The guest
-# also terminates itself after max_lifetime_minutes as a backstop.
+# also terminates itself after max_lifetime_minutes as a backstop, and the host
+# carries an rsi:expires-at tag for the orphan sweep.
+#
+# Spend (#3460): after the stop-line/daily-cap check and BEFORE terraform
+# apply, `rsi-cloud spend reserve` writes the worst-case cost of the run
+# (lifetime x the spot reserve rate, never the on-demand price) to the ledger
+# and refuses when that would pass either cap. The stop line the EXIT trap
+# writes names the reservation and replaces it with the actual cost; a run
+# whose stop line is never written (hub crash) stays reserved. A host AWS takes
+# back (spot interruption) ends the run with exit 75 and the line
+# "cloud-gate: spot_interrupted": incomplete, safe to retry.
 #
 # --run replaces the lander with COMMAND, run locally once the host is ready
 # with RSI_GATE_HOST (ec2-user@IP), RSI_GATE_IDENTITY and RSI_GATE_RUN_AS in its
 # environment (scripts/cloud-sweep.sh cloud uses it, so it shares the apply,
 # ledger and destroy code). --root-volume-gib and --max-lifetime-minutes size
-# the host for heavier runs.
+# the host for heavier runs; --max-lifetime-minutes defaults to 120 for --run
+# (240 for a lander gate).
 #
-# Every run first checks the spend ledger (scripts/cloud-spend.py check) and
+# Every run first checks the spend ledger (rsi-cloud spend check) and
 # refuses to start at or above the grant's stop line. When the persistent cache
 # stack (infra/aws/gate-cache, state gate-cache.tfstate) exists the host builds
 # through sccache with an S3 backend; the run's sccache hits, misses and hit
@@ -26,10 +38,11 @@
 # Inputs (defaults in parentheses): RSI_CLOUD_DIR (~/.rsi/cloud) holds
 # gate.tfvars, gate.tfstate, gate.lock and the spend ledger spend.md;
 # RSI_GATE_IDENTITY (~/.ssh/id_ed25519_rsi) is the private key of the
-# tfvars ssh_key_name; RSI_GATE_HOURLY_USD (1.7808, the configured
-# c7i.16xlarge $3.5616/h scaled to the default c7i.8xlarge) prices the
-# ledger entry; set it when passing another --instance-type.
-# Needs terraform, aws (profile rsi-cloud-terraform), ssh and ssh-keyscan.
+# tfvars ssh_key_name; RSI_GATE_HOURLY_USD (0.7813, the spot max price $0.75 +
+# 200 GiB gp3 + public IPv4 for the default c7i.8xlarge) is both the reserve
+# rate and the rate that prices the ledger entry; set it, and the terraform
+# spot_max_price_usd, when passing another --instance-type.
+# Needs terraform, rsi-cloud (AWS profile rsi-cloud-terraform), ssh and ssh-keyscan.
 # Slots (#969): the run holds no desktop lander slot. gate.lock is the
 # remote-gate pool (one host per state). The lander's local builds and tests
 # each take a desktop build slot through RSI_GATE_CARGO_SLOT
@@ -39,14 +52,25 @@
 set -euo pipefail
 
 usage() {
-  sed -n '2,37p' "$0" >&2
+  sed -n '2,48p' "$0" >&2
   exit 2
 }
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd -P)
+# The spend guard is crates/rsi-cloud. A gate job runs from the daemon-owned trusted
+# tree, where the daemon places the rsi-cloud it was installed with (bin/rsi-cloud);
+# RSI_CLOUD_BIN overrides it (tests), else the installed one on PATH.
+if [ -n "${RSI_CLOUD_BIN:-}" ]; then
+  rsi_cloud=$RSI_CLOUD_BIN
+elif [ -x "$repo_root/bin/rsi-cloud" ]; then
+  rsi_cloud="$repo_root/bin/rsi-cloud"
+else
+  rsi_cloud=$(command -v rsi-cloud || true)
+fi
+spend() { "$rsi_cloud" spend "$@"; }
 cloud_dir=${RSI_CLOUD_DIR:-$HOME/.rsi/cloud}
 identity=${RSI_GATE_IDENTITY:-$HOME/.ssh/id_ed25519_rsi}
-hourly_usd=${RSI_GATE_HOURLY_USD:-1.7808}
+hourly_usd=${RSI_GATE_HOURLY_USD:-0.7813}
 lander=${RSI_GATE_LANDER:-$HOME/.cargo/shared-target/debug/rsi-rolling-land}
 cargo_slot=${RSI_GATE_CARGO_SLOT:-$HOME/.rsi/bin/cargo-slot}
 tf_dir="$repo_root/infra/aws/gate"
@@ -74,14 +98,19 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ $# -gt 0 ] || usage
-for tool in terraform aws ssh ssh-keyscan ssh-keygen flock python3; do
+for tool in terraform ssh ssh-keyscan ssh-keygen flock; do
   command -v "$tool" >/dev/null || { echo "cloud-gate: missing $tool" >&2; exit 2; }
 done
+[ -n "$rsi_cloud" ] && [ -x "$rsi_cloud" ] || { echo "cloud-gate: missing rsi-cloud (the spend guard; install it with make release-install)" >&2; exit 2; }
 [ -f "$tfvars" ] || { echo "cloud-gate: missing $tfvars (ssh_key_name = \"...\")" >&2; exit 2; }
 [ -f "$identity" ] || { echo "cloud-gate: missing identity $identity" >&2; exit 2; }
+# A --run host is a QA/sweep host: two hours reserved by default, not four.
+[ "$run_mode" -eq 1 ] && [ -z "$max_lifetime_minutes" ] && max_lifetime_minutes=120
 [ "$run_mode" -eq 1 ] || [ -x "$lander" ] || { echo "cloud-gate: missing lander $lander" >&2; exit 2; }
 # Refuse to spend past the grant's stop line (limits read from the ledger header).
-python3 "$repo_root/scripts/cloud-spend.py" check --ledger "$ledger" || exit 4
+spend check --ledger "$ledger" || exit 4
+# The guest lifetime the reservation, the expiry tag and the shutdown share.
+lifetime_minutes=${max_lifetime_minutes:-240}
 
 # The shards run on the gate host, so this run takes no desktop lander slot
 # and starts the host at once (#969). Local work still pays its way: every
@@ -96,6 +125,13 @@ fi
 # One gate host at a time; a second caller fails fast instead of sharing it.
 exec 8>>"$cloud_dir/gate.lock"
 flock -n 8 || { echo "cloud-gate: another gate host is running" >&2; exit 3; }
+
+# Reserve the run's worst case before anything is applied (#3460). Done after
+# the single-host lock so a second caller never reserves; a refusal here exits
+# 4 with the cap named, before the EXIT trap and before any AWS call.
+reservation_id=$(spend reserve --ledger "$ledger" \
+  --minutes "$lifetime_minutes" --rate "$hourly_usd" | sed -n 's/^reservation_id=//p') || exit 4
+[ -n "$reservation_id" ] || { echo "cloud-gate: no reservation id; refusing to start a remote run" >&2; exit 4; }
 
 tf() { terraform -chdir="$tf_dir" "$@" -input=false -no-color; }
 tf_output() { terraform -chdir="$tf_dir" output -no-color -state="$state" -raw "$1"; }
@@ -127,7 +163,7 @@ collect_sccache() {
   raw=$(timeout 90 ssh -F /dev/null -T -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
     -o ConnectTimeout=10 -i "$identity" "ec2-user@$public_ip" \
     sudo -n -H -u "$run_as" /usr/local/bin/sccache --show-stats --stats-format json 2>/dev/null) || raw=
-  if summary=$(printf '%s' "$raw" | python3 "$repo_root/scripts/cloud-spend.py" cache \
+  if summary=$(printf '%s' "$raw" | spend cache \
     --json-out "$cloud_dir/logs/sccache-${instance_id:-unknown}.json" 2>/dev/null); then
     echo "cloud-gate: $summary" >&2
     echo "$summary"
@@ -149,6 +185,17 @@ cleanup() {
     exit "$status"
   fi
   collect_sccache || true
+  # A host AWS took back is not a failed run: name it so the caller retries.
+  local spot_note=
+  if [ "$status" -ne 0 ] && [ -n "$instance_id" ]; then
+    if [ "$(timeout 60 "$rsi_cloud" aws ec2 describe-instances --region "$region" --instance-ids "$instance_id" --output json 2>/dev/null \
+      | spend spot-reason 2>/dev/null)" = spot_interrupted ]; then
+      spot_note=spot_interrupted
+      status=75
+      echo "cloud-gate: spot_interrupted: AWS reclaimed $instance_id (Server.SpotInstanceTermination); the run is incomplete and safe to retry" >&2
+      echo "cloud-gate: spot_interrupted"
+    fi
+  fi
   echo "cloud-gate: destroying gate host" >&2
   local attempt destroyed=0
   for attempt in 1 2 3; do
@@ -160,13 +207,13 @@ cleanup() {
   done
   # Independent of Terraform state: nothing tagged as a gate host may remain.
   local leftover
-  leftover=$(aws ec2 describe-instances --region "$region" \
+  leftover=$("$rsi_cloud" aws ec2 describe-instances --region "$region" \
     --filters Name=tag:Service,Values=rsi-remote-gate \
     Name=instance-state-name,Values=pending,running,stopping,stopped \
-    --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || echo unknown)
+    --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null) || leftover=unknown
   if [ -n "$leftover" ] && [ "$leftover" != None ]; then
     echo "cloud-gate: LEFTOVER gate instances after destroy: $leftover" >&2
-    [ "$leftover" != unknown ] && aws ec2 terminate-instances --region "$region" \
+    [ "$leftover" != unknown ] && "$rsi_cloud" aws ec2 terminate-instances --region "$region" \
       --instance-ids $leftover >/dev/null 2>&1 || true
     status=1
   fi
@@ -175,12 +222,15 @@ cleanup() {
     local stopped elapsed
     stopped=$(date -u +%s)
     elapsed=$((stopped - started_epoch))
-    printf 'Gate window %s: stop %s, elapsed %s s = %s h, est compute $%s at $%s/h; terraform destroy %s; leftover gate instances: %s; %s.\n' \
+    printf 'Gate window %s: stop %s, elapsed %s s = %s h, est compute $%s at $%s/h; terraform destroy %s; leftover gate instances: %s; %s%s; reservation %s.\n' \
       "$instance_id" "$(utc)" "$elapsed" \
       "$(awk -v s="$elapsed" 'BEGIN { printf "%.4f", s / 3600 }')" \
       "$(awk -v s="$elapsed" -v r="$hourly_usd" 'BEGIN { printf "%.4f", s / 3600 * r }')" \
       "$hourly_usd" "$([ "$destroyed" -eq 1 ] && echo ok || echo FAILED)" "${leftover:-none}" \
-      "$sccache_note" >>"$ledger"
+      "$sccache_note" "${spot_note:+; $spot_note}" "$reservation_id" >>"$ledger"
+  else
+    # The host never started: hand the reservation back.
+    printf 'Gate reservation %s: released, no host started (%s).\n' "$reservation_id" "$(utc)" >>"$ledger"
   fi
   [ "$destroyed" -eq 1 ] || { echo "cloud-gate: terraform destroy failed; see $cloud_dir/logs/gate-destroy.log" >&2; status=1; }
   exit "$status"
@@ -197,7 +247,7 @@ cache_state="$cloud_dir/gate-cache.tfstate"
 # A failed apply of the cache stack still leaves its planned outputs in the
 # state, so the bucket must really exist before it is used.
 if [ -s "$cache_state" ] && cache_bucket=$(terraform -chdir="$tf_dir" output -no-color -state="$cache_state" -raw bucket 2>/dev/null) \
-  && [ -n "$cache_bucket" ] && aws s3api head-bucket --bucket "$cache_bucket" --region "$region" >/dev/null 2>&1; then
+  && [ -n "$cache_bucket" ] && "$rsi_cloud" aws s3api head-bucket --bucket "$cache_bucket" --region "$region" >/dev/null 2>&1; then
   tf_vars+=(-var "sccache_bucket=$cache_bucket"
     -var "sccache_prefix=$(terraform -chdir="$tf_dir" output -no-color -state="$cache_state" -raw key_prefix)"
     -var "instance_profile_name=$(terraform -chdir="$tf_dir" output -no-color -state="$cache_state" -raw instance_profile)")
@@ -207,14 +257,18 @@ else
   echo "cloud-gate: no cache stack state at $cache_state; building cold (see infra/aws/README.md)" >&2
 fi
 started_epoch=$(date -u +%s)
+# The orphan sweep terminates a host past this tag; it is the reservation's
+# expiry. A bare `terraform apply` falls back to timestamp() + lifetime.
+expires_at=$("$rsi_cloud" epoch-stamp "$((started_epoch + lifetime_minutes * 60))")
+tf_vars+=(-var "expires_at=$expires_at")
 tf apply -auto-approve "${tf_vars[@]}" >"$cloud_dir/logs/gate-apply.log" 2>&1
 instance_id=$(tf_output instance_id)
 public_ip=$(tf_output public_ip)
 run_as=$(tf_output run_as)
 applied_type=$(tf_output instance_type)
-printf 'Gate window %s: start %s, %s, public IPv4 %s, est $%s/h (apply began %s).\n' \
+printf 'Gate window %s: start %s, %s spot, public IPv4 %s, est $%s/h (apply began %s, lifetime %s min, reservation %s).\n' \
   "$instance_id" "$(utc)" "$applied_type" "$public_ip" "$hourly_usd" \
-  "$(date -u -d "@$started_epoch" +%H:%M:%SZ)" >>"$ledger"
+  "$(date -u -d "@$started_epoch" +%H:%M:%SZ)" "$lifetime_minutes" "$reservation_id" >>"$ledger"
 echo "cloud-gate: $instance_id ($applied_type) at $public_ip" >&2
 
 # Pin the host key only after it matches the fingerprint cloud-init printed
@@ -230,7 +284,7 @@ done
 fingerprint=$(printf '%s\n' "$scanned" | ssh-keygen -lf - | awk '{print $2}')
 verified=0
 for _ in $(seq 60); do
-  if aws ec2 get-console-output --region "$region" --instance-id "$instance_id" --latest \
+  if "$rsi_cloud" aws ec2 get-console-output --region "$region" --instance-id "$instance_id" --latest \
     --query Output --output text 2>/dev/null | grep -F "$fingerprint" | grep -q ED25519; then
     verified=1
     break

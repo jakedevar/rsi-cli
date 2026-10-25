@@ -22,7 +22,6 @@ use rsi_common::remote_read::{
     SessionResponseV1, SessionsResponseV1, SourceCoverageV1, SourceV1, Timestamp,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -47,7 +46,7 @@ pub fn spawn_info_read(
 /// context; the request alone never grants project visibility.
 pub fn spawn_projects_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
     trusted_configured: Vec<Uuid>,
@@ -165,7 +164,7 @@ fn known_runtime_signals(
 #[allow(clippy::too_many_lines)] // Keep capture, Store and reread in one guarded sequence.
 pub fn spawn_selected_session_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     request: &ReadRequestV1,
     trusted_project: Uuid,
@@ -283,7 +282,7 @@ pub fn spawn_selected_session_read(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keep all three guarded stages together.
 pub fn spawn_sessions_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
@@ -441,7 +440,7 @@ enum RoutedDecisions {
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn spawn_decisions_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
@@ -631,7 +630,7 @@ pub struct InitialSavedDecisionsSources {
 /// position step and is refused here until that owner path is complete.
 pub fn spawn_initial_saved_decisions_sources(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     request: &ReadRequestV1,
     trusted_project: Uuid,
@@ -674,7 +673,7 @@ pub fn spawn_initial_saved_decisions_sources(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_initial_saved_decisions_page(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
@@ -772,7 +771,7 @@ pub struct ResumedSavedDecisionsSources {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_resumed_saved_decisions_sources(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: &ReadRequestV1,
@@ -828,12 +827,23 @@ pub fn spawn_resumed_saved_decisions_sources(
             budget.check()?;
             let acquired =
                 manager.remote_saved_pending_finish(&selected, capture, store_sources)?;
+            // A session with no live native writer has an Unavailable native
+            // source (reported in coverage); it is not a changed one.
             let native_unchanged = matches!(
                 &acquired.native_runtime,
                 PendingRead::Observed {
                     value: (_, super::NativeRuntimeApprovalRecheck::NoObservedChange),
                     ..
                 }
+            ) || matches!(
+                &acquired.native_runtime,
+                PendingRead::Observed {
+                    value: (snapshot, _),
+                    ..
+                } if !matches!(
+                    snapshot.state,
+                    super::NativeRuntimeApprovalListState::Present(_)
+                )
             );
             let slots_unchanged = matches!(
                 &acquired.question_slots,
@@ -862,7 +872,7 @@ pub fn spawn_resumed_saved_decisions_sources(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_resumed_saved_decisions_page(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
@@ -969,7 +979,7 @@ pub fn spawn_resumed_saved_decisions_page(
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_runtime_only_decisions_page(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     manager: Arc<SessionManager>,
     signer: Arc<RemoteCursorSigner>,
     request: ReadRequestV1,
@@ -1111,7 +1121,7 @@ fn session_page_coverage(
 /// they require exact indexed reads on the same transaction.
 pub fn spawn_history_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     signer: &Arc<RemoteCursorSigner>,
     request: &ReadRequestV1,
     trusted_project: Uuid,
@@ -1277,7 +1287,7 @@ mod tests {
             .conn
             .busy_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let dir = tempfile::TempDir::new().unwrap();
         let config = Config::from_env();
         let manager = Arc::new(
@@ -1371,7 +1381,7 @@ mod tests {
             .conn
             .busy_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let signer = Arc::new(RemoteCursorSigner::new(Uuid::new_v4()));
         let limiter = RemoteReadLimiter::new();
         let epoch = Uuid::new_v4();
@@ -1452,7 +1462,7 @@ mod tests {
             .conn
             .busy_timeout(std::time::Duration::from_secs(10))
             .unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let signer = Arc::new(RemoteCursorSigner::new(Uuid::new_v4()));
         let limiter = RemoteReadLimiter::new();
         let epoch = Uuid::new_v4();

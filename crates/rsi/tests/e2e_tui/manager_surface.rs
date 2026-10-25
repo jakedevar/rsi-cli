@@ -174,7 +174,7 @@ async fn test_e2e_manager_surface_sections_share_one_entry() -> E2eResult<()> {
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     if manager.status == SessionStatus::Running {
         let _ = client.interrupt_session(manager.id).await;
     }

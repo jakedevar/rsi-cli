@@ -202,6 +202,65 @@ impl ReseatWorld {
     }
 }
 
+/// #169: a seat launched without a sandbox in a git-backed project root (the
+/// psychic-square seat: appointed with no sandbox, its root a git work tree) is
+/// reseated into a git-worktree sandbox of its own. Exactly one writer holds a
+/// tree afterwards: the successor owns the one live custody root, the stopped
+/// seat holds none, and the tree is not the project's shared root.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandboxless_seat_of_a_git_backed_project_is_reseated_into_its_own_sandbox() {
+    let world = ReseatWorld::new(SessionStatus::Failed).await;
+    let params = world.params(false);
+    let (successor, _process) = world.script_successor(&params);
+    let result = world
+        .manager
+        .reseat_harness_manager(params)
+        .await
+        .expect("a failed sandbox-less seat is reseated");
+    assert_eq!(result.successor_session_id, successor);
+
+    let own_root = live_root_facts(&world.manager, successor).await;
+    assert_eq!(own_root.owner, successor);
+    assert_eq!(own_root.allocation_session, successor);
+    assert_eq!(own_root.generation, 1);
+    let store = world.manager.store.lock().await;
+    let new_seat = store.get_session(successor).unwrap().unwrap();
+    assert_eq!(new_seat.sandbox_kind, Some(SandboxKind::GitWorktree));
+    assert_eq!(
+        new_seat.sandbox_cleanup_state,
+        Some(SandboxCleanupState::Live)
+    );
+    let tree = new_seat
+        .sandbox_root
+        .clone()
+        .expect("the successor has a tree");
+    assert_eq!(std::path::PathBuf::from(&own_root.sandbox_root), tree);
+    assert!(
+        tree.starts_with(world.manager.sandbox_allocator.base_dir()),
+        "the tree is a sandbox, not the project root: {}",
+        tree.display()
+    );
+    let predecessor = store.get_session(world.seat).unwrap().unwrap();
+    assert_eq!(predecessor.sandbox_root, None);
+    assert!(
+        store.live_custody_for_session(world.seat).is_err(),
+        "the stopped seat holds no tree"
+    );
+    let live_roots: i64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sandbox_custody_roots
+              WHERE owner_session_id IN (?1, ?2) AND state='live'",
+            [world.seat.to_string(), successor.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(live_roots, 1, "one writer: the successor's own tree");
+    drop(store);
+    stop_reseat_successor(&world.manager, successor).await;
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_codex_manager_is_reseated_onto_claude_and_hub_dispatch_follows() {
@@ -457,7 +516,11 @@ async fn give_provider_session(manager: &SessionManager, id: Uuid) {
 }
 
 /// Complete the scripted turn of `id`: a `result` event, the stream closing and
-/// the monitor settling the row `Completed` with nothing left active.
+/// the monitor settling the row `Completed` with nothing left active and its
+/// completed-map entry published. The row turns `Completed` before the entry
+/// exists; `give_provider_session` patches the entry, and an entry published
+/// after that patch would hold no provider session id, so the later resume
+/// wake would refuse with "no session ID was captured" (#614).
 async fn finish_scripted_turn(
     manager: &SessionManager,
     id: Uuid,
@@ -483,6 +546,7 @@ async fn finish_scripted_turn(
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let active = manager.active.read().await.contains_key(&id);
+            let published = manager.completed.read().await.contains_key(&id);
             let status = manager
                 .store
                 .lock()
@@ -490,7 +554,7 @@ async fn finish_scripted_turn(
                 .get_session(id)
                 .unwrap()
                 .map(|session| session.status);
-            if !active && status == Some(SessionStatus::Completed) {
+            if !active && published && status == Some(SessionStatus::Completed) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

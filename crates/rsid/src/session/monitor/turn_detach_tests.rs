@@ -167,7 +167,9 @@ async fn spool_content_blocks_persist_once_with_exact_question_and_newline_curso
     );
     tracked.spawn_generation = 7;
     let session = tracked.session.id;
-    let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().unwrap(),
+    ));
     let invocation = Uuid::new_v4();
     let boot = Uuid::new_v4();
     {

@@ -648,3 +648,33 @@ fn seat_recovery_waits_for_the_provider_usage_limit_reset_without_charging_attem
         .expect("claimed after the provider reset");
     assert_eq!((claim.tip_session_id, claim.attempt), (tip, 1));
 }
+
+/// hub #3859: a seat that fails asks for ONE satellite report; attempt
+/// counters, retry timestamps and later passes of the same condition do not,
+/// while a seat that recovered and fails again does.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn a_failed_seat_asks_for_one_hub_report_per_condition() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, _) = fixture(&store, execute(1, 5));
+    let tip = manager(&config);
+    let t0 = Utc::now();
+    assert_eq!(pass(&store, config.project_id, true, t0).seat_report, None);
+    fail(&store, tip);
+    let first = pass(&store, config.project_id, true, t0 + Duration::seconds(1));
+    let reported = first.seat_report.expect("the failure is reported");
+    assert_eq!(reported.state, ManagerSeatConditionV1::Recovering);
+    assert_eq!(reported.tip_session_id, tip);
+    let again = pass(&store, config.project_id, true, t0 + Duration::seconds(2));
+    assert_eq!(again.seat_report, None, "the same condition is not re-sent");
+    // Provider output proves recovery; the next failure is reported anew.
+    store
+        .update_session_status(tip, SessionStatus::Completed)
+        .unwrap();
+    output(&store, tip, t0 + Duration::seconds(3));
+    let live = pass(&store, config.project_id, true, t0 + Duration::seconds(4));
+    assert_eq!(live.seat_report, None);
+    fail(&store, tip);
+    let relapse = pass(&store, config.project_id, true, t0 + Duration::seconds(5));
+    assert!(relapse.seat_report.is_some());
+}

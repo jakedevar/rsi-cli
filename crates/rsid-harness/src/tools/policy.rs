@@ -97,6 +97,18 @@ impl ToolPolicyRuntime {
         rsi_common::egress_policy::EgressPolicy::for_mode(self.policy.egress_mode())
     }
 
+    /// The reach of the file tools under this policy (#3172).
+    #[must_use]
+    pub fn file_path_scope(&self) -> rsi_common::harness_tool_policy::FilePathScope {
+        self.policy.file_path_scope()
+    }
+
+    /// Extra environment names a host command launch passes through (#3169).
+    #[must_use]
+    pub fn env_passthrough(&self) -> std::sync::Arc<[String]> {
+        self.policy.env_passthrough.as_slice().into()
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     #[must_use]

@@ -2,8 +2,9 @@
 
 use super::motions;
 use super::motions::{
-    execute_char_search, handle_char_search_target, join_lines, move_paragraph_backward,
-    move_paragraph_forward, move_to_first_non_blank, move_to_matching_bracket, toggle_case,
+    clamp_word_cursor, execute_char_search, handle_char_search_target, join_lines,
+    move_paragraph_backward, move_paragraph_forward, move_to_first_non_blank,
+    move_to_matching_bracket, move_word, toggle_case,
 };
 use super::operators::{handle_operator_g_prefix, handle_operator_pending, handle_textobj_key};
 use super::state::{CharSearch, CharSearchDir, VimAction, VimState, VisualMode};
@@ -70,7 +71,7 @@ fn indent_unit(style: IndentStyle) -> String {
 /// - Count accumulation (1-9 start, 0 continues)
 /// - g-prefix (gg), r-prefix (replace char)
 /// - Operator-pending mode (d/c/y + motions, dd/cc/yy)
-/// - Motions (h/j/k/l/w/b/e/0/$/G/gg/^/{/}/%)
+/// - Motions (h/j/k/l/w/b/e/W/B/E/0/$/G/gg/^/{/}/%)
 /// - Direct editing (x, D, C, p, u, Ctrl+R, s, J, ~)
 /// - Mode transitions (i, a, A, I, o, O)
 /// - Operator triggers (d, c, y → start selection, set pending)
@@ -182,21 +183,24 @@ pub fn handle_vim_normal(
         }
 
         // Word movement
-        KeyCode::Char('w') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordForward);
+        KeyCode::Char(ch @ ('w' | 'W')) => {
+            move_word(textarea, CursorMove::WordForward, count, ch == 'W');
+            if ch == 'W' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }
-        KeyCode::Char('b') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordBack);
+        KeyCode::Char(ch @ ('b' | 'B')) => {
+            move_word(textarea, CursorMove::WordBack, count, ch == 'B');
+            if ch == 'B' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }
-        KeyCode::Char('e') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordEnd);
+        KeyCode::Char(ch @ ('e' | 'E')) => {
+            move_word(textarea, CursorMove::WordEnd, count, ch == 'E');
+            if ch == 'E' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }
@@ -208,6 +212,12 @@ pub fn handle_vim_normal(
         }
         KeyCode::Char('$') => {
             textarea.move_cursor(CursorMove::End);
+            // TextArea's End is an insert position, one past the last character.
+            // Only normal-mode $ stops on the character; A and operators still
+            // need the exclusive end position.
+            if textarea.cursor().1 > 0 {
+                textarea.move_cursor(CursorMove::Back);
+            }
             VimAction::Consumed
         }
         KeyCode::Char('^') => {

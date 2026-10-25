@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 use serde_json::json;
@@ -110,7 +109,7 @@ fn read_pid(temp: &TempDir, mode: &str) -> i32 {
 }
 
 fn process_alive(pid: i32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    crate::test_support::process_is_running(pid)
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -320,7 +319,12 @@ async fn drop_kills_and_reaps_the_process_group() {
         .parse::<i32>()
         .expect("group pid");
     drop(client);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    for _ in 0..100 {
+        if !process_alive(server_pid) && !process_alive(group_pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(!process_alive(server_pid));
     assert!(!process_alive(group_pid));
 }

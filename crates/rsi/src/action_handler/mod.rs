@@ -106,6 +106,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::HardInterruptSession
         | LcAction::DowngradeOperatorPause
         | LcAction::ClearOperatorPause
+        | LcAction::ClearProviderUsageHold
         | LcAction::QuickContinue
         | LcAction::ContinueSession(_)
         | LcAction::OpenQuestionModal
@@ -132,6 +133,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::ReseatManager(_)
         | LcAction::ColdRestoreSession
         | LcAction::ColdArchive(_)
+        | LcAction::ExternalReports(_)
         | LcAction::CommitAndPush
         | LcAction::ExecuteDocRegBlocks
         | LcAction::YankEventContent
@@ -250,6 +252,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         | LcAction::CreateProject { .. }
         | LcAction::EditProjectByName(_)
         | LcAction::DeleteProjectByName(_)
+        | LcAction::LaunchIntake(_)
         | LcAction::ToggleKeybindingsHelp
         | LcAction::OpenAllCommands
         | LcAction::OpenManual(_)
@@ -289,6 +292,9 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         LcAction::OpenLegacyScratch => {
             crate::overlay::legacy_scratch::open(app).await;
         }
+        LcAction::OpenHostTuning => {
+            crate::overlay::host_tuning::open(app).await;
+        }
 
         LcAction::EditHarnessManagerPolicy
         | LcAction::OpenHarnessManagerBoard
@@ -326,6 +332,7 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
             crate::overlay::global_manager_workspace::refresh_if_open(app).await;
         }
         LcAction::OpenFleet => crate::overlay::fleet::open(app).await,
+        LcAction::OpenGlobalDashboard => crate::overlay::global_dashboard::open(app).await,
         LcAction::OpenGlobalManagerWorkspace => {
             crate::overlay::global_manager_workspace::open(app).await;
         }
@@ -465,6 +472,18 @@ pub(crate) async fn dispatch_lc_action(app: &mut App, action: LcAction) {
         } => {
             operator_config::save_claude_hooks(app, expected_revision, hooks, edit).await;
         }
+        LcAction::RefreshClaudeSkills => {
+            operator_config::refresh_claude_skills(app).await;
+        }
+        LcAction::OpenSkillPreview { name } => {
+            operator_config::open_skill_preview(app, name).await;
+        }
+        LcAction::SetSkillEnabled { name, enabled } => {
+            operator_config::set_skill_enabled(app, name, enabled).await;
+        }
+        LcAction::DeleteSkill { name } => {
+            operator_config::delete_skill(app, name).await;
+        }
         LcAction::OpenMessageBridgeForm(bridge) => {
             operator_config::open_message_bridge_form(app, bridge).await;
         }
@@ -531,6 +550,7 @@ pub(crate) async fn dispatch_registered_action(
         ActionId::GlobalManagerWorkspace => {
             crate::overlay::global_manager_workspace::open(app).await;
         }
+        ActionId::GlobalDashboard => crate::overlay::global_dashboard::open(app).await,
         ActionId::ManagerPolicy
         | ActionId::ManagerBoard
         | ActionId::ManagerDecisions

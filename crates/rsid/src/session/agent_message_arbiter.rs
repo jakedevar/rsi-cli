@@ -7,7 +7,7 @@
 //! continuation". A snapshot is a pull. Three consequences follow, and they are
 //! the reason this module owns no channel:
 //!
-//! 1. **`monitor_session` already holds `Arc<tokio::sync::Mutex<Store>>`.** The
+//! 1. **`monitor_session` already holds `Arc<rsid_core::store_lock::Mutex<Store>>`.** The
 //!    durable `agent_messages` queue *is* the mail. A channel carrying grant
 //!    requests to the monitor would be a second, weaker copy of state SQLite
 //!    already holds exactly, and would have to be kept coherent with it.
@@ -487,7 +487,7 @@ fn decide_boundary_page(
 /// receives an owned page.
 ///
 /// This is a plain `fn`, not an `async fn`. A caller holding the monitor's
-/// `tokio::sync::Mutex<Store>` guard therefore cannot await anything while this
+/// `rsid_core::store_lock::Mutex<Store>` guard therefore cannot await anything while this
 /// runs, and — because the returned [`BoundaryDecision`] borrows nothing from
 /// the store — can and must drop that guard before the `start_turn` that
 /// follows.

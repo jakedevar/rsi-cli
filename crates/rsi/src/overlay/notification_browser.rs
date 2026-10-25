@@ -178,7 +178,7 @@ mod tests {
 
     #[tokio::test]
     async fn enter_fetches_linked_session_missing_from_local_cache() {
-        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_dir = crate::test_support::socket_tempdir().unwrap();
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         let id = uuid::Uuid::new_v4();

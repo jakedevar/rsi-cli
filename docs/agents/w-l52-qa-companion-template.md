@@ -8,9 +8,9 @@ active sweep's brief or runner when updating this template.
 The launching manager fills every placeholder below and names the bound Issue.
 Only include the fallback authorization when that QA task is authorized to use
 it. A brief cannot grant daemon capabilities. Read `AGENTS.md` and
-`thoughts/shared/manager/worker-contract.md` from published `origin/rolling`;
-section 3a defines this exception to section 5, so no conflicting precedence
-rule is needed. These instructions launch future QA work, not a docs worker.
+`docs/agents/worker-contract.md` from published `origin/rolling`;
+"QA companion continuation" defines the authorized fallback. These instructions
+launch future QA work, not a docs worker.
 
 ## Launch brief
 
@@ -29,8 +29,8 @@ program mode or push `rolling`/`main`. Retain the established runner's
 `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0` and cargo-slot discipline.
 
 **Task-specific fallback authorization (include only when authorized):** You
-may use worker-contract section 3a for the named companion lanes whose exact
-target, source directory or environment the deployed job surface cannot
+may use the worker contract's "QA companion continuation" for named lanes whose
+exact target, source directory or environment the deployed job surface cannot
 represent. Prefer caller-owned `AgentSubmitJob` jobs with `wake:"none"` and ONE
 `mode:"when"` `when.jobs_terminal` completion wake with `timeout_seconds`.
 Inspect the deployed catalog before deciding; a recipe must already be
@@ -40,9 +40,13 @@ Delegated `qa_lane` is known-shard-only and does not enable companion targets
 or recipes. Do not treat its longer timeout as companion authorization.
 
 For an unrepresentable lane, record the precise limitation and this launch
-authorization, then use ONE owned detached `systemd-run --user --collect` unit
-with `RuntimeMaxSec=1500`, durable log and exit record. While it is active, arm
-at most ONE named, one-shot same-session `mode:"resume"` safety wake with
+authorization, then use ONE owned unit through
+`scripts/systemd-test-fallback rsi-test-fallback-<unique-name> <absolute-log>
+<absolute-exit-file> -- <command> <args...>`. It uses `systemd-run --user --collect`
+with a 25-minute cap and 200% CPU quota, preserving the command's numeric exit
+status. Pass pipelines as `bash -o pipefail -c '<script>'`. Inspect both the exit
+file and unit status on wake; a missing exit file is incomplete, never green.
+While it is active, arm at most ONE named, one-shot same-session `mode:"resume"` safety wake with
 `in_seconds` from 1 to 600. Reuse the name; inspect `AgentListWakes` before
 ending the turn. Each wake inspects the unit/evidence once, then advances or
 replaces that wake and ends the turn. No `every_seconds`, fresh self-wake,
@@ -76,8 +80,9 @@ Write `companions.md` (at most 100 lines) only in the authorized output scope:
 lane run/pass/fail/skip/exit table, each failure's exact ID/signature/class,
 rerun evidence, unsupported/unrun residuals and owned-unit/source cleanup.
 Report the same results to the manager as authorized; it assembles final QA
-artifacts. Append the handoff to your bound Issue, preserving its body prefix.
-Commit task-owned artifacts before return; use worker-contract section 4's
+artifacts. Publish the complete handoff to your bound Issue with
+`AgentUpdateIssue {handoff}`. Commit task-owned artifacts before return; use the
+worker contract's "Evidence and return"
 `PIPELINE HANDOFF — IMPLEMENTATION:` and `RESULT <source-commit> issue=#<n>`
 format, separately naming the tested pin and QA verdict GREEN/RED/INCOMPLETE.
 End with `Friction: none | #N[, #M] | <one line, not filed because ...>`.

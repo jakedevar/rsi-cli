@@ -44,7 +44,7 @@ pub struct IssueTrackerManager {
     state: Mutex<PollerState>,
     event_bus: Arc<EventBus>,
     session_launcher: Arc<dyn SessionLauncher>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     last_poll_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
@@ -54,7 +54,7 @@ impl IssueTrackerManager {
         tracker: Box<dyn Tracker>,
         event_bus: Arc<EventBus>,
         session_launcher: Arc<dyn SessionLauncher>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> Self {
         Self {
             config,
@@ -463,7 +463,10 @@ mod tests {
         }
     }
 
-    fn make_manager(kind: &str, store: Arc<Mutex<Store>>) -> IssueTrackerManager {
+    fn make_manager(
+        kind: &str,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+    ) -> IssueTrackerManager {
         let config = IssueTrackerConfig {
             kind: kind.to_string(),
             project_id: (kind == "local").then(crate::store::d04_test_project_id),
@@ -518,7 +521,7 @@ mod tests {
                 terminal_state: None,
             })
             .unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
 
         let manager = make_manager("local", Arc::clone(&store));
         manager.restore_from_db().await.unwrap();
@@ -548,7 +551,7 @@ mod tests {
         store
             .insert_issue_dispatch(&make_dispatch("local-1", "local"))
             .unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
 
         let manager = make_manager("linear", Arc::clone(&store));
         manager.restore_from_db().await.unwrap();
@@ -677,7 +680,7 @@ mod tests {
         dispatch.session_id = session_id;
         store.insert_issue_dispatch(&dispatch).unwrap();
 
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let config = IssueTrackerConfig {
             kind: "linear".to_string(),
             completion_state: Some("Done".to_string()),
@@ -738,7 +741,7 @@ mod tests {
         dispatch.session_id = session_id;
         store.insert_issue_dispatch(&dispatch).unwrap();
 
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let config = IssueTrackerConfig {
             kind: "linear".to_string(),
             completion_state: Some("Done".to_string()),
@@ -800,7 +803,7 @@ mod tests {
         dispatch.session_id = session_id;
         store.insert_issue_dispatch(&dispatch).unwrap();
 
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let config = IssueTrackerConfig {
             kind: "linear".to_string(),
             completion_state: Some("Done".to_string()),

@@ -23,22 +23,9 @@ impl Store {
                 break;
             };
             for project in page {
-                let Some(policy) = self.get_harness_manager_policy(project)? else {
-                    continue;
-                };
-                if policy.revoked {
-                    continue;
+                if let Some(row) = self.satellite_manager_launch_row(project, false)? {
+                    rows.push(row);
                 }
-                let Some(config) = self.get_harness_manager_notice_config(project)? else {
-                    continue;
-                };
-                let launches = self
-                    .manager_effective_launches(&config, &policy.policy.allowed_launches)?
-                    .len();
-                rows.push(SatelliteManagerLaunchesV1 {
-                    project_id: project,
-                    launches: u32::try_from(launches).unwrap_or(u32::MAX),
-                });
                 if rows.len() >= SATELLITE_MAX_MANAGER_LAUNCH_ROWS {
                     break 'pages;
                 }
@@ -46,6 +33,52 @@ impl Store {
             after = Some(last);
         }
         Ok(rows)
+    }
+
+    /// Every declared project, including vacant seats and absent policies.
+    /// Kept separate from the legacy eight-row summary for old hub validators.
+    pub fn satellite_manager_policies(&self) -> Result<Vec<SatelliteManagerLaunchesV1>> {
+        let mut rows = Vec::new();
+        for project in self.satellite_inbound_policy()?.scope_projects {
+            if let Some(row) = self.satellite_manager_launch_row(project.0, true)? {
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    fn satellite_manager_launch_row(
+        &self,
+        project: uuid::Uuid,
+        declared: bool,
+    ) -> Result<Option<SatelliteManagerLaunchesV1>> {
+        let policy = self.get_harness_manager_policy(project)?;
+        let config = self.get_harness_manager_notice_config(project)?;
+        if !declared && (policy.as_ref().is_none_or(|p| p.revoked) || config.is_none()) {
+            return Ok(None);
+        }
+        let allowed = policy
+            .as_ref()
+            .map(|p| p.policy.allowed_launches.as_slice());
+        let live_config = config
+            .as_ref()
+            .filter(|c| !c.is_revoked() && !policy.as_ref().is_some_and(|p| p.revoked));
+        let launches = match live_config {
+            Some(config) => self
+                .manager_effective_launches(config, allowed.unwrap_or_default())?
+                .len(),
+            None => 0,
+        };
+        Ok(Some(SatelliteManagerLaunchesV1 {
+            project_id: project,
+            launches: u32::try_from(launches).unwrap_or(u32::MAX),
+            manager_session_id: live_config.and_then(|c| c.current_session_id),
+            scope_version: config.as_ref().map(|c| c.row_version),
+            policy_version: Some(policy.as_ref().map_or(0, |p| p.row_version)),
+            allowed_launches: Some(
+                u32::try_from(allowed.unwrap_or_default().len()).unwrap_or(u32::MAX),
+            ),
+        }))
     }
 
     /// #2750: the project whose manager seat a hub's reseat names. The same
@@ -138,16 +171,36 @@ impl Store {
         {
             return Ok(serde_json::from_value(replay)?);
         }
-        if config.row_version != request.expected_scope_version {
-            return Err(DaemonError::PolicyDenied(POLICY_STALE.into()));
-        }
         let previous = self.get_harness_manager_policy(config.project_id)?;
-        if previous.as_ref().is_some_and(|p| p.revoked) {
-            return Err(denied());
-        }
+        let revoked = previous.as_ref().is_some_and(|p| p.revoked);
         let version = previous.as_ref().map_or(0, |p| p.row_version);
-        if version != request.expected_policy_version {
-            return Err(DaemonError::PolicyDenied(POLICY_STALE.into()));
+        // Keep the original refusal precedence: a scope edit is stale even
+        // when it revoked the policy; with a matching scope, revocation wins.
+        if config.row_version != request.expected_scope_version
+            || (!revoked && version != request.expected_policy_version)
+        {
+            let error = SatelliteManagerPolicyStaleV1 {
+                actual_scope_version: Some(config.row_version),
+                actual_policy_version: Some(version),
+                allowed_launches: Some(
+                    u32::try_from(
+                        previous
+                            .as_ref()
+                            .map_or(0, |p| p.policy.allowed_launches.len()),
+                    )
+                    .unwrap_or(u32::MAX),
+                ),
+                manager_session_id: Some(session.id),
+            }
+            .rpc_error();
+            return Err(DaemonError::StructuredRpc {
+                rpc_code: error.code,
+                message: error.message,
+                data: error.data.unwrap_or_default(),
+            });
+        }
+        if revoked {
+            return Err(denied());
         }
         let mut policy = previous.map(|p| p.policy).unwrap_or_default();
         request.policy.apply(&mut policy);

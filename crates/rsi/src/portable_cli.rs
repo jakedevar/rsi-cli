@@ -26,7 +26,10 @@ usage:
       Land a session's branch through the merge queue (never a manual merge
       and push, which skips every gate). Shows the commit and whether it is
       unmerged, already on rolling or dirty, asks to confirm (--yes skips it),
-      then prints the queue entry. --wait follows the entry to its outcome.";
+      then prints the queue entry. --wait follows the entry to its outcome.
+  rsi report-issue --title TEXT --failure TEXT [--steps TEXT] [--evidence TEXT]
+      File a redacted harness report as a GitHub Issue with this machine's
+      `gh` login; --dry-run shows the redacted report and sends nothing.";
 
 /// One parsed portable subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]

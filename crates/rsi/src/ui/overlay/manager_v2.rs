@@ -654,11 +654,35 @@ fn render_answer_and_message(frame: &mut Frame, area: Rect, state: &board::Board
     );
 }
 
+/// Below this width the checklist drops its inline meaning (the detail line
+/// under the list still shows it for the focused row).
+const POLICY_NARROW: u16 = 100;
+
+/// Rows a line of `chars` characters takes at `width` columns (at least one,
+/// at most `cap`).
+fn wrapped_rows(chars: usize, width: u16, cap: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    u16::try_from(chars.div_ceil(width).max(1))
+        .unwrap_or(cap)
+        .min(cap)
+}
+
 fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
+    // One summary block: mode and preset, usage, spend and models, then the
+    // saved line, and a draft diff line only while the draft differs.
+    let mode = state.mode_summary();
+    let usage = state.usage_summary();
+    let limits = state.limits_summary();
+    let saved = state.saved_line();
+    let draft = state.draft_line();
+    let rows_for = |text: &str| wrapped_rows(text.chars().count(), area.width, 3);
     let parts = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(rows_for(&mode)),
+        Constraint::Length(rows_for(&usage)),
+        Constraint::Length(rows_for(&limits)),
+        Constraint::Length(rows_for(&saved)),
+        Constraint::Length(draft.as_deref().map_or(0, rows_for)),
         Constraint::Length(1),
         Constraint::Min(2),
         Constraint::Length(1),
@@ -680,27 +704,30 @@ fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
         ])),
         parts[0],
     );
+    let mut wrapped = |text: String, style: Style, area: Rect| {
+        frame.render_widget(
+            Paragraph::new(text).style(style).wrap(Wrap { trim: false }),
+            area,
+        );
+    };
+    wrapped(mode, Style::default().bold(), parts[1]);
+    wrapped(usage, Style::default().fg(theme::accent()), parts[2]);
+    wrapped(limits, Style::default(), parts[3]);
+    wrapped(saved, hints(), parts[4]);
+    if let Some(draft) = draft {
+        wrapped(draft, Style::default().fg(theme::yellow()), parts[5]);
+    }
     frame.render_widget(
-        Paragraph::new(state.saved_summary()).style(hints()),
-        parts[1],
-    );
-    frame.render_widget(
-        Paragraph::new(state.draft_summary())
-            .style(hints())
-            .wrap(Wrap { trim: false }),
-        parts[2],
-    );
-    frame.render_widget(
-        Paragraph::new(state.usage_summary()).style(Style::default().fg(theme::accent())),
-        parts[3],
+        Paragraph::new("─".repeat(usize::from(area.width))).style(hints()),
+        parts[6],
     );
     let rows = state.rows();
-    let (items, selected) = policy_items(&rows, state.selected);
+    let (items, selected) = policy_items(&rows, state.selected, area.width);
     frame.render_stateful_widget(
         List::new(items)
             .highlight_style(selection())
             .highlight_symbol("› "),
-        parts[4],
+        parts[7],
         &mut ListState::default().with_selected(selected),
     );
     // One line: the edit buffer while editing, else the selected row's
@@ -714,7 +741,7 @@ fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
             .map(|row| Line::from(policy_row_help(row)).style(hints()))
             .unwrap_or_default()
     };
-    frame.render_widget(Paragraph::new(detail), parts[5]);
+    frame.render_widget(Paragraph::new(detail), parts[8]);
     let message = state.error.as_deref().unwrap_or_else(|| {
         if state.edit.is_some() {
             "Enter apply · Esc cancel · Ctrl-u clear; blank removes optional limits"
@@ -730,79 +757,205 @@ fn render_policy(frame: &mut Frame, area: Rect, state: &policy::PolicyState) {
                 hints()
             })
             .wrap(Wrap { trim: false }),
-        parts[6],
+        parts[9],
     );
     frame.render_widget(
         Paragraph::new(if state.saved.as_ref().is_some_and(|p| p.revoked) {
-            "j/k Tab move · Enter edit · s save + regrant · r discard/reload · * unsaved · Esc close"
+            "j/k Tab move · Enter/Space edit · s save + regrant · r discard/reload · * unsaved · Esc close"
         } else {
             "j/k Tab move · Enter/Space edit · s save · r discard/reload · * unsaved · Esc close"
         })
         .style(hints()),
-        parts[7],
+        parts[10],
     );
     if let Some(picker) = &state.picker {
         render_policy_picker(frame, area, picker);
     }
 }
 
-/// Widest label column; longer labels (launch choices) extend past it.
-const POLICY_LABEL_WIDTH: usize = 30;
+/// Widest label column; longer labels (model ids) extend past it.
+const POLICY_LABEL_WIDTH: usize = 28;
 
-/// Section headers are interleaved at render time only, so `rows()` stays
-/// the selectable list; returns the display index of the selected row.
+/// `text` word-wrapped to lines of at most `max` characters (a longer word
+/// keeps its own line).
+fn wrap_words(text: &str, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = vec![];
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(line) if line.chars().count() + 1 + word.chars().count() <= max => {
+                line.push(' ');
+                line.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// `text` cut to `max` characters with an ellipsis.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Section and provider sub-headers are interleaved at render time only, so
+/// `rows()` stays the selectable list; returns the display index of the
+/// selected row. Labels are left-aligned in one column; a yes/no row is a
+/// `[x]` checklist item with its meaning beside it when the pane is wide.
 fn policy_items(
     rows: &[policy::PolicyRow],
     selected: usize,
+    width: u16,
 ) -> (Vec<ListItem<'static>>, Option<usize>) {
-    let width = rows
+    let label_width = rows
         .iter()
         .map(|r| r.label.chars().count())
         .filter(|n| *n <= POLICY_LABEL_WIDTH)
         .max()
         .unwrap_or(0);
     let selected = selected.min(rows.len().saturating_sub(1));
-    let mut items = Vec::with_capacity(rows.len() + 8);
+    let mut items = Vec::with_capacity(rows.len() + 12);
     let mut shown = None;
     let mut section = None;
+    let mut group: Option<&str> = None;
     for (i, row) in rows.iter().enumerate() {
         if section != Some(row.section) {
             section = Some(row.section);
+            group = None;
             items.push(ListItem::new(Line::from(Span::styled(
                 format!("── {} ──", row.section.title()),
                 Style::default().fg(theme::accent()).bold(),
             ))));
         }
+        if row.group.as_deref() != group {
+            group = row.group.as_deref();
+            if let Some(name) = group {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("  {name}"),
+                    Style::default().fg(theme::overlay_title()).bold(),
+                ))));
+            }
+        }
         if i == selected {
             shown = Some(items.len());
         }
         let read_only = row.kind == policy::RowKind::ReadOnly;
-        let mut spans = vec![
-            Span::styled(
-                if row.modified { "*" } else { " " },
-                Style::default().fg(theme::yellow()).bold(),
-            ),
-            Span::styled(
-                format!("{:>width$}: ", row.label),
-                if read_only { hints() } else { Style::default() },
-            ),
-            Span::styled(
-                row.value.clone(),
-                if read_only {
-                    hints()
-                } else {
-                    Style::default().bold()
-                },
-            ),
-        ];
-        if let Some(saved) = &row.saved {
-            spans.push(Span::styled(format!(" (saved {saved})"), hints()));
-        }
-        if let Some(error) = &row.error {
+        let indent = if row.group.is_some() { "  " } else { "" };
+        let mut spans = vec![Span::styled(
+            if row.modified { "*" } else { " " },
+            Style::default().fg(theme::yellow()).bold(),
+        )];
+        let used = if let Some(on) = row.check {
             spans.push(Span::styled(
-                format!("  ✗ {error}"),
-                Style::default().fg(theme::red()),
+                if on { "[x] " } else { "[ ] " },
+                if on {
+                    Style::default().fg(theme::accent()).bold()
+                } else {
+                    hints()
+                },
             ));
+            4
+        } else {
+            0
+        };
+        // Plain rows are padded past the checkbox so values and meanings
+        // start in one column.
+        let pad = if row.check.is_some() {
+            label_width
+        } else {
+            (label_width + 4).saturating_sub(indent.len())
+        };
+        spans.push(Span::styled(
+            format!("{indent}{:<pad$}  ", row.label),
+            if read_only { hints() } else { Style::default() },
+        ));
+        if row.check.is_some() {
+            let mut used = 2 + used + indent.len() + label_width + 2;
+            if let Some(saved) = &row.saved {
+                let saved = format!("(saved {}) ", if saved == "true" { "on" } else { "off" });
+                used += saved.chars().count();
+                spans.push(Span::styled(saved, Style::default().fg(theme::yellow())));
+            }
+            if let Some(error) = &row.error {
+                // The error outranks the meaning for the room left.
+                used += error.chars().count() + 5;
+            }
+            if width >= POLICY_NARROW {
+                spans.push(Span::styled(
+                    clip(&row.description, usize::from(width).saturating_sub(used)),
+                    hints(),
+                ));
+            }
+            if let Some(error) = &row.error {
+                spans.push(Span::styled(
+                    format!("  ✗ {error}"),
+                    Style::default().fg(theme::red()),
+                ));
+            }
+        } else {
+            let saved = row
+                .saved
+                .as_ref()
+                .map(|saved| format!(" (saved {saved})"))
+                .unwrap_or_default();
+            let error = row
+                .error
+                .as_ref()
+                .map(|error| format!("  ✗ {error}"))
+                .unwrap_or_default();
+            let fits = 1
+                + indent.len()
+                + pad
+                + 2
+                + [&row.value, &saved, &error]
+                    .iter()
+                    .map(|t| t.chars().count())
+                    .sum::<usize>()
+                + 2
+                <= usize::from(width);
+            let value_style = if read_only {
+                hints()
+            } else {
+                Style::default().bold()
+            };
+            if fits {
+                spans.push(Span::styled(row.value.clone(), value_style));
+                spans.push(Span::styled(saved, hints()));
+                spans.push(Span::styled(error, Style::default().fg(theme::red())));
+            } else {
+                // Narrow fallback: the label on its own line, the whole value
+                // wrapped and indented under it.
+                let label = row.label.clone();
+                let mut lines = vec![Line::from(vec![
+                    spans[0].clone(),
+                    Span::styled(
+                        format!("{indent}{label}"),
+                        if read_only { hints() } else { Style::default() },
+                    ),
+                ])];
+                let room = usize::from(width).saturating_sub(indent.len() + 8).max(10);
+                for text in wrap_words(&row.value, room) {
+                    lines.push(Line::from(Span::styled(
+                        format!("     {indent}{text}"),
+                        value_style,
+                    )));
+                }
+                if !saved.is_empty() || !error.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("     {indent}{}", saved.trim_start()), hints()),
+                        Span::styled(error, Style::default().fg(theme::red())),
+                    ]));
+                }
+                items.push(ListItem::new(lines));
+                continue;
+            }
         }
         items.push(ListItem::new(Line::from(spans)));
     }

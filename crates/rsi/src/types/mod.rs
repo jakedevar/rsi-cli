@@ -1575,21 +1575,72 @@ pub struct PromptLaunchSettings {
     /// Appoint the launched session as its project's manager.
     pub manager: Option<ManagerLaunchPlan>,
     /// #2237: the grant editor behind the settings side's second page. Created
-    /// the first time the operator opens the page; `None` means the preset's
-    /// policy is granted as is.
+    /// first time the page has a successful context read. `None` means
+    /// the page is unvisited or waiting for that read.
     pub grant: Option<crate::overlay::grant_editor::GrantEditor>,
     /// The settings side shows the grant page instead of the launch rows.
     pub grant_open: bool,
+    /// The operator stepped the Policy row: the appointment applies that
+    /// preset instead of re-granting the project's saved grant (#3270).
+    pub preset_chosen: bool,
+    /// Read state of the saved policy and ancestor launches. Only a
+    /// successful read may seed the grant editor or permit submission.
+    pub grant_context: GrantContextState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum GrantContextState {
+    #[default]
+    Loading,
+    Loaded(ManagerGrantContext),
+    Failed {
+        reason: String,
+    },
+}
+
+impl GrantContextState {
+    #[must_use]
+    pub fn status_message(&self) -> Option<String> {
+        match self {
+            Self::Loading => Some("Loading saved grant…".into()),
+            Self::Loaded(_) => None,
+            Self::Failed { reason } => Some(format!(
+                "Saved grant unavailable: {reason}. Reopen the grant page to retry."
+            )),
+        }
+    }
+}
+
+/// The grant state of the project a manager is being appointed in (#3270).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagerGrantContext {
+    /// The project's saved manager policy, kept across seats.
+    pub saved: Option<rsi_common::harness_manager_v2::ManagerPolicyV2>,
+    /// The launches the live ancestor grants admit; `None` when no ancestor
+    /// restricts launches.
+    pub ancestor_launches: Option<Vec<rsi_common::harness_manager_v2::ManagerLaunchChoiceV2>>,
 }
 
 impl PromptLaunchSettings {
+    /// Whether launching now re-grants the project's saved grant: one exists,
+    /// the operator neither picked a preset nor edited the grant (#3270).
+    #[must_use]
+    pub fn regrants_saved_grant(&self) -> bool {
+        self.manager.is_some()
+            && self.grant.is_none()
+            && !self.preset_chosen
+            && matches!(&self.grant_context, GrantContextState::Loaded(context) if context.saved.is_some())
+    }
+
     /// The appointment to run once the launch is accepted: the planned scope
-    /// plus the grant the operator edited (`None` = the preset's policy).
+    /// plus the edited grant (`None` re-reads the saved grant unless the
+    /// operator explicitly chose a preset).
     #[must_use]
     pub fn appointment(&self) -> Option<ManagerAppointment> {
         self.manager.map(|plan| ManagerAppointment {
             plan,
             grant: self.grant.as_ref().map(|editor| editor.finish()),
+            preset_chosen: self.preset_chosen,
         })
     }
 }
@@ -1601,6 +1652,10 @@ pub struct ManagerAppointment {
     pub plan: ManagerLaunchPlan,
     /// The policy to grant instead of `plan.policy()`.
     pub grant: Option<rsi_common::harness_manager_v2::ManagerPolicyV2>,
+    /// The operator picked `plan.preset` on purpose; without it (and without
+    /// an edited `grant`) the appointment re-grants the project's saved grant
+    /// when one exists (#3270).
+    pub preset_chosen: bool,
 }
 
 /// Operator choice to appoint a new session as its project's manager once
@@ -2794,6 +2849,8 @@ pub enum OverlayState {
     GlobalManagerWorkspace(
         Box<crate::overlay::global_manager_workspace::GlobalManagerWorkspaceState>,
     ),
+    /// RSI-wide metrics dashboard above every project (`gd`, #3317).
+    GlobalDashboard(Box<crate::overlay::global_dashboard::GlobalDashboardState>),
     /// Theme picker popup for Catppuccin + custom palettes.
     ThemePicker {
         /// Currently highlighted theme index.
@@ -2827,8 +2884,9 @@ pub enum OverlayState {
     /// `harness_searxng_url`): Enter writes it through `UpdateDaemonConfig` and
     /// shows the daemon's refusal in `error`.
     DaemonTextEditor {
-        /// The daemon field being edited (an entry of `DAEMON_TEXT_FIELDS`).
-        field: &'static str,
+        /// The daemon field being edited: an entry of `DAEMON_TEXT_FIELDS`, or
+        /// a numeric row typed as a number (#3468).
+        field: String,
         /// The text being typed; empty selects the default.
         input: String,
         /// Why the daemon refused the last save.
@@ -2898,6 +2956,7 @@ pub enum OverlayState {
     /// Operator legacy-scratch adoption (#1147): list unrecorded scratch the
     /// daemon retains and record chosen ones. Deletes nothing.
     LegacyScratch(Box<LegacyScratchOverlayState>),
+    HostTuning(Box<crate::overlay::host_tuning::State>),
     /// Trash browser — browse, restore, and permanently purge soft-deleted sessions.
     TrashBrowser {
         sessions: Vec<Session>,
@@ -2928,6 +2987,9 @@ pub enum OverlayState {
         color_index: usize,
         /// If editing an existing project, its ID.
         editing_id: Option<uuid::Uuid>,
+        /// The vim textarea behind the focused text field (#3421). View
+        /// state: `name` and `path` stay the source of truth.
+        text: crate::form_text::FormText,
     },
     /// File explorer drawer — left-anchored tree of the current project.
     FileExplorer(Box<crate::overlay::file_explorer::FileExplorerState>),

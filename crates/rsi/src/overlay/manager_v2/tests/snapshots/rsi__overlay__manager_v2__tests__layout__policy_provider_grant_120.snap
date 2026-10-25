@@ -1,0 +1,123 @@
+---
+source: crates/rsi/src/overlay/manager_v2/tests/layout.rs
+expression: "screen_at(&mut app, 120, 120)"
+---
+
+┌ Manager · operator ──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1 Board  2 Decisions  3 Inbox  4 Inspect  [5 Policy]                                                                 │
+│ Coordination desk · governs this PM's own launches only; caps above bind too (gm > b)                                │
+│ Mode Execute · Preset Full project control                                                                           │
+│ Usage: sessions 183/1024 created (lifetime) · 841 left · active 3/4                                                  │
+│ Spend uncapped · Allowed models: 17 (Claude 5 · Codex 5 · Pioneer 2 · OpenRouter 2 · Local 1 · Antigravity 1 ·       │
+│ Harness 1)                                                                                                           │
+│ Saved: Full project control · scope 93 / policy 107 · draft unchanged                                                │
+│ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│   ── Presets · each replaces mode and grants ──                                                                      │
+│ ›  Observe                           Monitor mode · no write grants · watches and reports only                       │
+│    Execute                           Execute mode · 8 of 15 grants · withholds Topology, GitEffect +5 more           │
+│    Full project control              Execute mode · all 15 grants, including Git, Topology, Automation and Deploy    │
+│    Custom                            Keep the draft exactly as edited · opens the raw launch rows                    │
+│   ── Budgets and limits ──                                                                                           │
+│    Created session quota             1024                                                                            │
+│    Created session window (hours)    24                                                                              │
+│    Created container quota           64                                                                              │
+│    Active session limit              4                                                                               │
+│    Tier-2 minimum reviewer           Standard                                                                        │
+│    Spend cap (USD)                   uncapped                                                                        │
+│    Provider limits                   none set · Enter to set one                                                     │
+│   ── Allowed models ──                                                                                               │
+│    Allowed models                    Restricted to 17 exact choices · Enter adds · x removes the focused one         │
+│     Claude · 5                                                                                                       │
+│      claude-opus-5                   xhigh                                                                           │
+│      claude-sonnet-5-5               high                                                                            │
+│      claude-haiku-5                  any effort                                                                      │
+│      claude-opus-5                   high                                                                            │
+│      claude-sonnet-5-5               medium                                                                          │
+│     Codex · 5                                                                                                        │
+│      gpt-6-astra                     high                                                                            │
+│      gpt-6-astra                     low                                                                             │
+│      gpt-6-astra                     xhigh                                                                           │
+│      gpt-6-mini                      high                                                                            │
+│      gpt-6-mini                      low                                                                             │
+│     Pioneer · 2                                                                                                      │
+│      pioneer-large                   high                                                                            │
+│      pioneer-small                   any effort                                                                      │
+│     OpenRouter · 2                                                                                                   │
+│      vendor/model-a                  any effort                                                                      │
+│      vendor/model-b                  high                                                                            │
+│     Local · 1                                                                                                        │
+│      local-coder                     any effort                                                                      │
+│     Antigravity · 1                                                                                                  │
+│      ag-pro                          any effort                                                                      │
+│     Harness · 1                                                                                                      │
+│      harness-direct                  high                                                                            │
+│    Launch allowlist entries          Enter expand raw provider/model/effort rows                                     │
+│   ── Provider grants · operator spend ──                                                                             │
+│    Provider grants                   OpenRouter $100 (high, medium) · Enter to show every provider                   │
+│    OpenRouter grant budget (USD)     100                                                                             │
+│    OpenRouter spend                  OpenRouter: $12.40 of $100 used, expires 2026-12-01                             │
+│    OpenRouter grant efforts          high, medium                                                                    │
+│    OpenRouter grant expiry           2026-12-01                                                                      │
+│    [x] OpenRouter bench jobs         Also turns the daemon setting bench.enabled on at save                          │
+│    bench.enabled (daemon setting)    off · a grant with bench ticked turns it on at save                             │
+│   ── Mode and grants ──                                                                                              │
+│    Operating mode                    Execute                                                                         │
+│    [ ] Operator pause                Stop every manager action until the operator clears the pause                   │
+│    [x] WorkPlan                      Record work, stages, evidence and request DB-native reviews                     │
+│    [x] LeadControl                   Resume, pause, retry and replace Epic leads                                     │
+│    [x] Topology                      Create and manage Groups and Epics under granted parents                        │
+│    [x] SessionCreate                 Create worker sessions (consumes the session quota)                             │
+│    [x] LeadAssign                    Assign or unassign an Epic's lead                                               │
+│    [x] Integration                   Record independently checked integration evidence                               │
+│    [x] SelfSuccession                Reserve its own successor with a committed handoff                              │
+│    [x] GitEffect                     Advance integration target refs through the merge engine                        │
+│    [x] SessionControl                Halt, continue and message scoped leads and descendants                         │
+│    [x] IssueCoordinate               Read project Issues through the guarded controls                                │
+│    [x] Operator delegation           Call allowlisted operator methods (logical archive, restore, session list) in t │
+│    [x] Automation                    Author, run, interrupt and resolve topologies on scoped Epics                   │
+│    [x] Storage control               Read sandbox storage status and run the build-cache reclaim under the configure │
+│    [x] Daemon settings               Change the allowlisted daemon settings inside the bounds set under Daemon setti │
+│    [x] Deploy                        Ask the daemon to stage built binaries and restart itself at a quiet point (Age │
+│   ── Scope ──                                                                                                        │
+│    Pause scoped Epic by ID           Enter UUID                                                                      │
+│    Grant Group by ID                 Enter UUID                                                                      │
+│    [x] Allow root Group creation     Create new root Groups; requires Grant Topology                                 │
+│   ── Recovery ──                                                                                                     │
+│    Recovery attempt limit            3                                                                               │
+│    Retry delay (seconds)             60                                                                              │
+│    Request timeout (seconds)         900                                                                             │
+│   ── Daemon settings · manager bounds ──                                                                             │
+│    Manager may set Maximum sandbox roots  not adjustable                                                             │
+│    Manager may set Minimum free space (GiB)  not adjustable                                                          │
+│    Manager may set Cache pressure high  not adjustable                                                               │
+│    Manager may set Cache pressure low  not adjustable                                                                │
+│    Manager may set Worker context cap (0 off, 1-100 = % of window)  not adjustable                                   │
+│    Manager may set Deploy restarts per hour  not adjustable                                                          │
+│    Manager may set Host load admission threshold  default 8-64                                                       │
+│    Manager may set Rolling queue batch size  default 1-8                                                             │
+│    Manager may set Build slots       default 1-4                                                                     │
+│    Manager may set Lander slots      default 1-5                                                                     │
+│    Manager may set Governor min free disk (GiB)  default 30-100                                                      │
+│    Manager may set Merge queue full-QA interval (min)  default 30-240                                                │
+│    Manager may set Merge queue gate timeout (min)  default 45-180                                                    │
+│    Manager may set Hub build CPU budget (%)  default 10-50                                                           │
+│   ── Effective preview · read-only ──                                                                                │
+│    Effective preview                 Enter expand                                                                    │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│ Enter runs · Replace mode and grants with this preset; explicit limits are kept                                      │
+│ Explicit operator grant · Enter/Space edit · s save                                                                  │
+│                                                                                                                      │
+│ j/k Tab move · Enter/Space edit · s save · r discard/reload · * unsaved · Esc close                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘

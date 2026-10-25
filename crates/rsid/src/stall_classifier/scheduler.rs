@@ -28,7 +28,7 @@ use rsi_common::types::SessionProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use super::input::build_classification_input;
@@ -161,7 +161,7 @@ pub(crate) async fn update_tracked_after_classification(
 pub(crate) async fn classify_once<C: ClassifierCompleter + ?Sized>(
     session_id: Uuid,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     llm: &C,
     config: &ClassifierConfig,
@@ -331,7 +331,7 @@ fn refresh_classifier_from_runtime(
 /// `main.rs` so the task is dropped (and the loop exits) when the daemon
 /// shuts down.
 pub fn spawn_classifier(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: Arc<EventBus>,
     llm: StallClassifierLlmClient,
@@ -620,7 +620,7 @@ mod tests {
 
     async fn seed_active_session(
         active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     ) -> Uuid {
         let id = Uuid::new_v4();
         let session = rsi_common::types::Session {
@@ -733,10 +733,10 @@ mod tests {
         }
     }
 
-    fn fresh_store() -> (TempDir, Arc<Mutex<Store>>) {
+    fn fresh_store() -> (TempDir, Arc<rsid_core::store_lock::Mutex<Store>>) {
         let dir = TempDir::new().expect("tempdir");
         let store = Store::open_test_fixture(&dir.path().join("classifier_test.db")).expect("open");
-        (dir, Arc::new(Mutex::new(store)))
+        (dir, Arc::new(rsid_core::store_lock::Mutex::new(store)))
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

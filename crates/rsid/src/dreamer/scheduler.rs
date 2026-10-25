@@ -216,7 +216,7 @@ enum PhaseCallOutcome {
 }
 
 pub fn spawn_dreamer(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     llm: DreamerLlmClient,
     config: DreamConfig,
@@ -235,7 +235,7 @@ pub fn spawn_dreamer(
 }
 
 pub fn spawn_dreamer_with_model_control_runtime(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     llm: DreamerLlmClient,
     config: DreamConfig,
@@ -257,7 +257,7 @@ pub fn spawn_dreamer_with_model_control_runtime(
 
 #[cfg(test)]
 fn spawn_dreamer_with_clock(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     llm: DreamerLlmClient,
     config: DreamConfig,
@@ -278,7 +278,7 @@ fn spawn_dreamer_with_clock(
 }
 
 fn spawn_dreamer_with_clock_and_runtime(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     llm: DreamerLlmClient,
     config: DreamConfig,
@@ -565,7 +565,7 @@ struct DreamControlState {
 
 async fn refresh_llm_from_runtime(
     llm: &mut DreamerLlmClient,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     runtime_config: &Arc<RuntimeConfig>,
 ) {
     let current_model = runtime_config.dream_model.read().clone();
@@ -590,7 +590,7 @@ async fn refresh_llm_from_runtime(
 }
 
 async fn compute_control_state(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active_sessions: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     runtime_config: &Arc<RuntimeConfig>,
     llm: &DreamerLlmClient,
@@ -733,7 +733,7 @@ fn is_control_nudge_event(event: Option<&DaemonEvent>) -> bool {
 }
 
 async fn drive_once(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     clock: &DreamClock,
     llm: &DreamerLlmClient,
@@ -863,6 +863,17 @@ async fn drive_once(
             return Ok(DriveResult::NoProgress);
         }
 
+        // Observations extracted from a benchmark (`is_eval`) session, and
+        // everything the dreamer derived from them, are soft-deleted before
+        // any dreamer input is read (#3325). The list queries also exclude
+        // them, so this only keeps the table honest.
+        {
+            let guard = store.lock().await;
+            let pruned = guard.prune_eval_observations()?;
+            if pruned > 0 {
+                tracing::info!(pruned, "dreamer: pruned eval-linked observations");
+            }
+        }
         let pending_sessions = {
             let guard = store.lock().await;
             guard.sessions_needing_extraction(config.batch_size)?
@@ -938,7 +949,7 @@ enum PreparedPhaseCall {
 }
 
 async fn prepare_current_phase_call(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     clock: &DreamClock,
     llm: &DreamerLlmClient,
     state: &mut DreamRuntimeState,
@@ -959,9 +970,14 @@ async fn prepare_current_phase_call(
                     .ok_or_else(|| DaemonError::Store("missing extraction session".to_string()))?;
                 let (events, query) = {
                     let guard = store.lock().await;
+                    // A checkpoint persisted before a session was marked
+                    // `is_eval` can still name it: never read its transcript.
+                    let session = guard.get_session(session_id)?;
+                    if session.as_ref().is_some_and(|session| session.is_eval) {
+                        return Ok(PreparedPhaseCall::Skip);
+                    }
                     let events = guard.load_events(session_id)?;
-                    let query = guard
-                        .get_session(session_id)?
+                    let query = session
                         .as_ref()
                         .map(|session| session.query.clone())
                         .unwrap_or_default();
@@ -1202,7 +1218,7 @@ fn enforce_wall_time_cap(run: &DreamRunState, clock: &DreamClock) -> Result<()> 
 }
 
 async fn settle_checkpointed_response(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     state: &mut DreamRuntimeState,
     event_bus: &Arc<EventBus>,
 ) -> Result<()> {
@@ -1228,7 +1244,7 @@ async fn settle_checkpointed_response(
 }
 
 async fn reconcile_uncheckpointed_invocation(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     clock: &DreamClock,
     state: &mut DreamRuntimeState,
     event_bus: &Arc<EventBus>,
@@ -1270,7 +1286,7 @@ async fn reconcile_uncheckpointed_invocation(
 }
 
 async fn finalize_phase_call(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     _event_bus: &Arc<EventBus>,
     clock: &DreamClock,
     state: &mut DreamRuntimeState,
@@ -1380,7 +1396,7 @@ fn record_attempt_consumption(
 }
 
 async fn apply_current_response(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     clock: &DreamClock,
     state: &mut DreamRuntimeState,
     raw_response: String,
@@ -1467,7 +1483,7 @@ async fn apply_current_response(
 }
 
 async fn advance_phase_if_needed(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     clock: &DreamClock,
     run: &mut DreamRunState,
 ) -> Result<bool> {
@@ -1577,7 +1593,7 @@ fn advance_current_phase_index(state: &mut DreamRuntimeState, clock: &DreamClock
 }
 
 async fn persist_state(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     state: &DreamRuntimeState,
     status: &Arc<RwLock<DreamStatusSnapshot>>,
     runtime_config: &Arc<RuntimeConfig>,
@@ -1594,7 +1610,7 @@ async fn persist_state(
 }
 
 async fn persist_state_no_reason(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     state: &DreamRuntimeState,
     clock: &DreamClock,
 ) -> Result<()> {
@@ -1603,14 +1619,16 @@ async fn persist_state_no_reason(
 }
 
 async fn load_observations_for_level(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     level: ObservationLevel,
 ) -> Result<Vec<Observation>> {
     let guard = store.lock().await;
     guard.list_observations_by_level(level, 500)
 }
 
-async fn load_all_observations(store: &Arc<Mutex<Store>>) -> Result<Vec<Observation>> {
+async fn load_all_observations(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+) -> Result<Vec<Observation>> {
     let guard = store.lock().await;
     let mut all = guard.list_observations_by_level(ObservationLevel::Explicit, 500)?;
     all.extend(guard.list_observations_by_level(ObservationLevel::Deductive, 500)?);
@@ -1619,7 +1637,7 @@ async fn load_all_observations(store: &Arc<Mutex<Store>>) -> Result<Vec<Observat
 }
 
 async fn load_explicit_project_observations(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Option<Uuid>,
 ) -> Result<Vec<Observation>> {
     let observations = load_observations_for_level(store, ObservationLevel::Explicit).await?;
@@ -1630,7 +1648,7 @@ async fn load_explicit_project_observations(
 }
 
 async fn load_all_project_observations(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Option<Uuid>,
 ) -> Result<Vec<Observation>> {
     let observations = load_all_observations(store).await?;
@@ -1641,7 +1659,7 @@ async fn load_all_project_observations(
 }
 
 async fn apply_deduction_result(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Option<Uuid>,
     result: &DeductionResult,
 ) -> Result<()> {
@@ -1670,7 +1688,10 @@ async fn apply_deduction_result(
     Ok(())
 }
 
-async fn apply_induction_result(store: &Arc<Mutex<Store>>, result: &InductionResult) -> Result<()> {
+async fn apply_induction_result(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    result: &InductionResult,
+) -> Result<()> {
     let guard = store.lock().await;
     for observation in &result.patterns {
         guard.insert_observation(&deterministic_inductive_observation(observation.clone()))?;
@@ -1923,11 +1944,16 @@ mod tests {
         runtime
     }
 
-    fn store() -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open_in_memory().expect("store")))
+    fn store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
+        Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ))
     }
 
-    fn local_llm(store: &Arc<Mutex<Store>>, backend: Arc<FakeDreamBackend>) -> DreamerLlmClient {
+    fn local_llm(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        backend: Arc<FakeDreamBackend>,
+    ) -> DreamerLlmClient {
         DreamerLlmClient::new_with_backend(
             Arc::clone(store),
             Arc::new(EventBus::new(8)),
@@ -1939,7 +1965,10 @@ mod tests {
         )
     }
 
-    fn paid_llm(store: &Arc<Mutex<Store>>, backend: Arc<FakeDreamBackend>) -> DreamerLlmClient {
+    fn paid_llm(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        backend: Arc<FakeDreamBackend>,
+    ) -> DreamerLlmClient {
         DreamerLlmClient::new_with_backend(
             Arc::clone(store),
             Arc::new(EventBus::new(8)),
@@ -2045,7 +2074,10 @@ mod tests {
         TrackedSession::new_for_test(test_session(SessionStatus::Running, updated_at))
     }
 
-    async fn insert_explicit_observation(store: &Arc<Mutex<Store>>, content: &str) {
+    async fn insert_explicit_observation(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        content: &str,
+    ) {
         let observation = Observation {
             id: Uuid::new_v4(),
             session_id: Uuid::nil(),
@@ -2087,7 +2119,7 @@ mod tests {
         panic!("condition not met before deterministic drive budget expired");
     }
 
-    async fn set_model_control_mode(store: &Arc<Mutex<Store>>, mode: &str) {
+    async fn set_model_control_mode(store: &Arc<rsid_core::store_lock::Mutex<Store>>, mode: &str) {
         let guard = store.lock().await;
         guard
             .set_daemon_setting("model_control_mode", mode)
@@ -2095,7 +2127,7 @@ mod tests {
     }
 
     async fn admit_dream_invocation(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         dedup_key: &str,
         request_fingerprint: &str,
         provider: &str,
@@ -3021,5 +3053,93 @@ mod tests {
         assert!(handle.cancel_invocation(invocation_id).await);
         drive_scheduler(&handle, &control, 1).await;
         assert!(!handle.cancel_invocation(invocation_id).await);
+    }
+    /// #3325: observations from an `is_eval` session, and the deductions and
+    /// inductions derived from them, never reach a dreamer input builder.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn dreamer_inputs_exclude_eval_linked_observations_3325() {
+        const SECRET: &str = "held-out-task-secret-3325";
+        let store = store();
+        let project = Some(Uuid::new_v4());
+        let (eval_session, normal_session) = {
+            let guard = store.lock().await;
+            let mut eval = test_session(SessionStatus::Completed, Utc::now());
+            eval.is_eval = true;
+            let normal = test_session(SessionStatus::Completed, Utc::now());
+            guard.insert_session(&eval).unwrap();
+            guard.insert_session(&normal).unwrap();
+            (eval.id, normal.id)
+        };
+        let make = |session_id: Uuid, level: ObservationLevel, source_ids: Vec<Uuid>| Observation {
+            id: Uuid::new_v4(),
+            session_id,
+            project_id: project,
+            level,
+            content: SECRET.to_string(),
+            source_ids,
+            confidence: None,
+            times_derived: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let eval_explicit = make(eval_session, ObservationLevel::Explicit, vec![]);
+        let eval_deductive = make(
+            Uuid::nil(),
+            ObservationLevel::Deductive,
+            vec![eval_explicit.id],
+        );
+        let eval_inductive = make(
+            Uuid::nil(),
+            ObservationLevel::Inductive,
+            vec![eval_deductive.id],
+        );
+        let normal_explicit = make(normal_session, ObservationLevel::Explicit, vec![]);
+        {
+            let guard = store.lock().await;
+            for o in [
+                &eval_explicit,
+                &eval_deductive,
+                &eval_inductive,
+                &normal_explicit,
+            ] {
+                guard.insert_observation(o).unwrap();
+            }
+        }
+
+        for level in [
+            ObservationLevel::Explicit,
+            ObservationLevel::Deductive,
+            ObservationLevel::Inductive,
+        ] {
+            let loaded = load_observations_for_level(&store, level).await.unwrap();
+            assert!(loaded.iter().all(|o| o.id != eval_explicit.id
+                && o.id != eval_deductive.id
+                && o.id != eval_inductive.id));
+        }
+        let all = load_all_observations(&store).await.unwrap();
+        assert_eq!(
+            all.iter().map(|o| o.id).collect::<Vec<_>>(),
+            vec![normal_explicit.id]
+        );
+        let explicit = load_explicit_project_observations(&store, project)
+            .await
+            .unwrap();
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].id, normal_explicit.id);
+        let all_project = load_all_project_observations(&store, project)
+            .await
+            .unwrap();
+        assert_eq!(all_project.len(), 1);
+        assert_eq!(
+            all_project[0].content, SECRET,
+            "normal content is still fed"
+        );
+        assert_eq!(all_project[0].id, normal_explicit.id);
+
+        // The sweep soft-deletes the eval-linked chain, nothing else.
+        let guard = store.lock().await;
+        assert_eq!(guard.prune_eval_observations().unwrap(), 3);
+        assert_eq!(guard.count_all_observations().unwrap(), 1);
     }
 }

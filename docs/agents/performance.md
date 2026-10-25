@@ -1,5 +1,8 @@
 # Live daemon CPU debugging
 
+For watchdog searches, use `journalctl --user -u rsid.service --since today -g 'rsid::watchdog'`
+to select daemon instrumentation and keep worker scope lifecycle messages out of the results.
+
 Use `python3 -I scripts/rsid-sample-stacks --pid <rsid-pid> --seconds 5`
 for a bounded, read-only local CPU investigation. Supply the known daemon process
 leader PID; the script requires the same real/effective/saved/filesystem UID and

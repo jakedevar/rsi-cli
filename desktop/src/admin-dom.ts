@@ -105,4 +105,12 @@ export const ADMIN_CSS = `
 .admin-phrase { font-family: var(--mono, monospace); user-select: all; background: var(--surface0); padding: 6px 8px; border-radius: 4px; overflow-wrap: anywhere; }
 .admin-grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; }
 .admin-grid .k { color: var(--subtext); }
+.admin-receipt h3 { margin: 10px 0 4px; font-size: 13px; }
+.admin-item { border-left: 3px solid var(--surface2, var(--subtext)); padding: 3px 8px; margin: 4px 0; font-size: 13px; overflow-wrap: anywhere; }
+.admin-item.ok { border-left-color: var(--green, var(--text)); }
+.admin-item.warn { border-left-color: var(--yellow, var(--text)); }
+.admin-item.bad { border-left-color: var(--red, var(--text)); }
+.admin-item-title { font-family: var(--mono, monospace); font-size: 12px; user-select: text; }
+.admin-detail { color: var(--subtext); font-size: 12px; font-family: var(--mono, monospace); user-select: text; }
+.admin-warn { font-family: var(--mono, monospace); font-size: 12px; color: var(--yellow, var(--text)); overflow-wrap: anywhere; user-select: text; }
 `;

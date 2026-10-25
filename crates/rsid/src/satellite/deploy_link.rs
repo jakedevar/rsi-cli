@@ -35,6 +35,33 @@ const DEPLOY_RPC_DEADLINE: Duration = Duration::from_secs(90);
 #[cfg(test)]
 const DEPLOY_RPC_DEADLINE: Duration = Duration::from_secs(10);
 
+/// #3291: a reseat launches a whole session on the satellite before it
+/// replies, which took longer than `RPC_DEADLINE` (3 s) on every real reseat
+/// while the satellite still completed it.
+#[cfg(not(test))]
+const RESEAT_RPC_DEADLINE: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const RESEAT_RPC_DEADLINE: Duration = Duration::from_secs(10);
+
+/// #3291: the stable reason appended to `satellite_reseat_uncertain`: the
+/// request reached the satellite but no usable reply came back.
+fn reseat_uncertain_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        "reply_timed_out"
+    } else {
+        "reply_lost"
+    }
+}
+
+/// #3291: a failure AFTER the request was written may have been a success on
+/// the satellite, so it is never reported as unreachable.
+fn reseat_uncertain(reason: &str) -> DaemonError {
+    DaemonError::PolicyDenied(format!(
+        "{} reason={reason}",
+        rsi_common::manager_reseat::SATELLITE_RESEAT_UNCERTAIN
+    ))
+}
+
 /// Stable codes a satellite refusal may carry through to the manager; anything
 /// else collapses to `satellite_deploy_refused` so remote text never leaks.
 const PASS_THROUGH: &[&str] = &[
@@ -66,6 +93,21 @@ fn classify_refusal(message: &str) -> &'static str {
     // for example "Policy denied: deploy_in_progress"). Match the code after the
     // last ": " exactly, so a longer remote string that merely contains a listed
     // code collapses to the generic refusal.
+    // #3423: the directory refusal carries detail after its code (the received
+    // path and the allowed roots), so it is read from the front.
+    // Hub #3884: the stage and missing-member refusals carry the member and the
+    // failed step after their code, so they are read from the front too.
+    let after_kind = message.split_once(": ").map_or(message, |(_, rest)| rest);
+    for detailed_code in [
+        DEPLOY_DIR_NOT_ALLOWED,
+        DEPLOY_STAGE_FAILED,
+        "deploy_binary_missing",
+    ] {
+        let detailed = format!("{detailed_code}: ");
+        if message.starts_with(&detailed) || after_kind.starts_with(&detailed) {
+            return detailed_code;
+        }
+    }
     let code = message
         .rsplit_once(": ")
         .map_or(message, |(_, code)| code)
@@ -187,6 +229,18 @@ pub(crate) async fn push_manager_policy(
         .await
         .map_err(|_| DaemonError::PolicyDenied(POLICY_UNREACHABLE.into()))?;
         if let Some(error) = response.error {
+            if let Some(data) = error.data.as_ref()
+                && data.get("code").and_then(serde_json::Value::as_str) == Some(POLICY_STALE)
+                && let Ok(detail) =
+                    serde_json::from_value::<SatelliteManagerPolicyStaleV1>(data.clone())
+            {
+                let safe = detail.rpc_error();
+                return Err(DaemonError::StructuredRpc {
+                    rpc_code: safe.code,
+                    message: safe.message,
+                    data: safe.data.unwrap_or_default(),
+                });
+            }
             let code = error
                 .message
                 .rsplit_once(": ")
@@ -216,6 +270,10 @@ pub(crate) async fn push_manager_policy(
 /// #2750: a manager reseat uses the same custody and paired-identity
 /// handshake as a policy push. Only the stable refusal codes the satellite
 /// can raise pass through; anything else is `satellite_reseat_refused`.
+/// `satellite_reseat_unreachable` means the request never reached the
+/// satellite; once it was sent, a lost or late reply is
+/// `satellite_reseat_uncertain` (#3291), because the satellite may have
+/// completed the reseat.
 pub(crate) async fn reseat_manager(
     root: &Path,
     peer: &RegistryPeer,
@@ -231,10 +289,10 @@ pub(crate) async fn reseat_manager(
             REQUEST_HUB_MANAGER_RESEAT_METHOD,
             serde_json::to_value(wire)?,
             MAX_RPC_ENVELOPE_BYTES,
-            RPC_DEADLINE,
+            RESEAT_RPC_DEADLINE,
         )
         .await
-        .map_err(|_| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()))?;
+        .map_err(|error| reseat_uncertain(reseat_uncertain_reason(&error)))?;
         if let Some(error) = response.error {
             let code = error
                 .message
@@ -259,9 +317,9 @@ pub(crate) async fn reseat_manager(
         return serde_json::from_value(
             response
                 .result
-                .ok_or_else(|| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()))?,
+                .ok_or_else(|| reseat_uncertain("reply_empty"))?,
         )
-        .map_err(|_| DaemonError::PolicyDenied(SATELLITE_RESEAT_UNREACHABLE.into()));
+        .map_err(|_| reseat_uncertain("reply_malformed"));
     }
     Err(DaemonError::PolicyDenied(
         SATELLITE_RESEAT_UNREACHABLE.into(),
@@ -291,6 +349,9 @@ pub(crate) async fn read_peer_daemon_info(
 ) -> SatelliteDaemonInfoV1 {
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true);
     let unreachable = |error: &str| SatelliteDaemonInfoV1 {
+        sessions_running: None,
+        workers_parked: None,
+        open_jobs: None,
         diagnostics: crate::store_support::satellite::reachability(peer.id),
         latest_watchdog_trip: crate::store_support::satellite::latest_watchdog_trip(peer.id),
         platform: None,
@@ -306,6 +367,8 @@ pub(crate) async fn read_peer_daemon_info(
         supervisor_mode: None,
         last_deploy: None,
         launches: None,
+        manager_policies: None,
+        usage: Vec::new(),
         error: Some(error.to_owned()),
     };
     for link in links(peer) {
@@ -316,8 +379,13 @@ pub(crate) async fn read_peer_daemon_info(
             return unreachable("satellite_reports_no_health");
         };
         return SatelliteDaemonInfoV1 {
+            sessions_running: Some(health.sessions_running),
+            workers_parked: health.workers_parked,
+            open_jobs: health.open_jobs,
             diagnostics: crate::store_support::satellite::reachability(peer.id),
             latest_watchdog_trip: health.latest_watchdog_trip,
+            manager_policies: health.manager_policies,
+            usage: health.usage,
             platform: health.platform,
             peer_id: SatelliteUuidV1(peer.id),
             label: peer.label.clone(),
@@ -342,6 +410,23 @@ pub(crate) async fn read_peer_daemon_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3291: a reply timeout after the request was sent names the timeout and
+    /// is never the "never reached" code.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn reseat_reply_failures_are_uncertain_and_name_the_timeout() {
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out");
+        let lost = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(reseat_uncertain_reason(&timed_out), "reply_timed_out");
+        assert_eq!(reseat_uncertain_reason(&lost), "reply_lost");
+        let text = reseat_uncertain("reply_timed_out").to_string();
+        assert!(
+            text.contains("satellite_reseat_uncertain reason=reply_timed_out"),
+            "{text}"
+        );
+        assert!(!text.contains("unreachable"), "{text}");
+    }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
@@ -385,8 +470,12 @@ mod tests {
         identity.health = Some(
             serde_json::from_value(serde_json::json!({
                 "daemon_version":"1.0.0", "uptime_seconds":1,
-                "sessions_running":0, "sessions_waiting_approval":0,
+                "sessions_running":1, "sessions_waiting_approval":0,
+                "workers_parked":2, "open_jobs":2,
                 "store_probe_elapsed_ms":17,
+                "usage":[{"provider":"Claude","window":"1h","invocations":9,
+                          "input_tokens":1,"output_tokens":2,"cache_creation_tokens":3,
+                          "cache_read_tokens":6300000,"reasoning_tokens":0}],
                 "latest_watchdog_trip": {
                     "restart_id":restart_id,
                     "observed_at":"2026-10-19T04:17:24.000000000Z",
@@ -418,6 +507,24 @@ mod tests {
         });
         let healthy = read_peer_daemon_info(&root, &peer).await;
         assert!(healthy.reachable);
+        assert_eq!(
+            (
+                healthy.sessions_running,
+                healthy.workers_parked,
+                healthy.open_jobs
+            ),
+            (Some(1), Some(2), Some(2))
+        );
+        // #4008: the satellite's per-provider usage reaches the hub's row.
+        assert_eq!(healthy.usage.len(), 1);
+        assert_eq!(
+            (
+                healthy.usage[0].provider.as_str(),
+                healthy.usage[0].invocations
+            ),
+            ("Claude", 9)
+        );
+        assert_eq!(healthy.usage[0].cache_read_tokens, 6_300_000);
         let diagnostics = healthy.diagnostics.unwrap();
         assert_eq!(diagnostics.connect.state, State::Succeeded);
         assert_eq!(diagnostics.daemon_rpc.state, State::Succeeded);
@@ -428,6 +535,14 @@ mod tests {
 
         let delayed = read_peer_daemon_info(&root, &peer).await;
         assert!(!delayed.reachable);
+        assert_eq!(
+            (
+                delayed.sessions_running,
+                delayed.workers_parked,
+                delayed.open_jobs
+            ),
+            (None, None, None)
+        );
         let diagnostics = delayed.diagnostics.unwrap();
         assert_eq!(diagnostics.connect.state, State::Succeeded);
         assert_eq!(diagnostics.transport.state, State::Succeeded);
@@ -448,6 +563,9 @@ mod tests {
         std::fs::remove_file(&socket).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // A live older satellite has unknown additive counts, rather than zero.
+        identity.health.as_mut().unwrap().workers_parked = None;
+        identity.health.as_mut().unwrap().open_jobs = None;
         let recovered = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut rpc = BufReader::new(stream);
@@ -466,6 +584,14 @@ mod tests {
         recovered.await.unwrap();
         assert!(recovered_info.reachable);
         assert_eq!(
+            (
+                recovered_info.sessions_running,
+                recovered_info.workers_parked,
+                recovered_info.open_jobs
+            ),
+            (Some(1), None, None)
+        );
+        assert_eq!(
             recovered_info.diagnostics.unwrap().daemon_rpc.state,
             State::Succeeded
         );
@@ -477,6 +603,10 @@ mod tests {
     fn refusal_codes_pass_through_only_as_the_exact_code_after_the_error_prefix() {
         let prefixed = format!("Policy denied: {DEPLOY_IN_PROGRESS}");
         assert_eq!(classify_refusal(&prefixed), DEPLOY_IN_PROGRESS);
+        let detailed = format!(
+            "Invalid parameter: {DEPLOY_STAGE_FAILED}: member target-pool: syntax check failed: x: y"
+        );
+        assert_eq!(classify_refusal(&detailed), DEPLOY_STAGE_FAILED);
         assert_eq!(classify_refusal(DEPLOY_SHA_MISMATCH), DEPLOY_SHA_MISMATCH);
         assert_eq!(
             classify_refusal("Invalid parameter: deploy_not_found"),
@@ -488,6 +618,13 @@ mod tests {
                 "Policy denied: deploy_restart_budget retry_after=2026-10-08T10:12:00Z"
             ),
             DEPLOY_RESTART_BUDGET
+        );
+        // #3423: the directory refusal names the path and roots after its code.
+        assert_eq!(
+            classify_refusal(
+                "Invalid parameter: deploy_directory_not_allowed: /x/target/release is outside every allowed root; allowed roots: /a, /b"
+            ),
+            DEPLOY_DIR_NOT_ALLOWED
         );
         let embedded = format!("Policy denied: remote said {DEPLOY_IN_PROGRESS} and more");
         assert_eq!(classify_refusal(&embedded), "satellite_deploy_refused");

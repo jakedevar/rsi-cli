@@ -11,16 +11,35 @@ enum RemoteError: Error, Equatable, Sendable {
     case unreachable(String)
     /// Still 401 after signing in again.
     case unauthorized
-    /// 403: this device is not on the gateway's allowlist (or Remote is off).
+    /// 403, still after one retry: this device is not on the gateway's
+    /// allowlist (or Remote is off). A single bare 403 can also be the
+    /// gateway's identity check refusing while tailscaled is busy (#350).
     case forbidden
-    /// 502: the gateway could not reach rsid.
+    /// 502: the gateway could not reach rsid (it is down, mostly a deploy restart).
     case daemonUnavailable
-    /// 503: the host is busy; polling retries it.
+    /// 503: rsid (or the gateway's read pool) is busy.
     case busy
     /// Any other HTTP failure, with the gateway's error code when it sent one.
     case server(status: Int, code: String)
     /// A body this app could not read.
     case invalidResponse(String)
+    /// The read was given up because its screen went away (a tab switch, a
+    /// navigation, a new pull): not a failure, never shown.
+    case cancelled
+
+    /// A few words naming the kind of failure, for status lines.
+    var headline: String {
+        switch self {
+        case .notConfigured, .invalidHost: "No RSI host set"
+        case .unreachable: "Can't reach the hub"
+        case .unauthorized: "Sign-in failed"
+        case .forbidden: "Refused by the hub"
+        case .daemonUnavailable: "Hub restarting"
+        case .busy: "Hub busy"
+        case .server, .invalidResponse: "Hub error"
+        case .cancelled: "Cancelled"
+        }
+    }
 
     var message: String {
         switch self {
@@ -28,28 +47,83 @@ enum RemoteError: Error, Equatable, Sendable {
             "Set the RSI host in Settings."
         case .invalidHost:
             "Enter the host name only, for example hub.your-tailnet.ts.net."
+        case .unreachable(let detail) where detail == "timed out":
+            "The RSI host did not answer within 15 s (timed out). The network (Tailscale) or the hub is slow."
         case .unreachable(let detail):
-            "Can't reach the RSI host. Check that Tailscale is on and connected. (\(detail))"
+            "Can't reach the RSI host over the network (\(detail)). Check that Tailscale is on and connected."
         case .unauthorized:
             "The gateway would not sign this app in. Pull to retry."
         case .forbidden:
-            "This device is not allowed. Check Remote settings on the hub."
+            "The hub refused this device (403). Check that this phone is allowed in the hub's Remote settings."
         case .daemonUnavailable:
-            "The RSI daemon is unavailable. Check that rsid is running on the hub."
+            "The hub's daemon (rsid) is not answering; it is most likely restarting after a deploy."
         case .busy:
-            "The RSI host is busy; retrying…"
+            "The hub's daemon is busy and could not answer in time."
         case .server(let status, let code):
             code.isEmpty
                 ? "The RSI host returned \(status)."
                 : "The RSI host returned \(status) (\(code))."
         case .invalidResponse(let what):
             "The RSI host sent a reply this app could not read (\(what))."
+        case .cancelled:
+            "Cancelled."
         }
     }
 
     /// Network-level, as opposed to an answer from the server.
     var isUnreachable: Bool {
         if case .unreachable = self { true } else { false }
+    }
+
+    /// Whether, and how often, a GET that ended in this error is tried again.
+    var readRetry: RetryClass {
+        switch self {
+        case .busy, .daemonUnavailable: .always
+        case .server(let status, _) where status == 504: .always
+        // A bare 403 is retried once: the identity check also answers 403 when
+        // tailscaled's LocalAPI is busy (hub log `localapi_busy`, #350).
+        case .forbidden: .once
+        // A 500 is not retried in place: on the hub every GetDecisions read
+        // failed with one, fast, for minutes (#350 soak), and a retry only
+        // doubled the load. The screen's backoff reads again.
+        default: .never
+        }
+    }
+}
+
+/// How often a failed read may be tried again.
+enum RetryClass: Sendable, Equatable {
+    case never
+    /// At most one retry for this kind of failure.
+    case once
+    /// Up to the read's attempt limit.
+    case always
+}
+
+/// How a GET rides out a busy, restarting or briefly unreachable hub (#350):
+/// a few attempts with jittered exponential backoff, honouring a short
+/// `Retry-After`. Writes are never retried here (their rules are below).
+struct ReadRetry: Sendable {
+    /// Attempts in total, the first included.
+    var attempts = 4
+    /// The first backoff; each later one doubles, up to `maxDelay` seconds.
+    var baseDelay = 0.5
+    var maxDelay = 4.0
+    /// A `Retry-After` longer than this ends the retries; the screen's own
+    /// refresh comes back after it.
+    var maxRetryAfter = 8
+    /// Scales each backoff so many clients do not retry in step.
+    var jitter: @Sendable () -> Double = { Double.random(in: 0.5...1) }
+    var sleep: @Sendable (Double) async throws -> Void = { try await Task.sleep(for: .seconds($0)) }
+
+    static let standard = ReadRetry()
+
+    /// The wait before attempt `attempt + 1`, or nil to give up.
+    func delay(after attempt: Int, retryAfter: Int?) -> Double? {
+        guard attempt < attempts else { return nil }
+        if let retryAfter, retryAfter > maxRetryAfter { return nil }
+        let backoff = min(maxDelay, baseDelay * Double(1 << min(attempt - 1, 16))) * jitter()
+        return max(backoff, Double(retryAfter ?? 0))
     }
 }
 
@@ -71,6 +145,33 @@ func normalizeHost(_ raw: String) -> String? {
         guard let port = Int(parts[1]), (1...65535).contains(port) else { return nil }
     }
     return text
+}
+
+/// Whether a transport failure is worth one more try: the link or the
+/// Tailscale path changed under the request. A timeout already waited 15 s and
+/// is left to the screen's own refresh.
+func transientTransport(_ code: URLError.Code) -> RetryClass {
+    switch code {
+    case .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet,
+        .cannotFindHost, .dnsLookupFailed:
+        .always
+    case .secureConnectionFailed:
+        .once
+    default:
+        .never
+    }
+}
+
+/// True for the error a task gets when it, or its URLSession task, was cancelled.
+func isCancellation(_ error: any Error) -> Bool {
+    error is CancellationError || (error as? URLError)?.code == .cancelled
+}
+
+/// Routes the gateway serves from its 2-permit operator pool (v2 reads and
+/// messages, decision targets, answers); every other route takes one of its 4
+/// read permits (crates/rsi-remote/src/reads.rs DaemonReads).
+func isOperatorRoute(_ path: String) -> Bool {
+    path.hasPrefix("/api/v2/") || path.hasSuffix("/decision-targets") || path.contains("/decisions/answer")
 }
 
 /// Map a transport failure to "unreachable" (Tailscale off, no route, DNS,
@@ -118,25 +219,41 @@ func errorCode(from body: Data) -> String {
 /// token live in memory only (an ephemeral session).
 actor RemoteClient {
     static let maxBodyBytes = 1_048_576
+    /// Requests in flight at once. The gateway refuses rather than queues: 4
+    /// tailscaled identity checks (a 403) and 4 daemon reads (a 503), with
+    /// none waiting, so the app stays below both (#350).
+    static let maxInFlight = 3
+    /// Requests in flight on the gateway's 2-permit operator pool.
+    static let maxOperatorInFlight = 2
 
     let host: String
     private let session: URLSession
+    private let retry: ReadRetry
     private var csrf: String?
+    /// Bumped by each sign-in, so a 401 for an older session does not end a newer one.
+    private var generation = 0
+    /// The sign-in in progress; concurrent requests wait for this one.
+    private var signingIn: Task<Void, any Error>?
+    private let slots = AsyncLimiter(slots: RemoteClient.maxInFlight)
+    private let operatorSlots = AsyncLimiter(slots: RemoteClient.maxOperatorInFlight)
 
-    /// `session` lets tests route the traffic through a `URLProtocol` stub.
-    init(host: String, session: URLSession? = nil) {
+    /// `session` lets tests route the traffic through a `URLProtocol` stub;
+    /// `retry` lets them replace the backoff sleeps.
+    init(host: String, session: URLSession? = nil, retry: ReadRetry = .standard) {
         self.host = host
-        if let session {
-            self.session = session
-            return
-        }
+        self.session = session ?? URLSession(configuration: Self.configuration())
+        self.retry = retry
+    }
+
+    /// The production session settings: an ephemeral cookie jar, no cache.
+    static func configuration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = true
         configuration.httpCookieAcceptPolicy = .always
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.timeoutIntervalForRequest = 15
         configuration.waitsForConnectivity = false
-        self.session = URLSession(configuration: configuration)
+        return configuration
     }
 
     private var origin: String { "https://\(host)" }
@@ -155,14 +272,52 @@ actor RemoteClient {
         return request
     }
 
+    /// One HTTP exchange inside the in-flight limits. Throws only
+    /// `RemoteError.cancelled`, when cancelled before it was sent; the
+    /// exchange's own outcome is the result.
+    private func exchange(_ request: URLRequest) async throws -> Result<(Data, URLResponse), any Error> {
+        let operatorRoute = isOperatorRoute(request.url?.path ?? "")
+        // The scarcer operator slot first, so a waiting operator request never
+        // holds one of the general slots that plain reads need.
+        if operatorRoute {
+            do { try await operatorSlots.acquire() } catch { throw RemoteError.cancelled }
+        }
+        do {
+            try await slots.acquire()
+        } catch {
+            if operatorRoute { await operatorSlots.release() }
+            throw RemoteError.cancelled
+        }
+        let result: Result<(Data, URLResponse), any Error>
+        do {
+            result = .success(try await session.data(for: request))
+        } catch {
+            result = .failure(error)
+        }
+        await slots.release()
+        if operatorRoute { await operatorSlots.release() }
+        return result
+    }
+
+    /// A request that failed before any HTTP status arrived.
+    private struct TransportFailure: Error {
+        let code: URLError.Code?
+        let error: RemoteError
+
+        var retry: RetryClass { code.map(transientTransport) ?? .never }
+    }
+
     private func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let data: Data
         let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            if let reason = unreachableReason(error) { throw RemoteError.unreachable(reason) }
-            throw RemoteError.unreachable(error.localizedDescription)
+        switch try await exchange(request) {
+        case .success(let reply):
+            (data, response) = reply
+        case .failure(let error):
+            if isCancellation(error) { throw RemoteError.cancelled }
+            throw TransportFailure(
+                code: (error as? URLError)?.code,
+                error: .unreachable(unreachableReason(error) ?? error.localizedDescription))
         }
         guard let http = response as? HTTPURLResponse else {
             throw RemoteError.invalidResponse("not HTTP")
@@ -173,6 +328,22 @@ actor RemoteClient {
 
     private struct Bootstrap: Decodable { let nonce: String }
     private struct Issued: Decodable { let csrf: String }
+
+    /// Make sure a session exists. Requests that need one at the same time
+    /// share a single sign-in: the gateway's boot cookie is single-use and
+    /// one cookie jar holds one at a time, so two interleaved sign-ins refuse
+    /// each other with a 403 (#350).
+    private func ensureSession() async throws {
+        if csrf != nil { return }
+        if let signingIn {
+            try await signingIn.value
+            return
+        }
+        let task = Task { try await self.establishSession() }
+        signingIn = task
+        defer { signingIn = nil }
+        try await task.value
+    }
 
     /// GET /auth/bootstrap, then POST /auth/session with its nonce.
     private func establishSession() async throws {
@@ -189,6 +360,13 @@ actor RemoteClient {
             throw statusError(response.statusCode, code: errorCode(from: data))
         }
         csrf = try decode(Issued.self, data, "session").csrf
+        generation += 1
+    }
+
+    /// The session a 401 was answered for is gone: forget it, unless a newer
+    /// sign-in has already replaced it.
+    private func sessionRejected(_ generation: Int) {
+        if generation == self.generation { csrf = nil }
     }
 
     private func decode<T: Decodable>(_ type: T.Type, _ data: Data, _ what: String) throws -> T {
@@ -213,13 +391,60 @@ actor RemoteClient {
         return data
     }
 
-    /// One read with its final status: signs in first if needed and once more on a 401.
+    /// One read with its final status. Signs in first if needed (one sign-in
+    /// shared by concurrent reads) and once more on a 401. A busy, restarting
+    /// or briefly unreachable hub, or a bare 403, is tried again under
+    /// `retry` (#350); the last answer is returned for the caller to map.
+    /// Throws `RemoteError` only, `.cancelled` when its task was cancelled.
     private func read(_ path: String) async throws -> (Data, HTTPURLResponse) {
-        if csrf == nil { try await establishSession() }
+        var attempt = 1
+        var onceSpent = false
+        while true {
+            let outcome: Result<(Data, HTTPURLResponse), RemoteError>
+            let retryClass: RetryClass
+            var retryAfter: Int?
+            do {
+                let (data, response) = try await readOnce(path)
+                if response.statusCode == 200 { return (data, response) }
+                outcome = .success((data, response))
+                retryClass = statusError(response.statusCode, code: errorCode(from: data)).readRetry
+                retryAfter = retryAfterSeconds(response.value(forHTTPHeaderField: "Retry-After"))
+            } catch let failure as TransportFailure {
+                outcome = .failure(failure.error)
+                retryClass = failure.retry
+            } catch let error as RemoteError {
+                // A refused or unreadable sign-in, or a cancelled read.
+                outcome = .failure(error)
+                retryClass = error.readRetry
+            } catch {
+                outcome = .failure(.invalidResponse("request"))
+                retryClass = .never
+            }
+            if case .failure(.cancelled) = outcome { throw RemoteError.cancelled }
+            let allowed = retryClass == .always || (retryClass == .once && !onceSpent)
+            guard allowed, let delay = retry.delay(after: attempt, retryAfter: retryAfter) else {
+                return try outcome.get()
+            }
+            if retryClass == .once { onceSpent = true }
+            do {
+                try Task.checkCancellation()
+                try await retry.sleep(delay)
+            } catch {
+                throw RemoteError.cancelled
+            }
+            attempt += 1
+        }
+    }
+
+    /// One attempt: the shared sign-in, the GET, and one fresh sign-in and
+    /// resend on a 401.
+    private func readOnce(_ path: String) async throws -> (Data, HTTPURLResponse) {
+        try await ensureSession()
+        let generation = self.generation
         var (data, response) = try await send(try request(path))
         if response.statusCode == 401 {
-            csrf = nil
-            try await establishSession()
+            sessionRejected(generation)
+            try await ensureSession()
             (data, response) = try await send(try request(path))
         }
         return (data, response)
@@ -245,8 +470,12 @@ actor RemoteClient {
         try await get(SessionDetailResult.self, sessionPath(project, id))
     }
 
-    func history(project: String, session id: String) async throws -> HistoryPageResult {
-        try await get(HistoryPageResult.self, sessionPath(project, id) + "/history")
+    /// The newest page, or with `cursor` (the `next_cursor` token of the page
+    /// before) the next older one.
+    func history(project: String, session id: String, cursor: String? = nil) async throws -> HistoryPageResult {
+        var path = sessionPath(project, id) + "/history"
+        if let cursor { path += "?cursor=\(escape(cursor))" }
+        return try await get(HistoryPageResult.self, path)
     }
 
     func decisions(project: String, session id: String) async throws -> DecisionListResult {
@@ -323,6 +552,17 @@ actor RemoteClient {
         try await get(ProjectSeatsList.self, "/api/v2/projects")
     }
 
+    /// `GET /api/v2/dashboard` (hub #3287): satellites and running agents.
+    func dashboard() async throws -> Dashboard {
+        try await get(Dashboard.self, "/api/v2/dashboard")
+    }
+
+    /// `GET /api/v2/providers` (hub #3796): every provider's plan windows,
+    /// overage posture and spend. No query, no project.
+    func providers() async throws -> ProviderUsage {
+        try await get(ProviderUsage.self, "/api/v2/providers")
+    }
+
     /// `GET …/conversation[?before=]`, newest first. `before` is a
     /// `next_before` the gateway gave, sent back unchanged (not percent-encoded:
     /// the gateway parses `<sequence>:<id>` literally).
@@ -370,7 +610,8 @@ actor RemoteClient {
         } catch {
             switch error {
             case .signIn(let reason):
-                throw MessageError(.session, "\(reason.message) Nothing was sent.")
+                // An unreachable host is the network, not a refused sign-in.
+                throw MessageError(reason.isUnreachable ? .unavailable : .session, "\(reason.message) Nothing was sent.")
             case .reSignIn:
                 throw messageRefusal(status: 401, code: "", retryAfter: nil)
             case .unreadable:
@@ -420,20 +661,21 @@ actor RemoteClient {
     /// One write with the CSRF token. On a 401 (denied before any dispatch)
     /// sign in again once and resend exactly `body`.
     private func write(_ path: String, body: Data) async throws(WriteFailure) -> (Data, HTTPURLResponse) {
-        if csrf == nil {
-            do {
-                try await establishSession()
-            } catch let error as RemoteError {
-                throw .signIn(error)
-            } catch {
-                throw .signIn(.invalidResponse("session"))
-            }
+        do {
+            try await ensureSession()
+        } catch let error as RemoteError {
+            throw .signIn(error)
+        } catch let failure as TransportFailure {
+            throw .signIn(failure.error)
+        } catch {
+            throw .signIn(.invalidResponse("session"))
         }
+        let generation = self.generation
         var (data, response) = try await post(path, body: body)
         if response.statusCode == 401 {
-            csrf = nil
+            sessionRejected(generation)
             do {
-                try await establishSession()
+                try await ensureSession()
             } catch {
                 throw .reSignIn
             }
@@ -449,9 +691,17 @@ actor RemoteClient {
         post.httpBody = body
         let data: Data
         let response: URLResponse
+        let result: Result<(Data, URLResponse), any Error>
         do {
-            (data, response) = try await session.data(for: post)
+            result = try await exchange(post)
         } catch {
+            // Cancelled while waiting for a slot: nothing left the phone.
+            throw .neverSent
+        }
+        switch result {
+        case .success(let reply):
+            (data, response) = reply
+        case .failure(let error):
             if let url = error as? URLError, Self.neverSent.contains(url.code) { throw .neverSent }
             // The request may have reached the gateway before the link broke.
             throw .lost

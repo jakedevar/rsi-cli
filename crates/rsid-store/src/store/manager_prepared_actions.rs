@@ -475,11 +475,17 @@ fn blocker_for_error(error: &DaemonError) -> Option<ManagerPreparedActionBlocker
     };
     use ManagerPreparedActionBlockerCodeV2 as Code;
     use ManagerPreparedActionRequiredActionV2 as Required;
-    let (code, required_action) = match code.as_str() {
+    // A `code: detail` refusal (#235: the concurrency refusal names the
+    // counted sessions) is classified by its code.
+    let code = code.split_once(':').map_or(code.as_str(), |(code, _)| code);
+    let (code, required_action) = match code {
         "manager_v2_pending_operator_decision" | "manager_v2_decision_hold" => (
             Code::PendingOperatorDecision,
             Required::AnswerOperatorDecision,
         ),
+        "manager_v2_pending_manager_decision" => {
+            (Code::PendingManagerDecision, Required::RuleManagerDecision)
+        }
         "manager_v2_human_or_recovery_owner" => (
             Code::HumanOrRecoveryOwner,
             Required::ResolveHumanOrRecoveryOwner,

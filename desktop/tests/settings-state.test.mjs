@@ -10,6 +10,7 @@ import {
   EMPTY_STAGING, MODE_FIELD, OVERLAY_ROW_IDS, TUI_ONLY_WHY, applyStaged, pendingUpdates, sectionRows, stage, stepValue, widgetFor,
 } from '../dist/settings-model.js';
 import { checkTuiOnly } from '../scripts/parity-audit-lib.mjs';
+import { SETTINGS_UPDATE_HINT } from '../scripts/settings.mjs';
 import { SETTINGS_ROWS } from '../dist/settings.generated.js';
 import {
   MODEL_CONTROL_MODES, allowedWork, budgetAlerts, cancelMessage, deniedInvocations, formatBinaryBytes, liveInvocations, modeMessage,
@@ -20,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const desktop = join(here, '..');
 const src = (rel) => readFileSync(join(desktop, rel), 'utf8');
 
-/** The 15 rows the Issue lists as TUI preferences in the TUI's own state.json. */
+/** The documented TUI preferences in the TUI's own state.json. */
 const TUI_ONLY = [
   'formulation_animation', 'formulation_speed', 'activity_indicator', 'detail_column', 'navigator_preset', 'navigator_columns',
   'card_fields', 'show_system_events', 'show_thinking_events', 'hide_tool_results', 'submit_on_enter', 'auto_open_question_panel',
@@ -29,15 +30,39 @@ const TUI_ONLY = [
 
 const widgetOf = (id) => widgetFor(SETTINGS_ROWS.find((r) => r.id === id), undefined);
 
+function checkRowMappings(rows) {
+  const partial = rows.filter((r) => widgetFor(r, undefined).type === 'partial').map((r) => r.id);
+  assert.deepEqual(partial, [], `Unmapped desktop settings rows: ${partial.join(', ')}. ${SETTINGS_UPDATE_HINT}`);
+  const tuiOnly = rows.filter((r) => widgetFor(r, undefined).type === 'tui-only').map((r) => r.id);
+  assert.deepEqual([...tuiOnly].sort(), [...TUI_ONLY].sort(), `TUI-only settings rows must match the documented mapping. ${SETTINGS_UPDATE_HINT}`);
+  return tuiOnly;
+}
+
 test('no registry row is a placeholder: each is a control, an overlay or a documented TUI-only preference', () => {
-  const partial = SETTINGS_ROWS.filter((r) => widgetFor(r, undefined).type === 'partial').map((r) => r.id);
-  assert.deepEqual(partial, [], 'a "not in the desktop yet" placeholder is left');
-  const tuiOnly = SETTINGS_ROWS.filter((r) => widgetFor(r, undefined).type === 'tui-only').map((r) => r.id);
-  assert.deepEqual([...tuiOnly].sort(), [...TUI_ONLY].sort());
+  const tuiOnly = checkRowMappings(SETTINGS_ROWS);
   for (const id of tuiOnly) {
     assert.equal(SETTINGS_ROWS.find((r) => r.id === id).owner.kind, 'tui', `${id} must be a TUI-owned row`);
     assert.equal(widgetOf(id).why, TUI_ONLY_WHY);
   }
+});
+
+test('unmapped settings rows name the row, regeneration command and mapping file/table', () => {
+  const spec = { ...SETTINGS_ROWS[0], id: 'new_settings_row', owner: { kind: 'daemon_state' }, kind: 'read_only' };
+  assert.throws(() => checkRowMappings([...SETTINGS_ROWS, spec]), (error) => {
+    assert.ok(error.message.startsWith('Unmapped desktop settings rows: new_settings_row. '));
+    assert.ok(error.message.includes('From the repository root, run `node desktop/scripts/settings.mjs` to regenerate desktop/src/settings.generated.ts.'));
+    assert.ok(error.message.includes('Map new rows in `widgetFor` / `OVERLAY_ROW_IDS` in desktop/src/settings-model.ts;'));
+    return true;
+  });
+});
+
+test('a new TUI-only row names the explicit documentation tables', () => {
+  const spec = { ...SETTINGS_ROWS[0], id: 'new_tui_preference', owner: { kind: 'tui' } };
+  assert.throws(() => checkRowMappings([...SETTINGS_ROWS, spec]), (error) => {
+    assert.ok(error.message.startsWith('TUI-only settings rows must match the documented mapping. '));
+    assert.ok(error.message.includes('`TUI_ONLY` in desktop/tests/settings-state.test.mjs and `tuiOnlyRows` in desktop/parity-audit.json.'));
+    return true;
+  });
 });
 
 test('parity-audit.json documents exactly the TUI-only rows, each a TUI-local preference with no rsid state', () => {

@@ -1,0 +1,25 @@
+{
+  "name": "dashboard_empty_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/dashboard"
+  },
+  "response": {
+    "body": {
+      "agents": [],
+      "agents_incomplete": false,
+      "agents_total": 0,
+      "agents_truncated": false,
+      "observed_at": "2026-10-19T19:30:00.000000000Z",
+      "satellites": [],
+      "satellites_truncated": false
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

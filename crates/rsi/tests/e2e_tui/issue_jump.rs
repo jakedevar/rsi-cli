@@ -110,7 +110,8 @@ async fn test_e2e_issue_jump_by_number_reaches_archived_issues() -> E2eResult<()
         press(&term, Key::Char('p')).await?;
         visible(&term, "Workspaces").await?;
         visible(&term, PROJECT_NAME).await?;
-        press(&term, Key::Char('j')).await?;
+        // Down, not `j`: the project picker types every printable key into its filter (#3288).
+        press(&term, Key::Down).await?;
         press(&term, Key::Enter).await?;
         visible(&term, GROUP_NAME).await?;
         press(&term, Key::Char(' ')).await?;
@@ -237,7 +238,8 @@ async fn test_e2e_issue_tracker_operator_filter_and_detail_links() -> E2eResult<
         press(&term, Key::Char('p')).await?;
         visible(&term, "Workspaces").await?;
         visible(&term, PROJECT_NAME).await?;
-        press(&term, Key::Char('j')).await?;
+        // Down, not `j`: the project picker types every printable key into its filter (#3288).
+        press(&term, Key::Down).await?;
         press(&term, Key::Enter).await?;
         visible(&term, GROUP_NAME).await?;
         press(&term, Key::Char(' ')).await?;

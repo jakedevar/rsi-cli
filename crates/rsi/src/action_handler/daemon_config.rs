@@ -243,6 +243,67 @@ pub async fn write_daemon_text_field(
     Ok(())
 }
 
+/// The JSON number a typed `text` stands for (#3468): an integer when it is
+/// one, else a finite decimal. The daemon alone judges the range and whether a
+/// decimal fits the field, so anything that parses is sent and its refusal is
+/// shown; text that is no number never leaves the TUI. The word `default` is the
+/// field's default (`null`) on a row that offers `Default`, typed as `default`.
+fn typed_number_json(text: &str, has_default: bool) -> Result<serde_json::Value, String> {
+    let text = text.trim();
+    if has_default && text.eq_ignore_ascii_case("default") {
+        return Ok(serde_json::Value::Null);
+    }
+    if text.is_empty() {
+        return Err("Type a number, then Enter.".to_string());
+    }
+    if let Ok(whole) = text.parse::<u64>() {
+        return Ok(serde_json::json!(whole));
+    }
+    if let Ok(whole) = text.parse::<i64>() {
+        return Ok(serde_json::json!(whole));
+    }
+    match text.parse::<f64>() {
+        Ok(decimal) if decimal.is_finite() => Ok(serde_json::json!(decimal)),
+        _ => Err(format!("\"{text}\" is not a number.")),
+    }
+}
+
+/// Write a typed number to a numeric daemon row through `UpdateDaemonConfig`
+/// as a JSON number and mirror the accepted value into the row (a value no
+/// preset matches joins the row's choices, so the page shows it). A staged
+/// slider step on the row is settled by the write. Returns the value as the
+/// row shows it; a daemon refusal comes back as `Err` with the daemon's
+/// reason and leaves the cache unchanged.
+pub async fn write_daemon_number_field(
+    app: &mut App,
+    field: &str,
+    text: &str,
+) -> Result<String, String> {
+    if !app.authoritative_config_ready() {
+        return Err(app.daemon_config_unavailable_reason());
+    }
+    let has_default = app.daemon_features.iter().any(|entry| {
+        entry.field == field
+            && matches!(&entry.value, DaemonFeatureValue::Cycle { options, .. }
+                if options.iter().any(|option| option == "Default"))
+    });
+    let json_value = typed_number_json(text, has_default)?;
+    app.client
+        .update_daemon_config(field, json_value.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    DaemonFeatureEntry::update_from_json(
+        &mut app.daemon_features,
+        &serde_json::json!({ field: json_value }),
+    );
+    app.settings_state.pending.settle_daemon(field);
+    app.mark_dirty();
+    Ok(match json_value {
+        serde_json::Value::Null => "Default".to_string(),
+        other => other.to_string(),
+    })
+}
+
 /// Refresh the cached lifetime usage aggregate for the Settings -> Stats
 /// category (T8; 1:1 clone of `refresh_daemon_features`). Tab-scoped
 /// per-project filter (D1): reads `app.current_project_id` at fetch time,
@@ -678,6 +739,9 @@ fn finish_daemon_write(app: &mut App, write: PreparedWrite) -> String {
     }
     if field == rsi_common::provider_profile::PROVIDER_PROFILE_FIELD {
         app.sync_provider_profile();
+    }
+    if field.ends_with("_billing_mode") {
+        app.request_daemon_config_refresh();
     }
     let suffix = restart_toast_suffix(&field).unwrap_or("");
     format!("{label} → {value_str}{suffix}")
@@ -1217,7 +1281,7 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -1330,7 +1394,7 @@ mod tests {
     async fn launch_allow_command_writes_the_allowlist_field() {
         use crate::client::DaemonClient;
 
-        let Ok(directory) = tempfile::tempdir() else {
+        let Ok(directory) = crate::test_support::socket_tempdir() else {
             panic!("failed to create temp dir for fake daemon socket");
         };
         let socket = directory.path().join("daemon.sock");
@@ -1390,7 +1454,7 @@ mod tests {
             "recursive_dag_max_concurrent_graphs",
         ];
 
-        let Ok(directory) = tempfile::tempdir() else {
+        let Ok(directory) = crate::test_support::socket_tempdir() else {
             panic!("failed to create temp dir for fake daemon socket");
         };
         let socket = directory.path().join("daemon.sock");
@@ -1437,7 +1501,7 @@ mod tests {
     async fn per_provider_route_fallback_rows_toggle_and_send_their_field() {
         use crate::client::DaemonClient;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(respond_to_update_daemon_config(listener, 2));
@@ -1475,7 +1539,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_transcript_cache_setting_sends_zero_cap() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::socket_tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(respond_to_update_daemon_config(listener, 1));
@@ -1522,7 +1586,7 @@ mod tests {
     async fn restart_update_shows_restart_toast() {
         use crate::client::DaemonClient;
 
-        let Ok(directory) = tempfile::tempdir() else {
+        let Ok(directory) = crate::test_support::socket_tempdir() else {
             panic!("failed to create temp dir for fake daemon socket");
         };
         let socket = directory.path().join("daemon.sock");
@@ -1736,7 +1800,7 @@ mod tests {
         section: crate::settings_registry::SettingsSection,
         field: &str,
     ) -> (tempfile::TempDir, RecordedRequests, crate::app::App) {
-        let Ok(directory) = tempfile::tempdir() else {
+        let Ok(directory) = crate::test_support::socket_tempdir() else {
             panic!("failed to create temp dir for fake daemon socket");
         };
         let socket = directory.path().join("daemon.sock");
@@ -1789,7 +1853,7 @@ mod tests {
     /// apply produces exactly one update carrying the final value.
     #[tokio::test]
     async fn many_keypresses_send_nothing_and_apply_sends_one_update_with_the_final_value() {
-        use crossterm::event::KeyCode::{Char, Enter};
+        use crossterm::event::KeyCode::Char;
 
         let field = "sandbox_max_source_roots";
         let (_directory, log, mut app) = settings_app_with_recording_daemon(
@@ -1798,7 +1862,8 @@ mod tests {
         )
         .await;
         // The live row sits at 4096 (index 3 of 512..16384): 3 -> 0 (clamped),
-        // then up to 1, 2, 3 and back down to 2 = 2048.
+        // then up to 1, 2, 3 and back down to 2 = 2048. (Enter on a numeric row
+        // opens the number editor, #3468; it no longer steps.)
         press_keys(
             &mut app,
             &[
@@ -1807,7 +1872,7 @@ mod tests {
                 Char('-'),
                 Char('-'),
                 Char('+'),
-                Enter,
+                Char('+'),
                 Char('+'),
                 Char('-'),
             ],

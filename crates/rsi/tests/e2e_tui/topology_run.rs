@@ -277,7 +277,8 @@ async fn open_issues_workspace(term: &Terminal, project: &str, issue: &str) -> E
     press(term, Key::Char('p')).await?;
     visible(term, "Workspaces").await?;
     visible(term, project).await?;
-    press(term, Key::Char('j')).await?;
+    // Down, not `j`: the project picker types every printable key into its filter (#3288).
+    press(term, Key::Down).await?;
     press(term, Key::Enter).await?;
     visible(term, "Decisions Group").await?;
     press(term, Key::Char(' ')).await?;
@@ -364,7 +365,7 @@ async fn test_e2e_topology_run_view_shows_rows_ruling_and_the_waiting_banner() -
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     h.shutdown_daemon();
     if let Err(error) = outcome {
         let artifacts = h.preserve_artifacts(Some(&error.to_string()))?;

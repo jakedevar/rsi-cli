@@ -700,8 +700,10 @@ impl Store {
         scope: &FleetScope,
     ) -> Result<Option<ManagerNodeFleetV1>> {
         now.map(|now| {
-            self.fleet_overview_scoped(now, scope)
-                .map(ManagerNodeFleetV1::from_overview)
+            let mut fleet =
+                ManagerNodeFleetV1::from_overview(self.fleet_overview_scoped(now, scope)?);
+            fleet.provider_windows = self.load_provider_rate_limit_snapshots()?;
+            Ok(fleet)
         })
         .transpose()
     }

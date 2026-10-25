@@ -220,7 +220,7 @@ fn a_portfolio_ruling_settles_a_non_gate_record_and_unblocks_launches() {
     ask(&store, &config, epic, "other", "Pick a name?", None);
     assert_eq!(
         refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
-        "manager_v2_pending_operator_decision"
+        "manager_v2_pending_manager_decision"
     );
     let pending = operator_row(&store, &config, "census-access");
     assert_eq!(pending["answerable_by"], "manager");
@@ -245,7 +245,7 @@ fn a_portfolio_ruling_settles_a_non_gate_record_and_unblocks_launches() {
     // Ruling settles only this record; another pending decision still blocks.
     assert_eq!(
         refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
-        "manager_v2_pending_operator_decision"
+        "manager_v2_pending_manager_decision"
     );
     assert_eq!(operator_row(&store, &config, "other")["status"], "pending");
     let replay = store
@@ -327,7 +327,7 @@ fn a_gate_record_refuses_a_manager_answer_and_stays_with_the_operator() {
         &config,
         epic,
         "money",
-        "May we raise the monthly budget for the vendor?",
+        "May we raise the monthly budget to $500 for the vendor?",
         None,
     );
     for (key, class, source) in [
@@ -836,7 +836,7 @@ fn the_owning_manager_withdraws_its_record_and_others_cannot() {
     .unwrap();
     assert_eq!(
         refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
-        "manager_v2_pending_operator_decision"
+        "manager_v2_pending_manager_decision"
     );
     assert_eq!(operator_row(&store, &config, "other")["status"], "pending");
     pm_rule(&store, &config, "other", "Option A", "withdraw-other-rule").unwrap();
@@ -1889,4 +1889,274 @@ fn topology_decision_is_filed_once_and_its_gate_decides_who_may_rule() {
         ),
         "manager_v2_scope_denied"
     );
+}
+
+/// #3240: a block is named by who can answer it, and a manager-answerable
+/// topology question wakes the seat with one notice.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn a_block_is_named_by_who_answers_it_and_a_manager_question_notifies_the_seat_3240() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let epic = lead.parent_id.unwrap();
+    let execution = Uuid::new_v4();
+    let request = |key: String, gate: Option<&str>, question: &str| TopologyDecisionRequest {
+        key,
+        epic,
+        question: question.into(),
+        context: None,
+        gate: gate.map(str::to_owned),
+        source_digest: "d1".into(),
+        actor: json!({"kind":"topology_executor","session_id":null,"node_label":null,
+                      "execution_id":execution}),
+    };
+    let manager_key = format!("topology:{execution}:review:1:1");
+    let operator_key = format!("topology:{execution}:review:2:1");
+    store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request(
+                manager_key.clone(),
+                None,
+                "Review ran out of rounds. Accept, round or stop?\nSecond line.",
+            ),
+        )
+        .unwrap();
+    store
+        .manager_v2_put_topology_decision(
+            &config,
+            &request(operator_key.clone(), Some("main_or_release"), "Which tag?"),
+        )
+        .unwrap();
+
+    // The row names the block by its answerer.
+    let manager_row = operator_row(&store, &config, &manager_key);
+    assert_eq!(manager_row["answerable_by"], "manager");
+    assert_eq!(
+        manager_row["blocks"]["reason"],
+        "manager_v2_pending_manager_decision"
+    );
+    assert_eq!(manager_row["blocks"]["execution_ids"], json!([execution]));
+    let operator_row = operator_row(&store, &config, &operator_key);
+    assert_eq!(operator_row["answerable_by"], "operator");
+    assert_eq!(
+        operator_row["blocks"]["reason"],
+        "manager_v2_pending_operator_decision"
+    );
+
+    // The summaries carry the first line of the question and the answerer.
+    let summaries = store
+        .manager_v2_pending_decision_summaries(&config, None, 10)
+        .unwrap();
+    let manager = summaries.iter().find(|d| d.key == manager_key).unwrap();
+    assert_eq!(manager.answerable_by, "manager");
+    assert_eq!(
+        manager.question,
+        "Review ran out of rounds. Accept, round or stop?"
+    );
+    assert_eq!(manager.execution_id, Some(execution));
+    assert_eq!(
+        summaries
+            .iter()
+            .find(|d| d.key == operator_key)
+            .unwrap()
+            .answerable_by,
+        "operator"
+    );
+
+    // One actionable notice, for the manager's question only, and a second
+    // pass adds none.
+    let notices = |store: &Store| -> Vec<(String, String)> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT subject_id,state_json FROM harness_manager_notices
+                 WHERE subject_id LIKE 'decision:%' AND retired_at IS NULL",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let recorded = notices(&store);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].0, format!("decision:{manager_key}"));
+    let state: Value = serde_json::from_str(&recorded[0].1).unwrap();
+    assert_eq!(state["reason"], "pending_manager_decision");
+    assert_eq!(state["answerable_by"], "manager");
+    assert_eq!(
+        state["summary"],
+        "Review ran out of rounds. Accept, round or stop?"
+    );
+    for summary in &summaries {
+        store
+            .record_manager_decision_notice(&config, summary)
+            .unwrap();
+    }
+    assert_eq!(notices(&store).len(), 1);
+}
+
+/// #3330: a decision filed before the seat rotated is read against the live
+/// seat. `owner_manager_session_id` stays the ledger's lineage anchor (what a
+/// ruling names); `current_manager_session_id` names the seat now holding the
+/// project, and the decision's notice is in that seat's inbox.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn a_decision_filed_before_a_rotation_names_the_live_seat_3330() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let epic = lead.parent_id.unwrap();
+    let execution = Uuid::new_v4();
+    let key = format!("topology:{execution}:pre_review:1:1");
+    store
+        .manager_v2_put_topology_decision(
+            &config,
+            &TopologyDecisionRequest {
+                key: key.clone(),
+                epic,
+                question: "Accept the review as is, or stop?".into(),
+                context: None,
+                gate: None,
+                source_digest: "d1".into(),
+                actor: json!({"kind":"topology_executor","session_id":null,"node_label":null,
+                              "execution_id":execution}),
+            },
+        )
+        .unwrap();
+    let before = operator_row(&store, &config, &key);
+    assert_eq!(
+        before["current_manager_session_id"],
+        json!(config.manager_session_id)
+    );
+
+    // Three rotations: each successor continues the previous seat.
+    let mut seat = config.manager_session_id;
+    for _ in 0..3 {
+        let mut next = store.get_session(seat).unwrap().unwrap();
+        next.id = Uuid::new_v4();
+        next.continued_from = Some(seat);
+        next.rotation_depth += 1;
+        store.insert_session(&next).unwrap();
+        store
+            .update_session_status(seat, SessionStatus::Archived)
+            .unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(seat, next.id)
+                .unwrap()
+        );
+        seat = next.id;
+    }
+    assert_ne!(seat, config.manager_session_id);
+
+    let after = operator_row(&store, &config, &key);
+    assert_eq!(
+        after["owner_manager_session_id"],
+        json!(config.manager_session_id)
+    );
+    assert_eq!(after["current_manager_session_id"], json!(seat));
+    assert_eq!(after["answerable_by"], "manager");
+
+    // The live seat reads the decision's notice.
+    let inbox = store.manager_inbox(seat, &Default::default()).unwrap();
+    assert!(
+        inbox
+            .notices
+            .iter()
+            .any(|n| n.subject_id == format!("decision:{key}")),
+        "{:?}",
+        inbox.notices
+    );
+}
+
+/// #3240: the Epic launch gate and intent name a plain decision by its answerer.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn the_epic_gate_names_a_manager_question_apart_from_an_operator_gate_3240() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, policy());
+    let epic = lead.parent_id.unwrap();
+    ask(&store, &config, epic, "plain", "Pick a name?", None);
+    assert_eq!(
+        refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
+        "manager_v2_pending_manager_decision"
+    );
+    let block = store
+        .manager_v2_epic_decision_block(&config, epic)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (block.key.as_str(), block.answerable_by),
+        ("plain", "manager")
+    );
+    assert_eq!(block.question, "Pick a name?");
+
+    // A real gate on the same Epic wins: the operator spelling.
+    ask(
+        &store,
+        &config,
+        epic,
+        "money",
+        "May we buy the licence?",
+        Some(ManagerDecisionGateV2::Spend),
+    );
+    assert_eq!(
+        refusal(store.manager_v2_decision_gate(&config, epic).unwrap_err()),
+        "manager_v2_pending_operator_decision"
+    );
+    assert_eq!(
+        operator_row(&store, &config, "plain")["blocks"]["reason"],
+        "manager_v2_pending_manager_decision"
+    );
+    assert_eq!(
+        operator_row(&store, &config, "money")["blocks"]["reason"],
+        "manager_v2_pending_operator_decision"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn gate_scan_matches_whole_words_and_budget_needs_a_money_signal_3307() {
+    // The exact text of the #3277 handoff: a test time budget and a build slot.
+    for text in [
+        "2567s of the 3540s budget went to waiting for a hub build slot",
+        "accept this build-slot-starved, non-test red and enqueue, or re-run once the hub is idle?",
+        "The run was suspended and resumed; the test budget was 60 minutes",
+    ] {
+        assert_eq!(scan_decision_gate(text), None, "{text}");
+    }
+    // A real spending request still gates, with or without "budget".
+    for (text, class) in [
+        ("raise the monthly budget to $500?", "spend"),
+        ("raise the budget by 40 dollars", "spend"),
+        ("we need a bigger cloud budget in USD", "spend"),
+        ("May we spend more on the vendor?", "spend"),
+        ("spending approval needed", "spend"),
+        ("rotate the credentials?", "credentials"),
+        ("hard-delete the rows", "data_deletion"),
+    ] {
+        assert_eq!(scan_decision_gate(text), Some(class), "{text}");
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn gate_scan_budget_money_signal_must_be_near_the_budget_3327() {
+    // A time budget plus an unrelated money word far from it is not a spend gate.
+    for text in [
+        "2567s of the 3540s budget went to waiting for a build slot; the vendor quoted USD pricing for a bigger runner, accept the red or re-run?",
+        "2567s of the 3540s budget went to waiting for a hub build slot",
+    ] {
+        assert_eq!(scan_decision_gate(text), None, "{text}");
+    }
+    for text in [
+        "the $50 budget",
+        "budget of 50 USD",
+        "budget for dollars",
+        "the budgets in euros",
+    ] {
+        assert_eq!(scan_decision_gate(text), Some("spend"), "{text}");
+    }
 }

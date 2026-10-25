@@ -1124,8 +1124,11 @@ fn root_succession_epoch_covers_normal_rotation_restore_retirement_foreign_proje
     );
     let rotated = w.store.manager_authority_epoch(w.project).unwrap();
     assert!(rotated > before);
+    // #667 fences the API writers while the receipt is current; the raw seam
+    // stands in for the unfenced restore the V103 and epoch triggers backstop
+    // (#4005).
     w.store
-        .update_session_status(w.owner, SessionStatus::Completed)
+        .unfenced_status_write_for_test(w.owner, SessionStatus::Completed)
         .unwrap();
     assert!(w.store.manager_authority_epoch(w.project).unwrap() > rotated);
     w.store

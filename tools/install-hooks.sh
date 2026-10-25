@@ -11,6 +11,9 @@
 set -e
 
 cd "$(git rev-parse --show-toplevel)"
-chmod +x tools/git-hooks/pre-commit tools/git-hooks/commit-msg tools/git-hooks/pre-push
-git config core.hooksPath tools/git-hooks
-echo "Installed: core.hooksPath -> tools/git-hooks (pre-commit, commit-msg and pre-push active across all worktrees)"
+chmod +x tools/git-hooks/pre-commit tools/git-hooks/pre-merge-commit tools/git-hooks/commit-msg tools/git-hooks/pre-push
+git config --local core.hooksPath tools/git-hooks
+# Set explicitly: Git can implicitly enable rerere when rr-cache already exists.
+# Leave the shared cache intact and inert; never delete recorded resolutions.
+git config --local --replace-all rerere.enabled false
+echo "Installed: core.hooksPath -> tools/git-hooks (pre-commit, pre-merge-commit, commit-msg and pre-push active across all worktrees); shared rerere disabled"

@@ -91,9 +91,10 @@ pub(super) async fn handle_project_picker_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Shared list navigation (j/k/g/G)
+    // Filter-list navigation: only non-printable keys (Down/Up, Ctrl-J/K,
+    // Home/End); every printable key, j/k/g/G included, types into the filter.
     if let OverlayState::ProjectPicker { selected_index, .. } = &mut app.overlay {
-        if list::handle_list_nav_key(selected_index, filtered_count, &key) {
+        if list::handle_filter_list_nav_key(selected_index, filtered_count, &key) {
             return;
         }
     }
@@ -148,7 +149,11 @@ pub(super) async fn handle_project_picker_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Calculate the number of filtered entries in the project picker.
-fn get_project_picker_filtered_count(app: &App, filter: &str, reassign_mode: bool) -> usize {
+pub(super) fn get_project_picker_filtered_count(
+    app: &App,
+    filter: &str,
+    reassign_mode: bool,
+) -> usize {
     let filter_lower = filter.to_lowercase();
     let mut count = 0;
 

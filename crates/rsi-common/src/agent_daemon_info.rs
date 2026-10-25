@@ -139,6 +139,13 @@ pub struct InstalledToolV1 {
 /// `error` code, never a stale identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SatelliteDaemonInfoV1 {
+    /// Live activity, absent for unreachable or older satellites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_running: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_parked: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_jobs: Option<u32>,
     /// Latest bounded hub observation; absent on older hubs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<crate::satellite_diagnostics::SatelliteReachabilityV1>,
@@ -173,6 +180,13 @@ pub struct SatelliteDaemonInfoV1 {
     /// else the smallest count; absent when the satellite seats no manager.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launches: Option<String>,
+    /// Declared satellite projects' reported manager seats and saved policies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_policies: Option<Vec<crate::satellite_manager_policy::SatelliteManagerLaunchesV1>>,
+    /// #4008: the satellite's own invocations and token totals by provider
+    /// over 1h and 24h, for attributing a shared account's burn to a host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<crate::satellite::ProviderUsageRollupV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -184,6 +198,11 @@ pub struct AgentGetDaemonInfoResultV1 {
     pub hub: DaemonInfoV1,
     #[serde(default)]
     pub satellites: Vec<SatelliteDaemonInfoV1>,
+    /// #4008: the hub's own invocations and token totals by provider over 1h
+    /// and 24h, the counterpart of each satellite row's `usage`. Absent from
+    /// older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hub_usage: Vec<crate::satellite::ProviderUsageRollupV1>,
     /// Deploy drain (#1073): whether new work is held for a waiting deploy,
     /// and what is held. Absent from older daemons.
     #[serde(default)]
@@ -279,6 +298,11 @@ pub const HOST_LOAD_THRESHOLD_DEFAULT: u32 = 40;
 /// Upper bound of `host_load_admission_threshold`.
 pub const HOST_LOAD_THRESHOLD_MAX: u32 = 1024;
 
+/// Per-launch target estimate in GiB, reserved above the governor disk floor.
+pub const WORKER_BUILD_RESERVE_GB_DEFAULT: u64 = 8;
+/// Upper bound of the operator's per-launch target estimate.
+pub const WORKER_BUILD_RESERVE_GB_MAX: u64 = 64;
+
 /// Host-load admission status (#1417). The daemon holds a manager's
 /// `create_session` (queued, never refused; Issue-worker launches and
 /// topology node launches included) while `load + recent_admissions` is above
@@ -360,8 +384,9 @@ pub struct HeldWorkV1 {
 pub struct DeployDrainV1 {
     /// True while worker starts, job starts or queue admission are held. Worker
     /// starts are held for at most `deploy_drain_hold_secs` from the deploy
-    /// request; queue admission (#1806) and, for an `interrupt_workers` deploy,
-    /// `test`/`build` job starts (#2190) are held for the whole staged deploy,
+    /// request; queue admission (#1806) and `test`/`build` job starts (#2190,
+    /// #3373: every owner-requested deploy, `interrupt_workers` or not) are held
+    /// for the whole staged deploy,
     /// to its deadline. After the worker window the deploy keeps waiting without
     /// holding worker starts, until its first quiet poll holds again through the swap.
     pub draining: bool,

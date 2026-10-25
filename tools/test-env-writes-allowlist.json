@@ -1,0 +1,15 @@
+{
+  "_comment": "Raw std::env::set_var/remove_var calls in Rust test code that the test-env-writes guard (scripts/repo-guard test-env-writes, #360) accepts (#190). Each entry names the file, the variable names (or the argument as written) and why the write cannot use a test-unique name, the code under test's own env input, or temp_env. Prefer removing an entry to adding one.",
+  "entries": [
+    {
+      "path": "crates/rsid/tests/compile_prompt_integration.rs",
+      "names": ["LOCAL_LLM_BASE_URL", "RSI_OLLAMA_URL", "self.key"],
+      "reason": "Its own integration-test binary: the only test that reaches the HTTP path holds the file's TEST_LOCK and RestoreEnvVar puts the values back; the cache-hit test never reads them."
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "names": ["RSI_V77_UNOWNED_ISSUE_PROJECT"],
+      "reason": "The released, immutable V77 migration reads this operator declaration from the process environment, so it cannot become an input. The test holds TEST_V77_UNOWNED_PROJECT_LOCK, and V77 reads the variable only when a V76 database holds an Issue with no creating session; any other fixture with one would fail without the declaration."
+    }
+  ]
+}

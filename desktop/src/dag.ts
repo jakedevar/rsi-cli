@@ -3,10 +3,11 @@
 // does (each optional read degrades to a warning); controls open only behind
 // their daemon capability and a typed confirmation (max_steps, a reason, a
 // recovery budget). Daemon text is set with textContent only.
-import { $, el, toast } from './dom.js';
+import { $, el, errorBlock, toast } from './dom.js';
+import { keepFocus, rememberOpener, returnFocus, shouldBlurAfterClick } from './focus-return.js';
 import {
   type Control, type DagState, type Detail, type Panel, type Row, PANELS, PANEL_LABEL, TASK_LIMIT, arr, artifactPage,
-  artifactStep, cancellationRows, cap, capsLine, cursorChanged, dagKey, deferredRows, focusRunId, footerText,
+  DAG_ACTION_KEYS, DAG_INSPECTOR_VIEWS, type DagActionId, artifactStep, cancellationRows, cap, capsLine, cursorChanged, dagActions, dagKey, deferredRows, focusRunId, footerText,
   gateLines, heartbeatRows, idOf, initialDag, interruptRows, obj, panelRows, parseBudget, parseMaxSteps, parseReason,
   short, sortGraphs, str, taskCounts, taskTreeRows, ts, word,
 } from './dag-model.js';
@@ -15,8 +16,9 @@ import { invoke } from './api.js';
 import { artifactRef, bucketLines, liveAttemptOf, previewBody, previewHead, validationOf } from './dag-readbacks.js';
 import { engineBusy } from './graphs.js';
 import { uiChanged } from './state.js';
-import { focusOwnsKey, paneKeyAllowed } from './modal-gate.js';
-import { isVimKeysOn } from './vimkeys.js';
+import { focusOwnsKey, paneKeyAllowed, paneKeyName } from './modal-gate.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
+import { syncListbox } from './listbox-a11y.js';
 
 let s: DagState = initialDag(null);
 
@@ -199,6 +201,7 @@ async function submit(c: Exclude<Control, { kind: 'none' } | { kind: 'cancel-pre
 export function openDag(projectId: string | null, graphId: string | null = null): void {
   if (open && graphId === null) { closeDag(); return; }
   onOpen?.();
+  if (!open) rememberOpener('dag');
   open = true;
   s = { ...initialDag(projectId), panel: graphId ? 'runs' : 'graphs' };
   document.querySelector<HTMLElement>('.layout')!.hidden = true;
@@ -214,6 +217,7 @@ export function closeDag(): void {
   epoch++;
   view().hidden = true;
   document.querySelector<HTMLElement>('.layout')!.hidden = false;
+  returnFocus('dag');
   uiChanged();
 }
 
@@ -266,6 +270,21 @@ function handleKey(key: string, ctrl: boolean, shift: boolean): boolean {
   return true;
 }
 
+/**
+ * A click on an action button (local #231): the same transition its key makes (dag-model
+ * DAG_ACTION_KEYS), so the typed confirmation, the gates and the capability checks are shared.
+ */
+export function runDagAction(id: DagActionId): void {
+  if (!open) return;
+  const enabled = dagActions(s).find((a) => a.id === id)?.enabled === true;
+  if (!enabled) return;
+  if (id === 'artifact-prev' || id === 'artifact-next') { s = artifactStep(s, id === 'artifact-next' ? 1 : -1); draw(); return; }
+  for (const key of DAG_ACTION_KEYS[id]) handleKey(key, false, false);
+  if (s.control.kind !== 'none' && s.control.kind !== 'cancel-prefix') {
+    window.setTimeout(() => view().querySelector<HTMLInputElement>('.dag-control input')?.focus(), 0);
+  }
+}
+
 // ---------- rendering ----------
 
 function table(head: string[], rows: string[][], selected: number | null, active: boolean, onPick?: (i: number) => void): HTMLElement {
@@ -275,6 +294,8 @@ function table(head: string[], rows: string[][], selected: number | null, active
   t.append(tr);
   rows.forEach((cells, i) => {
     const r = el('tr', i === selected && active ? 'sel' : '');
+    r.setAttribute('role', 'row');
+    r.setAttribute('aria-selected', String(i === selected && active));
     r.append(el('td', 'dag-mark', i === selected && active ? '>' : ''));
     for (const c of cells) r.append(el('td', '', c));
     if (onPick) r.addEventListener('click', () => onPick(i));
@@ -320,7 +341,7 @@ function drawDetail(body: HTMLElement, d: Detail): void {
     : dim('operational status readback unavailable or capability-disabled'));
   if (d.warnings.length > 0) {
     sum.append(kvLine('warnings', `${d.warnings.length} non-fatal readback issue(s)`));
-    for (const w of d.warnings.slice(0, 5)) sum.append(dim(`- ${w}`));
+    for (const w of d.warnings.slice(0, 5)) sum.append(errorBlock('p', 'meta', `- ${w}`));
   }
   body.append(sum);
 
@@ -531,12 +552,21 @@ function controlBox(c: Control): HTMLElement | null {
     box.append(a, b);
     window.setTimeout(() => (c.field === 'max_graphs' ? a : b).focus(), 0);
   }
-  if (c.error) box.append(el('div', 'form-error', c.error));
+  if (c.error) box.append(errorBlock('div', 'form-error', c.error));
   return box;
+}
+
+/** Buttons give focus back after a pointer click (or with Vim keys on) so j/k keep working; Enter keeps it (local #244). */
+function blurAfter(b: HTMLElement, ev: MouseEvent): void {
+  if (shouldBlurAfterClick(ev.detail, isVimKeysOn())) window.setTimeout(() => b.blur(), 0);
 }
 
 function draw(): void {
   if (!open) return;
+  keepFocus(view(), drawView);
+}
+
+function drawView(): void {
   const root = view();
   root.querySelector<HTMLElement>('.dag-caps')!.textContent = capsLine(s.caps);
   root.querySelector<HTMLElement>('.dag-loaded')!.textContent = `${s.projectId ? 'project scope' : 'all projects'} · loaded ${s.loadedAt ?? '-'} · panel ${PANEL_LABEL[s.panel]}${s.busy ? ' · loading…' : ''}`;
@@ -544,9 +574,32 @@ function draw(): void {
   tabs.replaceChildren(...PANELS.map((p) => {
     const b = el('button', `seg${p === s.panel ? ' active' : ''}`, PANEL_LABEL[p]);
     b.type = 'button';
-    b.addEventListener('click', () => { s = { ...s, panel: p }; draw(); window.setTimeout(() => b.blur(), 0); });
+    b.addEventListener('click', (ev) => { s = { ...s, panel: p }; draw(); blurAfter(b, ev); });
     return b;
   }));
+  const actions = root.querySelector<HTMLElement>('.dag-actions')!;
+  actions.replaceChildren(...dagActions(s).map((a) => {
+    const b = el('button', 'btn', a.label);
+    b.type = 'button';
+    b.dataset.dagAction = a.id;
+    b.title = a.title;
+    b.disabled = !a.enabled;
+    b.addEventListener('click', (ev) => { runDagAction(a.id); blurAfter(b, ev); });
+    return b;
+  }));
+  if (s.inspector.open) {
+    for (const v of DAG_INSPECTOR_VIEWS) {
+      const b = el('button', `btn${s.inspector.view === v.view ? ' active' : ''}`, v.label);
+      b.type = 'button';
+      b.title = `Show the ${v.label.toLowerCase()} of the selected artifact`;
+      b.addEventListener('click', (ev) => { handleKey(v.key, false, false); blurAfter(b, ev); });
+      actions.append(b);
+    }
+    const closeInspector = el('button', 'btn', 'Close inspector');
+    closeInspector.type = 'button';
+    closeInspector.addEventListener('click', (ev) => { handleKey('Escape', false, false); blurAfter(closeInspector, ev); });
+    actions.append(closeInspector);
+  }
   const ctl = root.querySelector<HTMLElement>('.dag-control-slot')!;
   const box = controlBox(s.control);
   ctl.replaceChildren(...(box ? [box] : []));
@@ -555,7 +608,7 @@ function draw(): void {
   gates.replaceChildren(el('h4', '', 'Control gates (!)'), ...gateLines(s).map((l) => el('div', '', l)));
   const body = root.querySelector<HTMLElement>('.dag-body')!;
   body.replaceChildren();
-  if (s.message) body.append(el('p', 'dag-message', s.message));
+  if (s.message) body.append(errorBlock('p', 'dag-message', s.message));
   if (s.status === 'ready' || (s.status === 'loading' && s.graphs.length > 0)) {
     const inv = section('graphs', `GRAPHS (showing up to 100)`);
     if (s.graphs.length === 0) inv.append(dim('no recursive DAG graphs found for this scope'));
@@ -569,8 +622,21 @@ function draw(): void {
     body.append(inv);
     if (s.detail) drawDetail(body, s.detail);
   }
-  root.querySelector<HTMLElement>('.dag-footer')!.textContent = footerText(s);
+  root.querySelector<HTMLElement>('.dag-footer')!.textContent = footerText(s, isVimKeysOn(), currentPlatform());
+  syncDagTables(root, body);
   body.querySelector('tr.sel')?.scrollIntoView({ block: 'nearest' });
+}
+
+/** The pane holds focus and the arrows move one highlighted row in the active table: each table is a named grid, the pane points at the active row (local #330). */
+function syncDagTables(root: HTMLElement, body: HTMLElement): void {
+  const tables = Array.from(body.querySelectorAll<HTMLElement>('table.dag-table'));
+  // Inactive tables first, so the active one has the last word on the pane's aria-activedescendant.
+  for (const t of [...tables.filter((x) => !x.classList.contains('active')), ...tables.filter((x) => x.classList.contains('active'))]) {
+    const name = t.closest('section')?.querySelector('h3')?.textContent || 'Table';
+    t.setAttribute('aria-label', name);
+    syncListbox(t, t.classList.contains('active') ? root : t, { role: 'grid' });
+  }
+  if (!tables.some((x) => x.classList.contains('active'))) root.removeAttribute('aria-activedescendant');
 }
 
 // ---------- wiring ----------
@@ -591,9 +657,9 @@ export function initDag(): void {
   close.addEventListener('click', closeDag);
   const reload = el('button', 'btn', 'Reload (r)');
   reload.type = 'button';
-  reload.addEventListener('click', () => { refreshDag(); window.setTimeout(() => reload.blur(), 0); });
+  reload.addEventListener('click', (ev) => { refreshDag(); blurAfter(reload, ev); });
   head.append(el('h1', '', 'Recursive DAG'), el('span', 'meta dag-loaded'), el('span', 'spacer'), reload, close);
-  root.append(head, el('div', 'meta dag-caps'), el('div', 'dag-tabs view-toggle'), el('div', 'dag-control-slot'), el('div', 'dag-gates'), el('div', 'dag-body'), el('footer', 'dag-footer meta'));
+  root.append(head, el('div', 'meta dag-caps'), el('div', 'dag-tabs view-toggle'), el('div', 'dag-actions'), el('div', 'dag-control-slot'), el('div', 'dag-gates'), el('div', 'dag-body'), el('footer', 'dag-footer meta'));
   const layout = document.querySelector('.layout');
   if (layout) layout.after(root);
   else document.body.append(root);
@@ -606,7 +672,7 @@ export function initDag(): void {
     if (ev.metaKey || ev.altKey || isTyping(target) || engineBusy()) return;
     if (ev.key === 'Enter' && target?.closest('button')) return;
     if (ev.key === ' ' || ev.key === ':') return;
-    if (handleKey(ev.key, ev.ctrlKey, ev.shiftKey)) {
+    if (handleKey(paneKeyName(ev), ev.ctrlKey, ev.shiftKey)) {
       ev.preventDefault();
       ev.stopImmediatePropagation();
     }

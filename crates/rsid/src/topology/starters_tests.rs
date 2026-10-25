@@ -347,24 +347,41 @@ async fn a_manager_upsert_of_shipped_text_has_one_digest_and_is_preserved_at_boo
         "N differs from the current text, so it is flagged against it"
     );
 
-    // The daemon now ships N+1: publish it at the fixed ID while preserving
-    // the manager's private definition, including its digest and revision.
+    // The daemon now ships N+1: publish it at the fixed ID. The manager's row
+    // still holds the older shipped text N, so it is retired (archived, its
+    // text and digest kept) rather than left to shadow the shared starter
+    // (hub #3257).
     assert_eq!(
         starters::seed_one(&store, starter, &[validated.as_str()]).unwrap(),
         SeedOutcome::Inserted
     );
-    let (revision, owner, upgraded, column): (i64, String, String, String) = store
+    let (revision, owner, upgraded, column, archived): (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) = store
         .conn
         .query_row(
-            "SELECT revision,owner_kind,definition_json,definition_digest FROM topologies \
-             WHERE id=?1",
+            "SELECT revision,owner_kind,definition_json,definition_digest,archived_at \
+                 FROM topologies WHERE id=?1",
             [topology_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!((revision, owner.as_str()), (1, "manager"));
     assert_eq!(upgraded, stored_text);
     assert_eq!(column, validated);
+    assert!(archived.is_some(), "the stale private copy is archived");
     let listed = agent::list(
         &store,
         world.manager,
@@ -372,12 +389,11 @@ async fn a_manager_upsert_of_shipped_text_has_one_digest_and_is_preserved_at_boo
     )
     .unwrap()
     .topologies;
-    let row = listed
-        .iter()
-        .find(|t| t.topology_id == topology_id)
-        .unwrap();
-    assert_eq!(row.definition_digest, validated);
-    assert_eq!(row.starter_drift.as_ref().unwrap().shipped_digest, current);
+    assert!(listed.iter().all(|t| t.topology_id != topology_id));
+    let row = listed.iter().find(|t| t.name == ISSUE_PIPELINE).unwrap();
+    assert_eq!(row.topology_id, starter.id);
+    assert_eq!(row.definition_digest, current);
+    assert!(row.starter_drift.is_none());
     let shared = agent::get(
         &store,
         world.manager,
@@ -413,6 +429,109 @@ async fn a_manager_upsert_of_shipped_text_has_one_digest_and_is_preserved_at_boo
             .definition_digest,
         shipped_digest
     );
+}
+
+/// hub #3257: a manager-owned copy of an older shipped starter would shadow
+/// the current shared row by name, so every manager would keep executing the
+/// old definition. Seeding archives such a copy and leaves exactly one
+/// executable row per starter name, holding the shipped digest. An edited
+/// private row (text no release shipped) is still kept.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn seeding_retires_stale_private_copies_so_each_starter_name_has_one_row() {
+    use rsi_common::topology_agent::AgentTopologyGetRequestV1;
+
+    let world = World::new(policy(&[ManagerCapabilityV2::Automation], live_grant(), 64)).await;
+    let mut stale = Vec::new();
+    for starter in &STARTERS[2..] {
+        let mut older = starter.definition().unwrap();
+        older.nodes[0].label = "An older shipped label".into();
+        let older_digest =
+            starters::canonical_digest(&serde_json::to_string(&older).unwrap()).unwrap();
+        let row = world
+            .upsert(world.manager, &manager_upsert(starter.name, older))
+            .await
+            .unwrap();
+        assert_eq!(row.definition_digest, older_digest);
+        stale.push((starter, row.topology_id.unwrap(), older_digest));
+    }
+    let edited = starter_named(ISSUE_IMPLEMENT_REVIEW_LAND);
+    let mut definition = edited.definition().unwrap();
+    definition.nodes[0].label = "Edited by the manager".into();
+    let kept = world
+        .upsert(world.manager, &manager_upsert(edited.name, definition))
+        .await
+        .unwrap()
+        .topology_id
+        .unwrap();
+
+    let store = world.harness.executor.store.lock().await;
+    for (starter, _, older_digest) in &stale {
+        assert_eq!(
+            starters::seed_one(&store, starter, &[older_digest.as_str()]).unwrap(),
+            SeedOutcome::Inserted
+        );
+    }
+    assert_eq!(
+        starters::seed_one(&store, edited, &[]).unwrap(),
+        SeedOutcome::Inserted
+    );
+    let listed = agent::list(
+        &store,
+        world.manager,
+        &AgentTopologyListRequestV1::default(),
+    )
+    .unwrap()
+    .topologies;
+    for (starter, private_id, _) in &stale {
+        let rows: Vec<_> = listed.iter().filter(|t| t.name == starter.name).collect();
+        assert_eq!(rows.len(), 1, "{}", starter.name);
+        let current = crate::topology::store::digest(&starter.canonical_text().unwrap());
+        assert_eq!(rows[0].topology_id, starter.id);
+        assert_eq!(rows[0].definition_digest, current);
+        assert!(rows[0].starter_drift.is_none());
+        let by_name = agent::get(
+            &store,
+            world.manager,
+            &AgentTopologyGetRequestV1 {
+                name: Some(starter.name.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_name.topology.topology_id, starter.id);
+        let archived: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT archived_at FROM topologies WHERE id=?1",
+                [private_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            archived.is_some(),
+            "{} was archived, not deleted",
+            starter.name
+        );
+    }
+    // The edited private row still shadows its name.
+    let by_name = agent::get(
+        &store,
+        world.manager,
+        &AgentTopologyGetRequestV1 {
+            name: Some(edited.name.into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(by_name.topology.topology_id, kept);
+    // Seeding again changes nothing.
+    for (starter, _, older_digest) in &stale {
+        assert_eq!(
+            starters::seed_one(&store, starter, &[older_digest.as_str()]).unwrap(),
+            SeedOutcome::Unchanged
+        );
+    }
 }
 
 /// The starter's bundled JSON decoded afresh (a new `HashMap` per node).
@@ -954,6 +1073,105 @@ async fn issue_input_is_snapshotted_at_accept() {
     );
 }
 
+/// #3757: a topology-run worker sees the Issue's newest handoff records (a
+/// manager's ruling or reopen evidence), labelled by author role, not just
+/// the body. An Issue with no records keeps the exact old snapshot.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn issue_input_carries_the_newest_handoff_records() {
+    let world = World::new(policy(&[ManagerCapabilityV2::Automation], live_grant(), 64)).await;
+    let store = world.harness.executor.store.lock().await;
+    let issue = store
+        .create_issue(&NewIssue {
+            project_id: world.project,
+            title: "Needs the ruling".into(),
+            body: "The body.".into(),
+            priority: None,
+            labels: Vec::new(),
+            created_by_session_id: None,
+            assignee: None,
+            idea_id: None,
+            source_event_id: None,
+            source_finding_ref: None,
+        })
+        .unwrap();
+    let snapshot = |store: &crate::store::Store| {
+        starters::resolve_issue_input(
+            store,
+            Some(world.project),
+            Some(serde_json::json!({"issue": issue.display_number})),
+        )
+        .unwrap()
+        .unwrap()["issue"]
+            .clone()
+    };
+    assert!(snapshot(&store).get("handoffs").is_none());
+
+    let manager_author = uuid::Uuid::new_v4();
+    {
+        let mut row = crate::session::agent_verbs::tests::test_session(
+            manager_author,
+            world.harness.repo.clone(),
+        );
+        row.project_id = Some(world.project);
+        row.agent_role = Some("project_manager".into());
+        store.insert_session(&row).unwrap();
+    }
+    for sequence in 1..=7_i64 {
+        let author = if sequence == 7 {
+            manager_author
+        } else {
+            uuid::Uuid::new_v4()
+        };
+        let body = if sequence == 7 {
+            format!(
+                "RULING bash only. {}",
+                "é".repeat(starters::ISSUE_HANDOFF_MAX_BYTES)
+            )
+        } else {
+            format!("record {sequence}")
+        };
+        store
+            .conn
+            .execute(
+                "INSERT INTO issue_handoffs
+                     (issue_id, sequence, project_id, author_session_id, idempotency_key,
+                      body, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-10-22T14:04:00.000000000Z')",
+                rusqlite::params![
+                    issue.id.to_string(),
+                    sequence,
+                    world.project.to_string(),
+                    author.to_string(),
+                    format!("k-{sequence}"),
+                    body
+                ],
+            )
+            .unwrap();
+    }
+    let stored = snapshot(&store);
+    assert_eq!(stored["handoff_total"], 7);
+    let sequences: Vec<i64> = stored["handoffs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["sequence"].as_i64().unwrap())
+        .collect();
+    assert_eq!(sequences, vec![3, 4, 5, 6, 7]);
+    assert_eq!(stored["handoffs"][4]["author_role"], "project_manager");
+
+    // The node prompt renders them, the ruling last, labelled and clipped.
+    let graph: rsi_graph::data::Value = serde_json::from_value(stored).unwrap();
+    let rendered = starters::render_issue(&graph).unwrap();
+    assert!(rendered.contains("> #"), "{rendered}");
+    assert!(rendered.contains("newest 5 of 7"), "{rendered}");
+    assert!(rendered.contains("> handoff 7 by project_manager at 2026-10-22T14:04"));
+    assert!(rendered.contains("> handoff 6 by session at"));
+    assert!(rendered.contains("> RULING bash only."));
+    assert!(rendered.contains("[handoff truncated at 4096 of"));
+    assert!(!rendered.contains("record 2"));
+    assert!(rendered.find("record 3").unwrap() < rendered.find("RULING").unwrap());
+}
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn starter_b_files_triage_only_on_a_red_baseline() {
@@ -1040,7 +1258,7 @@ fn starter_a_prompted_handoffs_parse_for_the_executor() {
 pub(super) const EXISTING_STARTER_DIGESTS: &[(&str, &str)] = &[
     (
         ISSUE_IMPLEMENT_REVIEW_LAND,
-        "sha256:960c08847f32fada6c1a72d68aaf5b11c6a00f3cd39b9f013e4bb95e4be76d51",
+        "sha256:1dedb0b203be3c321e8db9911f6f59d5891ab3db59460c70d6a5b092d7b02613",
     ),
     (
         ROLLING_QA_SWEEP,
@@ -1085,7 +1303,7 @@ fn existing_starter_canonical_text_and_digest_unchanged() {
 /// A change to its text moves this on purpose: an unedited seeded row then
 /// advances, and an operator-edited one is left alone (see the seed test).
 const ISSUE_PIPELINE_DIGEST: &str =
-    "sha256:4d63a05f378390ad5ea1a785891d5653148fd5fff891e3056d28fe0f22704ef7";
+    "sha256:027141f4a5a5f6938d0e1933f157d696b1ad80d02d4b82906bcc6e5a2408cffd";
 
 /// #2688: the pre-land review a refused land routes to is the review node of
 /// `issue-pipeline-reviewed`: no land but `pre_land` is admitted by it, the
@@ -1098,7 +1316,15 @@ fn assert_pre_land_review_route(definition: &rsi_common::types::TopologyDefiniti
         .map(|node| node.id.as_str())
         .filter(|id| id.starts_with("pre_"))
         .collect();
-    assert_eq!(reviews, ["pre_review"]);
+    assert_eq!(
+        reviews,
+        [
+            "pre_review",
+            "pre_land_review_1",
+            "pre_land_review_2",
+            "pre_land_review_3"
+        ]
+    );
     let reviewed = starter_named(ISSUE_PIPELINE_REVIEWED).definition().unwrap();
     let node = |definition: &rsi_common::types::TopologyDefinition, id: &str| {
         serde_json::to_value(definition.nodes.iter().find(|n| n.id == id).unwrap()).unwrap()
@@ -1307,7 +1533,16 @@ fn issue_pipeline_has_its_own_digest_fixture_and_the_default_route_shape() {
             "pre_land",
             "repair_review",
             "repair_fix",
-            "repair_land"
+            "repair_land",
+            "pre_land_repair_1",
+            "pre_land_review_1",
+            "pre_land_1",
+            "pre_land_repair_2",
+            "pre_land_review_2",
+            "pre_land_2",
+            "pre_land_repair_3",
+            "pre_land_review_3",
+            "pre_land_3",
         ]
     );
     let step = |id: &str| {
@@ -1830,6 +2065,114 @@ async fn issue_pipeline_bundled_graph_closes_after_publication() {
             .await
             .is_empty()
     );
+}
+
+/// #3297: the manager's cancel reason survives queue mirroring and rendering
+/// into the repair session's upstream land input.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn cancelled_land_detail_reaches_the_repair_input() {
+    use rsi_common::rolling_queue::{RollingQueueEntryState, RollingQueueOutcome};
+
+    let world = World::new(pipeline_manager()).await;
+    let issue = open_issue(&world, "Cancelled land needs repair").await;
+    let execution = start_pipeline(&world, &issue, "pipeline-cancel-detail").await;
+    deliver_verified(&world, execution, "implement").await;
+    let land = land_waiting_on(&world, execution, "land").await;
+    let detail = "Merge origin/rolling, resolve crates/rsid/src/topology/land.rs, then verify.";
+    world.harness.set_land_state(
+        land.land_entry_id.unwrap(),
+        LandStatus::from_queue(
+            RollingQueueEntryState::Superseded,
+            Some(RollingQueueOutcome {
+                refusal: Some("queue_entry_cancelled".into()),
+                detail: Some(detail.into()),
+                ..Default::default()
+            }),
+        ),
+    );
+
+    let (repair, _, _) = deliver_verified(&world, execution, "repair").await;
+    let reason = format!("queue_entry_cancelled: {detail}");
+    let land = world.harness.attempt(execution, "land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Failed);
+    assert_eq!(land.output.unwrap()["fields"]["reason"], reason);
+    assert!(repair.query().contains(&reason), "{}", repair.query());
+}
+
+/// #3297: use the production lander-result parser so the repair sees paths
+/// in the queue's real outcome detail shape, alongside the refusal code.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn conflict_land_paths_reach_the_repair_input() {
+    let world = World::new(pipeline_manager()).await;
+    let issue = open_issue(&world, "Conflicting land needs repair").await;
+    let execution = start_pipeline(&world, &issue, "pipeline-conflict-detail").await;
+    deliver_verified(&world, execution, "implement").await;
+    let land = land_waiting_on(&world, execution, "land").await;
+    let detail = r#"integration refused: Conflict { paths: ["src/x.rs", "docs/repair.md"] }"#;
+    let result = crate::rolling_queue::classify_run(Some(1), "", detail, || None);
+    assert_eq!(
+        result.outcome.refusal.as_deref(),
+        Some("queue_batch_merge_conflict")
+    );
+    world.harness.set_land_state(
+        land.land_entry_id.unwrap(),
+        LandStatus::from_queue(result.state, Some(result.outcome)),
+    );
+
+    let (repair, _, _) = deliver_verified(&world, execution, "repair").await;
+    let reason = format!("queue_batch_merge_conflict: {detail}");
+    let land = world.harness.attempt(execution, "land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Failed);
+    assert_eq!(land.output.unwrap()["fields"]["reason"], reason);
+    assert!(repair.query().contains(&reason), "{}", repair.query());
+    assert_eq!(
+        world.harness.land_conflict_scans(),
+        vec![land.land_entry_id.unwrap()],
+        "the refusal code still classifies this as a merge conflict"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn land_refusal_keeps_the_code_and_bounded_utf8_detail_for_each_terminal_state() {
+    use rsi_common::rolling_queue::{RollingQueueEntryState, RollingQueueOutcome};
+
+    let detail = "é".repeat(crate::rolling_queue::OUTCOME_TAIL_BYTES);
+    let bounded = crate::rolling_queue::tail(&detail);
+    assert_eq!(bounded.len(), crate::rolling_queue::OUTCOME_TAIL_BYTES);
+    for state in [
+        RollingQueueEntryState::Refused,
+        RollingQueueEntryState::Failed,
+        RollingQueueEntryState::Superseded,
+    ] {
+        for (code, detail, expected) in [
+            (
+                Some("queue_test"),
+                Some(detail.as_str()),
+                format!("queue_test: {bounded}"),
+            ),
+            (Some("queue_test"), None, "queue_test".into()),
+            (None, Some(detail.as_str()), bounded.clone()),
+            (None, None, state.as_str().into()),
+        ] {
+            assert_eq!(
+                LandStatus::from_queue(
+                    state,
+                    Some(RollingQueueOutcome {
+                        refusal: code.map(str::to_owned),
+                        detail: detail.map(str::to_owned),
+                        ..Default::default()
+                    })
+                ),
+                LandStatus::Refused {
+                    state: state.as_str().into(),
+                    reason: expected
+                }
+            );
+        }
+    }
 }
 
 /// F-004: one refusal takes exactly one verified repair and the repaired
@@ -2674,9 +3017,9 @@ async fn repair_review_changes_requested_fixes_then_lands_the_approved_head() {
 /// The pinned `definition_digest` of the bundled review routes' revision 1.
 /// A change to either text moves its pin on purpose (see the seed test).
 const REVIEWED_DIGEST: &str =
-    "sha256:0e93e7c928315ce23da0a955e64d23ea552bede7c2e62ac97de949a30ff9c5ce";
+    "sha256:723b4a9cf1cf7afceb6f2d66fe84f7ef0beb25f25dccc8a8cf5aaa5fc079fa23";
 const POST_REVIEW_DIGEST: &str =
-    "sha256:5d7e93f6fa4b8b8903a6f796de1e111b37c2d925a34f0655eec3e78aa21cc014";
+    "sha256:acd936feb149c4f15c552268362b85ad490e15c9ca435163fd5232052c807d9f";
 
 pub(super) fn starter_named(name: &str) -> &'static starters::Starter {
     STARTERS
@@ -2822,7 +3165,16 @@ fn review_route_starters_have_their_own_digests_and_the_planned_shape() {
             "pre_land",
             "repair_review",
             "repair_fix",
-            "repair_land"
+            "repair_land",
+            "pre_land_repair_1",
+            "pre_land_review_1",
+            "pre_land_1",
+            "pre_land_repair_2",
+            "pre_land_review_2",
+            "pre_land_2",
+            "pre_land_repair_3",
+            "pre_land_review_3",
+            "pre_land_3",
         ]
     );
     let ordinary = pipeline_starter().definition().unwrap();
@@ -3439,6 +3791,7 @@ async fn post_review_starter_dispatches_after_close_once() {
         "/queue/logs/batch-*.log",
         "Do not re-run",
         "at most one exact-name test job",
+        "reviewer sandbox is pinned to the exact reviewed source",
         "infra_",
     ] {
         assert!(
@@ -4089,6 +4442,7 @@ fn issue_pipeline_starters_prompt_the_already_satisfied_handoff() {
             prompt.contains("status: already_satisfied, evidence_commit:"),
             "{name}"
         );
+        assert!(prompt.contains("already_satisfied_unproven"), "{name}");
         // The final outcome rule is conditional: the `complete` clause is
         // reached only through "Otherwise", after the already-satisfied branch
         // (no commit) and before the blocked branch, so no unconditional
@@ -4201,4 +4555,97 @@ fn every_starter_instructed_handoff_stage_parses() {
             .any(|(name, stage)| *name == ROLLING_QA_SWEEP && stage == "VERIFY"),
         "{seen:?}"
     );
+}
+
+/// #3319: a starter node that may end BLOCKED names the full set of fields the
+/// strict handoff parser requires, so a worker does not learn them one refusal
+/// at a time (a missing `blocker` and then a missing `blocker_evidence` failed a
+/// whole execution for a correct handoff).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn every_starter_node_that_may_end_blocked_names_the_full_blocked_field_set() {
+    let mut checked = 0;
+    for starter in STARTERS {
+        let definition: serde_json::Value =
+            serde_json::from_str(&starter.canonical_text().expect("text")).expect("json");
+        for node in definition["nodes"].as_array().expect("nodes") {
+            let Some(prompt) = node["params"]["instructions"].as_str() else {
+                continue;
+            };
+            if !prompt.contains("BLOCKED handoff") {
+                continue;
+            }
+            checked += 1;
+            for field in [
+                "status: blocked",
+                "blocker,",
+                "blocker_class",
+                "blocker_evidence",
+                "blocker_question",
+            ] {
+                assert!(
+                    prompt.contains(field),
+                    "{} node {}: BLOCKED handoff does not name `{field}`",
+                    starter.name,
+                    node["id"]
+                );
+            }
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} nodes mention a BLOCKED handoff"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[path = "pre_land_repair_tests.rs"]
+mod pre_land_repair_tests;
+
+/// #3770: a worker whose receipt exits non-zero on baseline reds alone (empty
+/// `new_failures`, every red a `baseline_reds` entry) is verified and finishes
+/// `complete`; it must not park the execution on a manager decision. The rule
+/// is in every implement and repair prompt of the issue-pipeline variants.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn pipeline_prompts_treat_baseline_only_reds_as_verified() {
+    let rule = "is verified: the landing gate is no new failures relative to rolling";
+    let expected: &[(&str, &[&str])] = &[
+        (
+            ISSUE_PIPELINE,
+            &[
+                "implement",
+                "repair",
+                "repair_2",
+                "repair_3",
+                "pre_land_repair_1",
+                "pre_land_repair_2",
+                "pre_land_repair_3",
+            ],
+        ),
+        (ISSUE_PIPELINE_REVIEWED, &["implement", "repair"]),
+        (
+            ISSUE_PIPELINE_POST_REVIEW,
+            &[
+                "implement",
+                "repair",
+                "repair_2",
+                "repair_3",
+                "pre_land_repair_1",
+                "pre_land_repair_2",
+                "pre_land_repair_3",
+            ],
+        ),
+    ];
+    for &(name, nodes) in expected {
+        let text = starter_named(name).canonical_text().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for &id in nodes {
+            let instructions = json_node(&value, id)["params"]["instructions"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}/{id} has instructions"));
+            assert!(instructions.contains(rule), "{name}/{id}");
+            assert!(instructions.contains("do not end BLOCKED"), "{name}/{id}");
+        }
+    }
 }

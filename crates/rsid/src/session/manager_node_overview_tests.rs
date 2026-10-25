@@ -19,7 +19,7 @@ use rsi_common::harness_manager_v2::{
 use rsi_common::portfolio_nodes::ConfigurePortfolioNodeRequestV1;
 use rsi_common::types::{Project, SessionKind, SessionProvider, SessionStatus};
 
-type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 fn launch() -> ManagerLaunchChoiceV2 {
     ManagerLaunchChoiceV2 {
@@ -252,15 +252,28 @@ async fn overview_from_a_global_lists_its_project_managers_and_projects() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test]
 async fn overview_fleet_detail_defaults_to_a_compact_summary() {
-    use rsi_common::manager_node_workspace::ManagerOverviewFleetV1;
+    use rsi_common::manager_node_workspace::{ManagerOverviewDetailV1, ManagerOverviewFleetV1};
     let (control, store) = control_handle_with_store();
     let t = tree(&store).await;
+    // `full` detail: this test is about the fleet rollup, not #3531's compaction.
     let call = |fleet| {
-        control
-            .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1 { fleet })
+        control.agent_manager_overview_value(
+            t.global1_seat,
+            AgentManagerOverviewRequestV1 {
+                fleet,
+                detail: ManagerOverviewDetailV1::Full,
+                ..Default::default()
+            },
+        )
     };
     let default = control
-        .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1::default())
+        .agent_manager_overview_value(
+            t.global1_seat,
+            AgentManagerOverviewRequestV1 {
+                detail: ManagerOverviewDetailV1::Full,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let summary = call(ManagerOverviewFleetV1::Summary).await.unwrap();
@@ -457,6 +470,57 @@ async fn overview_shows_the_open_qa_issues_of_each_project_2743() {
     assert_eq!(health["open_qa_issues_total"], 0, "{overview}");
 }
 
+/// #3531: the default overview is compact: each project manager's seat once,
+/// no rendered launches duplicate, and smaller than `detail: full`, which is
+/// the whole serialized workspace.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn overview_defaults_to_compact_and_full_detail_keeps_the_whole_workspace() {
+    use rsi_common::manager_node_workspace::ManagerOverviewDetailV1;
+    let (control, store) = control_handle_with_store();
+    let t = tree(&store).await;
+    let compact = control
+        .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let full = control
+        .agent_manager_overview_value(
+            t.global1_seat,
+            AgentManagerOverviewRequestV1 {
+                detail: ManagerOverviewDetailV1::Full,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(full.get("launches_display").is_some());
+    assert!(compact.get("launches_display").is_none());
+    assert_eq!(
+        compact["grant"]["allowed_launches"], full["grant"]["allowed_launches"],
+        "the structured launches stay"
+    );
+    // The project child's seat is the PM row's session, not a second copy.
+    let child = compact["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["node"]["project_id"] == serde_json::json!(t.a))
+        .expect("project A child");
+    assert_eq!(child["seat"]["session_id"], serde_json::json!(t.pm_a));
+    assert!(child["seat"].get("status").is_none(), "{child}");
+    let row = compact["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["overview"]["project_id"] == serde_json::json!(t.a))
+        .expect("project A row");
+    assert_eq!(
+        row["overview"]["manager"]["session_id"],
+        serde_json::json!(t.pm_a)
+    );
+    assert!(serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&full).unwrap().len());
+}
+
 /// Acceptance: for a single global, `GetGlobalManagerWorkspace` and
 /// `AgentGlobalOverview` return the v0 data: the node snapshot's grant, seat,
 /// projects and missing projects, active and after revocation.
@@ -561,4 +625,50 @@ async fn global_shims_return_the_v0_data_of_the_single_global() {
     assert_eq!(node_view.state, "revoked");
     assert_eq!(node_view.into_global(), revoked);
     let _ = gone;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn overview_fleet_summary_exposes_shared_provider_windows() {
+    use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
+    use rsi_common::types::SessionProvider;
+    let (control, store) = control_handle_with_store();
+    let t = tree(&store).await;
+    let observed_at = Utc::now();
+    let reset = (observed_at + chrono::Duration::days(4)).timestamp();
+    for provider in [SessionProvider::Claude, SessionProvider::Codex] {
+        store
+            .lock()
+            .await
+            .upsert_provider_rate_limit_snapshot(
+                &ProviderRateLimitSnapshot {
+                    provider,
+                    observed_at,
+                    status: None,
+                    rate_limit_type: None,
+                    overage_status: None,
+                    is_using_overage: false,
+                    stale_reason: None,
+                    windows: vec![ProviderRateLimitWindow {
+                        window_key: "seven_day".into(),
+                        utilization: 0.83,
+                        resets_at_epoch: Some(reset),
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+    }
+    let overview = control
+        .agent_manager_overview_value(t.global1_seat, AgentManagerOverviewRequestV1::default())
+        .await
+        .unwrap();
+    let windows = overview["fleet"]["provider_windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 2);
+    for (value, provider) in windows.iter().zip(["Claude", "Codex"]) {
+        assert_eq!(value["provider"], provider);
+        assert_eq!(value["windows"][0]["window_key"], "seven_day");
+        assert_eq!(value["windows"][0]["utilization"], 0.83);
+        assert_eq!(value["windows"][0]["resets_at_epoch"], reset);
+    }
 }

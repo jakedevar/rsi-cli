@@ -3,7 +3,6 @@
 use crate::store::Store;
 use rsi_common::completion_gates::CompletionGates;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// The gates `session_id` launches under. A stored row wins over an explicit
@@ -12,7 +11,7 @@ use uuid::Uuid;
 /// policy, unreadable gates fail the launch rather than silently permitting
 /// completion.
 pub(super) async fn resolve_launch_completion_gates(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     parent: Option<Uuid>,
     explicit: Option<&CompletionGates>,
@@ -48,7 +47,7 @@ pub(super) fn fail_closed() -> CompletionGates {
 /// Record an explicit operator launch value. The session row must already
 /// exist; an existing row is kept.
 pub(super) async fn persist_launch_completion_gates(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     gates: &CompletionGates,
 ) -> crate::error::Result<()> {
@@ -75,11 +74,16 @@ mod tests {
         }
     }
 
-    fn store() -> Arc<Mutex<Store>> {
-        Arc::new(Mutex::new(Store::open_in_memory().unwrap()))
+    fn store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
+        Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ))
     }
 
-    async fn session(store: &Arc<Mutex<Store>>, continued_from: Option<Uuid>) -> Uuid {
+    async fn session(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        continued_from: Option<Uuid>,
+    ) -> Uuid {
         let id = Uuid::new_v4();
         let mut row = crate::session::agent_verbs::tests::test_session(
             id,

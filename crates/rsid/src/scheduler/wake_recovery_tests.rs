@@ -75,7 +75,7 @@ fn allocate_worker(
 }
 
 struct CustodyLauncher {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     base: PathBuf,
     admitted: StdMutex<Vec<Uuid>>,
 }
@@ -132,7 +132,7 @@ async fn a_rewritten_parked_source_is_recoverable_once_and_its_exact_head_can_be
     let producer = insert_job(&store, worker.id, "verified result");
     finish(&store, producer, JobState::Succeeded, 0, None);
     let wake = arm(&store, worker.id, jobs_terminal(&[producer]), None).unwrap();
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let launcher = Arc::new(CustodyLauncher {
         store: store.clone(),
         base,
@@ -236,7 +236,7 @@ async fn exhausted_continuation_fences_report_the_preserved_head_and_relaunch_pa
     let producer = insert_job(&store, worker.id, "green job");
     finish(&store, producer, JobState::Succeeded, 0, None);
     let wake = arm(&store, worker.id, jobs_terminal(&[producer]), None).unwrap();
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let bus = Arc::new(EventBus::new(16));
     let error = DaemonError::InvalidParam(
         crate::store::manager_actions::fence::CONTINUATION_TURN_CHANGED.into(),

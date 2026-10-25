@@ -228,3 +228,14 @@ test('session info lists the TUI rows in order', () => {
   const grp = sessionInfoRows(s('k', 'Completed', '2026-10-02T00:00:00Z', { session_kind: 'Epic', lead_session_id: 'deadbeef1234' }), [], []);
   assert.equal(grp.find((r) => r[0] === 'lead')[1], 'deadbeef');
 });
+
+test('desktop #210: project validation speaks plain words and checks the folder and duplicates', () => {
+  const ok = { name: 'web', path: '/srv/web', color: '#7aa2f7' };
+  assert.equal(validateProject({ ...ok, path: '' }), null, 'the folder is optional');
+  assert.equal(validateProject({ ...ok, path: '~/code/web' }), null);
+  assert.equal(validateProject({ ...ok, path: 'C:\\code\\web' }), null);
+  assert.match(validateProject({ ...ok, name: ' ' }), /Name is required: give the project a short name/);
+  assert.match(validateProject({ ...ok, path: 'code/web' }), /must be a full path such as \/Users\/you\/code\/app/);
+  assert.match(validateProject(ok, ['Other', 'WEB']), /A project named “web” already exists/);
+  assert.match(validateProject({ ...ok, color: 'blue' }), /Pick a color for the project/);
+});

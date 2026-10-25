@@ -66,3 +66,17 @@ export function paletteArgument(keys: readonly string[]): string | null {
   const c = keys.find((k) => /^:[a-z]/i.test(k));
   return c ? `${c.split(/\s+/)[0]} ` : null;
 }
+
+// ---------- the generic form's keys (local #338) ----------
+
+/**
+ * The chords the TUI's "Provider Form" table lists beside Enter and Esc: Ctrl-Enter (Cmd-Enter on macOS, like the
+ * entity form) saves and Ctrl-Q closes without saving, from any field. A plain Enter is the form's own submit, Esc the
+ * dialog's own cancel, so neither is a chord here. Cmd-Q is the operating system's Quit and never a form key.
+ */
+export function formChord(k: { key: string; ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean; shiftKey?: boolean; isComposing?: boolean }): 'save' | 'close' | null {
+  if (k.isComposing || k.altKey || k.shiftKey) return null;
+  if (k.key === 'Enter' && (k.ctrlKey || k.metaKey)) return 'save';
+  if ((k.key === 'q' || k.key === 'Q') && k.ctrlKey && !k.metaKey) return 'close';
+  return null;
+}

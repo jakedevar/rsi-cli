@@ -21,7 +21,7 @@ pub(super) fn permanent_custody_refusal(error: &DaemonError) -> bool {
 /// retirement. A failed notice write leaves the original wake armed, with no
 /// delivery retries spent; an edited/disarmed wake owns its newer epoch.
 pub(super) async fn settle_recoverable_wake(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: &Arc<EventBus>,
     job: &rsi_common::types::ScheduledJob,
     target: Uuid,

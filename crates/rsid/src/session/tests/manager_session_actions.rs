@@ -802,3 +802,74 @@ async fn manager_session_update_refuses_invalid_patch_stale_fence_and_archived_t
     .await;
     assert_eq!(row(&p, worker).await.title.as_deref(), Some("K7 worker"));
 }
+
+/// #197: `AgentGetStatus` serves the in-memory copy, which can lag the row by
+/// a later write. The status a manager reads must be the value the fence
+/// compares, and a stale fence names the observed value.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn agent_get_status_updated_at_is_the_fence_value_after_a_later_row_touch_197() {
+    let (p, worker) = k7_pilot(ManagerOperatingModeV2::Execute).await;
+    let first = row(&p, worker).await.updated_at;
+    // A later write the completed-map copy never saw.
+    let touched = first + chrono::Duration::milliseconds(5);
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET updated_at=?1 WHERE id=?2",
+            rusqlite::params![
+                touched.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                worker.to_string()
+            ],
+        )
+        .unwrap();
+    let stale_copy = p
+        .manager
+        .completed
+        .read()
+        .await
+        .get(&worker)
+        .unwrap()
+        .session
+        .updated_at;
+    assert_eq!(stale_copy, first, "the in-memory copy lags the row");
+
+    let status = p.manager.agent_get_status(p.owner, worker).await.unwrap();
+    assert_eq!(status.updated_at, touched);
+
+    // The refusal for a stale fence carries the observed value.
+    let stale = ManagerActionV2::ArchiveSession {
+        session_id: worker,
+        expected_updated_at: first,
+    };
+    let error = control(&p, 2, "k197-stale", stale)
+        .await
+        .unwrap_err()
+        .to_string();
+    let observed = touched.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    assert!(
+        error.contains("manager_v2_session_changed")
+            && error.contains(&format!("observed_updated_at={observed}")),
+        "got {error}"
+    );
+
+    // Archiving with the status value is accepted.
+    let queued = control(
+        &p,
+        2,
+        "k197-archive",
+        ManagerActionV2::ArchiveSession {
+            session_id: worker,
+            expected_updated_at: status.updated_at,
+        },
+    )
+    .await
+    .unwrap();
+    p.execute().await.unwrap();
+    let receipt = p.receipt(queued.operation_id).await;
+    assert_eq!(receipt.result, Some(ManagerActionResultV2::SessionArchived));
+    assert_eq!(row(&p, worker).await.status, SessionStatus::Archived);
+}

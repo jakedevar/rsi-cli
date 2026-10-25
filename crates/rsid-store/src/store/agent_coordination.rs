@@ -675,7 +675,7 @@ fn terminal_sandbox_worktree_dirty_on(
 /// for it under the Store (a busy stripe drops the Store and retries), so a long
 /// maintenance proof on a colliding stripe delays only this settlement (#1172).
 pub async fn settle_post_bind_agent_child_failure_store_first(
-    store: &tokio::sync::Mutex<Store>,
+    store: &rsid_core::store_lock::Mutex<Store>,
     spawn_request_id: Uuid,
     child_session_id: Uuid,
     invocation_id: Uuid,
@@ -8209,15 +8209,18 @@ mod tests {
                                     predicate: WakePredicate {
                                         jobs_terminal: Some(jobs.clone()),
                                         sha_on_rolling: None,
+                                        shas_on_rolling: None,
                                         issue_closed: None,
                                         todo_closed: None,
                                         topology_execution_settled: None,
                                         health_anomaly: None,
                                         settlement_run_settled: None,
+                                        fire: None,
                                     },
                                     armed_at: accepted_at,
                                     deadline: (wait == "when").then_some(wake_at),
                                     repo_dir: None,
+                                    delivered_shas: Vec::new(),
                                 },
                                 false,
                             )
@@ -9928,7 +9931,7 @@ mod tests {
         use crate::store::stripe_liveness_support::run_behind_held_stripes;
 
         let fixture = post_bind_child_fixture();
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(fixture.store));
+        let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
         let run = run_behind_held_stripes(
             &store,
             Some(vec![fixture.custody_id]),
@@ -9975,7 +9978,7 @@ mod tests {
 
         for advance_session in [true, false] {
             let fixture = post_bind_child_fixture();
-            let store = std::sync::Arc::new(tokio::sync::Mutex::new(fixture.store));
+            let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
             let contended = admission_contention_signal(fixture.custody_id);
             let advance = async {
                 tokio::task::spawn_blocking(move || {

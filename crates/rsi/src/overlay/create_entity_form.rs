@@ -3628,7 +3628,8 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::sync::{Notify, mpsc};
 
-        let temp_dir = tempfile::tempdir().expect("temporary create-entity socket directory");
+        let temp_dir = crate::test_support::socket_tempdir()
+            .expect("temporary create-entity socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("create listener");
         let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -3777,7 +3778,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let temp_dir = tempfile::tempdir().expect("temporary create-entity socket directory");
+        let temp_dir = crate::test_support::socket_tempdir()
+            .expect("temporary create-entity socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("create listener");
         let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));

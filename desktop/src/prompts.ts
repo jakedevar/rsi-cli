@@ -20,13 +20,18 @@ import { keyToken } from './keyengine.js';
 import { openKeyHelp } from './keyhelp.js';
 import { openModelDropdown } from './model-dropdown.js';
 import {
-  type LaunchSettings, type PromptKind, PRESET_LABELS, ROW_HELP, ROW_LABELS, type SettingRow, launchSummary, launchedId,
-  promptKey, scopeChoices, scopeLabel, settingRows, settingsKey, stepEffort, stepPreset, stepScope,
+  type GrantContext, type LaunchSettings, type PromptKind, PRESET_LABELS, ROW_HELP, ROW_LABELS, type SettingRow, appointArgs,
+  freshPlan, grantStatus, launchBlock, launchSummary, launchedId, policyLabel, promptKey, regrantsSaved, scopeChoices,
+  scopeLabel, settingRows, settingsKey, stepEffort, stepPlanPreset, stepScope,
 } from './prompt-model.js';
+import { HOME_WORKTREE_WHY, isHomeProjectId } from './project-model.js';
 import { currentSessions, state } from './state.js';
+import { providerDescription, providerLabel } from './launch-model.js';
 import { editorOf, isVimField, modeOf } from './vim-field.js';
+import { sendChord } from './keylabel.js';
 import { currentPlatform, isVimKeysOn } from './vimkeys.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
 
 // ---------- which prompt ----------
 
@@ -63,7 +68,7 @@ function drawPreview(p: Preview, busy: string | null): void {
   p.box.append(
     el('div', 'g4-correction-head', c.kind === 'compile' ? (c.clarify ? 'The compiler needs an answer' : 'Compiled prompt') : 'Grammar and spelling'),
     el('pre', 'g4-correction-text', c.text),
-    el('div', 'pick-hint', c.clarify ? 'd or Esc dismiss · edit the draft and Ctrl-Y again' : 'a accept · d or Esc discard · Ctrl+Enter sends the original'),
+    el('div', 'pick-hint', c.clarify ? 'd or Esc dismiss · edit the draft and Ctrl-Y again' : `a accept · d or Esc discard · ${sendChord(currentPlatform())} sends the original`),
   );
 }
 
@@ -125,6 +130,9 @@ function previewKeyDown(ev: KeyboardEvent, insert: boolean): boolean {
 let sandbox = false;
 let manager: LaunchSettings['manager'] = null;
 let openPolicyAfter = false;
+/** The planned manager's project's saved grant (`GrantContextState`, #3270 / desktop #204). */
+let grant: GrantContext | null = null;
+let grantSeq = 0;
 let side: { panel: HTMLElement; row: number } | null = null;
 
 const form = (): HTMLFormElement => $<HTMLFormElement>('launch-form');
@@ -135,7 +143,7 @@ function settings(): LaunchSettings {
     provider: field<HTMLSelectElement>('provider').value || 'Claude',
     model: field<HTMLInputElement>('model').value.trim(),
     effort: field<HTMLSelectElement>('effort').value,
-    sandbox,
+    sandbox: sandbox && !homeChosen(),
     manager,
   };
 }
@@ -145,6 +153,11 @@ function workingDir(): string {
   if (dir) return dir;
   const pid = field<HTMLSelectElement>('project_id').value;
   return state.projects.find((p) => p.id === pid)?.path ?? '';
+}
+
+function projectName(): string {
+  const pid = field<HTMLSelectElement>('project_id').value;
+  return state.projects.find((p) => p.id === pid)?.name ?? '';
 }
 
 function summaryEl(): HTMLElement {
@@ -159,8 +172,51 @@ function summaryEl(): HTMLElement {
 
 export function renderLaunchSummary(): void {
   if (!document.getElementById('launch-form')) return;
-  summaryEl().textContent = launchSummary(settings(), workingDir());
+  // A planned manager whose project changed reads that project's saved grant.
+  if (manager && projectId() && grant?.projectId !== projectId()) loadGrant();
+  summaryEl().textContent = launchSummary(settings(), workingDir(), grant, projectName());
+  // The line under the Provider list says what the chosen provider is (local #211).
+  const hint = document.getElementById('launch-provider-hint');
+  if (hint) hint.textContent = providerDescription(settings().provider);
   if (side) drawSide();
+  syncMoreButton();
+  drawConfirm();
+}
+
+/**
+ * Read the project's saved grant (`fetch_grant_context`: `GetHarnessManagerPolicy`
+ * through the operator path). Until it loads the launch is blocked; a later
+ * read for another project supersedes this one.
+ */
+function loadGrant(): void {
+  const pid = projectId();
+  const seq = ++grantSeq;
+  grant = { state: 'loading', projectId: pid };
+  const timeout = new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error('grant read timed out')), 3000));
+  void Promise.race([invoke<unknown>('harness_manager_policy_get', { projectId: pid }), timeout]).then(
+    (saved) => { if (seq === grantSeq) { grant = { state: 'loaded', projectId: pid, saved: saved ?? null }; renderLaunchSummary(); } },
+    (e: unknown) => {
+      if (seq !== grantSeq) return;
+      const reason = e instanceof Error ? e.message : String(e);
+      grant = { state: 'failed', projectId: pid, reason: reason.startsWith('grant read') ? reason : `saved grant read failed: ${reason}` };
+      renderLaunchSummary();
+    },
+  );
+}
+
+/** Why the launch cannot be confirmed yet (`block_unloaded_grant`), else null. */
+export function launchBlocked(): string | null {
+  return launchBlock(manager, grant, projectId());
+}
+
+/** The Launch button waits for the saved grant, saying so. */
+function drawConfirm(): void {
+  const button = form().querySelector<HTMLButtonElement>('button[type="submit"]');
+  if (!button) return;
+  const why = launchBlocked();
+  button.disabled = why !== null;
+  button.title = why ?? '';
+  button.textContent = why !== null && grant?.state === 'loading' ? 'Loading saved grant…' : 'Launch';
 }
 
 function setEffort(v: string): void {
@@ -176,13 +232,19 @@ function stepLaunchEffort(by: 1 | -1): void {
   toast(`Effort: ${field<HTMLSelectElement>('effort').value || 'model default'}`, true);
 }
 
+/** RSI home is the person's home folder, never a repository: no worktree there (desktop #319). */
+function homeChosen(): boolean {
+  return isHomeProjectId(projectId());
+}
+
 function toggleSandbox(): void {
+  if (homeChosen()) { toast(HOME_WORKTREE_WHY); return; }
   sandbox = !sandbox;
   renderLaunchSummary();
   toast(sandbox ? 'Sandbox on: the session runs in its own git worktree' : 'Sandbox off', true);
 }
 
-function pickLaunchModel(): void {
+export function pickLaunchModel(): void {
   const s = settings();
   openModelDropdown({
     title: 'Model for this launch',
@@ -191,7 +253,12 @@ function pickLaunchModel(): void {
     withDefault: true,
     onPick: (provider, m) => {
       const prov = field<HTMLSelectElement>('provider');
-      if (![...prov.options].some((o) => o.value === provider)) prov.append(el('option', undefined, provider));
+      if (![...prov.options].some((o) => o.value === provider)) {
+        const opt = el('option', undefined, providerLabel(provider));
+        opt.value = provider;
+        opt.title = providerDescription(provider);
+        prov.append(opt);
+      }
       prov.value = provider;
       field<HTMLInputElement>('model').value = m.id;
       renderLaunchSummary();
@@ -205,9 +272,11 @@ function projectId(): string {
 }
 
 function toggleManager(): void {
-  if (manager) { manager = null; openPolicyAfter = false; renderLaunchSummary(); return; }
+  if (manager) { manager = null; openPolicyAfter = false; grant = null; grantSeq++; renderLaunchSummary(); return; }
   if (!projectId()) { toast('Choose a project first: the manager is appointed for the launched session’s project'); return; }
-  manager = { scope: { kind: 'project' }, preset: 'execute' };
+  manager = freshPlan();
+  // Ask for what the project already has granted (#3270).
+  loadGrant();
   renderLaunchSummary();
 }
 
@@ -223,14 +292,31 @@ function drawSide(): void {
       case 'sandbox': return s.sandbox ? '━━● ON' : '○── OFF';
       case 'manager': return s.manager ? '━━● appoint' : projectId() ? '○── OFF' : '○── needs a project';
       case 'scope': return s.manager ? `◂ ${scopeLabel(s.manager.scope)} ▸` : '';
-      case 'policy': return s.manager ? `◂ ${PRESET_LABELS[s.manager.preset]} ▸` : '';
-      case 'grant': return openPolicyAfter ? 'open the policy editor after launch' : `${s.manager ? PRESET_LABELS[s.manager.preset] : ''} preset · p`;
+      case 'policy': return s.manager ? `◂ ${policyLabel(s.manager, grant)} ▸` : '';
+      case 'grant': {
+        if (!s.manager) return '';
+        const status = grantStatus(grant);
+        if (status) return status;
+        if (openPolicyAfter) return 'open the policy editor after launch';
+        return regrantsSaved(s.manager, grant) ? 're-grants the saved grant · p' : `${PRESET_LABELS[s.manager.preset]} preset as is · p`;
+      }
     }
   };
+  // The person's focus stays on the same control when the panel is redrawn (a click changes the row).
+  const focusedAct = side.panel.contains(document.activeElement) ? (document.activeElement as HTMLElement | null)?.dataset?.act : undefined;
+  const controls = new Map<string, HTMLElement>();
   const list = el('ul', 'g4-side-rows');
   rows.forEach((r, i) => {
     const li = el('li', i === side!.row ? 'sel' : '');
-    li.append(el('span', 'g4-side-label', ROW_LABELS[r]), el('span', 'g4-side-value', value(r)));
+    // role=row in a grid (local #334): the buttons and checkboxes in the value cell stay reachable and named.
+    li.setAttribute('role', 'row');
+    li.setAttribute('aria-selected', String(i === side!.row));
+    li.dataset.index = String(i);
+    const labelCell = el('span', 'g4-side-label', ROW_LABELS[r]);
+    labelCell.setAttribute('role', 'rowheader');
+    const valueCell = sideValue(r, s, value(r), controls);
+    valueCell.setAttribute('role', 'gridcell');
+    li.append(labelCell, valueCell);
     li.addEventListener('click', () => { side!.row = i; drawSide(); });
     list.append(li);
   });
@@ -238,8 +324,129 @@ function drawSide(): void {
     el('div', 'g4-side-title', 'Launch settings'),
     list,
     el('div', 'pick-hint', ROW_HELP[rows[side.row]!]),
-    el('div', 'pick-hint', 'j/k move · h/l change · Space/Enter toggle or open · p grant · Ctrl-E effort · Ctrl-B sandbox · Ctrl-M model · Ctrl-Enter launch · Ctrl-O, Tab or Esc back'),
+    el('div', 'pick-hint', sideHint(isVimKeysOn())),
   );
+  // The panel holds focus and j / k move the highlighted setting (local #330).
+  syncListbox(list, side.panel, { label: 'Launch setting rows', role: 'grid' });
+  if (focusedAct) controls.get(focusedAct)?.focus();
+}
+
+/** The hint line under the rows: buttons first with the Vim keys off, the keys with them on. */
+export function sideHint(vim: boolean): string {
+  return vim
+    ? 'Click or tick a choice, or: j/k move · h/l change · Space/Enter toggle or open · p grant · Ctrl-E effort · Ctrl-B sandbox · Ctrl-M model · Ctrl-Enter launch · Ctrl-O, Tab or Esc back'
+    : 'Tick a box or press a button to change a choice, Tab to move between them. Press More options (or Esc) to go back to the prompt; Launch starts the session.';
+}
+
+/** A small button that changes one choice in the settings side; `act` lets a redraw keep the focus on it. */
+function sideButton(controls: Map<string, HTMLElement>, act: string, text: string, name: string, onClick: () => void): HTMLButtonElement {
+  const b = el('button', 'btn small', text);
+  b.type = 'button';
+  b.dataset.act = act;
+  b.setAttribute('aria-label', name);
+  b.title = name;
+  b.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(); });
+  controls.set(act, b);
+  return b;
+}
+
+/** A real checkbox for an on/off choice (own git worktree, manager, open the policy editor). */
+function sideCheck(controls: Map<string, HTMLElement>, act: string, text: string, checked: boolean, onChange: () => void): HTMLElement {
+  const box = el('input');
+  box.type = 'checkbox';
+  box.checked = checked;
+  box.dataset.act = act;
+  box.addEventListener('click', (ev) => ev.stopPropagation());
+  box.addEventListener('change', onChange);
+  controls.set(act, box);
+  const label = el('label', 'g4-side-check');
+  label.append(box, el('span', undefined, text));
+  return label;
+}
+
+/** The value cell of a settings row: its text plus the control a mouse user presses (the keys stay the same). */
+function sideValue(r: SettingRow, s: LaunchSettings, text: string, controls: Map<string, HTMLElement>): HTMLElement {
+  const cell = el('span', 'g4-side-value');
+  switch (r) {
+    case 'model':
+      cell.append(el('span', undefined, text), sideButton(controls, 'model', 'List…', 'Pick the model for this launch', pickLaunchModel));
+      break;
+    case 'effort':
+      cell.append(
+        sideButton(controls, 'effort-down', '◂', 'Lower the effort', () => stepLaunchEffort(-1)),
+        el('span', undefined, s.effort || 'default'),
+        sideButton(controls, 'effort-up', '▸', 'Raise the effort', () => stepLaunchEffort(1)),
+      );
+      break;
+    case 'sandbox':
+      cell.append(sideCheck(controls, 'sandbox', 'Run in its own git worktree', s.sandbox, () => toggleSandbox()));
+      if (homeChosen()) {
+        const box = controls.get('sandbox') as HTMLInputElement;
+        box.checked = false;
+        box.disabled = true;
+        box.title = HOME_WORKTREE_WHY;
+        cell.append(el('span', 'g4-side-why', HOME_WORKTREE_WHY));
+      }
+      break;
+    case 'manager':
+      cell.append(sideCheck(controls, 'manager', projectId() || manager ? 'Appoint it as the project manager' : 'Appoint it as the project manager (choose a project first)', !!s.manager, () => {
+        toggleManager();
+        (controls.get('manager') as HTMLInputElement).checked = !!manager;
+      }));
+      break;
+    case 'scope':
+      if (!s.manager) break;
+      cell.append(
+        sideButton(controls, 'scope-down', '◂', 'Previous scope', () => stepManagerScope(-1)),
+        el('span', undefined, scopeLabel(s.manager.scope)),
+        sideButton(controls, 'scope-up', '▸', 'Next scope', () => stepManagerScope(1)),
+      );
+      break;
+    case 'policy':
+      if (!s.manager) break;
+      cell.append(
+        sideButton(controls, 'policy-down', '◂', 'Previous grant preset', () => stepManagerPolicy(-1)),
+        el('span', undefined, policyLabel(s.manager, grant)),
+        sideButton(controls, 'policy-up', '▸', 'Next grant preset', () => stepManagerPolicy(1)),
+      );
+      break;
+    case 'grant':
+      if (!s.manager) break;
+      cell.append(el('span', undefined, text), sideButton(controls, 'grant', grant?.state === 'failed' ? 'Retry' : openPolicyAfter ? 'Do not open the editor' : 'Open the policy editor after launch', 'Grant: toggle opening the policy editor after launch', toggleGrant));
+      break;
+  }
+  return cell;
+}
+
+function stepManagerScope(by: 1 | -1): void {
+  if (!manager) return;
+  manager = { ...manager, scope: stepScope(scopeChoices(currentSessions(), projectId()), manager.scope, by) };
+  renderLaunchSummary();
+}
+
+function stepManagerPolicy(by: 1 | -1): void {
+  if (!manager) return;
+  manager = stepPlanPreset(manager, by);
+  renderLaunchSummary();
+}
+
+function toggleGrant(): void {
+  if (!manager) { toast('Plan a manager first (the Manager row)'); return; }
+  // One bounded read per retry after a failure (`open_grant_page`).
+  if (grant?.state === 'failed') { loadGrant(); renderLaunchSummary(); return; }
+  openPolicyAfter = !openPolicyAfter;
+  toast(openPolicyAfter ? 'After launch the manager policy editor opens on the granted policy' : regrantsSaved(manager, grant) ? 'The saved grant is re-granted as is' : 'The preset is granted as is', true);
+  drawSide();
+}
+
+/** The More options button: shows or hides the settings side (the same flip as Ctrl-O). */
+export function toggleLaunchSide(): void {
+  flipSide();
+}
+
+function syncMoreButton(): void {
+  const b = document.getElementById('launch-more');
+  if (b) b.setAttribute('aria-expanded', side ? 'true' : 'false');
 }
 
 function flipSide(): void {
@@ -248,15 +455,18 @@ function flipSide(): void {
     side.panel.remove();
     side = null;
     if (prompt) prompt.hidden = false;
+    syncMoreButton();
     field<HTMLTextAreaElement>('query').focus();
     return;
   }
   const panel = el('div', 'g4-side');
+  panel.id = 'launch-side';
   panel.tabIndex = 0;
   panel.setAttribute('aria-label', 'Launch settings');
   (prompt ?? summaryEl()).after(panel);
   if (prompt) prompt.hidden = true;
   side = { panel, row: 0 };
+  syncMoreButton();
   drawSide();
   panel.focus();
 }
@@ -274,19 +484,9 @@ function sideKey(ev: KeyboardEvent): boolean {
     case 'effort': stepLaunchEffort(c.by); return true;
     case 'sandbox': toggleSandbox(); return true;
     case 'manager': toggleManager(); return true;
-    case 'scope': {
-      if (!manager) return true;
-      manager = { ...manager, scope: stepScope(scopeChoices(currentSessions(), projectId()), manager.scope, c.by) };
-      renderLaunchSummary();
-      return true;
-    }
-    case 'policy': if (manager) { manager = { ...manager, preset: stepPreset(manager.preset, c.by) }; renderLaunchSummary(); } return true;
-    case 'grant':
-      if (!manager) { toast('Plan a manager first (the Manager row)'); return true; }
-      openPolicyAfter = !openPolicyAfter;
-      toast(openPolicyAfter ? 'After launch the manager policy editor opens on the granted policy' : 'The preset is granted as is', true);
-      drawSide();
-      return true;
+    case 'scope': stepManagerScope(c.by); return true;
+    case 'policy': stepManagerPolicy(c.by); return true;
+    case 'grant': toggleGrant(); return true;
   }
 }
 
@@ -294,7 +494,7 @@ function sideKey(ev: KeyboardEvent): boolean {
 
 /** The extras the settings side adds to a launch. */
 export function launchExtras(): { sandbox: boolean } {
-  return { sandbox };
+  return { sandbox: sandbox && !homeChosen() };
 }
 
 /** After a successful launch: appoint the planned manager, then reset the side. */
@@ -304,19 +504,15 @@ export async function afterLaunch(result: unknown, launchProject: string | undef
   sandbox = false;
   manager = null;
   openPolicyAfter = false;
+  grant = null;
+  grantSeq++;
   if (side) flipSide();
   renderLaunchSummary();
   if (!plan || !launchProject) return;
   const id = launchedId(result);
   if (!id) { toast('Session launched but not appointed manager: the daemon did not return its id. Use :manager appoint on it.'); return; }
   try {
-    const r = await invoke<{ message?: string }>('appoint_launched_manager', {
-      projectId: launchProject,
-      sessionId: id,
-      scopeKind: plan.scope.kind,
-      scopeId: plan.scope.kind === 'project' ? null : plan.scope.id,
-      preset: plan.preset,
-    });
+    const r = await invoke<{ message?: string }>('appoint_launched_manager', appointArgs(plan, launchProject, id));
     toast(r.message ?? 'Manager appointed', true);
     if (thenPolicy) void import('./commands.js').then((m) => m.dispatch('mgr-policy', { source: 'menu' }));
   } catch (e) {
@@ -333,6 +529,13 @@ function submitOnEnter(): boolean {
 }
 
 function onKeyDown(ev: KeyboardEvent): void {
+  // Esc on a button or box inside the settings side goes back to the prompt (the draft stays) instead of closing the dialog.
+  if (ev.key === 'Escape' && side && !ev.defaultPrevented && ev.target !== side.panel && side.panel.contains(ev.target as Node | null)) {
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    flipSide();
+    return;
+  }
   if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
   if (ev.defaultPrevented || ev.isComposing) return;
   const target = document.activeElement;
@@ -385,14 +588,17 @@ function onKeyDown(ev: KeyboardEvent): void {
 }
 
 const CSS = `
-.g4-launch-summary { font-family: var(--mono); font-size: 11px; color: var(--subtext); margin: -4px 0 8px; white-space: pre-wrap; }
+.g4-launch-summary { font-size: 12px; color: var(--subtext); margin: -4px 0 8px; white-space: pre-wrap; }
 .g4-side { border: 1px solid var(--surface1); border-radius: 6px; padding: 8px 10px; outline: none; min-height: 9em; }
 .g4-side:focus { border-color: var(--blue); }
 .g4-side-title { font-weight: 600; margin-bottom: 4px; }
 .g4-side-rows { list-style: none; margin: 0 0 6px; padding: 0; font-family: var(--mono); font-size: 12px; }
 .g4-side-rows li { display: flex; gap: 12px; padding: 2px 6px; border-radius: 4px; cursor: default; }
 .g4-side-rows li.sel { background: var(--surface1); }
-.g4-side-label { width: 8ch; color: var(--subtext); }
+.g4-side-label { width: 8ch; color: var(--subtext); flex: none; }
+.g4-side-value { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.g4-side-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.launch-more { margin-right: auto; }
 .g4-correction { margin: 6px 0; padding: 8px 10px; border: 1px solid var(--surface1); border-radius: 8px; background: var(--mantle); }
 .g4-correction[hidden] { display: none; }
 .g4-correction-head { font-weight: 600; font-size: 12px; margin-bottom: 4px; }

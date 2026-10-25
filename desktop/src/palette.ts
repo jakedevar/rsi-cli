@@ -3,19 +3,23 @@
 // a TUI command line (the TUI's own palette is the `:` line). Ranking and the
 // highlight move are pure (registry.ts); this file only renders and routes.
 import { dispatch, snapshot } from './commands.js';
+import type { UiSnapshot } from './registry.js';
 import { $, el, toast } from './dom.js';
 import {
-  type PaletteEntry, type Ranked, commandQuery, isPaletteChord, movePick, paletteEntries, rankPalette,
+  type PaletteEntry, type Ranked, collapsedCount, commandQuery, isPaletteChord, movePick, paletteEntries, rankPalette,
 } from './registry.js';
 import { currentPlatform, runCommandLine } from './vimkeys.js';
 import { paletteArgument } from './overlay-keys.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
 
 let entries: PaletteEntry[] = [];
 let ranked: Ranked[] = [];
 /** The `:` command the query spells, shown as row 0. */
 let cmd: string | null = null;
 let pick = 0;
+/** The Vim keys switch when the palette opened (its empty-result line and rows follow it). */
+let vimOn = true;
 /** Tab put the highlighted command on the line to edit its argument: the query to go back to (gap sweep G4). */
 let argFrom: string | null = null;
 
@@ -28,9 +32,11 @@ export function isPaletteOpen(): boolean {
   return dialog().open;
 }
 
-export function openPalette(): void {
+/** `snap` is for tests; the palette reads the live snapshot. */
+export function openPalette(snap: UiSnapshot = snapshot()): void {
   const d = dialog();
-  entries = paletteEntries(snapshot(), currentPlatform());
+  vimOn = snap.vimKeys;
+  entries = paletteEntries(snap, currentPlatform());
   input().value = '';
   argFrom = null;
   rerank();
@@ -69,10 +75,22 @@ function titleNode(r: Ranked): HTMLElement {
   return span;
 }
 
+/** An empty query hides the actions that wait on a screen that is not open; this line says so (not an option row). */
+function hiddenNote(): HTMLElement[] {
+  const n = input().value.trim() === '' ? collapsedCount(entries) : 0;
+  if (n === 0) return [];
+  const li = el('li', 'palette-empty', `${n} more actions work once their screen is open (such as the Issues workspace). Type to find them.`);
+  li.setAttribute('role', 'note');
+  return [li];
+}
+
 function render(): void {
   const list = $('palette-list');
   if (total() === 0) {
-    list.replaceChildren(el('li', 'palette-empty', 'No matching action (start with : to run a TUI command)'));
+    list.replaceChildren(el('li', 'palette-empty', vimOn
+      ? 'No matching action (start with : to run a TUI command)'
+      : 'No matching action. Try one plain word, such as “files”, “help” or “stop”.'));
+    syncListbox(list, input());
     return;
   }
   const off = cmd === null ? 0 : 1;
@@ -106,8 +124,9 @@ function render(): void {
     li.append(el('span', 'palette-group', e.group), main, keys);
     li.title = e.enabled ? e.title : `${e.title}: ${e.why ?? 'unavailable'}`;
     return li;
-  }));
+  }), ...hiddenNote());
   list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+  syncListbox(list, input());
 }
 
 /** Move the highlight without rebuilding the rows (a click may be in flight). */
@@ -119,6 +138,7 @@ function highlight(i: number, scroll = true): void {
     li.setAttribute('aria-selected', String(on));
     if (on && scroll) li.scrollIntoView({ block: 'nearest' });
   }
+  syncListbox($('palette-list'), input());
 }
 
 function runPick(i: number): void {
@@ -155,7 +175,7 @@ export function initPalette(): void {
       // Tab edits the highlighted command's argument on the `:` line (the TUI palette's argument edit).
       ev.preventDefault();
       const r = ranked[pick - (cmd === null ? 0 : 1)];
-      const line = r ? paletteArgument(r.entry.keys) : null;
+      const line = r ? paletteArgument(r.entry.searchKeys) : null;
       if (!line) { if (r) toast(`${r.entry.title} has no : command to give an argument`, true); return; }
       argFrom ??= input().value;
       input().value = line;

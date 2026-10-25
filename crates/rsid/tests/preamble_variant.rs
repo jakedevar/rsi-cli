@@ -62,3 +62,25 @@ fn on_demand_references_exist() {
         assert!(root().join(path).is_file(), "missing {path}");
     }
 }
+
+/// #3565: the base preamble tells workers to keep a long-lived notes file out of
+/// the file tools (a tool-tracked file is re-injected after every change), and
+/// carries the version that change bumped to.
+#[test]
+fn base_preamble_keeps_long_lived_notes_out_of_the_file_tools() {
+    let base = fs::read_to_string(root().join(".claude/commands/_shared/worker_preamble.md"))
+        .expect("base preamble");
+    let version: u32 = base
+        .lines()
+        .find_map(|line| line.strip_prefix("version: "))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("preamble version");
+    assert!(version >= 32, "the notes-file line shipped in version 32");
+    assert!(base.contains("## Notes files"));
+    assert!(base.contains("with Bash (`cat >> notes.md <<'EOF'`)"));
+    assert!(base.contains("read it with `tail`, never Read/Write/Edit"));
+    assert!(base.contains("re-injected into your context after every later change"));
+    // The one-line contract stays one line in every composed preamble.
+    let loaded = preamble::load(SessionKind::Standard, &root()).expect("base preamble");
+    assert!(loaded.contains("## Notes files"));
+}

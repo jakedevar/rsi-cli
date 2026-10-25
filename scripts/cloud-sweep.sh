@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Transfer one exact rolling commit over SSH and run the complete test matrix.
+# Transfer one exact rolling commit over SSH and run the full-library QA there:
+# `make rolling-library-qa`, the same recipe the merge queue's QA runs on the
+# hub (nextest -p rsid -p rsid-store -p rsid-remote-read -p rsi-common -p rsid-core -p rsi-cloud, then every workspace
+# package standalone), as one lane named rolling-library-qa (#3460).
 #
 #   cloud-sweep.sh cloud SHA [--instance-type TYPE] [--repo DIR]
-#       One command: apply an ephemeral gate host (scripts/cloud-gate.sh --run,
-#       which owns apply, spend guard, ledger lines, cache stats and the
-#       EXIT-trap destroy), run the full sweep of SHA (the current rolling tip)
-#       there, collect the report into ~/.rsi/cloud/results/SHA, destroy.
+#       One command: apply an ephemeral SPOT gate host (scripts/cloud-gate.sh
+#       --run, which owns apply, the spend reservation, ledger lines, cache
+#       stats and the EXIT-trap destroy; 120-minute lifetime), run the full QA
+#       of SHA (the current rolling tip) there, collect the report into
+#       ~/.rsi/cloud/results/SHA, destroy. A host AWS takes back ends the job
+#       without a verdict (INCOMPLETE, "spot_interrupted"): rerun it.
 #       --repo DIR names the git repository whose `origin` URL says where
 #       rolling lives (default: this script's repository); the daemon's
 #       cloud_sweep job runs an embedded copy of this script and passes the
@@ -27,6 +32,14 @@
 # gate host (/srv/rsi-sweep, /home/rsi).
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Collection uses the reporter installed beside the daemon's trusted script.
+if [[ -n "${RSI_CLOUD_BIN:-}" ]]; then
+  rsi_cloud="$RSI_CLOUD_BIN"
+elif [[ -x "$repo_root/bin/rsi-cloud" ]]; then
+  rsi_cloud="$repo_root/bin/rsi-cloud"
+else
+  rsi_cloud="$(command -v rsi-cloud || true)"
+fi
 
 usage() {
   echo 'usage: cloud-sweep.sh cloud SHA [--instance-type TYPE] [--repo DIR] [--mirror DIR] | bundle SHA OUT [--repo DIR] [--mirror DIR] | hub|collect|wait SHA ec2-user@IP [SSH_KEY] | remote SHA' >&2
@@ -215,12 +228,12 @@ if [[ "$mode" == cloud ]]; then
       *) usage ;;
     esac
   done
-  # The sweep builds 16 separate rsid test target trees, hence the larger disk.
+  # One QA target tree and the gate's default 120-minute lifetime and volume:
+  # the reservation is lifetime x the spot reserve rate (rsi-cloud spend reserve).
   mkdir -p "$HOME/.rsi/cloud/results/$sha"
   RSI_SWEEP_ROOT=/srv/rsi-sweep RSI_SWEEP_HOME=/home/rsi \
     RSI_GATE_STATS_COPY="$HOME/.rsi/cloud/results/$sha/sccache.json" \
-    exec "$repo_root/scripts/cloud-gate.sh" ${gate_args[@]+"${gate_args[@]}"} \
-    --root-volume-gib 400 --max-lifetime-minutes 420 --run -- \
+    exec "$repo_root/scripts/cloud-gate.sh" ${gate_args[@]+"${gate_args[@]}"} --run -- \
     "$repo_root/scripts/cloud-sweep.sh" hosted "$sha"
 fi
 
@@ -261,6 +274,7 @@ sudo install -d -o rsi -g rsi "$root/incoming" "$root/src" "$root/sweeps" "$root
 # AL2023 mounts /tmp as tmpfs, and the custody code rejects sandbox roots on
 # tmpfs/ramfs, so give the remote sweep a disk-backed TMPDIR under /srv/rsi.
 sudo install -d -o rsi -g rsi -m 700 "$root/sweeps/tmp/$sha"
+# Remote shard runner still needs Python 3.11 until #3656 lands.
 command -v python3.11 >/dev/null 2>&1 || sudo dnf install -y python3.11
 sudo mv "/tmp/rsi-cloud-$sha.bundle" "$root/incoming/$sha.bundle"
 sudo chown rsi:rsi "$root/incoming/$sha.bundle"
@@ -277,6 +291,10 @@ sudo systemd-run --unit="rsi-cloud-sweep-${sha:0:12}" --remain-after-exit \
   --setenv=RSI_SWEEP_ROOT="$root" \
   --setenv=PATH="$home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
   --setenv=TMPDIR="$root/sweeps/tmp/$sha" \
+  --setenv=GIT_AUTHOR_NAME=rsi-sweep \
+  --setenv=GIT_AUTHOR_EMAIL=rsi-sweep@invalid \
+  --setenv=GIT_COMMITTER_NAME=rsi-sweep \
+  --setenv=GIT_COMMITTER_EMAIL=rsi-sweep@invalid \
   --property=RequiresMountsFor="$root" \
   /usr/bin/bash "$root/sweeps/source/$sha/scripts/cloud-sweep.sh" remote "$sha"
 REMOTE
@@ -287,7 +305,7 @@ REMOTE
     # The unit outlives its process (--remain-after-exit); SubState leaves
     # "running" when the sweep script exits. Give up if the host stays
     # unreachable (the guest also terminates itself at its lifetime limit).
-    deadline=$(( $(date +%s) + ${RSI_SWEEP_WAIT_SECS:-25200} ))
+    deadline=$(( $(date +%s) + ${RSI_SWEEP_WAIT_SECS:-7200} ))
     unit="rsi-cloud-sweep-${sha:0:12}"
     fails=0
     while :; do
@@ -324,7 +342,7 @@ REMOTE
   fi
   # Mechanical KNOWN/NEW verdict from the collected logs (Issue #1016). Best
   # effort and after everything above: the host destroy never depends on it.
-  python3 "$repo_root/scripts/cloud-sweep-verdict.py" "$local_result" >/dev/null 2>&1 ||
+  "$rsi_cloud" sweep-verdict "$local_result" >/dev/null 2>&1 ||
     echo "cloud-sweep: verdict step failed; classify $local_result by hand" >&2
   cat "$local_result/QA.md"
   exit 0
@@ -342,16 +360,23 @@ cd "$repo_root"
 export TMPDIR="$sweep_root/sweeps/tmp/$sha"
 mkdir -p "$TMPDIR"
 chmod 700 "$TMPDIR"
+# The sweep user has no gitconfig, so tests that commit in temp repos would die
+# with 'empty ident name' (#4012). Fixed identity for every git the sweep runs.
+export GIT_AUTHOR_NAME=rsi-sweep GIT_AUTHOR_EMAIL=rsi-sweep@invalid
+export GIT_COMMITTER_NAME=rsi-sweep GIT_COMMITTER_EMAIL=rsi-sweep@invalid
 mkdir -p "$sweep_root/sweeps/results"
 exec 9>"$sweep_root/sweeps/cloud-sweep.lock"
 flock -n 9 || { echo 'another cloud sweep is active' >&2; exit 1; }
 result_dir="$sweep_root/sweeps/results/$sha"
 [[ ! -e "$result_dir" ]] || { echo "sweep already recorded: $result_dir" >&2; exit 1; }
 mkdir -p "$result_dir/logs" "$result_dir/status" "$result_dir/lists" "$result_dir/list-status" "$result_dir/bin"
-# The shard runner invokes python3, while AL2023's system python3 is 3.9.
+# Remote shard runner still needs Python 3.11 until #3656 lands (AL2023 has 3.9).
 ln -s "$(command -v python3.11)" "$result_dir/bin/python3"
 export PATH="$result_dir/bin:$PATH"
-export CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
+# The 32-vCPU spot host runs one QA lane: cargo may use most of it, and the
+# recipe's nextest threads default (2, sized for the hub) is raised.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}" CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
+export RSI_LIBRARY_QA_TEST_THREADS="${RSI_LIBRARY_QA_TEST_THREADS:-8}"
 if ! command -v cargo >/dev/null 2>&1; then
   curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
 fi
@@ -364,6 +389,10 @@ fi
 if ! command -v cargo-nextest >/dev/null 2>&1; then
   cargo install cargo-nextest --locked --version 0.9.137
 fi
+# Build the reporting tools from the exact swept source, before running QA.
+report_target="$sweep_root/target/cloud-$sha/reporting"
+cargo build --locked -p rsi-cloud --bin rsi-cloud --target-dir "$report_target"
+rsi_cloud="$report_target/debug/rsi-cloud"
 started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "CLOUD SWEEP running sha=$sha started=$started"
 
@@ -371,9 +400,9 @@ finish() {
   local code="$?" finished
   trap - EXIT
   finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  python3.11 scripts/cloud-sweep-report.py "$sha" "$started" "$finished" "$result_dir" \
+  "$rsi_cloud" sweep-report "$sha" "$started" "$finished" "$result_dir" \
     "$sweep_root/seed-failures.txt" >"$result_dir/QA.md" || true
-  python3.11 scripts/cloud-sweep-json.py "$sha" "$started" "$finished" "$result_dir" \
+  "$rsi_cloud" sweep-json "$sha" "$started" "$finished" "$result_dir" \
     nextest >"$result_dir/report.json" || true
   cat "$result_dir/QA.md" 2>/dev/null || true
   rm -rf "$TMPDIR" || true
@@ -388,72 +417,8 @@ run_lane() {
   printf '%s\t%s\n' "$label" "$status" >"$result_dir/status/$label.tsv"
 }
 
-# shard -> "-p PACKAGE ..." flags (#1021 S4: a shard spans rsid and rsid-store).
-declare -A shard_package_flags
-while read -r shard_name shard_packages; do
-  flags=""
-  for package_name in $shard_packages; do flags+="-p $package_name "; done
-  shard_package_flags[$shard_name]="${flags% }"
-done < <(python3.11 scripts/check-rsid-test-shards.py --list-shard-packages)
-
-run_list() {
-  local shard="$1" status
-  local -a package_flags
-  read -r -a package_flags <<<"${shard_package_flags[$shard]}"
-  if env CARGO_TARGET_DIR="$sweep_root/target/cloud-$sha/rsid-$shard" \
-    cargo nextest list --profile rsid-fast "${package_flags[@]}" --lib --no-default-features \
-    --features "test-shard-$shard" --ignore-default-filter --message-format json \
-    >"$result_dir/lists/$shard.json" 2>"$result_dir/logs/list-$shard.log"; then
-    status=0
-  else
-    status=$?
-  fi
-  printf '%s\n' "$status" >"$result_dir/list-status/$shard"
-}
-
-bounded_wait() {
-  if [[ "$(jobs -rp | wc -l)" -ge 4 ]]; then wait -n || true; fi
-}
-
-shard_output="$(python3.11 scripts/check-rsid-test-shards.py --require-gates --list-shards)"
-mapfile -t shards <<<"$shard_output"
-[[ "${#shards[@]}" -eq 16 ]] || { echo 'expected 16 rsid library shards' >&2; exit 1; }
-for shard in "${shards[@]}"; do
-  run_list "$shard" &
-  bounded_wait
-done
-wait || true
-[[ "$(find "$result_dir/list-status" -type f | wc -l)" -eq 16 ]] || exit 1
-if grep -qv '^0$' "$result_dir"/list-status/*; then exit 1; fi
-python3.11 scripts/check-rsid-test-shards.py --require-gates --runtime-dir "$result_dir/lists"
-for shard in "${shards[@]}"; do
-  run_lane "rsid-$shard" scripts/run-rsid-test-shards.sh shard "$shard" --jobs 4 --slow-tier &
-  bounded_wait
-done
-wait || true
-
-# Select integration targets explicitly: `--tests` also selects the unsharded
-# rsid library harness, which would defeat the shard memory limit.
-integration_args=()
-for target in crates/rsid/tests/*.rs; do
-  [[ -f "$target" ]] || continue
-  label="${target##*/}"
-  label="${label%.rs}"
-  integration_args+=(--test "$label")
-done
-[[ "${#integration_args[@]}" -gt 0 ]] || { echo 'no rsid integration targets found' >&2; exit 1; }
-run_lane rsid-integrations cargo nextest run --profile ci-full -p rsid \
-  "${integration_args[@]}" --status-level all --final-status-level all -j 8 &
-run_lane rsid-bins cargo nextest run --profile ci-full -p rsid --bins \
-  --status-level all --final-status-level all -j 8 &
-run_lane rsi cargo nextest run --profile ci-full -p rsi --lib \
-  --status-level all --final-status-level all -j 8 &
-run_lane rsi-common cargo nextest run --profile ci-full -p rsi-common --all-targets \
-  --status-level all --final-status-level all -j 8 &
-wait || true
-run_lane other-workspace cargo nextest run --profile ci-full --workspace \
-  --exclude rsid --exclude rsid-store --exclude rsi --exclude rsi-common \
-  --status-level all --final-status-level all -j 8 &
-run_lane rsid-doctests cargo test -p rsid -p rsid-store --doc -- --test-threads=8 &
-run_lane other-doctests cargo test --workspace --exclude rsid --exclude rsid-store --doc -- --test-threads=8 &
-wait || true
+# The whole library QA is one lane: exactly what `make rolling-library-qa` runs
+# on the hub. Its red names come from the nextest "FAIL" lines and
+# check-standalone-packages.sh, and a nonzero exit with no named test is a
+# build_or_harness_failure (INCOMPLETE), as for any lane.
+run_lane rolling-library-qa make rolling-library-qa

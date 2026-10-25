@@ -243,7 +243,7 @@ pub(crate) fn select_explained(
         "rust-toolchain",
         "rust-toolchain.toml",
     ]);
-    let output = Command::new("git")
+    let output = crate::lander_env::command("git")
         .args(&args)
         .current_dir(repo)
         .output()
@@ -622,6 +622,17 @@ impl UnfilteredSelection {
                 self.reached_tests,
             ),
         };
+        // #3887: an empty selection describes the rsid family only. It says the
+        // diff reached no rsid or rsid-store library test, not that the gate ran
+        // no test; the package runs are counted by `gate_timing shards=`.
+        let library = if matches!(&self.lib, LibTests::Tests(tests) if tests.is_empty())
+            && self.reached_tests == 0
+            && self.targets.is_empty()
+        {
+            format!("{library} scope=rsid_family_only")
+        } else {
+            library
+        };
         if self.targets_bounded() {
             format!(
                 "{library} targets=bounded selected={} reached={}",
@@ -689,7 +700,7 @@ fn nearest_tests(tests: &BTreeMap<String, usize>, bound: usize) -> BTreeSet<Stri
 /// like the lander's other git calls: an inherited `GIT_DIR` must not turn a
 /// diff into `--no-index` mode.
 fn repo_git(repo: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::lander_env::command("git");
     command
         .current_dir(repo)
         .env_remove("GIT_DIR")
@@ -4086,6 +4097,29 @@ mod tests {
         );
     }
 
+    /// #3887: an empty rsid-family selection is labelled as such, so the queue
+    /// outcome of a package-only source does not read as "the gate ran no test".
+    #[test]
+    fn an_empty_rsid_family_selection_names_its_scope() {
+        let empty = UnfilteredSelection {
+            lib: LibTests::Tests(BTreeSet::new()),
+            reached_tests: 0,
+            targets: BTreeSet::new(),
+            reached_targets: 0,
+            leaf_tests: BTreeSet::new(),
+        };
+        assert_eq!(
+            empty.evidence(),
+            "selection=closure selected=0 reached=0 scope=rsid_family_only"
+        );
+        let one = UnfilteredSelection {
+            lib: LibTests::Tests(BTreeSet::from(["t".to_owned()])),
+            reached_tests: 1,
+            ..empty
+        };
+        assert_eq!(one.evidence(), "selection=closure selected=1 reached=1");
+    }
+
     #[test]
     fn explanation_reports_the_real_selectors_distances_and_cut() {
         let tree = daemon_hub_tree();
@@ -6417,8 +6451,9 @@ Binary files a/crates/rsid/src/img.png and b/crates/rsid/src/img.png differ
     }
 
     /// The real source/test pair of #1280: a change to the body of
-    /// `topology_created_usage` reaches `t4_a5_max_created_sessions_is_charged`
-    /// (or, at worst, runs every library test).
+    /// the topology charge rule reaches `t4_a5_max_created_sessions_is_charged`
+    /// in the whole dependency closure. The gate's separate nearest-test
+    /// budget can omit this downstream test as unrelated source grows (#589).
     #[test]
     fn the_real_topology_usage_change_reaches_its_topology_test() {
         let root = Path::new(rsi_common::manifest_dir!()).join("../..");
@@ -6448,9 +6483,11 @@ Binary files a/crates/rsid/src/img.png and b/crates/rsid/src/img.png differ
         }
         let path = "crates/rsid-store/src/store_support/topology_usage.rs";
         let text = real.get(path).expect("topology_usage.rs").clone();
-        let start = line_of(&text, "fn topology_created_usage");
-        let body = start + 2;
-        let selection = select_from(&[changed(path, &[body])], &real, &real).unwrap();
+        // #3416: the charged-attempt rule (the SQL) lives in
+        // `topology_created_times`; `topology_created_usage` counts its rows.
+        let body = line_of(&text, "let mut statement = conn.prepare(");
+        let selection =
+            select_from_within(&[changed(path, &[body])], &real, &real, Budget::WHOLE).unwrap();
         match selection.lib {
             LibTests::Tests(tests) => assert!(
                 tests.contains("topology::agent_tests::t4_a5_max_created_sessions_is_charged"),

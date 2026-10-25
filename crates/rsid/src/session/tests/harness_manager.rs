@@ -2,6 +2,135 @@ use super::*;
 use rsi_common::harness_manager::*;
 use rsi_common::types::{Project, ScheduledJob, WakeMode};
 
+#[cfg(unix)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn profile_candidate_accepts_only_live_scoped_manager_evidence_in_registered_source() {
+    use crate::agent_jobs::profile_verification;
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::{AgentJobResultV1, JobParams, JobState, JobWake};
+    use rsi_common::agent_landing_candidate::AgentCheckLandingCandidateRequestV1 as Request;
+    use rsi_repo_guards::scratch_git::Policy;
+    let policy = Policy::from_process(std::path::Path::new(rsi_common::manifest_dir!())).unwrap();
+    let repo = policy.tempdir("profile-candidate-").unwrap();
+    std::fs::write(repo.path().join("Makefile"), "test:\n\t@echo verified\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "Makefile"],
+        vec![
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        assert!(
+            policy
+                .command(repo.path(), &args)
+                .unwrap()
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let pilot = pilot().await;
+    let control = pilot.manager.agent_control();
+    let params: JobParams =
+        serde_json::from_value(serde_json::json!({"kind":"test", "scoped_test":{"base":"HEAD"}}))
+            .unwrap();
+    let binding = profile_verification::resolve_binding(&params, repo.path())
+        .unwrap()
+        .unwrap();
+    let (worker, wrong_root, unreachable) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let other = policy.tempdir("profile-other-").unwrap();
+    let job_id = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        for (id, root, parent) in [
+            (worker, repo.path(), Some(pilot.epics[0])),
+            (wrong_root, other.path(), Some(pilot.epics[0])),
+            (unreachable, repo.path(), None),
+        ] {
+            let mut session = bare_session(id);
+            session.parent_id = parent;
+            session.session_kind = SessionKind::Task;
+            session.status = SessionStatus::Completed;
+            session.project_id = Some(pilot.config.project_id);
+            session.working_dir = root.to_path_buf();
+            session.sandbox_root = Some(root.to_path_buf());
+            store.insert_session(&session).unwrap();
+        }
+        let new = NewAgentJob {
+            id: job_id,
+            owner_session_id: pilot.owner,
+            project_id: Some(pilot.config.project_id),
+            name: None,
+            params,
+            cwd: repo.path().to_string_lossy().into_owned(),
+            unit_name: format!("rsi-job-{job_id}"),
+            log_path: other.path().join("job.log").to_string_lossy().into_owned(),
+            status_path: other
+                .path()
+                .join("job.status")
+                .to_string_lossy()
+                .into_owned(),
+            idempotency_key: None,
+            wake: JobWake::None,
+        };
+        store.insert_agent_job(&new, chrono::Utc::now()).unwrap();
+        store
+            .record_agent_job_profile_verification(job_id, &binding)
+            .unwrap();
+        let job = store.get_agent_job(job_id).unwrap().unwrap().job;
+        let mut state = JobState::Succeeded;
+        let mut result = AgentJobResultV1 {
+            exit_code: Some(0),
+            ..AgentJobResultV1::default()
+        };
+        profile_verification::finish_profile_verification(&job, &mut state, &mut result);
+        store
+            .settle_agent_job(job_id, state, &result, false, chrono::Utc::now())
+            .unwrap();
+    }
+    let request = |source, explicit: bool| Request {
+        job_id: explicit.then(|| job_id.to_string()),
+        source_session_id: Some(source),
+        source_commit: binding.head.clone(),
+    };
+    for explicit in [true, false] {
+        let verdict = control
+            .agent_check_landing_candidate(pilot.owner, request(worker, explicit))
+            .await
+            .unwrap();
+        assert!(verdict.ok, "{verdict:?}");
+        assert_eq!(verdict.job_owner_session_id, Some(pilot.owner));
+    }
+    for source in [wrong_root, unreachable] {
+        let error = control
+            .agent_check_landing_candidate(pilot.owner, request(source, true))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("candidate_not_found"), "{error}");
+    }
+    // A source/profile edit after successful settlement invalidates evidence.
+    std::fs::create_dir(repo.path().join(".rsi")).unwrap();
+    std::fs::write(
+        repo.path().join(".rsi/project.toml"),
+        "version=1\nverification=[]\n",
+    )
+    .unwrap();
+    let verdict = control
+        .agent_check_landing_candidate(pilot.owner, request(worker, true))
+        .await
+        .unwrap();
+    assert_eq!(verdict.refusal.as_deref(), Some("candidate_profile_stale"));
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 #[allow(
@@ -122,15 +251,23 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         let predicate = || WakePredicate {
             jobs_terminal: Some(vec![live.id, queued.id]),
             sha_on_rolling: None,
+            shas_on_rolling: None,
             issue_closed: None,
             todo_closed: None,
             topology_execution_settled: None,
             health_anomaly: None,
             settlement_run_settled: None,
+            fire: None,
         };
         assert!(
             control
-                .agent_get_job(successor, AgentGetJobRequestV1 { job_id: live.id })
+                .agent_get_job(
+                    successor,
+                    AgentGetJobRequestV1 {
+                        job_id: live.id,
+                        fields: Default::default()
+                    }
+                )
                 .await
                 .unwrap_err()
                 .to_string()
@@ -152,11 +289,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
                 WakePredicate {
                     jobs_terminal: Some(vec![live.id, done.id]),
                     sha_on_rolling: None,
+                    shas_on_rolling: None,
                     issue_closed: None,
                     todo_closed: None,
                     topology_execution_settled: None,
                     health_anomaly: None,
                     settlement_run_settled: None,
+                    fire: None,
                 },
                 None,
             )
@@ -203,7 +342,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         }
         assert_eq!(
             control
-                .agent_get_job(successor, AgentGetJobRequestV1 { job_id: live.id })
+                .agent_get_job(
+                    successor,
+                    AgentGetJobRequestV1 {
+                        job_id: live.id,
+                        fields: Default::default()
+                    }
+                )
                 .await
                 .unwrap()
                 .owner_session_id,
@@ -212,14 +357,34 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         // #2470: a job settled before a published rotation stays readable by
         // the successor seat, listed and fetched, without moving its owner;
         // a seat change with no rotation lineage proves no predecessor.
-        let listed = control
-            .agent_list_jobs(successor, AgentListJobsRequestV1 { limit: None })
+        let listed_result = control
+            .agent_list_jobs(successor, AgentListJobsRequestV1::default())
             .await
-            .unwrap()
-            .jobs;
+            .unwrap();
+        // hub #3889: the predecessor listing is compact by default (no result payload).
+        let rows = listed_result.render(AgentListJobsRequestV1::default().fields);
+        assert_eq!(rows["view"], "compact");
+        assert_eq!(
+            rows["jobs"].as_array().unwrap().len(),
+            if rotation { 3 } else { 2 }
+        );
+        assert!(
+            rows["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("result").is_none() && row["state"].is_string())
+        );
+        let listed = listed_result.jobs;
         assert_eq!(listed.len(), if rotation { 3 } else { 2 });
         let settled = control
-            .agent_get_job(successor, AgentGetJobRequestV1 { job_id: done.id })
+            .agent_get_job(
+                successor,
+                AgentGetJobRequestV1 {
+                    job_id: done.id,
+                    fields: Default::default(),
+                },
+            )
             .await;
         if rotation {
             let settled = settled.unwrap();
@@ -239,11 +404,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
                 WakePredicate {
                     jobs_terminal: Some(vec![done.id]),
                     sha_on_rolling: None,
+                    shas_on_rolling: None,
                     issue_closed: None,
                     todo_closed: None,
                     topology_execution_settled: None,
                     health_anomaly: None,
                     settlement_run_settled: None,
+                    fire: None,
                 },
                 None,
             )
@@ -262,7 +429,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         // An in-scope worker's job is readable by the live seat only.
         assert_eq!(
             control
-                .agent_get_job(successor, AgentGetJobRequestV1 { job_id: foreign.id })
+                .agent_get_job(
+                    successor,
+                    AgentGetJobRequestV1 {
+                        job_id: foreign.id,
+                        fields: Default::default()
+                    }
+                )
                 .await
                 .unwrap()
                 .owner_session_id,
@@ -271,7 +444,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         for caller in [pilot.owner, pilot.leads[1]] {
             assert!(
                 control
-                    .agent_get_job(caller, AgentGetJobRequestV1 { job_id: foreign.id })
+                    .agent_get_job(
+                        caller,
+                        AgentGetJobRequestV1 {
+                            job_id: foreign.id,
+                            fields: Default::default()
+                        }
+                    )
                     .await
                     .unwrap_err()
                     .to_string()
@@ -283,7 +462,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         for job_id in [done.id, foreign.id] {
             assert!(
                 control
-                    .agent_get_job(outsider, AgentGetJobRequestV1 { job_id })
+                    .agent_get_job(
+                        outsider,
+                        AgentGetJobRequestV1 {
+                            job_id,
+                            fields: Default::default()
+                        }
+                    )
                     .await
                     .unwrap_err()
                     .to_string()
@@ -292,7 +477,7 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         }
         assert_eq!(
             control
-                .agent_list_jobs(pilot.owner, AgentListJobsRequestV1 { limit: None })
+                .agent_list_jobs(pilot.owner, AgentListJobsRequestV1::default())
                 .await
                 .unwrap()
                 .jobs[0]
@@ -316,7 +501,13 @@ async fn manager_seat_succession_hands_over_job_reads_waits_and_cancellation() {
         for caller in [pilot.owner, pilot.leads[1]] {
             assert!(
                 control
-                    .agent_get_job(caller, AgentGetJobRequestV1 { job_id: live.id })
+                    .agent_get_job(
+                        caller,
+                        AgentGetJobRequestV1 {
+                            job_id: live.id,
+                            fields: Default::default()
+                        }
+                    )
                     .await
                     .unwrap_err()
                     .to_string()
@@ -435,6 +626,190 @@ async fn notices(pilot: &Pilot) -> Vec<ScheduledJob> {
         .into_iter()
         .filter(|job| job.wake_session_id == Some(pilot.owner))
         .collect()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn rotated_manager_with_policy() -> (Pilot, Uuid, Session) {
+    use rsi_common::harness_manager_v2::{
+        ConfigureHarnessManagerPolicyRequestV2, ManagerCapabilityV2, ManagerPolicyV2,
+    };
+    let pilot = pilot().await;
+    let successor = Uuid::new_v4();
+    let predecessor = {
+        let store = pilot.manager.store.lock().await;
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: pilot.config.project_id,
+                expected_scope_version: pilot.config.row_version,
+                expected_policy_version: 0,
+                idempotency_key: "rotation-policy".into(),
+                policy: ManagerPolicyV2 {
+                    capabilities: vec![ManagerCapabilityV2::WorkPlan],
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let mut next = store.get_session(pilot.owner).unwrap().unwrap();
+        next.id = successor;
+        next.continued_from = Some(pilot.owner);
+        next.rotation_depth += 1;
+        next.status = SessionStatus::Running;
+        store.insert_session(&next).unwrap();
+        store
+            .set_session_terminal_status(pilot.owner, SessionStatus::Completed, "success")
+            .unwrap();
+        store
+            .update_session_status(pilot.owner, SessionStatus::Archived)
+            .unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(pilot.owner, successor)
+                .unwrap()
+        );
+        store.get_session(pilot.owner).unwrap().unwrap()
+    };
+    (pilot, successor, predecessor)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+async fn assert_rotated_manager_current(pilot: &Pilot, successor: Uuid, predecessor: &Session) {
+    {
+        let store = pilot.manager.store.lock().await;
+        let stored = store.get_session(pilot.owner).unwrap().unwrap();
+        assert_eq!(stored.status, SessionStatus::Archived);
+        assert_eq!(stored.stop_reason, predecessor.stop_reason);
+        assert_eq!(stored.updated_at, predecessor.updated_at);
+        let current: String = store
+            .conn
+            .query_row(
+                "SELECT successor_session_id FROM harness_manager_rotation_edges
+             WHERE predecessor_session_id=?1 AND retired_at IS NULL",
+                [pilot.owner.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current, successor.to_string());
+        assert_eq!(
+            store
+                .get_harness_manager(pilot.config.project_id)
+                .unwrap()
+                .unwrap()
+                .current_session_id,
+            Some(successor),
+        );
+        let policy = store
+            .get_harness_manager_policy(pilot.config.project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.manager_session_id, pilot.owner);
+        assert_eq!(policy.scope_version, pilot.config.row_version);
+        assert!(!policy.revoked);
+    }
+    let catalog = pilot
+        .manager
+        .agent_control()
+        .agent_get_authority_catalog(successor, Default::default())
+        .await
+        .unwrap();
+    assert!(
+        catalog.roles.iter().any(|role| role == "manager"),
+        "{:?}",
+        catalog.roles
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn late_terminal_writes_keep_rotated_manager_successor() {
+    use crate::store::daemon_settings::{AutofileCause, C5StageOutcome};
+    let (pilot, successor, predecessor) = rotated_manager_with_policy().await;
+    assert_rotated_manager_current(&pilot, successor, &predecessor).await;
+    for status in [
+        SessionStatus::Completed,
+        SessionStatus::Failed,
+        SessionStatus::Interrupted,
+    ] {
+        // Replay the queued default writer and the finalizer's cause-bearing
+        // writer AFTER the rotation commit, including its observed success cause.
+        pilot
+            .manager
+            .persistence
+            .update_status(pilot.owner, status)
+            .await
+            .unwrap();
+        pilot.manager.persistence.barrier().await.unwrap();
+        assert_rotated_manager_current(&pilot, successor, &predecessor).await;
+        pilot
+            .manager
+            .persistence
+            .update_terminal_status(pilot.owner, status, "success".into())
+            .await
+            .unwrap();
+        pilot.manager.persistence.barrier().await.unwrap();
+        assert_rotated_manager_current(&pilot, successor, &predecessor).await;
+    }
+    // A late non-terminal queued write must not lift the predecessor either.
+    for status in [
+        SessionStatus::Starting,
+        SessionStatus::Running,
+        SessionStatus::WaitingApproval,
+    ] {
+        pilot
+            .manager
+            .persistence
+            .update_status(pilot.owner, status)
+            .await
+            .unwrap();
+        pilot.manager.persistence.barrier().await.unwrap();
+        assert_rotated_manager_current(&pilot, successor, &predecessor).await;
+    }
+    assert_eq!(
+        pilot.manager.persistence.acknowledge_failed_and_stage_autofile(
+            pilot.owner, AutofileCause::OtherTerminalFailure,
+        ).await.unwrap(),
+        C5StageOutcome::SupersededByRotation,
+    );
+    assert_rotated_manager_current(&pilot, successor, &predecessor).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn unarchive_rotated_manager_predecessor_keeps_successor() {
+    let (pilot, successor, predecessor) = rotated_manager_with_policy().await;
+    let error = pilot
+        .manager
+        .unarchive_session(pilot.owner)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("session_rotation_successor_current"),
+        "{error}"
+    );
+    {
+        let store = pilot.manager.store.lock().await;
+        let error = store.unarchive_session(pilot.owner).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("session_rotation_successor_current"),
+            "{error}"
+        );
+        // Ordinary historical sessions still restore through the same writer.
+        store
+            .update_session_status(pilot.leads[0], SessionStatus::Archived)
+            .unwrap();
+        assert_eq!(
+            store
+                .unarchive_session(pilot.leads[0])
+                .unwrap()
+                .unwrap()
+                .status,
+            SessionStatus::Completed
+        );
+    }
+    assert_rotated_manager_current(&pilot, successor, &predecessor).await;
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -1092,6 +1467,254 @@ async fn lead_reply(pilot: &Pilot, request_id: Uuid, key: &str) -> HarnessManage
         .unwrap()
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn lead_inbox_pending_request_has_exact_reply_instruction_and_notes_have_no_obligation() {
+    let pilot = pilot().await;
+    let control = pilot.manager.agent_control();
+    let info = control
+        .agent_manager_send(
+            pilot.owner,
+            AgentManagerSendRequestV1 {
+                epic_id: pilot.epics[0],
+                message: "Ruling: continue the agreed scope".into(),
+                idempotency_key: "informational-ruling".into(),
+                informational: true,
+            },
+        )
+        .await
+        .unwrap();
+    let progress = control
+        .agent_manager_progress(pilot.owner, AgentManagerProgressRequestV1::default())
+        .await
+        .unwrap();
+    assert!(progress.rows.iter().all(|row| row.pending_requests == 0));
+
+    let request = manager_request(&pilot, "explicit-reply").await;
+    let instruction = format!(
+        "reply with AgentManagerReply request_id={}",
+        request.message_id
+    );
+    for fields in [
+        AgentManagerInboxFieldsV1::Compact,
+        AgentManagerInboxFieldsV1::Full,
+        AgentManagerInboxFieldsV1::Summary,
+    ] {
+        let inbox = control
+            .agent_manager_inbox(
+                pilot.leads[0],
+                AgentManagerInboxRequestV1 {
+                    fields,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let wire = serde_json::to_value(&inbox).unwrap();
+        let messages = wire["messages"].as_array().unwrap();
+        let pending = messages
+            .iter()
+            .find(|message| message["message_id"] == request.message_id.to_string())
+            .unwrap();
+        assert_eq!(pending["reply_instruction"], instruction);
+        let note = messages
+            .iter()
+            .find(|message| message["message_id"] == info.message_id.to_string())
+            .unwrap();
+        assert_eq!(note["informational"], true);
+        assert_eq!(note.get("reply_instruction"), None);
+    }
+    let progress = control
+        .agent_manager_progress(pilot.owner, AgentManagerProgressRequestV1::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        progress
+            .rows
+            .iter()
+            .map(|row| row.pending_requests)
+            .sum::<u32>(),
+        1
+    );
+    let error = control
+        .agent_manager_reply(
+            pilot.leads[0],
+            AgentManagerReplyRequestV1 {
+                request_id: info.message_id,
+                message: "No reply required".into(),
+                idempotency_key: "cannot-reply-to-ruling".into(),
+                still_running: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_request_not_in_scope"));
+
+    lead_reply(&pilot, request.message_id, "complete-request").await;
+    for caller in [pilot.leads[0], pilot.owner] {
+        let inbox = control
+            .agent_manager_inbox(
+                caller,
+                AgentManagerInboxRequestV1 {
+                    fields: AgentManagerInboxFieldsV1::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let settled = inbox
+            .messages
+            .iter()
+            .find(|message| message.message_id == request.message_id)
+            .unwrap();
+        assert!(settled.replied);
+        assert_eq!(settled.reply_instruction, None);
+    }
+    let progress = control
+        .agent_manager_progress(pilot.owner, AgentManagerProgressRequestV1::default())
+        .await
+        .unwrap();
+    assert!(progress.rows.iter().all(|row| row.pending_requests == 0));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn lead_message_notices_return_bodies_beyond_a_stale_message_page_3914() {
+    let mut pilot = pilot().await;
+    let control = pilot.manager.agent_control();
+    // Fill the first message page with mail addressed to a former lead.
+    // Informational sends avoid creating unrelated outstanding obligations.
+    for index in 0..=HARNESS_MANAGER_MAX_INBOX_PAGE {
+        control
+            .agent_manager_send(
+                pilot.owner,
+                AgentManagerSendRequestV1 {
+                    epic_id: pilot.epics[0],
+                    message: format!("Historical ruling {index}"),
+                    idempotency_key: format!("historical-{index}"),
+                    informational: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    // Reproduce create_session then assign_lead, without changing the role
+    // publication/launch ordering tracked separately by #3907/#3908.
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut replacement = store.get_session(pilot.leads[0]).unwrap().unwrap();
+        replacement.id = Uuid::new_v4();
+        store.insert_session(&replacement).unwrap();
+        store
+            .set_lead_session(pilot.epics[0], Some(replacement.id))
+            .unwrap();
+        pilot.leads[0] = replacement.id;
+    }
+    let request = manager_request(&pilot, "readable-request").await;
+    let note_text = "Ruling: continue the agreed scope\nPreserve this entire second line.";
+    let info = control
+        .agent_manager_send(
+            pilot.owner,
+            AgentManagerSendRequestV1 {
+                epic_id: pilot.epics[0],
+                message: note_text.into(),
+                idempotency_key: "readable-information".into(),
+                informational: true,
+            },
+        )
+        .await
+        .unwrap();
+    let expected = [
+        (request.message_id, "Status request readable-request", false),
+        (info.message_id, note_text, true),
+    ];
+    // Stored notices remain ID-only, exactly like the incident's retained
+    // rows. The read projection must hydrate them; new-write-only fixes fail.
+    {
+        let inbox = control
+            .agent_manager_inbox(
+                pilot.leads[0],
+                AgentManagerInboxRequestV1 {
+                    fields: AgentManagerInboxFieldsV1::Full,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // This is the observed failure shape: no live messages on page one,
+        // while the notices independently deliver current mail.
+        assert!(inbox.messages.is_empty());
+        assert!(inbox.next_after_sequence.is_some());
+        assert_eq!(inbox.notices.len(), expected.len());
+        for (id, body, informational) in expected {
+            let notice = inbox
+                .notices
+                .iter()
+                .find(|notice| notice.subject_id == id.to_string())
+                .unwrap();
+            assert_eq!(notice.state["message"], body);
+            assert_eq!(notice.state["informational"], informational);
+            let foreign = control
+                .agent_manager_inbox(
+                    pilot.leads[1],
+                    AgentManagerInboxRequestV1 {
+                        read_notice_ids: vec![notice.notice_id],
+                        fields: AgentManagerInboxFieldsV1::Full,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                foreign
+                    .to_string()
+                    .contains("manager_notice_not_authorized")
+            );
+            for fields in [
+                AgentManagerInboxFieldsV1::Compact,
+                AgentManagerInboxFieldsV1::Summary,
+                AgentManagerInboxFieldsV1::Full,
+            ] {
+                let reread = control
+                    .agent_manager_inbox(
+                        pilot.leads[0],
+                        AgentManagerInboxRequestV1 {
+                            read_notice_ids: vec![notice.notice_id],
+                            fields,
+                            include_sent: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(reread.messages.is_empty());
+                assert_eq!(reread.next_after_sequence, None);
+                let retained = &reread.notices[0];
+                assert_eq!(retained.retrieved_at, notice.retrieved_at);
+                assert_eq!(retained.settled_at, notice.settled_at);
+                if fields != AgentManagerInboxFieldsV1::Summary {
+                    assert_eq!(retained.state["message"], body);
+                    assert_eq!(retained.state["informational"], informational);
+                } else {
+                    assert!(retained.state.is_null());
+                    assert!(retained.state_summary.is_some());
+                }
+            }
+            let filtered = control
+                .agent_manager_inbox(
+                    pilot.leads[0],
+                    AgentManagerInboxRequestV1 {
+                        request_id: Some(id),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(filtered.messages[0].message, body);
+        }
+    }
+}
+
 /// Record the planner's delivery exactly as the scheduler does after a
 /// successful manager-notice continuation.
 async fn settle_delivery(pilot: &Pilot, job_id: Uuid) {
@@ -1400,6 +2023,9 @@ async fn manager_mail_wakes_idle_lead_while_manager_is_running() {
     };
     assert_eq!(tip, pilot.leads[0]);
     assert!(message.starts_with("1 durable manager notices pending; read AgentManagerInbox"));
+    assert!(message.contains("AgentManagerInbox {\"fields\":\"full\"}"));
+    assert!(message.contains("notices[].state.message"));
+    assert!(message.contains("read_notice_ids:[<notice_id>], fields:\"full\""));
     assert!(message.contains(&format!("message subject={}", request.message_id)));
 }
 
@@ -2757,7 +3383,7 @@ async fn v1_failed_seat_beyond_first_page_is_signalled_within_bounded_passes() {
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
-async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_probe() {
+async fn enqueue_successor_supersedes_predecessor_descendants_and_refuses_a_claim_during_probe() {
     use rsi_common::rolling_queue::{AgentEnqueueLandingSourceRequestV1, RollingQueueEntryState};
     let pilot = pilot().await;
     let repo = crate::test_support::disk_backed_tempdir("enqueue-supersedes");
@@ -2791,8 +3417,27 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
                 .unwrap();
         }
     }
+    let issue = {
+        let store = pilot.manager.store.lock().await;
+        store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: pilot.config.project_id,
+                title: "queue link".into(),
+                body: String::new(),
+                priority: None,
+                labels: Vec::new(),
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .display_number
+    };
     let request =
         |index: usize, key: &str, supersedes: Option<Uuid>| AgentEnqueueLandingSourceRequestV1 {
+            issue: Some(issue),
             supersedes,
             source_commit: commits[index].clone(),
             idempotency_key: key.into(),
@@ -2802,8 +3447,19 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
             test_filters: Vec::new(),
             project_id: None,
             source_session_id: None,
+            expedite: None,
         };
     let control = pilot.manager.agent_control();
+    let mut unknown = request(1, "unknown-issue", None);
+    unknown.issue = Some(issue + 1000);
+    let error = control
+        .agent_enqueue_landing_source(pilot.owner, unknown, true)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("queue_invalid_request"),
+        "{error}"
+    );
     let old = control
         .agent_enqueue_landing_source(pilot.owner, request(1, "old", None), true)
         .await
@@ -2827,25 +3483,58 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
         error.to_string().contains("queue_entry_not_found"),
         "{error}"
     );
+    let successor = {
+        let store = pilot.manager.store.lock().await;
+        let mut row = store.get_session(pilot.owner).unwrap().unwrap();
+        row.id = Uuid::new_v4();
+        row.continued_from = Some(pilot.owner);
+        row.rotation_depth += 1;
+        store.insert_session(&row).unwrap();
+        store
+            .update_session_status(pilot.owner, SessionStatus::Archived)
+            .unwrap();
+        store
+            .record_harness_manager_rotation(pilot.owner, row.id)
+            .unwrap();
+        row.id
+    };
     let replacement = control
-        .agent_enqueue_landing_source(pilot.owner, request(2, "replacement", Some(old.id)), true)
+        .agent_enqueue_landing_source(successor, request(2, "replacement", Some(old.id)), true)
         .await
         .unwrap();
     assert_eq!(replacement.entry.sequence, old.sequence);
+    assert_eq!(replacement.entry.issue, Some(issue));
+    let store = pilot.manager.store.lock().await;
+    let (listed, _) = store
+        .list_rolling_queue_for_agent(
+            successor,
+            &rsi_common::rolling_queue::AgentListRollingQueueRequestV1 {
+                limit: Some(32),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let listed = listed
+        .iter()
+        .find(|row| row.id == replacement.entry.id)
+        .unwrap();
+    assert_eq!(listed.issue, Some(issue));
+    assert_eq!(listed.wake_session_id, Some(successor));
+    drop(store);
     let replay = control
-        .agent_enqueue_landing_source(pilot.owner, request(2, "replacement", Some(old.id)), true)
+        .agent_enqueue_landing_source(successor, request(2, "replacement", Some(old.id)), true)
         .await
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.entry.id, replacement.entry.id);
     let error = control
-        .agent_enqueue_landing_source(pilot.owner, request(3, "terminal", Some(old.id)), true)
+        .agent_enqueue_landing_source(successor, request(3, "terminal", Some(old.id)), true)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("queue_entry_settled"), "{error}");
 
     // Claim wins after the ancestry check, before the enqueue transaction.
-    crate::session::effect_fence::seam::install(pilot.owner, "enqueue", |store| {
+    crate::session::effect_fence::seam::install(successor, "enqueue", |store| {
         store
             .claim_next_rolling_queue_entry(chrono::Utc::now())
             .unwrap()
@@ -2853,7 +3542,7 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
     });
     let error = control
         .agent_enqueue_landing_source(
-            pilot.owner,
+            successor,
             request(3, "raced", Some(replacement.entry.id)),
             true,
         )
@@ -2871,7 +3560,7 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
     );
     let error = control
         .agent_enqueue_landing_source(
-            pilot.owner,
+            successor,
             request(3, "in-flight", Some(replacement.entry.id)),
             true,
         )
@@ -2882,7 +3571,7 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
         "{error}"
     );
     let normal = control
-        .agent_enqueue_landing_source(pilot.owner, request(3, "normal", None), true)
+        .agent_enqueue_landing_source(successor, request(3, "normal", None), true)
         .await
         .unwrap();
     assert!(normal.entry.sequence > replacement.entry.sequence);
@@ -2897,7 +3586,7 @@ async fn enqueue_supersedes_only_owned_descendants_and_refuses_a_claim_during_pr
     );
     assert!(
         store
-            .get_rolling_queue_entry_by_key(pilot.owner, "raced")
+            .get_rolling_queue_entry_by_key(successor, "raced")
             .unwrap()
             .is_none()
     );
@@ -2960,6 +3649,7 @@ fn derive_request(
     key: &str,
 ) -> rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
     rsi_common::rolling_queue::AgentEnqueueLandingSourceRequestV1 {
+        issue: None,
         supersedes: None,
         derive_filters: true,
         fixes_issue: None,
@@ -2969,6 +3659,7 @@ fn derive_request(
         source_commit: source.to_string(),
         test_filters: Vec::new(),
         idempotency_key: key.into(),
+        expedite: None,
     }
 }
 
@@ -3232,6 +3923,174 @@ async fn a_derive_replay_after_the_filters_settle_returns_the_entry_not_a_confli
     );
 }
 
+/// Wait (bounded) until `entry` carries `state` as its filters state.
+async fn filters_state_reaches(
+    pilot: &Pilot,
+    entry: Uuid,
+    state: rsi_common::rolling_queue::QueueFiltersState,
+) -> rsi_common::rolling_queue::RollingQueueEntryV1 {
+    for _ in 0..300 {
+        let row = pilot
+            .manager
+            .store
+            .lock()
+            .await
+            .get_rolling_queue_entry(entry)
+            .unwrap()
+            .unwrap();
+        if row.filters_state == Some(state) {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the entry never reached {state:?}");
+}
+
+/// #3372: a derivation that exceeds its wall-clock budget does not refuse the
+/// entry: it is kept with `filters_state: lander_selects` and no derived
+/// filters, the lander admits it, and the enqueuer gets no refusal wake.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
+async fn a_derivation_over_its_time_budget_keeps_the_entry_with_lander_selection_3372() {
+    use rsi_common::rolling_queue::{QueueFiltersState, RollingQueueEntryState};
+    let pilot = pilot().await;
+    // The checker waits for a release that never comes.
+    let (repo, source, _release) = deriving_fixture(
+        &pilot,
+        "over-time",
+        "print(json.dumps({'suggested_filters': ['rsid=rolling_queue']}))",
+    )
+    .await;
+    // #519: a slow tip read used to exhaust the artificial 100 ms inline
+    // budget before the checker even started. Keep finite git latency in the
+    // regression, but use the production enqueue budget: this test exercises
+    // the checker's own 4 s budget, not a tip-read deadline.
+    crate::rolling_queue::delay_git(
+        repo.path(),
+        "rev-parse",
+        std::time::Duration::from_millis(200),
+    );
+    crate::rolling_queue::set_derive_budget_for_test(
+        repo.path(),
+        std::time::Duration::from_millis(4000),
+        300,
+    );
+    let control = pilot.manager.agent_control();
+    let mut request = derive_request(&source, "derive-over-time");
+    request.test_filters = vec!["rsid=rolling_queue".to_string()];
+    let entry = control
+        .agent_enqueue_landing_source(pilot.owner, request, true)
+        .await
+        .unwrap()
+        .entry;
+
+    // Both an inline answer and a deferred answer must keep the same entry.
+    let kept = filters_state_reaches(&pilot, entry.id, QueueFiltersState::LanderSelects).await;
+    assert_eq!(kept.state, RollingQueueEntryState::Queued);
+    assert_eq!(
+        kept.test_filters,
+        vec!["rsid=rolling_queue".to_string()],
+        "only the caller's own filters stay; nothing was derived"
+    );
+    let claimed = pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .claim_rolling_queue_batch(chrono::Utc::now(), 4)
+        .unwrap()
+        .expect("an entry the lander selects for is admitted, not refused");
+    assert_eq!(claimed.entries.len(), 1);
+    assert_eq!(claimed.entries[0].id, entry.id);
+    assert_eq!(
+        claimed.entries[0].test_filters,
+        vec!["rsid=rolling_queue".to_string()]
+    );
+    assert_eq!(
+        queue_wakes_for(&pilot, pilot.owner).await,
+        0,
+        "no refusal wake"
+    );
+}
+
+/// #3372: a diff wider than the derivation bound is recorded at once with
+/// `lander_selects` (the checker is never run), not after burning the whole
+/// timeout, and a replay returns the same entry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
+async fn a_diff_over_the_derivation_bound_is_recorded_with_lander_selection_3372() {
+    use rsi_common::rolling_queue::{QueueFiltersState, RollingQueueEntryState};
+    let pilot = pilot().await;
+    let (repo, _empty_source, _release) = deriving_fixture(
+        &pilot,
+        "wide",
+        "print(json.dumps({'suggested_filters': ['rsid=rolling_queue']}))",
+    )
+    .await;
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(repo.path().join(name), name).unwrap();
+    }
+    git(&["add", "a.txt", "b.txt", "c.txt"]);
+    git(&["commit", "-q", "-m", "wide"]);
+    let source = git(&["rev-parse", "HEAD"]);
+    crate::rolling_queue::set_derive_budget_for_test(
+        repo.path(),
+        std::time::Duration::from_secs(60),
+        2,
+    );
+    let control = pilot.manager.agent_control();
+    let entry = control
+        .agent_enqueue_landing_source_within(
+            pilot.owner,
+            derive_request(&source, "derive-wide"),
+            true,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap()
+        .entry;
+    assert_eq!(entry.state, RollingQueueEntryState::Queued);
+    assert_eq!(entry.filters_state, Some(QueueFiltersState::LanderSelects));
+    assert!(entry.test_filters.is_empty());
+    let replay = control
+        .agent_enqueue_landing_source_within(
+            pilot.owner,
+            derive_request(&source, "derive-wide"),
+            true,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.entry.id, entry.id);
+    assert_eq!(
+        replay.entry.filters_state,
+        Some(QueueFiltersState::LanderSelects)
+    );
+    let claimed = pilot
+        .manager
+        .store
+        .lock()
+        .await
+        .claim_rolling_queue_batch(chrono::Utc::now(), 4)
+        .unwrap()
+        .expect("admitted with lander selection");
+    assert_eq!(claimed.entries[0].id, entry.id);
+    assert_eq!(queue_wakes_for(&pilot, pilot.owner).await, 0);
+}
+
 /// #2993: a derivation that fails after the entry was recorded settles it
 /// `refused` with a typed reason and wakes the enqueuer once; nothing is admitted.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -3386,8 +4245,9 @@ async fn the_queue_sweep_finishes_a_pending_entry_no_task_is_finishing_2993() {
 #[tokio::test]
 #[allow(clippy::unwrap_used, clippy::significant_drop_tightening)]
 async fn a_stalled_tip_read_is_refused_with_its_own_code_and_recorded_as_friction_2993() {
+    use rsi_common::rolling_queue::RollingQueueEntryState;
     let pilot = pilot().await;
-    let (repo, source, _release) = deriving_fixture(&pilot, "tip", "print('{}')").await;
+    let (repo, source, release) = deriving_fixture(&pilot, "tip", "print('{}')").await;
     crate::rolling_queue::stall_git(repo.path(), "rev-parse");
     let control = pilot.manager.agent_control();
     let started = std::time::Instant::now();
@@ -3410,6 +4270,10 @@ async fn a_stalled_tip_read_is_refused_with_its_own_code_and_recorded_as_frictio
             .to_string()
             .contains(rsi_common::rolling_queue::QUEUE_TIP_READ_TIMEOUT),
         "{error}"
+    );
+    assert!(
+        crate::rolling_queue::stalled_git_was_killed(repo.path()),
+        "the real tip-read deadline must kill the stalled git"
     );
     let store = pilot.manager.store.lock().await;
     assert!(
@@ -3442,6 +4306,25 @@ async fn a_stalled_tip_read_is_refused_with_its_own_code_and_recorded_as_frictio
                 == "agent_refusal:AgentEnqueueLandingSource:queue_tip_read_timeout"),
         "{rollup:?}"
     );
+    drop(store);
+
+    // #519: a real deadline still refuses insertion, and once git recovers
+    // the same key can enqueue exactly one entry under the normal budget.
+    std::fs::remove_file(repo.path().join(".rsi-stall")).unwrap();
+    std::fs::write(release, "go").unwrap();
+    let retry = control
+        .agent_enqueue_landing_source(pilot.owner, derive_request(&source, "derive-tip"), true)
+        .await
+        .unwrap();
+    assert_eq!(retry.entry.state, RollingQueueEntryState::Queued);
+    assert!(!retry.replayed);
+    let replay = control
+        .agent_enqueue_landing_source(pilot.owner, derive_request(&source, "derive-tip"), true)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.entry.id, retry.entry.id);
+    assert_eq!(queue_wakes_for(&pilot, pilot.owner).await, 0);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -3511,6 +4394,7 @@ async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
         }
     }
     let request = |commit: &str, key: &str| AgentEnqueueLandingSourceRequestV1 {
+        issue: None,
         supersedes: None,
         derive_filters: false,
         fixes_issue: None,
@@ -3520,6 +4404,7 @@ async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
         source_commit: commit.to_string(),
         test_filters: vec!["rsid=rolling_queue".into()],
         idempotency_key: key.into(),
+        expedite: None,
     };
     let control = pilot.manager.agent_control();
 
@@ -3793,6 +4678,347 @@ async fn enqueue_landing_source_admits_manager_and_lead_and_refuses_workers() {
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.entry.id, claimed.entry.id);
+
+    // #3264: a claimed Issue that names its shard command gets the filter that
+    // selects its tests added by the queue (never refused for the missing
+    // selection), with explicit filters and with `derive_filters` alike, and
+    // `derive_filters` combines with explicit `test_filters`.
+    let shard_issue = {
+        let store = pilot.manager.store.lock().await;
+        let project = store
+            .get_session(pilot.leads[0])
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: project,
+                title: "Test red on rolling: manifest_dir_guard::guard".into(),
+                body:
+                    "Test: `manifest_dir_guard::guard`\nFailing tests: manifest_dir_guard::guard\n\
+                       Shard command: `cargo test -p rsi-common --test manifest_dir_guard`\n"
+                        .into(),
+                priority: None,
+                labels: vec!["qa".into()],
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .display_number
+    };
+    let selecting = "rsi-common=test:manifest_dir_guard";
+    git(&["commit", "-q", "--allow-empty", "-m", "five-b"]);
+    let fifth_b = git(&["rev-parse", "HEAD"]);
+    let mut shard_explicit = claim("shard-explicit", Some(shard_issue), &[]);
+    shard_explicit.source_commit = fifth_b;
+    let explicit = control
+        .agent_enqueue_landing_source(pilot.leads[0], shard_explicit, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        explicit.entry.test_filters,
+        vec!["rsid=queue_lands", selecting],
+        "the Issue's shard command adds the filter that selects its test"
+    );
+    assert_eq!(
+        explicit.entry.fixes_tests,
+        vec!["manifest_dir_guard::guard"]
+    );
+    git(&["commit", "-q", "--allow-empty", "-m", "six"]);
+    let sixth = git(&["rev-parse", "HEAD"]);
+    let mut derived = request(&sixth, "shard-derived");
+    derived.derive_filters = true;
+    derived.test_filters = vec!["rsid=queue_lands".into()];
+    derived.fixes_issue = Some(shard_issue);
+    let derived = control
+        .agent_enqueue_landing_source(pilot.leads[0], derived, true)
+        .await
+        .expect("derive_filters with explicit test_filters is not refused");
+    for filter in ["rsid=queue_lands", selecting] {
+        assert!(
+            derived.entry.test_filters.iter().any(|f| f == filter),
+            "the derived landing also gates {filter}: {:?}",
+            derived.entry.test_filters
+        );
+    }
+}
+
+/// #3487: the queue's expedite lane. Only the appointed manager may pass
+/// `expedite`; a reason is required; at most two expedited entries are live per
+/// project; a fix for an open `qa` Issue expedites with no flag and is never
+/// refused for the cap (it stays ordinary and the receipt warns).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn enqueue_expedite_is_manager_only_capped_and_automatic_for_qa_fixes_3487() {
+    use rsi_common::rolling_queue::{
+        AgentCancelRollingQueueEntryRequestV1, AgentEnqueueLandingSourceRequestV1,
+        AgentListRollingQueueRequestV1, QueueExpediteRequestV1, RollingQueueFieldsV1,
+    };
+
+    let pilot = pilot().await;
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "work"]);
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+    git(&["branch", "origin/rolling"]);
+    let mut commits = Vec::new();
+    for index in 0..8 {
+        git(&["commit", "-q", "--allow-empty", "-m", &format!("c{index}")]);
+        commits.push(git(&["rev-parse", "HEAD"]));
+    }
+    {
+        let store = pilot.manager.store.lock().await;
+        for id in [pilot.owner, pilot.leads[0]] {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET working_dir=?2 WHERE id=?1",
+                    rusqlite::params![id.to_string(), repo.path().display().to_string()],
+                )
+                .unwrap();
+        }
+    }
+    let request =
+        |commit: &str, key: &str, reason: Option<&str>| AgentEnqueueLandingSourceRequestV1 {
+            issue: None,
+            supersedes: None,
+            derive_filters: false,
+            fixes_issue: None,
+            fixes_tests: Vec::new(),
+            project_id: None,
+            source_session_id: None,
+            source_commit: commit.to_string(),
+            test_filters: vec!["rsid=rolling_queue".into()],
+            idempotency_key: key.into(),
+            expedite: reason.map(|reason| QueueExpediteRequestV1 {
+                reason: reason.into(),
+            }),
+        };
+    let control = pilot.manager.agent_control();
+
+    // An Epic lead is refused, with the named code, and nothing is queued.
+    let refused = control
+        .agent_enqueue_landing_source(
+            pilot.leads[0],
+            request(&commits[0], "lead", Some("urgent")),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("queue_expedite_not_authorized"),
+        "{refused}"
+    );
+    // The same lead enqueues ordinarily.
+    let ordinary = control
+        .agent_enqueue_landing_source(pilot.leads[0], request(&commits[0], "lead", None), true)
+        .await
+        .unwrap();
+    assert_eq!(ordinary.entry.expedite_reason, None);
+    assert_eq!(ordinary.expedite_warning, None);
+
+    // The manager must give a reason.
+    let refused = control
+        .agent_enqueue_landing_source(pilot.owner, request(&commits[1], "m0", Some("  ")), true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("queue_expedite_reason_invalid"),
+        "{refused}"
+    );
+
+    let first = control
+        .agent_enqueue_landing_source(
+            pilot.owner,
+            request(&commits[1], "m1", Some("hub rsid SIGINT loop")),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        first.entry.expedite_reason.as_deref(),
+        Some("hub rsid SIGINT loop")
+    );
+    let second = control
+        .agent_enqueue_landing_source(
+            pilot.owner,
+            request(&commits[2], "m2", Some("self-heal fix")),
+            true,
+        )
+        .await
+        .unwrap();
+    let third = control
+        .agent_enqueue_landing_source(
+            pilot.owner,
+            request(&commits[3], "m3", Some("one too many")),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(third.contains("queue_expedite_cap_reached"), "{third}");
+    for held in [&first.entry, &second.entry] {
+        assert!(third.contains(&held.id.to_string()), "{third}");
+    }
+
+    // The list shows the flag and the reason, summary and full alike.
+    for fields in [RollingQueueFieldsV1::Summary, RollingQueueFieldsV1::Full] {
+        let listed = control
+            .agent_list_rolling_queue(
+                pilot.owner,
+                AgentListRollingQueueRequestV1 {
+                    fields: Some(fields),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let row = listed
+            .entries
+            .iter()
+            .find(|e| e.id == first.entry.id)
+            .unwrap();
+        assert!(row.expedited);
+        assert_eq!(row.expedite_reason.as_deref(), Some("hub rsid SIGINT loop"));
+        let plain = listed
+            .entries
+            .iter()
+            .find(|e| e.id == ordinary.entry.id)
+            .unwrap();
+        assert!(!plain.expedited);
+    }
+
+    // A fix for an open qa Issue expedites with no flag; past the cap it is
+    // queued ordinary and the receipt says why.
+    let (qa, plain_issue, closed_qa) = {
+        let store = pilot.manager.store.lock().await;
+        let project = store
+            .get_session(pilot.leads[0])
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        let issue = |title: &str, labels: &[&str]| {
+            store
+                .create_issue(&rsi_common::types::NewIssue {
+                    project_id: project,
+                    title: title.into(),
+                    body: "Failing tests: demo::red".into(),
+                    priority: None,
+                    labels: labels.iter().map(|l| (*l).to_string()).collect(),
+                    created_by_session_id: None,
+                    assignee: None,
+                    idea_id: None,
+                    source_event_id: None,
+                    source_finding_ref: None,
+                })
+                .unwrap()
+        };
+        (
+            issue("qa: rolling red", &["qa"]),
+            issue("plain red", &["bug"]),
+            issue("qa: old red", &["qa"]),
+        )
+    };
+    let fix = |commit: &str, key: &str, issue: i64| {
+        let mut fix = request(commit, key, None);
+        fix.fixes_issue = Some(issue);
+        fix
+    };
+    let capped = control
+        .agent_enqueue_landing_source(
+            pilot.leads[0],
+            fix(&commits[4], "qa-capped", qa.display_number),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        capped.entry.expedite_reason, None,
+        "over the cap it stays ordinary"
+    );
+    let warning = capped.expedite_warning.expect("the receipt warns");
+    assert!(warning.contains("queue_expedite_cap_reached"), "{warning}");
+    assert!(warning.contains(&first.entry.id.to_string()), "{warning}");
+
+    // Withdraw one expedited entry: the slot frees and the qa fix expedites.
+    control
+        .agent_cancel_rolling_queue_entry(
+            pilot.owner,
+            AgentCancelRollingQueueEntryRequestV1 {
+                entry_id: first.entry.id,
+                reason: Some("superseded".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let plain_fix = control
+        .agent_enqueue_landing_source(
+            pilot.leads[0],
+            fix(&commits[5], "plain-fix", plain_issue.display_number),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plain_fix.entry.expedite_reason, None,
+        "no qa label, no expedite"
+    );
+    assert_eq!(plain_fix.expedite_warning, None);
+    {
+        let store = pilot.manager.store.lock().await;
+        store
+            .update_issue_status(closed_qa.id, rsi_common::types::IssueStatus::Closed)
+            .unwrap();
+    }
+    let closed_fix = control
+        .agent_enqueue_landing_source(
+            pilot.leads[0],
+            fix(&commits[6], "closed-fix", closed_qa.display_number),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        closed_fix.entry.expedite_reason, None,
+        "a closed qa Issue is not urgent"
+    );
+    let automatic = control
+        .agent_enqueue_landing_source(
+            pilot.leads[0],
+            fix(&commits[7], "qa-auto", qa.display_number),
+            true,
+        )
+        .await
+        .unwrap();
+    let reason = automatic.entry.expedite_reason.expect("automatic expedite");
+    assert!(
+        reason.contains(&format!("#{}", qa.display_number)) && reason.contains("qa: rolling red"),
+        "{reason}"
+    );
+    assert_eq!(automatic.expedite_warning, None);
 }
 
 /// #1964: the queue list and cancel verbs. The gate is the advertised
@@ -4023,13 +5249,13 @@ async fn rolling_queue_list_and_cancel_follow_the_seat_and_refuse_workers() {
     assert_eq!(withdrawn.entry.state, RollingQueueEntryState::Superseded);
 }
 
-#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
-#[tokio::test]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::significant_drop_tightening
 )]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
 async fn check_landing_candidate_reports_the_receipt_to_managers_and_leads_only() {
     use crate::store::agent_jobs::NewAgentJob;
     use rsi_common::agent_jobs::{AgentJobResultV1, JobState, JobWake};
@@ -4119,6 +5345,9 @@ async fn check_landing_candidate_reports_the_receipt_to_managers_and_leads_only(
             )
             .unwrap();
         if state != JobState::Running {
+            if let Some(tool) = &result.scoped_tool {
+                store.record_agent_job_scoped_tool(id, tool).unwrap();
+            }
             store
                 .settle_agent_job(id, state, &result, false, chrono::Utc::now())
                 .unwrap();
@@ -4137,6 +5366,12 @@ async fn check_landing_candidate_reports_the_receipt_to_managers_and_leads_only(
         AgentJobResultV1 {
             exit_code: receipt["exit_code"].as_i64().map(|code| code as i32),
             receipt: Some(receipt),
+            scoped_tool: Some(rsi_common::agent_jobs::ScopedToolProvenanceV1 {
+                source: rsi_common::agent_jobs::ScopedToolSource::Rolling,
+                path: "/daemon/tool/scripts/scoped-test".into(),
+                rev: Some(commit_a.clone()),
+                files: vec![],
+            }),
             ..AgentJobResultV1::default()
         }
     };
@@ -4407,6 +5642,73 @@ async fn check_landing_candidate_reports_the_receipt_to_managers_and_leads_only(
             "{job:?} {session:?} {commit}"
         );
     }
+
+    // A candidate-copy green receipt is evidence only; a separate rolling
+    // run at the same head supplies verification, even when the caller still
+    // names the original job or a newer candidate job is the session's latest.
+    let candidate_id = Uuid::new_v4();
+    let mut candidate_result = receipt(&commit_b, serde_json::json!({"tool":{"source":"rolling"}}));
+    candidate_result.scoped_tool.as_mut().unwrap().source =
+        rsi_common::agent_jobs::ScopedToolSource::Candidate;
+    {
+        let store = pilot.manager.store.lock().await;
+        add_job(
+            &store,
+            candidate_id,
+            worker,
+            JobState::Succeeded,
+            candidate_result.clone(),
+        );
+    }
+    for (job, session) in [(Some(candidate_id.to_string()), None), (None, Some(worker))] {
+        let verdict = check(manager, job.as_deref(), session, &commit_b)
+            .await
+            .unwrap();
+        assert_eq!(verdict.ok, false);
+        assert_eq!(verdict.refusal.as_deref(), Some("candidate_tool_untrusted"));
+        assert_eq!(
+            verdict.scoped_tool.unwrap().source,
+            rsi_common::agent_jobs::ScopedToolSource::Candidate
+        );
+    }
+    let rolling_id = Uuid::new_v4();
+    let newer_candidate_id = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        add_job(
+            &store,
+            rolling_id,
+            worker,
+            JobState::Succeeded,
+            receipt(&commit_b, serde_json::json!({})),
+        );
+        add_job(
+            &store,
+            newer_candidate_id,
+            worker,
+            JobState::Succeeded,
+            candidate_result,
+        );
+    }
+    for (job, session) in [(Some(candidate_id.to_string()), None), (None, Some(worker))] {
+        let verdict = check(manager, job.as_deref(), session, &commit_b)
+            .await
+            .unwrap();
+        assert!(verdict.ok, "{verdict:?}");
+        assert_eq!(verdict.job_id, Some(rolling_id));
+        assert_eq!(
+            verdict.scoped_tool.unwrap().source,
+            rsi_common::agent_jobs::ScopedToolSource::Rolling
+        );
+        assert_eq!(
+            verdict.tool_under_test.unwrap().job_id,
+            if job.is_some() {
+                candidate_id
+            } else {
+                newer_candidate_id
+            }
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -4461,6 +5763,7 @@ async fn provider_status_admits_manager_and_lead_and_refuses_workers_without_a_k
     let control = pilot.manager.agent_control();
     let request = || AgentGetProviderStatusRequestV1 {
         provider: Some("openrouter".into()),
+        ..Default::default()
     };
 
     let refused = control
@@ -4496,6 +5799,7 @@ async fn provider_status_admits_manager_and_lead_and_refuses_workers_without_a_k
             pilot.owner,
             AgentGetProviderStatusRequestV1 {
                 provider: Some("nope".into()),
+                ..Default::default()
             },
             &service,
             &vault,
@@ -4507,6 +5811,175 @@ async fn provider_status_admits_manager_and_lead_and_refuses_workers_without_a_k
             .to_string()
             .contains("provider_status_unknown_provider"),
         "{unknown}"
+    );
+}
+
+/// #3154: the `openrouter` entry of `AgentGetProviderStatus` carries the spend
+/// ceiling (cap, baseline, spent, remainder, warn percent, state) so a lead can
+/// check it before a paid run, reads `refused` once the line is reached, and
+/// returns per-million-token prices with `fetched_at` for the models a request
+/// names, from the daemon's own catalog fetch (never a hand-typed price).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn provider_status_carries_the_spend_cap_and_discovered_prices() {
+    use crate::provider_status::{OpenRouterApi, ProviderStatusService};
+    use crate::vault::check::ProbeOutcome;
+    use crate::vault::secret::SecretString;
+    use crate::vault::{VaultHandleBuilder, VaultSettings};
+    use rsi_common::agent_provider_status::AgentGetProviderStatusRequestV1;
+    use std::sync::Arc;
+
+    const KEY: &str = "sk-or-test-spend-verb-0011";
+    struct Stub;
+    #[async_trait::async_trait]
+    impl OpenRouterApi for Stub {
+        async fn key(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Http {
+                status: 200,
+                body: br#"{"data":{"limit":null,"usage":9.0,"limit_remaining":null}}"#.to_vec(),
+            }
+        }
+        async fn credits(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Http {
+                status: 200,
+                body: br#"{"data":{"total_credits":40.0,"total_usage":19.0}}"#.to_vec(),
+            }
+        }
+        async fn models(&self, _secret: &SecretString) -> ProbeOutcome {
+            ProbeOutcome::Http {
+                status: 200,
+                body: br#"{"data":[
+                    {"id":"test-3154/cheap-1","pricing":{"prompt":"0.00000014","completion":"0.00000042","input_cache_read":"0.0000000042"}},
+                    {"id":"test-3154/dynamic","pricing":{"prompt":"-1","completion":"-1"}}
+                ]}"#
+                .to_vec(),
+            }
+        }
+    }
+
+    let pilot = pilot().await;
+    let vault = VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
+        .env(|name| (name == "OPEN_ROUTER").then(|| KEY.to_string()))
+        .open()
+        .unwrap();
+    let service = ProviderStatusService::new(Arc::new(Stub), std::time::Duration::from_secs(60));
+    let control = pilot.manager.agent_control();
+    let request = AgentGetProviderStatusRequestV1 {
+        provider: Some("openrouter".into()),
+        models: vec![
+            "test-3154/cheap-1".into(),
+            "test-3154/dynamic".into(),
+            "test-3154/not-listed".into(),
+        ],
+        ..Default::default()
+    };
+
+    // No cap armed: the entry says so and prices come back.
+    let off = control
+        .agent_get_provider_status_with(pilot.owner, request.clone(), &service, &vault)
+        .await
+        .unwrap();
+    let entry = &off.providers[0];
+    let cap = entry.spend_cap.as_ref().expect("spend_cap on openrouter");
+    assert_eq!(cap.state.as_str(), "off");
+    assert_eq!(entry.launch_admission, "open");
+    assert_eq!(entry.model_prices.len(), 1, "{:?}", entry.model_prices);
+    let price = &entry.model_prices[0];
+    assert_eq!(price.model, "test-3154/cheap-1");
+    assert!((price.prompt_usd_per_mtok - 0.14).abs() < 1e-9);
+    assert!((price.completion_usd_per_mtok - 0.42).abs() < 1e-9);
+    assert!((price.input_cache_read_usd_per_mtok.unwrap() - 0.0042).abs() < 1e-9);
+    assert!((chrono::Utc::now() - price.fetched_at).num_seconds() < 60);
+    assert_eq!(
+        entry.model_prices_unknown,
+        vec!["test-3154/dynamic", "test-3154/not-listed"]
+    );
+
+    // Armed at baseline 17 against usage 19 with a $5 cap: $2 spent, $3 left.
+    pilot
+        .manager
+        .runtime_config
+        .arm_openrouter_spend_cap(5.0, 17.0, chrono::Utc::now());
+    let armed = control
+        .agent_get_provider_status_with(pilot.owner, request.clone(), &service, &vault)
+        .await
+        .unwrap();
+    let cap = armed.providers[0].spend_cap.as_ref().unwrap();
+    assert_eq!(cap.state.as_str(), "ok");
+    assert!((cap.baseline_usage - 17.0).abs() < 1e-9);
+    assert!((cap.spent_usd.unwrap() - 2.0).abs() < 1e-6);
+    assert!((cap.remaining_usd.unwrap() - 3.0).abs() < 1e-6);
+    assert_eq!(cap.warn_pct, 80);
+    assert_eq!(cap.cap_usd, 5.0);
+
+    // A $1 cap against the same $2 of spend is reached: the entry refuses.
+    pilot
+        .manager
+        .runtime_config
+        .arm_openrouter_spend_cap(1.0, 17.0, chrono::Utc::now());
+    let reached = control
+        .agent_get_provider_status_with(pilot.owner, request, &service, &vault)
+        .await
+        .unwrap();
+    let entry = &reached.providers[0];
+    assert_eq!(entry.spend_cap.as_ref().unwrap().state.as_str(), "reached");
+    assert_eq!(entry.launch_admission, "refused");
+    assert_eq!(
+        entry.refusal_detail.as_deref(),
+        Some(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE)
+    );
+    assert!(!serde_json::to_string(&reached).unwrap().contains(KEY));
+
+    // The per-run budget (M3): a $1 cap is reached, so a run is refused; a $5
+    // cap has $3 left, so a $2 run is admitted and a $4 run is not, and a run
+    // that spent its own budget is told to stop.
+    pilot
+        .manager
+        .runtime_config
+        .arm_openrouter_spend_cap(5.0, 17.0, chrono::Utc::now());
+    let run = |budget: f64, sessions: Vec<uuid::Uuid>| AgentGetProviderStatusRequestV1 {
+        provider: Some("openrouter".into()),
+        run_budget_usd: Some(budget),
+        run_sessions: sessions,
+        ..Default::default()
+    };
+    let verdict = |request| {
+        let control = control.clone();
+        let (service, vault, owner) = (&service, &vault, pilot.owner);
+        async move {
+            control
+                .agent_get_provider_status_with(owner, request, service, vault)
+                .await
+                .unwrap()
+                .providers[0]
+                .run_budget
+                .clone()
+                .expect("run_budget on the openrouter entry")
+        }
+    };
+    let fits = verdict(run(2.0, Vec::new())).await;
+    assert!(fits.admitted, "{fits:?}");
+    let too_big = verdict(run(4.0, Vec::new())).await;
+    assert!(!too_big.admitted);
+    assert_eq!(
+        too_big.refusal_code.as_deref(),
+        Some(rsi_common::openrouter_spend::RUN_BUDGET_EXCEEDS_REMAINDER_CODE)
+    );
+    // The run has no sessions yet, so nothing is spent against its budget.
+    assert_eq!(too_big.status.spent_usd, 0.0);
+    pilot
+        .manager
+        .runtime_config
+        .arm_openrouter_spend_cap(1.0, 17.0, chrono::Utc::now());
+    let capped = verdict(run(0.5, Vec::new())).await;
+    assert_eq!(
+        capped.refusal_code.as_deref(),
+        Some(rsi_common::openrouter_spend::SPEND_CAP_REACHED_CODE)
     );
 }
 
@@ -4712,6 +6185,7 @@ async fn a_draining_deploy_holds_child_jobs_refuses_continuations_and_reports_th
             worker,
             rsi_common::agent_jobs::AgentGetJobRequestV1 {
                 job_id: held.job.id,
+                fields: Default::default(),
             },
         )
         .await
@@ -4720,7 +6194,7 @@ async fn a_draining_deploy_holds_child_jobs_refuses_continuations_and_reports_th
     let listed = control
         .agent_list_jobs(
             worker,
-            rsi_common::agent_jobs::AgentListJobsRequestV1 { limit: None },
+            rsi_common::agent_jobs::AgentListJobsRequestV1::default(),
         )
         .await
         .unwrap();
@@ -4828,6 +6302,7 @@ async fn a_draining_deploy_holds_child_jobs_refuses_continuations_and_reports_th
             worker,
             rsi_common::agent_jobs::AgentGetJobRequestV1 {
                 job_id: held.job.id,
+                fields: Default::default(),
             },
         )
         .await
@@ -5128,6 +6603,7 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
             worker,
             AgentGetJobRequestV1 {
                 job_id: receipt.job.id,
+                fields: Default::default(),
             },
         )
         .await
@@ -5139,6 +6615,7 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
             pilot.owner,
             AgentGetJobRequestV1 {
                 job_id: receipt.job.id,
+                fields: Default::default(),
             },
         )
         .await
@@ -5151,6 +6628,7 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
             pilot.leads[1],
             AgentGetJobRequestV1 {
                 job_id: receipt.job.id,
+                fields: Default::default(),
             },
         )
         .await
@@ -5181,7 +6659,7 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
         .unwrap_err();
     assert!(hidden.to_string().contains("job_not_found"), "{hidden}");
     let mine = control
-        .agent_list_jobs(worker, AgentListJobsRequestV1 { limit: None })
+        .agent_list_jobs(worker, AgentListJobsRequestV1::default())
         .await
         .unwrap();
     assert_eq!(mine.jobs.len(), 1);
@@ -5190,7 +6668,7 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
     // Lists stay owner-scoped: the manager's list does not carry a worker's jobs.
     for caller in [pilot.owner, pilot.leads[1]] {
         let theirs = control
-            .agent_list_jobs(caller, AgentListJobsRequestV1 { limit: None })
+            .agent_list_jobs(caller, AgentListJobsRequestV1::default())
             .await
             .unwrap();
         assert!(theirs.jobs.is_empty());
@@ -5250,11 +6728,276 @@ async fn submit_job_runs_in_the_callers_sandbox_and_reads_are_owner_scoped() {
             worker,
             AgentGetJobRequestV1 {
                 job_id: receipt.job.id,
+                fields: Default::default(),
             },
         )
         .await
         .unwrap();
     assert_eq!(read_back.state, JobState::Failed);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::significant_drop_tightening
+)]
+async fn submit_recipe_job_without_sandbox_runs_only_in_the_registered_project_root() {
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use rsi_common::agent_jobs::{AgentSubmitJobRequestV1, JobKind, JobState};
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    let pilot = pilot().await;
+    // Outside any Git work tree: a repository root is refused (below).
+    let scratch = crate::test_support::non_repository_tempdir("nosandbox-recipe");
+    let project_root = scratch.path().join("psychic-square");
+    let foreign = scratch.path().join("foreign");
+    for dir in [&project_root, &foreign] {
+        std::fs::create_dir_all(dir.join(".rsi")).unwrap();
+        std::fs::write(
+            dir.join(".rsi/jobs.toml"),
+            "version = 1\n[recipes.test]\nrunner = 'make'\ntarget = 'test'\ntimeout_minutes = 20\ncpu_quota_percent = 200\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Makefile"), "test:\n\ttrue\n").unwrap();
+    }
+    // `<root>/escape` names the foreign tree; `via-link` names the root.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&foreign, project_root.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&project_root, scratch.path().join("via-link")).unwrap();
+    }
+    let sandbox = scratch.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let missing_sandbox = scratch.path().join("gone");
+
+    let project_id = {
+        let store = pilot.manager.store.lock().await;
+        let project_id = store
+            .get_session(pilot.owner)
+            .unwrap()
+            .unwrap()
+            .project_id
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE projects SET path=?2 WHERE id=?1",
+                rusqlite::params![project_id.to_string(), project_root.display().to_string()],
+            )
+            .unwrap();
+        project_id
+    };
+    // A worker session of the project with the given directories.
+    let session = |working_dir: &std::path::Path, sandbox_root: Option<&std::path::Path>| {
+        let id = Uuid::new_v4();
+        let mut row = bare_session(id);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = Some(project_id);
+        row.working_dir = working_dir.to_path_buf();
+        (id, row, sandbox_root.map(|p| p.display().to_string()))
+    };
+    let mut ids = Vec::new();
+    {
+        let store = pilot.manager.store.lock().await;
+        let cases = [
+            session(&project_root, None),
+            session(&foreign, None),
+            session(&project_root.join("escape"), None),
+            session(&scratch.path().join("via-link"), None),
+            session(&project_root.join("..").join("foreign"), None),
+            session(&project_root, Some(&sandbox)),
+            session(&project_root, Some(&missing_sandbox)),
+        ];
+        for (id, row, root) in cases {
+            store.insert_session(&row).unwrap();
+            if let Some(root) = root {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                        rusqlite::params![id.to_string(), root],
+                    )
+                    .unwrap();
+            }
+            ids.push(id);
+        }
+    }
+    let [
+        own,
+        in_foreign,
+        escaped,
+        linked,
+        traversal,
+        sandboxed,
+        sandbox_gone,
+    ] = ids[..]
+    else {
+        panic!("seven sessions")
+    };
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let request = |kind: JobKind, params: serde_json::Value| AgentSubmitJobRequestV1 {
+        project_id: None,
+        sandbox_session_id: None,
+        kind,
+        params,
+        name: None,
+        idempotency_key: None,
+        worktree: None,
+        wake: None,
+    };
+    let recipe = || request(JobKind::Test, serde_json::json!({"recipe": "test"}));
+    let control = pilot.manager.agent_control();
+    let recorder = std::sync::Arc::new(Recorder::default());
+    let refused = |error: DaemonError| {
+        assert!(
+            error.to_string().contains("job_directory_not_allowed"),
+            "{error}"
+        );
+    };
+
+    // Allowed: no sandbox, working_dir is the registered root.
+    let receipt = control
+        .agent_submit_job(own, recipe(), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(receipt.job.state, JobState::Running);
+    assert_eq!(
+        std::path::PathBuf::from(&receipt.job.cwd),
+        project_root.canonicalize().unwrap()
+    );
+    // A symlink that resolves to the registered root is that root.
+    let receipt = control
+        .agent_submit_job(linked, recipe(), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::path::PathBuf::from(&receipt.job.cwd),
+        project_root.canonicalize().unwrap()
+    );
+    // Foreign directory, symlink escape and `..` traversal are refused.
+    for caller in [in_foreign, escaped, traversal] {
+        refused(
+            control
+                .agent_submit_job(caller, recipe(), recorder.clone(), tools())
+                .await
+                .unwrap_err(),
+        );
+    }
+    // Only a declared recipe job: a build, a scoped test and a requested
+    // worktree from the same no-sandbox session keep the refusal.
+    refused(
+        control
+            .agent_submit_job(
+                own,
+                request(
+                    JobKind::Build,
+                    serde_json::json!({"command": "check", "workspace": true}),
+                ),
+                recorder.clone(),
+                tools(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    refused(
+        control
+            .agent_submit_job(
+                own,
+                request(
+                    JobKind::Test,
+                    serde_json::json!({"scoped_test": {"base": "origin/rolling"}}),
+                ),
+                recorder.clone(),
+                tools(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    let mut with_worktree = recipe();
+    with_worktree.worktree = Some(project_root.display().to_string());
+    refused(
+        control
+            .agent_submit_job(own, with_worktree, recorder.clone(), tools())
+            .await
+            .unwrap_err(),
+    );
+    // A session that owns a sandbox keeps the sandbox-only rule: it runs in
+    // its sandbox, never its working_dir, and a lost sandbox is refused.
+    let sandbox_manifest = sandbox.join(".rsi");
+    std::fs::create_dir_all(&sandbox_manifest).unwrap();
+    std::fs::copy(
+        project_root.join(".rsi/jobs.toml"),
+        sandbox_manifest.join("jobs.toml"),
+    )
+    .unwrap();
+    std::fs::write(sandbox.join("Makefile"), "test:\n\ttrue\n").unwrap();
+    let receipt = control
+        .agent_submit_job(sandboxed, recipe(), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::path::PathBuf::from(&receipt.job.cwd),
+        sandbox.canonicalize().unwrap()
+    );
+    refused(
+        control
+            .agent_submit_job(sandbox_gone, recipe(), recorder.clone(), tools())
+            .await
+            .unwrap_err(),
+    );
+    // Every unit that launched ran in the registered root or the sandbox
+    // (peer queueing and capacity holds may defer some launches).
+    let launched = recorder.0.lock().unwrap().clone();
+    let (root, sandbox) = (
+        project_root.canonicalize().unwrap(),
+        sandbox.canonicalize().unwrap(),
+    );
+    assert!(
+        launched
+            .iter()
+            .all(|spec| spec.cwd == root || spec.cwd == sandbox)
+    );
+    // Hub #33 / hard rule 2: once the registered root is a git repository the
+    // daemon allocates sandboxes for the project's sessions, so a no-sandbox
+    // session is refused with the typed reason and the fix.
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&project_root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(init.success());
+    let error = control
+        .agent_submit_job(own, recipe(), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("job_project_root_sandboxed"),
+        "{error}"
+    );
+    // A sandboxed session of the same project is unaffected.
+    control
+        .agent_submit_job(sandboxed, recipe(), recorder.clone(), tools())
+        .await
+        .unwrap();
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -5578,8 +7321,9 @@ async fn report_to_hub_admits_only_the_appointed_manager_that_is_the_declared_se
     let pilot = pilot().await;
     let hub = Uuid::new_v4();
     let request = || AgentReportToHubRequestV1 {
-        kind: SatelliteReportKindV1::DeployReady,
-        text: "DEPLOY-READY abc123".into(),
+        binaries_dir: None,
+        kind: SatelliteReportKindV1::Result,
+        text: "RESULT abc123".into(),
     };
     let control = pilot.manager.agent_control();
 
@@ -5733,6 +7477,7 @@ async fn report_to_hub_warns_on_a_sha_no_origin_ref_contains_and_still_queues() 
             .unwrap();
     }
     let request = |text: String| AgentReportToHubRequestV1 {
+        binaries_dir: None,
         kind: SatelliteReportKindV1::Result,
         text,
     };
@@ -5778,6 +7523,7 @@ async fn report_to_hub_refuses_a_revoked_manager_appointment() {
     let pilot = pilot().await;
     let hub = Uuid::new_v4();
     let request = || AgentReportToHubRequestV1 {
+        binaries_dir: None,
         kind: SatelliteReportKindV1::Result,
         text: "RESULT abc123".into(),
     };
@@ -5939,6 +7685,7 @@ async fn operator_enqueue_admits_what_the_agent_enqueue_admits() {
         .agent_enqueue_landing_source(
             pilot.owner,
             AgentEnqueueLandingSourceRequestV1 {
+                issue: None,
                 supersedes: None,
                 source_commit: commits[2].clone(),
                 idempotency_key: "agent".into(),
@@ -5948,6 +7695,7 @@ async fn operator_enqueue_admits_what_the_agent_enqueue_admits() {
                 test_filters: Vec::new(),
                 project_id: None,
                 source_session_id: None,
+                expedite: None,
             },
             true,
         )
@@ -6099,4 +7847,565 @@ async fn operator_enqueue_admits_what_the_agent_enqueue_admits() {
         .await
         .unwrap_err();
     assert!(other.to_string().contains("queue_idempotency_conflict"));
+}
+
+/// Hub #3345: the daemon takes a satellite ENQUEUE report in itself. A clean
+/// source is enqueued with its Issue, a conflicting one is answered with a typed
+/// `conflicts_with`, a migration is held for the manager, a commit origin does
+/// not serve is refused, and the satellite hears each outcome exactly once.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn satellite_enqueue_reports_are_taken_in_and_answered_by_the_daemon() {
+    use rsi_common::rolling_queue::{RollingQueueEntryState, RollingQueueOutcome};
+    use rsi_common::satellite::{
+        SatellitePeerConfigV1, SatellitePutPeerRequestV1, SatelliteUuidV1,
+    };
+    use rsi_common::satellite_dispatch::{SatelliteReportKindV1, SatelliteReportV1};
+    use rsi_common::satellite_intake::IntakeStateV1;
+
+    let pilot = pilot().await;
+    let tmp = crate::test_support::disk_backed_tempdir("satellite-intake");
+    let (origin, sat, hub) = (
+        tmp.path().join("origin.git"),
+        tmp.path().join("sat"),
+        tmp.path().join("hub"),
+    );
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    std::fs::create_dir_all(&origin).unwrap();
+    std::fs::create_dir_all(&sat).unwrap();
+    git(&origin, &["init", "-q", "--bare", "-b", "rolling"]);
+    git(&sat, &["init", "-q", "-b", "rolling"]);
+    git(&sat, &["config", "user.email", "test@example.invalid"]);
+    git(&sat, &["config", "user.name", "test"]);
+    std::fs::write(sat.join("a.txt"), "base\n").unwrap();
+    git(&sat, &["add", "a.txt"]);
+    git(&sat, &["commit", "-q", "-m", "base"]);
+    git(&sat, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    git(&sat, &["push", "-q", "origin", "rolling"]);
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            hub.to_str().unwrap(),
+        ],
+    );
+    // Branches the hub has never fetched: the intake must fetch them.
+    let branch = |name: &str, path: &str, body: &str, push: bool| -> String {
+        git(&sat, &["checkout", "-q", "-b", name, "rolling"]);
+        let file = sat.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, body).unwrap();
+        git(&sat, &["add", path]);
+        git(&sat, &["commit", "-q", "-m", name]);
+        let sha = git(&sat, &["rev-parse", "HEAD"]);
+        if push {
+            git(&sat, &["push", "-q", "origin", name]);
+        }
+        git(&sat, &["checkout", "-q", "rolling"]);
+        sha
+    };
+    let sha_a = branch("sat-a", "a.txt", "A\n", true);
+    let sha_b = branch("sat-b", "a.txt", "B\n", true);
+    let sha_c = branch(
+        "sat-c",
+        "crates/rsid-store/src/store/migrations/v999.rs",
+        "// migration\n",
+        true,
+    );
+    let sha_d = branch("sat-d", "d.txt", "D\n", false);
+    let sha_e = branch("sat-e", "e.txt", "E\n", true);
+    let sha_f = branch(
+        "sat-f",
+        "crates/rsid/src/session/agent_authority.rs",
+        "// authority\n",
+        true,
+    );
+
+    let (project, issue, fixes_issue, peer, pin) = {
+        let store = pilot.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET working_dir=?2 WHERE id=?1",
+                rusqlite::params![pilot.owner.to_string(), hub.display().to_string()],
+            )
+            .unwrap();
+        let issue = store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: pilot.config.project_id,
+                title: "satellite work".into(),
+                body: String::new(),
+                priority: None,
+                labels: Vec::new(),
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .display_number;
+        let fixes_issue = store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: pilot.config.project_id,
+                title: "satellite qa repair".into(),
+                body: "Failing tests: a::listed\n".into(),
+                labels: vec!["qa".into()],
+                priority: None,
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .display_number;
+        store
+            .configure_harness_manager_policy(
+                &rsi_common::harness_manager_v2::ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: pilot.config.project_id,
+                    expected_scope_version: pilot.config.row_version,
+                    expected_policy_version: 0,
+                    idempotency_key: "grant-intake".into(),
+                    policy: rsi_common::harness_manager_v2::ManagerPolicyV2::default(),
+                },
+            )
+            .unwrap();
+        let (peer, pin) = (Uuid::new_v4(), Uuid::new_v4());
+        store
+            .put_satellite_peer(
+                &SatellitePutPeerRequestV1 {
+                    expected_registry_revision: 1,
+                    peer: SatellitePeerConfigV1 {
+                        peer_id: SatelliteUuidV1(peer),
+                        label: "laptop".into(),
+                        expected_installation_id: Some(SatelliteUuidV1(pin)),
+                        enabled: true,
+                        read_enabled: true,
+                        dispatch_enabled: true,
+                    },
+                    repair_quarantine: false,
+                },
+                std::path::Path::new("/tmp/satellites"),
+            )
+            .unwrap();
+        let remote_project = Uuid::new_v4();
+        store
+            .put_satellite_peer_scope_entries(2, peer, &[], &[SatelliteUuidV1(remote_project)])
+            .unwrap();
+        (pilot.config.project_id, issue, fixes_issue, peer, pin)
+    };
+    let report = |text: String| SatelliteReportV1 {
+        report_id: Uuid::new_v4(),
+        kind: SatelliteReportKindV1::Enqueue,
+        text,
+        binaries_dir: None,
+    };
+    let record = |report: &SatelliteReportV1| {
+        let store = pilot.manager.store.clone();
+        let report = report.clone();
+        async move {
+            store
+                .lock()
+                .await
+                .record_satellite_report(peer, pin, &report, chrono::Utc::now())
+                .unwrap()
+        }
+    };
+    let control = pilot.manager.agent_control();
+    let pass = |queue_enabled: bool| {
+        let (store, control) = (pilot.manager.store.clone(), control.clone());
+        async move { crate::satellite::enqueue_intake::pass(&store, &control, queue_enabled).await }
+    };
+    let intake = |report: &SatelliteReportV1| {
+        let store = pilot.manager.store.clone();
+        let id = report.report_id;
+        async move {
+            store
+                .lock()
+                .await
+                .get_enqueue_intake(peer, id)
+                .unwrap()
+                .unwrap()
+        }
+    };
+    let messages = || {
+        let store = pilot.manager.store.clone();
+        async move {
+            let store = store.lock().await;
+            let mut statement = store
+                .conn
+                .prepare(
+                    "SELECT payload FROM satellite_messages WHERE peer_id=?1 ORDER BY created_at",
+                )
+                .unwrap();
+            statement
+                .query_map([peer.to_string()], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<String>, _>>()
+                .unwrap()
+        }
+    };
+
+    // A clean source: fetched, enqueued with its Issue, no reply yet.
+    let a = report(format!(
+        "ENQUEUE {sha_a} issue=#{issue} branch=sat-a fixes_issue {fixes_issue} (qa red) fixes_tests=a::explicit"
+    ));
+    let b = report(format!("ENQUEUE {sha_b} branch=sat-b"));
+    let c = report(format!("ENQUEUE {sha_c} branch=sat-c"));
+    let d = report(format!("ENQUEUE {sha_d} branch=sat-d"));
+    for r in [&a, &b, &c, &d] {
+        assert_eq!(
+            record(r).await,
+            crate::store::satellite_reports::ReportRecord::Recorded
+        );
+    }
+    pass(true).await;
+    let row_a = intake(&a).await;
+    assert_eq!(row_a.state, IntakeStateV1::Enqueued, "{row_a:?}");
+    let entry_a = row_a.queue_entry_id.expect("queue entry");
+    {
+        let store = pilot.manager.store.lock().await;
+        let entry = store.get_rolling_queue_entry(entry_a).unwrap().unwrap();
+        assert_eq!(entry.source_commit, sha_a);
+        assert_eq!(entry.issue, Some(issue));
+        assert_eq!(entry.fixes_tests, ["a::explicit", "a::listed"]);
+        assert!(
+            entry
+                .expedite_reason
+                .as_deref()
+                .unwrap()
+                .contains(&format!("#{fixes_issue}"))
+        );
+        assert_eq!(entry.state, RollingQueueEntryState::Queued);
+        assert_eq!(
+            store
+                .live_rolling_queue_sources(Some(project), 8)
+                .unwrap()
+                .len(),
+            1,
+            "only the clean source was enqueued"
+        );
+    }
+
+    // The rest were decided in the same pass, in order. B conflicts with the
+    // queued A (same file), C carries a migration, D is not on origin.
+    // (A pass decides at most PASS_BATCH intakes, so all four were handled.)
+    let row_b = intake(&b).await;
+    assert_eq!(row_b.state, IntakeStateV1::Conflicts, "{row_b:?}");
+    let conflict = &row_b.outcome.as_ref().unwrap()["conflicts_with"][0];
+    assert_eq!(conflict["with"], "entry");
+    assert_eq!(conflict["branch"], "sat-a");
+    assert_eq!(conflict["entry_id"], entry_a.to_string());
+    assert!(
+        conflict["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "a.txt")
+    );
+    assert_eq!(intake(&c).await.state, IntakeStateV1::NeedsReview);
+    assert_eq!(
+        intake(&c).await.outcome_code.as_deref(),
+        Some("pre_merge_review")
+    );
+    let row_d = intake(&d).await;
+    assert_eq!(row_d.state, IntakeStateV1::Refused);
+    assert_eq!(row_d.outcome_code.as_deref(), Some("source_not_on_origin"));
+
+    // The satellite was told B, C and D (not A), each once, even over passes.
+    pass(true).await;
+    pass(true).await;
+    let told = messages().await;
+    assert_eq!(told.len(), 3, "{told:#?}");
+    assert!(
+        told.iter()
+            .any(|text| text.starts_with("HUB INTAKE conflicts:")
+                && text.contains("conflicts_with: entry branch=sat-a")
+                && text.contains("paths=a.txt")),
+        "{told:#?}"
+    );
+    assert!(told.iter().any(|text| text.starts_with("HUB INTAKE held:")));
+    assert!(told.iter().any(
+        |text| text.starts_with("HUB INTAKE refused:") && text.contains("source_not_on_origin")
+    ));
+
+    // With the queue off, a new source is held for the manager.
+    let e = report(format!("ENQUEUE {sha_e} branch=sat-e"));
+    record(&e).await;
+    pass(false).await;
+    let row_e = intake(&e).await;
+    assert_eq!(row_e.state, IntakeStateV1::NeedsReview);
+    assert_eq!(row_e.outcome_code.as_deref(), Some("queue_disabled"));
+
+    // An authority-path source is enqueued, and its digest notice asks the
+    // manager for the post-land review; the clean source's notice does not.
+    let f = report(format!("ENQUEUE {sha_f} branch=sat-f Please expedite."));
+    record(&f).await;
+    pass(true).await;
+    let row_f = intake(&f).await;
+    assert_eq!(row_f.state, IntakeStateV1::Enqueued, "{row_f:?}");
+    let entry_f = row_f.queue_entry_id.expect("queue entry");
+    assert_eq!(
+        pilot
+            .manager
+            .store
+            .lock()
+            .await
+            .get_rolling_queue_entry(entry_f)
+            .unwrap()
+            .unwrap()
+            .expedite_reason
+            .as_deref(),
+        Some("satellite ENQUEUE requested expedite")
+    );
+    let enqueued_notice = |report: Uuid| {
+        let store = pilot.manager.store.clone();
+        async move {
+            let store = store.lock().await;
+            let subject = format!(
+                "{}{peer}:{report}",
+                rsi_common::satellite_intake::INTAKE_NOTICE_SUBJECT_PREFIX
+            );
+            let state_json: String = store
+                .conn
+                .query_row(
+                    "SELECT state_json FROM harness_manager_notices
+                     WHERE subject_id=?1 AND subject_version='enqueued'",
+                    [subject],
+                    |db| db.get(0),
+                )
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&state_json).unwrap()
+        }
+    };
+    let notice_f = enqueued_notice(f.report_id).await;
+    assert_eq!(notice_f["state"], "enqueued", "{notice_f}");
+    assert_eq!(notice_f["queue_entry_id"], entry_f.to_string());
+    assert_eq!(notice_f["needs_attention"], true, "{notice_f}");
+    assert_eq!(
+        notice_f["outcome"]["post_land_review"], "changes agent or manager authority",
+        "{notice_f}"
+    );
+    let notice_a = enqueued_notice(a.report_id).await;
+    assert_eq!(notice_a["needs_attention"], false, "{notice_a}");
+    assert!(notice_a["outcome"]["post_land_review"].is_null());
+
+    // A syntactically valid claim of a missing hub Issue is a named refusal,
+    // rather than an ordinary entry that silently lost the claim.
+    let missing = report(format!("ENQUEUE {sha_e} fixes_issue=999999999"));
+    record(&missing).await;
+    pass(true).await;
+    let refused = intake(&missing).await;
+    assert_eq!(refused.state, IntakeStateV1::Refused);
+    assert_eq!(
+        refused.outcome_code.as_deref(),
+        Some("queue_fixes_issue_not_found")
+    );
+
+    // Both priority slots are occupied. An explicit request is refused,
+    // rather than silently being queued without the requested priority.
+    let capped = report(format!("ENQUEUE {sha_e} expedite=urgent-repair"));
+    record(&capped).await;
+    pass(true).await;
+    let refused = intake(&capped).await;
+    assert_eq!(refused.state, IntakeStateV1::Refused);
+    assert_eq!(
+        refused.outcome_code.as_deref(),
+        Some("queue_expedite_cap_reached")
+    );
+
+    // The entry publishes: the satellite hears PUBLISHED once.
+    {
+        let store = pilot.manager.store.lock().await;
+        store
+            .conn
+            .execute(
+                "UPDATE rolling_queue_entries SET state='gating' WHERE id=?1",
+                [entry_a.to_string()],
+            )
+            .unwrap();
+        store
+            .settle_rolling_queue_entry(
+                entry_a,
+                RollingQueueEntryState::Published,
+                &RollingQueueOutcome {
+                    landed_sha: Some(sha_a.clone()),
+                    ..RollingQueueOutcome::default()
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    }
+    let before = messages().await.len();
+    pass(true).await;
+    pass(true).await;
+    let row_a = intake(&a).await;
+    assert_eq!(row_a.state, IntakeStateV1::Settled);
+    assert_eq!(row_a.outcome_code.as_deref(), Some("published"));
+    let told = messages().await;
+    assert_eq!(told.len(), before + 1, "PUBLISHED is told once");
+    assert!(
+        told.iter()
+            .any(|text| text.starts_with("HUB INTAKE published:")
+                && text.contains("PUBLISHED")
+                && text.contains(&sha_a)),
+        "{told:#?}"
+    );
+}
+
+/// #3181: a `bench` job is for the appointed manager or an Epic lead. A worker is
+/// refused `job_kind_not_authorized`; the manager's and a lead's submits run the
+/// gates before any row exists (a dirty config or a disabled switch leaves no job)
+/// and queue the job behind its start gates.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+#[allow(clippy::unwrap_used)]
+async fn a_bench_job_is_manager_or_lead_only_and_runs_its_gates_before_a_row_exists() {
+    use crate::agent_jobs::bench::tests::{FakePorts, Repo};
+    use crate::agent_jobs::{JobRuntime, JobTools, LaunchSpec};
+    use rsi_common::agent_jobs::{
+        AgentListJobsRequestV1, AgentSubmitJobRequestV1, JobKind, JobState,
+    };
+
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<LaunchSpec>>);
+    impl JobRuntime for Recorder {
+        fn launch(&self, spec: &LaunchSpec) -> std::result::Result<(), String> {
+            self.0.lock().unwrap().push(spec.clone());
+            Ok(())
+        }
+        fn unit_active(&self, _unit: &str) -> bool {
+            true
+        }
+    }
+
+    const CONFIG: &str = "eval/bench/tb2/runs/smoke-oracle.toml";
+    let pilot = pilot().await;
+    let repo = Repo::new();
+    let worker = Uuid::new_v4();
+    {
+        let store = pilot.manager.store.lock().await;
+        let mut row = bare_session(worker);
+        row.parent_id = Some(pilot.epics[0]);
+        row.session_kind = SessionKind::Task;
+        row.status = SessionStatus::Running;
+        row.project_id = store.get_session(pilot.owner).unwrap().unwrap().project_id;
+        store.insert_session(&row).unwrap();
+        for session in [worker, pilot.owner, pilot.leads[0]] {
+            store
+                .conn
+                .execute(
+                    "UPDATE sessions SET sandbox_root=?2 WHERE id=?1",
+                    rusqlite::params![session.to_string(), repo.path().display().to_string()],
+                )
+                .unwrap();
+        }
+    }
+    let tools = || JobTools {
+        cargo_slot: "/x/cargo-slot".into(),
+        lander: "/x/rsi-rolling-land".into(),
+    };
+    let request = |budget: f64| AgentSubmitJobRequestV1 {
+        project_id: None,
+        sandbox_session_id: None,
+        kind: JobKind::Bench,
+        params: serde_json::json!({"config": CONFIG, "budget_usd": budget}),
+        name: Some("smoke".into()),
+        idempotency_key: None,
+        worktree: None,
+        wake: None,
+    };
+    let ports = FakePorts::new();
+    let control = pilot
+        .manager
+        .agent_control()
+        .with_bench_ports(ports.clone());
+    let recorder = std::sync::Arc::new(Recorder::default());
+    let jobs = |who: Uuid| {
+        let control = pilot.manager.agent_control();
+        async move {
+            control
+                .agent_list_jobs(who, AgentListJobsRequestV1::default())
+                .await
+                .unwrap()
+                .jobs
+        }
+    };
+
+    // A worker, however well it names its config, is not authorized.
+    let denied = control
+        .agent_submit_job(worker, request(1.0), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("job_kind_not_authorized"),
+        "{denied}"
+    );
+    assert!(jobs(worker).await.is_empty());
+
+    // The operator's switch is checked before anything else.
+    ports.set(|s| s.enabled = false);
+    let off = control
+        .agent_submit_job(pilot.owner, request(1.0), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(off.to_string().contains("bench_disabled"), "{off}");
+    ports.set(|s| s.enabled = true);
+
+    // An edited config is refused before a row exists.
+    repo.write(CONFIG, "# edited\n");
+    let dirty = control
+        .agent_submit_job(pilot.owner, request(1.0), recorder.clone(), tools())
+        .await
+        .unwrap_err();
+    assert!(
+        dirty.to_string().contains("bench_config_uncommitted"),
+        "{dirty}"
+    );
+    assert!(dirty.to_string().contains(CONFIG), "{dirty}");
+    assert!(
+        jobs(pilot.owner).await.is_empty(),
+        "no row for a refused submit"
+    );
+    repo.git(&["checkout", "--", CONFIG]);
+
+    // The manager and an Epic lead each queue one; nothing launches yet.
+    let manager_job = control
+        .agent_submit_job(pilot.owner, request(1.0), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(manager_job.job.kind, JobKind::Bench);
+    assert_eq!(manager_job.job.state, JobState::Queued);
+    assert_eq!(
+        manager_job.job.held.as_deref(),
+        Some("held_for_bench_admission")
+    );
+    let lead_job = control
+        .agent_submit_job(pilot.leads[0], request(2.0), recorder.clone(), tools())
+        .await
+        .unwrap();
+    assert_eq!(lead_job.job.state, JobState::Queued);
+    assert_ne!(lead_job.job.id, manager_job.job.id);
+    assert!(
+        recorder.0.lock().unwrap().is_empty(),
+        "the start gates run first"
+    );
+    assert_eq!(jobs(pilot.owner).await.len(), 1);
 }

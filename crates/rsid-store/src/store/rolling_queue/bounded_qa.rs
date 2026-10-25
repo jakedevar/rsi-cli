@@ -6,6 +6,9 @@
 use super::*;
 use crate::store::issues::{IssueWriteActor, issue_write_before_commit};
 use crate::store::manager_notices::QaIssueNotice;
+use rsi_common::failure_signature::{
+    Matcher, SCHEMA_VERSION, SignatureClass, SignatureRecord, digest, parse_issue_blocks,
+};
 use rsi_common::types::NewIssue;
 
 #[derive(Clone, Debug)]
@@ -67,6 +70,9 @@ pub struct BoundedQaRun {
     pub exit_code: Option<i32>,
     pub failing_tests: Vec<String>,
     pub log_path: Option<String>,
+    /// Panic evidence from the executing host, when available. Internal only;
+    /// satellite receipts currently carry outcomes without panic payloads.
+    pub failure_matchers: std::collections::BTreeMap<String, Matcher>,
 }
 
 /// Most failing test names one finished receipt stores (the Issue body names
@@ -436,6 +442,7 @@ mod tests {
             exit_code: Some(100),
             failing_tests: vec!["store::tests::red".into()],
             log_path: Some("/laptop/jobs/x.log".into()),
+            ..Default::default()
         };
         store
             .finish_bounded_qa(
@@ -663,6 +670,84 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn auto_filed_qa_issue_is_found_by_signature_query_and_replay_keeps_one_record() {
+        use rsi_common::agent_failure_signatures::{
+            AgentQueryFailureSignaturesRequestV1, AgentQueryFailureSignaturesResultV1,
+        };
+        use rsi_common::failure_signature::{
+            Classification, MatchedBy, build_snapshot, classify, panic_matcher_for,
+        };
+
+        let (store, work) = fixture();
+        let text = "thread 'a::red' (1) panicked at src/a.rs:1:1:\nassertion failed: manager inbox received the notification\nnote: run with `RUST_BACKTRACE=1`";
+        let run = BoundedQaRun {
+            failing_tests: vec!["a::red".into(), "b::timeout".into()],
+            failure_matchers: [("a::red".into(), panic_matcher_for(text, "a::red").unwrap())]
+                .into(),
+            ..Default::default()
+        };
+        let job = Uuid::new_v4();
+        let make = |tests: &[String]| issue_naming(&work, tests);
+        for _ in 0..2 {
+            store
+                .finish_bounded_qa_with(
+                    &work,
+                    job,
+                    &"d".repeat(40),
+                    false,
+                    &run,
+                    Some(&make),
+                    Utc::now(),
+                )
+                .unwrap();
+        }
+        let sources = store
+            .open_failure_signature_issues(work[0].project_id.unwrap())
+            .unwrap();
+        let result = AgentQueryFailureSignaturesResultV1::from_issues(
+            &sources,
+            &AgentQueryFailureSignaturesRequestV1 {
+                test_id: Some("a::red".into()),
+                digest: None,
+            },
+        );
+        assert!(result.malformed_issues.is_empty());
+        assert_eq!(result.records.len(), 1);
+        let owner = all_issues(&store, &work).pop().unwrap();
+        assert_eq!(result.records[0].record.issue, owner.display_number as u64);
+        assert_eq!(
+            result.records[0].record.matcher.contains,
+            ["assertion failed: manager inbox received the notification"]
+        );
+        let snapshot = build_snapshot(
+            &[(owner.display_number as u64, "Open".into(), owner.body)],
+            None,
+        )
+        .snapshot;
+        // A changed location/count still matches the captured assertion line.
+        assert_eq!(
+            classify(
+                &snapshot,
+                "a::red",
+                "observed: assertion failed: manager inbox received the notification",
+                None
+            ),
+            Classification::Known {
+                issue: owner.display_number as u64,
+                class: SignatureClass::Regression,
+                by: MatchedBy::Contains,
+            }
+        );
+        assert_eq!(
+            classify(&snapshot, "b::timeout", "a different failure cause", None),
+            Classification::NameOnly {
+                issues: vec![owner.display_number as u64]
+            }
+        );
+    }
+
     /// Hub #3054: a second red run of a test an open `qa` Issue already names
     /// files nothing and records the run on that Issue; a replay of the same
     /// job adds nothing more.
@@ -717,6 +802,20 @@ mod tests {
             tracking.body.contains(&job.to_string()),
             "{}",
             tracking.body
+        );
+        red_run(&store, &work, 1, job, &["a::new_one", "a::tracked"]);
+        let replayed = all_issues(&store, &work);
+        let filed = replayed
+            .iter()
+            .find(|i| i.display_number == second)
+            .unwrap();
+        let signatures = parse_issue_blocks(&filed.body, second as u64).unwrap();
+        assert_eq!(
+            signatures
+                .iter()
+                .map(|r| r.test_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a::new_one"]
         );
     }
 
@@ -1073,6 +1172,7 @@ mod tests {
             exit_code: Some(124),
             failing_tests: vec![],
             log_path: Some("/jobs/qa.log".into()),
+            ..Default::default()
         };
         for _ in 0..2 {
             store
@@ -1744,6 +1844,70 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    /// #3733: a pending, unbound `landing` that the project's latest passing
+    /// full-library run (`green`) already covers is settled from that run
+    /// instead of owing another one. The caller proves the ancestry (git); this
+    /// writes one `bounded_qa_finished` receipt (`passed`, `credited`) that
+    /// carries the green run's SHA, job and original pass time, so
+    /// `qa_green` and its age do not move. A coverage-incomplete overdue Issue
+    /// already filed for the landing is closed with that evidence. Idempotent:
+    /// a landing that already has a finished receipt is left alone. Returns
+    /// whether a receipt was written.
+    pub fn credit_bounded_qa_green(
+        &self,
+        landing: &BoundedQaLanding,
+        green: &rsi_common::rolling_queue::RollingQaGreenV1,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let at =
+            DateTime::parse_from_rfc3339(&green.passed_at).map_or(now, |at| at.with_timezone(&Utc));
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let finished: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rolling_queue_events
+             WHERE entry_id=?1 AND kind='bounded_qa_finished')",
+            [landing.entry.id.to_string()],
+            |row| row.get(0),
+        )?;
+        if finished {
+            return Ok(false);
+        }
+        record_event(
+            &tx,
+            landing.batch_id,
+            "bounded_qa_finished",
+            Some(landing.entry.id),
+            Some(serde_json::json!({
+                "job_id": green.job_id,
+                "sha": green.sha,
+                "passed": true,
+                "credited": true,
+                "issue": serde_json::Value::Null,
+                "exit_code": 0,
+                "failing_tests": Vec::<String>::new(),
+                "failing_tests_total": 0,
+                "landings": [landing.entry.id.to_string()],
+            })),
+            at,
+        )?;
+        tx.commit()?;
+        // The overdue Issue (if one was filed before the green run covered
+        // the landing) is stale: close it with the evidence.
+        let overdue = Uuid::new_v5(&landing.entry.id, b"bounded-library-qa-overdue");
+        if let (Some(project), Some(issue)) = (landing.project_id, self.get_issue(overdue)?)
+            && matches!(
+                issue.status,
+                rsi_common::types::IssueStatus::Open | rsi_common::types::IssueStatus::InProgress
+            )
+        {
+            self.update_issue_status_in_project(
+                project,
+                overdue,
+                rsi_common::types::IssueStatus::Closed,
+            )?;
+        }
+        Ok(true)
+    }
+
     /// #2112: record that each published `entries` member owes the async
     /// full-library run (`reason` names why, e.g. `derived_filters`). The
     /// queue writes it before the members settle, so a crash in between keeps
@@ -1859,14 +2023,14 @@ impl Store {
                 AND id > COALESCE((SELECT MAX(id) FROM rolling_queue_events
                     WHERE entry_id=rolling_queue_entries.id
                       AND kind='bounded_qa_capacity_deferred'), 0)
-              ORDER BY id DESC LIMIT 1),
+              ORDER BY id DESC LIMIT 1) AS qa_request_json,
              (SELECT detail_json FROM rolling_queue_events
               WHERE entry_id=rolling_queue_entries.id
                 AND kind IN ('bounded_qa_dispatching','bounded_qa_dispatch_withdrawn')
                 AND id > COALESCE((SELECT MAX(id) FROM rolling_queue_events
                     WHERE entry_id=rolling_queue_entries.id
                       AND kind='bounded_qa_capacity_deferred'), 0)
-              ORDER BY id DESC LIMIT 1)
+              ORDER BY id DESC LIMIT 1) AS qa_dispatch_json
              FROM rolling_queue_entries
              WHERE state='published' AND batch_id IS NOT NULL
                AND (instr(json_extract(outcome_json,'$.detail'),'selection=bounded ')>0
@@ -1881,7 +2045,10 @@ impl Store {
         ))?; // sql-dynamic-ok: static column list; no input interpolated
         let rows = stmt.query_map([], |row| {
             let entry = map_entry(row)?;
-            let json_column = |column: usize| -> rusqlite::Result<Option<serde_json::Value>> {
+            // These columns follow ENTRY_COLUMNS; resolve their aliases so an
+            // entry field cannot shift the QA request/dispatch decoders.
+            let json_column = |name: &str| -> rusqlite::Result<Option<serde_json::Value>> {
+                let column = row.as_ref().column_index(name)?;
                 let text: Option<String> = row.get(column)?;
                 text.map(|text| {
                     serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
@@ -1894,8 +2061,9 @@ impl Store {
                 })
                 .transpose()
             };
-            let detail = json_column(18)?;
-            let dispatch = json_column(19)?;
+            let detail = json_column("qa_request_json")?;
+            let dispatch = json_column("qa_dispatch_json")?;
+            let dispatch_column = row.as_ref().column_index("qa_dispatch_json")?;
             let job = detail
                 .as_ref()
                 .and_then(|d| d.get("job_id"))
@@ -1932,7 +2100,7 @@ impl Store {
                     };
                     let invalid = |what: &str| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            19,
+                            dispatch_column,
                             rusqlite::types::Type::Text,
                             what.to_owned().into(),
                         )
@@ -2340,12 +2508,26 @@ impl Store {
                         label: QA_ACTOR_LABEL.into(),
                     },
                 )?;
+                // On replay the stored Issue may name only the untracked
+                // subset from the first settlement. Preserve that ownership.
+                let listed = rsi_common::rolling_queue::failing_tests_listed(&created.issue.body);
+                let named: Vec<String> = untracked
+                    .iter()
+                    .filter(|test| listed.is_empty() || listed.contains(test))
+                    .cloned()
+                    .collect();
+                Self::append_qa_signatures_in_tx(tx, &created.issue, &named, run)?;
                 Ok::<_, DaemonError>((created.issue.display_number, new))
             })
             .transpose()?;
         let filed_number = filed.as_ref().map(|(number, _)| *number);
         for (issue, names) in &tracked {
-            Self::append_qa_run_in_tx(tx, issue, names, job_id, sha, filed_number, now)?;
+            Self::append_qa_signatures_in_tx(tx, issue, names, run)?;
+            // Appending signatures advances the Issue; use the current row
+            // for the run appendix's event/CAS bookkeeping.
+            let issue = Self::get_issue_tx(tx, issue.id)?
+                .ok_or_else(|| DaemonError::Store("QA signature owner disappeared".into()))?;
+            Self::append_qa_run_in_tx(tx, &issue, names, job_id, sha, filed_number, now)?;
         }
         let number = filed_number.or_else(|| tracked.first().map(|(i, _)| i.display_number));
         Ok(number.map(|number| QaFiling {
@@ -2359,6 +2541,66 @@ impl Store {
                 issue,
             }),
         }))
+    }
+
+    /// Attach records after allocation of the owner number, inside the same
+    /// transaction as the Issue and QA receipt. A replay adds no duplicate.
+    fn append_qa_signatures_in_tx(
+        tx: &Transaction<'_>,
+        issue: &rsi_common::types::Issue,
+        tests: &[String],
+        run: &BoundedQaRun,
+    ) -> Result<()> {
+        let number = u64::try_from(issue.display_number)
+            .map_err(|_| DaemonError::Store("negative QA Issue number".into()))?;
+        // A malformed pre-existing signature is already reported by the query.
+        // It must not prevent settlement of a later QA run.
+        let Ok(existing) = parse_issue_blocks(&issue.body, number) else {
+            return Ok(());
+        };
+        let mut section = String::new();
+        for test in tests {
+            if existing.iter().any(|record| {
+                record.test_id == *test
+                    && (!record.matcher.contains.is_empty()
+                        || run
+                            .failure_matchers
+                            .get(test)
+                            .is_none_or(|matcher| matcher.contains.is_empty()))
+            }) {
+                continue;
+            }
+            let matcher = run
+                .failure_matchers
+                .get(test)
+                .cloned()
+                .unwrap_or_else(|| Matcher {
+                    digest: Some(digest(test)),
+                    contains: Vec::new(),
+                });
+            let note = matcher.contains.is_empty().then(|| {
+                "Panic output unavailable; the digest covers the reported outcome or test identity only. Confirm the cause from the executing host's log.".into()
+            });
+            let record = SignatureRecord {
+                schema_version: SCHEMA_VERSION,
+                test_id: test.clone(),
+                matcher,
+                issue: number,
+                class: SignatureClass::Regression,
+                host_scope: None,
+                note,
+            };
+            section.push('\n');
+            section.push_str(
+                &record
+                    .issue_block()
+                    .map_err(|error| DaemonError::Store(error.to_string()))?,
+            );
+        }
+        if !section.is_empty() {
+            Self::append_issue_body_as_system_tx(tx, issue, &section, QA_ACTOR_LABEL)?;
+        }
+        Ok(())
     }
 
     /// The open `qa` Issues of `project` that name at least one of `failing`

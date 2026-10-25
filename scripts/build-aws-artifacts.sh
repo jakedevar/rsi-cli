@@ -40,8 +40,15 @@ cd "$repo_dir"
 # `${CARGO_TARGET_DIR:-target}` instead looked in ./target while a global
 # `build.target-dir` made cargo build elsewhere, so an install of ./target (or of
 # another worktree's stale binaries) could replace this commit's artifacts.
-target_dir="$(cargo metadata --format-version 1 --no-deps --locked \
-  | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+metadata_json="$(cargo metadata --format-version 1 --no-deps --locked)"
+# `target_directory` is a top-level string of the metadata JSON: read with plain text
+# tools (no interpreter). A path that needs JSON escaping cannot be read this way and
+# is refused rather than guessed.
+target_dir="$(printf '%s' "$metadata_json" \
+  | sed -n 's/.*"target_directory"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+case "$target_dir" in
+  *\\*) echo 'The cargo target directory needs JSON escaping; set CARGO_TARGET_DIR to a plain path.' >&2; exit 1 ;;
+esac
 [[ -n "$target_dir" ]] || {
   echo 'Cannot resolve the cargo target directory.' >&2
   exit 1

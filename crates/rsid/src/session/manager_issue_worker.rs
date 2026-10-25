@@ -86,12 +86,26 @@ impl AgentControlHandle {
             request.brief.push_str("\n\n");
             request.brief.push_str(&section);
         }
-        let admission = crate::store_lock::lock(
-            &self.store,
-            "manager_issue_worker::agent_manager_launch_issue_worker",
-        )
-        .await
-        .enqueue_manager_issue_worker(caller, &request)?;
+        // #3688: a manager whose scope is the whole project and holds no live
+        // Epic launches its first worker without an operator or global-manager
+        // round trip: the daemon creates the default Epic (and Group). #3786:
+        // the containers are written inside the admission's own transaction, so
+        // a launch that is refused (no SessionCreate capability, unavailable
+        // Issue, ...) leaves nothing behind.
+        let (admission, created) = {
+            let store = crate::store_lock::lock(
+                &self.store,
+                "manager_issue_worker::agent_manager_launch_issue_worker",
+            )
+            .await;
+            let created = Self::default_issue_worker_containers(&store, caller, &request)?;
+            let admission =
+                store.enqueue_manager_issue_worker_provisioning(caller, &request, &created)?;
+            (admission, created)
+        };
+        for session in created {
+            self.project_default_container(session).await;
+        }
         let watch = self
             .arm_issue_worker_watch(caller, admission.worker_session_id)
             .await;
@@ -335,5 +349,68 @@ fn issue_worker_parties(operation: &ManagerActionOperationV2) -> Option<(Uuid, U
     ) {
         (Some(_), ManagerActionOriginV2::Agent { caller }, Some(worker)) => Some((*caller, worker)),
         _ => None,
+    }
+}
+
+/// Display names and tags of the containers #3688 provisions. The tags are the
+/// normalized form `create_container` would store.
+const DEFAULT_GROUP_NAME: &str = "Managed work";
+const DEFAULT_GROUP_TAG: &str = "managed-work";
+const DEFAULT_EPIC_NAME: &str = "Issue workers";
+const DEFAULT_EPIC_TAG: &str = "issue-workers";
+
+impl AgentControlHandle {
+    /// #3688: the default Group (when the project has no live top-level Group)
+    /// and Epic a first launch needs, when the store's plan says the caller is a
+    /// project-wide manager with no live Epic in scope. Only built here; the
+    /// admission transaction writes them (#3786), so a refusal persists nothing.
+    fn default_issue_worker_containers(
+        store: &crate::store::Store,
+        caller: Uuid,
+        request: &AgentManagerLaunchIssueWorkerRequestV1,
+    ) -> Result<Vec<rsi_common::types::Session>> {
+        use rsi_common::rpc::CreateContainerParams;
+        use rsi_common::types::SessionKind;
+        {
+            let Some(plan) = store.issue_worker_default_container_plan(caller, request)? else {
+                return Ok(Vec::new());
+            };
+            let mut created = Vec::new();
+            let group = match plan.existing_group {
+                Some(group) => group,
+                None => {
+                    let session = super::hierarchy_ops::build_container_session(
+                        Uuid::new_v4(),
+                        CreateContainerParams {
+                            kind: SessionKind::Group,
+                            name: DEFAULT_GROUP_NAME.into(),
+                            parent_id: None,
+                            project_id: Some(plan.project_id),
+                            tags: vec![DEFAULT_GROUP_TAG.into()],
+                            topology_id: None,
+                        },
+                        plan.working_dir.clone(),
+                        vec![DEFAULT_GROUP_TAG.into()],
+                    );
+                    let id = session.id;
+                    created.push(session);
+                    id
+                }
+            };
+            created.push(super::hierarchy_ops::build_container_session(
+                Uuid::new_v4(),
+                CreateContainerParams {
+                    kind: SessionKind::Epic,
+                    name: DEFAULT_EPIC_NAME.into(),
+                    parent_id: Some(group),
+                    project_id: Some(plan.project_id),
+                    tags: vec![DEFAULT_EPIC_TAG.into()],
+                    topology_id: None,
+                },
+                plan.working_dir,
+                vec![DEFAULT_EPIC_TAG.into()],
+            ));
+            Ok(created)
+        }
     }
 }

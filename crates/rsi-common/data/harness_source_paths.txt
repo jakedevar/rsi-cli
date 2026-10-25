@@ -1,0 +1,19 @@
+# Harness source path list (#3192, program #3135 M6 decision D4).
+#
+# `harness_source_digest` is a sha256 over the git tree or blob ids of exactly these paths at the
+# daemon's RSI_BUILD_SHA (`rsi_common::harness_source_digest`). A change to any listed path changes
+# the digest, so a benchmark record taken before it is not comparable to one taken after. A change
+# anywhere else, for example the TUI, the merge queue or this repository's docs, leaves it alone.
+#
+# Format: `<path> | <one-line reason>`. A trailing `/` marks a directory. Adding or removing a line
+# changes the digest.
+crates/rsid-harness/ | the harness crate the Harness provider runs on
+crates/rsid/src/session/harness/ | the agent loop, tool registry, tools, compaction, completion gates and the build digest
+crates/rsid/assets/harness/ | the base and bench system prompts the loop sends
+crates/rsi-common/src/harness_tool_policy.rs | the tool policy that decides which tools a session may call
+crates/rsi-common/src/exec_target.rs | the container exec target types the tools run commands through (#3176)
+crates/rsid/src/session/exec_target_launch.rs | resolves and validates the container exec target at launch (#3176)
+crates/rsi-common/src/bench_profile.rs | the bench launch profile and per-launch loop knobs (#3177)
+crates/rsi-common/src/bench_overlay.rs | the run overlay: how a candidate maps to the tool policy, the loop knobs and the prompt body (#3191)
+crates/rsid/src/session/bench_route.rs | the bench launch route and the build digest read-back (#3177)
+crates/rsid/src/session/harness_hash.rs | harness_version_hash: how a session's harness identity is computed

@@ -19,9 +19,18 @@ export interface ThemeChoice {
   /** A TUI theme key, or null for the desktop's own stylesheet. */
   theme: string | null;
   overrides: Overrides;
+  /**
+   * "Match system": the theme follows the system light/dark setting (Light when the system is light, the
+   * desktop default otherwise), live. An explicit theme pick clears it; `theme` is ignored while it is set.
+   */
+  system?: boolean;
 }
 
 export const DEFAULT_CHOICE: ThemeChoice = { theme: null, overrides: {} };
+/** A profile that never stored a choice (a new install) matches the system. A stored choice never does unless it says so. */
+export const FIRST_RUN_CHOICE: ThemeChoice = { theme: null, overrides: {}, system: true };
+/** The built-in theme "Match system" shows when the system is light (the dark side is the desktop default). */
+export const SYSTEM_LIGHT_THEME = 'light';
 export const DESKTOP_DEFAULT_NAME = 'Desktop default (Catppuccin Mocha)';
 export const STORAGE_KEY = 'rsi.desktop.theme.v1';
 
@@ -39,6 +48,7 @@ export const DESKTOP_VARS: Readonly<Record<string, { role: string } | { slot: st
   '--overlay0': { role: 'disabled' },
   '--text': { role: 'primary_text' },
   '--subtext': { role: 'muted_text' },
+  '--muted': { role: 'muted_text' },
   '--blue': { role: 'accent' },
   '--green': { role: 'running' },
   '--yellow': { slot: 'yellow' },
@@ -52,10 +62,24 @@ export const DESKTOP_VARS: Readonly<Record<string, { role: string } | { slot: st
 export const DESKTOP_DEFAULT_VARS: Readonly<Record<string, Hex>> = {
   '--base': '#1e1e2e', '--mantle': '#181825', '--crust': '#11111b',
   '--surface0': '#313244', '--surface1': '#45475a', '--overlay0': '#6c7086',
-  '--text': '#cdd6f4', '--subtext': '#a6adc8',
+  '--text': '#cdd6f4', '--subtext': '#a6adc8', '--muted': '#9ca0b8',
   '--blue': '#89b4fa', '--green': '#a6e3a1', '--yellow': '#f9e2af', '--red': '#f38ba8',
   '--mauve': '#cba6f7', '--peach': '#fab387', '--teal': '#94e2d5',
 };
+
+/**
+ * Text drawn on a filled accent (badges, primary and danger buttons): the accent variable it sits on and the
+ * `--on-*` variable that carries its text colour. The stylesheet defaults each to `var(--crust)`; a theme or an
+ * override sets the one that reaches 4.5:1 (`onColor`).
+ */
+export const ON_ACCENT_VARS: Readonly<Record<string, string>> = {
+  '--on-blue': '--blue', '--on-green': '--green', '--on-yellow': '--yellow', '--on-red': '--red',
+  '--on-mauve': '--mauve', '--on-peach': '--peach', '--on-teal': '--teal',
+};
+const AA_TEXT = 4.5;
+/** The surfaces text is drawn on (panes, bars, cards and the selected row) and the text variables a theme keeps readable on them. */
+export const TEXT_SURFACES: readonly string[] = ['--base', '--mantle', '--crust', '--surface0', '--surface1'];
+export const ADJUSTED_TEXT_VARS: readonly string[] = ['--subtext', '--muted', '--blue', '--green', '--yellow', '--red', '--mauve', '--peach', '--teal'];
 
 /** Desktop-default colours of the roles no desktop variable shows. */
 const DESKTOP_DEFAULT_UNMAPPED: Readonly<Record<string, Hex>> = {
@@ -109,6 +133,59 @@ export function contrastRatio(a: Hex, b: Hex): number {
   return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
 }
 
+/**
+ * The text colour for a fill: `preferred` (the theme's own dark surface) when it reaches 4.5:1, else the theme's
+ * text colour, else black or white, whichever reads better. The best of black and white is always >= 4.58:1.
+ */
+export function onColor(fill: Hex, preferred: Hex, text: Hex): Hex {
+  const candidates = [preferred, text, '#000000', '#ffffff'];
+  for (const c of candidates) if (contrastRatio(c, fill) >= AA_TEXT) return c;
+  return contrastRatio('#000000', fill) >= contrastRatio('#ffffff', fill) ? '#000000' : '#ffffff';
+}
+
+function toHex(c: [number, number, number]): Hex {
+  return `#${c.map((v) => Math.round(Math.min(255, Math.max(0, v))).toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** `color` moved `t` (0..1) of the way to black or white. */
+function shifted(color: Hex, toward: 'black' | 'white', t: number): Hex {
+  const goal = toward === 'white' ? 255 : 0;
+  return toHex(rgb(color).map((v) => v + (goal - v) * t) as [number, number, number]);
+}
+
+/** The largest move toward black or white the text tokens accept before the theme keeps its own colour. */
+const MAX_TEXT_SHIFT = 0.65;
+
+/**
+ * Text `color` adjusted to read at `min` on every one of `surfaces`: the same hue, moved toward white on dark surfaces
+ * or toward black on light ones by the smallest step (of 1%) that clears it. A colour that already reads is returned
+ * as is; one that would need more than MAX_TEXT_SHIFT, or surfaces that need opposite directions, keep their colour.
+ */
+export function readableOn(color: Hex, surfaces: readonly Hex[], min = AA_TEXT): Hex {
+  const worst = (c: Hex) => Math.min(...surfaces.map((s) => contrastRatio(c, s)));
+  if (worst(color) >= min) return color;
+  const light = surfaces.filter((s) => contrastRatio(s, '#000000') > contrastRatio(s, '#ffffff')).length;
+  if (light !== 0 && light !== surfaces.length) return color;
+  const toward = light === 0 ? 'white' : 'black';
+  for (let t = 0.01; t <= MAX_TEXT_SHIFT + 1e-9; t += 0.01) {
+    const c = shifted(color, toward, t);
+    if (worst(c) >= min) return c;
+  }
+  return color;
+}
+
+/** The choice the page is painted with: "Match system" resolves to Light or the desktop default. */
+export function effectiveChoice(choice: ThemeChoice, systemLight: boolean): ThemeChoice {
+  if (!choice.system) return choice;
+  return { ...choice, theme: systemLight ? SYSTEM_LIGHT_THEME : null };
+}
+
+/** `color-scheme` for a choice (native checkboxes, selects, scrollbars): by the canvas it paints. */
+export function colorSchemeOf(choice: ThemeChoice): 'light' | 'dark' {
+  const canvas = resolveRoles(choice)['canvas']!;
+  return contrastRatio(canvas, '#000000') > contrastRatio(canvas, '#ffffff') ? 'light' : 'dark';
+}
+
 // ---------- roles ----------
 
 /** A role's colour in a theme before any override (`semantic_baseline`). */
@@ -148,13 +225,28 @@ export function cssVars(choice: ThemeChoice): Record<string, Hex> {
       out[v] = PALETTES[theme.palette]?.[src.slot] ?? DESKTOP_DEFAULT_VARS[v]!;
     }
   }
+  // A built-in theme's accent and secondary text colours read at 4.5:1 on every surface text sits on (the pane
+  // surfaces and the selected row); a role override the operator typed is theirs and is left alone.
+  if (theme) {
+    const surfaces = TEXT_SURFACES.map((v) => out[v]!);
+    for (const [v, src] of Object.entries(DESKTOP_VARS)) {
+      if (!ADJUSTED_TEXT_VARS.includes(v) || ('role' in src && choice.overrides[src.role])) continue;
+      out[v] = readableOn(out[v]!, surfaces);
+    }
+  }
   for (const r of THEME_ROLES) if (theme || choice.overrides[r.key]) out[`--role-${r.key.replace(/_/g, '-')}`] = roles[r.key]!;
+  // Text on a filled accent follows the fill; only when the fill, the dark surface or the text colour changed.
+  const eff = { ...DESKTOP_DEFAULT_VARS, ...out };
+  const moved = (v: string) => v in out;
+  for (const [on, fill] of Object.entries(ON_ACCENT_VARS)) {
+    if (moved(fill) || moved('--crust') || moved('--text')) out[on] = onColor(eff[fill]!, eff['--crust']!, eff['--text']!);
+  }
   return out;
 }
 
 /** Every variable cssVars can set (cleared before a new choice is applied). */
 export function allVarNames(): string[] {
-  return [...Object.keys(DESKTOP_VARS), ...THEME_ROLES.map((r) => `--role-${r.key.replace(/_/g, '-')}`)];
+  return [...Object.keys(DESKTOP_VARS), ...Object.keys(ON_ACCENT_VARS), ...THEME_ROLES.map((r) => `--role-${r.key.replace(/_/g, '-')}`)];
 }
 
 export type Assessment =
@@ -187,16 +279,22 @@ export function setOverride(choice: ThemeChoice, role: string, hex: Hex | null):
 // ---------- persistence ----------
 
 export function encodeChoice(choice: ThemeChoice): string {
-  return JSON.stringify({ theme: choice.theme, overrides: choice.overrides });
+  return JSON.stringify(choice.system
+    ? { theme: choice.theme, overrides: choice.overrides, system: true }
+    : { theme: choice.theme, overrides: choice.overrides });
 }
 
-/** A stored choice; anything malformed falls back to the default (unknown roles and bad colours dropped). */
+/**
+ * A stored choice (unknown roles and bad colours dropped). Nothing stored is a new install and matches the
+ * system; a stored choice without `system` is an explicit pick and keeps its theme; unreadable text is treated
+ * as nothing stored.
+ */
 export function decodeChoice(text: string | null | undefined): ThemeChoice {
-  if (!text) return DEFAULT_CHOICE;
+  if (!text) return FIRST_RUN_CHOICE;
   let v: unknown;
-  try { v = JSON.parse(text); } catch { return DEFAULT_CHOICE; }
-  if (!v || typeof v !== 'object') return DEFAULT_CHOICE;
-  const o = v as { theme?: unknown; overrides?: unknown };
+  try { v = JSON.parse(text); } catch { return FIRST_RUN_CHOICE; }
+  if (!v || typeof v !== 'object') return FIRST_RUN_CHOICE;
+  const o = v as { theme?: unknown; overrides?: unknown; system?: unknown };
   const theme = typeof o.theme === 'string' && themeByKey(o.theme) ? o.theme : null;
   const overrides: Record<string, Hex> = {};
   if (o.overrides && typeof o.overrides === 'object') {
@@ -205,14 +303,33 @@ export function decodeChoice(text: string | null | undefined): ThemeChoice {
       if (hex && THEME_ROLES.some((r) => r.key === k)) overrides[k] = hex;
     }
   }
-  return { theme, overrides };
+  return o.system === true ? { theme: null, overrides, system: true } : { theme, overrides };
 }
 
 // ---------- picker ----------
 
-/** The picker's entries: the desktop default first, then the TUI's themes in their order. */
-export function pickerEntries(): { key: string | null; name: string }[] {
-  return [{ key: null, name: DESKTOP_DEFAULT_NAME }, ...THEMES.map((t) => ({ key: t.key, name: t.name }))];
+export const MATCH_SYSTEM_NAME = 'Match system (light/dark)';
+
+export interface PickerEntry { key: string | null; name: string; system?: boolean }
+
+/** The picker's entries: "Match system", the desktop default, then the TUI's themes in their order. */
+export function pickerEntries(): PickerEntry[] {
+  return [
+    { key: null, name: MATCH_SYSTEM_NAME, system: true },
+    { key: null, name: DESKTOP_DEFAULT_NAME },
+    ...THEMES.map((t) => ({ key: t.key, name: t.name })),
+  ];
+}
+
+/** The picker row a choice sits on. */
+export function pickerIndexOf(choice: ThemeChoice): number {
+  if (choice.system) return 0;
+  return Math.max(1, pickerEntries().findIndex((e) => !e.system && e.key === choice.theme));
+}
+
+/** `:theme system`: does this name ask to follow the system? */
+export function isMatchSystemName(name: string): boolean {
+  return /^(match[\s-]*)?system$/i.test(name.trim());
 }
 
 /** Eight swatch colours for a picker row (the TUI's `theme_swatch` idea). */
@@ -220,6 +337,11 @@ export function swatch(key: string | null): Hex[] {
   const choice: ThemeChoice = { theme: key, overrides: {} };
   const roles = resolveRoles(choice);
   return ['canvas', 'panel', 'primary_text', 'accent', 'running', 'waiting', 'warning', 'error'].map((r) => roles[r]!);
+}
+
+/** The "Match system" row's swatch: the dark side's four first colours, then the light side's. */
+export function systemSwatch(): Hex[] {
+  return [...swatch(null).slice(0, 4), ...swatch(SYSTEM_LIGHT_THEME).slice(0, 4)];
 }
 
 export type PickerEffect =
@@ -240,8 +362,8 @@ export function pickerKey(index: number, count: number, key: string): PickerEffe
     default:
       if (/^[1-9]$/.test(key)) {
         const i = Number(key) - 1;
-        // The TUI's 1-9 pick its first nine themes; the desktop list starts with its own default.
-        return i + 1 < count ? { kind: 'apply', index: i + 1 } : { kind: 'none' };
+        // The TUI's 1-9 pick its first nine themes; the desktop list starts with "Match system" and its own default.
+        return i + 2 < count ? { kind: 'apply', index: i + 2 } : { kind: 'none' };
       }
       return { kind: 'none' };
   }

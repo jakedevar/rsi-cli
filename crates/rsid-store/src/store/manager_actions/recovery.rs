@@ -72,7 +72,7 @@ impl Store {
     /// Every level of a (possibly nested) settlement must be in the caller's
     /// project, granted, and target an Epic/container in the current scope.
     /// A settlement of a settlement resolves and checks the inner operation.
-    fn manager_settle_scope(
+    pub(super) fn manager_settle_scope(
         &self,
         authority: &ManagerAuthorityV2,
         op: &ManagerActionOperationV2,
@@ -97,7 +97,8 @@ impl Store {
             ManagerActionV2::SucceedManager { .. } | ManagerActionV2::Integrate { .. } => {
                 return Err(refused("manager_v2_effect_unobservable"));
             }
-            ManagerActionV2::SettleUncertainAction { operation_id, .. } => {
+            ManagerActionV2::SettleUncertainAction { operation_id, .. }
+            | ManagerActionV2::WithdrawQueuedCreate { operation_id, .. } => {
                 let inner = self
                     .manager_action_operation(*operation_id)?
                     .ok_or_else(|| refused("manager_v2_action_out_of_scope"))?;

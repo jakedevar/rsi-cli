@@ -230,6 +230,69 @@ pub async fn put_message_bridge(
     }
 }
 
+/// `LcAction::RefreshClaudeSkills`: the daemon user's skills (`ListSkills`).
+#[allow(clippy::future_not_send)]
+pub async fn refresh_claude_skills(app: &mut App) {
+    match app.client.list_user_skills().await {
+        Ok(listing) => app.set_user_skills(&listing),
+        Err(error) => {
+            // `claude_skills_requested` stays set, so render does not retry
+            // in a loop; a change or a re-entry asks again.
+            tracing::warn!("Failed to list Claude skills: {}", error);
+            app.notify_error(format!("Failed to list ~/.claude/skills: {error}"));
+        }
+    }
+}
+
+/// `LcAction::OpenSkillPreview`: read SKILL.md through the daemon (`GetSkill`).
+#[allow(clippy::future_not_send)]
+pub async fn open_skill_preview(app: &mut App, name: String) {
+    match app.client.get_user_skill(&name).await {
+        Ok(skill) => crate::overlay::open_skill_preview(app, &name, skill.content),
+        Err(error) => app.notify_error(format!("Failed to read SKILL.md: {error}")),
+    }
+}
+
+/// `LcAction::SetSkillEnabled`: the `e` key (`SetSkillEnabled`).
+#[allow(clippy::future_not_send)]
+pub async fn set_skill_enabled(app: &mut App, name: String, enabled: bool) {
+    match app.client.set_skill_enabled(&name, enabled).await {
+        Ok(changed) => {
+            let verb = if changed.enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            };
+            app.notify_success(format!("{verb} skill: {name}"));
+            refresh_claude_skills(app).await;
+        }
+        Err(error) => app.notify_error(format!("Toggle failed: {error}")),
+    }
+}
+
+/// `LcAction::DeleteSkill`: the confirmed `d d` (`DeleteSkill`), which moves
+/// the skill into the daemon's skill trash.
+#[allow(clippy::future_not_send)]
+pub async fn delete_skill(app: &mut App, name: String) {
+    match app.client.delete_skill(&name).await {
+        Ok(deleted) => {
+            app.notify_success(format!(
+                "Deleted skill: {name} (moved to {})",
+                deleted.trash_path
+            ));
+            refresh_claude_skills(app).await;
+            let new_max = app
+                .cached_user_skills
+                .as_ref()
+                .map_or(0, |skills| skills.len().saturating_sub(1));
+            if app.settings_state.selected_index > new_max {
+                app.settings_state.selected_index = new_max;
+            }
+        }
+        Err(error) => app.notify_error(format!("Delete failed: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +516,88 @@ mod tests {
         assert_eq!(commands, ["mine.sh", "theirs.sh"]);
         assert_eq!(app.cached_claude_hooks.as_ref().unwrap().revision, "r2");
         assert_eq!(log.lock().unwrap()[1].0, "ListClaudeHooks");
+    }
+
+    /// Local #91: the TUI's skills rows are the daemon's (`ListSkills user`),
+    /// and the confirmed delete is `DeleteSkill`, whose trash path the notice
+    /// names, followed by a fresh listing.
+    #[tokio::test]
+    async fn skills_list_and_delete_go_through_the_daemon() {
+        let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&deleted);
+        let (_dir, log, mut app) = app_with_daemon(move |method, params| match method {
+            "ListSkills" => {
+                let mut skills = vec![serde_json::json!({
+                    "name": "beta", "enabled": false, "description": "B", "has_skill_md": true
+                })];
+                if !seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    skills.insert(0, serde_json::json!({
+                        "name": "alpha", "enabled": true, "description": null, "has_skill_md": true
+                    }));
+                }
+                Ok(serde_json::json!({
+                    "skills_dir": "/home/op/.claude/skills", "skills": skills,
+                    "truncated": false, "skipped_outside_root": 0
+                }))
+            }
+            "DeleteSkill" => {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({
+                    "name": params["name"], "enabled": true,
+                    "path": "/home/op/.claude/skills/alpha",
+                    "trash_path": "/home/op/.rsi/trash/skills/20261019T000000-abcd1234/alpha"
+                }))
+            }
+            other => panic!("unexpected {other} {params}"),
+        })
+        .await;
+
+        refresh_claude_skills(&mut app).await;
+        let rows: Vec<_> = app
+            .cached_user_skills
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|skill| (skill.name, skill.enabled))
+            .collect();
+        assert_eq!(
+            rows,
+            [("alpha".to_string(), true), ("beta".to_string(), false)]
+        );
+
+        app.settings_state.selected_index = 1;
+        delete_skill(&mut app, "alpha".to_string()).await;
+        let names: Vec<_> = app
+            .cached_user_skills
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(names, ["beta"]);
+        assert_eq!(app.settings_state.selected_index, 0);
+        assert!(
+            app.notifications
+                .back()
+                .is_some_and(|n| n.message.contains("/home/op/.rsi/trash/skills/")),
+            "the notice names the trash path"
+        );
+        let calls: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(m, p)| (m.clone(), p.clone()))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("ListSkills".to_string(), serde_json::json!({"user": true})),
+                (
+                    "DeleteSkill".to_string(),
+                    serde_json::json!({"name": "alpha"})
+                ),
+                ("ListSkills".to_string(), serde_json::json!({"user": true})),
+            ]
+        );
     }
 }

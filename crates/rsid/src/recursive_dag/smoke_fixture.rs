@@ -1,8 +1,9 @@
 //! Dev-only recursive DAG smoke fixture generation.
 //!
-//! This module is gated by the `dev-fixtures` Cargo feature and is intended for
-//! offline fixture DB preparation only. It never launches provider sessions and
-//! only opens the generated or copied output DB through `Store::open`.
+//! Outside its `other-02` unit-test shard, this module requires the `dev-fixtures`
+//! Cargo feature. It is intended for offline fixture DB preparation only. It
+//! never launches provider sessions and only opens the generated or copied
+//! output DB through `Store::open`.
 
 #![allow(clippy::too_many_lines)]
 
@@ -11,6 +12,7 @@ use crate::recursive_dag::{
     RecursiveDagFakeBehavior, RecursiveDagFakeExecutor, RecursiveDagScheduler,
 };
 use crate::store::Store;
+use crate::store::migration_backup::{DatabaseSnapshotMode, snapshot_database};
 use crate::store::recursive_dag::{
     RecursiveExecutionArtifactCreate, RecursiveExecutionArtifactPreviewLookup,
     RecursiveExecutionArtifactPreviewOptions, RecursiveLiveAttemptCreate,
@@ -38,8 +40,6 @@ use rsi_common::recursive_dag::{
 use rsi_common::types::{
     FailurePolicy, SessionKind, Topology, TopologyDefinition, TopologyEdge, TopologyNode,
 };
-use rusqlite::backup::Backup;
-use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -47,7 +47,6 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 pub const FIXTURE_SCHEMA_VERSION: &str = "recursive-dag-smoke-v1";
@@ -243,7 +242,7 @@ pub fn generate_smoke_fixture(options: SmokeFixtureOptions) -> Result<SmokeFixtu
             fs::create_dir_all(parent)?;
         }
         if let Some(source_db) = paths.source_db.as_deref() {
-            copy_sqlite_db_readonly(source_db, &paths.output_db)?;
+            snapshot_database(source_db, &paths.output_db, DatabaseSnapshotMode::PageCopy)?;
         }
     }
 
@@ -355,17 +354,6 @@ fn absolutize(path: impl AsRef<Path>) -> PathBuf {
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
     }
-}
-
-fn copy_sqlite_db_readonly(source_db: &Path, output_db: &Path) -> Result<()> {
-    let source = Connection::open_with_flags(
-        source_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let mut destination = Connection::open(output_db)?;
-    let backup = Backup::new(&source, &mut destination)?;
-    backup.run_to_completion(16, StdDuration::from_millis(50), None)?;
-    Ok(())
 }
 
 fn validate_existing_output_sidecar(paths: &PreparedPaths) -> Result<()> {

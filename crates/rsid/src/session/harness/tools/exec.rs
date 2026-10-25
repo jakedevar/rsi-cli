@@ -5,6 +5,7 @@
 
 use super::{
     HarnessTool, ToolContext, custody_guard,
+    exec_pty::{self, PtyIo},
     process_registry::ProcessWakeController,
     shell::{ShellLaunchIdentity, scoped_shell_command},
 };
@@ -184,11 +185,34 @@ struct ProcessState {
     /// pins the PGID) and is taken *before* the leader is reaped, so a
     /// retained exited-but-unread handle can never signal a recycled PGID.
     group: std::sync::Mutex<Option<i32>>,
+    /// #3176: for a container target, what kills this command's process tree
+    /// inside the container. Killing the local docker client does not.
+    remote_kill: std::sync::Mutex<Option<super::exec_target::RemoteKill>>,
+    /// #3162: the command as the model wrote it, for the handle list.
+    command: String,
+    started: std::time::Instant,
+    /// #3162: `Some` when the command runs on a pseudo-terminal; its input and
+    /// hang-up then go through the terminal, not through `stdin`.
+    pty: Option<PtyIo>,
 }
 
 impl ProcessState {
+    #[cfg(test)]
     fn new(stdin: Option<ChildStdin>, stdout_capacity: usize, stderr_capacity: usize) -> Arc<Self> {
+        Self::with_meta(stdin, None, String::new(), stdout_capacity, stderr_capacity)
+    }
+
+    fn with_meta(
+        stdin: Option<ChildStdin>,
+        pty: Option<PtyIo>,
+        command: String,
+        stdout_capacity: usize,
+        stderr_capacity: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            command,
+            started: std::time::Instant::now(),
+            pty,
             output: Mutex::new(ProcessOutput {
                 stdout: HeadTailBuffer::new(stdout_capacity),
                 stderr: HeadTailBuffer::new(stderr_capacity),
@@ -201,7 +225,28 @@ impl ProcessState {
             pending_notice: AtomicBool::new(false),
             completion: Mutex::new(()),
             group: std::sync::Mutex::new(None),
+            remote_kill: std::sync::Mutex::new(None),
         })
+    }
+
+    fn arm_remote_kill(&self, kill: super::exec_target::RemoteKill) {
+        *self
+            .remote_kill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kill);
+    }
+
+    /// Kill the command's tree inside its container, once. Called where the
+    /// session is cancelled or terminated, never on a command's own exit.
+    fn kill_remote(&self) {
+        let kill = self
+            .remote_kill
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(kill) = kill {
+            kill.fire();
+        }
     }
 
     fn arm_group(&self, pgid: i32) {
@@ -214,17 +259,26 @@ impl ProcessState {
     /// SIGKILL the group while the leader still pins it; a disarmed process
     /// holds no target and is never signalled.
     fn signal_group(&self) {
+        self.signal_group_with(nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// Signal the group while the leader still pins it. Returns whether a
+    /// target was still armed.
+    fn signal_group_with(&self, signal: nix::sys::signal::Signal) -> bool {
         let group = self
             .group
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(pgid) = *group else {
-            return;
+            return false;
         };
-        let _ = crate::process_control::signal_process_group(
-            nix::unistd::Pid::from_raw(pgid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
+        let _ =
+            crate::process_control::signal_process_group(nix::unistd::Pid::from_raw(pgid), signal);
+        true
+    }
+
+    fn is_running(&self) -> bool {
+        self.exit_code.load(Ordering::Acquire) == u32::MAX
     }
 
     /// Drop the signal target without signalling (nothing proves the PGID).
@@ -329,6 +383,25 @@ struct ProcessNotice {
     session_id: u32,
     exit_code: Option<u32>,
     state: Arc<ProcessState>,
+}
+
+/// A refused handle control (#3162), with the typed code the model sees.
+#[derive(Debug)]
+struct ControlError {
+    code: &'static str,
+    message: String,
+}
+
+const LIST_COMMAND_CHARS: usize = 200;
+
+fn truncate_command(command: &str) -> String {
+    let mut chars = command.chars();
+    let head: String = chars.by_ref().take(LIST_COMMAND_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
 }
 
 pub(crate) struct ProcessRegistry {
@@ -457,7 +530,7 @@ impl ProcessRegistry {
         let mut processes = self.processes.lock().await;
         if processes.len() >= self.capacity {
             return Err(format!(
-                "concurrent process limit ({}) reached; read or finish an existing session first",
+                "concurrent process limit ({}) reached; read or finish an existing session first, or free one with write_stdin action kill (action list shows the live ones)",
                 self.capacity
             ));
         }
@@ -466,58 +539,131 @@ impl ProcessRegistry {
             .fetch_add(1, Ordering::AcqRel)
             .checked_add(1)
             .ok_or_else(|| "process session ids exhausted".to_string())?;
+        // #3176: stamp a container command so a cancel can find its whole tree.
+        let marker_identity;
+        let remote_kill;
+        let identity = match identity.exec_target.container() {
+            Some(target) => {
+                let marker = uuid::Uuid::new_v4();
+                remote_kill = Some(super::exec_target::RemoteKill::new(
+                    target,
+                    marker,
+                    identity.session_id,
+                ));
+                marker_identity = ShellLaunchIdentity {
+                    exec_marker: Some(marker),
+                    container_timeout_secs: None,
+                    ..identity.clone()
+                };
+                &marker_identity
+            }
+            None => {
+                remote_kill = None;
+                identity
+            }
+        };
         let mut scoped = scoped_shell_command(command, working_dir, identity)?;
-        scoped
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = scoped.spawn().map_err(|error| error.to_string())?;
-        let pid = child
-            .id()
-            .ok_or_else(|| "spawned process did not expose a pid".to_string())?
-            as i32;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "process stdout pipe was unavailable".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "process stderr pipe was unavailable".to_string())?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "process stdin pipe was unavailable".to_string())?;
-
         let stdout_capacity = max_output_bytes.max(1);
         let stderr_capacity = max_output_bytes.max(1);
-        let state = ProcessState::new(Some(stdin), stdout_capacity, stderr_capacity);
-        let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
-            .map(|pgid| pgid.as_raw())
-            .unwrap_or(pid);
-        state.arm_group(pgid);
-        let process_registry = Arc::clone(self);
-        let stdout_task = tokio::spawn(read_stream(stdout, Arc::clone(&state), true));
-        let stderr_task = tokio::spawn(read_stream(stderr, Arc::clone(&state), false));
         let terminate = CancellationToken::new();
         let external_cancel = external_cancel.clone();
         let notices_tx = self.notices_tx.clone();
-        let monitor_state = Arc::clone(&state);
-        let monitor_terminate = terminate.clone();
-        let monitor = tokio::spawn(async move {
-            supervise_process(
-                child,
-                monitor_state,
-                monitor_terminate,
-                external_cancel,
-                notices_tx,
-                process_registry,
-                session_id,
-                vec![stdout_task, stderr_task],
-            )
-            .await;
-        });
+        let process_registry = Arc::clone(self);
+        let (state, monitor) = if identity.tty {
+            // #3162: a real terminal. Output is the terminal's one stream.
+            let launch = exec_pty::spawn(scoped.as_std())?;
+            let pid = launch.pid;
+            let state = ProcessState::with_meta(
+                None,
+                Some(launch.io),
+                command.to_string(),
+                stdout_capacity,
+                stderr_capacity,
+            );
+            // The child is a session leader, so its group is its own pid.
+            let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
+                .map(|pgid| pgid.as_raw())
+                .unwrap_or(pid);
+            state.arm_group(pgid);
+            if let Some(kill) = remote_kill {
+                state.arm_remote_kill(kill);
+            }
+            let reader = spawn_pty_reader(launch.reader, Arc::clone(&state));
+            let monitor_state = Arc::clone(&state);
+            let monitor_terminate = terminate.clone();
+            let child = launch.child;
+            let monitor = tokio::spawn(async move {
+                supervise_pty_process(
+                    child,
+                    pid,
+                    monitor_state,
+                    monitor_terminate,
+                    external_cancel,
+                    notices_tx,
+                    process_registry,
+                    session_id,
+                    vec![reader],
+                )
+                .await;
+            });
+            (state, monitor)
+        } else {
+            scoped
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            restore_default_interrupt_signals(&mut scoped);
+            let mut child = scoped.spawn().map_err(|error| error.to_string())?;
+            let pid = child
+                .id()
+                .ok_or_else(|| "spawned process did not expose a pid".to_string())?
+                as i32;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "process stdout pipe was unavailable".to_string())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "process stderr pipe was unavailable".to_string())?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "process stdin pipe was unavailable".to_string())?;
+            let state = ProcessState::with_meta(
+                Some(stdin),
+                None,
+                command.to_string(),
+                stdout_capacity,
+                stderr_capacity,
+            );
+            let pgid = nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid)))
+                .map(|pgid| pgid.as_raw())
+                .unwrap_or(pid);
+            state.arm_group(pgid);
+            if let Some(kill) = remote_kill {
+                state.arm_remote_kill(kill);
+            }
+            let stdout_task = tokio::spawn(read_stream(stdout, Arc::clone(&state), true));
+            let stderr_task = tokio::spawn(read_stream(stderr, Arc::clone(&state), false));
+            let monitor_state = Arc::clone(&state);
+            let monitor_terminate = terminate.clone();
+            let monitor = tokio::spawn(async move {
+                supervise_process(
+                    child,
+                    monitor_state,
+                    monitor_terminate,
+                    external_cancel,
+                    notices_tx,
+                    process_registry,
+                    session_id,
+                    vec![stdout_task, stderr_task],
+                )
+                .await;
+            });
+            (state, monitor)
+        };
         let handle = Arc::new(ProcessHandle {
             terminate,
             state,
@@ -562,6 +708,12 @@ impl ProcessRegistry {
         let Some(handle) = handle else {
             return Err(format!("unknown process session id: {session_id}"));
         };
+        if let Some(pty) = &handle.state.pty {
+            return pty
+                .write(bytes.to_vec())
+                .await
+                .map_err(|error| format!("{error} for process session {session_id}"));
+        }
         let mut stdin = handle.state.stdin.lock().await;
         if let Some(stdin) = stdin.as_mut() {
             stdin
@@ -571,6 +723,118 @@ impl ProcessRegistry {
         } else {
             Err(format!("stdin is closed for process session {session_id}"))
         }
+    }
+
+    async fn handle(&self, session_id: u32) -> Result<Arc<ProcessHandle>, ControlError> {
+        self.processes
+            .lock()
+            .await
+            .get(&session_id)
+            .map(Arc::clone)
+            .ok_or_else(|| ControlError {
+                code: "unknown_session",
+                message: format!("unknown process session id: {session_id}"),
+            })
+    }
+
+    /// #3162: interrupt the handle's foreground work. On a terminal that is
+    /// `^C`, which the line discipline turns into `SIGINT` for the foreground
+    /// process group; on pipes it is `SIGINT` to the command's process group.
+    /// An exited handle is left for the next poll to read.
+    async fn interrupt(&self, session_id: u32) -> Result<(), ControlError> {
+        let handle = self.handle(session_id).await?;
+        let state = &handle.state;
+        if !state.is_running() {
+            return Ok(());
+        }
+        if let Some(pty) = &state.pty {
+            return pty
+                .write(vec![exec_pty::CTRL_C])
+                .await
+                .map_err(|message| ControlError {
+                    code: "interrupt_error",
+                    message,
+                });
+        }
+        if state.remote_kill.lock().is_ok_and(|kill| kill.is_some()) {
+            return Err(ControlError {
+                code: "interrupt_unsupported",
+                message: "a pipe command in a container cannot be interrupted: start it with \
+                          tty:true to send ^C, or kill it with write_stdin action kill"
+                    .into(),
+            });
+        }
+        state.signal_group_with(nix::sys::signal::Signal::SIGINT);
+        Ok(())
+    }
+
+    /// #3162: end the handle's input. Pipes close the child's stdin; a terminal
+    /// gets `^D`, which is EOF for a reader at the start of a line.
+    async fn close_stdin(&self, session_id: u32) -> Result<(), ControlError> {
+        let handle = self.handle(session_id).await?;
+        let state = &handle.state;
+        if !state.is_running() {
+            return Ok(());
+        }
+        if let Some(pty) = &state.pty {
+            return pty
+                .write(vec![exec_pty::CTRL_D])
+                .await
+                .map_err(|message| ControlError {
+                    code: "stdin_error",
+                    message,
+                });
+        }
+        let mut stdin = state.stdin.lock().await;
+        if let Some(mut stdin) = stdin.take() {
+            let _ = stdin.shutdown().await;
+        }
+        Ok(())
+    }
+
+    /// #3162: kill the handle's process tree and remove it, which frees its
+    /// slot. Returns the final snapshot.
+    async fn kill(&self, session_id: u32) -> Result<ProcessSnapshot, ControlError> {
+        if !self.terminate(session_id).await {
+            return Err(ControlError {
+                code: "unknown_session",
+                message: format!("unknown process session id: {session_id}"),
+            });
+        }
+        self.take_read_result(session_id)
+            .await
+            .map_err(|message| ControlError {
+                code: "unknown_session",
+                message,
+            })
+    }
+
+    /// #3162: the live handles, oldest first.
+    async fn list(&self) -> Vec<Value> {
+        let handles: Vec<(u32, Arc<ProcessHandle>)> = self
+            .processes
+            .lock()
+            .await
+            .iter()
+            .map(|(id, handle)| (*id, Arc::clone(handle)))
+            .collect();
+        let mut handles = handles;
+        handles.sort_by_key(|(id, _)| *id);
+        handles
+            .into_iter()
+            .map(|(id, handle)| {
+                let state = &handle.state;
+                let exit_code = state.exit_code.load(Ordering::Acquire);
+                json!({
+                    "session_id": id,
+                    "command": truncate_command(&state.command),
+                    "running": exit_code == u32::MAX,
+                    "tty": state.pty.is_some(),
+                    "exit_code": (exit_code != u32::MAX).then_some(exit_code),
+                    "running_seconds": state.started.elapsed().as_secs_f64(),
+                })
+            })
+            .collect()
     }
 
     async fn take_read_result(&self, session_id: u32) -> Result<ProcessSnapshot, String> {
@@ -644,6 +908,25 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
+}
+
+/// Read the terminal on a blocking thread into the stdout buffer. A terminal
+/// read fails with `EIO` once its last slave end closes; that is end of output.
+fn spawn_pty_reader(
+    mut reader: Box<dyn std::io::Read + Send>,
+    state: Arc<ProcessState>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => state.output.blocking_lock().stdout.push(&chunk[..size]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 /// What the supervisor learned about the leader's exit, and therefore what it
@@ -778,6 +1061,7 @@ async fn supervise_process(
         }
         _ = terminate.cancelled() => {
             state.kill_and_disarm_group();
+            state.kill_remote();
             state.terminated.store(true, Ordering::Release);
             tokio::time::timeout(Duration::from_secs(1), child.wait())
                 .await
@@ -785,6 +1069,7 @@ async fn supervise_process(
         }
         _ = external_cancel.cancelled() => {
             state.kill_and_disarm_group();
+            state.kill_remote();
             state.terminated.store(true, Ordering::Release);
             terminate.cancel();
             tokio::time::timeout(Duration::from_secs(1), child.wait())
@@ -795,12 +1080,33 @@ async fn supervise_process(
     let exit_code = status
         .and_then(Result::ok)
         .and_then(|status| status.code())
-        .map(|code| u32::try_from(code).unwrap_or(1))
-        .unwrap_or(if state.terminated.load(Ordering::Acquire) {
-            137
-        } else {
-            127
-        });
+        .map(|code| u32::try_from(code).unwrap_or(1));
+    finish_supervision(
+        exit_code,
+        &state,
+        notices_tx,
+        process_registry,
+        session_id,
+        readers,
+    )
+    .await;
+}
+
+/// Record the exit, drain the output readers for a bounded time and queue the
+/// completion notice. Shared by the pipe and the terminal supervisor.
+async fn finish_supervision(
+    exit_code: Option<u32>,
+    state: &Arc<ProcessState>,
+    notices_tx: mpsc::UnboundedSender<ProcessNotice>,
+    process_registry: Arc<ProcessRegistry>,
+    session_id: u32,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+) {
+    let exit_code = exit_code.unwrap_or(if state.terminated.load(Ordering::Acquire) {
+        137
+    } else {
+        127
+    });
     state.exit_code.store(exit_code, Ordering::Release);
     state.running.store(false, Ordering::Release);
 
@@ -815,6 +1121,9 @@ async fn supervise_process(
             // aborted here, so rely on pipe closure and task completion.
         }
     }
+    if let Some(pty) = &state.pty {
+        pty.release();
+    }
     let completion = state.completion.lock().await;
     if state.claim_pending_notice() {
         process_registry
@@ -823,13 +1132,150 @@ async fn supervise_process(
         let _ = notices_tx.send(ProcessNotice {
             session_id,
             exit_code: Some(exit_code),
-            state: Arc::clone(&state),
+            state: Arc::clone(state),
         });
         drop(completion);
         process_registry.record_completion();
         return;
     }
     drop(completion);
+}
+
+/// A pipe command must answer `interrupt` (SIGINT to its group). A daemon
+/// launched from a non-interactive shell's background job, or from a job
+/// runner, inherits SIGINT/SIGQUIT as ignored, and an ignored disposition
+/// survives `exec`, so `sleep 30` would shrug off the interrupt (#3662). The
+/// terminal path already starts from default dispositions (portable-pty).
+#[cfg(unix)]
+fn restore_default_interrupt_signals(command: &mut tokio::process::Command) {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: `signal(2)` is async-signal-safe and the closure allocates nothing.
+    unsafe {
+        command.pre_exec(|| {
+            for sig in [Signal::SIGINT, Signal::SIGQUIT] {
+                signal(sig, SigHandler::SigDfl).map_err(std::io::Error::from)?;
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_default_interrupt_signals(_command: &mut tokio::process::Command) {}
+
+type PtyChild = Box<dyn portable_pty::Child + Send + Sync>;
+
+/// Reap an already-dead (or dying) terminal child, waiting briefly for it.
+async fn reap_pty_child(child: &mut PtyChild) -> Option<u32> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.exit_code()),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Linux: has the leader exited? Looks without reaping (`WNOWAIT`), so the
+/// zombie leader keeps pinning the PGID while the caller signals the group.
+#[cfg(target_os = "linux")]
+fn pty_leader_exited(pid: i32) -> Result<bool, nix::errno::Errno> {
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    waitid(
+        Id::Pid(nix::unistd::Pid::from_raw(pid)),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    )
+    .map(|status| !matches!(status, WaitStatus::StillAlive))
+}
+
+/// Wait for a terminal leader to exit. As for pipes, the group is killed and
+/// the handle disarmed before the leader is reaped.
+#[cfg(target_os = "linux")]
+async fn observe_pty_exit(child: &mut PtyChild, pid: i32, state: &ProcessState) -> Option<u32> {
+    loop {
+        match pty_leader_exited(pid) {
+            Ok(true) => {
+                state.kill_and_disarm_group();
+                return reap_pty_child(child).await;
+            }
+            Ok(false) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(errno) => {
+                tracing::warn!(%errno, "Terminal process exit unobservable; disarming without a group signal");
+                state.disarm_group();
+                return reap_pty_child(child).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn observe_pty_exit(child: &mut PtyChild, _pid: i32, state: &ProcessState) -> Option<u32> {
+    loop {
+        {
+            let mut group = state
+                .group
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    group.take();
+                    return Some(status.exit_code());
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    group.take();
+                    return None;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_pty_process(
+    mut child: PtyChild,
+    pid: i32,
+    state: Arc<ProcessState>,
+    terminate: CancellationToken,
+    external_cancel: CancellationToken,
+    notices_tx: mpsc::UnboundedSender<ProcessNotice>,
+    process_registry: Arc<ProcessRegistry>,
+    session_id: u32,
+    readers: Vec<tokio::task::JoinHandle<()>>,
+) {
+    let exit_code = tokio::select! {
+        code = observe_pty_exit(&mut child, pid, &state) => code,
+        _ = terminate.cancelled() => {
+            state.kill_and_disarm_group();
+            state.kill_remote();
+            state.terminated.store(true, Ordering::Release);
+            reap_pty_child(&mut child).await
+        }
+        _ = external_cancel.cancelled() => {
+            state.kill_and_disarm_group();
+            state.kill_remote();
+            state.terminated.store(true, Ordering::Release);
+            terminate.cancel();
+            reap_pty_child(&mut child).await
+        }
+    };
+    finish_supervision(
+        exit_code,
+        &state,
+        notices_tx,
+        process_registry,
+        session_id,
+        readers,
+    )
+    .await;
 }
 
 fn snapshot_value(session_id: u32, snapshot: ProcessSnapshot, wall_time_ms: u64) -> Value {
@@ -883,6 +1329,8 @@ fn requested_workdir(args: &Value, base: &Path) -> PathBuf {
 pub(super) struct ExecCommandTool {
     registry: Arc<ProcessRegistry>,
     identity: ShellLaunchIdentity,
+    /// #3165: the custody scan guards only commands inside this base.
+    sandbox_base: PathBuf,
 }
 
 impl ExecCommandTool {
@@ -894,13 +1342,30 @@ impl ExecCommandTool {
     ) -> Self {
         Self {
             registry,
-            identity: ShellLaunchIdentity {
+            identity: ShellLaunchIdentity::host(
                 session_id,
                 invocation_id,
                 execution_scratch,
-                egress: rsi_common::egress_policy::EgressMode::default(),
-            },
+                rsi_common::egress_policy::EgressMode::default(),
+            ),
+            sandbox_base: rsi_common::boundary_mail_hook::sandbox_base(),
         }
+    }
+
+    /// Test seam: the directory the custody scan treats as the sandbox base.
+    #[cfg(test)]
+    pub(super) fn with_sandbox_base(mut self, base: &Path) -> Self {
+        self.sandbox_base = base.to_path_buf();
+        self
+    }
+
+    /// #3176: run this tool's commands in the container instead of on the host.
+    pub(super) fn with_exec_target(
+        mut self,
+        exec_target: rsi_common::exec_target::ExecTarget,
+    ) -> Self {
+        self.identity.exec_target = exec_target;
+        self
     }
 }
 
@@ -912,12 +1377,17 @@ impl HarnessTool for ExecCommandTool {
 
     fn description(&self) -> &str {
         "Run a shell command and return output, or a session id for a still-running command. \
-         Uses the same scrubbed, systemd-scoped environment as shell. This implementation uses \
-         plain pipes even when tty is requested."
+         Uses the same scrubbed, systemd-scoped environment as shell. By default the command \
+         gets plain pipes (stdout and stderr stay separate). With tty:true it runs on a real \
+         24x80 pseudo-terminal with TERM=xterm-256color, so isatty is true; use it for REPLs, \
+         editors, confirmation prompts and curses programs. Its output is one stream and input \
+         is echoed. A still-running command is controlled with write_stdin: send input, \
+         interrupt (^C), close_stdin (EOF), kill, or list the live sessions. At most 8 \
+         sessions are live; kill frees a slot."
     }
 
     fn parameters_json(&self) -> &str {
-        r#"{"type":"object","additionalProperties":false,"required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute"},"workdir":{"type":"string","description":"Working directory; defaults to the turn working directory"},"tty":{"type":"boolean","description":"Accepted for compatibility; scoped execution uses plain pipes"},"yield_time_ms":{"type":"integer","description":"Wait before yielding; defaults to 10000 and is clamped to 250-30000"},"max_output_tokens":{"type":"integer","description":"Output byte budget; capped by session policy"}}}"#
+        r#"{"type":"object","additionalProperties":false,"required":["cmd"],"properties":{"cmd":{"type":"string","description":"Shell command to execute"},"workdir":{"type":"string","description":"Working directory; defaults to the turn working directory"},"tty":{"type":"boolean","description":"Run on a real 24x80 pseudo-terminal (TERM=xterm-256color); output is one stream. Default false: plain pipes"},"yield_time_ms":{"type":"integer","description":"Wait before yielding; defaults to 10000 and is clamped to 250-30000"},"max_output_tokens":{"type":"integer","description":"Output byte budget; capped by session policy"}}}"#
     }
 
     fn execution_mode(&self) -> super::ToolExecutionMode {
@@ -942,21 +1412,34 @@ impl HarnessTool for ExecCommandTool {
         if command.trim().is_empty() {
             return error_json("cmd must not be empty", "invalid_argument");
         }
-        if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
-            return error_json(refusal, "broad_kill_refused");
-        }
-        let working_dir = requested_workdir(&args, &context.working_dir);
-        // S6 (#2256): refuse git commands that break AGENTS.md hard rules 1, 2
-        // and 9 before anything in the command runs.
-        let probe = custody_guard::Probe {
-            session_id: self.identity.session_id,
-            invocation_id: self.identity.invocation_id,
-            working_dir: &working_dir,
-            cancel: &context.cancel,
+        // #3176: the kill and custody guards protect an RSI worktree; inside a
+        // task container they are wrong, so only a container target skips them
+        // and a relative `workdir` resolves inside the container.
+        let working_dir = match self.identity.exec_target.container() {
+            Some(target) => PathBuf::from(super::exec_target::resolve_container_workdir(
+                target,
+                args.get("workdir").and_then(Value::as_str),
+            )),
+            None => {
+                if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
+                    return error_json(refusal, "broad_kill_refused");
+                }
+                let working_dir = requested_workdir(&args, &context.working_dir);
+                // S6 (#2256): refuse git commands that break AGENTS.md hard
+                // rules 1, 2 and 9 before anything in the command runs.
+                let probe = custody_guard::Probe {
+                    session_id: self.identity.session_id,
+                    invocation_id: self.identity.invocation_id,
+                    working_dir: &working_dir,
+                    cancel: &context.cancel,
+                    sandbox_base: &self.sandbox_base,
+                };
+                if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
+                    return error_json(refusal.message(), custody_guard::ERROR_CODE);
+                }
+                working_dir
+            }
         };
-        if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
-            return error_json(refusal.message(), custody_guard::ERROR_CODE);
-        }
         let yield_ms = clamped_yield_ms(
             args.get("yield_time_ms").and_then(Value::as_u64),
             DEFAULT_EXEC_YIELD_MS,
@@ -964,6 +1447,8 @@ impl HarnessTool for ExecCommandTool {
         let max_output_bytes = output_limit(&args, context);
         let identity = ShellLaunchIdentity {
             egress: context.policy.egress.mode,
+            tty: args.get("tty").and_then(Value::as_bool).unwrap_or(false),
+            env_passthrough: context.policy.env_passthrough.clone(),
             ..self.identity.clone()
         };
         let session_id = match self
@@ -978,6 +1463,9 @@ impl HarnessTool for ExecCommandTool {
             .await
         {
             Ok(session_id) => session_id,
+            Err(error) if error.starts_with("tty_unavailable") => {
+                return error_json(error, "tty_unavailable");
+            }
             Err(error) => return error_json(error, "process_limit"),
         };
         let snapshot =
@@ -1029,12 +1517,16 @@ impl HarnessTool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Write bytes to an existing exec_command session and return recent output. \
-         Empty chars polls the process."
+        "Control an exec_command session and return recent output. Default action write sends \
+         chars (empty chars polls). interrupt sends ^C: on a tty:true session the terminal turns \
+         it into SIGINT for the foreground process group, on a pipe session SIGINT goes to the \
+         command's process group. close_stdin ends input (pipes: closes stdin; tty: sends ^D, \
+         EOF at the start of a line). kill kills the whole command and frees its slot. list \
+         shows every live session (id, command, running time) and needs no session_id."
     }
 
     fn parameters_json(&self) -> &str {
-        r#"{"type":"object","additionalProperties":false,"required":["session_id"],"properties":{"session_id":{"type":"integer","description":"Identifier returned by exec_command"},"chars":{"type":"string","description":"Bytes to write; empty polls without writing"},"yield_time_ms":{"type":"integer","description":"Wait before yielding; defaults to 1000 and is clamped to 250-30000"},"max_output_tokens":{"type":"integer","description":"Output byte budget accepted for compatibility"}}}"#
+        r#"{"type":"object","additionalProperties":false,"properties":{"session_id":{"type":"integer","description":"Identifier returned by exec_command; required except for action list"},"action":{"type":"string","enum":["write","interrupt","close_stdin","kill","list"],"description":"write (default): send chars or poll; interrupt: ^C / SIGINT; close_stdin: EOF; kill: kill the command and free its slot; list: live sessions"},"chars":{"type":"string","description":"Bytes to write; empty polls without writing"},"yield_time_ms":{"type":"integer","description":"Wait before yielding; defaults to 1000 and is clamped to 250-30000"},"max_output_tokens":{"type":"integer","description":"Output byte budget accepted for compatibility"}}}"#
     }
 
     fn execution_mode(&self) -> super::ToolExecutionMode {
@@ -1057,6 +1549,24 @@ impl HarnessTool for WriteStdinTool {
     }
 
     async fn execute_with_context(&self, args: Value, context: &ToolContext) -> ToolResult {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("write");
+        if !matches!(
+            action,
+            "write" | "interrupt" | "close_stdin" | "kill" | "list"
+        ) {
+            return error_json(
+                format!(
+                    "unknown action: {action}; use write, interrupt, close_stdin, kill or list"
+                ),
+                "invalid_argument",
+            );
+        }
+        if action == "list" {
+            return typed_json(json!({"sessions": self.registry.list().await}), false);
+        }
         let Some(session_id) = args.get("session_id").and_then(Value::as_u64) else {
             return error_json("missing required argument: session_id", "missing_argument");
         };
@@ -1064,15 +1574,41 @@ impl HarnessTool for WriteStdinTool {
             return error_json("session_id is out of range", "invalid_argument");
         };
         let input = args.get("chars").and_then(Value::as_str).unwrap_or("");
-        if !input.is_empty()
-            && let Err(error) = self.registry.write(session_id, input.as_bytes()).await
-        {
-            return error_json(error, "stdin_error");
+        if action != "write" && !input.is_empty() {
+            return error_json(
+                format!("chars is only valid with action write, not {action}"),
+                "invalid_argument",
+            );
         }
         let yield_ms = clamped_yield_ms(
             args.get("yield_time_ms").and_then(Value::as_u64),
             DEFAULT_WRITE_YIELD_MS,
         );
+        match action {
+            "interrupt" => {
+                if let Err(error) = self.registry.interrupt(session_id).await {
+                    return error_json(error.message, error.code);
+                }
+            }
+            "close_stdin" => {
+                if let Err(error) = self.registry.close_stdin(session_id).await {
+                    return error_json(error.message, error.code);
+                }
+            }
+            "kill" => {
+                return match self.registry.kill(session_id).await {
+                    Ok(snapshot) => typed_json(snapshot_value(session_id, snapshot, 0), false),
+                    Err(error) => error_json(error.message, error.code),
+                };
+            }
+            _ => {
+                if !input.is_empty()
+                    && let Err(error) = self.registry.write(session_id, input.as_bytes()).await
+                {
+                    return error_json(error, "stdin_error");
+                }
+            }
+        }
         let snapshot =
             match wait_snapshot(&self.registry, session_id, yield_ms, &context.cancel).await {
                 Ok(snapshot) => snapshot,
@@ -1198,7 +1734,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::session::harness::tools::ToolPolicy;
-    use nix::sys::signal::Signal;
 
     #[derive(Default)]
     struct CountingWakeController {
@@ -1453,7 +1988,8 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
         let head = git(dir, &["rev-parse", "HEAD"]);
         let registry = default_process_registry();
-        let exec = ExecCommandTool::new(Arc::clone(&registry), None, None, None);
+        let exec =
+            ExecCommandTool::new(Arc::clone(&registry), None, None, None).with_sandbox_base(dir);
         for (cmd, rule) in [
             ("touch ran.txt && git stash", "hard rule 9"),
             ("git stash pop", "hard rule 9"),
@@ -1491,6 +2027,38 @@ mod tests {
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
             "dirty\n"
         );
+    }
+
+    /// #3165: outside the sandbox base `git stash` runs; inside it is refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn exec_command_custody_scan_applies_only_inside_the_sandbox_base() {
+        use super::super::custody_guard::test_support::{git, repo};
+        let sandbox_base = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_base.path().join("session");
+        std::fs::create_dir(&sandbox).unwrap();
+        let scratch = repo();
+        let dir = scratch.path();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let registry = default_process_registry();
+        let exec = ExecCommandTool::new(Arc::clone(&registry), None, None, None)
+            .with_sandbox_base(sandbox_base.path());
+        let result = exec
+            .execute_with_context(
+                json!({"cmd": "git stash", "workdir": dir, "yield_time_ms": 30000}),
+                &context(CancellationToken::new(), 4096),
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error_msg);
+        assert!(git(dir, &["stash", "list"]).contains("WIP"));
+        let result = exec
+            .execute_with_context(
+                json!({"cmd": "git stash", "workdir": sandbox, "yield_time_ms": 250}),
+                &context(CancellationToken::new(), 4096),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(json_value(&result)["error_code"], "custody_git_refused");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -1715,6 +2283,11 @@ mod tests {
     #[tokio::test]
     async fn exited_leader_handle_is_disarmed_and_never_signalled_again() {
         use crate::process_control::recorded_group_signals::sent_to;
+        // Linux observes the exit unreaped (`WNOWAIT`) and kills the group once
+        // while the zombie leader pins the PGID. Other platforms cannot observe
+        // an exit without reaping, so they reap and disarm with no group kill
+        // (`observe_leader_exit`): the PGID is never signalled at all.
+        let observe_kills: usize = usize::from(cfg!(target_os = "linux"));
         let registry = default_process_registry();
         let (process_id, pgid) =
             test_support::start_running_with_pgid(&registry, "sleep 0.6; echo finished").await;
@@ -1744,20 +2317,24 @@ mod tests {
             handle.state.group.lock().unwrap().is_none(),
             "an exited handle holds no signal target"
         );
-        assert_eq!(sent_to(pgid), 1, "exactly the observe-kill before the reap");
+        assert_eq!(
+            sent_to(pgid),
+            observe_kills,
+            "exactly the observe-kill before the reap (Linux only)"
+        );
 
         // Archive/delete/interrupt/shutdown all funnel into these calls.
         assert!(registry.terminate(process_id_u32).await);
         assert_eq!(
             sent_to(pgid),
-            1,
+            observe_kills,
             "terminate sends nothing to a disarmed handle"
         );
         handle.signal_group();
         registry.shutdown_processes().await;
         assert_eq!(
             sent_to(pgid),
-            1,
+            observe_kills,
             "shutdown sends nothing to a disarmed handle"
         );
     }
@@ -1884,8 +2461,7 @@ mod tests {
     async fn pid_is_gone(pid: i32) -> bool {
         let mut reaped = false;
         for _ in 0..100 {
-            let signal = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None::<Signal>);
-            if signal.is_err() {
+            if !crate::test_support::process_is_running(pid) {
                 reaped = true;
                 break;
             }
@@ -1938,5 +2514,213 @@ mod tests {
         assert!(output.contains("bytes omitted"), "{output}");
         assert!(output.ends_with("TAIL"), "{output}");
         assert!(value["stdout_omitted_bytes"].as_u64().unwrap() > 0);
+    }
+
+    async fn run_exec(registry: &Arc<ProcessRegistry>, args: Value) -> Value {
+        let result = ExecCommandTool::new(Arc::clone(registry), None, None, None)
+            .execute_with_context(args, &context(CancellationToken::new(), 4096))
+            .await;
+        json_value(&result)
+    }
+
+    async fn run_write(registry: &Arc<ProcessRegistry>, args: Value) -> Value {
+        let result = WriteStdinTool::new(Arc::clone(registry))
+            .execute_with_context(args, &context(CancellationToken::new(), 4096))
+            .await;
+        json_value(&result)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn tty_exec_runs_on_a_real_terminal_and_pipes_do_not() {
+        let registry = default_process_registry();
+        let cmd = "python3 -c 'import sys; print(sys.stdin.isatty())'";
+        let tty = run_exec(
+            &registry,
+            json!({"cmd": cmd, "tty": true, "yield_time_ms": 5000}),
+        )
+        .await;
+        assert!(tty["output"].as_str().unwrap().contains("True"), "{tty}");
+        assert_eq!(tty["exit_code"].as_u64(), Some(0));
+        let pipes = run_exec(&registry, json!({"cmd": cmd, "yield_time_ms": 5000})).await;
+        assert!(
+            pipes["output"].as_str().unwrap().contains("False"),
+            "{pipes}"
+        );
+
+        let term = run_exec(
+            &registry,
+            json!({"cmd": "echo term=$TERM; stty size", "tty": true, "yield_time_ms": 5000}),
+        )
+        .await;
+        let output = term["output"].as_str().unwrap();
+        assert!(output.contains("term=xterm-256color"), "{output}");
+        assert!(output.contains("24 80"), "{output}");
+        registry.shutdown_processes().await;
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn tty_interactive_read_round_trips_through_write_stdin() {
+        let registry = default_process_registry();
+        let started = run_exec(
+            &registry,
+            json!({"cmd": "printf 'name? '; read n; echo hello:$n", "tty": true, "yield_time_ms": 400}),
+        )
+        .await;
+        let id = started["session_id"]
+            .as_u64()
+            .expect("still waiting for input");
+        assert!(
+            started["output"].as_str().unwrap().contains("name?"),
+            "{started}"
+        );
+        let done = run_write(
+            &registry,
+            json!({"session_id": id, "chars": "bob\n", "yield_time_ms": 5000}),
+        )
+        .await;
+        assert!(
+            done["output"].as_str().unwrap().contains("hello:bob"),
+            "{done}"
+        );
+        assert!(done["session_id"].is_null(), "{done}");
+        assert_eq!(done["exit_code"].as_u64(), Some(0));
+        registry.shutdown_processes().await;
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn interrupting_a_sleep_handle_frees_its_slot() {
+        for tty in [true, false] {
+            let registry = ProcessRegistry::new(1);
+            let started = run_exec(
+                &registry,
+                json!({"cmd": "sleep 30", "tty": tty, "yield_time_ms": 400}),
+            )
+            .await;
+            let id = started["session_id"].as_u64().expect("sleep is running");
+            let refused =
+                run_exec(&registry, json!({"cmd": "echo no", "yield_time_ms": 250})).await;
+            assert_eq!(
+                refused["error_code"], "process_limit",
+                "tty={tty}: {refused}"
+            );
+
+            let interrupted = run_write(
+                &registry,
+                json!({"session_id": id, "action": "interrupt", "yield_time_ms": 10000}),
+            )
+            .await;
+            assert!(
+                interrupted["session_id"].is_null(),
+                "tty={tty}: {interrupted}"
+            );
+            assert_ne!(interrupted["exit_code"].as_u64(), Some(0), "tty={tty}");
+            assert!(
+                interrupted["exit_code"].as_u64().is_some(),
+                "tty={tty}: {interrupted}"
+            );
+
+            let next = run_exec(
+                &registry,
+                json!({"cmd": "echo freed", "yield_time_ms": 5000}),
+            )
+            .await;
+            assert!(
+                next["output"].as_str().unwrap().contains("freed"),
+                "tty={tty}: {next}"
+            );
+            registry.shutdown_processes().await;
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn kill_frees_the_slot_and_list_names_the_live_handles() {
+        let registry = ProcessRegistry::new(2);
+        let started = run_exec(
+            &registry,
+            json!({"cmd": "trap '' INT; sleep 30", "tty": true, "yield_time_ms": 400}),
+        )
+        .await;
+        let id = started["session_id"].as_u64().expect("running");
+        let listed = run_write(&registry, json!({"action": "list"})).await;
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1, "{listed}");
+        assert_eq!(sessions[0]["session_id"].as_u64(), Some(id));
+        assert_eq!(sessions[0]["command"], "trap '' INT; sleep 30");
+        assert_eq!(sessions[0]["running"], true);
+        assert_eq!(sessions[0]["tty"], true);
+        assert!(sessions[0]["running_seconds"].as_f64().unwrap() > 0.0);
+
+        // A command that ignores SIGINT survives an interrupt and a kill ends it.
+        let survived = run_write(
+            &registry,
+            json!({"session_id": id, "action": "interrupt", "yield_time_ms": 400}),
+        )
+        .await;
+        assert_eq!(survived["session_id"].as_u64(), Some(id), "{survived}");
+        let killed = run_write(&registry, json!({"session_id": id, "action": "kill"})).await;
+        assert!(killed["session_id"].is_null(), "{killed}");
+        assert_eq!(killed["terminated"], true, "{killed}");
+        let empty = run_write(&registry, json!({"action": "list"})).await;
+        assert!(empty["sessions"].as_array().unwrap().is_empty(), "{empty}");
+        let gone = run_write(&registry, json!({"session_id": id, "action": "kill"})).await;
+        assert_eq!(gone["error_code"], "unknown_session", "{gone}");
+        registry.shutdown_processes().await;
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn close_stdin_sends_eof_on_pipes_and_on_a_terminal() {
+        for tty in [false, true] {
+            let registry = default_process_registry();
+            let started = run_exec(
+                &registry,
+                json!({"cmd": "cat", "tty": tty, "yield_time_ms": 400}),
+            )
+            .await;
+            let id = started["session_id"].as_u64().expect("cat waits for input");
+            let echoed = run_write(
+                &registry,
+                json!({"session_id": id, "chars": "abc\n", "yield_time_ms": 400}),
+            )
+            .await;
+            assert!(
+                echoed["output"].as_str().unwrap().contains("abc"),
+                "tty={tty}: {echoed}"
+            );
+            let closed = run_write(
+                &registry,
+                json!({"session_id": id, "action": "close_stdin", "yield_time_ms": 10000}),
+            )
+            .await;
+            assert!(closed["session_id"].is_null(), "tty={tty}: {closed}");
+            assert_eq!(closed["exit_code"].as_u64(), Some(0), "tty={tty}: {closed}");
+            registry.shutdown_processes().await;
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn handle_controls_refuse_bad_requests() {
+        let registry = default_process_registry();
+        let unknown = run_write(&registry, json!({"session_id": 1, "action": "dance"})).await;
+        assert_eq!(unknown["error_code"], "invalid_argument", "{unknown}");
+        let started = run_exec(&registry, json!({"cmd": "sleep 30", "yield_time_ms": 250})).await;
+        let id = started["session_id"].as_u64().unwrap();
+        let chars = run_write(
+            &registry,
+            json!({"session_id": id, "action": "interrupt", "chars": "x"}),
+        )
+        .await;
+        assert_eq!(chars["error_code"], "invalid_argument", "{chars}");
+        let missing = run_write(&registry, json!({"action": "kill"})).await;
+        assert_eq!(missing["error_code"], "missing_argument", "{missing}");
+        let unknown_id =
+            run_write(&registry, json!({"session_id": 999, "action": "interrupt"})).await;
+        assert_eq!(unknown_id["error_code"], "unknown_session", "{unknown_id}");
+        registry.shutdown_processes().await;
     }
 }

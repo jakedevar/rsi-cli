@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::store::Store;
@@ -155,7 +154,7 @@ impl WatchdogHandle {
 /// Store challenge, even when the Store mutex never becomes available.
 pub fn start_watchdog(
     socket_path: PathBuf,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     scheduler: Option<LoopHeartbeat>,
     reconciliation: Option<LoopHeartbeat>,
     policy: WatchdogPolicy,
@@ -195,11 +194,13 @@ pub fn start_watchdog(
                     let record = restart_record_from_trip(&trip);
                     let metrics = runtime.metrics();
                     let store_lock_contended = store.try_lock().is_err();
+                    let store_lock_holder = crate::store_lock::holder_snapshot(&store);
                     let store_probe_pending = store_probe_running.load(Ordering::Acquire);
                     let rpc_probe_pending = rpc_probe_running.load(Ordering::Acquire);
                     handle_trip(
                         &data_dir,
                         &record,
+                        &store_lock_holder,
                         TRIP_SNAPSHOT_DEADLINE,
                         || crate::thread_stacks::thread_wait_report(TRIP_SNAPSHOT_DEADLINE),
                         |thread_waits| {
@@ -210,6 +211,7 @@ pub fn start_watchdog(
                                 scheduler_age_ms = ?observation.scheduler_age.map(|age| age.as_millis()),
                                 reconciliation_age_ms = ?observation.reconciliation_age.map(|age| age.as_millis()),
                                 store_lock_contended,
+                                store_lock_holder = %store_lock_holder,
                                 store_probe_pending,
                                 rpc_probe_pending,
                                 tokio_workers = metrics.num_workers(),
@@ -241,6 +243,7 @@ pub fn start_watchdog(
 fn handle_trip(
     data_dir: &Path,
     record: &RestartRecord,
+    store_lock_holder: &str,
     deadline: Duration,
     collect: impl FnOnce() -> String + Send + 'static,
     log: impl FnOnce(&[String]),
@@ -254,7 +257,7 @@ fn handle_trip(
     let path = data_dir.join(format!("daemon-watchdog-stacks-{}.txt", record.id));
     let shown = path.display().to_string();
     let content = format!(
-        "# launch phases (id phase age)\n{}\n{report}",
+        "# Store lock holder at trip\n{store_lock_holder}\n# launch phases (id phase age)\n{}\n{report}",
         crate::launch_breadcrumbs::snapshot().join("\n"),
     );
     if crate::thread_stacks::write_snapshot_bounded(path, deadline, move || content) {
@@ -340,7 +343,7 @@ fn rpc_probe_single_flight(
 
 fn store_probe(
     runtime: &tokio::runtime::Handle,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     running: &Arc<AtomicBool>,
     deadline: Duration,
 ) -> StoreProbeOutcome {
@@ -464,6 +467,7 @@ mod tests {
         handle_trip(
             directory.path(),
             &record,
+            "<no labelled holder: unlocked or unlabelled>",
             Duration::from_millis(300),
             || loop {
                 std::thread::park();
@@ -511,9 +515,11 @@ mod tests {
         };
         let mut exit_code = None;
         let mut waits = Vec::new();
+        let holder = "label=test::trip_holder held_ms=104000";
         handle_trip(
             directory.path(),
             &record,
+            holder,
             Duration::from_secs(2),
             || "# header\ntid 1 comm \"x\" state S wchan futex_wait_queue\n".to_owned(),
             |lines| waits = lines.to_vec(),
@@ -531,6 +537,10 @@ mod tests {
         )
         .unwrap();
         assert!(stacks.contains("wchan futex_wait_queue"), "{stacks}");
+        assert!(
+            stacks.contains("# Store lock holder at trip\nlabel=test::trip_holder held_ms="),
+            "{stacks}"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -794,7 +804,9 @@ mod tests {
         let database = PathBuf::from(
             std::env::var_os("RSI_PRESSURE_DATABASE").expect("disposable on-disk database path"),
         );
-        let store = Arc::new(Mutex::new(Store::open_test_fixture(&database).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_test_fixture(&database).unwrap(),
+        ));
         let rpc_running = Arc::new(AtomicBool::new(false));
         let store_running = Arc::new(AtomicBool::new(false));
         let mut samples = std::fs::File::create(directory.join("probes.jsonl")).unwrap();
@@ -830,7 +842,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
     #[tokio::test]
     async fn blocked_store_probe_keeps_one_pending_challenge() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let guard = store.lock().await;
         let runtime = tokio::runtime::Handle::current();
         let running = Arc::new(AtomicBool::new(false));
@@ -878,7 +892,9 @@ mod tests {
     async fn fast_store_write_error_is_reported_without_a_timeout() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("watchdog.sqlite");
-        let store = Arc::new(Mutex::new(Store::open_test_fixture(&database).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_test_fixture(&database).unwrap(),
+        ));
         rusqlite::Connection::open(&database)
             .unwrap()
             .execute_batch(

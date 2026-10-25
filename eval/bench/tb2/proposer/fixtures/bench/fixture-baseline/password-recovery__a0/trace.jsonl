@@ -1,0 +1,12 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Recover the password from the damaged archive.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"unzip -P guess1 data.zip"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 82","output":"incorrect password","success":false},"seq":2}
+{"args":{"command":"unzip -P guess2 data.zip"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 82","output":"incorrect password","success":false},"seq":4}
+{"args":{"command":"unzip -P guess3 data.zip"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 82","output":"incorrect password","success":false},"seq":6}
+{"args":{"command":"unzip -P guess4 data.zip"},"kind":"tool_call","name":"shell","seq":7}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 82","output":"incorrect password","success":false},"seq":8}
+{"args":{"command":"unzip -P guess5 data.zip"},"kind":"tool_call","name":"shell","seq":9}
+{"kind":"tool_result","name":"shell","result":{"error_msg":"Exit code: 82","output":"incorrect password","success":false},"seq":10}
+{"kind":"model_response","response":{"content":"I ran out of iterations before the password was found.","stop_reason":"max_iterations","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":11}

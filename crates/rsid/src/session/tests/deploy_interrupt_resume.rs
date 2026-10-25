@@ -530,6 +530,86 @@ async fn restart_claim_starts_no_turn_and_the_deferred_continuation_resumes_the_
     assert!(!resumed.restart_intent_pending);
 }
 
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn restart_journal_retires_nodes_of_terminal_executions_before_claim_and_dispatch() {
+    for status in ["failed", "succeeded", "cancelled"] {
+        for settle_after_claim in [false, true] {
+            let (manager, _dir) = manager();
+            let repo = git_repo();
+            let worker = running_worker(&manager, &repo).await;
+            let execution = Uuid::new_v4();
+            {
+                let store = manager.store.lock().await;
+                let boot = Uuid::new_v4();
+                assert!(store.record_restart_intent(worker.id, boot).unwrap());
+                store.mark_restart_interrupt_sent(worker.id, boot).unwrap();
+                // A session node still in flight when a sibling's failure
+                // settles the execution. Mirror the production row writers.
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO topology_executions (id,topology_name_snapshot,workflow_id, \
+                     definition_json,definition_digest,requested_by_kind,repo_root,base_commit, \
+                     custody_plan_json,status,created_at,updated_at) \
+                     VALUES (?1,'restart-test',?2,'{}','d','operator',?3,'0','{}',?4,?5,?5)",
+                        rusqlite::params![
+                            execution.to_string(),
+                            Uuid::new_v4().to_string(),
+                            repo.path().to_str().unwrap(),
+                            if settle_after_claim {
+                                "running"
+                            } else {
+                                status
+                            },
+                            crate::topology::store::now_text()
+                        ],
+                    )
+                    .unwrap();
+                let attempt = Uuid::new_v4();
+                store.conn.execute(
+                    "INSERT INTO topology_node_attempts (id,execution_id,node_id,iteration,attempt_no, \
+                     node_kind,status,dedup_key,session_id,base_commit,input_json,created_at,updated_at) \
+                     VALUES (?1,?2,'A',0,1,'session','running',?1,?3,'0','{}',?4,?4)",
+                    rusqlite::params![attempt.to_string(), execution.to_string(), worker.id.to_string(), crate::topology::store::now_text()],
+                ).unwrap();
+            }
+            manager.restore_sessions().await.unwrap();
+            let process = install_controller_candidate_test_process(worker.id);
+            let claimed = manager.claim_restart_intents_at_startup().await.unwrap();
+            assert_eq!(claimed.len(), usize::from(settle_after_claim));
+            if settle_after_claim {
+                manager
+                    .store
+                    .lock()
+                    .await
+                    .conn
+                    .execute(
+                        "UPDATE topology_executions SET status=?2 WHERE id=?1",
+                        rusqlite::params![execution.to_string(), status],
+                    )
+                    .unwrap();
+            }
+            manager.continue_claimed_restart_intents(claimed).await;
+            assert_eq!(process.productive_start_count.load(Ordering::SeqCst), 0);
+            let store = manager.store.lock().await;
+            let state: (String, String) = store
+                .conn
+                .query_row(
+                    "SELECT state,outcome FROM daemon_restart_intents WHERE session_id=?1",
+                    [worker.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("failed".into(), "not_needed".into()));
+            assert_eq!(
+                store.get_session(worker.id).unwrap().unwrap().status,
+                SessionStatus::Interrupted
+            );
+        }
+    }
+}
+
 /// #2617: the cut turn ends in memory before its terminal status reaches the
 /// store (the persistence worker lags under a drain). The executor must not
 /// see that terminal view next to a row that is still `Running`: it carries no

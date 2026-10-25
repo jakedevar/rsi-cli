@@ -19,6 +19,12 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# The New session dialog's Choose folder… (local #271): a native directory picker, called from our own
+# `choose_folder` command (dialog.rs). Never exposed to the page, so capabilities/default.json has no dialog entry.
+tauri-plugin-dialog = "2"
+# OS notifications when a session needs the operator (local #294), posted from our own `notify_session`
+# command (notify.rs). Never exposed to the page, so capabilities/default.json has no notification entry.
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "time", "rt-multi-thread", "macros"] }
@@ -36,6 +42,21 @@ rsi-graph = { path = "../../crates/rsi-graph" }
 # portfolio_nodes, manager_nodes, harness_manager_presets), and G4's New session
 # prompt builds its manager appointment with the same preset code.
 rsi-common = { path = "../../crates/rsi-common" }
+
+# The daemon-down card's Start rsid (service.rs, local #232) names the launchd
+# domain gui/<uid>; getuid only, already in the tree through tauri.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Settings says when macOS has notifications turned off for RSI (local #300): the notification plugin
+# always reports "granted" on desktop, so notify.rs reads UNUserNotificationCenter's authorization
+# status itself. All three crates are already in the tree through tauri (objc2-app-kit, tao); only
+# the features are new. Read-only: nothing is posted, requested or changed.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "UNNotificationSettings", "UNUserNotificationCenter", "block2"] }
 
 [dev-dependencies]
 tempfile = "3"

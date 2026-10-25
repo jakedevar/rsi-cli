@@ -11,6 +11,7 @@ pub(crate) mod dialectic;
 mod esp_square;
 pub mod file_explorer;
 pub mod fleet;
+pub mod global_dashboard;
 pub mod global_manager_command;
 pub mod global_manager_workspace;
 pub mod global_manager_workspace_launch;
@@ -19,11 +20,13 @@ pub mod grant_editor;
 pub mod graph;
 pub mod harness_manager;
 pub mod hook_form;
+pub mod host_tuning;
 pub mod keybindings_help;
 pub mod label_form;
 pub mod label_picker;
 pub(crate) mod launch_settings;
 pub mod list;
+pub mod manager_coverage;
 pub mod manager_v2;
 pub(crate) mod mcp_server_form;
 pub mod memory_search;
@@ -69,6 +72,8 @@ pub mod todo_popup;
 pub mod trash_browser;
 
 #[cfg(test)]
+mod filter_picker_tests;
+#[cfg(test)]
 mod help_tests;
 #[cfg(test)]
 mod tests;
@@ -111,7 +116,9 @@ fn selected_prompt_processor_config(
 pub use budget_policy_form::open_budget_policy_form;
 pub use cohort_settlement::open_source_worktree_settlement;
 pub use create_entity_form::open_create_entity_form;
-pub use daemon_text_editor::{daemon_text_field, open_daemon_text_editor};
+pub use daemon_text_editor::{
+    daemon_number_entry, daemon_text_field, editor_copy, open_daemon_text_editor,
+};
 pub use hook_form::open_hook_form;
 pub use keybindings_help::{close_keybindings_help, open_keybindings_help};
 pub use label_picker::open_label_picker;
@@ -235,6 +242,13 @@ fn handle_text_overlay_prompt_leader(app: &mut App, key: KeyEvent) -> bool {
     // launch form is active (#1231).
     if let OverlayState::GlobalManagerWorkspace(state) = &app.overlay
         && global_manager_workspace::owns_text_entry(state)
+    {
+        app.overlay_leader_pending = false;
+        return false;
+    }
+    // The dashboard owns typed text while its input bar is active (#3317).
+    if let OverlayState::GlobalDashboard(state) = &app.overlay
+        && global_dashboard::owns_text_entry(state)
     {
         app.overlay_leader_pending = false;
         return false;
@@ -552,6 +566,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
             legacy_scratch::handle_key(app, key).await;
             return true;
         }
+        OverlayState::HostTuning(..) => {
+            host_tuning::handle_key(app, key).await;
+            return true;
+        }
         OverlayState::SatelliteRegistry(..) => {
             satellite_registry::handle_key(app, key).await;
             return true;
@@ -567,6 +585,10 @@ pub async fn handle_overlay_key(app: &mut App, key: KeyEvent) -> bool {
         OverlayState::Fleet(..) => fleet::handle_key(app, key).await,
         OverlayState::GlobalManagerWorkspace(..) => {
             global_manager_workspace::handle_key(app, key).await;
+            return true;
+        }
+        OverlayState::GlobalDashboard(..) => {
+            global_dashboard::handle_key(app, key).await;
             return true;
         }
         OverlayState::HarnessManagerV2(..) => {
@@ -1953,6 +1975,7 @@ fn paste_into_overlay(app: &mut App) {
 
 /// Paste pre-read text into the active overlay textarea with normalization and wrapping.
 fn paste_text_into_overlay(app: &mut App, text: &str) {
+    let standard = app.standard_editing();
     let normalized = crate::input_surface::normalize_pasted_text(text);
     if matches!(&app.overlay, OverlayState::SatelliteRegistry(..)) {
         if satellite_registry::paste_text(app, &normalized) {
@@ -1998,12 +2021,19 @@ fn paste_text_into_overlay(app: &mut App, text: &str) {
             focused_field,
             name,
             path,
+            text,
             ..
         } => {
-            match *focused_field {
-                0 => name.push_str(&normalized),
-                1 => path.push_str(&normalized),
-                _ => {}
+            let field = *focused_field;
+            if field < 2 {
+                let spec = crate::form_text::FieldSpec::SINGLE_LINE;
+                let value = if field == 0 { name } else { path };
+                text.load(field, value, spec, standard);
+                if text.paste(&normalized, spec).0 == crate::form_text::TextKey::Edited
+                    && let Some(content) = text.content()
+                {
+                    *value = content;
+                }
             }
             handled = true;
         }

@@ -127,7 +127,7 @@ pub(super) async fn handle_parent_picker_key(app: &mut App, key: KeyEvent) {
     let visible_count = visible.len();
 
     if let OverlayState::ParentPicker { selected, .. } = &mut app.overlay
-        && list::handle_list_nav_key(selected, visible_count, &key)
+        && list::handle_filter_list_nav_key(selected, visible_count, &key)
     {
         app.mark_dirty();
         return;

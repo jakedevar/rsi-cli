@@ -20,12 +20,12 @@
 use super::Store;
 use super::custody_lock_order::admission_contention_signal_matching;
 use super::sandbox_custody::lock_custody_root;
+use rsid_core::store_lock::Mutex as StoreMutex;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as StoreMutex;
 use uuid::Uuid;
 
 /// Worst acceptable wait for an unrelated Store acquisition while the path is
@@ -33,9 +33,14 @@ use uuid::Uuid;
 /// 3 s hold, and far above scheduling noise on a loaded runner.
 pub const PROBE_BOUND: Duration = Duration::from_millis(1500);
 
-/// Fewest probe samples taken inside the post-acknowledgement hold that make
-/// the run meaningful (a 3 s hold at one probe per 5 ms is ~600).
-pub const MIN_PROBE_SAMPLES: usize = 20;
+/// The probe must take at least this many samples inside the post-acknowledgement
+/// hold. The count is deliberately not a rate: how many 5 ms probe iterations fit
+/// in the hold depends on host load (a loaded satellite took 19 of ~120, #175).
+/// What makes a run meaningful is that the probe sampled inside the hold at all
+/// (so a Store pinned for the hold is timed, not skipped) and was never starved
+/// for as long as the bound it is checked against (`PROBE_BOUND`): see
+/// [`ProbeReport::max_gap`].
+pub const MIN_PROBE_SAMPLES: usize = 1;
 
 /// How long the holder waits for the path to acknowledge contention before it
 /// gives up and releases (the run then reports no acknowledgement). Long
@@ -54,6 +59,11 @@ pub struct StripeRun<T> {
     pub worst_wait: Duration,
     /// How many probe samples were taken inside that hold.
     pub samples_while_held: usize,
+    /// The longest the Store probe went between two consecutive iterations from
+    /// its first sample inside the hold to the first iteration after release.
+    /// Any Store pin of at least `PROBE_BOUND` therefore begins before an
+    /// iteration that observes it, however loaded the host was.
+    pub max_sample_gap: Duration,
     /// Whether the path finished only after the root locks were released, i.e. it
     /// really waited behind them.
     pub finished_after_release: bool,
@@ -67,6 +77,8 @@ pub struct ProbeReport {
     pub name: &'static str,
     pub worst_wait: Duration,
     pub samples: usize,
+    /// See [`StripeRun::max_sample_gap`].
+    pub max_gap: Duration,
 }
 
 /// An extra probe: `touch` acquires and releases the resource under test (an
@@ -90,6 +102,12 @@ impl<T> StripeRun<T> {
             self.samples_while_held
         );
         assert!(
+            self.max_sample_gap < PROBE_BOUND,
+            "{what}: the Store probe went {:?} between iterations while the stripes were held, \
+             so a pinned Store could have gone unseen",
+            self.max_sample_gap
+        );
+        assert!(
             self.worst_wait < PROBE_BOUND,
             "{what}: an unrelated Store user waited {:?} behind a path blocked on a custody stripe",
             self.worst_wait
@@ -104,6 +122,12 @@ impl<T> StripeRun<T> {
                 "{what}: the {} probe took only {} samples while the stripes were held",
                 probe.name,
                 probe.samples
+            );
+            assert!(
+                probe.max_gap < PROBE_BOUND,
+                "{what}: the {} probe went {:?} between iterations while the stripes were held",
+                probe.name,
+                probe.max_gap
             );
             assert!(
                 probe.worst_wait < PROBE_BOUND,
@@ -227,10 +251,20 @@ fn start_probe(
         let mut ready = Some(ready_tx);
         let mut worst_wait = Duration::ZERO;
         let mut samples = 0;
+        let mut max_gap = Duration::ZERO;
+        // Start of the previous iteration while the window (first sample inside
+        // the hold .. first iteration after release) is open.
+        let mut window_prev: Option<Instant> = None;
         while !shared.stop.load(Ordering::Acquire) {
             let held_at_start = shared.acknowledged.load(Ordering::SeqCst)
                 && !shared.released.load(Ordering::SeqCst);
             let started = Instant::now();
+            if let Some(prev) = window_prev {
+                max_gap = max_gap.max(started.duration_since(prev));
+                window_prev = (!shared.released.load(Ordering::SeqCst)).then_some(started);
+            } else if held_at_start && samples == 0 {
+                window_prev = Some(started);
+            }
             touch();
             let waited = started.elapsed();
             if held_at_start {
@@ -246,6 +280,7 @@ fn start_probe(
             name,
             worst_wait,
             samples,
+            max_gap,
         }
     });
     (thread, ready_rx)
@@ -321,6 +356,7 @@ where
         contention_acknowledged,
         worst_wait: store_report.worst_wait,
         samples_while_held: store_report.samples,
+        max_sample_gap: store_report.max_gap,
         finished_after_release,
         extra_probes: reports.collect(),
     }
@@ -422,12 +458,45 @@ mod tests {
         .await;
         let elapsed = started.elapsed();
         assert!(run.contention_acknowledged);
+        // Load-independent: the probe sampled inside the hold (at least once) and
+        // never went a bound without an iteration; how many 5 ms iterations fit
+        // in the hold depends on the host, so no rate is asserted.
+        assert!(run.samples_while_held >= MIN_PROBE_SAMPLES);
         run.assert_store_stayed_free("late contention");
         assert!(
             elapsed >= Duration::from_millis(2000),
             "the stripe was held {:?} after the acknowledgement, not from run start",
             elapsed
         );
+    }
+
+    fn manual_run(samples: usize, max_gap: Duration) -> StripeRun<()> {
+        StripeRun {
+            output: (),
+            contention_acknowledged: true,
+            worst_wait: Duration::ZERO,
+            samples_while_held: samples,
+            max_sample_gap: max_gap,
+            finished_after_release: true,
+            extra_probes: Vec::new(),
+        }
+    }
+
+    /// The sample floor is a coverage rule, not a rate: one sample with small
+    /// gaps passes however few iterations the host allowed, while no sample, or
+    /// a probe starved for the bound, is refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn probe_coverage_not_rate_decides_whether_a_run_is_meaningful() {
+        manual_run(1, Duration::from_millis(40)).assert_store_stayed_free("one sample");
+        for refused in [manual_run(0, Duration::ZERO), manual_run(50, PROBE_BOUND)] {
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    refused.assert_store_stayed_free("starved probe");
+                }))
+                .is_err()
+            );
+        }
     }
 
     /// The probe is not vacuous: a path that acknowledges contention and then

@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "version": 185,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v185.rs",
+      "source_blob": "sha256:1025b06beceb6273dd47e04f563e5146df8ff3740729bd77205410cb4ae32001",
+      "sites": [
+        {
+          "anchor": "fn migrate_v185(",
+          "replacement": "fn migrate_v${VERSION}(",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 185 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 185)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ],
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs"
+    },
+    {
+      "path": "crates/rsid-store/src/store/migrations/altered_objects.rs",
+      "source_blob": "sha256:e7a823e5de5a48e20daed7aaf82b0c255fb26092f04d6aba96ae53c86156d18a",
+      "sites": [
+        {
+          "anchor": "(185, &[\"rolling_queue_entries\"]),",
+          "replacement": "(${VERSION}, &[\"rolling_queue_entries\"]),",
+          "scope": "unit"
+        }
+      ],
+      "path_template": "crates/rsid-store/src/store/migrations/altered_objects.rs"
+    },
+    {
+      "path": "crates/rsid-store/src/store/rolling_queue.rs",
+      "source_blob": "sha256:e28c0d4d0cb66f08d29182709234caf361eb548cb93b24dd21116ac14c23ee79",
+      "sites": [
+        {
+          "anchor": "crate::store::tests::rewind_post_v121_tail_to(&store.conn, 185 - 1);",
+          "replacement": "crate::store::tests::rewind_post_v121_tail_to(&store.conn, ${VERSION} - 1);",
+          "scope": "unit"
+        },
+        {
+          "anchor": "crate::store::assert_catalog_preserved_across_replay(&catalog, &store.conn, 185 - 1);",
+          "replacement": "crate::store::assert_catalog_preserved_across_replay(&catalog, &store.conn, ${VERSION} - 1);",
+          "scope": "unit"
+        }
+      ],
+      "path_template": "crates/rsid-store/src/store/rolling_queue.rs"
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:32c8216327fa8ce89b24dd4f77a1ef6ae33f55bea9b26b35a425c36f43030190",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 185;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 185 && target < 185 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 185 - 1).unwrap();",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION} - 1).unwrap();",
+          "scope": "unit"
+        },
+        {
+          "anchor": "queue_issue,\n        target_version >= 185,",
+          "replacement": "queue_issue,\n        target_version >= ${VERSION},",
+          "scope": "unit"
+        },
+        {
+          "anchor": "queue_issue_index,\n        target_version >= 185,",
+          "replacement": "queue_issue_index,\n        target_version >= ${VERSION},",
+          "scope": "unit"
+        }
+      ],
+      "path_template": "crates/rsid-store/src/store/tests.rs"
+    }
+  ]
+}

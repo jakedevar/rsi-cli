@@ -5,6 +5,9 @@ use std::path::{Component, Path, PathBuf};
 
 use rsi_codegraph::{
     SourceFile,
+    invalidate::{
+        estimated_fact_heap_bytes, estimated_pass_heap_bytes, estimated_streamed_heap_bytes,
+    },
     staged::{MAX_STAGED_FILE_BYTES, MAX_STAGED_FILES, MAX_STAGED_SOURCE_BYTES},
 };
 use walkdir::WalkDir;
@@ -13,6 +16,16 @@ use super::{IndexError, RegisteredWorkspace, Result};
 
 const IGNORED_DIRS: &[&str] = &[".git", ".rsi", "target", "node_modules", "vendor", ".venv"];
 const MAX_WALK_ENTRIES: usize = 100_000;
+
+/// Estimated heap one index pass may hold (#3491). A corpus within the extraction
+/// cache's retention budget keeps every file's facts alive while it resolves
+/// references ([`estimated_fact_heap_bytes`] sizes it); a larger one is streamed
+/// (`rsi_codegraph::stream`) and holds only the resolver's inputs
+/// ([`estimated_streamed_heap_bytes`]). A hub start whose largest checkout
+/// (193 MB, 90 MB of it Rust) reached 2.8 GB resident, then 1.5 GB with the
+/// pass held whole; streamed, a 127 MB checkout peaks near 0.17 GB live. A corpus over this budget fails its
+/// pass visibly (`DiscoveryLimit`) instead of starving the daemon.
+pub const MAX_PASS_HEAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 pub struct Discovery {
     pub files: Vec<SourceFile>,
@@ -88,11 +101,31 @@ fn link_target_within_root(root: &Path, link: &Path) -> bool {
 /// repository that tracks `CLAUDE.md -> AGENTS.md` still indexes. A root or
 /// directory swapped during the scan still fails closed.
 pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
+    scan(workspace, true, MAX_PASS_HEAP_BYTES)
+}
+
+/// The same scan and digest as [`discover`] without keeping any file's bytes
+/// (`files` is empty): the publish fence only compares digests, and holding a
+/// second copy of the source next to the staged facts is memory the pass does
+/// not need (#3491).
+pub fn discover_digest(workspace: &RegisteredWorkspace) -> Result<Discovery> {
+    scan(workspace, false, MAX_PASS_HEAP_BYTES)
+}
+
+fn scan(
+    workspace: &RegisteredWorkspace,
+    keep_bytes: bool,
+    heap_budget: usize,
+) -> Result<Discovery> {
     // A registered root can disappear or be replaced while the daemon runs.
     workspace.validate_current_root()?;
     let mut files = Vec::new();
+    let mut digests: Vec<(String, blake3::Hash)> = Vec::new();
     let mut skipped_symlinks = Vec::new();
     let mut total_bytes = 0usize;
+    let mut read_bytes = 0usize;
+    let mut estimated_heap = 0usize;
+    let mut streamed_heap = 0usize;
     let mut entry_count = 0usize;
     let walker = WalkDir::new(&workspace.root)
         .follow_links(false)
@@ -121,7 +154,7 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
         if !entry.file_type().is_file() {
             continue;
         }
-        if files.len() == MAX_STAGED_FILES {
+        if digests.len() == MAX_STAGED_FILES {
             return Err(IndexError::DiscoveryLimit("file count"));
         }
         let relative = entry
@@ -159,6 +192,13 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
         if total_bytes > MAX_STAGED_SOURCE_BYTES {
             return Err(IndexError::DiscoveryLimit("source bytes"));
         }
+        estimated_heap =
+            estimated_heap.saturating_add(estimated_fact_heap_bytes(&relative_path, size));
+        streamed_heap =
+            streamed_heap.saturating_add(estimated_streamed_heap_bytes(&relative_path, size));
+        if estimated_pass_heap_bytes(estimated_heap, streamed_heap) > heap_budget {
+            return Err(IndexError::DiscoveryLimit("pass heap budget"));
+        }
         // Reject path substitution between traversal and read. This does not
         // close every TOCTOU race; a post-extraction rescan is the publish fence.
         let canonical = entry.path().canonicalize()?;
@@ -171,23 +211,28 @@ pub fn discover(workspace: &RegisteredWorkspace) -> Result<Discovery> {
         if bytes.len() > MAX_STAGED_FILE_BYTES {
             return Err(IndexError::DiscoveryLimit("file size"));
         }
-        files.push(SourceFile {
-            relative_path,
-            bytes,
-        });
+        read_bytes = read_bytes.saturating_add(bytes.len());
+        digests.push((relative_path.clone(), blake3::hash(&bytes)));
+        if keep_bytes {
+            files.push(SourceFile {
+                relative_path,
+                bytes,
+            });
+        }
     }
+    digests.sort_by(|a, b| a.0.cmp(&b.0));
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     skipped_symlinks.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    let bytes = files.iter().map(|file| file.bytes.len()).sum();
+    let bytes = read_bytes;
     if bytes > MAX_STAGED_SOURCE_BYTES {
         return Err(IndexError::DiscoveryLimit("source bytes"));
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rsid-codegraph-discovery-v1");
-    for file in &files {
-        hasher.update(&(file.relative_path.len() as u64).to_le_bytes());
-        hasher.update(file.relative_path.as_bytes());
-        hasher.update(blake3::hash(&file.bytes).as_bytes());
+    for (relative_path, digest) in &digests {
+        hasher.update(&(relative_path.len() as u64).to_le_bytes());
+        hasher.update(relative_path.as_bytes());
+        hasher.update(digest.as_bytes());
     }
     // A tree with no links hashes exactly as before. Mixing the skips in
     // otherwise lets a new link reach the publish fence and refresh the count.
@@ -224,6 +269,37 @@ mod tests {
         let after = discover(&workspace).unwrap();
         assert_ne!(before.digest, after.digest);
         assert_eq!(after.files[0].relative_path, "lib.rs");
+    }
+
+    /// #3491: the publish fence needs the digest only, so it must not hold a
+    /// second copy of the source next to the staged facts; and a corpus whose
+    /// estimated pass heap exceeds the budget fails visibly before any read.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_fence_scan_keeps_no_bytes_and_a_pass_over_the_heap_budget_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn one() {}\n".repeat(8)).unwrap();
+        std::fs::write(root.path().join("notes.md"), "# notes\n".repeat(8)).unwrap();
+        let workspace = RegisteredWorkspace::primary(Uuid::new_v4(), root.path()).unwrap();
+        let full = discover(&workspace).unwrap();
+        let fence = discover_digest(&workspace).unwrap();
+        assert_eq!(full.files.len(), 2);
+        assert!(fence.files.is_empty());
+        assert_eq!(fence.digest, full.digest);
+        assert_eq!(fence.bytes, full.bytes);
+
+        let estimate = full
+            .files
+            .iter()
+            .map(|file| estimated_fact_heap_bytes(&file.relative_path, file.bytes.len()))
+            .sum::<usize>();
+        scan(&workspace, true, estimate).expect("a pass exactly at the budget is admitted");
+        assert!(matches!(
+            scan(&workspace, true, estimate - 1),
+            Err(IndexError::DiscoveryLimit("pass heap budget"))
+        ));
+        // The shipped budget admits this pass.
+        assert!(estimate < MAX_PASS_HEAP_BYTES);
     }
 
     #[cfg(unix)]

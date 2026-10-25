@@ -196,8 +196,8 @@ impl Store {
     /// # Errors
     /// `project_not_authorized`, `project_not_in_scope`, `project_name_taken`,
     /// `project_path_taken`, `project_harness_protected`,
-    /// `project_has_live_sessions` or a persistence error. The harness
-    /// project's path never changes here, and no path may overlap
+    /// `project_has_live_sessions`, `home_project_repath_refused` or a
+    /// persistence error. The harness and home projects' paths never change here, and no path may overlap
     /// `harness_root`.
     pub fn agent_edit_project(
         &self,
@@ -226,6 +226,9 @@ impl Store {
         if let Some(path) = &edit.path
             && existing.path.as_deref().map(comparable).as_deref() != Some(path.as_path())
         {
+            if Project::is_home_id(project_id) {
+                return Err(refuse(Project::HOME_REPATH_REFUSED));
+            }
             let is_harness = harness_root.is_some_and(|root| {
                 existing.path.as_deref().map(comparable).as_deref() == Some(root)
             });

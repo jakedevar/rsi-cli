@@ -1,28 +1,42 @@
 //! Shell execution tool with timeout, output cap, and env scrubbing.
 //!
-//! - 120-second default timeout
+//! - 120-second default timeout, `timeout_secs` up to 600
 //! - 1 MB output cap
 //! - Environment scrubbed: only safe vars carried through
 
 use super::{HarnessTool, ToolContext, custody_guard, truncation::truncate_text};
 use crate::process_control::{
-    CaptureError, CaptureLimits, SESSION_TOOL_MAX_STREAM_BYTES, SESSION_TOOL_TIMEOUT,
-    capture_bounded,
+    CaptureError, CaptureLimits, EscapeSweep, ProcessContainment, SESSION_TOOL_MAX_STREAM_BYTES,
+    SESSION_TOOL_TIMEOUT, capture_bounded,
 };
 use crate::sandbox::execution_scratch::SandboxExecutionScratch;
 use crate::session::harness::types::ToolResult;
 use rsi_common::egress_policy::EgressMode;
+use rsi_common::exec_target::ExecTarget;
 use std::path::Path;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// The longest foreground `timeout_secs` a model may request (#3168). Longer
+/// runs belong to `exec_command`.
+const MAX_TIMEOUT_SECS: u64 = 600;
 const MAX_OUTPUT_BYTES: usize = SESSION_TOOL_MAX_STREAM_BYTES;
+
+/// #3176: a container target's `shell` timeout is its per-call ceiling; a
+/// `timeout_secs` argument may only lower it.
+fn container_command_timeout(args: &serde_json::Value, ceiling_secs: u64) -> Duration {
+    let secs = args
+        .get("timeout_secs")
+        .and_then(|value| value.as_u64())
+        .map_or(ceiling_secs, |requested| requested.clamp(1, ceiling_secs));
+    Duration::from_secs(secs)
+}
 
 fn command_timeout(args: &serde_json::Value, default: Duration) -> Duration {
     args.get("timeout_secs")
         .and_then(|value| value.as_u64())
-        .map(|seconds| Duration::from_secs(seconds.clamp(1, DEFAULT_TIMEOUT_SECS)))
+        .map(|seconds| Duration::from_secs(seconds.clamp(1, MAX_TIMEOUT_SECS)))
         .unwrap_or(default.min(SESSION_TOOL_TIMEOUT))
 }
 
@@ -56,6 +70,60 @@ pub const SAFE_ENV_VARS: &[&str] = &[
     "CONDA_PREFIX",
 ];
 
+/// Non-interactive defaults every `shell` and `exec_command` launch gets when
+/// the variable is otherwise unset (#3169): no pager to block on, no ANSI
+/// colour in the transcript, a UTF-8 locale every image ships.
+pub(crate) const NON_INTERACTIVE_ENV_DEFAULTS: [(&str, &str); 6] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("NO_COLOR", "1"),
+    ("LANG", "C.UTF-8"),
+    ("LC_ALL", "C.UTF-8"),
+];
+/// `TERM` of a command on plain pipes. A PTY launch sets an xterm-like `TERM`.
+pub(crate) const PIPE_TERM: &str = "dumb";
+
+/// The environment of a host command: the fixed [`SAFE_ENV_VARS`] allowlist,
+/// the policy's extra names (never a credential-looking one), then the
+/// non-interactive defaults for what is still unset. `lookup` reads the
+/// daemon's environment.
+pub(crate) fn host_command_env(
+    extra: &[String],
+    tty: bool,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    fn put(env: &mut Vec<(String, String)>, name: &str, value: String) {
+        match env.iter_mut().find(|(existing, _)| existing == name) {
+            Some(slot) => slot.1 = value,
+            None => env.push((name.to_string(), value)),
+        }
+    }
+    let mut env: Vec<(String, String)> = Vec::new();
+    for name in SAFE_ENV_VARS {
+        if let Some(value) = lookup(name) {
+            put(&mut env, name, value);
+        }
+    }
+    for name in extra {
+        if rsi_common::harness_tool_policy::env_name_is_withheld(name) {
+            continue;
+        }
+        if let Some(value) = lookup(name) {
+            put(&mut env, name, value);
+        }
+    }
+    for (name, value) in NON_INTERACTIVE_ENV_DEFAULTS {
+        if !env.iter().any(|(existing, _)| existing == name) {
+            put(&mut env, name, value.to_string());
+        }
+    }
+    if !tty {
+        put(&mut env, "TERM", PIPE_TERM.to_string());
+    }
+    env
+}
+
 #[derive(Clone)]
 pub(crate) struct ShellLaunchIdentity {
     pub(crate) session_id: Option<uuid::Uuid>,
@@ -67,6 +135,44 @@ pub(crate) struct ShellLaunchIdentity {
     /// git need the network), so the shell is NOT covered by the private-range
     /// guard that protects network tools.
     pub(crate) egress: EgressMode,
+    /// #3176: where the command runs. `Host` (the default) is the scoped local
+    /// `bash -c`; `Container` is `docker -H <host> exec` into the validated
+    /// container, with an explicit environment and no host `unshare` wrapper.
+    pub(crate) exec_target: ExecTarget,
+    /// #3176: stamps an `exec_command` command inside its container so a
+    /// cancel can kill its whole tree there. Container targets only.
+    pub(crate) exec_marker: Option<uuid::Uuid>,
+    /// #3176: wrap the container command in `timeout -k 5 <secs>` so the limit
+    /// is enforced inside the container too (`shell`; `None` for `exec_command`).
+    pub(crate) container_timeout_secs: Option<u64>,
+    /// #3162: the command wants a terminal. `exec_command` with `tty: true`
+    /// launches it on a PTY; a container target adds `-t` to `docker exec`.
+    pub(crate) tty: bool,
+    /// #3169: extra environment names the session policy passes through to a
+    /// host command, on top of [`SAFE_ENV_VARS`].
+    pub(crate) env_passthrough: std::sync::Arc<[String]>,
+}
+
+impl ShellLaunchIdentity {
+    /// An identity that runs on the daemon host.
+    pub(crate) fn host(
+        session_id: Option<uuid::Uuid>,
+        invocation_id: Option<uuid::Uuid>,
+        execution_scratch: Option<SandboxExecutionScratch>,
+        egress: EgressMode,
+    ) -> Self {
+        Self {
+            session_id,
+            invocation_id,
+            execution_scratch,
+            egress,
+            exec_target: ExecTarget::Host,
+            exec_marker: None,
+            container_timeout_secs: None,
+            tty: false,
+            env_passthrough: std::sync::Arc::from([]),
+        }
+    }
 }
 
 /// argv that runs `command` with no network: a fresh user + network namespace
@@ -110,12 +216,21 @@ pub(crate) fn scoped_shell_command(
     working_dir: &Path,
     identity: &ShellLaunchIdentity,
 ) -> Result<tokio::process::Command, String> {
-    let mut env: Vec<(String, String)> = Vec::new();
-    for var in SAFE_ENV_VARS {
-        if let Ok(val) = std::env::var(var) {
-            env.push((var.to_string(), val));
-        }
+    if let ExecTarget::Container(target) = &identity.exec_target {
+        // The container workdir is the caller's `working_dir`, read as a path
+        // inside the container; the host path never reaches the docker client.
+        let workdir = super::exec_target::container_workdir(working_dir)?;
+        return super::exec_target::scoped_container_command(
+            target,
+            &workdir,
+            command,
+            identity,
+            identity.container_timeout_secs,
+        );
     }
+    let env = host_command_env(&identity.env_passthrough, identity.tty, &|name| {
+        std::env::var(name).ok()
+    });
 
     let limits = crate::process_scope::WorkerScopeLimits::from_launcher_snapshot()
         .map_err(|error| error.to_string())?;
@@ -167,6 +282,10 @@ pub struct ShellTool {
     session_id: Option<uuid::Uuid>,
     invocation_id: Option<uuid::Uuid>,
     execution_scratch: Option<SandboxExecutionScratch>,
+    /// #3176: `Host` unless the session is bound to a container.
+    exec_target: ExecTarget,
+    /// #3165: the custody scan guards only commands inside this base.
+    sandbox_base: std::path::PathBuf,
 }
 
 impl Default for ShellTool {
@@ -176,6 +295,8 @@ impl Default for ShellTool {
             session_id: None,
             invocation_id: None,
             execution_scratch: None,
+            exec_target: ExecTarget::Host,
+            sandbox_base: rsi_common::boundary_mail_hook::sandbox_base(),
         }
     }
 }
@@ -194,6 +315,19 @@ impl ShellTool {
         }
     }
 
+    /// #3176: run this tool's commands in the container instead of on the host.
+    pub(super) fn with_exec_target(mut self, exec_target: ExecTarget) -> Self {
+        self.exec_target = exec_target;
+        self
+    }
+
+    /// Test seam: the directory the custody scan treats as the sandbox base.
+    #[cfg(test)]
+    pub(super) fn with_sandbox_base(mut self, base: &Path) -> Self {
+        self.sandbox_base = base.to_path_buf();
+        self
+    }
+
     async fn execute_with_cancel(
         &self,
         args: serde_json::Value,
@@ -201,35 +335,49 @@ impl ShellTool {
         cancel: &CancellationToken,
         max_output_bytes: usize,
         egress: EgressMode,
+        env_passthrough: std::sync::Arc<[String]>,
     ) -> ToolResult {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let timeout = command_timeout(&args, self.timeout);
+        let container = self.exec_target.container();
+        let timeout = match container {
+            Some(target) => container_command_timeout(&args, target.per_call_ceiling_secs),
+            None => command_timeout(&args, self.timeout),
+        };
 
         let command = command
             .strip_prefix("```bash\n")
             .or_else(|| command.strip_prefix("```sh\n"))
             .and_then(|c| c.strip_suffix("\n```"))
             .unwrap_or(command);
-        if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
-            return ToolResult {
-                success: false,
-                output: String::new(),
-                error_msg: Some(refusal.to_string()),
+        // #3176: the kill guard and the custody guard protect an RSI worktree.
+        // Inside a task container they are wrong (TB2 has git tasks and kills
+        // processes it started), so they are skipped for a container target
+        // only; the host path keeps the kill guard (a host `pkill` can reach
+        // other sessions' processes). #3165: the custody scan applies only to a
+        // command inside the RSI sandbox base, like the CLI provider hook.
+        if container.is_none() {
+            if let Some(refusal) = rsi_common::kill_guard::broad_kill_refusal(command) {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error_msg: Some(refusal.to_string()),
+                };
+            }
+            // S6 (#2256): refuse git commands that break AGENTS.md hard rules 1, 2
+            // and 9 before anything in the command runs.
+            let probe = custody_guard::Probe {
+                session_id: self.session_id,
+                invocation_id: self.invocation_id,
+                working_dir,
+                cancel,
+                sandbox_base: &self.sandbox_base,
             };
-        }
-        // S6 (#2256): refuse git commands that break AGENTS.md hard rules 1, 2
-        // and 9 before anything in the command runs.
-        let probe = custody_guard::Probe {
-            session_id: self.session_id,
-            invocation_id: self.invocation_id,
-            working_dir,
-            cancel,
-        };
-        if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
-            return custody_guard::refused_result(refusal);
+            if let Some(refusal) = custody_guard::check_shell(command, &probe).await {
+                return custody_guard::refused_result(refusal);
+            }
         }
 
         let identity = ShellLaunchIdentity {
@@ -237,8 +385,17 @@ impl ShellTool {
             invocation_id: self.invocation_id,
             execution_scratch: self.execution_scratch.clone(),
             egress,
+            exec_target: self.exec_target.clone(),
+            exec_marker: None,
+            container_timeout_secs: container.map(|_| timeout.as_secs()),
+            tty: false,
+            env_passthrough,
         };
-        let cmd = match scoped_shell_command(command, working_dir, &identity) {
+        // A container target runs in its own workdir, never the host path.
+        let container_dir = container.map(|target| std::path::PathBuf::from(&target.workdir));
+        let run_dir = container_dir.as_deref().unwrap_or(working_dir);
+        let started = std::time::Instant::now();
+        let mut cmd = match scoped_shell_command(command, run_dir, &identity) {
             Ok(command) => command,
             Err(error) => {
                 return ToolResult {
@@ -250,11 +407,31 @@ impl ShellTool {
         };
 
         let mut limits = CaptureLimits::session_tool();
-        limits.execution_timeout = timeout;
+        // The in-container `timeout` fires first; the client waits a grace longer.
+        limits.execution_timeout = if container.is_some() {
+            timeout + super::exec_target::CLIENT_TIMEOUT_GRACE
+        } else {
+            timeout
+        };
+        // #3168: a timeout still kills the group but keeps what it printed.
+        limits.partial_on_timeout = true;
         let max_output_bytes = max_output_bytes.min(MAX_OUTPUT_BYTES);
         limits.max_stdout_bytes = max_output_bytes;
         limits.max_stderr_bytes = max_output_bytes;
-        match capture_bounded(cmd, limits, cancel).await {
+        // #4029: a container target runs the docker client, which starts its `ssh://`
+        // helper with `setsid`; the no-escape seccomp filter denies that and every call
+        // failed as "permission denied ... docker API". Contain the client by group
+        // only (as the bench runner does, #3890) and sweep any helper that left the
+        // group once the capture ends (#3900). The host path keeps the filter.
+        let sweep = container.map(|_| {
+            limits.containment = ProcessContainment::Group;
+            EscapeSweep::arm(cmd.as_std_mut())
+        });
+        let captured = capture_bounded(cmd, limits, cancel).await;
+        if let Some(sweep) = sweep {
+            let _ = tokio::task::spawn_blocking(move || sweep.sweep(None)).await;
+        }
+        match captured {
             Ok(output) => {
                 let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
                 if !output.stderr.is_empty() {
@@ -269,16 +446,25 @@ impl ShellTool {
                     output.stdout_truncated || output.stderr_truncated,
                 )
                 .content;
+                // `timeout` exits 124 (TERM) or 137 (it had to KILL) at the limit.
+                let container_timed_out = container.is_some()
+                    && matches!(output.status.code(), Some(124 | 137))
+                    && started.elapsed() + Duration::from_secs(1) >= timeout;
+                let timed_out = output.timed_out || container_timed_out;
                 ToolResult {
                     success: output.status.success(),
                     output: combined,
                     error_msg: if output.status.success() {
                         None
+                    } else if timed_out {
+                        Some(format!("Command timed out after {}s", timeout.as_secs()))
                     } else {
                         Some(format!("Exit code: {}", output.status.code().unwrap_or(-1)))
                     },
                 }
             }
+            // Not reached with `partial_on_timeout` unless the leader could not
+            // be reaped; there is then no output to keep.
             Err(CaptureError::ExecutionTimedOut) => ToolResult {
                 success: false,
                 output: String::new(),
@@ -305,12 +491,20 @@ impl HarnessTool for ShellTool {
     }
 
     fn description(&self) -> &str {
+        if self.exec_target.is_container() {
+            return "Execute a shell command inside the task container, in its working \
+                    directory. Returns stdout and stderr. Commands are run with bash -c. \
+                    Output capped at 1 MB. Default timeout is the container's per-call limit.";
+        }
         "Execute a shell command in the working directory. Returns stdout and stderr. \
-         Commands are run with bash -c. Timeout: 120 seconds. Output capped at 1 MB."
+         Commands are run with bash -c. Default timeout 120 seconds; pass timeout_secs for \
+         a longer run, up to 600 seconds, and use exec_command for anything longer. On a \
+         timeout the process is killed and the output printed so far is returned. \
+         Output capped at 1 MB."
     }
 
     fn parameters_json(&self) -> &str {
-        r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_secs":{"type":"integer","description":"Timeout in seconds (default 120)"}}}"#
+        r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout_secs":{"type":"integer","description":"Timeout in seconds (default 120, maximum 600; use exec_command for longer runs)"}}}"#
     }
 
     async fn execute(&self, args: serde_json::Value, working_dir: &Path) -> ToolResult {
@@ -321,6 +515,7 @@ impl HarnessTool for ShellTool {
             &cancel,
             MAX_OUTPUT_BYTES,
             EgressMode::default(),
+            std::sync::Arc::from([]),
         )
         .await
     }
@@ -337,6 +532,7 @@ impl HarnessTool for ShellTool {
             cancel,
             MAX_OUTPUT_BYTES,
             EgressMode::default(),
+            std::sync::Arc::from([]),
         )
         .await
     }
@@ -352,6 +548,7 @@ impl HarnessTool for ShellTool {
             &context.cancel,
             context.policy.max_output_bytes,
             context.policy.egress.mode,
+            context.policy.env_passthrough.clone(),
         )
         .await
     }
@@ -405,7 +602,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
         std::fs::write(dir.join("sentinel.txt"), "keep\n").unwrap();
         let head = git(dir, &["rev-parse", "HEAD"]);
-        let tool = ShellTool::default();
+        let tool = ShellTool::default().with_sandbox_base(dir);
         for (command, rule) in [
             ("echo ran > ran.txt && git stash", "hard rule 9"),
             ("git stash pop", "hard rule 9"),
@@ -469,6 +666,59 @@ mod tests {
         );
     }
 
+    /// #3165: the custody scan guards RSI worktrees only. A repository outside
+    /// the sandbox base (a benchmark task's own repository, a scratch repo) may
+    /// stash and reset; the same commands in a sandbox are refused.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_custody_scan_applies_only_inside_the_sandbox_base() {
+        use super::custody_guard::test_support::{git, repo};
+        let sandbox_base = tempfile::tempdir().unwrap();
+        let sandbox = sandbox_base.path().join("session");
+        std::fs::create_dir(&sandbox).unwrap();
+        let scratch = repo();
+        let dir = scratch.path();
+        let tool = ShellTool::default().with_sandbox_base(sandbox_base.path());
+
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let result = tool
+            .execute(serde_json::json!({"command": "git stash"}), dir)
+            .await;
+        assert!(result.success, "{:?} {}", result.error_msg, result.output);
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert!(git(dir, &["stash", "list"]).contains("WIP"));
+        let result = tool
+            .execute(serde_json::json!({"command": "git stash pop"}), dir)
+            .await;
+        assert!(result.success, "{:?} {}", result.error_msg, result.output);
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "git checkout -b recovery && git reset --hard HEAD"}),
+                dir,
+            )
+            .await;
+        assert!(result.success, "{:?} {}", result.error_msg, result.output);
+        assert_eq!(git(dir, &["branch", "--show-current"]).trim(), "recovery");
+
+        // The same commands from a directory inside the base are refused, and so
+        // is a command that names the base from outside it.
+        for (command, cwd) in [
+            ("git stash", sandbox.as_path()),
+            ("git reset --hard", sandbox.as_path()),
+            (&format!("git -C {} stash", sandbox.display()) as &str, dir),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"command": command}), cwd)
+                .await;
+            assert!(!result.success, "{command}");
+            let message = result.error_msg.unwrap_or_default();
+            assert!(
+                message.starts_with("custody_git_refused: "),
+                "{command}: {message}"
+            );
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn shell_still_runs_allowed_git_commands() {
@@ -516,12 +766,7 @@ mod tests {
     }
 
     fn launch_args(egress: EgressMode) -> Vec<String> {
-        let identity = ShellLaunchIdentity {
-            session_id: None,
-            invocation_id: None,
-            execution_scratch: None,
-            egress,
-        };
+        let identity = ShellLaunchIdentity::host(None, None, None, egress);
         scoped_shell_command("echo hi", Path::new("/tmp"), &identity)
             .unwrap()
             .as_std()
@@ -684,6 +929,8 @@ mod tests {
             session_id: None,
             invocation_id: None,
             execution_scratch: None,
+            exec_target: ExecTarget::Host,
+            sandbox_base: rsi_common::boundary_mail_hook::sandbox_base(),
         };
         let result = tool
             .execute(
@@ -694,6 +941,54 @@ mod tests {
         assert!(!result.success);
         let msg = result.error_msg.unwrap();
         assert!(msg.contains("timed out"), "unexpected msg: {msg}");
+    }
+
+    /// #3168: a model-requested `timeout_secs` above the old 120 s clamp is
+    /// kept up to 600; the default stays 120 and the schema says so.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn command_timeout_keeps_values_up_to_the_documented_maximum() {
+        let default = Duration::from_secs(120);
+        let secs = |value: serde_json::Value| command_timeout(&value, default).as_secs();
+        assert_eq!(secs(serde_json::json!({"timeout_secs": 300})), 300);
+        assert_eq!(secs(serde_json::json!({"timeout_secs": 600})), 600);
+        assert_eq!(secs(serde_json::json!({"timeout_secs": 601})), 600);
+        assert_eq!(secs(serde_json::json!({"timeout_secs": 0})), 1);
+        assert_eq!(secs(serde_json::json!({})), 120);
+        let tool = ShellTool::default();
+        assert!(tool.parameters_json().contains("maximum 600"));
+        assert!(tool.parameters_json().contains("exec_command"));
+        assert!(tool.description().contains("600"));
+        assert!(tool.description().contains("exec_command"));
+    }
+
+    /// #3168: a command that prints and then outlives its timeout is killed and
+    /// the model still sees what it printed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_timeout_returns_the_output_printed_before_it() {
+        let started = std::time::Instant::now();
+        let result = ShellTool::default()
+            .execute(
+                serde_json::json!({
+                    "command": "echo before-hang; echo err-before-hang >&2; sleep 30",
+                    "timeout_secs": 1,
+                }),
+                Path::new("/tmp"),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(
+            result.error_msg.as_deref(),
+            Some("Command timed out after 1s")
+        );
+        assert!(result.output.contains("before-hang"), "{}", result.output);
+        assert!(
+            result.output.contains("err-before-hang"),
+            "{}",
+            result.output
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -713,21 +1008,22 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
     #[tokio::test]
     async fn test_shell_env_scrubbing() {
-        // RSI_TEST_SECRET should not be visible to the subprocess
-        // SAFETY: Test runs sequentially; no concurrent thread reads this var.
-        unsafe { std::env::set_var("RSI_TEST_SECRET", "supersecret") };
+        // The daemon's variable must not be visible to the subprocess.
+        // SAFETY: the name is unique to this test (#190), so no concurrent
+        // test reads or writes it.
+        unsafe { std::env::set_var("RSI_SHELL_SCRUB_TEST_SECRET", "supersecret") };
         let tool = ShellTool::default();
         let result = tool
             .execute(
-                serde_json::json!({"command": "echo ${RSI_TEST_SECRET:-EMPTY}"}),
+                serde_json::json!({"command": "echo ${RSI_SHELL_SCRUB_TEST_SECRET:-EMPTY}"}),
                 Path::new("/tmp"),
             )
             .await;
         assert!(result.success, "{:?}", result.error_msg);
         // Since env is scrubbed, the var should be unset → output is EMPTY
         assert_eq!(result.output.trim(), "EMPTY");
-        // SAFETY: Test cleanup; no concurrent thread reads this var.
-        unsafe { std::env::remove_var("RSI_TEST_SECRET") };
+        // SAFETY: test cleanup; the name is unique to this test.
+        unsafe { std::env::remove_var("RSI_SHELL_SCRUB_TEST_SECRET") };
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -736,6 +1032,10 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         let invocation_id = uuid::Uuid::new_v4();
         let tool = ShellTool::new(Some(session_id), Some(invocation_id), None);
+        // #187: a directory this test owns. The process-global
+        // `CARGO_TARGET_DIR` (or `<crate>/target` when it is unset) is not
+        // guaranteed to exist, and another test of this process may change it.
+        let cwd = tempfile::tempdir().unwrap();
         let result = tool
             .execute(
                 serde_json::json!({
@@ -746,9 +1046,7 @@ mod tests {
                         rsi_common::identity::ENV_PROCESS_OWNERSHIP_NAMESPACE,
                     )
                 }),
-                &std::env::var_os("CARGO_TARGET_DIR")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join("target")),
+                cwd.path(),
             )
             .await;
 
@@ -789,5 +1087,140 @@ mod tests {
             .await;
         assert!(result.success, "{:?}", result.error_msg);
         assert_eq!(result.output, expected);
+    }
+    fn env_of(
+        pairs: &[(&str, &str)],
+        extra: &[&str],
+        tty: bool,
+    ) -> std::collections::BTreeMap<String, String> {
+        let extra: Vec<String> = extra.iter().map(|name| (*name).to_string()).collect();
+        host_command_env(&extra, tty, &|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .into_iter()
+        .collect()
+    }
+
+    /// #3169: every launch gets the non-interactive defaults, and `TERM` is
+    /// `dumb` on pipes.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn host_env_overlays_non_interactive_defaults() {
+        let env = env_of(&[("PATH", "/usr/bin"), ("TERM", "xterm-kitty")], &[], false);
+        for (name, value) in [
+            ("PAGER", "cat"),
+            ("GIT_PAGER", "cat"),
+            ("GH_PAGER", "cat"),
+            ("NO_COLOR", "1"),
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("TERM", "dumb"),
+        ] {
+            assert_eq!(env.get(name).map(String::as_str), Some(value), "{name}");
+        }
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+        // On a PTY the daemon's TERM is not forced to dumb.
+        let tty = env_of(&[("TERM", "xterm-256color")], &[], true);
+        assert_eq!(tty.get("TERM").map(String::as_str), Some("xterm-256color"));
+    }
+
+    /// An operator's own value wins over a default, and a name outside the
+    /// allowlist is dropped.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn host_env_keeps_set_values_and_drops_unlisted_names() {
+        let env = env_of(
+            &[
+                ("LANG", "en_US.UTF-8"),
+                ("JAVA_HOME", "/jdk"),
+                ("CC", "gcc"),
+            ],
+            &[],
+            false,
+        );
+        assert_eq!(env.get("LANG").map(String::as_str), Some("en_US.UTF-8"));
+        assert!(!env.contains_key("JAVA_HOME"));
+        assert!(!env.contains_key("CC"));
+    }
+
+    /// An extra allowlisted name passes; a credential-looking one never does,
+    /// nor does a daemon variable.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn host_env_extra_names_pass_but_credentials_never() {
+        let pairs = [
+            ("JAVA_HOME", "/jdk"),
+            ("HTTPS_PROXY", "http://proxy:3128"),
+            ("GITHUB_TOKEN", "t0ken"),
+            ("OPENROUTER_API_KEY", "k3y"),
+            ("DB_PASSWORD", "pw"),
+            ("CLIENT_SECRET", "s3cret"),
+            ("RSI_SESSION_TOKEN", "rsi"),
+        ];
+        let names = [
+            "JAVA_HOME",
+            "HTTPS_PROXY",
+            "GITHUB_TOKEN",
+            "OPENROUTER_API_KEY",
+            "DB_PASSWORD",
+            "CLIENT_SECRET",
+            "RSI_SESSION_TOKEN",
+        ];
+        let env = env_of(&pairs, &names, false);
+        assert_eq!(env.get("JAVA_HOME").map(String::as_str), Some("/jdk"));
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://proxy:3128")
+        );
+        for withheld in &names[2..] {
+            assert!(!env.contains_key(*withheld), "{withheld} leaked");
+        }
+    }
+
+    /// End to end through the real tool: the overlay reaches the command, and a
+    /// process variable outside the allowlist is dropped until the policy lists
+    /// it.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[tokio::test]
+    async fn shell_command_sees_the_overlay_and_the_policy_allowlist() {
+        // Scoped runners also launch compiled test binaries directly, without
+        // Cargo's runtime environment. Own the fixture instead (#593).
+        const LISTED: &str = "HARNESS_SHELL_POLICY_ALLOWLIST_TEST";
+        const EXPECTED: &str = "policy-listed-value";
+        temp_env::async_with_vars([(LISTED, Some(EXPECTED))], async {
+            assert!(!SAFE_ENV_VARS.contains(&LISTED));
+            let command = format!(
+                "printf '%s|%s|%s|%s|%s|%s' \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\" \
+             \"$NO_COLOR\" \"$TERM\" \"${{{LISTED}:-unset}}\""
+            );
+            let run = |env_passthrough: Vec<String>| {
+                let context = ToolContext {
+                    session_id: None,
+                    working_dir: Path::new("/tmp").to_path_buf(),
+                    cancel: CancellationToken::new(),
+                    event_sink: None,
+                    policy: super::super::ToolPolicy {
+                        env_passthrough: env_passthrough.into(),
+                        ..super::super::ToolPolicy::default()
+                    },
+                };
+                let args = serde_json::json!({ "command": command });
+                async move {
+                    ShellTool::default()
+                        .execute_with_context(args, &context)
+                        .await
+                }
+            };
+            let plain = run(Vec::new()).await;
+            assert!(plain.success, "{:?}", plain.error_msg);
+            assert_eq!(plain.output, "cat|cat|cat|1|dumb|unset");
+            let listed = run(vec![LISTED.into()]).await;
+            assert!(listed.success, "{:?}", listed.error_msg);
+            assert_eq!(listed.output, format!("cat|cat|cat|1|dumb|{EXPECTED}"));
+        })
+        .await;
     }
 }

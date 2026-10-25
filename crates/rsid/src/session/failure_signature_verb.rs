@@ -28,8 +28,7 @@ impl AgentControlHandle {
         request
             .validate()
             .map_err(|_| DaemonError::InvalidParam(FAILURE_SIGNATURE_QUERY_INVALID.into()))?;
-        let unavailable =
-            || DaemonError::InvalidParam(FAILURE_SIGNATURE_CALLER_UNAVAILABLE.into());
+        let unavailable = || DaemonError::InvalidParam(FAILURE_SIGNATURE_CALLER_UNAVAILABLE.into());
         let sources = {
             let store = self.store.lock().await;
             let session = store
@@ -61,7 +60,7 @@ mod tests {
 
     const TEXT: &str = "thread 'a::b' (1) panicked at crates/x.rs:1:1:\nboom 42\nnote: run with `RUST_BACKTRACE=1`";
 
-    type SharedStore = Arc<tokio::sync::Mutex<crate::store::Store>>;
+    type SharedStore = Arc<rsid_core::store_lock::Mutex<crate::store::Store>>;
 
     fn body(issue: u64) -> String {
         let record = serde_json::json!({
@@ -208,7 +207,10 @@ mod tests {
             .agent_query_failure_signatures(other_worker, query())
             .await
             .expect("foreign query");
-        assert!(foreign.records.is_empty(), "project {other_project} sees no records");
+        assert!(
+            foreign.records.is_empty(),
+            "project {other_project} sees no records"
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
@@ -225,6 +227,10 @@ mod tests {
             .agent_query_failure_signatures(Uuid::new_v4(), query())
             .await
             .unwrap_err();
-        assert!(stranger.to_string().contains(FAILURE_SIGNATURE_CALLER_UNAVAILABLE));
+        assert!(
+            stranger
+                .to_string()
+                .contains(FAILURE_SIGNATURE_CALLER_UNAVAILABLE)
+        );
     }
 }

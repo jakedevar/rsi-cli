@@ -107,7 +107,7 @@ async fn codegraph_custody_pages_keep_historical_reads_and_find_later_active_own
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(store));
     runtime.attach_registry(std::sync::Arc::clone(&store), Vec::new());
     // The registry task's first step registers the startup snapshot.
     tokio::time::timeout(std::time::Duration::from_secs(7), async {
@@ -289,7 +289,7 @@ async fn terminal_custody_keeps_snapshot_reads_and_resume_tools_before_starting(
     })
     .await
     .unwrap();
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(store));
     let changed = tempfile::tempdir().unwrap();
     std::fs::write(
         changed.path().join(".git"),
@@ -497,7 +497,9 @@ fn codegraph_workspace_cursor_covers_more_than_128_dormant_custodies() {
     let indexes = tempfile::tempdir().unwrap();
     std::fs::create_dir(repo.path().join(".git")).unwrap();
     let project_id = Uuid::new_v4();
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().unwrap(),
+    ));
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     {
         let guard = store.blocking_lock();
@@ -633,7 +635,9 @@ fn codegraph_full_custody_traversal_computes_constant_digests_under_unrelated_wr
     let indexes = tempfile::tempdir().unwrap();
     std::fs::create_dir(repo.path().join(".git")).unwrap();
     let project_id = Uuid::new_v4();
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().unwrap(),
+    ));
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     {
         let guard = store.blocking_lock();

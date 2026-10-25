@@ -37,6 +37,28 @@ export const UNDO_WINDOW_SECS = 60;
 export const TODO_REFRESH_MS = 5_000;
 
 /**
+ * Below this window width the panel is a drawer over the session pane, not a column (local #291). A 340 px sidebar, a 320 px
+ * panel and a 480 px conversation need 1140 px, so the column is kept from 1200 px up. static/layout.css carries the same number.
+ */
+export const TODO_DRAWER_MAX_WIDTH = 1199;
+export const TODO_DRAWER_QUERY = `(max-width: ${TODO_DRAWER_MAX_WIDTH}px)`;
+
+/** Whether the panel starts open at launch: the remembered choice, except a drawer window starts closed (local #291). */
+export function initialPanelOpen(remembered: unknown, drawer: boolean): boolean {
+  return remembered === true && !drawer;
+}
+
+/** What Escape does for the panel: in drawer mode, with the panel open and no dialog above it, it closes the panel. */
+export function drawerEscape(st: { drawer: boolean; open: boolean; dialogOpen: boolean; key: string }): 'close' | 'none' {
+  return st.key === 'Escape' && st.drawer && st.open && !st.dialogOpen ? 'close' : 'none';
+}
+
+/** Where focus goes when the drawer closes: back to where it was, when that is still on the page and not inside the drawer. */
+export function drawerReturnTarget<T>(saved: T | null, alive: (t: T) => boolean, insideDrawer: (t: T) => boolean): T | null {
+  return saved !== null && alive(saved) && !insideDrawer(saved) ? saved : null;
+}
+
+/**
  * Milliseconds of an RFC 3339 time. rsid writes nanoseconds; the fraction is
  * cut to milliseconds first because not every webview's Date.parse takes more.
  */

@@ -195,6 +195,21 @@ impl Store {
     /// relaunched Issue and an archived session release it, so nothing is
     /// retained indefinitely.
     pub fn automatic_reclaim_resume_hold(&self, session_id: Uuid) -> Result<Option<&'static str>> {
+        // #3908: a completed provider turn does not retire an Epic lead. It
+        // may be waiting for manager mail without a scheduled wake. Keep the
+        // checkout until the lead is explicitly replaced, unassigned or archived.
+        let live_lead: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions epic JOIN sessions lead
+               ON lead.id=epic.lead_session_id
+             WHERE lead.id=?1 AND epic.session_kind='Epic'
+               AND epic.status NOT IN ('Archived','Deleted')
+               AND lead.status NOT IN ('Archived','Deleted'))",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if live_lead {
+            return Ok(Some("live_epic_lead"));
+        }
         if self.manager_action_operator_paused(session_id)? {
             return Ok(Some("operator_paused"));
         }

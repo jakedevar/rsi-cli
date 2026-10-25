@@ -134,7 +134,11 @@ impl ManagerResourceLaunchOrigin {
             }
             Some(LaunchReservation::Appointment) => {
                 let appointment = store.launched_appointment_for_session(self.session_id)?;
-                if Some(appointment.launch_project_id) != self.project_id
+                // Hub #3315: a portfolio seat runs in the home project; its
+                // admission and charges stay on `launch_project_id`.
+                let home_seat = appointment.portfolio_target
+                    && self.project_id == Some(rsi_common::types::Project::HOME_ID);
+                if (Some(appointment.launch_project_id) != self.project_id && !home_seat)
                     || self.parent_id.is_some()
                     || self.kind != SessionKind::Standard
                 {

@@ -88,7 +88,7 @@ export const ISSUES_ACTIONS: readonly ActionSpec[] = [
 
 type Rule = (s: UiSnapshot) => string | null;
 
-const NEED_WORKSPACE = 'Open the Issues workspace first (<Space>i)';
+const NEED_WORKSPACE = 'Open the Issues workspace first (choose “Issues workspace” in Actions; <Space>i)';
 const inside = (more?: (i: IssuesSnapshot) => string | null): Rule => (s) => {
   const i = s.issues;
   if (!i?.active) return NEED_WORKSPACE;

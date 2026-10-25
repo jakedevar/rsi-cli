@@ -666,7 +666,7 @@ impl MemoryHandle {
 pub struct MemoryWorker {
     rx: mpsc::Receiver<MemoryCommand>,
     sync_engine: MemorySyncEngine,
-    main_store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    main_store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     watcher: Option<MemoryFileWatcher>,
     bus: Arc<EventBus>,
     runtime_config: Arc<RuntimeConfig>,
@@ -679,7 +679,7 @@ impl MemoryWorker {
     pub fn new(
         rx: mpsc::Receiver<MemoryCommand>,
         mut sync_engine: MemorySyncEngine,
-        main_store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        main_store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         watcher: Option<MemoryFileWatcher>,
         bus: Arc<EventBus>,
         runtime_config: Arc<RuntimeConfig>,
@@ -1078,7 +1078,7 @@ impl MemoryWorker {
         query: String,
         events: Vec<ConversationEvent>,
         store: Arc<std::sync::Mutex<MemoryStore>>,
-        main_store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        main_store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         config: MemoryConfig,
         embedding_provider: Arc<EmbeddingProviderResult>,
         bus: Arc<EventBus>,
@@ -1255,7 +1255,10 @@ impl MemoryWorker {
             project_id.as_ref().map(|u| u.to_string()).as_deref(),
             limit,
         )?;
-        Ok(rows
+        // Eval-session observations never reach a later session (#3325).
+        Ok(self
+            .sync_engine
+            .drop_eval_observation_rows(rows)
             .into_iter()
             .filter_map(observation_row_to_common)
             .collect())
@@ -1280,8 +1283,22 @@ impl MemoryWorker {
 
         // Fetch full observation data for each result
         let mut search_results = Vec::with_capacity(results.len());
+        let mut fetched = Vec::with_capacity(results.len());
         for (id, score) in results {
-            if let Ok(Some(row)) = store.get_observation(&id)
+            if let Ok(Some(row)) = store.get_observation(&id) {
+                fetched.push((row, score));
+            }
+        }
+        // Eval-session observations never reach a later session (#3325).
+        let (rows, scores): (Vec<_>, Vec<_>) = fetched.into_iter().unzip();
+        let kept: std::collections::HashSet<String> = self
+            .sync_engine
+            .drop_eval_observation_rows(rows.clone())
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        for (row, score) in rows.into_iter().zip(scores) {
+            if kept.contains(&row.id)
                 && let Some(obs) = observation_row_to_common(row)
             {
                 search_results.push(ObservationSearchResult {
@@ -1412,7 +1429,7 @@ pub fn spawn_memory_worker(
     config: MemoryConfig,
     memory_store: MemoryStore,
     main_db_path: PathBuf,
-    main_store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    main_store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     embedding_provider: Arc<EmbeddingProviderResult>,
     bus: Arc<EventBus>,
     memory_dir: PathBuf,
@@ -1469,7 +1486,7 @@ mod tests {
     ) -> (
         mpsc::Receiver<MemoryCommand>,
         MemorySyncEngine,
-        Arc<tokio::sync::Mutex<crate::store::Store>>,
+        Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         Arc<EventBus>,
         mpsc::Sender<MemoryCommand>,
     ) {
@@ -1480,7 +1497,7 @@ mod tests {
 
         let main_db = dir.path().join("flywheel.db");
         // Create the main store so it exists on disk
-        let main_store = Arc::new(tokio::sync::Mutex::new(
+        let main_store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_test_fixture(&main_db).unwrap(),
         ));
 
@@ -2217,7 +2234,7 @@ mod tests {
         let store = MemoryStore::open(&db_path).unwrap();
 
         let main_db = dir.path().join("flywheel.db");
-        let main_store = Arc::new(tokio::sync::Mutex::new(
+        let main_store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_test_fixture(&main_db).unwrap(),
         ));
 

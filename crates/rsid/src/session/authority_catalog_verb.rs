@@ -1,4 +1,4 @@
-//! `AgentGetAuthorityCatalog`: the agent's callable operator's manual.
+//! `AgentGetAuthorityCatalog`: the agent'XX callable operator's manual.
 //!
 //! Every RSI-managed session may call it. The caller is transport-bound (RPC
 //! token or native-tool registration); the answer is rendered from one durable
@@ -57,11 +57,12 @@ impl AgentControlHandle {
             catalog.guidance.push_str(&note);
         }
         if coordinator {
-            if let Some(budget) = self
-                .get_session(caller)
-                .await
-                .and_then(|s| self.seat_coordinator_budget(&s))
-            {
+            let seat = self.get_session(caller).await;
+            let budget = match seat {
+                Some(seat) => self.seat_coordinator_budget(&seat).await,
+                None => None,
+            };
+            if let Some(budget) = budget {
                 catalog
                     .guidance
                     .push_str("\n\nResolved coordinator budget: ");
@@ -185,7 +186,11 @@ mod tests {
     #[test]
     fn no_guidance_file_hard_codes_a_context_rotation_percentage_2558() {
         let root = Path::new(rsi_common::manifest_dir!()).join("../..");
-        let mut files = vec![root.join(".claude/commands/_shared/worker_preamble.md")];
+        let worker_contract = root.join("docs/agents/worker-contract.md");
+        let mut files = vec![
+            root.join(".claude/commands/_shared/worker_preamble.md"),
+            worker_contract.clone(),
+        ];
         for dir in [
             root.join("crates/rsid/src/session/guidance"),
             root.join(".claude/skills/rsi-portfolio-manager"),
@@ -209,9 +214,13 @@ mod tests {
         }
         let mut violations = Vec::new();
         for file in &files {
-            let Ok(text) = std::fs::read_to_string(file) else {
-                continue;
-            };
+            let text = std::fs::read_to_string(file)
+                .unwrap_or_else(|err| panic!("read guidance {}: {err}", file.display()));
+            if file == &worker_contract {
+                assert!(
+                    text.contains("`AgentGetAuthorityCatalog` serves `worker_context_cap_tokens`")
+                );
+            }
             for line in rotation_percentage_lines(&text) {
                 violations.push(format!("{}:{line}", file.display()));
             }

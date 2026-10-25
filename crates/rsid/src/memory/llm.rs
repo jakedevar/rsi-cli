@@ -1,5 +1,6 @@
 use crate::bus::EventBus;
 use crate::error::{DaemonError, Result};
+use crate::memory::helper_breaker;
 use crate::memory::worker::MemoryWorkContext;
 use crate::model_control::registry::RuntimeExecutionRoute;
 use crate::model_control::{
@@ -15,11 +16,10 @@ use crate::session::harness::provider::{ApiProvider, resolve_provider};
 use crate::session::harness::providers::openai_api::OpenAiApiProvider;
 use crate::session::harness::types::{ChatMessage, ChatRequest, ProviderQuirks};
 use crate::store::Store;
-use rsi_common::model_control::ModelUsageConfidence;
+use rsi_common::model_control::{ModelInvocationPurpose, ModelUsageConfidence};
 use rsi_common::types::SessionProvider;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -356,7 +356,7 @@ pub(crate) fn apply_estimated_usage(
 }
 
 pub async fn admit_and_generate_text(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     mut request: ModelAdmissionRequest,
     target: &MemoryLlmTarget,
@@ -374,11 +374,46 @@ pub async fn admit_and_generate_text(
     let dedup_key = request.dedup_key.clone();
     let helper_purpose = request.purpose.as_str();
 
-    let permit = match MemoryWorkContext::interruptible(admit_invocation(store, request, event_bus))
-        .await?
-    {
-        AdmissionDecision::Admitted(permit) => permit,
-        AdmissionDecision::Duplicate { invocation_id } => {
+    // #261: a local helper endpoint behind an open breaker is refused here,
+    // before any admission or model call.
+    helper_breaker::drain_friction(store).await;
+    let gate = local_helper_gate(&resolved, request.purpose);
+    let breaker = helper_breaker::HelperEndpointBreaker::global();
+    let breaker_admission = match &gate {
+        Some(gate) => match breaker.admit(&gate.endpoint, &gate.call, Instant::now()) {
+            helper_breaker::Admission::Reject { retry_in } => {
+                return Err(DaemonError::PolicyDenied(helper_breaker::refusal_message(
+                    &gate.endpoint,
+                    &gate.call,
+                    retry_in,
+                )));
+            }
+            admission => Some(admission),
+        },
+        None => None,
+    };
+    // A probe that never reaches the endpoint frees its slot.
+    let release_probe = || {
+        if let (Some(gate), Some(admission)) = (&gate, breaker_admission) {
+            breaker.record(
+                &gate.endpoint,
+                &gate.call,
+                admission,
+                helper_breaker::Outcome::Unknown,
+            );
+        }
+    };
+
+    let admitted =
+        MemoryWorkContext::interruptible(admit_invocation(store, request, event_bus)).await;
+    let permit = match admitted {
+        Err(error) => {
+            release_probe();
+            return Err(error);
+        }
+        Ok(AdmissionDecision::Admitted(permit)) => permit,
+        Ok(AdmissionDecision::Duplicate { invocation_id }) => {
+            release_probe();
             let duplicate_state = if let Some(key) = dedup_key.as_deref() {
                 MemoryWorkContext::interruptible(async {
                     let guard = store.lock().await;
@@ -417,14 +452,90 @@ pub async fn admit_and_generate_text(
         store, event_bus, &permit, execution, &cancel, purpose, &usage,
     )
     .await;
+    if let (Some(gate), Some(admission)) = (&gate, breaker_admission) {
+        let outcome = local_route_outcome(&result, &gate.endpoint).await;
+        breaker.record(&gate.endpoint, &gate.call, admission, outcome);
+        if outcome == helper_breaker::Outcome::Unreachable {
+            // The breaker owns this outage (one friction event, one health
+            // condition); the streak tracker must not report it hourly.
+            helper_breaker::drain_friction(store).await;
+            return result;
+        }
+    }
     note_helper_outcome(store, helper_purpose, &result).await;
     result
+}
+
+/// The breaker gate of a call on a loopback OpenAI-compatible endpoint.
+struct LocalHelperGate<'a> {
+    endpoint: String,
+    call: helper_breaker::HelperCall<'a>,
+}
+
+fn local_helper_gate(
+    resolved: &ResolvedMemoryLlmTarget,
+    purpose: ModelInvocationPurpose,
+) -> Option<LocalHelperGate<'_>> {
+    if resolved.api_route != Some(ApiRouteKind::Local) {
+        return None;
+    }
+    let endpoint = helper_breaker::loopback_endpoint_key(resolved.target.base_url.as_deref()?)?;
+    Some(LocalHelperGate {
+        endpoint,
+        call: helper_breaker::HelperCall {
+            purpose: purpose.as_str(),
+            setting_key: helper_setting_key(purpose),
+            model: &resolved.target.model,
+            gate: true,
+        },
+    })
+}
+
+/// The daemon setting that routes a helper purpose's admitted call.
+fn helper_setting_key(purpose: ModelInvocationPurpose) -> &'static str {
+    match purpose {
+        ModelInvocationPurpose::SessionSummary
+        | ModelInvocationPurpose::MemoryObservationExtract => "memory_model_fallback_provider",
+        ModelInvocationPurpose::SessionTitle => "title_model_provider",
+        ModelInvocationPurpose::PromptCompile => "prompt_compile_model_provider",
+        ModelInvocationPurpose::DreamConsolidation => "dream_model_provider",
+        _ => "helper_model_settings",
+    }
+}
+
+/// What a finished call on a loopback endpoint says about it. The HTTP client
+/// folds every send failure into `transport_error`, so a transport failure
+/// asks the port directly whether anything listens there.
+async fn local_route_outcome(result: &Result<String>, endpoint: &str) -> helper_breaker::Outcome {
+    use crate::session::harness::errors::{ProviderError, ProviderErrorExt};
+    use helper_breaker::Outcome;
+    let error = match result {
+        Ok(_) => return Outcome::Reachable,
+        Err(error) => error,
+    };
+    if matches!(error, DaemonError::OpenAiApiError(_)) {
+        return Outcome::Reachable;
+    }
+    let Some(provider_error) = ProviderError::from_daemon_error(error) else {
+        return Outcome::Unknown;
+    };
+    if provider_error.http_status.is_some() {
+        return Outcome::Reachable;
+    }
+    if provider_error.detail_code != "transport_error" {
+        return Outcome::Unknown;
+    }
+    if helper_breaker::listening(endpoint).await {
+        Outcome::Unknown
+    } else {
+        Outcome::Unreachable
+    }
 }
 
 /// Feed the failure tracker and, when a streak of one purpose is due, record
 /// its friction event. Cancellation and policy denials are not model failures.
 async fn note_helper_outcome(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     helper_purpose: &str,
     result: &Result<String>,
 ) {
@@ -459,7 +570,7 @@ async fn note_helper_outcome(
 
 #[cfg(test)]
 async fn settle_memory_execution<T>(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     permit: &AdmissionPermit,
     execution: impl std::future::Future<Output = Result<T>>,
@@ -479,7 +590,7 @@ async fn settle_memory_execution<T>(
 }
 
 async fn settle_memory_execution_with_usage<T>(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     permit: &AdmissionPermit,
     execution: impl std::future::Future<Output = Result<T>>,
@@ -1155,7 +1266,7 @@ mod tests {
     }
 
     async fn admitted_http_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         bus: &Arc<EventBus>,
         target: &MemoryLlmTarget,
         dedup_key: &str,
@@ -1197,7 +1308,9 @@ mod tests {
             base_url: Some(format!("{}/v1", server.uri())),
             api_key: None,
         };
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = admitted_http_permit(&store, &bus, &target, "openai-loopback").await;
 
@@ -1219,7 +1332,9 @@ mod tests {
             base_url: Some(format!("{}/v1", server.uri())),
             api_key: None,
         };
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let request = http_request(ModelInvocationPurpose::PromptCompile, &target, dedup_key);
         let reply = admit_and_generate_text(
@@ -1370,7 +1485,9 @@ mod tests {
             .mount(&server)
             .await;
         let target = local_gemma_target(&server);
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = admitted_http_permit(&store, &bus, &target, "local-effort-none").await;
 
@@ -1400,7 +1517,9 @@ mod tests {
             .mount(&server)
             .await;
         let target = local_gemma_target(&server);
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = admitted_http_permit(&store, &bus, &target, "local-reasoning-overrun").await;
 
@@ -1422,6 +1541,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: Default::default(),
             reasoning_content: Some("thinking".into()),
+            reasoning_details: None,
             stop_reason: Some("stop".into()),
         };
         assert_eq!(
@@ -1441,7 +1561,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn a_repeated_helper_failure_records_one_friction_event() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let purpose = "memory.test_streak_2603";
         let failure: Result<String> = Err(DaemonError::Store(format!(
             "openai returned empty content: {REASONING_BUDGET_CAUSE} (finish_reason length)"
@@ -1511,7 +1633,9 @@ mod tests {
             base_url: None,
             api_key: Some("test-key".to_string()),
         };
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
 
         let response =
@@ -1531,7 +1655,7 @@ mod tests {
         for mode in [ModelControlMode::DenyPaid, ModelControlMode::LocalOnly] {
             let store = Store::open_in_memory().expect("store");
             store.set_model_control_mode(mode).expect("control mode");
-            let store = Arc::new(Mutex::new(store));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
             let bus = Arc::new(EventBus::new(8));
             let request = http_request(
                 ModelInvocationPurpose::PromptCompile,
@@ -1598,7 +1722,9 @@ mod tests {
             .await
             .expect("bind local HTTP listener");
         let address = listener.local_addr().expect("listener address");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let session_id = Uuid::new_v4();
         let request = ModelAdmissionRequest {
@@ -1726,7 +1852,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn live_memory_off_llm_waits_for_cleanup_before_settlement() {
         use std::sync::atomic::Ordering;
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let bus = Arc::new(EventBus::new(16));
         let permit = match admit_invocation(
             &store,
@@ -1827,7 +1955,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-memory-01"))]
     #[tokio::test]
     async fn memory_cli_child_receives_exact_durable_invocation_stamp() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,
@@ -1873,7 +2003,9 @@ mod tests {
     async fn denied_cli_admission_never_spawns_the_local_stub() {
         let temp = TempDir::new().expect("tempdir");
         let marker = temp.path().join("spawned");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
 
         let result = async {
@@ -1914,7 +2046,9 @@ mod tests {
     async fn pre_cancelled_cli_never_spawns_the_local_stub() {
         let temp = TempDir::new().expect("tempdir");
         let marker = temp.path().join("spawned");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,
@@ -1955,7 +2089,9 @@ mod tests {
     async fn cancellation_drains_reaps_and_settles_cli_stub_once() {
         let temp = TempDir::new().expect("tempdir");
         let marker = temp.path().join("spawned");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let runtime = ModelControlRuntime::default_normal();
         let permit = match admit_invocation(
@@ -2061,7 +2197,9 @@ mod tests {
     async fn memory_cli_stderr_overflow_is_bounded_reaped_and_truthfully_settled() {
         let temp = TempDir::new().expect("tempdir");
         let marker = temp.path().join("spawned");
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(EventBus::new(8));
         let permit = match admit_invocation(
             &store,

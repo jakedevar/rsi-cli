@@ -25,7 +25,7 @@ export interface SettingsSnapshot {
 type Rule = (s: UiSnapshot) => string | null;
 
 const needPane = (more?: (p: SettingsSnapshot) => string | null): Rule => (s) => {
-  if (!s.settings?.open) return 'Open settings first (<Space>, or :set)';
+  if (!s.settings?.open) return 'Open settings first (click Settings in the top bar, or press Ctrl-,)';
   return more ? more(s.settings) : null;
 };
 
@@ -42,7 +42,7 @@ export const SETTINGS_RULES: Readonly<Record<SettingsActionId, Rule>> = {
 };
 
 export const SETTINGS_ACTIONS: readonly ActionSpec[] = [
-  { id: 'settings-open', title: 'Settings…', group: 'view', menuBreak: true, detail: 'Theme, workspace, models, safety, automation and host settings (the TUI settings page)' },
+  { id: 'settings-open', title: 'Settings…', group: 'view', menuBreak: true, extraKeys: ['Ctrl-,'], detail: 'Theme, workspace, models, safety, automation and host settings (the TUI settings page)' },
   { id: 'settings-hooks', title: 'Hook settings…', group: 'view', noMenu: true, detail: 'Settings at the Claude hooks list' },
   { id: 'settings-skills', title: 'Skill settings…', group: 'view', noMenu: true, detail: 'Settings at the Claude skills list' },
   { id: 'settings-apply', title: 'Apply pending settings', group: 'view', noMenu: true, detail: 'One daemon update with every staged value (w in the settings pane)' },

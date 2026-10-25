@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "latest_schema_version": 182,
+  "latest_schema_version": 190,
   "migration_dir": "crates/rsid-store/src/store/migrations",
   "blocks": {
     "0": "sha256:3e79edf6e3b6718c67bf3de92309ddd9cf97c1768cab75922a24d61405589ca5",
@@ -184,7 +184,15 @@
     "179": "sha256:0fc6630fceeacaacf9efd148e61936f6d558dacd8775c31813b5a7296fb69bf0",
     "180": "sha256:768499f1a6248e2f5681376b2b9bc39a5e3014606b6d3069060660f43b4b122a",
     "181": "sha256:0f1be96f90e03fcc220abe96b58c13c19bdd28057a940e72b0b06f4726bca2e7",
-    "182": "sha256:478edc1f58bf36815887e4813e21fd24aa5d092226060372d5947ce0d5c32e82"
+    "182": "sha256:478edc1f58bf36815887e4813e21fd24aa5d092226060372d5947ce0d5c32e82",
+    "183": "sha256:ac6ac4a2ec8d9f8ffc9367e7d4259472f3f9ec8c2e3dc62b6b867cce0d2150d5",
+    "184": "sha256:9c9730b375357f1004e0a5d8738d7bec18e47bbe27655f5bbb6ce93014e8e5f0",
+    "185": "sha256:6c034e9b991c74959ca8a6ffdb92bd7ea592435ebdce7de07aaa48410d192402",
+    "186": "sha256:da3cc37a47dfde47631642d739dea32c142b08b8a8c4089d33ecd71fab10cbe3",
+    "187": "sha256:ae472d9c03815e60fd7b09a2eb364cbc168e977e51c8ca09a735fc44c639e5f6",
+    "188": "sha256:9baa8539e8a7cb5919c55d3ae471f4b0940508f5b312dfefc799f3bbbb9966d4",
+    "189": "sha256:c21d98f3fa5cf04d517d996ab27172f9767c5e64b0ed665d1e39bd539acf6499",
+    "190": "sha256:3bff216cc17f0119309b76a5ada1a0021c355adb7b2f6e04bb618455b3c053df"
   },
   "protected_sections": {
     "v112-operator-views-convergence-driver": {

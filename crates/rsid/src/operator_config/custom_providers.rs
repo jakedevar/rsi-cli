@@ -21,7 +21,7 @@ use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
 use crate::vault::{VaultError, VaultHandle};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rsi_common::operator_config::{
     CustomProviderIdParams, CustomProviderKeyChange, CustomProviderRole, CustomProviderRouteResult,
     CustomProviderRouteView, CustomProviderSummary, DeleteCustomProviderResult,
@@ -29,33 +29,9 @@ use rsi_common::operator_config::{
     MAX_CUSTOM_PROVIDER_NAME_BYTES, MAX_CUSTOM_PROVIDER_URL_BYTES, MAX_CUSTOM_PROVIDERS,
     PutCustomProviderParams, SetCustomProviderRouteParams,
 };
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const CUSTOM_PROVIDER_SETTING_PREFIX: &str = "custom_provider.";
-pub const CUSTOM_PROVIDER_ROUTE_PREFIX: &str = "custom_provider_route.";
-
-/// The nonsecret row. There is deliberately no field that could hold a key.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct StoredCustomProvider {
-    pub(super) id: Uuid,
-    pub(super) name: String,
-    pub(super) base_url: String,
-    #[serde(default)]
-    pub(super) default_model: String,
-    pub(super) ordinal: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) deleted_at: Option<DateTime<Utc>>,
-}
-
-fn setting_key(id: Uuid) -> String {
-    format!("{CUSTOM_PROVIDER_SETTING_PREFIX}{}", id.as_hyphenated())
-}
-
-fn route_key(role: CustomProviderRole) -> String {
-    format!("{CUSTOM_PROVIDER_ROUTE_PREFIX}{}", role.as_str())
-}
+pub(super) use crate::store::operator_settings::StoredCustomProvider;
 
 fn vault_error(error: VaultError) -> DaemonError {
     match error {
@@ -106,33 +82,15 @@ pub(super) fn validate_base_url(value: &str) -> Result<String> {
     Ok(url)
 }
 
-fn parse_row(key: &str, raw: &str) -> Result<StoredCustomProvider> {
-    let row: StoredCustomProvider = serde_json::from_str(raw)
-        .map_err(|_| DaemonError::Store(format!("stored custom provider {key} is malformed")))?;
-    if setting_key(row.id) != key {
-        return Err(DaemonError::Store(format!(
-            "stored custom provider {key} has a mismatched id"
-        )));
-    }
-    Ok(row)
-}
-
 /// Every row, deleted ones included, in list order.
 pub(super) fn load_rows(store: &Store) -> Result<Vec<StoredCustomProvider>> {
-    let mut rows = Vec::new();
-    for (key, raw) in store.list_daemon_settings_with_prefix(CUSTOM_PROVIDER_SETTING_PREFIX)? {
-        rows.push(parse_row(&key, &raw)?);
-    }
+    let mut rows = store.list_custom_provider_records()?;
     rows.sort_by(|left, right| (left.ordinal, left.id).cmp(&(right.ordinal, right.id)));
     Ok(rows)
 }
 
 fn load_row(store: &Store, id: Uuid) -> Result<Option<StoredCustomProvider>> {
-    let key = setting_key(id);
-    store
-        .get_daemon_setting(&key)?
-        .map(|raw| parse_row(&key, &raw))
-        .transpose()
+    store.get_custom_provider_record(id)
 }
 
 fn load_live(store: &Store, id: Uuid) -> Result<StoredCustomProvider> {
@@ -142,9 +100,7 @@ fn load_live(store: &Store, id: Uuid) -> Result<StoredCustomProvider> {
 }
 
 pub(super) fn save_row(store: &Store, row: &StoredCustomProvider) -> Result<()> {
-    let raw = serde_json::to_string(row).map_err(DaemonError::from)?;
-    store.set_daemon_setting(&setting_key(row.id), &raw)?;
-    Ok(())
+    store.set_custom_provider_record(row)
 }
 
 fn summary(vault: &VaultHandle, row: StoredCustomProvider) -> CustomProviderSummary {
@@ -326,15 +282,11 @@ pub fn delete(
 }
 
 fn route_of(store: &Store, role: CustomProviderRole) -> Result<Option<Uuid>> {
-    Ok(store
-        .get_daemon_setting(&route_key(role))?
-        .and_then(|raw| Uuid::parse_str(raw.trim()).ok()))
+    store.get_custom_provider_route(role)
 }
 
 fn store_route(store: &Store, role: CustomProviderRole, id: Option<Uuid>) -> Result<()> {
-    let raw = id.map_or_else(|| "null".to_owned(), |id| id.as_hyphenated().to_string());
-    store.set_daemon_setting(&route_key(role), &raw)?;
-    Ok(())
+    store.set_custom_provider_route(role, id)
 }
 
 /// Write one role's base URL (persisted, like `UpdateDaemonConfig`) and its

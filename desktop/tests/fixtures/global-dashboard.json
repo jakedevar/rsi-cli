@@ -1,0 +1,277 @@
+{
+  "as_of": "2026-10-20T07:00:00.000000000Z",
+  "window": "24h",
+  "window_seconds": 86400,
+  "projects": [
+    {
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "name": "alpha",
+      "path": "/tmp/alpha",
+      "is_home": false,
+      "agents": {
+        "total": 5,
+        "managers": 1,
+        "leads": 1,
+        "workers": 2,
+        "reviewers": 1,
+        "other": 0,
+        "by_provider": [
+          {
+            "provider": "Codex",
+            "count": 2
+          },
+          {
+            "provider": "Claude",
+            "count": 3
+          }
+        ],
+        "by_model": [
+          {
+            "provider": "Claude",
+            "model": "opus",
+            "effort": "high",
+            "count": 3
+          },
+          {
+            "provider": "Codex",
+            "model": "gpt",
+            "effort": null,
+            "count": 2
+          }
+        ]
+      },
+      "pm_seat": {
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "status": "Running"
+      },
+      "usage": {
+        "invocations": 10,
+        "errors": 0,
+        "input_tokens": 1234567,
+        "output_tokens": 45600,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost_usd": 12.5
+      },
+      "usage_by_model": [
+        {
+          "provider": "Claude",
+          "model": "opus",
+          "usage": {
+            "invocations": 10,
+            "errors": 0,
+            "input_tokens": 1234567,
+            "output_tokens": 45600,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 12.5
+          }
+        }
+      ],
+      "issues": {
+        "open": 7,
+        "in_progress": 2,
+        "created_in_window": 4,
+        "closed_in_window": 3,
+        "open_operator_requests": 1
+      },
+      "landings": {
+        "published": 2,
+        "refused": 1
+      },
+      "rolling": {
+        "qa_green_sha": "abc",
+        "qa_green_age_secs": 7200,
+        "open_qa_issues": 0
+      }
+    },
+    {
+      "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      "name": "rsi",
+      "path": "/tmp/rsi",
+      "is_home": true,
+      "agents": {
+        "total": 1,
+        "managers": 1,
+        "leads": 0,
+        "workers": 0,
+        "reviewers": 0,
+        "other": 0,
+        "by_provider": [
+          {
+            "provider": "Claude",
+            "count": 1
+          }
+        ],
+        "by_model": [
+          {
+            "provider": "Claude",
+            "model": "opus",
+            "effort": "xhigh",
+            "count": 1
+          }
+        ]
+      },
+      "pm_seat": {
+        "session_id": "22222222-2222-4222-8222-222222222222",
+        "status": "WaitingApproval"
+      },
+      "usage": {
+        "invocations": 10,
+        "errors": 0,
+        "input_tokens": 900,
+        "output_tokens": 120,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost_usd": 3.2
+      },
+      "usage_by_model": [
+        {
+          "provider": "Claude",
+          "model": "opus",
+          "usage": {
+            "invocations": 10,
+            "errors": 0,
+            "input_tokens": 900,
+            "output_tokens": 120,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated_cost_usd": 3.2
+          }
+        }
+      ],
+      "issues": {
+        "open": 3,
+        "in_progress": 1,
+        "created_in_window": 2,
+        "closed_in_window": 5,
+        "open_operator_requests": 0
+      },
+      "landings": {
+        "published": 4,
+        "refused": 0
+      },
+      "rolling": {
+        "qa_green_sha": null,
+        "qa_green_age_secs": null,
+        "open_qa_issues": 2
+      }
+    },
+    {
+      "id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "name": "Zeta",
+      "path": null,
+      "is_home": false,
+      "agents": {
+        "total": 0,
+        "managers": 0,
+        "leads": 0,
+        "workers": 0,
+        "reviewers": 0,
+        "other": 0,
+        "by_provider": [],
+        "by_model": []
+      },
+      "pm_seat": null,
+      "usage": {
+        "invocations": 0,
+        "errors": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 0,
+        "estimated_cost_usd": 0
+      },
+      "usage_by_model": [],
+      "issues": {
+        "open": 0,
+        "in_progress": 0,
+        "created_in_window": 0,
+        "closed_in_window": 0,
+        "open_operator_requests": 0
+      },
+      "landings": {
+        "published": 0,
+        "refused": 0
+      },
+      "rolling": null
+    }
+  ],
+  "totals": {
+    "agents": {
+      "total": 7,
+      "managers": 2,
+      "leads": 1,
+      "workers": 2,
+      "reviewers": 1,
+      "other": 1,
+      "by_provider": [
+        {
+          "provider": "Claude",
+          "count": 4
+        },
+        {
+          "provider": "Codex",
+          "count": 2
+        },
+        {
+          "provider": "Local",
+          "count": 1
+        }
+      ],
+      "by_model": [
+        {
+          "provider": "Claude",
+          "model": "opus",
+          "effort": "high",
+          "count": 4
+        }
+      ]
+    },
+    "usage": {
+      "invocations": 10,
+      "errors": 0,
+      "input_tokens": 1235467,
+      "output_tokens": 45720,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "reasoning_tokens": 0,
+      "estimated_cost_usd": 15.7
+    },
+    "usage_by_model": [
+      {
+        "provider": "Claude",
+        "model": "opus",
+        "usage": {
+          "invocations": 10,
+          "errors": 0,
+          "input_tokens": 1235467,
+          "output_tokens": 45720,
+          "cache_read_tokens": 0,
+          "cache_creation_tokens": 0,
+          "reasoning_tokens": 0,
+          "estimated_cost_usd": 15.7
+        }
+      }
+    ],
+    "issues": {
+      "open": 10,
+      "in_progress": 3,
+      "created_in_window": 6,
+      "closed_in_window": 8,
+      "open_operator_requests": 1
+    },
+    "landings": {
+      "published": 6,
+      "refused": 1
+    },
+    "incomplete": false
+  },
+  "projects_incomplete": false,
+  "incomplete_reasons": []
+}

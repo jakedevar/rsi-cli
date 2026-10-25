@@ -502,6 +502,9 @@ pub struct AgentManagerInboxRequestV1 {
     pub request_id: Option<Uuid>,
     /// Include the manager seat's outbound sends for audits. A request_id or
     /// fields:"full" also includes them; routine reads return incoming mail.
+    /// #3363: a routine manager read returns each informational lead notice
+    /// once (read state carries across seat succession); these audit reads
+    /// replay the whole history. Requests awaiting a reply always stay.
     #[serde(default, skip_serializing_if = "is_false")]
     pub include_sent: bool,
     /// Independent cursor for notices; message paging remains unchanged.
@@ -748,6 +751,10 @@ pub struct HarnessManagerMessageV1 {
     pub replied: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub informational: bool,
+    /// Exact reply command for an unanswered request in the lead's inbox.
+    /// Informational mail carries no reply obligation or instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_instruction: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readdressed_from: Option<Uuid>,
     /// #656: the standing root request of a rollover successor, set on the
@@ -790,8 +797,12 @@ pub struct HarnessManagerNoticeV1 {
 
 /// Longest `reason` text a `state_summary` carries.
 const NOTICE_SUMMARY_REASON_CHARS: usize = 120;
-/// Longest `untrusted_text` excerpt a satellite-report `state_summary` carries (#326).
-const NOTICE_SUMMARY_UNTRUSTED_CHARS: usize = 240;
+/// Longest satellite-report `untrusted_text` a `state_summary` carries (#326).
+/// Equal to the bound `AgentReportToHub` accepts (#195): a summary drain settles
+/// the notice, so a shorter cut lost the end of every long report (the
+/// `scoped_test` verdict of an ENQUEUE) to the manager reading it.
+const NOTICE_SUMMARY_UNTRUSTED_CHARS: usize =
+    crate::satellite_dispatch::SATELLITE_REPORT_TEXT_MAX_BYTES;
 
 impl HarnessManagerNoticeV1 {
     /// Omit the repeated historical work-version list, retaining the notice's
@@ -882,21 +893,26 @@ impl HarnessManagerNoticeV1 {
             .collect()
     }
 
-    /// #326: a satellite report's kind, peer and a bounded, clearly untrusted
-    /// excerpt of its text, so a summary drain never needs SQL.
+    /// #326: a satellite report's kind, peer and its clearly untrusted text,
+    /// so a summary drain never needs SQL. #195: the whole text the satellite
+    /// accepted (at most `SATELLITE_REPORT_TEXT_MAX_BYTES`); only a stored
+    /// text above that bound, which the hub refuses to record, would be cut.
+    /// #237: a DEPLOY-READY also names its `binaries_dir` and whether it was
+    /// typed or read from a legacy satellite's text.
     fn satellite_report_parts(&self) -> Vec<String> {
-        let mut parts = self.scalar_parts(&["report_kind", "peer_label"]);
+        let mut parts = self.scalar_parts(&[
+            "report_kind",
+            "peer_label",
+            "binaries_dir",
+            "binaries_dir_source",
+        ]);
         let Some(text) = self.state["untrusted_text"].as_str() else {
             return parts;
         };
-        let excerpt: String = text.chars().take(NOTICE_SUMMARY_UNTRUSTED_CHARS).collect();
-        let ellipsis = if excerpt.len() < text.len() {
-            "..."
-        } else {
-            ""
-        };
+        let shown: String = text.chars().take(NOTICE_SUMMARY_UNTRUSTED_CHARS).collect();
+        let ellipsis = if shown.len() < text.len() { "..." } else { "" };
         parts.push("untrusted=true informational_only=true".to_owned());
-        parts.push(format!("untrusted_excerpt={excerpt:?}{ellipsis}"));
+        parts.push(format!("untrusted_text={shown:?}{ellipsis}"));
         parts
     }
 }
@@ -1221,16 +1237,42 @@ mod tests {
             .state_summary
             .expect("summary")
         };
-        let long = report("x".repeat(300));
-        assert!(long.starts_with("report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_excerpt=\""));
-        assert!(long.ends_with("\"..."));
-        assert!(long.contains(&"x".repeat(240)));
-        assert!(!long.contains(&"x".repeat(241)));
-        // Truncation is on a char boundary, not a byte offset.
-        assert!(report("é".repeat(300)).contains(&"é".repeat(240)));
+        // #195: the whole accepted text, up to the AgentReportToHub bound.
+        let max = crate::satellite_dispatch::SATELLITE_REPORT_TEXT_MAX_BYTES;
+        let whole = report("x".repeat(max));
+        assert_eq!(
+            whole,
+            format!(
+                "report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_text=\"{}\"",
+                "x".repeat(max)
+            )
+        );
+        // A stored text above the bound (never recorded) is cut and marked.
+        let over = report("x".repeat(max + 60));
+        assert!(over.ends_with("\"..."));
+        assert!(over.contains(&"x".repeat(max)));
+        assert!(!over.contains(&"x".repeat(max + 1)));
+        // The cut is on a char boundary, not a byte offset.
+        assert!(report("é".repeat(max + 1)).contains(&"é".repeat(max)));
         assert_eq!(
             report("ok".into()),
-            "report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_excerpt=\"ok\""
+            "report_kind=RESULT peer_label=mac-mini untrusted=true informational_only=true untrusted_text=\"ok\""
+        );
+        // #237: a DEPLOY-READY's directory and its source survive the drain.
+        let deploy_ready = notice_with(
+            "ledger_change",
+            json!({"record_kind":"satellite_report","report_kind":"DEPLOY-READY",
+                "peer_label":"mac-mini","untrusted":true,"untrusted_text":"DEPLOY READY",
+                "binaries_dir":"/home/u/.rsi/staging/bin-a","binaries_dir_source":"legacy_text"}),
+        )
+        .into_summary();
+        assert_eq!(
+            deploy_ready.state_summary.as_deref(),
+            Some(
+                "report_kind=DEPLOY-READY peer_label=mac-mini binaries_dir=/home/u/.rsi/staging/bin-a \
+                 binaries_dir_source=legacy_text untrusted=true informational_only=true \
+                 untrusted_text=\"DEPLOY READY\""
+            )
         );
         let qa = notice_with(
             "ledger_change",

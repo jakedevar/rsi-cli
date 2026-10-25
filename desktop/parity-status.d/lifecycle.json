@@ -16,6 +16,12 @@
       "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
       "note": ":pause soft downgrades the HARD pause of the open session to SOFT"
     },
+    "cmd:provider-clear-hold": {
+      "status": "missing",
+      "location": "",
+      "note": "Expose ClearProviderUsageHold for the selected session's provider after an account switch.",
+      "owner": ["#3636"]
+    },
     "key:<Space>gX": {
       "status": "done",
       "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
@@ -30,6 +36,12 @@
       "status": "done",
       "location": "src/actions/lifecycle-spec.ts, src/actions/lifecycle.ts, src/lifecycle-model.ts",
       "note": "downgrades the open session's HARD pause to SOFT (SetOperatorPause); refuses when it is not HARD"
+    },
+    "key:<Space>hu": {
+      "status": "missing",
+      "location": "",
+      "note": "Expose ClearProviderUsageHold for the selected session's provider after an account switch.",
+      "owner": ["#3636"]
     },
     "key:<Space>n": {
       "status": "done",

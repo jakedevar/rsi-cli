@@ -1,11 +1,11 @@
 use super::{ReadError, Result};
 use crate::store::Store;
+use rsid_core::store_lock::OwnedMutexGuard;
 use rusqlite::{Connection, ErrorCode};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::OwnedMutexGuard;
 
 const REMOTE_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const NORMAL_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -117,14 +117,13 @@ pub(super) fn with_store_budget_deadline<T>(
 ))]
 mod tests {
     use super::*;
-    use tokio::sync::Mutex;
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[tokio::test]
     async fn remote_store_budget_interrupts_vm_and_restores_shared_connection() {
         let store = Store::open_in_memory().unwrap();
         store.conn.busy_timeout(NORMAL_BUSY_TIMEOUT).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let guard = Arc::clone(&store).lock_owned().await;
         let answer = with_store_budget(guard, |conn| {
             conn.query_row("SELECT 7", [], |row| row.get::<_, i64>(0))

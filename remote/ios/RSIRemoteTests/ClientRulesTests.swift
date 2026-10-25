@@ -28,7 +28,11 @@ final class ClientRulesTests: XCTestCase {
         XCTAssertEqual(statusError(500, code: "malformed"), .server(status: 500, code: "malformed"))
         XCTAssertEqual(
             RemoteError.forbidden.message,
-            "This device is not allowed. Check Remote settings on the hub.")
+            "The hub refused this device (403). Check that this phone is allowed in the hub's Remote settings.")
+        XCTAssertEqual(RemoteError.busy.headline, "Hub busy")
+        XCTAssertEqual(RemoteError.daemonUnavailable.headline, "Hub restarting")
+        XCTAssertTrue(RemoteError.daemonUnavailable.message.contains("restarting"))
+        XCTAssertEqual(RemoteError.unreachable("timed out").headline, "Can't reach the hub")
     }
 
     func testTransportFailuresAreUnreachableNotServerErrors() {

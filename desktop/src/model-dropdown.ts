@@ -9,7 +9,9 @@ import {
   type DropdownState, type Hit, type ModelEntry, NEW_DROPDOWN, cycleProvider, dropdownKey, filterModels, orderProviders, queryLine,
 } from './model-dropdown-model.js';
 import { modelIds } from './nav-model.js';
-import { focusOwnsKey } from './modal-gate.js';
+import { focusOwnsKey, paneKeyName, tabIsNative } from './modal-gate.js';
+import { isVimKeysOn } from './vimkeys.js';
+import { syncListbox } from './listbox-a11y.js';
 
 export interface DropdownOpts {
   title: string;
@@ -59,7 +61,6 @@ export function openModelDropdown(o: DropdownOpts): HTMLDialogElement {
   const prov = el('div', 'md-provider');
   const query = el('div', 'md-query');
   const list = el('ul', 'pick-list');
-  list.setAttribute('role', 'listbox');
   const hint = el('div', 'pick-hint', o.fixed
     ? 'j/k move · / filter · 1-9 or Enter pick · Esc, q or m close'
     : 'j/k move · g/G ends · / filter · Tab/Shift-Tab provider · 1-9 or Enter pick · Esc or q close');
@@ -87,8 +88,8 @@ export function openModelDropdown(o: DropdownOpts): HTMLDialogElement {
     );
     query.textContent = queryLine(st, hits.length, entries.length);
     query.classList.toggle('typing', st.typing);
-    if (status) { list.replaceChildren(el('li', 'pick-empty', status)); return; }
-    if (hits.length === 0) { list.replaceChildren(el('li', 'pick-empty', entries.length ? 'No model matches' : 'No models discovered for this provider')); return; }
+    if (status) { list.replaceChildren(el('li', 'pick-empty', status)); syncListbox(list, dlg, { label: o.title }); return; }
+    if (hits.length === 0) { list.replaceChildren(el('li', 'pick-empty', entries.length ? 'No model matches' : 'No models discovered for this provider')); syncListbox(list, dlg, { label: o.title }); return; }
     list.replaceChildren(...hits.map((h, i) => {
       const li = el('li', `pick-item${i === st.sel ? ' sel' : ''}`);
       li.dataset.index = String(i);
@@ -109,6 +110,7 @@ export function openModelDropdown(o: DropdownOpts): HTMLDialogElement {
       return li;
     }));
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, dlg, { label: o.title });
   };
 
   const load = (p: string): void => {
@@ -143,7 +145,9 @@ export function openModelDropdown(o: DropdownOpts): HTMLDialogElement {
     if (ev.isComposing) return;
     // Ctrl-M closes the global picker from inside it (the TUI's toggle).
     if (ev.ctrlKey && !ev.metaKey && !ev.altKey && ev.key.toLowerCase() === 'm') { ev.preventDefault(); ev.stopPropagation(); dlg.close(); return; }
-    const r = dropdownKey(st, ev, hits.length, !!o.fixed);
+    // Vim keys off: Tab and Shift-Tab are the browser's focus order; F6 steps the provider instead.
+    if (tabIsNative(isVimKeysOn(), ev)) return;
+    const r = dropdownKey(st, { key: paneKeyName(ev), ctrlKey: ev.ctrlKey, metaKey: ev.metaKey, altKey: ev.altKey, shiftKey: ev.shiftKey }, hits.length, !!o.fixed);
     ev.preventDefault();
     ev.stopPropagation();
     st = r.st;

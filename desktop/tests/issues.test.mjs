@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-  ACTIONS, appMenuModel, contextMenuModel, keyHints, menuState, paletteEntries, rankPalette, unavailable,
+  ACTIONS, appMenuModel, menuItems, contextMenuModel, keyHints, menuState, paletteEntries, rankPalette, unavailable,
 } from '../dist/registry.js';
 import { COMMAND_BINDINGS, KEY_BINDINGS } from '../dist/keybindings.js';
 import { ISSUES_ACTIONS, ISSUES_RULES, isIssuesAction } from '../dist/actions/issues.js';
@@ -11,7 +11,7 @@ import {
   ISSUES_KEYS, applySavedView, canArchive, canEdit, canRestore, checkDraft, classifyFailure, copyText, createBody,
   defaultFilters, dependencyEdge, describeEvent, draftFromIssue, filterChips, findByNumber, idleKeys, listRequest, moveSelection,
   newWrite, nextSection, nextSort, numberJumpFilters, operatorOnly, parseIssueNumber, parsePriorities, parseProvenance,
-  parseStatuses, patchFrom, priorityLabel, readinessLabel, rebase, reconcileSelection, resolveIssuesKey, rowSummary,
+  parseStatuses, patchFrom, STATUS_CHOICES, statusesFromChecked, emptyIssuesText, retryBannerText, priorityLabel, readinessLabel, rebase, reconcileSelection, resolveIssuesKey, rowSummary,
   statusTargets, toggleOperatorOnly, writeBlock, writeBody, ISSUES_CHORD_MS,
 } from '../dist/issues-model.js';
 
@@ -48,7 +48,7 @@ test('every Issues action is registered, listed in the palette and the Issues me
   const menus = appMenuModel('other', s);
   const m = menus.find((x) => x.id === 'issues');
   assert.equal(m.text, 'Issues');
-  const inMenu = m.items.filter((n) => n.kind === 'item').map((n) => n.id);
+  const inMenu = menuItems(m.items).map((n) => n.id);
   for (const a of ISSUES_ACTIONS) assert.ok(inMenu.includes(`act:${a.id}`), `${a.id} in the menu`);
   assert.ok(menus.length <= 12 && m.items.length <= 64, 'within the Rust menu bounds');
   for (const a of ISSUES_ACTIONS) assert.ok(a.title.length <= 96 && !a.title.includes('&'));
@@ -351,4 +351,33 @@ test('the Rust backend registers every command the adapter calls', () => {
   const called = [...api.matchAll(/invoke<[^>]*(?:<[^>]*>)?[^>]*>\('([a-z_]+)'/g)].map((m) => m[1]);
   assert.ok(called.length >= 12, `found ${called.length} commands`);
   for (const c of called) assert.ok(lib.includes(`issues::${c},`), `${c} is registered`);
+});
+
+// ---------- plain wording (#213) ----------
+
+test('the empty list points at New Issue when no filter is set and keeps the filter text otherwise', () => {
+  assert.equal(emptyIssuesText(defaultFilters()), 'No Issues in this project yet. Click New Issue to add one.');
+  assert.equal(emptyIssuesText({ ...defaultFilters(), query: 'cache' }), 'No Issues match these filters.');
+  assert.equal(emptyIssuesText({ ...defaultFilters(), statuses: ['Closed'] }), 'No Issues match these filters.');
+});
+
+test('the Status filter is a checkbox group that maps to the exact serde enum strings', () => {
+  assert.deepEqual(STATUS_CHOICES.map((c) => c[1]), ['Open', 'In progress', 'Closed', 'Cancelled']);
+  assert.deepEqual(STATUS_CHOICES.map((c) => c[0]), ['Open', 'InProgress', 'Closed', 'Cancelled']);
+  assert.deepEqual(statusesFromChecked(['InProgress']), ['InProgress']);
+  assert.deepEqual(statusesFromChecked(['Cancelled', 'Open']), ['Open', 'Cancelled'], 'list order, exact enum strings');
+  assert.deepEqual(statusesFromChecked(['']), [], 'no boxes checked = the active ones');
+  assert.deepEqual(statusesFromChecked(['bogus']), []);
+  const src = readFileSync(here('../src/issues.ts'), 'utf8');
+  assert.match(src, /name: 'statuses', label: 'Status', kind: 'checks'/);
+  assert.doesNotMatch(src, /Open, InProgress, Closed, Cancelled; empty/);
+});
+
+test('the retry banner says saving may have failed and still replays the same key', () => {
+  assert.equal(retryBannerText('Issue created'), 'Saving “Issue created” may have failed. Try again (Ctrl-Enter)');
+  const w = newWrite('update', issue(), { patch: { title: 'X' } }, 'updated', () => 'k1');
+  assert.deepEqual(writeBody(w), writeBody(w), 'the retry replays the same idempotency key');
+  const src = readFileSync(here('../src/issues.ts'), 'utf8');
+  assert.match(src, /retryBannerText\(ws\.retry\.label, currentPlatform\(\)\)/);
+  assert.doesNotMatch(src, /identical request/);
 });

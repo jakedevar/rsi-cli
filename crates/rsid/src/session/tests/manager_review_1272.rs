@@ -82,6 +82,15 @@ async fn a_global_launch_obeys_the_granted_concurrency_cap_without_a_pm() {
 #[tokio::test]
 async fn a_global_launch_obeys_an_exhausted_granted_spend_cap() {
     let g = portfolio().await;
+    {
+        let store = g.p.manager.store.lock().await;
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
+        store
+            .set_daemon_setting("codex_billing_mode", "metered_api")
+            .unwrap();
+    }
     let p = &g.p;
     let mut policy = global_policy(p, ManagerOperatingModeV2::Execute);
     policy.max_spend_usd = Some(1.0);
@@ -118,9 +127,11 @@ async fn a_global_launch_obeys_an_exhausted_granted_spend_cap() {
 async fn a_global_cap_tighter_than_the_pm_cap_governs_both() {
     let g = portfolio().await;
     let p = &g.p;
-    // The running global seat is the one active session under A's Epic, so
-    // a global cap of one is full while the PM's cap of four is not.
+    // The global's own seat fills no slot of its cap (#235), so one real
+    // worker under A's Epic fills a global cap of one while the PM's cap of
+    // four is not full.
     assert_eq!(p.policy.max_active_sessions, 4);
+    live_leaf(p, Uuid::new_v4(), p.project, p.epic).await;
     let mut policy = global_policy(p, ManagerOperatingModeV2::Execute);
     policy.max_active_sessions = 1;
     let grant = regrant(&g, policy, "grant-tight").await;

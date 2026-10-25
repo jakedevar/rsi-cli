@@ -2,6 +2,7 @@ pub mod chunking;
 pub mod embedding;
 pub mod files;
 pub mod flush;
+pub(crate) mod helper_breaker;
 pub(crate) mod helper_failure;
 pub mod llm;
 pub mod manager;

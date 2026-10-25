@@ -102,9 +102,11 @@ test('positive state: the real client has no undocumented file, store or rsi-sta
   assert.ok(hits.length > 0 && hits.length <= readFacilities(desktop).reduce((n, f) => n + f.max, 0), 'every hit is a documented facility use');
 });
 
-test('the documented facilities are exactly the socket, the URL opener and the terminal PTY', () => {
+test('the documented facilities are exactly the socket, the URL opener, the terminal PTY, Start rsid and the folder chooser', () => {
   const fac = readFacilities(desktop);
-  assert.deepEqual([...new Set(fac.map((f) => f.file))].sort(), ['src-tauri/src/daemon.rs', 'src-tauri/src/nav.rs', 'src-tauri/src/pty.rs']);
+  // service.rs (local #232): asks launchd/systemd to start the installed rsid; it never runs rsid itself.
+  // Cargo.toml (local #271): tauri-plugin-dialog backs the Choose folder… button, called from Rust only; the webview is granted no dialog permission.
+  assert.deepEqual([...new Set(fac.map((f) => f.file))].sort(), ['src-tauri/Cargo.toml', 'src-tauri/src/daemon.rs', 'src-tauri/src/nav.rs', 'src-tauri/src/pty.rs', 'src-tauri/src/service.rs']);
   for (const f of fac) assert.ok(f.reason.length >= 20);
 });
 

@@ -46,6 +46,9 @@ pub enum LcAction {
     /// Clear the selected session's operator pause marker.
     ClearOperatorPause,
 
+    /// Clear plan-window telemetry for the selected session’s provider after an account switch.
+    ClearProviderUsageHold,
+
     /// Continue a completed/interrupted session with a follow-up query.
     ContinueSession(Option<String>),
 
@@ -193,6 +196,8 @@ pub enum LcAction {
     ColdRestoreSession,
     /// #2384: the cold-storage archive (`:cold-archive [status|run|move|verify|compact]`).
     ColdArchive(Option<String>),
+    /// #3789: the external harness-report import (`:external-reports [status|sync|filter]`).
+    ExternalReports(Option<String>),
 
     /// Open the sort order picker overlay.
     OpenSortPicker,
@@ -211,6 +216,8 @@ pub enum LcAction {
 
     /// Open the operator-only legacy-scratch adoption overlay (#1147).
     OpenLegacyScratch,
+    /// Local resource probe, host preference and operator preset editor.
+    OpenHostTuning,
 
     // --- Model Selection ---
     /// Toggle the model dropdown widget below the status bar (or prompt model badge).
@@ -243,6 +250,8 @@ pub enum LcAction {
 
     /// Delete a project by name.
     DeleteProjectByName(String),
+    /// `:intake <request>`: open the operator intake seat (#3787).
+    LaunchIntake(String),
 
     // --- Tab Operations ---
     /// Open the selected session in a new tab (detail view).
@@ -565,6 +574,8 @@ pub enum LcAction {
     /// #1213: open or focus the global manager workspace above all projects.
     OpenFleet,
     OpenGlobalManagerWorkspace,
+    /// #3317: open or refresh the RSI-wide metrics dashboard (`gd`).
+    OpenGlobalDashboard,
     /// #1122: `:manager restart [status|now|cancel]` for the operator's
     /// pending quiet-point restart.
     OperatorRestartCommand(String),
@@ -702,6 +713,21 @@ pub enum LcAction {
         hooks: rsi_common::claude_hooks::ClaudeHooks,
         edit: crate::claude_config::HookEdit,
     },
+    /// Load the daemon user's `~/.claude/skills` listing (`ListSkills`).
+    RefreshClaudeSkills,
+    /// Read one user skill's SKILL.md (`GetSkill`) and open the preview.
+    OpenSkillPreview {
+        name: String,
+    },
+    /// Enable or disable one user skill (`SetSkillEnabled`).
+    SetSkillEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// Move one user skill into the daemon's skill trash (`DeleteSkill`).
+    DeleteSkill {
+        name: String,
+    },
     /// Read a bridge config through the daemon and open its form.
     OpenMessageBridgeForm(crate::settings::MessageBridgeKind),
     /// Write a bridge config through the daemon (`PutMessageBridge`).
@@ -727,6 +753,7 @@ impl LcAction {
             LcAction::HardInterruptSession => "HardInterruptSession",
             LcAction::DowngradeOperatorPause => "DowngradeOperatorPause",
             LcAction::ClearOperatorPause => "ClearOperatorPause",
+            LcAction::ClearProviderUsageHold => "ClearProviderUsageHold",
             LcAction::ContinueSession(..) => "ContinueSession",
             LcAction::QuickContinue => "QuickContinue",
             LcAction::EnterSession => "EnterSession",
@@ -774,12 +801,14 @@ impl LcAction {
             LcAction::ReseatManager(..) => "ReseatManager",
             LcAction::ColdRestoreSession => "ColdRestoreSession",
             LcAction::ColdArchive(..) => "ColdArchive",
+            LcAction::ExternalReports(..) => "ExternalReports",
             LcAction::OpenSortPicker => "OpenSortPicker",
             LcAction::OpenDiagnostics => "OpenDiagnostics",
             LcAction::OpenRecursiveDagBrowser => "OpenRecursiveDagBrowser",
             LcAction::OpenMemorySearch => "OpenMemorySearch",
             LcAction::OpenSourceWorktreeSettlement => "OpenSourceWorktreeSettlement",
             LcAction::OpenLegacyScratch => "OpenLegacyScratch",
+            LcAction::OpenHostTuning => "OpenHostTuning",
             LcAction::ToggleModelDropdown => "ToggleModelDropdown",
             LcAction::SelectModel(..) => "SelectModel",
             LcAction::OpenThemePicker => "OpenThemePicker",
@@ -789,6 +818,7 @@ impl LcAction {
             LcAction::CreateProject { .. } => "CreateProject",
             LcAction::EditProjectByName(..) => "EditProjectByName",
             LcAction::DeleteProjectByName(..) => "DeleteProjectByName",
+            LcAction::LaunchIntake(..) => "LaunchIntake",
             LcAction::OpenSessionInNewTab => "OpenSessionInNewTab",
             LcAction::NextTab => "NextTab",
             LcAction::PrevTab => "PrevTab",
@@ -888,6 +918,7 @@ impl LcAction {
             LcAction::ManagerFrictionCommand(..) => "ManagerFrictionCommand",
             LcAction::OpenFleet => "OpenFleet",
             LcAction::OpenGlobalManagerWorkspace => "OpenGlobalManagerWorkspace",
+            LcAction::OpenGlobalDashboard => "OpenGlobalDashboard",
             LcAction::OperatorRestartCommand(..) => "OperatorRestartCommand",
             LcAction::RunEpicTopology => "RunEpicTopology",
             LcAction::JumpAttentionN(..) => "JumpAttentionN",
@@ -919,6 +950,10 @@ impl LcAction {
             Self::DeleteCustomProvider { .. } => "DeleteCustomProvider",
             Self::RefreshClaudeHooks => "RefreshClaudeHooks",
             Self::SaveClaudeHooks { .. } => "SaveClaudeHooks",
+            Self::RefreshClaudeSkills => "RefreshClaudeSkills",
+            Self::OpenSkillPreview { .. } => "OpenSkillPreview",
+            Self::SetSkillEnabled { .. } => "SetSkillEnabled",
+            Self::DeleteSkill { .. } => "DeleteSkill",
             Self::OpenMessageBridgeForm(..) => "OpenMessageBridgeForm",
             Self::PutMessageBridge { .. } => "PutMessageBridge",
         }
@@ -1055,6 +1090,7 @@ mod tests {
             LcAction::HardInterruptSession,
             LcAction::DowngradeOperatorPause,
             LcAction::ClearOperatorPause,
+            LcAction::ClearProviderUsageHold,
             LcAction::ContinueSession(None),
             LcAction::QuickContinue,
             LcAction::OpenQuestionModal,
@@ -1091,6 +1127,7 @@ mod tests {
             LcAction::ReseatManager(None),
             LcAction::ColdRestoreSession,
             LcAction::ColdArchive(None),
+            LcAction::ExternalReports(None),
             LcAction::OpenSortPicker,
             LcAction::OpenDiagnostics,
             LcAction::OpenRecursiveDagBrowser,
@@ -1107,6 +1144,7 @@ mod tests {
             },
             LcAction::EditProjectByName("x".into()),
             LcAction::DeleteProjectByName("x".into()),
+            LcAction::LaunchIntake("x".into()),
             LcAction::OpenSessionInNewTab,
             LcAction::NextTab,
             LcAction::PrevTab,
@@ -1241,6 +1279,7 @@ mod tests {
             LcAction::TodoUndo,
             LcAction::OpenSourceWorktreeSettlement,
             LcAction::OpenLegacyScratch,
+            LcAction::OpenHostTuning,
             LcAction::SyncTitleModelConfig,
             LcAction::OpenHarnessManager,
             LcAction::AppointHarnessManager,
@@ -1258,6 +1297,7 @@ mod tests {
             LcAction::ManagerFrictionCommand(String::new()),
             LcAction::OpenFleet,
             LcAction::OpenGlobalManagerWorkspace,
+            LcAction::OpenGlobalDashboard,
             LcAction::OperatorRestartCommand("status".into()),
             LcAction::JumpAttentionN(1),
             LcAction::OpenRecentFileN(1),
@@ -1330,6 +1370,17 @@ mod tests {
                     entry_index: 0,
                     hook_index: 0,
                 },
+            },
+            LcAction::RefreshClaudeSkills,
+            LcAction::OpenSkillPreview {
+                name: "demo".to_string(),
+            },
+            LcAction::SetSkillEnabled {
+                name: "demo".to_string(),
+                enabled: false,
+            },
+            LcAction::DeleteSkill {
+                name: "demo".to_string(),
             },
             LcAction::OpenMessageBridgeForm(crate::settings::MessageBridgeKind::Signal),
             LcAction::PutMessageBridge {

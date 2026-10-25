@@ -104,3 +104,40 @@ impl Store {
         }
     }
 }
+
+impl Store {
+    /// #86 (hub #3322): an index row that says `session_id`'s rows are in a
+    /// cold archive of `raw_bytes` bytes, at a path no archive is written to.
+    /// For a test of a reader's size bound, which is checked against the
+    /// index row before any archive is opened. The session must exist.
+    pub fn cold_index_row_for_test(&self, session_id: Uuid, raw_bytes: i64) -> ColdResult<()> {
+        let at = "2026-01-01T00:00:00.000000000Z";
+        let sql_error = |error: rusqlite::Error| ColdError::new("test_seam", error.to_string());
+        self.conn
+            .execute(
+                "INSERT INTO cold_archive_files(path, month, format_version, created_at, updated_at)
+                 VALUES (?1, '2026-01', 1, ?2, ?2)",
+                rusqlite::params![format!("/nonexistent/cold-{session_id}.sqlite"), at],
+            )
+            .map_err(sql_error)?;
+        let file_id = self.conn.last_insert_rowid();
+        self.conn
+            .execute(
+                "INSERT INTO cold_archive_sessions(session_id, state, generation, file_id,
+                     events_chunk_id, pre_event_count, pre_provenance_count,
+                     archived_event_count, archived_provenance_count, archived_content_len,
+                     events_sha256, raw_bytes, compressed_bytes, staged_at, archived_at,
+                     updated_at)
+                 VALUES (?1, 'cold', 1, ?2, 1, 1, 0, 1, 0, 1, ?3, ?4, ?4, ?5, ?5, ?5)",
+                rusqlite::params![
+                    session_id.to_string(),
+                    file_id,
+                    "0".repeat(64),
+                    raw_bytes,
+                    at
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(())
+    }
+}

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-  ACTIONS, appMenuModel, contextMenuModel, keyHints, paletteEntries, tooltipText, unavailable,
+  ACTIONS, appMenuModel, menuItems, contextMenuModel, keyHints, paletteEntries, tooltipText, unavailable,
 } from '../dist/registry.js';
 import { DETAIL_ACTIONS, DETAIL_COMMAND_BINDINGS, DETAIL_KEY_BINDINGS, DETAIL_RULES } from '../dist/actions/detail-spec.js';
 import { desktopKeymap } from '../dist/keybindings.js';
@@ -124,18 +124,18 @@ test('detail actions say why they are unavailable', () => {
 test('the menus and context menus offer the detail actions from the registry', () => {
   const s = snap({ cursor: true });
   const menus = appMenuModel('other', s);
-  const find = (id) => menus.flatMap((m) => m.items).find((n) => n.id === `act:${id}`);
-  const view = menus.find((m) => m.id === 'view').items.filter((n) => n.kind === 'item');
+  const find = (id) => menus.flatMap((m) => menuItems(m.items)).find((n) => n.id === `act:${id}`);
+  const view = menuItems(menus.find((m) => m.id === 'view').items);
   for (const id of ['fold-open', 'fold-close', 'fold-toggle', 'fold-close-all', 'fold-open-all', 'toggle-system', 'toggle-thinking']) {
     assert.ok(view.some((n) => n.id === `act:${id}`), `View > ${id}`);
   }
   assert.equal(find('toggle-system').checked, true);
   assert.equal(appMenuModel('other', snap({ hideSystem: true }))
-    .flatMap((m) => m.items).find((n) => n.id === 'act:toggle-system').checked, false);
-  const go = menus.find((m) => m.id === 'go').items.filter((n) => n.kind === 'item').map((n) => n.id);
+    .flatMap((m) => menuItems(m.items)).find((n) => n.id === 'act:toggle-system').checked, false);
+  const go = menuItems(menus.find((m) => m.id === 'go').items).map((n) => n.id);
   for (const id of ['event-next', 'event-prev', 'user-next', 'user-prev']) assert.ok(go.includes(`act:${id}`), id);
   assert.ok(!go.includes('act:scroll-up'), 'the scroll keys stay out of the menu bar');
-  const sess = menus.find((m) => m.id === 'session').items.filter((n) => n.kind === 'item').map((n) => n.id);
+  const sess = menuItems(menus.find((m) => m.id === 'session').items).map((n) => n.id);
   for (const id of ['rename-session', 'rate-session', 'switch-model', 'prompt-preview', 'yank']) assert.ok(sess.includes(`act:${id}`), id);
   const row = contextMenuModel('session-row', s).filter((n) => n.kind === 'item').map((n) => n.id);
   for (const id of ['rename-session', 'rate-session', 'switch-model', 'prompt-preview']) assert.ok(row.includes(`ctx:${id}`), id);

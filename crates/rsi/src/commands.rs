@@ -99,7 +99,7 @@ pub fn parse_command(input: &str) -> CommandResult {
         && descriptor.command_argument == crate::action_registry::CommandArgument::None
     {
         return CommandResult::Unhandled(
-            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
+            "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart|tune]"
                 .to_string(),
         );
     }
@@ -112,6 +112,7 @@ pub fn parse_command(input: &str) -> CommandResult {
                 | ActionId::OpenIssuesWorkspace
                 | ActionId::Fleet
                 | ActionId::GlobalManagerWorkspace
+                | ActionId::GlobalDashboard
         )
     {
         return CommandResult::Unhandled(trimmed.to_string());
@@ -133,6 +134,7 @@ pub fn parse_command(input: &str) -> CommandResult {
             CommandResult::LcAction(LcAction::DowngradeOperatorPause)
         }
         ActionId::ClearOperatorPause => CommandResult::LcAction(LcAction::ClearOperatorPause),
+        ActionId::ClearProviderUsageHold => CommandResult::LcAction(LcAction::ClearProviderUsageHold),
 
         // :delete / :del — delete selected session
         ActionId::DeleteSession => CommandResult::LcAction(LcAction::DeleteSession),
@@ -154,6 +156,11 @@ pub fn parse_command(input: &str) -> CommandResult {
         // :cold-archive [status|run|move|verify|compact] — the cold-storage archive
         ActionId::ColdArchive => {
             CommandResult::LcAction(LcAction::ColdArchive(args.map(str::to_string)))
+        }
+
+        // :external-reports [status|sync|filter] — external harness-report import (#3789)
+        ActionId::ExternalReports => {
+            CommandResult::LcAction(LcAction::ExternalReports(args.map(str::to_string)))
         }
 
         // :archives — switch to archive zone
@@ -232,6 +239,14 @@ pub fn parse_command(input: &str) -> CommandResult {
                 // No name given — ignore
                 CommandResult::Unhandled(trimmed.to_string())
             }
+        },
+
+        // :intake <request> — the small-model intake agent files it as an Issue (#3787)
+        ActionId::Intake => match args {
+            Some(request) if !request.trim().is_empty() => {
+                CommandResult::LcAction(LcAction::LaunchIntake(request.trim().to_string()))
+            }
+            _ => CommandResult::Unhandled(trimmed.to_string()),
         },
 
         // :set / :settings — open settings pane
@@ -337,6 +352,7 @@ pub fn parse_command(input: &str) -> CommandResult {
 
         ActionId::Manager => match args {
             None => CommandResult::LcAction(LcAction::OpenHarnessManager),
+            Some("tune") => CommandResult::LcAction(LcAction::OpenHostTuning),
             Some("tree") => CommandResult::LcAction(LcAction::ManagerNodeCommand("tree".into())),
             Some("node") => CommandResult::LcAction(LcAction::ManagerNodeCommand("list".into())),
             Some(command) if command.starts_with("node ") => CommandResult::LcAction(
@@ -376,7 +392,7 @@ pub fn parse_command(input: &str) -> CommandResult {
                 LcAction::OperatorRestartCommand(command[8..].trim().to_string()),
             ),
             Some(_) => CommandResult::Unhandled(
-                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
+                "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart|tune]"
                     .to_string(),
             ),
         },
@@ -386,6 +402,7 @@ pub fn parse_command(input: &str) -> CommandResult {
         ActionId::GlobalManagerWorkspace => {
             CommandResult::LcAction(LcAction::OpenGlobalManagerWorkspace)
         }
+        ActionId::GlobalDashboard => CommandResult::LcAction(LcAction::OpenGlobalDashboard),
         ActionId::ManagerGlobal => CommandResult::LcAction(LcAction::ManagerGlobalCommand(
             args.unwrap_or("show").to_string(),
         )),
@@ -527,7 +544,7 @@ mod tests {
                         | ActionId::TabNext
                         | ActionId::TabPrev
                 );
-                if is_vim || descriptor.id == ActionId::ProjectDelete {
+                if is_vim || matches!(descriptor.id, ActionId::ProjectDelete | ActionId::Intake) {
                     assert!(matches!(result, CommandResult::Unhandled(_)), "{alias}");
                 } else {
                     assert!(matches!(result, CommandResult::LcAction(_)), "{alias}");
@@ -567,6 +584,7 @@ mod tests {
             (" manager appoint ", LcAction::AppointHarnessManager),
             ("manager scope", LcAction::EditHarnessManagerScope),
             ("manager clear", LcAction::ClearHarnessManagerScope),
+            ("provider-clear-hold", LcAction::ClearProviderUsageHold),
             ("manager policy", LcAction::EditHarnessManagerPolicy),
             ("manager board", LcAction::OpenHarnessManagerBoard),
             ("manager decisions", LcAction::OpenHarnessManagerDecisions),
@@ -610,6 +628,7 @@ mod tests {
                 "manager friction 72",
                 LcAction::ManagerFrictionCommand("72".into()),
             ),
+            ("manager tune", LcAction::OpenHostTuning),
             (
                 "manager restart",
                 LcAction::OperatorRestartCommand("status".into()),
@@ -629,7 +648,7 @@ mod tests {
             assert_eq!(
                 parse_command(command),
                 CommandResult::Unhandled(
-                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart]"
+                    "Use :manager [appoint|scope|clear|policy|board|decisions|inbox|inspect|node|tree|global|portfolio|escalations|friction|restart|tune]"
                         .to_string()
                 )
             );
@@ -650,6 +669,8 @@ mod tests {
             ("gm", ActionId::GlobalManagerWorkspace),
             ("global-manager", ActionId::GlobalManagerWorkspace),
             ("manager workspace", ActionId::GlobalManagerWorkspace),
+            ("dashboard", ActionId::GlobalDashboard),
+            ("gd", ActionId::GlobalDashboard),
             ("manager global", ActionId::ManagerGlobal),
             ("manager global configure {}", ActionId::ManagerGlobal),
             ("manager global appoint Rsi", ActionId::ManagerGlobalAppoint),
@@ -674,6 +695,8 @@ mod tests {
         for (command, action) in [
             ("gm", LcAction::OpenGlobalManagerWorkspace),
             ("global-manager", LcAction::OpenGlobalManagerWorkspace),
+            ("dashboard", LcAction::OpenGlobalDashboard),
+            ("gd", LcAction::OpenGlobalDashboard),
             (
                 "manager global appoint",
                 LcAction::ManagerGlobalCommand("appoint".into()),

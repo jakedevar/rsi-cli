@@ -35,6 +35,8 @@ use crate::store::global_manager::GlobalProjectRow;
 use crate::store::manager_node_workspace::ProjectSpan;
 use crate::store::portfolio_nodes::delegation::{ChildAppointment, ChildTargetRef};
 
+const HOME_ID: Uuid = rsi_common::types::Project::HOME_ID;
+
 fn invalid(code: &'static str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
 }
@@ -134,6 +136,7 @@ impl AgentControlHandle {
                 break;
             };
             cursor = prior.continued_from;
+            let prior_cost = self.visible_session_cost(&prior).await;
             predecessors.push(SeatPredecessorV1 {
                 session_id: prior.id,
                 project_id: prior.project_id,
@@ -141,27 +144,54 @@ impl AgentControlHandle {
                 provider: prior.provider,
                 model: prior.model,
                 context_fill_pct: prior.context_fill_pct,
-                cost_usd: prior.cost_usd,
+                cost_usd: prior_cost,
+                launch_turn: Box::pin(self.seat_launch_turn(prior.id)).await,
                 updated_at: prior.updated_at,
             });
         }
         let succession_refusal = self.succession_refusal_of(session.id).await;
+        let session_cost = self.visible_session_cost(&session).await;
         Some(GlobalSeatSessionV1 {
             session_id: session.id,
             project_id: session.project_id,
             status: session.status,
             provider: session.provider,
             rotation_threshold_pct: self.seat_rotation_threshold_pct(&session),
-            coordinator_budget: self.seat_coordinator_budget(&session),
+            coordinator_budget: self.seat_coordinator_budget(&session).await,
             model: session.model,
             context_fill_pct: session.context_fill_pct,
-            cost_usd: session.cost_usd,
+            cost_usd: session_cost,
+            launch_turn: Box::pin(self.seat_launch_turn(session.id)).await,
             updated_at: session.updated_at,
             pending_question: session.pending_question.is_some(),
             succession_refusal,
             predecessors,
             predecessors_truncated: truncated,
         })
+    }
+
+    async fn visible_session_cost(&self, session: &rsi_common::types::Session) -> Option<f64> {
+        let store = self.store.lock().await;
+        store
+            .session_billing_mode(session)
+            .ok()
+            .filter(|mode| mode.is_metered())
+            .and(session.cost_usd)
+    }
+
+    /// #3386: the launch turn of a rotation successor, or `None` for a session
+    /// that was not one (or when the read fails: the seat view stays usable).
+    async fn seat_launch_turn(
+        &self,
+        id: Uuid,
+    ) -> Option<rsi_common::global_manager::SeatLaunchTurnV1> {
+        match self.store.lock().await.seat_launch_turn(id) {
+            Ok(turn) => turn,
+            Err(error) => {
+                tracing::warn!(session_id = %id, %error, "seat launch-turn read failed");
+                None
+            }
+        }
     }
 
     /// #2558: the rotation threshold a manager seat is held to, beside its
@@ -171,15 +201,23 @@ impl AgentControlHandle {
         super::context_cap::rotation_threshold_for(runtime, session, true).map(|t| t.pct)
     }
 
-    pub(super) fn seat_coordinator_budget(
+    pub(super) async fn seat_coordinator_budget(
         &self,
         session: &rsi_common::Session,
     ) -> Option<rsi_common::coordinator_budget::CoordinatorBudgetV1> {
-        Some(self.runtime_config.as_deref()?.resolved_coordinator_budget(
+        let mut budget = self.runtime_config.as_deref()?.resolved_coordinator_budget(
             session.provider,
             session.model.as_deref(),
             crate::provider_capabilities::resolved_context_budget_for_session(session),
-        ))
+        );
+        // Issue #4021: the seat's wake-turn rate against the operator's cap.
+        let store = self.store.lock().await;
+        budget.turn_budget = Some(crate::scheduler::turn_budget::snapshot(
+            &store,
+            session.id,
+            chrono::Utc::now(),
+        ));
+        Some(budget)
     }
 
     /// Operator settings projection. Enumerate only seat roots, then use the
@@ -212,7 +250,7 @@ impl AgentControlHandle {
         let mut budgets = Vec::new();
         for session_id in ids {
             if let Some(session) = self.get_session(session_id).await {
-                if let Some(budget) = self.seat_coordinator_budget(&session) {
+                if let Some(budget) = self.seat_coordinator_budget(&session).await {
                     budgets.push(rsi_common::coordinator_budget::CoordinatorSeatBudgetV1 {
                         session_id,
                         budget,
@@ -279,8 +317,9 @@ impl AgentControlHandle {
     async fn global_pm_seat(&self, id: Uuid, scope_version: i64) -> Option<GlobalPmSeatV1> {
         let session = self.get_session(id).await?;
         let rotation_threshold_pct = self.seat_rotation_threshold_pct(&session);
-        let coordinator_budget = self.seat_coordinator_budget(&session);
+        let coordinator_budget = self.seat_coordinator_budget(&session).await;
         let succession_refusal = self.succession_refusal_of(session.id).await;
+        let session_cost = self.visible_session_cost(&session).await;
         Some(GlobalPmSeatV1 {
             session_id: session.id,
             status: session.status,
@@ -290,7 +329,7 @@ impl AgentControlHandle {
             coordinator_budget,
             effort: session.effort,
             context_fill_pct: session.context_fill_pct,
-            cost_usd: session.cost_usd,
+            cost_usd: session_cost,
             updated_at: session.updated_at,
             scope_version,
             pending_question: session.pending_question.is_some(),
@@ -436,7 +475,7 @@ impl AgentControlHandle {
 /// The admission refusals, `global_manager_not_seat` after a re-grant, a
 /// launch error or a manager-store refusal.
 pub(crate) async fn appoint_child_with<F, Fut>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     caller: Uuid,
     request: &AgentManagerAppointChildRequestV1,
     launch: F,
@@ -503,7 +542,7 @@ where
 /// # Errors
 /// See [`appoint_child_with`].
 pub(crate) async fn global_appoint_manager_with<F, Fut>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     caller: Uuid,
     request: &AgentGlobalAppointManagerRequestV1,
     launch: F,
@@ -587,12 +626,14 @@ impl super::SessionManager {
         session_id: Uuid,
         appointment: Option<ChildAppointment>,
     ) -> Result<Uuid> {
-        let working_dir = self.resolve_project_working_dir(project_id).await?;
-        let config = child_launch_config(request, project_id, working_dir, session_id);
-        let publication = if matches!(
+        let config = self
+            .child_seat_launch_config(request, project_id, session_id)
+            .await?;
+        let portfolio = matches!(
             request.target,
             rsi_common::portfolio_delegation::AppointChildTargetV1::Portfolio { .. }
-        ) {
+        );
+        let publication = if portfolio {
             let appointment =
                 appointment.expect("portfolio launch carries its admitted appointment");
             Some(Box::new(super::types::PortfolioAppointmentLaunchContext {
@@ -605,6 +646,42 @@ impl super::SessionManager {
         };
         self.launch_global_appointment(config, session_id, publication)
             .await
+    }
+
+    /// The launch of a child seat appointed with `project_id` as its
+    /// admission project. Hub #3315: a portfolio seat (new child, replacement
+    /// or self-handoff) is launched in the built-in home project at `$HOME`
+    /// with no sandbox, never in a project of its coverage; `project_id` stays
+    /// its admission and charge project. A store without the home project (it
+    /// is registered at every daemon start) keeps the coverage project.
+    /// Project PM seats are unchanged (#169's sandbox rule).
+    pub(crate) async fn child_seat_launch_config(
+        &self,
+        request: &AgentManagerAppointChildRequestV1,
+        project_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<LaunchConfig> {
+        let portfolio = matches!(
+            request.target,
+            rsi_common::portfolio_delegation::AppointChildTargetV1::Portfolio { .. }
+        );
+        let launch_project = if portfolio && self.get_project(HOME_ID).await?.is_some() {
+            HOME_ID
+        } else {
+            project_id
+        };
+        let working_dir = self.resolve_project_working_dir(launch_project).await?;
+        // The home project is an explicit no-sandbox case: `$HOME` is itself a
+        // git repository, so it is never probed as a sandbox origin.
+        let root_admits_sandbox =
+            launch_project != HOME_ID && project_root_admits_sandbox(&working_dir).await;
+        Ok(child_launch_config(
+            request,
+            launch_project,
+            working_dir,
+            session_id,
+            root_admits_sandbox,
+        ))
     }
 }
 
@@ -620,25 +697,58 @@ pub(crate) fn global_manager_launch_config(
         request.project_id,
         working_dir,
         session_id,
+        // The launch-shape tests pin everything but the sandbox, which
+        // `manager_seat_sandbox` and its launch tests pin.
+        false,
     )
 }
 
+/// #169: whether a manager seat launched in `root` can get its own sandbox: the
+/// allocation predicate itself (`origin_admits_sandbox`, a git work tree), run
+/// off the async runtime because it starts a bounded `git` process.
+pub(crate) async fn project_root_admits_sandbox(root: &std::path::Path) -> bool {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::sandbox::git_worktree::origin_admits_sandbox(&root))
+        .await
+        .unwrap_or(false)
+}
+
+/// #169: the sandbox an appointed manager seat is launched with. A seat of a
+/// git-backed project always gets its own git-worktree sandbox, like every
+/// worker, so it submits jobs from its own tree and never writes the project's
+/// shared root (hard rule 2); a caller's `sandbox: false` does not opt a
+/// git-backed seat out. A seat of a non-git root gets none unless `true` is
+/// asked, which the allocation then refuses (no worktree can be made), as before.
+pub(crate) fn manager_seat_sandbox(
+    requested: Option<bool>,
+    root_admits_sandbox: bool,
+) -> Option<rsi_common::types::SandboxSpec> {
+    (root_admits_sandbox || requested == Some(true)).then_some(rsi_common::types::SandboxSpec {
+        kind: Some(rsi_common::types::SandboxKind::GitWorktree),
+        branch: None,
+    })
+}
+
 /// A child seat's launch: a Standard root session in `project_id` (the
-/// `:blank` launch shape) with the grant-checked provider, model and effort.
+/// `:blank` launch shape) with the grant-checked provider, model and effort,
+/// in its own sandbox when the project root admits one ([`manager_seat_sandbox`]);
+/// never in the home project (hub #3315).
 pub(crate) fn child_launch_config(
     request: &AgentManagerAppointChildRequestV1,
     project_id: Uuid,
     working_dir: std::path::PathBuf,
     session_id: Uuid,
+    root_admits_sandbox: bool,
 ) -> LaunchConfig {
     {
-        let sandbox = request
-            .sandbox
-            .unwrap_or(true)
-            .then_some(rsi_common::types::SandboxSpec {
-                kind: Some(rsi_common::types::SandboxKind::GitWorktree),
-                branch: None,
-            });
+        // Hub #3315: a home seat never gets a sandbox. `$HOME` is itself a git
+        // repository, so the #169 rule would otherwise give it a worktree of
+        // the operator's home repository; `sandbox: true` does not opt in.
+        let sandbox = if HOME_ID == project_id {
+            None
+        } else {
+            manager_seat_sandbox(request.sandbox, root_admits_sandbox)
+        };
         LaunchConfig {
             completion_gates: None,
             query: request.query.clone(),
@@ -691,6 +801,9 @@ pub(crate) fn child_launch_config(
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 }

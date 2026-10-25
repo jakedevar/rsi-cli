@@ -1,7 +1,8 @@
 //! Warm target pool lifecycle on the daemon side (#1882): garbage collection
 //! after each sandbox reclaim pass and the status the operator reads.
 //!
-//! The pool itself is `scripts/target-pool`; this module only schedules it and
+//! The pool itself is the Rust `target-pool` (`rsi-repo-guards`, reached through the
+//! `scripts/target-pool` shim); this module only schedules it and
 //! relays its report. A pool a seed is reading is never removed (the script's
 //! use lock), and a missing script is not an error. Each pass also collects a
 //! pool beyond the seed distance of the rolling tip (the script's `gc` default) and

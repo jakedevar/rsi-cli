@@ -177,10 +177,25 @@ pub fn create_scratch_dir_in(
     name: &str,
     kind: super::RootKind,
 ) -> io::Result<PathBuf> {
+    create_scratch_dir_for_in(registry_path, parent, name, kind, None)
+}
+
+/// [`create_scratch_dir_in`] naming the `source` worktree the directory is
+/// allocated for (#646): reclaim reads it to tell a target whose worktree is gone.
+///
+/// # Errors
+/// As [`create_scratch_dir`].
+pub(super) fn create_scratch_dir_for_in(
+    registry_path: &Path,
+    parent: &Path,
+    name: &str,
+    kind: super::RootKind,
+    source: Option<&Path>,
+) -> io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let dir = parent.join(name);
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    if let Err(error) = allocate(registry_path, &dir, kind, None) {
+    if let Err(error) = allocate(registry_path, &dir, kind, source) {
         let _ = std::fs::remove_dir(&dir);
         return Err(error);
     }

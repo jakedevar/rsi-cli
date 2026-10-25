@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 impl PersistenceHandle {
-    pub(super) fn new(store: Arc<tokio::sync::Mutex<Store>>) -> Self {
+    pub(super) fn new(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> Self {
         let (tx, rx) = mpsc::channel(super::types::PERSISTENCE_QUEUE_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let last_command_duration_ms = Arc::new(AtomicU64::new(0));
@@ -366,7 +366,7 @@ impl PersistenceHandle {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn compare_and_update_session_model(
         &self,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         expected_model: Option<String>,
         expected_context_window: Option<u64>,
@@ -397,7 +397,7 @@ impl PersistenceHandle {
     /// writes matters for the same reason.
     pub(super) async fn update_session_provider_handshake(
         &self,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         cli_version: Option<String>,
         capabilities: Vec<String>,
@@ -789,7 +789,7 @@ impl PersistenceHandle {
 }
 
 fn spawn_persistence_worker(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     mut rx: mpsc::Receiver<StoreCommand>,
     pending: Arc<AtomicUsize>,
     last_command_duration_ms: Arc<AtomicU64>,
@@ -1463,7 +1463,11 @@ fn spawn_persistence_worker(
                 let holder = crate::store_lock::contention_since(start);
                 tracing::warn!(
                     elapsed_ms,
-                    lock_holder = holder.map_or("none", |holder| holder.label),
+                    lock_holder = holder
+                        .map_or(crate::store_lock::Label::Explicit("none"), |holder| holder
+                            .label)
+                        .to_string()
+                        .as_str(),
                     lock_holder_held_ms = holder.map_or(0, |holder| holder.held_ms),
                     "persistence worker: slow command detected"
                 );
@@ -1488,7 +1492,10 @@ fn stamp_or_warn(
     }
 }
 
-pub(super) async fn run_store_op<F, T>(store: Arc<tokio::sync::Mutex<Store>>, op: F) -> Result<T>
+pub(super) async fn run_store_op<F, T>(
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
+    op: F,
+) -> Result<T>
 where
     F: FnOnce(&mut Store) -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -1501,7 +1508,7 @@ where
 }
 
 async fn run_c5_store_op<F, T>(
-    store: Arc<tokio::sync::Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     op: F,
 ) -> crate::store::daemon_settings::C5TransitionResult<T>
 where
@@ -1651,9 +1658,13 @@ mod tests {
         }
     }
 
-    async fn store_with_session() -> (Arc<tokio::sync::Mutex<Store>>, tempfile::TempDir, Session) {
+    async fn store_with_session() -> (
+        Arc<rsid_core::store_lock::Mutex<Store>>,
+        tempfile::TempDir,
+        Session,
+    ) {
         let dir = tempfile::tempdir().expect("create persistence test directory");
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open_test_fixture(&dir.path().join("rsi.db"))
                 .expect("open persistence test store"),
         ));
@@ -2120,7 +2131,7 @@ mod tests {
             .install_session_diagnostics_schema_for_test()
             .expect("install diagnostics schema");
 
-        let store = Arc::new(tokio::sync::Mutex::new(store));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let persistence = PersistenceHandle::new(Arc::clone(&store));
         persistence
             .record_session_diagnostic(

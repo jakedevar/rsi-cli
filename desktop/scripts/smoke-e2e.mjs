@@ -11,9 +11,10 @@
 // One interaction per section of the generated desktop/PARITY.md (E2E_SECTIONS), plus the Issue lifecycle and
 // the Vim-keys toggle. Each result records source, command, result, runner SHA and daemon SHA.
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { generate as generateParity } from './parity.mjs';
 import { createBridge, rpcCall } from './smoke-bridge.mjs';
 import { judgeEgress, sampleDirectConnections } from './smoke-egress.mjs';
 import { BUILD_COMMAND, findRsid, findSeeder, seedSynthetic, startIsolatedRsid } from './smoke-isolated.mjs';
@@ -281,7 +282,7 @@ export async function runIsolated(opts, { dist, chromeBin, sections, signal }) {
     });
     const refusals = bridgeLog.filter((e) => e.outcome === 'refused').map((r) => `${r.cmd}: ${r.reason}`);
     const forwardedWrites = [...new Set(bridgeLog.filter((e) => e.write && e.outcome === 'forwarded').map((e) => e.method))].sort();
-    const parity = paritySections(readFileSync(join(REPO, 'desktop', 'PARITY.md'), 'utf8'));
+    const parity = paritySections(generateParity({ root: REPO, sidecarDir: join(REPO, 'desktop', 'parity-status.d') }).text);
     const covered = new Set(sections.filter((s) => !s.extra).map((s) => s.section));
     const skips = results.flatMap((r) => [r, ...r.steps]).filter((r) => r.evidence?.skipped).map((r) => ({ id: r.id, reason: r.evidence.skipped }));
     const report = {

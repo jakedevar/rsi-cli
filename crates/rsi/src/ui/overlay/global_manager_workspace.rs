@@ -26,7 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Padding, Paragraph, Wrap};
 use uuid::Uuid;
 
-fn safe(value: &str) -> String {
+pub(super) fn safe(value: &str) -> String {
     value.chars().filter(|ch| !ch.is_control()).collect()
 }
 
@@ -692,6 +692,145 @@ fn render_form(frame: &mut Frame, area: Rect, form: &LaunchForm) {
     render_lines(frame, area, lines, selected.map(|line| line + 4));
 }
 
+/// The same draft fills the console for appointment and existing-grant edits.
+fn render_coverage(
+    frame: &mut Frame,
+    area: Rect,
+    form: &crate::overlay::manager_coverage::CoverageForm,
+) {
+    if area.height < 10 || area.width < 30 {
+        frame.render_widget(
+            Paragraph::new("Resize to at least 30 x 10. Esc cancels."),
+            area,
+        );
+        return;
+    }
+    let width = usize::from(area.width);
+    let policy = form.editor.policy();
+    let heading = vec![
+        Line::from(Span::styled(
+            "Manager coverage & permissions",
+            Style::default()
+                .fg(theme::accent())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "{}/5 {} · nothing saved",
+            form.step + 1,
+            crate::overlay::manager_coverage::STEPS[form.step]
+        )),
+        Line::from(format!(
+            "{} · {} permissions · groups {}",
+            form.editor.preset().label().replace(" project control", ""),
+            policy.capabilities.len(),
+            if policy.allow_create_groups {
+                "ON"
+            } else {
+                "OFF"
+            }
+        )),
+        Line::from(if form.step == 0 {
+            format!(
+                "/ Search: {}{}",
+                safe(&form.query),
+                if form.searching { "▏" } else { "" }
+            )
+        } else {
+            "Tab next · Shift-Tab back · r Review".into()
+        }),
+    ];
+    frame.render_widget(
+        Paragraph::new(heading),
+        Rect::new(area.x, area.y, area.width, 4),
+    );
+    let hints = if form.searching {
+        "Type search · Enter done · Esc done"
+    } else if form.step == 4 {
+        if form.launch.is_some() {
+            "y Launch and appoint · Esc edit"
+        } else {
+            "y Save permissions · Esc edit"
+        }
+    } else {
+        "j/k move · Space toggle · h/l change"
+    };
+    let mut footer = vec![
+        "Live budget: unknown · b Budget chain".to_string(),
+        hints.into(),
+    ];
+    if !form.searching && form.step < 4 {
+        footer.push("Enter next · Esc cancel".into());
+    }
+    if form.step < 4 {
+        if let Some(error) = &form.error {
+            footer.insert(0, safe(error));
+        }
+    }
+    let footer: Vec<Line> = footer
+        .iter()
+        .flat_map(|text| wrap_words(text, width))
+        .map(Line::from)
+        .collect();
+    let footer_height = u16::try_from(footer.len())
+        .unwrap_or(4)
+        .min(area.height.saturating_sub(6));
+    let body_height = usize::from(area.height.saturating_sub(5 + footer_height));
+    let rows = form.rows();
+    let mut lines = Vec::new();
+    let mut selected_line = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if index == form.selected {
+            selected_line = lines.len();
+        }
+        let marker = if index == form.selected { "> " } else { "  " };
+        for (part, text) in wrap_words(&safe(row), width.saturating_sub(2).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            lines.push(Line::from(Span::styled(
+                format!("{}{text}", if part == 0 { marker } else { "  " }),
+                Style::default().fg(if index == form.selected {
+                    theme::text()
+                } else {
+                    theme::subtext0()
+                }),
+            )));
+        }
+    }
+    let offset = selected_line
+        .saturating_sub(body_height / 2)
+        .min(lines.len().saturating_sub(body_height));
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Rows {}-{} / {}",
+            form.selected + usize::from(!rows.is_empty()),
+            (form.selected + body_height).min(rows.len()),
+            rows.len()
+        ))
+        .style(Style::default().fg(theme::dim_metadata())),
+        Rect::new(area.x, area.y + 4, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(body_height)
+                .collect::<Vec<_>>(),
+        ),
+        Rect::new(area.x, area.y + 5, area.width, body_height as u16),
+    );
+    frame.render_widget(
+        Paragraph::new(footer),
+        Rect::new(
+            area.x,
+            area.y + area.height - footer_height,
+            area.width,
+            footer_height,
+        ),
+    );
+}
+
 /// What the detail half shows for the selected seat.
 enum Detail {
     Form,
@@ -786,7 +925,7 @@ fn detail(app: &App, state: &GlobalManagerWorkspaceState) -> Detail {
 }
 
 /// Rows `lines` take when word-wrapped (as rendered) at `width`.
-fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
+pub(super) fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
     let rows = Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
         .line_count(width.max(1));
@@ -795,7 +934,7 @@ fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
 
 /// A signal band: the accent rail down its left edge, `lines` beside it on the
 /// selected-row band (the session list's selected-signal panel).
-fn render_band(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
+pub(super) fn render_band(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     if area.height == 0 || area.width < 3 {
         return;
     }
@@ -854,6 +993,7 @@ fn hint_segments(state: &GlobalManagerWorkspaceState) -> &'static [&'static str]
             "i type",
             "t talk",
             "n new manager",
+            "e coverage & permissions",
             "b budget",
             "s status",
             "x halt",
@@ -871,7 +1011,11 @@ fn hint_segments(state: &GlobalManagerWorkspaceState) -> &'static [&'static str]
 /// The last row: as many key hints as fit, always ending on `? keys` /
 /// `Esc` so the way out and the help stay visible.
 fn footer_line(state: &GlobalManagerWorkspaceState, width: u16) -> Line<'static> {
-    let segments = hint_segments(state);
+    hint_footer(hint_segments(state), width)
+}
+
+/// `segments` as the footer row: keys bright, text dim.
+pub(super) fn hint_footer(segments: &[&str], width: u16) -> Line<'static> {
     let tail = segments.len().saturating_sub(2);
     let mut chosen: Vec<&str> = Vec::new();
     // The closing segments (help and the way out) are always kept, so their
@@ -944,6 +1088,12 @@ pub(super) fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         && let Some(panel) = &state.budget
     {
         crate::ui::overlay::gm_budget::render(frame, inner, state, panel);
+        return;
+    }
+    if let OverlayState::GlobalManagerWorkspace(state) = &app.overlay
+        && let Some(form) = &state.coverage
+    {
+        render_coverage(frame, inner, form);
         return;
     }
     let (areas, detail, focus) = {
@@ -1333,6 +1483,7 @@ mod tests {
                 last_attempt: None,
                 focus: self.focus,
                 launch: self.launch.clone(),
+                coverage: self.coverage.clone(),
                 target: self.target,
                 node: self.node.clone(),
                 budget: None,
@@ -1838,5 +1989,72 @@ mod tests {
             let text = screen(&mut app, 80, 30);
             std::fs::write(dir.join(format!("{name}-80x30.txt")), text + "\n").unwrap();
         }
+    }
+    fn coverage_state(f: &Fixture, step: usize) -> GlobalManagerWorkspaceState {
+        let grant = rich(f).grant.unwrap();
+        let request =
+            crate::overlay::global_manager_command::grant_addition_request(&grant, &[]).unwrap();
+        let mut form = crate::overlay::manager_coverage::CoverageForm::new(
+            request,
+            &[f.a.clone(), f.b.clone()],
+        );
+        form.new_defaults();
+        form.step = step;
+        let mut state = loaded(rich(f));
+        state.coverage = Some(form);
+        state
+    }
+
+    #[test]
+    fn coverage_form_render_snapshots_keep_steps_groups_and_budget_visible() {
+        let f = fixture();
+        for (width, height) in [(96, 28), (72, 24), (48, 24)] {
+            let mut app = app_with(&f, coverage_state(&f, 1));
+            let text = screen(&mut app, width, height);
+            for needle in [
+                "Manager coverage & permissions",
+                "2/5 Permissions",
+                "groups ON",
+                "[x] Create project groups",
+                "Budget chain",
+                "Enter next",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "{width}x{height}: {needle} in\n{text}"
+                );
+            }
+            if let OverlayState::GlobalManagerWorkspace(state) = &mut app.overlay {
+                let form = state.coverage.as_mut().unwrap();
+                form.selected = form.rows().len() - 1;
+            }
+            let text = screen(&mut app, width, height);
+            assert!(
+                text.contains("Request daemon deployment"),
+                "selected final permission:\n{text}"
+            );
+            assert!(text.contains("Budget chain"), "pinned budget:\n{text}");
+        }
+    }
+
+    #[test]
+    fn coverage_review_scrolls_with_confirmation_and_budget_pinned() {
+        let f = fixture();
+        let mut state = coverage_state(&f, 4);
+        let form = state.coverage.as_mut().unwrap();
+        form.selected = form.rows().len() - 1;
+        let mut app = app_with(&f, state);
+        let text = screen(&mut app, 48, 24);
+        for needle in [
+            "5/5 Review",
+            "y Save permissions",
+            "Esc edit",
+            "Budget chain",
+            "Advanced policy fields",
+        ] {
+            assert!(text.contains(needle), "{needle} in\n{text}");
+        }
+        let text = screen(&mut app, 28, 8);
+        assert!(text.contains("Resize"), "{text}");
     }
 }

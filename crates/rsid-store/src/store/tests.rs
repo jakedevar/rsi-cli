@@ -2034,7 +2034,9 @@ async fn issue_writer_d04_link_issue_operator_cas_replay_changed_conflict_and_at
     use rsi_common::types::IssueSourceFindingRef;
 
     let project_id = d04_test_project_id();
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().unwrap(),
+    ));
     let handle =
         IdeaControlHandle::for_operator(std::sync::Arc::clone(&store), project_id, "d04-operator")
             .unwrap();
@@ -7658,7 +7660,7 @@ async fn h1_v83_transfer_first_revalidates_successor_and_reclaims_original_root_
         "stale reclaim must preserve target"
     );
 
-    let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
     let (service, worker) = CustodySettlementService::new(Arc::clone(&store)).unwrap();
     let handle = {
         let mut store = store.lock().await;
@@ -7718,7 +7720,7 @@ async fn effect_release_waits_for_a_held_stripe_without_pinning_the_store() {
     use std::sync::Arc;
 
     let fixture = h1_v83_real_custody_fixture(SessionStatus::Completed, "effect-release-stripe");
-    let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
     let (service, worker) = CustodySettlementService::new(Arc::clone(&store)).unwrap();
     let handle = {
         let mut store = store.lock().await;
@@ -7777,7 +7779,7 @@ async fn h1_v83_effect_first_fences_reclaim_until_settlement() {
     use std::sync::Arc;
 
     let fixture = h1_v83_real_custody_fixture(SessionStatus::Completed, "effect-first");
-    let store = Arc::new(tokio::sync::Mutex::new(fixture.store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
     let (service, worker) = CustodySettlementService::new(Arc::clone(&store)).unwrap();
     let handle = {
         let mut store = store.lock().await;
@@ -7839,7 +7841,7 @@ async fn h1_v83_effect_first_fences_reclaim_until_settlement() {
 /// #1157: effect admission against a custody stripe held by an unrelated proof.
 struct AdmissionStripeFixture {
     _fixture_dir: tempfile::TempDir,
-    store: std::sync::Arc<tokio::sync::Mutex<Store>>,
+    store: std::sync::Arc<rsid_core::store_lock::Mutex<Store>>,
     service: crate::sandbox::custody::CustodySettlementService,
     _worker: crate::sandbox::custody::CustodySettlementWorker,
     session: Session,
@@ -7852,7 +7854,7 @@ struct AdmissionStripeFixture {
 impl AdmissionStripeFixture {
     fn new(label: &str) -> Self {
         let fixture = h1_v83_real_custody_fixture(SessionStatus::Completed, label);
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(fixture.store));
+        let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(fixture.store));
         let (service, worker) =
             crate::sandbox::custody::CustodySettlementService::new(std::sync::Arc::clone(&store))
                 .unwrap();
@@ -8167,12 +8169,12 @@ async fn h1_v83_effect_permits_settle_drop_abort_failures_and_backpressure() {
             }),
         )
         .unwrap();
-    let store = Arc::new(tokio::sync::Mutex::new(initial));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(initial));
     let (service, worker) = CustodySettlementService::new(Arc::clone(&store)).unwrap();
     let boot = Uuid::new_v4();
 
     async fn admit(
-        store: &Arc<tokio::sync::Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         service: &CustodySettlementService,
         session: &Session,
         sandbox_base: &std::path::Path,
@@ -8366,7 +8368,7 @@ async fn h1_v83_settlement_shutdown_seals_waits_for_permit_and_drains() {
             }),
         )
         .unwrap();
-    let store = Arc::new(tokio::sync::Mutex::new(initial));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(initial));
     let (service, worker) = CustodySettlementService::new(Arc::clone(&store)).unwrap();
     let boot = Uuid::new_v4();
     let handle = {
@@ -24269,7 +24271,9 @@ fn agent_list_issues_desc_order_pages_with_cursor_and_filters_title() {
 #[test]
 #[allow(clippy::unwrap_used)]
 fn agent_list_issues_title_search_returns_summary_rows_by_default() {
-    use rsi_common::rpc::{AgentListIssuesRequestV1, IssueListFieldsV1};
+    use rsi_common::rpc::{
+        AgentListIssuesRequestV1, AgentUpdateIssueStatusRequestV1, IssueListFieldsV1,
+    };
     let (store, lead, project) = issue_v97_authority_fixture();
     let created = store
         .create_issue(&NewIssue {
@@ -24302,6 +24306,7 @@ fn agent_list_issues_title_search_returns_summary_rows_by_default() {
         };
         let row = &page.issues[0];
         assert_eq!(row.id, created.id);
+        assert_eq!(row.row_version, created.row_version);
         assert_eq!(row.display_number, created.display_number);
         assert_eq!(row.title, "rotation dedupe target");
         assert_eq!(row.updated_at, created.updated_at);
@@ -24312,6 +24317,32 @@ fn agent_list_issues_title_search_returns_summary_rows_by_default() {
     ] {
         let page = page.into_full().expect("full rows keep bodies");
         assert_eq!(page.issues[0].body, "SECRET-BODY-TEXT");
+    }
+
+    // #539: use the serialized summary directly for a single CAS close,
+    // without a full AgentGetIssue read or a stale-version probe.
+    let summary = serde_json::to_value(list(Some("rotation"), None)).unwrap();
+    let row = &summary["issues"][0];
+    assert_eq!(row["row_version"], serde_json::json!(created.row_version));
+    let request: AgentUpdateIssueStatusRequestV1 = serde_json::from_value(serde_json::json!({
+        "display_number": row["display_number"],
+        "expected_row_version": row["row_version"],
+        "status": "Closed",
+        "idempotency_key": "summary-row-version-close",
+    }))
+    .unwrap();
+    store.agent_update_issue_status(lead, &request).unwrap();
+    for page in [
+        list(Some("rotation"), None),
+        list(None, Some(IssueListFieldsV1::Summary)),
+    ] {
+        let rsi_common::types::AgentIssuePageV1::Summary(page) = page else {
+            panic!("expected summary rows after close");
+        };
+        let row = &page.issues[0];
+        assert_eq!(row.id, created.id);
+        assert_eq!(row.status, IssueStatus::Closed);
+        assert_eq!(row.row_version, created.row_version + 1);
     }
 }
 
@@ -32156,7 +32187,7 @@ mod d02_idea_event_cas_tests {
     use super::*;
 
     struct D02KernelFixture {
-        store: std::sync::Arc<tokio::sync::Mutex<Store>>,
+        store: std::sync::Arc<rsid_core::store_lock::Mutex<Store>>,
         handle: IdeaControlHandle,
         project: Project,
     }
@@ -32223,7 +32254,7 @@ mod d02_idea_event_cas_tests {
     }
 
     async fn d02_fixture() -> D02KernelFixture {
-        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+        let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open_in_memory().expect("open D02 store"),
         ));
         let project = make_test_project("D02 project");
@@ -32276,7 +32307,7 @@ mod d02_idea_event_cas_tests {
         }
     }
 
-    impl D02StoreAccess for tokio::sync::MutexGuard<'_, Store> {
+    impl D02StoreAccess for rsid_core::store_lock::LabeledGuard<'_, Store> {
         fn d02_store(&self) -> &Store {
             self
         }
@@ -33350,7 +33381,7 @@ mod d02_idea_event_cas_tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let initial_store = Arc::new(tokio::sync::Mutex::new(store));
+        let initial_store = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let initial_handle =
             IdeaControlHandle::for_operator(Arc::clone(&initial_store), project.id, "operator")?;
         let created = runtime.block_on(
@@ -33360,12 +33391,12 @@ mod d02_idea_event_cas_tests {
         drop(initial_store);
 
         let first_handle = IdeaControlHandle::for_operator(
-            Arc::new(tokio::sync::Mutex::new(Store::open(&path)?)),
+            Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&path)?)),
             project.id,
             "operator",
         )?;
         let second_handle = IdeaControlHandle::for_operator(
-            Arc::new(tokio::sync::Mutex::new(Store::open(&path)?)),
+            Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&path)?)),
             project.id,
             "operator",
         )?;
@@ -33634,8 +33665,9 @@ mod d02_idea_event_cas_tests {
             std::fs::read(&rollback_path)?
         );
 
-        let working_store =
-            std::sync::Arc::new(tokio::sync::Mutex::new(Store::open(&working_path)?));
+        let working_store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(Store::open(
+            &working_path,
+        )?));
         let handle = IdeaControlHandle::for_operator(
             std::sync::Arc::clone(&working_store),
             project.id,
@@ -33664,7 +33696,9 @@ mod d02_idea_event_cas_tests {
         }
         drop(handle);
         drop(working_store);
-        let reopened = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open(&working_path)?));
+        let reopened = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(Store::open(
+            &working_path,
+        )?));
         let reopened_handle = IdeaControlHandle::for_operator(
             std::sync::Arc::clone(&reopened),
             project.id,
@@ -33739,7 +33773,7 @@ mod d03_controller_store_tests {
     };
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::sync::{Mutex, RwLock};
+    use tokio::sync::RwLock;
 
     struct FixedClock(chrono::DateTime<chrono::Utc>);
 
@@ -33749,13 +33783,15 @@ mod d03_controller_store_tests {
         }
     }
 
-    async fn d03_fixture() -> (Arc<Mutex<Store>>, Project, Idea) {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("open D03 store")));
+    async fn d03_fixture() -> (Arc<rsid_core::store_lock::Mutex<Store>>, Project, Idea) {
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("open D03 store"),
+        ));
         let (project, idea) = seed_d03_fixture(Arc::clone(&store)).await;
         (store, project, idea)
     }
 
-    async fn seed_d03_fixture(store: Arc<Mutex<Store>>) -> (Project, Idea) {
+    async fn seed_d03_fixture(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> (Project, Idea) {
         let project = make_test_project("D03 project");
         store
             .lock()
@@ -33805,7 +33841,10 @@ mod d03_controller_store_tests {
         (project, created.idea)
     }
 
-    async fn d03_transfer(store: &Arc<Mutex<Store>>, idea: &Idea) -> IdeaControllerTransferHandle {
+    async fn d03_transfer(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        idea: &Idea,
+    ) -> IdeaControllerTransferHandle {
         IdeaControllerTransferHandle::for_system(
             Arc::clone(store),
             idea.project_id,
@@ -33817,7 +33856,7 @@ mod d03_controller_store_tests {
     }
 
     async fn d03_transfer_at(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         idea: &Idea,
         now: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<IdeaControllerTransferHandle> {
@@ -34844,11 +34883,11 @@ mod d03_controller_store_tests {
     async fn d03_controller_store_file_backed_wal_reserve_race_and_assign_replay() {
         let temp = tempfile::tempdir().expect("D03 WAL tempdir");
         let db_path = temp.path().join("d03-controller-race.db");
-        let first_store = Arc::new(Mutex::new(
+        let first_store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open(&db_path).expect("open first D03 WAL"),
         ));
         let (project, idea) = seed_d03_fixture(Arc::clone(&first_store)).await;
-        let second_store = Arc::new(Mutex::new(
+        let second_store = Arc::new(rsid_core::store_lock::Mutex::new(
             Store::open(&db_path).expect("open second D03 WAL"),
         ));
         let first = d03_transfer(&first_store, &idea).await;
@@ -35309,7 +35348,7 @@ mod d03_controller_store_tests {
     }
 
     async fn publish_rotation_for_test(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         predecessor: Uuid,
         successor: Uuid,
         rotation_id: &str,
@@ -35694,9 +35733,9 @@ mod d03_controller_store_tests {
     -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let db_path = temp.path().join("d03-cancellation-race.db");
-        let assign_store = Arc::new(Mutex::new(Store::open(&db_path)?));
+        let assign_store = Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&db_path)?));
         let (project, idea) = seed_d03_fixture(Arc::clone(&assign_store)).await;
-        let release_store = Arc::new(Mutex::new(Store::open(&db_path)?));
+        let release_store = Arc::new(rsid_core::store_lock::Mutex::new(Store::open(&db_path)?));
         let reserving = d03_transfer(&assign_store, &idea).await;
         let reserved = reserving
             .reserve(&ReserveIdeaControllerRequestV1 {
@@ -36511,7 +36550,9 @@ fn v100_historical_zero_context_window_is_readable_but_never_resolved() {
 /// rewind, so adding a migration without teaching the fixtures how to undo it
 /// fails the migration-chain tests immediately, with a message naming the fix —
 /// instead of silently suppressing chain coverage the way issue #26 did.
-const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 182;
+const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 190;
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+pub(crate) const SESSION_START_PREAMBLE_SCHEMA_VERSION: i32 = 189;
 const FLEET_INDEX_SCHEMA_VERSION: i32 = 153;
 const FLEET_INDEX_NAMES: [&str; 3] = [
     "idx_fleet_invocations_created",
@@ -36717,6 +36758,83 @@ pub(crate) fn rewind_post_v121_tail_to(connection: &Connection, target: i32) {
         target <= active,
         "cannot rewind forward from V{active} to V{target}"
     );
+    if active >= 190 && target < 190 {
+        connection
+            .execute_batch(
+                "DROP INDEX satellite_enqueue_intakes_open;
+                 DROP TABLE satellite_enqueue_intakes;",
+            )
+            .expect("rewind satellite enqueue intakes");
+        connection
+            .pragma_update(None, "user_version", 190 - 1)
+            .unwrap();
+    }
+    if active >= 189 && target < 189 {
+        connection
+            .execute_batch("DROP TABLE session_start_preambles;")
+            .expect("rewind session preamble debt");
+        connection
+            .pragma_update(None, "user_version", 189 - 1)
+            .unwrap();
+    }
+    if active >= 188 && target < 188 {
+        // #149: back to V187 (drop the settlement unproven survivors).
+        connection
+            .execute_batch(
+                "DROP TABLE source_worktree_settlement_unproven_survivors;
+                 PRAGMA user_version=187;",
+            )
+            .expect("rewind settlement unproven survivors");
+    }
+    if active >= 187 && target < 187 {
+        // #3181: back below the bench job migration. The widened `agent_jobs` kind CHECK stays (the
+        // bench step rebuilds the table, so a re-run is harmless), like V159.
+        connection
+            .pragma_update(None, "user_version", 187 - 1)
+            .expect("restore version before #3181");
+    }
+    if active >= 186 && target < 186 {
+        // #3178: back to V185 (drop the bench run store; its triggers go with it).
+        connection
+            .execute_batch(
+                "DROP TABLE bench_tasks;
+                 DROP TABLE bench_runs;",
+            )
+            .expect("rewind bench run store");
+        connection
+            .pragma_update(None, "user_version", 186 - 1)
+            .unwrap();
+    }
+    if active >= 185 && target < 185 {
+        let tx = connection.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "DROP INDEX rolling_queue_live_issue;
+             ALTER TABLE rolling_queue_entries DROP COLUMN issue;",
+        )
+        .unwrap();
+        tx.pragma_update(None, "user_version", 185 - 1).unwrap();
+        tx.commit().unwrap();
+    }
+    if active >= 184 && target < 184 {
+        connection
+            .execute_batch(
+                "DROP TRIGGER harness_manager_retired_appointments_insert;
+                 DROP TABLE harness_manager_retired_appointments;",
+            )
+            .expect("rewind retired appointment projection");
+        connection
+            .pragma_update(None, "user_version", 184 - 1)
+            .unwrap();
+    }
+    if active >= 183 && target < 183 {
+        // #3176: back to V182 (drop the session exec targets).
+        connection
+            .execute_batch(
+                "DROP TABLE session_exec_targets;
+                 PRAGMA user_version=182;",
+            )
+            .expect("rewind session exec targets");
+    }
     if active >= 182 && target < 182 {
         // Recreate V43 plus V129 byte-for-byte: historical catalog pins
         // authenticate the table SQL, including whitespace and quoting. Renaming
@@ -41116,6 +41234,81 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
         target_version >= 170,
         "fixture V{target_version} has incorrect V170 appointment handoff trigger presence"
     );
+    let preamble_debt: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='session_start_preambles')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        preamble_debt,
+        target_version >= 189,
+        "fixture preamble debt"
+    );
+    let bench_store: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'bench_runs%' OR name LIKE 'bench_tasks%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        bench_store,
+        if target_version >= 186 { 8 } else { 0 },
+        "fixture V{target_version}: bench run store"
+    );
+    // #3181: the jobs table admits the `bench` kind from its migration. (A rewind
+    // below it keeps the widened CHECK, like V159, so only the head is asserted.)
+    if target_version >= 187 {
+        let jobs_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            jobs_sql.contains("'cloud_sweep','bench'"),
+            "fixture V{target_version}: agent_jobs admits the bench kind"
+        );
+    }
+    let satellite_intakes: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'satellite_enqueue_intakes%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        satellite_intakes,
+        if target_version >= 190 { 2 } else { 0 },
+        "fixture V{target_version}: satellite enqueue intakes"
+    );
+    let retired_appointments: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'harness_manager_retired_appointments%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retired_appointments,
+        if target_version >= 184 { 5 } else { 0 },
+        "fixture V{target_version}: retired appointments"
+    );
+    let exec_targets: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'session_exec_targets%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        exec_targets,
+        if target_version >= 183 { 3 } else { 0 },
+        "fixture V{target_version}: session exec targets"
+    );
     let standing_directives: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='standing_directives')",
@@ -41127,6 +41320,39 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
         standing_directives,
         target_version >= 178,
         "fixture V{target_version}: standing directives"
+    );
+    let unproven_survivors: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='source_worktree_settlement_unproven_survivors')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unproven_survivors,
+        target_version >= 188,
+        "fixture V{target_version}: settlement unproven survivors"
+    );
+    let queue_issue: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rolling_queue_entries') WHERE name='issue')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        queue_issue,
+        target_version >= 185,
+        "fixture V{target_version}: queue Issue link"
+    );
+    let queue_issue_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='rolling_queue_live_issue')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        queue_issue_index,
+        target_version >= 185,
+        "fixture V{target_version}: queue Issue index"
     );
     let scoped_topology_names: bool = connection
         .query_row(
@@ -41311,6 +41537,19 @@ fn assert_fixture_matches_claimed_version(connection: &Connection, target_versio
 /// that stopped short cannot produce a matching value.
 #[allow(clippy::expect_used)]
 pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
+    let queue_issue: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rolling_queue_entries') WHERE name='issue')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(queue_issue, "queue Issue link replayed");
+    let queue_issue_index: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='rolling_queue_live_issue')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(queue_issue_index, "queue Issue index replayed");
     let scoped_topology_names: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='idx_topologies_owner_name')",
@@ -41348,6 +41587,71 @@ pub(crate) fn assert_post_v77_chain_replayed(connection: &Connection) {
         )
         .unwrap();
     assert!(retained_roots, "settlement retained roots replayed");
+    let unproven_survivors: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='source_worktree_settlement_unproven_survivors')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(unproven_survivors, "settlement unproven survivors replayed");
+    let exec_targets: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'session_exec_targets%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(exec_targets, 3, "V183 session exec targets replayed");
+    let satellite_intakes: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'satellite_enqueue_intakes%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        satellite_intakes, 2,
+        "V190 satellite enqueue intakes replayed"
+    );
+    let retired_appointments: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'harness_manager_retired_appointments%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retired_appointments, 5,
+        "V184 retired appointments replayed"
+    );
+    let preamble_debt: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='session_start_preambles')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(preamble_debt, "session preamble debt replayed");
+    let bench_store: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'bench_runs%' OR name LIKE 'bench_tasks%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bench_store, 8, "V186 bench run store replayed");
+    let jobs_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_jobs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        jobs_sql.contains("'cloud_sweep','bench'") && jobs_sql.contains("started_at"),
+        "the bench agent jobs kind check replayed with every column"
+    );
     let standing_directives: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='standing_directives')",
@@ -50935,6 +51239,7 @@ fn newest_stored_handoff_orders_records_against_body_handoffs() {
                 &AgentUpdateIssueRequestV1 {
                     issue_id: Some(issue.id),
                     body: Some(body),
+                    replace_body: true,
                     ..AgentUpdateIssueRequestV1::new(current.row_version, key.into())
                 },
             )

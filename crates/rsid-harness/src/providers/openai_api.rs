@@ -19,6 +19,10 @@ pub struct ChatCompletionsWire<'a> {
     pub disable_streaming: bool,
     /// OpenRouter normalises reasoning control under `reasoning.effort`.
     pub openrouter_reasoning: bool,
+    /// Send an assistant message's `reasoning` / `reasoning_details` back on the
+    /// tool-call chain of the current turn (#3170). OpenRouter accepts both on
+    /// assistant messages; a route that does not is never asked to.
+    pub replay_reasoning: bool,
     /// The route's own top-level `reasoning_effort` vocabulary, if it has one.
     pub reasoning_effort_wire: &'a dyn Fn(&str) -> Option<&'static str>,
 }
@@ -28,7 +32,15 @@ pub fn build_request_body(request: &ChatRequest, wire: &ChatCompletionsWire<'_>)
     let mut messages: Vec<Value> = Vec::new();
     let mut pending_image_messages: Vec<Value> = Vec::new();
 
-    for msg in &request.messages {
+    // The current turn's tool-call chain starts after the last user message;
+    // earlier turns' reasoning is not replayed.
+    let chain_start = request
+        .messages
+        .iter()
+        .rposition(|msg| msg.role == MessageRole::User)
+        .map_or(0, |index| index + 1);
+
+    for (index, msg) in request.messages.iter().enumerate() {
         // Chat Completions requires every tool reply for one assistant turn
         // before the next user message. Defer image parts until the batch ends.
         if msg.role != MessageRole::Tool {
@@ -70,6 +82,18 @@ pub fn build_request_body(request: &ChatRequest, wire: &ChatCompletionsWire<'_>)
                             })
                             .collect::<Vec<_>>()
                     );
+                }
+                if wire.replay_reasoning && index >= chain_start {
+                    // Structured blocks go back verbatim and win over the flat
+                    // text, which they already contain; send one form, not both.
+                    if let Some(details) = msg.reasoning_details.as_ref().filter(|d| !d.is_empty())
+                    {
+                        m["reasoning_details"] = json!(details);
+                    } else if let Some(text) =
+                        msg.reasoning.as_deref().filter(|t| !t.trim().is_empty())
+                    {
+                        m["reasoning"] = json!(text);
+                    }
                 }
                 messages.push(m);
             }
@@ -264,6 +288,11 @@ pub fn parse_chat_response(json: &Value) -> Result<ChatResponse, &'static str> {
         .filter_map(|key| message.get(*key).and_then(|value| value.as_str()))
         .find(|text| !text.trim().is_empty())
         .map(String::from);
+    let reasoning_details = message
+        .get("reasoning_details")
+        .and_then(|value| value.as_array())
+        .filter(|blocks| !blocks.is_empty())
+        .cloned();
 
     let tool_calls: Vec<ToolCall> = message
         .get("tool_calls")
@@ -310,6 +339,7 @@ pub fn parse_chat_response(json: &Value) -> Result<ChatResponse, &'static str> {
         tool_calls,
         usage,
         reasoning_content,
+        reasoning_details,
         stop_reason,
     })
 }
@@ -360,6 +390,7 @@ mod tests {
             tool_choice_none: false,
             disable_streaming: false,
             openrouter_reasoning: false,
+            replay_reasoning: false,
             reasoning_effort_wire: &no_effort,
         }
     }
@@ -482,6 +513,7 @@ mod tests {
                 tool_choice_none: true,
                 disable_streaming: true,
                 openrouter_reasoning: true,
+                replay_reasoning: false,
                 reasoning_effort_wire: &effort,
             },
         );
@@ -529,5 +561,74 @@ mod tests {
             parse_chat_response(&json!({"choices": [{}]})).unwrap_err(),
             "No message in choice"
         );
+    }
+
+    fn thinking_assistant(text: &str, details: Option<Vec<Value>>) -> ChatMessage {
+        let mut message = ChatMessage::assistant("");
+        message.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+            hosted: false,
+            hosted_result: None,
+        }];
+        message.reasoning = Some(text.into());
+        message.reasoning_details = details;
+        message
+    }
+
+    #[test]
+    fn replay_sends_reasoning_on_the_current_chain_only_when_the_route_asks() {
+        let details = vec![json!({"type": "reasoning.text", "text": "step one", "index": 0})];
+        let req = request(vec![
+            ChatMessage::user("first task"),
+            thinking_assistant("old turn thoughts", None),
+            ChatMessage::tool_result("c1", "ok"),
+            ChatMessage::user("second task"),
+            thinking_assistant("flat thoughts", None),
+            ChatMessage::tool_result("c1", "ok"),
+            thinking_assistant("structured thoughts", Some(details.clone())),
+        ]);
+        let replay = ChatCompletionsWire {
+            replay_reasoning: true,
+            ..wire()
+        };
+
+        let body = build_request_body(&req, &replay);
+        let messages = body["messages"].as_array().unwrap();
+        // The earlier turn's reasoning is not replayed.
+        assert!(messages[1].get("reasoning").is_none());
+        assert!(messages[1].get("reasoning_details").is_none());
+        // The current chain replays the flat text, or the verbatim blocks when
+        // the route returned them (one form, never both).
+        assert_eq!(messages[4]["reasoning"], "flat thoughts");
+        assert!(messages[4].get("reasoning_details").is_none());
+        assert_eq!(messages[6]["reasoning_details"], json!(details));
+        assert!(messages[6].get("reasoning").is_none());
+        assert_eq!(messages[6]["tool_calls"][0]["id"], "c1");
+
+        // Any other route is unchanged: no reasoning on the wire.
+        let plain = build_request_body(&req, &wire());
+        let rendered = plain.to_string();
+        assert!(!rendered.contains("thoughts"), "{rendered}");
+        assert!(!rendered.contains("reasoning_details"), "{rendered}");
+    }
+
+    #[test]
+    fn chat_response_keeps_reasoning_details_verbatim() {
+        let blocks = json!([{"type": "reasoning.text", "text": "t", "index": 0}]);
+        let response = parse_chat_response(&json!({
+            "choices": [{
+                "message": {"content": "x", "reasoning": "t", "reasoning_details": blocks},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(response.reasoning_details, blocks.as_array().cloned());
+        let none = parse_chat_response(&json!({
+            "choices": [{"message": {"content": "x", "reasoning_details": []}}]
+        }))
+        .unwrap();
+        assert_eq!(none.reasoning_details, None);
     }
 }

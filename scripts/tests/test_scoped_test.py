@@ -1,6 +1,8 @@
 """Bounded runner checks with stub builds and an optional real systemd stop."""
 
 import contextlib
+from datetime import datetime, timedelta, timezone
+import hashlib
 import io
 import json
 import re
@@ -20,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scratch_git import scratch_git, scratch_tempdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scoped-test"
+# #3478: a run probes and uses a PID namespace unless this is off. These tests pin the plain
+# argv of every lane; the namespace tests below turn the probe on explicitly.
+os.environ["RSI_PID_ISOLATION"] = "off"
 RUNNER = runpy.run_path(str(SCRIPT))
 
 
@@ -58,6 +63,74 @@ class ControlledClock:
 
     def __getattr__(self, name):
         return getattr(time, name)
+
+
+class ReceiptEncodingTest(unittest.TestCase):
+    def test_large_selection_keeps_progress_and_terminal_receipts_below_64_kib(self):
+        filters = [f"rsid=shard:store-01:test(module_{n}::dependent_tests)" for n in range(7000)]
+        entries = [{"package": "rsid", "module": f"module_{n}", "filter": value,
+                    "path": f"crates/rsid/src/module_{n}.rs", "reason": "public library dependency"}
+                   for n, value in enumerate(filters)]
+        downstream = {"items": entries, "selections": entries, "filters": filters, "notes": [],
+                      "changed_libraries": [{"package": "rsi-common", "paths": ["src/lib.rs"]}],
+                      "packages": [{"package": "rsid", "status": "pending"}]}
+        selection = {"filters": filters, "downstream_compile": downstream,
+                     "downstream_tests": {key: downstream[key] for key in ("items", "selections", "filters", "notes")}}
+        # Terminal fields read by agent_jobs.rs and rsi-common/src/agent_landing_candidate.rs.
+        # The Rust parser accepts a JSON object, with no fixed deserialization schema.
+        failure = {"package": "rsid", "kind": "lib", "target": "rsid", "test": "existing_red"}
+        evidence = {"head": "a" * 40, "failure_class": "test_failure", "failures": [failure],
+                    "baseline_reds": [failure], "new_failures": [], "plan": "targeted_subset",
+                    "uncertain": "broad_observers", "stale_base": "base note", "gate_covers_rest": True,
+                    "selected_tests": 7000, "run_tests": 100, "merges_cleanly_onto_rolling": False,
+                    "conflict_paths": ["scripts/scoped-test"],
+                    "tool": {"source": "rolling", "rev": "b" * 40, "blob": "c" * 40}}
+        with scratch_tempdir(prefix="scoped-receipt-") as tmp, patch.dict(RUNNER["RECEIPT"], clear=True):
+            receipt = RUNNER["RECEIPT"]
+            receipt.update(schema=1, emit=True, packages=[], **selection, **evidence)
+            RUNNER["persist_selection"](Path(tmp))
+            path = Path(receipt["selection"]["path"])
+            saved = path.read_bytes()
+            self.assertEqual(json.loads(saved), selection)
+            self.assertEqual(receipt["selection"]["sha256"], hashlib.sha256(saved).hexdigest())
+            with patch.object(Path, "write_bytes", side_effect=AssertionError("selection must be written once")), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                for phase in ("building", "listed", "testing", "test_failed"):
+                    RUNNER["snapshot_package"]({"package": "rsid", "status": "running", "phase": phase,
+                                                "completed": 100})
+                downstream["packages"][0]["status"] = "passed"
+                receipt["packages"] = [{"package": "rsid", "status": "passed", "completed": 100}]
+                RUNNER["emit_receipt"](0)
+            lines = out.getvalue().splitlines()
+            self.assertEqual(len(lines), 5)
+            for line in lines:
+                self.assertLess(len(line.encode()) + 1, 64 * 1024)
+            parsed = [json.loads(line.removeprefix(RUNNER["RECEIPT_PREFIX"])) for line in lines]
+            self.assertEqual([item["packages"][0]["phase"] for item in parsed[:-1]],
+                             ["building", "listed", "testing", "test_failed"])
+            self.assertTrue(all(item["partial"] and not item["ok"] for item in parsed[:-1]))
+            terminal = parsed[-1]
+            self.assertEqual((terminal["ok"], terminal["exit_code"]), (True, 0))
+            self.assertEqual({key: terminal[key] for key in evidence}, evidence)
+            self.assertEqual(terminal["packages"], receipt["packages"])
+            self.assertEqual(terminal["filters"]["count"], 7000)
+            self.assertEqual(terminal["downstream_tests"]["counts"]["selections"], 7000)
+            self.assertEqual(terminal["downstream_compile"]["packages"][0]["status"], "passed")
+            for key in selection:
+                summary = terminal[key]
+                self.assertEqual(summary["detail_path"], str(path))
+                self.assertEqual(summary["sha256"],
+                                 hashlib.sha256(RUNNER["json_bytes"](json.loads(saved)[key])).hexdigest())
+            self.assertEqual(path.read_bytes(), saved)
+            self.assertEqual(receipt["filters"], filters)
+
+    def test_progress_cannot_be_green_even_after_baseline_verdict(self):
+        with patch.dict(RUNNER["RECEIPT"], {"emit": True, "packages": [],
+                                           "ok_reason": "baseline_known_failure"}, clear=True), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            RUNNER["emit_receipt"](1, progress=True)
+        receipt = json.loads(out.getvalue().removeprefix(RUNNER["RECEIPT_PREFIX"]))
+        self.assertEqual((receipt["ok"], receipt["partial"]), (False, True))
 
 
 class ScopedTest(unittest.TestCase):
@@ -119,6 +192,10 @@ print('store::migration: test' if '--list' in sys.argv else 'test result: ok. 1 
     def baseline_git(self, args):
         if args[:3] == ["rev-parse", "--verify", "--quiet"]:
             return subprocess.CompletedProcess(args, 1 if self.base_baseline == "unresolved" else 0, "", "")
+        if args[0] == "merge-tree":
+            # This fixture has no Git history. Its warning-baseline JSON is not a trial tree;
+            # real trial merges and recent-deletion receipts have separate Git fixtures.
+            return subprocess.CompletedProcess(args, 128, "", "not a Git history fixture")
         document = self.base_baseline if isinstance(self.base_baseline, dict) else None
         return subprocess.CompletedProcess(args, 0 if document else 1, json.dumps(document) if document else "", "")
 
@@ -128,6 +205,31 @@ print('store::migration: test' if '--list' in sys.argv else 'test result: ok. 1 
             "rsid=shard:store-01:test(migration)"], {"store-01": ["rsid-store"]})["rsid-store"]
         return {"repo": str(self.root), "package": "rsid-store", "selections": selections,
                 "build": RUNNER["build_command"]("rsid-store", selections, [str(self.cargo)])}
+
+    def test_downstream_compile_builds_test_targets_without_listing_or_running_them(self):
+        plan = self.plan()
+        plan.update(compile_only=True, selections=[],
+                    build=RUNNER["build_command"]("rsid-store", [], [str(self.cargo)],
+                                                   ["dev-fixtures"], all_tests=True))
+        output = io.StringIO()
+        with contextlib.chdir(self.root), contextlib.redirect_stdout(output):
+            code = RUNNER["execute_package"](plan)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertEqual(self.log.read_text().splitlines(), [
+            "cargo-stub test -p rsid-store --tests --features dev-fixtures --no-run --message-format=json"])
+        self.assertIn("SCOPED_PHASE compiled", output.getvalue())
+        self.assertIn("SCOPED_COMPLETE rsid-store 0", output.getvalue())
+
+    def test_downstream_compile_failure_is_red(self):
+        cargo = self.executable("broken-cargo", "print('error[E0308]: mismatched types')\nsys.exit(101)\n")
+        plan = self.plan()
+        plan.update(compile_only=True, selections=[], build=[str(cargo), "test", "--tests", "--no-run"])
+        output = io.StringIO()
+        with contextlib.chdir(self.root), contextlib.redirect_stdout(output):
+            code = RUNNER["execute_package"](plan)
+        self.assertEqual(code, 101)
+        self.assertIn("SCOPED_PHASE build_failed", output.getvalue())
+        self.assertIn("E0308", output.getvalue())
 
     def test_bounded_unit_builds_with_the_worker_shell_build_settings(self):
         # #1741: the systemd unit must build like the worker's shell, or it
@@ -221,6 +323,76 @@ print('store::migration: test' if '--list' in sys.argv else 'test result: ok. 1 
                     os.environ["RSI_JOB_ID"] = value
                 _command, plain = RUNNER["bounded_command"]({"repo": "/s"}, Path("/p"), 60, 200, True)
             self.assertRegex(plain, r"^rsi-scoped-test-[0-9a-f]{32}$")
+
+    def test_test_lanes_run_in_the_pid_namespace_the_run_probed(self):
+        # #3478: the bounded cargo worker and the Python lane run inside `unshare --pid`, so a
+        # test's host-wide `pgrep`/`kill` cannot reach the hub daemon.
+        from types import SimpleNamespace
+
+        namespaced = {"mode": "namespaced", "reason": "", "mapping": "current_user"}
+        globals_ = RUNNER["bounded_command"].__globals__
+        with patch.dict(os.environ):
+            os.environ.pop("RSI_BUILD_SLICE", None)
+            with patch.dict(globals_, PID_ISOLATION=None):
+                plain, _ = RUNNER["bounded_command"]({"repo": "/s"}, Path("/p"), 60, 200, True)
+            with patch.dict(globals_, PID_ISOLATION=namespaced):
+                wrapped, unit = RUNNER["bounded_command"]({"repo": "/s"}, Path("/p"), 60, 200, True)
+                off_linux, _ = RUNNER["bounded_command"]({"repo": "/s"}, Path("/p"), 60, 200, False)
+        # The unit (cgroup, CPU quota, timeout) is unchanged; only its worker is wrapped.
+        self.assertEqual(plain[-5], sys.executable)
+        self.assertIn(f"--unit={unit}", wrapped)
+        tail = wrapped[wrapped.index("unshare"):]
+        self.assertEqual(tail[:2], ["unshare", "--user"])
+        for flag in ("--pid", "--fork", "--kill-child", "--mount-proc"):
+            self.assertIn(flag, tail)
+        self.assertEqual(tail[tail.index("--") + 1:], plain[-5:])
+        self.assertNotIn("unshare", off_linux)
+
+        seen = []
+
+        def stream(command, emit, **_kwargs):
+            seen.append(list(command))
+            emit("Ran 1 test in 0.1s\n")
+            return 0
+
+        args = SimpleNamespace(dry_run=False, runtime_max_sec=60, total_max_sec=None, repo=str(self.root))
+        command = ["python3", "-m", "unittest", "-v", "scripts/tests/t.py"]
+        for state, expected in ((namespaced, True), (None, False)):
+            seen.clear()
+            with patch.dict(RUNNER["run_python_tests"].__globals__, PID_ISOLATION=state, stream=stream,
+                            RECEIPT={"python": []}), \
+                    patch.object(RUNNER["PYTHON_GATE"], "runner_status", return_value=None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(RUNNER["run_python_tests"]([command], args, self.root, time.monotonic(), {}))
+            self.assertEqual(seen[0][0] == "unshare", expected, seen)
+            self.assertEqual(seen[0][-5:], command)
+
+    def test_the_receipt_records_whether_the_run_was_pid_isolated(self):
+        # #3478: `pid_isolation` is `namespaced` or `unavailable` (with the reason), never absent.
+        record = RUNNER["record_pid_isolation"]
+        globals_ = record.__globals__
+        receipt = globals_["RECEIPT"]
+        isolate = RUNNER["PID_ISOLATE"]
+        found = {"mode": "namespaced", "reason": "", "mapping": "current_user"}
+        refused = {"mode": "unavailable", "reason": "canary_exit_1: unshare failed: Operation not permitted"}
+        before = dict(receipt)
+        try:
+            with patch.dict(globals_, PID_ISOLATION=None), contextlib.redirect_stdout(io.StringIO()) as printed:
+                with patch.object(isolate, "probe", return_value=found):
+                    record()
+                self.assertEqual(receipt["pid_isolation"], "namespaced")
+                self.assertNotIn("pid_isolation_reason", receipt)
+                self.assertEqual(globals_["PID_ISOLATION"], found)
+                with patch.object(isolate, "probe", return_value=refused):
+                    record()
+                self.assertEqual(receipt["pid_isolation"], "unavailable")
+                self.assertIn("Operation not permitted", receipt["pid_isolation_reason"])
+                self.assertIsNone(globals_["PID_ISOLATION"])
+            self.assertIn("pid_isolation=unavailable", printed.getvalue())
+        finally:
+            for key in ("pid_isolation", "pid_isolation_reason"):
+                receipt.pop(key, None)
+            receipt.update({key: before[key] for key in ("pid_isolation", "pid_isolation_reason") if key in before})
 
     def test_tmpfs_runs_selected_binaries_under_private_tmpdir_and_cleans_up(self):
         parent = self.root / "shm"
@@ -442,7 +614,7 @@ for name in names:
 sys.exit(100 if '{fail}' in names else 0)
 """
 
-    def nextest_plan(self, names, threads=3, fail="", box=None):
+    def nextest_plan(self, names, threads=3, fail="", box=None, features=(), filter_="rsid=shardcase::"):
         body = f"names = {names!r}\nif '--list' in sys.argv:\n    [print(n + ': test') for n in names]\n"
         self.binary = self.executable("test-binary", body)
         artifact = {"reason": "compiler-artifact", "profile": {"test": True},
@@ -450,10 +622,11 @@ sys.exit(100 if '{fail}' in names else 0)
                     "executable": str(self.binary), "target": {"kind": ["lib"], "name": "rsid"}}
         stub = self.executable("cargo-stub", "import re\n" + self.NEXTEST_STUB.format(
             artifact=json.dumps(artifact), threads=threads, fail=fail))
-        selections = RUNNER["selection_plan"](["rsid=shardcase::"], {})["rsid"]
+        selections = RUNNER["selection_plan"]([filter_], {})["rsid"]
         plan = {"repo": str(self.root), "package": "rsid", "selections": selections, "test_shards": threads,
                 "test_threads": threads, "runner": "nextest", "nextest": [str(stub), "nextest"],
-                "time_box_sec": box, "build": RUNNER["build_command"]("rsid", selections, [str(stub)])}
+                "features": list(features),
+                "time_box_sec": box, "build": RUNNER["build_command"]("rsid", selections, [str(stub)], features)}
         path = self.root / "plan.json"
         path.write_text(json.dumps(plan))
         return [sys.executable, str(SCRIPT), "--execute-plan", str(path)]
@@ -480,6 +653,18 @@ sys.exit(100 if '{fail}' in names else 0)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("SCOPED_FAILURE lib:rsid shardcase::t1", result.stdout)
         self.assertIn("SCOPED_PHASE test_failed", result.stdout)
+
+    def test_required_features_reach_both_the_build_and_nextest(self):
+        result = subprocess.run(self.nextest_plan(["recursive_dag::smoke_fixture::tests::one"],
+                                                 features=["dev-fixtures"], filter_="rsid=recursive_dag::smoke_fixture"),
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SCOPED_COMPLETE rsid 1", result.stdout)
+        commands = self.log.read_text().splitlines()
+        build = next(line for line in commands if line.startswith("cargo-stub test"))
+        run = next(line for line in commands if line.startswith("cargo-stub nextest run"))
+        self.assertIn("--features dev-fixtures", build)
+        self.assertIn("--features dev-fixtures", run)
 
     def test_a_spent_time_box_skips_the_remaining_batches_without_failing(self):
         out = io.StringIO()
@@ -592,17 +777,20 @@ sys.exit(100 if '{fail}' in names else 0)
         self.assertEqual((result, calls), (0, [["provider_capabilities::legacy_0", "provider_capabilities::legacy_1",
                                                 "provider_capabilities::legacy_2"]]))
         self.assertEqual(subset["changed_module_tests"], [0, 0])
-        # With them, the first and only batch the box admits is the changed module's own tests, the
-        # smallest module (recovery) before the larger one, and never an unchanged child source's.
+        # With them, a spent box never takes a changed module's own tests (#3252): the smallest module
+        # (recovery) runs first, then the rest of the changed modules, never an unchanged child source's,
+        # and only the tiers after them are left to the gate.
         result, calls, subset, plan, rotation, untouched = self.boxed_changed_module_run(self.CHANGED_ROTATION)
         self.assertEqual(result, 0)
-        self.assertEqual(calls, [["session::rotation::recovery::tests::keeps_controller"]])
+        self.assertEqual(calls[0], ["session::rotation::recovery::tests::keeps_controller"])
+        self.assertEqual(sorted(name for batch in calls for name in batch), sorted(rotation))
+        self.assertNotIn(untouched[0], [name for batch in calls for name in batch])
         self.assertTrue(subset["box_expired"])
-        self.assertEqual(subset["changed_module_tests"], [4, 1])
-        self.assertEqual((subset["selected_tests"], subset["run_tests"]), (38, 1))
+        self.assertEqual(subset["changed_module_tests"], [4, 4])
+        self.assertEqual((subset["selected_tests"], subset["run_tests"]), (38, 4))
         coverage = RUNNER["filter_coverage"](plan, [subset])
         self.assertEqual(coverage["run"], [])
-        self.assertIn({"filter": "rsid=shard:session-03:test(/^session::/)", "selected": 35, "executed": 1}, coverage["partial"])
+        self.assertIn({"filter": "rsid=shard:session-03:test(/^session::/)", "selected": 35, "executed": 4}, coverage["partial"])
         self.assertEqual(len(coverage["not_run"]), 3)
 
     def test_with_a_wider_box_every_changed_module_test_runs_in_size_order_before_the_rest(self):
@@ -728,9 +916,10 @@ sys.exit(100 if '{fail}' in names else 0)
         # The pure ranking: specificity no longer puts a one-test far filter ahead of a proven observer.
         self.assertEqual(RUNNER["specificity_tiers"](["far_exact", "near_broad"], {"far_exact": 1, "near_broad": 100},
                                                      direct_ranks={"near_broad": 1}), [["near_broad"], ["far_exact"]])
-        # Added and changed-module tests still come first: the box admits only the added test.
+        # Added and changed-module tests still come first: the spent box admits the added test and the
+        # changed module's own test (#3252), never a direct or far observer.
         result, calls, subset, plan, added, changed = self.mixed_run(0.05)
-        self.assertEqual((result, calls), (0, [[added]]))
+        self.assertEqual((result, calls), (0, [[added], [changed]]))
         self.assertTrue(subset["box_expired"])
 
     def test_the_box_admits_the_nearest_direct_observer_once_the_priority_tests_ran(self):
@@ -1043,6 +1232,47 @@ sys.exit(100 if '{fail}' in names else 0)
         self.assertEqual(receipt["filters_not_run_total"], 14)
         self.assertIn("merge-queue gate covers the rest", output)
 
+    def test_a_spent_box_still_runs_the_changed_module_tests_of_a_later_package(self):
+        """#3252: `rsid` spends the whole box on its priority tests and far observers; the `rsi` package that
+        owns the changed module `settings_registry` still runs that module's tests, not the gate first."""
+        def binary(name, tests):
+            listing = "\n".join(f"{test}: test" for test in tests)
+            return self.executable(name, "import time\nif '--list' in sys.argv:\n    time.sleep(0.4)\n"
+                                         f"print({listing!r} if '--list' in sys.argv else 'test result: ok. 1 passed')\n")
+        rsid = binary("rsid-binary", ["far::priority", *[f"far::observer_{n}" for n in range(4)]])
+        registry = ["settings_registry::tests::no_section_holds_more_than_a_dozen_rows",
+                    "settings_registry::tests::rows_are_unique"]
+        rsi = binary("rsi-binary", [*registry, "unrelated::tests::far_observer"])
+        self.cargo = self.executable("cargo-two-packages", f"""
+import json
+package = sys.argv[sys.argv.index('-p') + 1]
+binary = {str(rsid)!r} if package == 'rsid' else {str(rsi)!r}
+print(json.dumps({{'reason': 'compiler-artifact', 'profile': {{'test': True}},
+                  'manifest_path': {str(self.root / 'Cargo.toml')!r},
+                  'executable': binary, 'target': {{'kind': ['lib'], 'name': package}}}}))
+""")
+        filters = ["rsid=shard:session-01:test(/^far::/)", "rsi=settings_registry", "rsi=unrelated"]
+        changed = {"package": "rsi", "module": "settings_registry", "path": "crates/rsi/src/settings_registry.rs",
+                   "excluded": [], "tests": 2}
+        code, output = self.invoke(
+            linux=False, seconds="20", entrypoint=True, filters=filters,
+            shard_packages={"session-01": ["rsid"]},
+            extra_args=["--filter-budget", "1", "--test-time-box-sec", "0.1"],
+            derived_extra={"changed_modules": [changed], "priority_filters": ["rsid=shard:session-01:test(far::priority)"]})
+        self.assertEqual(code, 0, output)
+        self.assertIn("rsi still runs the tests of its changed modules", output)
+        self.assertNotIn("rsi left to the merge-queue gate", output)
+        receipt = self.receipt_of(output)
+        self.assertEqual((receipt["changed_module_tests_selected"], receipt["changed_module_tests_run"]), (2, 2))
+        log = (self.root / "output" / "rsi.log").read_text()
+        for test in registry:
+            self.assertIn(f"SCOPED_END {test}", log)
+        self.assertNotIn("SCOPED_END unrelated::tests::far_observer", log)
+        self.assertTrue(receipt["box_expired"])
+        # A changed module's own filter is run, never named as left for the gate.
+        self.assertNotIn("rsi=settings_registry", receipt["filters_not_run"])
+        self.assertNotIn("rsi", receipt.get("unlisted_packages", []))
+
     def test_batches_are_bounded_by_count_and_argv_size(self):
         names = [f"t{n:04}" for n in range(10)]
         self.assertEqual(list(RUNNER["test_batches"](names, max_tests=4)),
@@ -1158,6 +1388,64 @@ print('test result: ok. 1 passed; 0 failed')
             ran, result, failures, _done = RUNNER["run_batch"](
                 str(binary), ["a::one"], str(self.root), {"SCOPED_TEST_LOG": str(self.log)})
         self.assertEqual((ran, result, failures), (1, 0, []))
+
+    def test_unterminated_libtest_start_line_names_the_blocked_test(self):
+        """#196: `test b ... ` has no newline until b finishes, so the hung test is b, not a."""
+        release = self.root / "release-b"
+        binary = self.executable("blocked-b", f"""
+import time
+if '--list' in sys.argv:
+    print('a: test')
+    print('b: test')
+else:
+    sys.stdout.write('test a ... ok\\n')
+    sys.stdout.write('test b ... ')
+    sys.stdout.flush()
+    release = Path({str(release)!r})
+    for _ in range(3000):
+        if release.exists():
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit(3)
+    print('ok')
+    print('test result: ok. 2 passed; 0 failed')
+""")
+        seen = []
+
+        def emit(line):
+            seen.append(line)
+            if line == "SCOPED_START b\n":
+                # The child is still blocked on `release`: b is the live test.
+                self.assertFalse(release.exists())
+                release.touch()
+            print(line, end="")
+
+        with patch.dict(RUNNER["run_batch"].__globals__, emit_line=emit), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ran, result, failures, done = RUNNER["run_batch"](
+                str(binary), ["a", "b"], str(self.root), {"SCOPED_TEST_LOG": str(self.log)})
+        self.assertEqual((ran, result, failures, done), (2, 0, [], {"a", "b"}))
+        self.assertEqual([line.strip() for line in seen if line.startswith("SCOPED_")],
+                         ["SCOPED_START a", "SCOPED_END a", "SCOPED_START b", "SCOPED_END b"])
+        self.assertEqual(seen.count("test b ... ok\n"), 1)
+
+    def test_partial_line_start_is_parsed_without_a_second_emit_or_count(self):
+        out = []
+        progress = RUNNER["BatchProgress"](["a", "b"], out.append)
+        progress.begin("a")
+        progress.partial("test a ... ok\n")  # a is the active test: not a new start
+        progress.partial("test x ... ")  # unselected names are ignored
+        progress.partial("test b")  # too short to be a start line yet
+        self.assertEqual((progress.active, progress.ran), ("a", 0))
+        progress.partial("test b ... ")
+        self.assertEqual((progress.active, progress.ran), ("b", 1))
+        progress.line("test b ... ok\n")
+        progress.partial("test b ... ")  # b is finished
+        progress.finish_active()
+        self.assertEqual((progress.ran, progress.missing()), (2, []))
+        self.assertEqual(out.count("SCOPED_START b\n"), 1)
+        self.assertEqual(out.count("SCOPED_END b\n"), 1)
 
     def slot_stub(self, delay, grant=True):
         grant_line = "print('rsi-phase 1 slot-granted: waited %ds (build); running' % DELAY, file=sys.stderr, flush=True)\n"
@@ -1302,37 +1590,113 @@ else:
         self.assertIn("rsid-store: passed (1 completed tests)", output)
         self.assertNotIn("scoped_test_timeout", output)
 
-    def test_daemon_job_slot_wait_uses_the_remaining_budget_instead_of_600_seconds(self):
+    def test_daemon_job_slot_wait_uses_its_separate_admission_allowance(self):
         slot = self.executable("cargo-slot", """
 cap = int(os.environ['RSI_CARGO_ADMISSION_MAX_SEC'])
-assert 3400 < cap <= 3480, cap
+assert 3500 < cap <= 3600, cap
 print('rsi-phase 1 slot-granted: running', file=sys.stderr, flush=True)
 os.environ['RSI_CARGO_SLOT_HELD'] = '1'
 os.execv(sys.argv[1], sys.argv[1:])
 """)
         code, output = self.invoke(linux=False, seconds="5", slot=slot,
-                                   extra_args=["--job-max-sec", "3600"])
+                                   extra_args=["--job-max-sec", "3600", "--slot-wait-max-sec", "3600"])
         self.assertEqual(code, 0, output)
         self.assertIn("rsid-store: passed (1 completed tests)", output)
+        self.assertRegex(output, r"rsid-store: waited \d+s for a build slot \(not counted against the budget\)")
+
+    def test_daemon_job_slot_wait_defaults_to_the_job_allowance(self):
+        """#3284: a daemon that passes only --job-max-sec still gets the hour, not 600s."""
+        slot = self.executable("cargo-slot", """
+assert int(os.environ['RSI_CARGO_ADMISSION_MAX_SEC']) == 3600
+print('rsi-phase 1 slot-granted: running', file=sys.stderr, flush=True)
+os.environ['RSI_CARGO_SLOT_HELD'] = '1'
+os.execv(sys.argv[1], sys.argv[1:])
+""")
+        code, output = self.invoke(linux=False, seconds="5", slot=slot, extra_args=["--job-max-sec", "3600"])
+        self.assertEqual(code, 0, output)
 
     def test_daemon_admission_timeout_has_a_typed_phase_and_red_receipt(self):
-        # Include 179s already spent in the wrapper's sandbox/artifact locks.
+        # The wrapper's lock wait leaves only one second of admission allowance.
         code, output = self.invoke(linux=False, seconds="5", slot=self.slot_stub(30, grant=False),
-                                   extra_args=["--job-max-sec", "300"], entrypoint=True,
-                                   job_started_at=str(time.time() - 179))
+                                   extra_args=["--job-max-sec", "300", "--slot-wait-max-sec", "180"],
+                                   entrypoint=True, job_started_at=str(time.time() - 179))
         self.assertEqual(code, 124, output)
-        self.assertIn("admission-timeout: no build slot within remaining job budget", output)
+        self.assertIn("admission-timeout: no build slot within separate admission allowance", output)
         receipt = self.receipt_of(output)
         self.assertEqual((receipt["ok"], receipt["exit_code"]), (False, 124))
 
-    def test_granted_slot_keeps_the_remaining_job_deadline(self):
+    def test_granted_slot_gets_the_full_execution_budget_after_35_minutes_queued(self):
         with patch("time.monotonic", return_value=100):
-            budget = RUNNER["Budget"](3600, queued=True, wait_cap=3480, deadline=3640)
-        with patch("time.monotonic", return_value=3579):
-            budget.observe("rsi-phase 3579 slot-granted: running")
-            self.assertEqual(budget.remaining(), 61)
-        with patch("time.monotonic", return_value=3640):
+            budget = RUNNER["Budget"](3600, queued=True, wait_cap=3600, deadline=3700)
+        with patch("time.monotonic", return_value=2200):
+            budget.observe("rsi-phase 2200 slot-granted: running")
+            self.assertEqual(budget.waited, 2100)
+            self.assertEqual(budget.remaining(), 3600)
+        with patch("time.monotonic", return_value=5799):
+            self.assertEqual(budget.remaining(), 1)
+        with patch("time.monotonic", return_value=5800):
             self.assertEqual(budget.remaining(), 0)
+
+    def test_slot_wait_is_excluded_from_the_job_deadline(self):
+        """#3284: a 2736s queue used to leave 804s of a 3540s deadline; it now leaves all of it."""
+        with patch("time.monotonic", return_value=100):
+            budget = RUNNER["Budget"](4000, queued=True, wait_cap=3600, deadline=100 + 3540)
+        with patch("time.monotonic", return_value=100 + 2736):
+            # Still queued: only the wait cap bounds the queue, not the job deadline.
+            self.assertEqual(budget.remaining(), 3600 - 2736)
+            budget.observe("rsi-phase 2836 slot-granted: waited 2736s (build); running")
+            self.assertEqual(budget.waited, 2736)
+            self.assertEqual(budget.remaining(), 3540)
+        with patch("time.monotonic", return_value=100 + 2736 + 3540):
+            self.assertEqual(budget.remaining(), 0)
+        with patch("time.monotonic", return_value=100 + 2736 + 3500):
+            self.assertEqual(budget.remaining(), 40)
+
+    def test_slot_wait_is_capped_as_a_whole_not_by_the_job_deadline(self):
+        with patch("time.monotonic", return_value=100):
+            budget = RUNNER["Budget"](3480, queued=True, wait_cap=600, deadline=100 + 300)
+        with patch("time.monotonic", return_value=100 + 599):
+            self.assertEqual(budget.remaining(), 1)
+        with patch("time.monotonic", return_value=100 + 600):
+            self.assertEqual(budget.remaining(), 0)
+            self.assertFalse(budget.ran_out())
+
+    def test_an_unqueued_budget_keeps_the_job_deadline_unshifted(self):
+        with patch("time.monotonic", return_value=100):
+            budget = RUNNER["Budget"](4000, deadline=100 + 3540)
+        with patch("time.monotonic", return_value=100 + 3000):
+            self.assertEqual(budget.remaining(), 540)
+
+    def test_daemon_job_lock_and_slot_wait_leave_budget_for_all_packages_and_triage(self):
+        clock = ControlledClock()
+        acquire = RUNNER["BuildAdmission"].acquire
+        compare = RUNNER["compare_failures_with_base"]
+        comparison_budgets = []
+
+        def held_admission(admission, *args):
+            if admission.process is None:
+                clock.advance(35 * 60)
+            return acquire(admission, *args)
+
+        def compare_after_wait(repo, base, failures, log_dir, seconds, *args):
+            comparison_budgets.append(seconds)
+            return compare(repo, base, failures, log_dir, seconds, *args)
+
+        with patch.dict(RUNNER["main"].__globals__, time=clock,
+                        compare_failures_with_base=compare_after_wait), \
+             patch.object(RUNNER["BuildAdmission"], "acquire", held_admission):
+            code, output = self.invoke(
+                linux=False, seconds="3480", total="3540", slot=self.shared_slot_stub(),
+                filters=["rsid-store=store::migration", "rsi-common=store::migration"],
+                extra_args=["--job-max-sec", "3600", "--slot-wait-max-sec", "3600"],
+                job_started_at=str(time.time() - 179))
+        self.assertEqual(code, 0, output)
+        receipt = RUNNER["RECEIPT"]
+        self.assertEqual([item["status"] for item in receipt["packages"]], ["passed", "passed"])
+        self.assertEqual(comparison_budgets, [3540])
+        self.assertGreaterEqual(receipt["admission"]["startup_wait_sec"], 179)
+        self.assertGreaterEqual(receipt["admission"]["waited_sec"], 2279)
+        self.assertEqual(receipt["admission"]["excluded_from_execution"], True)
 
     def test_python_only_daemon_diff_runs_without_acquiring_a_slot(self):
         tests = self.root / "scripts/tests"
@@ -1346,7 +1710,7 @@ os.execv(sys.argv[1], sys.argv[1:])
                                    slot=slot, extra_args=["--job-max-sec", "3600"], entrypoint=True)
         self.assertEqual(code, 0, output)
         receipt = self.receipt_of(output)
-        self.assertEqual(receipt["packages"], [])
+        self.assertEqual(self.core_packages(receipt), [])
         self.assertEqual(receipt["python"], [{"test_file": "scripts/tests/test_widget.py", "status": "passed",
                                              "completed": True, "runner": "unittest", "executed_tests": 1}])
         commands = self.log.read_text()
@@ -1513,6 +1877,39 @@ else:
         self.assertEqual(result["baseline_reds"], [{"package": "rsid-store", "kind": "lib",
                                                      "target": "rsid_store", "test": "store::migration"}])
 
+    def test_base_comparison_plan_sets_up_e2e_for_e2e_tui_failures(self):
+        """#3321: the base rerun of an e2e_tui failure needs RSI_E2E=1 and the rsid prebuild."""
+        fn = RUNNER["compare_failures_with_base"]
+        plans = []
+        for target, expect_e2e in (("e2e_tui", True), ("flow", False)):
+            log_dir = self.root / f"e2e-base-{target}"
+            log_dir.mkdir()
+
+            def git(command, **_kwargs):
+                if command[:3] == ["git", "worktree", "add"]:
+                    Path(command[-2]).mkdir()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def command(plan, _path, _seconds, _quota, _linux, env=None):
+                plans.append(plan)
+                return [sys.executable], None
+
+            def stream(_command, emit, **_kwargs):
+                emit("scoped-test: rsi executed 1 tests\n")
+                return 0
+
+            failure = {"kind": "test", "target": target, "test": "issue_jump::one"}
+            with patch.dict(fn.__globals__, stream=stream, bounded_command=command,
+                            seed_baseline_target=lambda *_: None), \
+                 patch("subprocess.run", side_effect=git):
+                fn(self.root, "base", {"rsi": [failure]}, log_dir, 30, 200, False,
+                   [str(self.cargo)])
+            plan = plans[-1]
+            self.assertEqual("e2e" in plan, expect_e2e, target)
+            if expect_e2e:
+                self.assertEqual(plan["e2e"]["prebuild"],
+                                 RUNNER["e2e_prebuild_command"]([str(self.cargo)]))
+
     def test_base_red_requires_a_failing_base_run_and_an_observed_named_failure(self):
         failure = {"kind": "lib", "target": "rsid_store", "test": "store::migration"}
         fn = RUNNER["compare_failures_with_base"]
@@ -1565,6 +1962,169 @@ sys.exit(1)
             {**failure, "status": "unknown", "records": []}])
         self.assertEqual(receipt["new_failures"], [])
         self.assertIn("baseline red without known-failure record: rsid-store store::migration", output)
+        # A loaded snapshot with no record for the red keeps the run red, as before #183.
+        self.assertFalse(self.emitted_receipt(code)["ok"])
+
+    def emitted_receipt(self, code):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            RUNNER["emit_receipt"](code)
+        return json.loads(out.getvalue().splitlines()[-1].removeprefix("SCOPED_TEST_RECEIPT "))
+
+    def run_with_baseline(self, comparison, record):
+        fn = RUNNER["main"]
+        with patch.dict(fn.__globals__,
+                        compare_failures_with_base=lambda *_: comparison,
+                        split_stale_base_failures=lambda *_: ([], {}),
+                        query_failure_records=lambda *_: record):
+            code, output = self.invoke(systemd_body="""
+print('SCOPED_MATCH rsid=shard:store-01:test(store::migration)')
+print('SCOPED_START store::migration')
+print('SCOPED_END store::migration')
+print('SCOPED_FAILURE lib:rsid_store store::migration')
+print('SCOPED_PHASE listed')
+print('SCOPED_PHASE test_failed')
+sys.exit(1)
+""")
+        return code, output, self.emitted_receipt(code)
+
+    def test_baseline_confirmed_red_without_snapshot_is_ok_with_its_reason(self):
+        failure = {"package": "rsid-store", "kind": "lib", "target": "rsid_store", "test": "store::migration"}
+        missing = {"status": "unavailable", "source": "snapshot",
+                   "reason": "cannot read snapshot fixture/known-failures.v1.json: No such file or directory"}
+        code, output, receipt = self.run_with_baseline(
+            {"status": "complete", "base": "origin/rolling", "baseline_reds": [failure]}, missing)
+        self.assertEqual(code, 1, output)
+        self.assertEqual((receipt["exit_code"], receipt["ok"]), (1, True))
+        self.assertEqual(receipt["ok_reason"], "baseline_confirmed_without_snapshot")
+        self.assertEqual(receipt["new_failures"], [])
+        self.assertEqual(receipt["baseline_failure_records"], [{**failure, **missing}])
+        self.assertIn("scoped-test: ok: every failure is a baseline red (baseline_confirmed_without_snapshot)",
+                      output)
+
+    def test_baseline_red_with_an_active_record_is_ok_with_its_reason(self):
+        failure = {"package": "rsid-store", "kind": "lib", "target": "rsid_store", "test": "store::migration"}
+        record = {"issue": 183, "class": "regression", "test_id": "store::migration"}
+        code, output, receipt = self.run_with_baseline(
+            {"status": "complete", "base": "origin/rolling", "baseline_reds": [failure]},
+            {"status": "recorded", "source": "snapshot", "records": [record]})
+        self.assertEqual(code, 1, output)
+        self.assertEqual((receipt["ok"], receipt["ok_reason"]), (True, "baseline_known_failure"))
+
+    @staticmethod
+    def core_packages(receipt):
+        """The package entries without the per-package failure lists #199 added."""
+        drop = ("failed_tests", "new_failures", "baseline_reds")
+        return [{k: v for k, v in entry.items() if k not in drop} for entry in receipt["packages"]]
+
+    def run_two_failures(self, reds, record):
+        """A package where two tests fail and 7 ran, only 2 of them as SCOPED_START/END pairs (#199)."""
+        fn = RUNNER["main"]
+        # The module-level receipt outlives one run: keep an earlier test's unmatched filters out.
+        with patch.dict(RUNNER["RECEIPT"]), patch.dict(
+                fn.__globals__,
+                compare_failures_with_base=lambda *_: {
+                    "status": "complete", "base": "origin/rolling", "baseline_reds": reds},
+                split_stale_base_failures=lambda *_: ([], {}),
+                query_failure_records=lambda *_: record):
+            RUNNER["RECEIPT"].pop("unmatched_filters", None)
+            code, output = self.invoke(systemd_body="""
+print('SCOPED_MATCH rsid=shard:store-01:test(store::migration)')
+for name in ('store::migration', 'store::other'):
+    print('SCOPED_START ' + name)
+    print('SCOPED_END ' + name)
+    print('SCOPED_FAILURE lib:rsid_store ' + name)
+print('scoped-test: rsid-store executed 7 tests')
+print('SCOPED_EXECUTED rsid-store 7')
+print('SCOPED_PHASE listed')
+print('SCOPED_PHASE test_failed')
+sys.exit(1)
+""")
+            final = self.emitted_receipt(code)
+        receipts = [json.loads(line.removeprefix("SCOPED_TEST_RECEIPT ")) for line in output.splitlines()
+                    if line.startswith("SCOPED_TEST_RECEIPT ")]
+        return code, output, receipts, final
+
+    def test_only_baseline_reds_leave_a_final_package_verdict_split_by_origin(self):
+        migration = {"package": "rsid-store", "kind": "lib", "target": "rsid_store", "test": "store::migration"}
+        other = {**migration, "test": "store::other"}
+        record = {"status": "recorded", "source": "snapshot", "records": [
+            {"issue": 183, "class": "regression", "test_id": "store::migration"},
+            {"issue": 184, "class": "regression", "test_id": "store::other"}]}
+        code, output, receipts, final = self.run_two_failures([migration, other], record)
+        self.assertEqual(code, 1, output)
+        package = final["packages"][0]
+        # A final status, the whole run's completed count and the failing ids split by origin.
+        self.assertEqual((package["status"], package["phase"], package["completed"]),
+                         ("failed", "test_failed", 7))
+        self.assertEqual(package["failed_tests"], [migration, other])
+        self.assertEqual((package["new_failures"], package["baseline_reds"]), ([], [migration, other]))
+        # The package lists are the top-level lists, the ones AgentCheckLandingCandidate reads.
+        self.assertEqual((package["new_failures"], package["baseline_reds"]),
+                         (final["new_failures"], final["baseline_reds"]))
+        self.assertEqual((final["ok"], final.get("ok_reason")), (True, "baseline_known_failure"), output)
+        # No printed receipt after the package settled can read "running": a run cut off during the
+        # base comparison leaves the last printed one (#199).
+        settled = [r for r in receipts if "failed_tests" in (r["packages"] or [{}])[0]]
+        self.assertTrue(settled, receipts)
+        self.assertFalse(any(p["status"] == "running" for p in settled[-1]["packages"]))
+        self.assertEqual(receipts[-1]["packages"][0]["baseline_reds"], [migration, other])
+
+    def test_a_new_red_beside_a_baseline_red_is_split_per_package(self):
+        migration = {"package": "rsid-store", "kind": "lib", "target": "rsid_store", "test": "store::migration"}
+        other = {**migration, "test": "store::other"}
+        code, output, _receipts, final = self.run_two_failures(
+            [migration], {"status": "recorded", "source": "snapshot", "records": [
+                {"issue": 183, "class": "regression", "test_id": "store::migration"}]})
+        self.assertEqual(code, 1, output)
+        package = final["packages"][0]
+        self.assertEqual((package["new_failures"], package["baseline_reds"]), ([other], [migration]))
+        self.assertEqual((final["new_failures"], final["baseline_reds"]), ([other], [migration]))
+        self.assertFalse(final["ok"])
+
+    def test_an_unavailable_base_comparison_leaves_package_new_failures_unknown(self):
+        fn = RUNNER["split_package_failures"]
+        failed = {"package": "p", "kind": "lib", "target": "t", "test": "a"}
+        packages = [{"package": "p", "failed_tests": [failed]}]
+        fn(packages, None, set(), False)
+        self.assertEqual((packages[0]["new_failures"], packages[0]["baseline_reds"]), (None, []))
+
+    def test_a_new_failure_is_never_ok_without_a_snapshot(self):
+        failure = {"package": "rsid-store", "kind": "lib", "target": "rsid_store", "test": "store::migration"}
+        code, output, receipt = self.run_with_baseline(
+            {"status": "complete", "base": "origin/rolling", "baseline_reds": []},
+            {"status": "unavailable", "source": "snapshot", "reason": "known-failure snapshot missing file"})
+        self.assertEqual(code, 1, output)
+        self.assertEqual(receipt["new_failures"], [failure])
+        self.assertEqual((receipt["ok"], receipt.get("ok_reason")), (False, None))
+
+    def test_baseline_only_ok_needs_a_clean_run_apart_from_baseline_reds(self):
+        fn = RUNNER["baseline_only_ok_reason"]
+        red = {"package": "rsid", "kind": "lib", "target": "rsid", "test": "a::b"}
+        unavailable = {**red, "status": "unavailable", "reason": "known-failure snapshot missing file"}
+        base = {"dry_run": False, "baseline_comparison": {"status": "complete"}, "failures": [red],
+                "baseline_reds": [red], "new_failures": [], "baseline_failure_records": [unavailable],
+                "packages": [{"package": "rsid", "status": "failed", "phase": "test_failed"},
+                             {"package": "rsid-store", "status": "passed"}],
+                "python": [{"status": "passed"}], "desktop": [], "warnings": {"status": "ok"}}
+        self.assertEqual(fn(base), "baseline_confirmed_without_snapshot")
+        for name, change in (
+                ("comparison incomplete", {"baseline_comparison": {"status": "incomplete"}}),
+                ("new failure", {"new_failures": [red]}),
+                ("no comparison verdict", {"new_failures": None}),
+                ("stale-base red only", {"baseline_reds": []}),
+                ("timed out", {"packages": [{"package": "rsid", "status": "timed out"}]}),
+                ("incomplete package", {"packages": [{"package": "rsid", "status": "failed",
+                                                      "phase": "incomplete"}]}),
+                ("build failed", {"packages": [{"package": "rsid", "status": "failed", "phase": "build_failed"}]}),
+                ("unmatched filter", {"unmatched_filters": ["rsid=x"]}),
+                ("warning gate", {"warnings": {"status": "new_warnings"}}),
+                ("desktop lane", {"desktop": [{"status": "runner_unavailable"}]}),
+                ("untracked red", {"baseline_failure_records": [{**red, "status": "unknown", "records": []}]}),
+                ("unannotated red", {"baseline_failure_records": []}),
+                ("dry run", {"dry_run": True}),
+                ("no failures", {"failures": []})):
+            with self.subTest(name=name):
+                self.assertIsNone(fn({**base, **change}))
 
     def test_known_failure_record_lookup_preserves_unknown_and_unavailable(self):
         fn = RUNNER["query_failure_records"]
@@ -1600,12 +2160,147 @@ sys.exit(1)
                 ("", "cannot read snapshot", 2, "unavailable"),
                 (json.dumps({**record, "test_id": "other"}), "", 0, "unavailable")):
             with self.subTest(output=output, stderr=stderr), \
-                 patch.dict(os.environ, RSI_SESSION_TOKEN="", RSI_KNOWN_FAILURE_BIN="classifier"), \
+                 patch.dict(os.environ, RSI_SESSION_TOKEN="", RSI_JOB_ID="", RSI_KNOWN_FAILURE_BIN="classifier"), \
                  patch("subprocess.run", return_value=
                        subprocess.CompletedProcess([], code, output, stderr)) as run:
                 result = fn(self.root, "store::migration", 2)
                 self.assertEqual((result["status"], result["source"]), (status, "snapshot"))
                 self.assertEqual(run.call_args.args[0], ["classifier", "query", "store::migration"])
+                if stderr:
+                    self.assertEqual(result["reason"], stderr)
+
+    def test_daemon_job_reads_project_snapshot_without_classifier_or_authority(self):
+        fn = RUNNER["query_failure_records"]
+        path = self.root / "target/.rsi-tmp/scoped-test/known-failures.v1.json"
+        path.parent.mkdir(parents=True)
+        record = {"schema_version": 1, "issue": 430, "test_id": "store::migration",
+                  "class": "regression", "matcher": {"contains": ["boom"]}}
+        export = {"schema_version": 1, "project_id": "00000000-0000-4000-8000-000000000430",
+                  "snapshot": {"schema_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(),
+                               "records": [{"record": record, "issue_status": "InProgress"}]},
+                  "malformed_issues": []}
+        for name, records, errors, status, expected_records in (
+                ("recorded", export["snapshot"]["records"], [], "recorded", [record]),
+                ("different test", [{"record": {**record, "test_id": "another::test"},
+                                     "issue_status": "Open"}], [], "unknown", []),
+                ("closed owner", [{"record": record, "issue_status": "Closed"}], [], "unknown", []),
+                ("empty export", [], [], "unknown", []),
+                ("malformed source", [], ["issue #430: invalid JSON"], "unavailable", None),
+                ("matching record despite other malformed source", export["snapshot"]["records"],
+                 ["issue #431: invalid JSON"], "recorded", [record])):
+            with self.subTest(name=name), \
+                 patch.dict(os.environ, RSI_SESSION_TOKEN="", RSI_JOB_ID="job-fixture",
+                            HOME=str(self.root / "different-home"), TMPDIR=str(self.root / "job-private-tmp"),
+                            CARGO_TARGET_DIR="another-target"), \
+                 patch("subprocess.run") as run:
+                current = {**export, "snapshot": {**export["snapshot"], "records": records},
+                           "malformed_issues": errors}
+                path.write_text(json.dumps(current))
+                result = fn(self.root, "store::migration", 2)
+                self.assertEqual((result["status"], result["source"]), (status, "snapshot"))
+                self.assertEqual(result["path"], str(path))
+                if expected_records is not None:
+                    self.assertEqual(result["records"], expected_records)
+                    self.assertGreaterEqual(result["age_seconds"], 0)
+                    if status == "unknown":
+                        self.assertEqual(result["reason"], "snapshot loaded; no matching active record")
+                else:
+                    self.assertEqual(result["malformed_issues"], errors)
+                run.assert_not_called()
+
+    def test_daemon_snapshot_qa_issue_mentions_are_advisory_and_do_not_change_verdict(self):
+        path = self.root / "target/.rsi-tmp/scoped-test/known-failures.v1.json"
+        path.parent.mkdir(parents=True)
+        export = {"schema_version": 1, "project_id": "00000000-0000-4000-8000-000000000430",
+                  "snapshot": {"schema_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(),
+                               "records": []}, "malformed_issues": [],
+                  "qa_advisories": {"store::migration": [430, 431], "store::migration_extra": [432]}}
+        path.write_text(json.dumps(export))
+        failure = {"package": "rsid-store", "kind": "lib", "target": "rsid_store",
+                   "test": "store::migration"}
+        with patch.dict(os.environ, RSI_SESSION_TOKEN="", RSI_JOB_ID="job-fixture"), \
+             patch("subprocess.run") as run, contextlib.redirect_stdout(io.StringIO()) as out:
+            annotation = RUNNER["annotate_baseline_reds"](self.root, [failure])
+        expected = [{"issue": number, "message":
+                     f"open qa Issue #{number} names this test (advisory, not a signature match)"}
+                    for number in (430, 431)]
+        record = annotation["baseline_failure_records"][0]
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["records"], [])
+        self.assertEqual(record["qa_issue_advisories"], expected)
+        self.assertEqual(annotation["baseline_reds_without_record"], [failure])
+        for advisory in expected:
+            self.assertIn(advisory["message"], out.getvalue())
+        receipt = {"baseline_comparison": {"status": "complete"}, "failures": [failure],
+                   "baseline_reds": [failure], "new_failures": [], **annotation}
+        self.assertIsNone(RUNNER["baseline_only_ok_reason"](receipt))
+        run.assert_not_called()
+
+    def test_daemon_snapshot_qa_advisory_is_exact_and_signature_records_win(self):
+        path = self.root / "target/.rsi-tmp/scoped-test/known-failures.v1.json"
+        path.parent.mkdir(parents=True)
+        record = {"schema_version": 1, "issue": 433, "test_id": "store::migration",
+                  "class": "regression", "matcher": {"contains": ["boom"]}}
+        export = {"schema_version": 1, "project_id": "00000000-0000-4000-8000-000000000430",
+                  "snapshot": {"schema_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(),
+                               "records": []}, "malformed_issues": []}
+        fn = RUNNER["query_job_failure_snapshot"]
+        for name, records, advisories, status, expected_issues in (
+                ("prefix collision", [], {"store::migration_extra": [430]}, "unknown", []),
+                ("signature wins", [{"record": record, "issue_status": "Open"}],
+                 {"store::migration": [430]}, "recorded", [record]),
+                ("malformed optional context", [], [430], "unknown", []),
+                ("malformed optional Issue numbers", [], {"store::migration": [True]}, "unknown", []),
+                ("old snapshot", [], None, "unknown", [])):
+            with self.subTest(name=name):
+                current = {**export, "snapshot": {**export["snapshot"], "records": records}}
+                if advisories is not None:
+                    current["qa_advisories"] = advisories
+                path.write_text(json.dumps(current))
+                result = fn(self.root, "store::migration")
+                self.assertEqual((result["status"], result["records"]), (status, expected_issues))
+                self.assertEqual(result.get("qa_issue_advisories", []), [])
+
+    def test_daemon_snapshot_load_failures_report_concrete_causes_and_stale_age(self):
+        fn = RUNNER["query_failure_records"]
+        path = self.root / "target/.rsi-tmp/scoped-test/known-failures.v1.json"
+        path.parent.mkdir(parents=True)
+        with patch.dict(os.environ, RSI_SESSION_TOKEN="", RSI_JOB_ID="job-fixture"):
+            missing = fn(self.root, "store::migration", 2)
+            self.assertEqual(missing["status"], "unavailable")
+            self.assertIn(f"missing file: {path}", missing["reason"])
+            path.mkdir()
+            unreadable = fn(self.root, "store::migration", 2)
+            self.assertEqual(unreadable["status"], "unavailable")
+            self.assertIn("read error:", unreadable["reason"])
+            path.rmdir()
+            export = {"schema_version": 1, "project_id": "00000000-0000-4000-8000-000000000430",
+                      "snapshot": {"schema_version": 1, "exported_at": datetime.now(timezone.utc).isoformat(),
+                                   "records": []}, "malformed_issues": []}
+            for content, reason in (
+                    ("not JSON", "parse error:"),
+                    (json.dumps({**export, "schema_version": 2}), "unsupported export schema_version"),
+                    (json.dumps({**export, "snapshot": {**export["snapshot"], "schema_version": 2}}),
+                     "unsupported snapshot schema_version"),
+                    (json.dumps({**export, "snapshot": {**export["snapshot"], "exported_at": "invalid"}}),
+                     "exported_at must be RFC3339"),
+                    (json.dumps({**export, "snapshot": {**export["snapshot"], "records": [{}]}}),
+                     "parse error:"),
+                    (json.dumps({**export, "snapshot": {**export["snapshot"], "records": {}}}),
+                     "records and malformed_issues must be lists")):
+                with self.subTest(reason=reason):
+                    path.write_text(content)
+                    result = fn(self.root, "store::migration", 2)
+                    self.assertEqual(result["status"], "unavailable")
+                    self.assertIn(reason, result["reason"])
+            old = datetime.now(timezone.utc) - timedelta(hours=25, seconds=13)
+            export["snapshot"]["exported_at"] = old.isoformat()
+            path.write_text(json.dumps(export))
+            stale = fn(self.root, "store::migration", 2)
+            self.assertEqual(stale["status"], "unavailable")
+            self.assertAlmostEqual(stale["age_seconds"], 90013, delta=2)
+            self.assertIn(f"age={stale['age_seconds']:.3f}s", stale["reason"])
+            self.assertIn("limit=86400s", stale["reason"])
 
     def test_baseline_record_annotation_deduplicates_queries_and_bounds_lookup_time(self):
         first = {"package": "rsid", "kind": "lib", "target": "rsid", "test": "one"}
@@ -1949,7 +2644,7 @@ print({json.dumps(json.dumps(artifact))})
                reclaim_incremental=False, derive_code=0, audits=None, guard_failure=None,
                broad=False, total=None, env_filters=None, python_paths=(), slot=None, extra_args=(),
                entrypoint=False, job_started_at=None, broad_filters=None, derived_extra=None, slot_held=False,
-               missing_guards=()):
+               missing_guards=(), downstream=None):
         selected = filters if filters is not None else ["rsid=shard:store-01:test(store::migration)"]
         receipt = subprocess.CompletedProcess([], derive_code, json.dumps({
             "suggested_filters": selected, "head": "candidate", "broad": broad,
@@ -1958,10 +2653,11 @@ print({json.dumps(json.dumps(artifact))})
                 "shard_gates": {"verdict": "ok"}, "released_migrations": {"verdict": "ok"}},
         }), "BROAD: split the run\n" if broad else "")
         self.guard_commands = []
-        # The guard scripts live in the candidate tree; a test names the ones its candidate predates (#3126).
+        # The guard scripts and the Rust guard modules (#360) live in the candidate tree; a test
+        # names the ones its candidate predates (#3126).
         for rel in ("scripts/check-rsid-test-shards.py", "tools/check-released-migrations.py",
-                    "tools/check_starter_pins.py", "tools/check_identity_assertions.py",
-                    "tools/check_portable_shell.py"):
+                    "crates/rsi-repo-guards/src/starter_pins.rs", "crates/rsi-repo-guards/src/settings_preflight.rs", "crates/rsi-repo-guards/src/identity_assertions.rs", "scripts/check-target-reclaim.py", "scripts/check-guard-regressions.py", "scripts/check-store-boundary.py", "crates/rsi-repo-guards/src/test_env_writes.rs",
+                    "crates/rsi-repo-guards/src/personal_paths.rs", "crates/rsi-repo-guards/src/agents_md_size.rs", "crates/rsi-repo-guards/src/portable_shell.rs"):
             if rel not in missing_guards:
                 (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
                 (self.root / rel).write_text("")
@@ -2000,6 +2696,9 @@ os.execv(sys.executable, [sys.executable, '-u', sys.argv[index - 1], *sys.argv[i
         log_dir = self.root / "output"
         log_dir.mkdir()
         checker = {"git_out": lambda *args: worktree_head if args[-1] == "HEAD" else head,
+                   "feature_test_inventory": lambda *args: [],
+                   "downstream_test_plan": lambda *args: (downstream if downstream is not None else
+                                                           {"changed_libraries": [], "packages": []}),
                    "cargo_prefix": lambda: [*([str(slot)] if slot and not os.environ.get("RSI_CARGO_SLOT_HELD") else []),
                                             str(self.cargo)],
                    "shard_packages": lambda repo: (shard_packages if shard_packages is not None else
@@ -2045,6 +2744,9 @@ os.execv(sys.executable, [sys.executable, '-u', sys.argv[index - 1], *sys.argv[i
                     os.environ[name] = value
 
         with patch.object(sys, "argv", argv), patch.object(sys, "platform", "linux" if linux else "darwin"), \
+             patch.dict(RUNNER["run"].__globals__, **({"downstream_test_plan": lambda *_args: downstream}
+                                                    if downstream is not None else {})), \
+             patch.dict(RUNNER["run"].__globals__, installed_rust_targets=lambda *_args: set()), \
              isolated_env(), \
              patch.dict(os.environ, env_patch), \
              patch("runpy.run_path", return_value=checker), patch("subprocess.run", side_effect=run) as derive, \
@@ -2068,6 +2770,30 @@ os.execv(sys.executable, [sys.executable, '-u', sys.argv[index - 1], *sys.argv[i
             self.assertIn("--filters-only", derive.call_args_list[0].args[0])
         return code, output.getvalue()
 
+    def test_compile_only_lane_records_success_without_runtime_test_evidence(self):
+        downstream = {"changed_libraries": [{"package": "rsi-common", "paths": ["src/lib.rs"]}],
+                      "packages": [{"package": "rsid-store", "status": "pending"}]}
+        code, output = self.invoke(linux=False, filters=[], downstream=downstream)
+        self.assertEqual(code, 0, output)
+        receipt = RUNNER["RECEIPT"]
+        entry = receipt["downstream_compile"]["packages"][0]
+        self.assertEqual((entry["status"], entry["execution"]), ("passed", "compile_only"))
+        self.assertIn("--tests", entry["command"])
+        self.assertEqual(self.core_packages(receipt), [{"package": "rsid-store", "status": "passed", "completed": 0}])
+        self.assertEqual(receipt["compile"]["packages"], {"rsid-store": "executed"})
+        self.assertEqual(len(self.log.read_text().splitlines()), 1)
+
+    def test_compile_only_lane_keeps_a_downstream_type_error_red_in_the_receipt(self):
+        self.cargo = self.executable("type-error-cargo", "print('error[E0308]: mismatched types')\nsys.exit(101)\n")
+        downstream = {"changed_libraries": [{"package": "rsi-common", "paths": ["src/lib.rs"]}],
+                      "packages": [{"package": "rsid-store", "status": "pending"}]}
+        code, output = self.invoke(linux=False, filters=[], downstream=downstream)
+        self.assertEqual(code, 1, output)
+        receipt = RUNNER["RECEIPT"]
+        self.assertEqual(receipt["downstream_compile"]["packages"][0]["status"], "failed")
+        self.assertEqual(receipt["packages"][0]["phase"], "build_failed")
+        self.assertEqual(receipt["compile"]["packages"], {"rsid-store": "failed"})
+
     def test_successful_package_run_ends_with_a_green_durable_receipt(self):
         code, output = self.invoke(linux=False, seconds="5", entrypoint=True)
         self.assertEqual(code, 0, output)
@@ -2076,7 +2802,7 @@ os.execv(sys.executable, [sys.executable, '-u', sys.argv[index - 1], *sys.argv[i
         self.assertTrue(lines[-1].startswith("SCOPED_TEST_RECEIPT "), output)
         receipt = json.loads(lines[-1].split(" ", 1)[1])
         self.assertEqual((receipt["ok"], receipt["exit_code"]), (True, code))
-        self.assertEqual(receipt["packages"], [
+        self.assertEqual(self.core_packages(receipt), [
             {"package": "rsid-store", "status": "passed", "completed": 1}])
         self.assertEqual(receipt["filters"], ["rsid=shard:store-01:test(store::migration)"])
         self.assertEqual(receipt["log_dir"], str(self.root / "output"))
@@ -2135,7 +2861,7 @@ else:
         self.assertTrue(lines[-1].startswith("SCOPED_TEST_RECEIPT "), output)
         receipt = json.loads(lines[-1].split(" ", 1)[1])
         self.assertEqual((receipt["ok"], receipt["exit_code"]), (False, code))
-        self.assertEqual(receipt["packages"], [
+        self.assertEqual(self.core_packages(receipt), [
             {"package": "rsid-store", "status": "failed", "completed": 1, "phase": "test_failed",
              "log": str(self.root / "output/rsid-store.log")}])
         self.assertEqual(receipt["failures"], [
@@ -2224,7 +2950,7 @@ else:
         self.assertEqual(code, 1, output)  # The empty filter still needs attention.
         self.assertIn("SCOPED_COMPLETE rsid-store 90", output)
         receipt = self.receipt_of(output)
-        self.assertEqual(receipt["packages"], [
+        self.assertEqual(self.core_packages(receipt), [
             {"package": "rsid-store", "status": "passed", "completed": 90}])
         self.assertEqual(receipt["unmatched_filters"], [missing])
 
@@ -2315,7 +3041,7 @@ else:
         receipt = json.loads(output.splitlines()[-1].split(" ", 1)[1])
         self.assertEqual(receipt["scratch_mode"], "tmpfs")
         self.assertEqual(receipt["scratch_parent"], parent)
-        self.assertEqual(receipt["packages"], [{"package": "rsid-store", "status": "passed", "completed": 1}])
+        self.assertEqual(self.core_packages(receipt), [{"package": "rsid-store", "status": "passed", "completed": 1}])
 
     def assert_default_fallback_runs_tests(self, linux):
         with patch.dict(os.environ, CHECK_TOUCHED_SHARDS_TMPDIR=str(self.root / "missing")):
@@ -2325,7 +3051,7 @@ else:
         receipt = json.loads(output.splitlines()[-1].split(" ", 1)[1])
         self.assertEqual(receipt["scratch_mode"], "host")
         self.assertTrue(receipt["parity_unavailable"])
-        self.assertEqual(receipt["packages"], [{"package": "rsid-store", "status": "passed", "completed": 1}])
+        self.assertEqual(self.core_packages(receipt), [{"package": "rsid-store", "status": "passed", "completed": 1}])
         commands = self.log.read_text().splitlines()
         self.assertEqual(sum(line.startswith("cargo-stub test ") for line in commands), 1)
         self.assertEqual(sum(line.startswith("test-binary store::migration ") for line in commands), 1)
@@ -2342,7 +3068,7 @@ else:
         self.assertRegex(output, r"TMPFS_PARITY unavailable: .*quota included.*below 1000000000 GiB")
         receipt = json.loads(output.splitlines()[-1].split(" ", 1)[1])
         self.assertEqual(receipt["scratch_mode"], "host")
-        self.assertEqual(receipt["packages"], [{"package": "rsid-store", "status": "passed", "completed": 1}])
+        self.assertEqual(self.core_packages(receipt), [{"package": "rsid-store", "status": "passed", "completed": 1}])
         self.assertEqual(list(parent.iterdir()), [])
 
     def test_tmpfs_parent_counts_the_user_quota_not_just_free_space(self):
@@ -2571,8 +3297,8 @@ else:
         self.assertEqual((receipt["python"], receipt["filters"], receipt["packages"]), ([], [], []))
         self.assertIn("scoped-test: execution order: the desktop lane", output)
         self.assertRegex(output, r"desktop lane: \S+ \S+desktop-test-gate\.py --run --repo ")
-        for name in ("whitespace", "shard_gates", "released_migrations", "starter_pins", "identity_assertions",
-                     "portable_shell"):
+        for name in ("whitespace", "shard_gates", "released_migrations", "starter_pins", "settings_preflight", "identity_assertions", "target_reclaim", "store_boundary", "test_env_writes",
+                     "personal_paths", "agents_md_size", "portable_shell"):
             self.assertIn(f"static guard {name}=ok", output)
         self.assertFalse(self.log.exists(), "a dry run must not start Cargo")
 
@@ -2661,7 +3387,7 @@ else:
         entry = receipt["desktop"][0]
         self.assertEqual((entry["status"], entry["completed"], entry["failed_step"]), ("failed", True, "npm test"))
         self.assertEqual((receipt["ok"], receipt["exit_code"]), (False, 1))
-        self.assertEqual(receipt["packages"], [{"package": package, "status": "passed", "completed": 1}
+        self.assertEqual(self.core_packages(receipt), [{"package": package, "status": "passed", "completed": 1}
                                               for package in ("rsid-store", "rsi-common")])
         self.assertEqual((receipt["python"][0]["status"], receipt["python"][0]["executed_tests"]), ("passed", 1))
         self.assertEqual(receipt["warnings"]["status"], "ok")
@@ -2769,14 +3495,21 @@ else:
         code, output = self.invoke(dry_run=True, broad=True)
         self.assertEqual(code, 0, output)
         self.assertIn("BROAD", output)
-        for name in ("whitespace", "shard_gates", "released_migrations", "starter_pins", "identity_assertions",
-                     "portable_shell"):
+        for name in ("whitespace", "shard_gates", "released_migrations", "starter_pins", "settings_preflight", "identity_assertions", "target_reclaim", "store_boundary", "test_env_writes",
+                     "personal_paths", "agents_md_size", "portable_shell"):
             self.assertIn(f"static guard {name}=ok", output)
         self.assertEqual(self.guard_commands, [
             ["git", "diff", "--check", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_starter_pins.py", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_identity_assertions.py"],
-            [sys.executable, "tools/check_portable_shell.py", "--base", "origin/rolling"],
+            ["scripts/repo-guard", "starter-pins", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "settings-preflight", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "identity-assertions"],
+            [sys.executable, "scripts/check-target-reclaim.py"],
+            [sys.executable, "scripts/check-guard-regressions.py", "origin/rolling", "candidate"],
+            [sys.executable, "scripts/check-store-boundary.py"],
+            ["scripts/repo-guard", "test-env-writes"],
+            ["scripts/repo-guard", "personal-paths"],
+            ["scripts/repo-guard", "agents-md-size"],
+            ["scripts/repo-guard", "portable-shell", "--base", "origin/rolling"],
         ])
         self.assertEqual(list(self.root.glob("commands.log")), [])
 
@@ -2941,9 +3674,16 @@ else:
             ["git", "diff", "--check", "origin/rolling", "candidate"],
             [sys.executable, "scripts/check-rsid-test-shards.py", "--require-gates"],
             [sys.executable, "tools/check-released-migrations.py", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_starter_pins.py", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_identity_assertions.py"],
-            [sys.executable, "tools/check_portable_shell.py", "--base", "origin/rolling"],
+            ["scripts/repo-guard", "starter-pins", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "settings-preflight", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "identity-assertions"],
+            [sys.executable, "scripts/check-target-reclaim.py"],
+            [sys.executable, "scripts/check-guard-regressions.py", "origin/rolling", "candidate"],
+            [sys.executable, "scripts/check-store-boundary.py"],
+            ["scripts/repo-guard", "test-env-writes"],
+            ["scripts/repo-guard", "personal-paths"],
+            ["scripts/repo-guard", "agents-md-size"],
+            ["scripts/repo-guard", "portable-shell", "--base", "origin/rolling"],
         ])
         self.assertIn("static guard shard_gates=fail: guard finding", output)
         self.assertIn("static guard released_migrations=ok", output)
@@ -2954,23 +3694,23 @@ else:
         # #3126: the tool copy is rolling's, the guard scripts are the candidate's. A stack that
         # predates a guard must still run its tests; the merge queue runs the guard on the merged tree.
         code, output = self.invoke(explicit=["rsid-store=migration"],
-                                   missing_guards=("tools/check_starter_pins.py",), entrypoint=True)
+                                   missing_guards=("crates/rsi-repo-guards/src/starter_pins.rs",), entrypoint=True)
         self.assertEqual(code, 0, output)
         receipt = json.loads(output.splitlines()[-1].removeprefix("SCOPED_TEST_RECEIPT "))
         self.assertEqual(receipt["static_guards"]["starter_pins"], {
             "status": "skipped",
-            "detail": "tools/check_starter_pins.py not in candidate; merge queue runs it on the merged tree",
+            "detail": "crates/rsi-repo-guards/src/starter_pins.rs not in candidate; merge queue runs it on the merged tree",
         })
         self.assertEqual(receipt["static_guards"]["identity_assertions"]["status"], "ok")
-        self.assertIn("static guard starter_pins=skipped: tools/check_starter_pins.py not in candidate", output)
+        self.assertIn("static guard starter_pins=skipped: crates/rsi-repo-guards/src/starter_pins.rs not in candidate", output)
         self.assertIn("static guard identity_assertions=ok", output)
-        self.assertEqual(len(self.guard_commands), 5)
+        self.assertEqual(len(self.guard_commands), 12)  # thirteen guards, one missing
         self.assertNotIn(
-            [sys.executable, "tools/check_starter_pins.py", "origin/rolling", "candidate"], self.guard_commands)
+            ["scripts/repo-guard", "starter-pins", "origin/rolling", "candidate"], self.guard_commands)
 
     def test_a_present_guard_that_fails_still_blocks_when_another_is_missing(self):
-        code, output = self.invoke(explicit=["rsid-store=migration"], guard_failure="tools/check_portable_shell.py",
-                                   missing_guards=("tools/check_starter_pins.py",), entrypoint=True)
+        code, output = self.invoke(explicit=["rsid-store=migration"], guard_failure="portable-shell",
+                                   missing_guards=("crates/rsi-repo-guards/src/starter_pins.rs",), entrypoint=True)
         self.assertEqual(code, 1, output)
         receipt = json.loads(output.splitlines()[-1].removeprefix("SCOPED_TEST_RECEIPT "))
         self.assertEqual(receipt["static_guards"]["starter_pins"]["status"], "skipped")
@@ -2981,16 +3721,24 @@ else:
         self.assertIn("static guard portable_shell=fail: guard finding", output)
 
     def test_explicit_narrowing_runs_all_guards_and_each_failure_blocks_build(self):
-        for path, name in (("diff", "whitespace"),
-                           ("scripts/check-rsid-test-shards.py", "shard_gates"),
-                           ("tools/check-released-migrations.py", "released_migrations"),
-                           ("tools/check_starter_pins.py", "starter_pins"),
-                           ("tools/check_identity_assertions.py", "identity_assertions"),
-                           ("tools/check_portable_shell.py", "portable_shell")):
+        guards = (("diff", "whitespace"),
+                  ("scripts/check-rsid-test-shards.py", "shard_gates"),
+                  ("tools/check-released-migrations.py", "released_migrations"),
+                  ("starter-pins", "starter_pins"),
+                  ("settings-preflight", "settings_preflight"),
+                  ("identity-assertions", "identity_assertions"),
+                  ("scripts/check-target-reclaim.py", "target_reclaim"),
+                  ("scripts/check-guard-regressions.py", "guard_regressions"),
+                  ("scripts/check-store-boundary.py", "store_boundary"),
+                  ("test-env-writes", "test_env_writes"),
+                  ("personal-paths", "personal_paths"),
+                  ("agents-md-size", "agents_md_size"),
+                  ("portable-shell", "portable_shell"))
+        for path, name in guards:
             with self.subTest(guard=name):
                 code, output = self.invoke(explicit=["rsid-store=migration"], guard_failure=path)
                 self.assertEqual(code, 1, output)
-                self.assertEqual(len(self.guard_commands), 6)
+                self.assertEqual(len(self.guard_commands), len(guards))
                 self.assertIn(f"static guard {name}=fail: guard finding", output)
                 self.assertEqual(list(self.root.glob("commands.log")), [])
                 shutil.rmtree(self.root / "output")
@@ -3006,9 +3754,16 @@ else:
         self.assertIn("static guard portable_shell=ok", output)
         self.assertEqual(self.guard_commands, [
             ["git", "diff", "--check", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_starter_pins.py", "origin/rolling", "candidate"],
-            [sys.executable, "tools/check_identity_assertions.py"],
-            [sys.executable, "tools/check_portable_shell.py", "--base", "origin/rolling"],
+            ["scripts/repo-guard", "starter-pins", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "settings-preflight", "origin/rolling", "candidate"],
+            ["scripts/repo-guard", "identity-assertions"],
+            [sys.executable, "scripts/check-target-reclaim.py"],
+            [sys.executable, "scripts/check-guard-regressions.py", "origin/rolling", "candidate"],
+            [sys.executable, "scripts/check-store-boundary.py"],
+            ["scripts/repo-guard", "test-env-writes"],
+            ["scripts/repo-guard", "personal-paths"],
+            ["scripts/repo-guard", "agents-md-size"],
+            ["scripts/repo-guard", "portable-shell", "--base", "origin/rolling"],
         ])
         self.assertEqual(list(self.root.glob("commands.log")), [])
 
@@ -3050,16 +3805,20 @@ else:
     def test_total_budget_caps_each_package_and_skips_those_it_cannot_afford(self):
         # #1584: sequential package budgets must fit inside the job's own cap.
         filters = ["rsid=migration", "rsid-store=migration"]
-        code, output = self.invoke(filters=filters, explicit=filters, seconds="5", total="2",
-                                   systemd_body="""
-import time
-time.sleep(1.3)
-index = sys.argv.index('--execute-plan')
-os.execv(sys.executable, [sys.executable, '-u', sys.argv[index - 1], *sys.argv[index:]])
-""")
+        clock = ControlledClock()
+        stream = RUNNER["stream"]
+
+        def run_package(*args, **kwargs):
+            code = stream(*args, **kwargs)
+            # #499: charge a fixed package cost, independent of host scheduling.
+            clock.advance(1.3)
+            return code
+
+        with patch.dict(RUNNER["main"].__globals__, time=clock, stream=run_package):
+            code, output = self.invoke(filters=filters, explicit=filters, seconds="5", total="2")
         self.assertEqual(code, 1, output)
         commands = self.log.read_text()
-        self.assertEqual(len(re.findall(r"RuntimeMaxSec=(?:1\.9\d*|2) ", commands)), 1, commands)
+        self.assertEqual(re.findall(r"RuntimeMaxSec=(\S+) ", commands), ["2"], commands)
         self.assertEqual(commands.count("cargo-stub test"), 1)
         self.assertIn("scoped_test_timeout: total budget exhausted before rsid-store", output)
         self.assertIn("rsid: passed (1 completed tests)", output)
@@ -3201,6 +3960,49 @@ print('SCOPED_END store::migration', flush=True)
         self.assertIn("scoped_test_incomplete", output)
         self.assertIn("rsid-store: failed (1 completed tests)", output)
 
+    def test_a_worker_killed_by_a_signal_is_named_with_its_unfinished_tests_not_as_a_time_box(self):
+        # #146: a test that signals its own process group killed the worker after 617 tests on macOS;
+        # the run read as a bare incomplete next to a 600 s box. The signal and the tests the worker
+        # had started and not finished are named, in the message and in the package's receipt entry.
+        code, output = self.invoke(entrypoint=True, systemd_body="""
+import signal
+print('SCOPED_MATCH rsid=shard:store-01:test(store::migration)', flush=True)
+print('SCOPED_START store::migration::done', flush=True)
+print('SCOPED_END store::migration::done', flush=True)
+print('SCOPED_START store::migration::cut_a', flush=True)
+print('SCOPED_START store::migration::cut_b', flush=True)
+os.kill(os.getpid(), signal.SIGKILL)
+""")
+        self.assertEqual(code, 1, output)
+        incomplete = next(line for line in output.splitlines() if line.startswith("scoped_test_incomplete"))
+        self.assertIn("1 completed tests", incomplete)
+        self.assertIn("killed by SIGKILL", incomplete)
+        self.assertIn("not a time-box expiry", incomplete)
+        self.assertIn("store::migration::cut_a, store::migration::cut_b", incomplete)
+        self.assertNotIn("scoped_test_timeout", output)
+        receipt = json.loads(output.splitlines()[-1].split(" ", 1)[1])
+        entry = next(item for item in receipt["packages"] if item["package"] == "rsid-store")
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["worker_signal"], "SIGKILL")
+        self.assertEqual(entry["unfinished_tests"], ["store::migration::cut_a", "store::migration::cut_b"])
+        self.assertEqual(entry["unfinished_total"], 2)
+
+    def test_worker_end_names_the_signal_and_bounds_the_unfinished_list(self):
+        worker_end = RUNNER["worker_end"]
+        self.assertEqual(worker_end(0, {}), ("", {}))
+        self.assertEqual(worker_end(1, {}), ("", {}))
+        suffix, fields = worker_end(-signal.SIGTERM, {})
+        self.assertIn("killed by SIGTERM", suffix)
+        self.assertEqual(fields, {"worker_signal": "SIGTERM"})
+        suffix, fields = worker_end(0, {"b": 1.0, "a": 2.0})
+        self.assertIn("started and not finished, not failures: a, b", suffix)
+        self.assertEqual((fields["unfinished_tests"], fields["unfinished_total"]), (["a", "b"], 2))
+        many = {f"t{index:03}": 0.0 for index in range(RUNNER["UNFINISHED_LIMIT"] + 5)}
+        suffix, fields = worker_end(1, many)
+        self.assertEqual(len(fields["unfinished_tests"]), RUNNER["UNFINISHED_LIMIT"])
+        self.assertEqual(fields["unfinished_total"], RUNNER["UNFINISHED_LIMIT"] + 5)
+        self.assertIn("(+5 more)", suffix)
+
     def test_termination_overrides_successful_completion_receipt(self):
         for outcome in ("code=killed, status=15/TERM", "code=dumped, status=11/SEGV",
                         "Finished with result: signal"):
@@ -3242,6 +4044,53 @@ print('Finished with result: timeout')
         self.assertEqual(code, 1, output)
         self.assertIn("scoped_test_timeout", output)
         self.assertIn("rsid-store: timed out (0 completed tests)", output)
+
+    def test_timeout_retains_passed_priority_filter_coverage_and_a_red_receipt(self):
+        # The worker is killed inside a batch, before it can emit SCOPED_SUBSET (#448).
+        # Listing and verdicts must preserve the completed priority regex, the partial
+        # broad observer, and the exact tests that never reached a verdict.
+        priority = "rsid=shard:store-01:test(/^case::pri_[ab]$/)"
+        broad = "rsid-store=case::"
+        pending = ["rsid=shard:store-01:test(=case::hang)", "rsid=shard:store-01:test(=case::unrun)"]
+        self.binary = self.executable("test-binary", """
+import time
+if '--list' in sys.argv:
+    for name in ('case::pri_a', 'case::pri_b', 'case::hang', 'case::unrun'):
+        print(name + ': test')
+else:
+    for name in sys.argv[1:]:
+        if name.startswith('case::'):
+            if name == 'case::hang':
+                print('test ' + name + ' ... ', flush=True)
+                time.sleep(60)
+            print('test ' + name + ' ... ok', flush=True)
+""")
+        code, output = self.invoke(
+            linux=False, seconds="2", entrypoint=True, filters=[broad, *pending],
+            derived_extra={"priority_filters": [priority]},
+            extra_args=["--filter-budget", "1", "--test-shards", "1"])
+        receipt = self.receipt_of(output)
+        self.assertEqual(code, 1, output)
+        self.assertFalse(receipt["ok"])
+        self.assertTrue(receipt["packages"], output)
+        self.assertEqual(receipt["packages"][0]["status"], "timed out")
+        self.assertEqual(receipt["packages"][0]["completed"], 2)
+        self.assertIn("test case::pri_a ... ok", output)
+        self.assertIn("test case::pri_b ... ok", output)
+        self.assertEqual((receipt["selected_tests"], receipt["run_tests"]), (4, 2))
+        self.assertEqual((receipt["selected_filters"], receipt["run_filters"]), (4, 1))
+        self.assertEqual(receipt["filters_partial"], [{"filter": broad, "selected": 4, "executed": 2}])
+        self.assertEqual(receipt["filters_not_run"], pending)
+        self.assertEqual(receipt["unlisted_packages"], [])
+
+    def test_interrupted_coverage_keeps_identical_names_in_different_binaries_separate(self):
+        records = [{"selected": ["same::test"], "ran": ran, "by_filter": {"shared": ["same::test"]},
+                    "changed": ["same::test"], "direct": [], "bounded": {}, "deferred": []}
+                   for ran in (["same::test"], [])]
+        subset = RUNNER["subset_progress"]("rsid", records, True, 1)
+        self.assertEqual(subset["filters"], {"shared": [2, 1]})
+        self.assertEqual(subset["changed_module_tests"], [2, 1])
+        self.assertEqual((subset["selected_tests"], subset["run_tests"]), (2, 1))
 
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("systemd-run"),
                          "requires Linux systemd")
@@ -3530,6 +4379,7 @@ if Path(sys.argv[index + 1]).stem == 'rsid':
         self.assertEqual(code, 1, output)
         self.assertEqual(receipt["warnings"]["status"], "baseline_raised")
         self.assertIn("scoped-test: warning_baseline_raised: rsid-store: baseline raised", output)
+        self.assertEqual(receipt["reverts_recent_landing"]["status"], "skipped")
 
     def test_no_checked_in_baseline_leaves_the_run_and_its_receipt_alone(self):
         code, output, receipt = self.warning_run_with(*self.warning_messages(*known_warnings()))
@@ -3573,7 +4423,7 @@ class WhitespaceGuardTest(unittest.TestCase):
                 return real_run(command, **kwargs)
             return subprocess.CompletedProcess(command, 0, "", "")
         audits = {name: {"verdict": "ok"} for name in
-                  ("shard_gates", "released_migrations", "identity_assertions", "portable_shell")}
+                  ("shard_gates", "released_migrations", "identity_assertions", "target_reclaim", "portable_shell")}
         out = io.StringIO()
         with patch.object(subprocess, "run", run), contextlib.redirect_stdout(out):
             failed = RUNNER["static_guards"](repo, base, head, audits)
@@ -3592,7 +4442,25 @@ class WhitespaceGuardTest(unittest.TestCase):
 
 
 class ScopedTestReceipt(unittest.TestCase):
-    """#1638: the daemon's scoped-test job reads the last-line JSON receipt."""
+    """#1638: the daemon's scoped-test job reads the last-line JSON receipt.
+
+    #3256: the dry runs target an empty fixture repository, never this checkout. The real checkout's
+    static guards (a deferred migration pin, a dirty tool tree) would otherwise decide these
+    receipt tests; a fixture without the guard scripts reports every guard as skipped."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._fixture_temp = scratch_tempdir(prefix="scoped-test-receipt-")
+        cls.fixture = Path(cls._fixture_temp.name) / "repo"
+        cls.fixture.mkdir()
+        scratch_git(cls.fixture, "init", "--quiet")
+        scratch_git(cls.fixture, "config", "user.name", "Test")
+        scratch_git(cls.fixture, "config", "user.email", "test@example.invalid")
+        scratch_git(cls.fixture, "commit", "--quiet", "--allow-empty", "-m", "base")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._fixture_temp.cleanup()
 
     def run_script(self, *args, extra_env=None):
         # A recipe job exports focused filters that would replace the derived plan, and a
@@ -3602,18 +4470,18 @@ class ScopedTestReceipt(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in leaked}
         env["RSI_SCOPED_TEST_RUNNER"] = "libtest"
         env.update(extra_env or {})
-        done = subprocess.run([sys.executable, str(SCRIPT), *args], cwd=SCRIPT.parents[1],
+        done = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(self.fixture), *args], cwd=SCRIPT.parents[1],
                               text=True, capture_output=True, env=env)
         lines = done.stdout.splitlines()
         self.assertTrue(lines and lines[-1].startswith("SCOPED_TEST_RECEIPT "), done.stdout + done.stderr)
         return done.returncode, json.loads(lines[-1].split(" ", 1)[1])
 
     def test_a_dry_run_ends_with_the_typed_receipt(self):
-        code, receipt = self.run_script("--dry-run", "--base", "HEAD", "--filter", "rsid=shard:other-01:test(x)")
+        code, receipt = self.run_script("--dry-run", "--base", "HEAD", "--filter", "rsid-core=error")
         self.assertEqual(code, 0)
         self.assertEqual((receipt["ok"], receipt["exit_code"], receipt["schema"]), (True, 0, 1))
         self.assertEqual(receipt["base"], "HEAD")
-        self.assertEqual(receipt["filters"], ["rsid=shard:other-01:test(x)"])
+        self.assertEqual(receipt["filters"], ["rsid-core=error"])
         self.assertRegex(receipt["head"], r"^[0-9a-f]{40}$")
         self.assertTrue(receipt["log_dir"].startswith("/tmp/") or Path(receipt["log_dir"]).is_dir())
 
@@ -3724,7 +4592,7 @@ class ScopedTestPlanningNeverCompilesTest(unittest.TestCase):
     """
 
     def setUp(self):
-        sandbox = SCRIPT.parents[2]
+        sandbox = SCRIPT.parents[1]
         self.temp = scratch_tempdir(prefix="scoped-planning-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
@@ -3740,8 +4608,9 @@ class ScopedTestPlanningNeverCompilesTest(unittest.TestCase):
             (self.bin / name).write_text(stub)
             (self.bin / name).chmod(0o755)
         guard = "import sys\nsys.exit(0)\n"
-        for rel in ("tools/check-released-migrations.py", "tools/check_identity_assertions.py",
-                    "tools/check_portable_shell.py", "tools/check_starter_pins.py"):
+        # The Rust guards (#360) are absent here, so they are skipped and start no Cargo build.
+        for rel in ("tools/check-released-migrations.py", "scripts/check-target-reclaim.py", "scripts/check-guard-regressions.py",
+                    "scripts/check-store-boundary.py"):
             self.write(rel, guard)
         self.write("scripts/check-rsid-test-shards.py",
                    "import sys\nif '--list-shard-packages' in sys.argv:\n    print('store-02 rsid')\n")
@@ -3787,6 +4656,182 @@ class ScopedTestPlanningNeverCompilesTest(unittest.TestCase):
         self.assertIn("build once: " + str(self.bin / "cargo-stub"), done.stdout)
         self.assertEqual(receipt["compile"], {"planning": {"source": "filters_only", "cargo_invoked": False},
                                               "execution": "skipped_dry_run", "packages": {}})
+
+    def downstream_fixture(self):
+        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/*"]\n'
+                   '[workspace.dependencies]\ncommon = { package = "rsi-common", path = "crates/rsi-common" }\n')
+        for name, deps in (("rsi-common", ""), ("rsid", '[dev-dependencies]\ncommon.workspace = true\n'),
+                           ("rsi", '[target.\'cfg(unix)\'.dependencies]\nrsid = { path = "../rsid" }\n'),
+                           ("unrelated", "")):
+            self.write(f"crates/{name}/Cargo.toml", f'[package]\nname = "{name}"\nversion = "0.1.0"\n' + deps)
+            self.write(f"crates/{name}/src/lib.rs", "pub fn unchanged() {}\n")
+        # This is the #441 shape: inferred registry iteration changes across the crate boundary.
+        self.write("crates/rsi-common/src/lib.rs", "pub mod health_anomaly;\n")
+        self.write("crates/rsi-common/src/health_anomaly.rs", 'pub const ALL_KINDS: [&str; 1] = ["one"];\n')
+        self.git("add", "Cargo.toml", "crates")
+        self.git("commit", "-q", "-m", "workspace fixture")
+
+    def downstream_change(self, source, path="crates/rsi-common/src/health_anomaly.rs"):
+        self.write(path, source)
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "API change")
+
+    def test_public_common_api_diff_plans_transitive_dependent_test_compilation(self):
+        self.downstream_fixture()
+        self.downstream_change('pub const ALL_KINDS: &[&str] = &["one"];\n')
+        done, receipt = self.scoped("--dry-run", "--base", "HEAD~1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        downstream = receipt["downstream_compile"]
+        self.assertEqual(downstream["changed_libraries"], [{"package": "rsi-common", "paths": [
+            "crates/rsi-common/src/health_anomaly.rs"]}])
+        self.assertEqual([p["package"] for p in downstream["packages"]], ["rsi", "rsid"])
+        for entry in downstream["packages"]:
+            self.assertEqual((entry["status"], entry["execution"]), ("planned", "compile_only"))
+            self.assertIn("--tests", entry["command"])
+            self.assertIn("--no-run", entry["command"])
+        self.assertFalse(self.log.exists())
+
+    def test_public_item_consumers_become_runtime_selections_in_shared_dry_run(self):
+        self.downstream_fixture()
+        self.write("crates/rsid/src/lib.rs", "mod consumer;\n")
+        self.write("crates/rsid/src/consumer.rs", "use common::health_anomaly::ALL_KINDS;\n"
+                   "#[cfg(test)]\nmod tests {\n"
+                   '    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]\n'
+                   "    #[test]\n    fn registry_shape() {\n        assert_eq!(ALL_KINDS.len(), 1);\n    }\n}\n")
+        self.git("add", "crates")
+        self.git("commit", "-q", "-m", "consumer fixture")
+        self.downstream_change('pub const ALL_KINDS: &[&str] = &["one"];\n')
+        done, receipt = self.scoped("--dry-run", "--base", "HEAD~1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        selected = "rsid=shard:store-02:test(=consumer::tests::registry_shape)"
+        self.assertEqual(receipt["filters"], [selected])
+        self.assertEqual(receipt["downstream_tests"]["filters"], [selected])
+        entry = next(p for p in receipt["downstream_compile"]["packages"] if p["package"] == "rsid")
+        self.assertEqual(entry["execution"], "selected_tests_also_run")
+        self.assertEqual(receipt["downstream_tests"]["selections"][0]["module"], "consumer")
+        self.assertFalse(self.log.exists())
+
+    def test_downstream_compile_unions_fixture_features_and_preserves_selected_filters(self):
+        self.downstream_fixture()
+        self.feature_fixture()
+        self.downstream_change('pub const ALL_KINDS: &[&str] = &["one"];\n')
+        selected = "rsid=shard:store-02:test(recursive_dag::smoke_fixture)"
+        done, receipt = self.scoped("--dry-run", "--base", "HEAD~1", "--filter", selected)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        entry = next(p for p in receipt["downstream_compile"]["packages"] if p["package"] == "rsid")
+        self.assertEqual((entry["execution"], entry["features"]), ("selected_tests_also_run", ["dev-fixtures"]))
+        self.assertEqual(receipt["filters"], [selected])
+        self.assertEqual(receipt["features"]["rsid"], ["dev-fixtures"])
+        self.assertEqual(entry["command"].count("--no-run"), 1)
+        self.assertFalse(self.log.exists())
+
+    def test_private_function_and_test_only_edits_keep_downstream_compile_empty(self):
+        self.downstream_fixture()
+        path = "crates/rsi-common/src/health_anomaly.rs"
+        source = ('pub const ALL_KINDS: &[&str] = &["one"];\n'
+                  'fn helper() -> u8 {\n    1\n}\n'
+                  '#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() { assert_eq!(1, 1); }\n}\n')
+        self.downstream_change(source)
+        checker = runpy.run_path(str(SCRIPT.with_name("check-touched-shards")))
+        for before, after in ((source, source.replace("    1\n", "    2\n")),
+                              (source, source.replace("assert_eq!(1, 1)", "assert_eq!(2, 2)")),
+                              (source, source + "// documentation only\n")):
+            with self.subTest(after=after):
+                self.downstream_change(before + "\n")
+                self.downstream_change(after)
+                plan = RUNNER["downstream_test_plan"](checker, self.repo, "HEAD~1", "HEAD")
+                self.assertEqual(plan["changed_libraries"], [])
+                self.assertEqual(plan["packages"], [])
+
+    def test_removed_public_item_and_multiline_type_member_select_downstream(self):
+        self.downstream_fixture()
+        checker = runpy.run_path(str(SCRIPT.with_name("check-touched-shards")))
+        for source in ('pub struct Record {\n    pub value: u8,\n}\n',
+                       'pub struct Record {\n    pub value: u16,\n}\n', ""):
+            self.downstream_change(source)
+            plan = RUNNER["downstream_test_plan"](checker, self.repo, "HEAD~1", "HEAD")
+            self.assertEqual([p["package"] for p in plan["packages"]], ["rsi", "rsid"])
+
+    def test_binary_only_and_unmounted_sources_do_not_trigger_library_compilation(self):
+        self.downstream_fixture()
+        checker = runpy.run_path(str(SCRIPT.with_name("check-touched-shards")))
+        for path in ("crates/rsi-common/src/bin/helper.rs", "crates/rsi-common/src/unmounted.rs"):
+            self.downstream_change("pub fn helper() {}\n", path)
+            plan = RUNNER["downstream_test_plan"](checker, self.repo, "HEAD~1", "HEAD")
+            self.assertEqual(plan["packages"], [])
+
+    def feature_fixture(self):
+        self.write("crates/rsid/src/lib.rs", "pub mod recursive_dag;\n")
+        self.write("crates/rsid/src/recursive_dag.rs",
+                   '#[cfg(feature = "dev-fixtures")]\npub mod smoke_fixture;\n')
+        path = "crates/rsid/src/recursive_dag/smoke_fixture.rs"
+        source = '''pub fn fixture_value() -> u8 {
+    1
+}
+#[cfg(test)]
+mod tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]
+    #[test]
+    fn fixture_readback() {
+        assert_eq!(super::fixture_value(), 1);
+    }
+}
+'''
+        self.write(path, source)
+        self.git("add", "crates")
+        self.git("commit", "-q", "-m", "fixture base")
+        self.write(path, source.replace("    1\n", "    2\n"))
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "change fixture implementation")
+
+    def test_feature_gated_module_diff_enables_its_feature_without_cargo(self):
+        self.feature_fixture()
+        done, receipt = self.scoped("--dry-run", "--base", "HEAD~1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(any("recursive_dag::smoke_fixture" in f for f in receipt["filters"]), receipt)
+        self.assertEqual(receipt["features"], {"rsid": ["dev-fixtures"]})
+        self.assertIn("--lib --features dev-fixtures --no-run", done.stdout)
+        self.assertFalse(self.log.exists())
+
+    def test_feature_inventory_matches_exact_regex_and_ancestor_filters(self):
+        self.feature_fixture()
+        checker = runpy.run_path(str(SCRIPT.with_name("check-touched-shards")))
+        name = "recursive_dag::smoke_fixture::tests::fixture_readback"
+        for atom in ("=" + name, r"/^recursive_dag::(?:\w+::)*fixture_readback$/", "recursive_dag"):
+            with self.subTest(atom=atom):
+                selections = RUNNER["selection_plan"]([f"rsid=shard:store-02:test({atom})"],
+                                                      {"store-02": ["rsid"]})["rsid"]
+                self.assertEqual(RUNNER["required_test_features"](checker, self.repo, "HEAD", "rsid", selections),
+                                 ["dev-fixtures"])
+        selections = RUNNER["selection_plan"](["rsid=shard:store-02:test(unrelated)"],
+                                              {"store-02": ["rsid"]})["rsid"]
+        self.assertEqual(RUNNER["required_test_features"](checker, self.repo, "HEAD", "rsid", selections), [])
+
+    def test_module_without_inline_tests_selects_sibling_rpc_behaviour_tests(self):
+        self.write("crates/rsid/src/lib.rs", "pub mod operator_config;\npub mod unrelated;\n")
+        self.write("crates/rsid/src/operator_config/mod.rs",
+                   "mod custom_providers;\n#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod legacy_import_tests;\n")
+        path = "crates/rsid/src/operator_config/custom_providers.rs"
+        source = "pub fn saved_provider() -> u8 {\n    1\n}\n"
+        self.write(path, source)
+        gate = '#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-02"))]\n#[test]\n'
+        for module, test in (("operator_config/tests", "provider_rpc_roundtrip"),
+                             ("operator_config/legacy_import_tests", "legacy_provider_roundtrip"),
+                             ("unrelated", "unrelated_behaviour")):
+            # RPC behaviour does not name saved_provider directly.
+            self.write(f"crates/rsid/src/{module}.rs", gate + f"fn {test}() {{}}\n")
+        self.git("add", "crates")
+        self.git("commit", "-q", "-m", "RPC fixture base")
+        self.write(path, source.replace("    1\n", "    2\n"))
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "change provider persistence")
+        done, receipt = self.scoped("--dry-run", "--base", "HEAD~1")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(receipt["filters"]), {
+            "rsid=shard:store-02:test(/^operator_config::tests::/)",
+            "rsid=shard:store-02:test(/^operator_config::legacy_import_tests::/)",
+        })
+        self.assertFalse(self.log.exists())
 
 
 def cargo_diagnostic(file, line, text, code="dead_code", package="rsid-store", level="warning", column=5):
@@ -4189,6 +5234,146 @@ class StopProcessGroupTest(unittest.TestCase):
         code = stream([sys.executable, "-c", "print('rsid ran')"], out.append, budget=Budget(30))
         self.assertEqual(code, 0)
         self.assertEqual(out, ["rsid ran\n"])
+
+
+class RenumberDeclaredCandidateTest(unittest.TestCase):
+    """#3339: a declared provisional migration whose number rolling took is tested renumbered."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = Path(__file__).with_name("test_rolling_migration_renumber.py")
+        spec = importlib.util.spec_from_file_location("renumber_fixture_for_scoped_test", path)
+        cls.fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.fixtures)
+        cls.tools = Path(__file__).resolve().parents[2] / "tools"
+
+    def setUp(self):
+        self.fixture = self.fixtures.ProvisionalMigrationTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.repo = self.fixture.repo
+        self.git = self.fixture.git
+        self.renumber = RUNNER["renumber_declared_candidate"]
+
+    def landed_alpha(self):
+        """Rolling after another source took v130."""
+        _, tip = self.fixture.candidate(self.fixture.source("alpha"), self.fixture.base)
+        return tip
+
+    def test_a_taken_number_yields_the_landers_renumbered_candidate_to_test(self):
+        tip = self.landed_alpha()
+        beta = self.fixture.source("beta")
+        plain = RUNNER["merge_onto_rolling"](self.repo, beta, rolling=tip)
+        self.assertFalse(plain["merges_cleanly_onto_rolling"], "the premise: v130 collides")
+        result = self.renumber(self.repo, beta, tip, tool_dir=self.tools)
+        self.assertEqual(result["status"], "renumbered", result)
+        self.assertEqual((result["old_version"], result["new_version"]), (130, 131))
+        candidate = result["candidate"]
+        self.assertEqual(self.git(self.repo, "show", "-s", "--format=%P", candidate), f"{tip} {beta}")
+        manifest = self.fixtures.RENUMBER.revision_inventory(self.repo, candidate)
+        self.assertEqual(manifest["latest_schema_version"], 131)
+        self.assertEqual(sorted(manifest["blocks"])[-2:], ["130", "131"])
+        trial = RUNNER["merge_onto_rolling"](self.repo, candidate, rolling=tip)
+        self.assertTrue(trial["merges_cleanly_onto_rolling"])
+        self.assertTrue(self.fixtures.RENUMBER.is_ancestor(self.repo, beta, candidate))
+
+    def test_a_declared_source_at_rolling_head_plus_one_needs_no_renumber(self):
+        beta = self.fixture.source("beta")
+        self.assertIsNone(self.renumber(self.repo, beta, self.fixture.base, tool_dir=self.tools))
+
+    def test_a_free_version_with_an_undeclared_nonmigration_literal_is_refused(self):
+        self.fixture.source("beta")
+        hidden = self.fixture.commit_extra(
+            "beta", "crates/rsi-common/src/satellite_intake.rs",
+            'const FIXTURE: &str = "migrations/v130.rs";\n')
+        # The source contains the target, but must still be validated (#3397).
+        result = self.renumber(self.repo, hidden, self.fixture.base, tool_dir=self.tools)
+        self.assertEqual(result["status"], "refused", result)
+        self.assertIn("undeclared version-bearing file or site: crates/rsi-common/src/satellite_intake.rs:35",
+                      result["reason"])
+
+    def test_a_free_version_with_an_undeclared_site_in_a_declared_file_is_refused(self):
+        hidden = self.fixture.source("beta", "const HIDDEN_V130: i32 = 130;\n")
+        result = self.renumber(self.repo, hidden, self.fixture.base, tool_dir=self.tools)
+        self.assertEqual(result["status"], "refused", result)
+        self.assertIn("undeclared version-bearing site: crates/rsid-store/src/store/mod.rs:",
+                      result["reason"])
+
+    def test_a_provisional_refusal_stops_the_run_before_derivation_and_builds(self):
+        self.fixture.source("beta")
+        hidden = self.fixture.commit_extra("beta", "extra.rs", "const SCHEMA: i32 = 130;\n")
+        receipt = RUNNER["RECEIPT"]
+        saved = dict(receipt)
+        try:
+            run = RUNNER["run"]
+            with patch.object(sys, "argv", [str(SCRIPT), "--repo", str(self.repo),
+                                           "--base", self.fixture.base, "--head", hidden, "--dry-run"]), \
+                    patch.dict(run.__globals__, integrated_base=lambda *_: self.fail("derived refused source")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = run(None)
+            self.assertEqual(code, 2)
+            self.assertEqual(receipt["head"], hidden)
+            self.assertEqual(receipt["renumber"]["status"], "refused")
+            self.assertIn("extra.rs", receipt["renumber"]["reason"])
+        finally:
+            RUNNER["cleanup_renumbered"]()
+            receipt.clear()
+            receipt.update(saved)
+
+    def test_a_source_without_a_declaration_needs_no_renumber(self):
+        tip = self.landed_alpha()
+        worktree = Path(self.fixture.temp.name) / "plain"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.fixture.base)
+        (worktree / "note.txt").write_text("plain\n")
+        self.git(worktree, "add", "note.txt")
+        self.git(worktree, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "-qm", "plain")
+        head = self.git(worktree, "rev-parse", "HEAD")
+        self.assertIsNone(self.renumber(self.repo, head, tip, tool_dir=self.tools))
+
+    def test_a_source_that_already_contains_rolling_needs_no_renumber(self):
+        tip = self.landed_alpha()
+        self.assertIsNone(self.renumber(self.repo, tip, tip, tool_dir=self.tools))
+
+    def test_a_refused_renumber_reports_why_and_changes_nothing(self):
+        tip = self.landed_alpha()
+        hidden = self.fixture.source("beta", "const HIDDEN_V130: i32 = 130;\n")
+        result = self.renumber(self.repo, hidden, tip, tool_dir=self.tools)
+        self.assertEqual(result["status"], "refused", result)
+        self.assertIn("undeclared version-bearing site", result["reason"])
+        self.assertNotIn("candidate", result)
+
+    def test_the_renumbered_candidate_checks_out_and_is_removed(self):
+        tip = self.landed_alpha()
+        result = self.renumber(self.repo, self.fixture.source("beta"), tip, tool_dir=self.tools)
+        tree = RUNNER["checkout_renumbered"](self.repo, result["candidate"])
+        try:
+            head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True,
+                                  text=True, check=True).stdout.strip()
+            self.assertEqual(head, result["candidate"])
+            self.assertIn("131", (tree / self.fixtures.RENUMBER.STORE).read_text())
+        finally:
+            RUNNER["cleanup_renumbered"]()
+        self.assertFalse(tree.exists())
+
+
+    def test_the_receipt_keeps_the_committed_head_and_merges_the_renumbered_candidate(self):
+        tip = self.landed_alpha()
+        beta = self.fixture.source("beta")
+        result = self.renumber(self.repo, beta, tip, tool_dir=self.tools)
+        self.git(self.repo, "update-ref", "refs/remotes/origin/rolling", tip)
+        receipt = RUNNER["RECEIPT"]
+        saved = dict(receipt)
+        try:
+            receipt.update(head=beta, candidate_repo=str(self.repo), dry_run=False, emit=True,
+                           renumber={"status": "renumbered", "candidate": result["candidate"]})
+            RUNNER["record_merge_onto_rolling"]()
+            self.assertEqual(receipt["head"], beta)
+            self.assertIs(receipt["merges_cleanly_onto_rolling"], True)
+            self.assertEqual(receipt["conflict_paths"], [])
+        finally:
+            receipt.clear()
+            receipt.update(saved)
 
 
 if __name__ == "__main__":

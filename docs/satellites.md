@@ -86,7 +86,8 @@ journalctl --user -u rsi-satellite@arch-laptop.service
 
 When the laptop has a routeable address and accepts SSH from the hub, install
 the hub-initiated direct tunnel on the hub. Use the laptop's SSH host or config
-alias as the target:
+alias as the target. The installer is Linux-only (a systemd user unit) and
+refuses to run elsewhere; a macOS satellite is only ever the SSH target:
 
 ```bash
 ~/rsi/scripts/satellite/install-direct.sh arch-laptop laptop-ssh --port 22
@@ -193,8 +194,7 @@ appointed (the second call was refused) is appointed by rerunning with
 the satellite's `GetSatelliteScopeStatus` reports the project `live` (#2952): an
 archived or otherwise dead seat exits 1 with the recovery (reseat from the hub with
 `AgentReseatSatelliteManager`, or rerun with `--manager-session <live id>`), never
-"already appointed". Tests:
-`python3 -m unittest scripts.tests.test_pair_direct` (stub `rsi-rpc`).
+"already appointed". Tests: `scripts/tests/test_pair_direct.py` (stub `rsi-rpc`); `pair-direct.py` is Python, so that suite is a red `incomplete_contract` residual entry until the helper is ported (#366).
 
 ## Network reachability choices
 
@@ -381,14 +381,64 @@ failure `undelivered` (nothing happened for 180 s: `hub_not_pulling` or
 next pull only to a satellite whose identity advertises `report_outcomes`; an
 older satellite sees acknowledgements only (a refused report then reads as
 delivered). While the hub has not pulled for 180 s with a report waiting,
-`AgentReportToHub` refuses `satellite_report_hub_unreachable` instead of
-promising delivery; keep the report in the manager's own outbox note and retry
-after `hub_pulling` is true again. At 32 unacknowledged reports it refuses
+`AgentReportToHub` still accepts the report into the same backlog, in arrival order
+(#530): the receipt is `queued` with `reason: "hub_not_pulling"`, which tells the
+caller it is not yet fetched, and the next pull hands it over; keep no copy outside
+the daemon. The `hub_not_pulling` anomaly stays the alarm. At 32 unacknowledged reports it refuses
 `satellite_report_queue_full` and the message says what is stuck (#135): `depth`, the
 oldest pending report's `oldest_queued_at` and `oldest_age_secs`, `pending_by_kind`
 (result, enqueue, deploy_ready) and `last_hub_pull_at`; `hub_reports.backlog` carries
 the same numbers at any time. Wait for the hub to acknowledge, fold further results
 into one RESULT line, and never re-send an ENQUEUE or DEPLOY-READY that is pending.
+
+### Informational reports are a digest (hub #3850)
+
+A `RESULT` report is informational: its notice does not wake the hub manager for
+a turn of its own. It is readable at once in `AgentManagerInbox` (summary form
+too), rides any other wake the manager gets, and otherwise wakes it once when a
+shared per-project 30-minute window (`digest_until_unix` in the notice,
+`SATELLITE_RESULT_DIGEST_SECS`, a fixed constant) ends. Everything that needs a
+decision still wakes at once: `DEPLOY-READY`, an `ENQUEUE` the daemon did not
+take in, intake refusals, reviews and stalls, and the satellite failure
+notices. So a satellite that needs the manager to act sends a `DEPLOY-READY` or a
+parseable `ENQUEUE`, never a `RESULT`.
+
+### ENQUEUE intake (hub #3345)
+
+The hub daemon, not the hub manager, takes in a satellite's `ENQUEUE` report.
+A text of the form `ENQUEUE <40-hex sha> [branch=<name>] [issue=#N] [fixes=#N]
+[fixes_tests=a::b,c::d]` (one unambiguous full SHA; `sha=` names it explicitly;
+`rsi_common::satellite_intake::parse_enqueue_claim`) is recorded with one
+`satellite_enqueue_intakes` row and its notice is marked `auto_intake`
+(routine: it never wakes the hub manager). The intake loop
+(`satellite/enqueue_intake.rs`, every 10 s) then, as the project's current
+manager seat:
+
+1. fetches the commit from `origin` (not served: `refused`, `source_not_on_origin`);
+2. settles a source already on rolling;
+3. probes it against the rolling tip and every queued entry. A conflict is
+   answered to the satellite as `conflicts_with: rolling|entry branch=... paths=...`
+   and nothing is enqueued (`conflicts`); a conflict touching only migration
+   bookkeeping of a source that declares a provisional migration is
+   renumberable (#3336) and does not count;
+4. holds a source AGENTS.md reserves a pre-merge review for (a migration or a
+   credential, IAM or network-exposure path, or anything git cannot show) as
+   `needs_review`: not enqueued, the hub manager decides;
+5. otherwise enqueues it with `derive_filters` (the same admission and gates as
+   the manager's own `AgentEnqueueLandingSource`), `issue` and the claims;
+6. when the entry settles, tells the satellite once: `PUBLISHED`, the refusal
+   code and failing tests, or `withdrawn`.
+
+Replies go to the peer's only declared scope entry (a project, which the
+satellite resolves to its current manager, else a single declared session);
+an ambiguous scope is never guessed and becomes a digest notice for the hub
+manager to relay. The hub manager sees one `satellite_intake:<peer>:<report>`
+digest notice per state, routine unless it must act (held review, refusal,
+stall, a source wanting a post-land review). Override: switch the operator
+setting `rolling_queue_enabled` off to hold every source (`needs_review`,
+`queue_disabled`), or `AgentCancelRollingQueueEntry` a queued entry (the
+satellite is told it was withdrawn). A report the grammar does not parse stays
+a plain manager notice, handled by hand as before.
 
 Delivery is at most once: the satellite queue and this state are in memory, so a
 satellite restart loses unsent reports and forgets the states. A replayed report
@@ -446,6 +496,11 @@ Mac needs Remote Login (sshd) on and the hub's key authorized. A non-interactive
 ssh session there has PATH `/usr/bin:/bin:/usr/sbin:/sbin`, so call tools by
 absolute path or through `zsh -lc '...'` (rustup's `cargo` lives in
 `/opt/homebrew/opt/rustup/bin`, which a login shell may still lack).
+
+**Agent git hooks.** The commit-msg and pre-push hooks (AGENTS.md rules 1 and 8)
+are active only once `core.hooksPath` is set in the repository's shared
+`.git/config`. `scripts/install-release.sh` sets it to `tools/git-hooks` when it
+is unset (#63); on a fresh satellite run `./tools/install-hooks.sh` once.
 
 **Keeping it running: the launchd user agent `dev.rsi.rsid`.**
 `scripts/install-release.sh` (so `make release-install`) and
@@ -538,16 +593,19 @@ cannot do them):
    the same user; `GetHealthStatus` `provider_logins` shows the result.
 4. Remote Login on, with the hub's dedicated key authorized (above).
 
-## Python verification in satellite briefs (#221)
+## Script verification in satellite briefs (#221)
 
-A brief that delegates Python-only work to a satellite names the stdlib runner,
-`python3 -m unittest -v <file>`, the one both hosts and the lander have. It never
-requires `pytest`: neither the hub nor the laptop installs it. A host that lacks
-a planned runner reports the typed `runner_unavailable` (the runner, zero executed
-tests, a red job) in the `scoped_test` receipt's `python` entries instead of a
-generic exit 1, and no other runner is substituted. Treat it as a missing
-prerequisite to report, not a test result. Detail: `docs/agents/worker-contract.md`
-("Python verification").
+For hub source references, blob fallbacks and hub Issue coordinates in briefs,
+see ["Satellite (arch-laptop)"](../.claude/skills/rsi-project-manager/procedures.md#satellite-arch-laptop).
+
+Python is forbidden (#358), so a brief never asks a satellite to run Python or
+`pytest`. Work on a script is verified by its bash TAP suite
+(`bash scripts/tests/test_<stem>.sh`, which both hosts and the lander have) or by
+exact Rust tests. A host without bash reports the typed `runner_unavailable` (the
+runner, zero executed tests, a red job) in the `scoped_test` receipt's `residual`
+entries instead of a generic exit 1, and no other runner is substituted. Treat it
+as a missing prerequisite to report, not a test result. Detail:
+`docs/agents/worker-contract.md` ("Script suites").
 
 ## Remove
 

@@ -17,14 +17,14 @@ use std::sync::Mutex as StdMutex;
 /// then either completes or "crashes" (the scheduler's settlement is cut by
 /// the test through `crash_after_delivery`).
 struct EffectLauncher {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     /// True: take the real effect claim before delivering.
     claim_effect: bool,
     deliveries: StdMutex<Vec<(Uuid, String)>>,
 }
 
 impl EffectLauncher {
-    fn new(store: &Arc<Mutex<Store>>, claim_effect: bool) -> Arc<Self> {
+    fn new(store: &Arc<rsid_core::store_lock::Mutex<Store>>, claim_effect: bool) -> Arc<Self> {
         Arc::new(Self {
             store: store.clone(),
             claim_effect,
@@ -74,7 +74,7 @@ impl SessionLauncher for EffectLauncher {
 }
 
 struct Fixture {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     target: Uuid,
     job: ScheduledJob,
@@ -82,7 +82,9 @@ struct Fixture {
 
 impl Fixture {
     async fn new(recurrence: Recurrence) -> Self {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let target = Uuid::new_v4();
         let now = Utc::now();
         let job = ScheduledJob {

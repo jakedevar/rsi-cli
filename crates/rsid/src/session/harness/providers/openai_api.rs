@@ -23,6 +23,9 @@ pub struct OpenAiApiProvider {
     base_url: String,
     quirks: ProviderQuirks,
     execution_route: crate::model_control::registry::RuntimeExecutionRoute,
+    /// Send the model's earlier thinking back on the current tool-call chain
+    /// (#3170). On for the OpenRouter route only.
+    replay_reasoning: bool,
 }
 
 impl OpenAiApiProvider {
@@ -96,6 +99,7 @@ impl OpenAiApiProvider {
             base_url,
             execution_route:
                 crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
+            replay_reasoning: false,
             quirks: ProviderQuirks {
                 native_tools: true,
                 ..Default::default()
@@ -119,7 +123,15 @@ impl OpenAiApiProvider {
             quirks,
             execution_route:
                 crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
+            replay_reasoning: false,
         })
+    }
+
+    /// A test route that replays reasoning without the OpenRouter transport.
+    #[cfg(test)]
+    pub(crate) fn with_reasoning_replay(mut self, replay: bool) -> Self {
+        self.replay_reasoning = replay;
+        self
     }
 
     pub fn openrouter() -> Result<Self> {
@@ -133,6 +145,7 @@ impl OpenAiApiProvider {
         )?;
         provider.execution_route =
             crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp;
+        provider.replay_reasoning = true;
         Ok(provider)
     }
 
@@ -149,6 +162,9 @@ impl OpenAiApiProvider {
                 disable_streaming: self.quirks.disable_streaming,
                 openrouter_reasoning: self.execution_route
                     == crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenRouterHttp,
+                // #3170: OpenRouter takes the model's earlier thinking back on
+                // the tool-call chain; every other route is unchanged.
+                replay_reasoning: self.replay_reasoning,
                 reasoning_effort_wire: &|effort| reasoning_effort.wire_value(effort),
             },
         )
@@ -235,17 +251,17 @@ impl ApiProvider for OpenAiApiProvider {
             return Err(error);
         }
 
-        let (content, acc_tool_calls, usage, stop_reason) =
-            read_openai_sse_stream(resp, &chunk_tx, cancel).await?;
+        let streamed = read_openai_sse_stream(resp, &chunk_tx, cancel).await?;
 
-        let tool_calls = openai_wire::convert_tool_calls(acc_tool_calls);
+        let tool_calls = openai_wire::convert_tool_calls(streamed.tool_calls);
 
         Ok(ChatResponse {
-            content,
+            content: streamed.content,
             tool_calls,
-            usage,
-            reasoning_content: None,
-            stop_reason,
+            usage: streamed.usage,
+            reasoning_content: streamed.reasoning,
+            reasoning_details: streamed.reasoning_details,
+            stop_reason: streamed.finish_reason,
         })
     }
 
@@ -537,6 +553,37 @@ mod route_tests {
             }
         ));
         assert!(provider.supports_native_tools());
+
+        // #3170: only the OpenRouter route replays reasoning.
+        let mut thinking = ChatMessage::assistant("");
+        thinking.reasoning = Some("earlier thoughts".into());
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("task"), thinking],
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            temperature: None,
+            max_tokens: None,
+            tools: Vec::new(),
+            stream: false,
+            reasoning_effort: None,
+            context_editing: false,
+            tool_choice_none: false,
+        };
+        assert_eq!(
+            provider.build_request_body(&req)["messages"][1]["reasoning"],
+            "earlier thoughts"
+        );
+        let other = OpenAiApiProvider::with_config(
+            "http://localhost".into(),
+            ApiCredential::None,
+            ProviderQuirks::default(),
+        )
+        .unwrap();
+        assert!(
+            !other
+                .build_request_body(&req)
+                .to_string()
+                .contains("earlier thoughts")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

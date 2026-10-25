@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ACTIONS, appMenuModel, keyHints, paletteEntries, tooltipText, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, keyHints, paletteEntries, tooltipText, unavailable } from '../dist/registry.js';
 import { TERMINAL_ACTIONS, TERMINAL_COMMAND_BINDINGS, TERMINAL_RULES, isTerminalAction } from '../dist/actions/terminal-spec.js';
 import { desktopKeymap } from '../dist/keybindings.js';
 import { KeyEngine, routeKey } from '../dist/keyengine.js';
@@ -109,7 +109,9 @@ test('titles and mode labels', () => {
   assert.equal(overlayTitle({ key: S1, ptyId: P1, cwd: '/a', exited: null }), 'Terminal — /a');
   assert.match(overlayTitle({ key: S1, ptyId: null, cwd: '/a', exited: { code: null } }), /— exited; /);
   assert.equal(modeLabel('insert'), 'INSERT');
-  assert.equal(modeLabel('normal'), 'NORMAL');
+  assert.equal(modeLabel('normal'), 'NORMAL · i to type', 'normal mode names the way back');
+  assert.equal(modeLabel('insert', false), '', 'no Vim keys, no mode label');
+  assert.equal(modeLabel('normal', false), '');
 });
 
 // ---------- keys ----------
@@ -157,6 +159,30 @@ test('normal mode scrolls the scrollback the TUI way', () => {
   assert.deepEqual(r('\\', { code: 'Backslash', ctrlKey: true }), { kind: 'toggle' });
   assert.equal(halfPage(1), 1);
   assert.equal(halfPage(0), 1);
+});
+
+test('with Vim keys off the terminal has no modal layer', () => {
+  for (const mode of ['insert', 'normal']) {
+    const r = (k, over, rows = 24) => routeTerminalKey(mode, key(k, over), 'other', rows, false);
+    assert.deepEqual(r('Escape'), { kind: 'pty' }, `Esc reaches the shell (${mode})`);
+    assert.deepEqual(r('x'), { kind: 'pty' }, `a letter reaches the shell (${mode})`);
+    assert.deepEqual(r('i'), { kind: 'pty' });
+    assert.deepEqual(r('j'), { kind: 'pty' });
+    assert.deepEqual(r('G', { shiftKey: true }), { kind: 'pty' });
+    assert.deepEqual(r('d', { code: 'KeyD', ctrlKey: true }), { kind: 'pty' }, 'Ctrl-D is EOF for the shell');
+    assert.deepEqual(r('ArrowUp'), { kind: 'pty' }, 'history, not scrollback');
+    assert.deepEqual(r('Escape', { isComposing: true }), { kind: 'pty' });
+    assert.deepEqual(r('\\', { code: 'Backslash', ctrlKey: true }), { kind: 'toggle' }, 'Ctrl-\\ still hides');
+    assert.deepEqual(r('PageUp', { shiftKey: true }), { kind: 'scroll', scroll: { by: 'lines', n: -23 } });
+    assert.deepEqual(r('PageDown', { shiftKey: true }), { kind: 'scroll', scroll: { by: 'lines', n: 23 } });
+    assert.deepEqual(r('PageUp', { shiftKey: true }, 1), { kind: 'scroll', scroll: { by: 'lines', n: -1 } });
+    assert.deepEqual(r('PageUp'), { kind: 'pty' }, 'plain PageUp is the program’s');
+  }
+  assert.deepEqual(routeTerminalKey('insert', key('c', { metaKey: true }), 'mac', 24, false), { kind: 'native' }, 'Cmd-C still copies');
+});
+
+test('the default is the TUI’s: Esc enters normal mode with Vim keys on', () => {
+  assert.deepEqual(routeTerminalKey('insert', key('Escape'), 'other', 24, true), { kind: 'mode', mode: 'normal' });
 });
 
 test('vim keys stand aside while the terminal (an xterm textarea) has focus', () => {
@@ -218,10 +244,10 @@ test('the terminal is an action with a palette entry, a View menu item and its k
   const entry = paletteEntries(snap(), 'other').find((e) => e.id === 'toggle-terminal');
   assert.ok(entry?.enabled);
   const view = appMenuModel('other', snap({ terminal: { visible: true, running: true } })).find((m) => m.id === 'view');
-  const item = view.items.find((n) => n.kind === 'item' && n.id === 'act:toggle-terminal');
+  const item = menuItems(view.items).find((n) => n.id === 'act:toggle-terminal');
   assert.equal(item.checked, true);
   assert.equal(item.accelerator, undefined, 'the webview catches Ctrl-\\ itself');
-  assert.ok(view.items.some((n) => n.kind === 'item' && n.id === 'act:kill-terminal'));
+  assert.ok(menuItems(view.items).some((n) => n.id === 'act:kill-terminal'));
 });
 
 test(':term, :terminal and :shell open the terminal', () => {

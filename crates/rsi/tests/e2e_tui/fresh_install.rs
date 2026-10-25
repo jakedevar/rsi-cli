@@ -59,6 +59,9 @@ async fn wait_session(
     )))
 }
 
+/// The whole walk takes about 15 s; this bounds a wedged one (#3431).
+const SCENARIO_BUDGET: Duration = Duration::from_secs(150);
+
 /// README "Seat a project manager on the current repo", then "Seat a global
 /// manager over several projects", from first start with nothing configured.
 #[tokio::test]
@@ -81,10 +84,15 @@ async fn test_e2e_fresh_install_appoint_project_manager() -> E2eResult<()> {
     )?;
     fs::set_permissions(h.bin_dir.join("claude"), fs::Permissions::from_mode(0o755))?;
     h.phase = "fresh-install-daemon";
-    h.start_daemon()?;
-    // Nothing is seeded: no project, no session, no editing mode.
+    h.start_daemon_with_fixture_scopes()?;
+    // Nothing is seeded: no operator project, no session, no editing mode. The
+    // daemon registers exactly one built-in home project on start (hub #3315).
     let mut client = h.wait_for_daemon().await?;
-    assert!(client.list_projects().await?.is_empty());
+    let projects = client.list_projects().await?;
+    assert_eq!(
+        projects.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![rsi_common::Project::HOME_ID]
+    );
     assert!(client.list_sessions().await?.is_empty());
 
     let term = Terminal::builder()
@@ -100,7 +108,10 @@ async fn test_e2e_fresh_install_appoint_project_manager() -> E2eResult<()> {
         .spawn(&h.rsi_bin, &[])
         .await
         .map_err(|e| test_error(format!("fresh install TUI: {e:?}")))?;
-    let outcome = async {
+    // A wedged daemon or TUI must fail this test with preserved artifacts, never
+    // hang it until the gate's 20-minute guard kills the whole shard unparsed
+    // (#3431: the gate saw a TimedOut with no output at all).
+    let outcome = tokio::time::timeout(SCENARIO_BUDGET, async {
         // First start: the required Standard/Vim prompt comes before anything.
         visible(&term, "Choose how you edit text").await?;
         keys(&term, "s").await?;
@@ -187,6 +198,13 @@ async fn test_e2e_fresh_install_appoint_project_manager() -> E2eResult<()> {
         assert_eq!(grant.state, "active");
         assert_eq!(grant.seat_session_id, global_seat);
         assert_eq!(grant.project_ids, vec![project.id]);
+        // `:manager global` shows the seated grant. This runs BEFORE the starter
+        // prompt on purpose: its answer is a transient toast, and once the project
+        // manager ends that turn with no wake the daemon's idle backstop re-fires
+        // it many times a second, each firing posting a "Scheduled: ... fired"
+        // toast that replaces this one before the poll can read it.
+        command(&term, "manager global").await?;
+        visible(&term, "Global manager v1 seat").await?;
 
         // README step 5: back on the manager's row (`k`), Enter opens it, the
         // text box is already live in Standard mode; type a starter prompt and
@@ -207,17 +225,24 @@ async fn test_e2e_fresh_install_appoint_project_manager() -> E2eResult<()> {
             .await
             .map_err(|e| test_error(format!("ctrl-h: {e:?}")))?;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        command(&term, "manager global").await?;
-        visible(&term, "Global manager v1 seat").await?;
 
         // The editing-mode choice was stored by the daemon.
         let config = client.get_daemon_config().await?;
         assert_eq!(config["editing_mode"], "standard");
         Ok::<(), Box<dyn Error + Send + Sync>>(())
-    }
-    .await;
-    h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(test_error(format!(
+            "fresh install scenario exceeded {SCENARIO_BUDGET:?}"
+        )))
+    });
+    h.final_screen_text = Some(
+        tokio::time::timeout(Duration::from_secs(10), term.screen())
+            .await
+            .map_or_else(|_| "screen read timed out".to_owned(), |s| s.text()),
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(30), quit_tui(&term)).await;
     h.shutdown_daemon();
     if let Err(error) = outcome {
         let artifacts = h.preserve_artifacts(Some(&error.to_string()))?;

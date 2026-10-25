@@ -21,7 +21,8 @@
 //!
 //! Host pressure (#2562, `host_pressure`) holds the same work through the same
 //! queue: a CPU at or above `job_thermal_ceiling_c` (`held {reason: thermal}`) or
-//! free disk below the governor floor (`reason: disk_pressure`) holds it even
+//! free disk below the governor floor plus `worker_build_reserve_gb`
+//! (`reason: disk_pressure`) holds it even
 //! when the load hold is disabled; a topology node records it as
 //! `admission_hold{kind}`.
 //!
@@ -127,7 +128,9 @@ fn default_source() -> LoadSource {
 pub type PressureSource = Arc<dyn Fn() -> Option<PressureHold> + Send + Sync>;
 
 /// The pressure source a production daemon uses: the shared thermal and
-/// disk-pressure predicate against the live `min_free_disk_gb` floor (#2562).
+/// disk-pressure predicate against the live governor floor plus one worker's
+/// configured target estimate. Reserving one launch avoids scanning sandboxes
+/// or tracking their build lifecycle; job admission keeps its own floor.
 /// Tests never see a hot or full CI host: they default to no pressure.
 fn default_pressure_source(config: &Arc<RuntimeConfig>) -> PressureSource {
     #[cfg(any(test, feature = "test-seam"))]
@@ -138,7 +141,12 @@ fn default_pressure_source(config: &Arc<RuntimeConfig>) -> PressureSource {
     #[cfg(not(any(test, feature = "test-seam")))]
     {
         let config = Arc::clone(config);
-        Arc::new(move || crate::host_pressure::hold_now(config.governor_policy().min_free_disk_gb))
+        Arc::new(move || {
+            crate::host_pressure::launch_hold_now(
+                config.governor_policy().min_free_disk_gb,
+                config.worker_build_reserve_gb.load(Ordering::Relaxed),
+            )
+        })
     }
 }
 
@@ -417,6 +425,12 @@ impl HostLoadAdmission {
         Some(look.load_hold_now().unwrap_or(older))
     }
 
+    /// A durable queued create was withdrawn. It must stop fencing younger
+    /// work in the shared admission queue immediately.
+    pub(crate) fn forget_waiter(&self, key: Uuid) {
+        self.state().waiters.remove(&key);
+    }
+
     /// The store calls this only for an eligible new create. It shares the
     /// held queue with topology nodes, so neither lane can consume capacity
     /// indefinitely ahead of older work in the other lane.
@@ -662,6 +676,7 @@ mod tests {
         PressureHold::DiskPressure {
             free_gb: 12.0,
             min_gb: 30,
+            reserve_gb: 0,
         }
     }
 

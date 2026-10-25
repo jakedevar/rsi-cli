@@ -16,10 +16,15 @@
       "location": "src/keybindings.ts, src/issues.ts",
       "note": "opens the Issues workspace for a project"
     },
+    "module:ui/form_field.rs": {
+      "status": "done",
+      "location": "src/form-field.ts, src/form-text.ts, src/issues.ts, src/pickers.ts, src/actions/sessionlist-run.ts",
+      "note": "the wrapped vim text field of every Issue editor and project form field (TUI #3421, desktop #317, hub #3439): each text field is a vim field through the one VimEditor (modes, counts, text objects, colon commands) with Vim keys on and plain editing with them off; it opens in INSERT with the caret at the end of its text; Esc in INSERT goes to NORMAL only, Esc in NORMAL on a dirty Issue form shows UNSAVED CHANGES and a further Esc discards; Tab / Shift-Tab move between fields; the mode shows in the field border and tag. A one-line field (title, labels, assignee, dependency number, filter and search inputs, project name and folder) is a textarea that wraps and grows with its text and never takes a newline (Enter submits); the Issue title is cut at 200 characters in the editor only, with a live counter from 150 and a hint when typing is refused or a paste cut. The description is multi-line and scrolls. Field order, validation, stale-conflict handling, the discard confirmation and submit are unchanged, and the mouse still works. Tests: tests/form-text.test.mjs, scripts/smoke-vim.mjs scenarios issue-editor-fields, issue-form-esc-contract, title-limit, project-form-fields, issue-filter-dependency-fields, form-fields-vim-off"
+    },
     "module:ui/issue_detail.rs": {
       "status": "substitute",
-      "location": "src/issues.ts, src/issues-tracker-model.ts",
-      "note": "the inspector with body, metadata, dependencies, events, handoffs and the associated-session selection (G2). Substitute for the fold cursor: handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole"
+      "location": "src/issues.ts, src/issue-markdown.ts, src/issues-tracker-model.ts",
+      "note": "the inspector with body, metadata, dependencies, events, handoffs and the associated-session selection (G2). The body and every handoff are rendered as Markdown with the transcript's renderer and sanitizer (headings, lists, emphasis, code, tables, links; a View raw button shows the text as written; links open in the system browser, never the webview; #293). Substitute for the fold cursor: handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole"
     },
     "module:ui/issues.rs": {
       "status": "done",

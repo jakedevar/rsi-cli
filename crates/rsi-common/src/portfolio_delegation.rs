@@ -69,10 +69,13 @@ pub enum AppointChildTargetV1 {
         project_ids: Vec<Uuid>,
         /// Defaults to the caller's effective launches.
         #[serde(default)]
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         allowed_launches: Vec<ManagerLaunchChoiceV2>,
         #[serde(default)]
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         policy: Option<ManagerPolicyV2>,
         #[serde(default)]
+        #[serde(deserialize_with = "crate::strict_input::deserialize")]
         child_policy: Option<ManagerPolicyV2>,
         /// Defaults to the smaller of 5 and the caller's limit.
         #[serde(default)]
@@ -94,10 +97,14 @@ pub enum AppointChildTargetV1 {
 #[serde(deny_unknown_fields)]
 pub struct AgentManagerAppointChildRequestV1 {
     pub target: AppointChildTargetV1,
+    #[serde(deserialize_with = "crate::strict_input::deserialize")]
     pub launch: ManagerLaunchChoiceV2,
     pub query: String,
     pub idempotency_key: String,
-    /// Launch the seat in its own git worktree sandbox (default true).
+    /// Launch the seat in its own git worktree sandbox. A git-backed project
+    /// root always gives the seat one, whatever this says (#169); a non-git
+    /// root gives none unless `true` is asked, which is refused because no
+    /// worktree can be made there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
     /// A seat replacement only: where the predecessor wrote its handoff (a
@@ -217,6 +224,15 @@ impl AgentManagerAppointChildRequestV1 {
                 {
                     return Err(PORTFOLIO_INVALID_REQUEST);
                 }
+                // #3417: a spend grant is real-money authority only the operator
+                // writes; a delegated policy never carries one.
+                if !policy.provider_grants.is_empty()
+                    || child_policy
+                        .as_ref()
+                        .is_some_and(|child| !child.provider_grants.is_empty())
+                {
+                    return Err(crate::provider_grant::PROVIDER_GRANT_OPERATOR_ONLY_MESSAGE);
+                }
                 if let Some(child) = child_policy {
                     child.validate().map_err(|_| PORTFOLIO_INVALID_REQUEST)?;
                     if child
@@ -325,6 +341,37 @@ mod tests {
             sandbox: None,
             handoff: None,
         }
+    }
+
+    /// #3417: an agent delegation cannot create or raise a provider spend
+    /// grant; the refusal names the screen and the key.
+    #[test]
+    fn a_delegated_policy_never_carries_a_provider_grant() {
+        use crate::provider_grant::{ManagerProviderGrantV2, PROVIDER_GRANT_OPERATOR_ONLY_MESSAGE};
+        let grant = ManagerProviderGrantV2 {
+            provider: SessionProvider::OpenRouter,
+            budget_usd: 100.0,
+            expires_at: None,
+            efforts: vec!["high".into()],
+            enable_bench: false,
+            granted_at: None,
+        };
+        let b = Uuid::new_v4();
+        let mut own = create(vec![b]);
+        if let AppointChildTargetV1::Portfolio { policy, .. } = &mut own.target {
+            policy.as_mut().unwrap().provider_grants = vec![grant.clone()];
+        }
+        assert_eq!(own.validate(), Err(PROVIDER_GRANT_OPERATOR_ONLY_MESSAGE));
+        let mut handed = create(vec![b]);
+        if let AppointChildTargetV1::Portfolio { child_policy, .. } = &mut handed.target {
+            *child_policy = Some(ManagerPolicyV2 {
+                provider_grants: vec![grant],
+                ..ManagerPolicyV2::default()
+            });
+        }
+        let refusal = handed.validate().unwrap_err();
+        assert!(refusal.contains("provider_grants"), "{refusal}");
+        assert!(refusal.contains("Policy"), "{refusal}");
     }
 
     #[test]

@@ -160,6 +160,15 @@ const SEAT_CHANGE_GRACE: chrono::Duration = chrono::Duration::minutes(30);
 /// current manager seat may read back (`manager_seat_reads_predecessor`).
 const PREDECESSOR_APPOINTMENTS_MAX: i64 = 32;
 
+// One row per distinct retired anchor: the covering index can stop after 32
+// results (at most 33 entries including the current anchor). Limiting raw
+// scope retirements before grouping would lose appointments when one anchor
+// has many scope versions.
+const PREDECESSOR_APPOINTMENTS_SQL: &str =
+    "SELECT manager_session_id FROM harness_manager_retired_appointments
+     WHERE project_id=?1 AND manager_session_id<>?2
+     ORDER BY retired_at DESC,manager_session_id LIMIT ?3";
+
 /// Most undelivered global-manager messages one grant may hold, across all
 /// recipients. Queued mail follows a PM's rotation at delivery, so a
 /// per-recipient count could be exceeded by an old and a new seat together;
@@ -679,12 +688,7 @@ impl Store {
         // project), so the seats of those earlier appointments' lineages are
         // earlier holders of this slot too. Only that durable record counts;
         // a prompt, title or launch brief never does.
-        let mut retired = self.conn.prepare(
-            "SELECT manager_session_id FROM harness_manager_notice_scope_retirements
-             WHERE project_id=?1 AND manager_session_id<>?2
-             GROUP BY manager_session_id
-             ORDER BY MAX(retired_at) DESC LIMIT ?3",
-        )?;
+        let mut retired = self.conn.prepare(PREDECESSOR_APPOINTMENTS_SQL)?;
         let anchors = retired
             .query_map(
                 params![
@@ -1262,6 +1266,11 @@ impl Store {
         let key = project.id.to_string();
         let config = self.get_harness_manager(project.id)?;
         let effective_caps = self.project_effective_resource_caps(project.id)?;
+        // #206: the PM's own creation caps, from the counter its refusal uses.
+        let creation_caps = match config.as_ref().filter(|c| !c.is_revoked()) {
+            Some(config) => self.manager_own_creation_caps(config)?,
+            None => Vec::new(),
+        };
         let policy = self
             .get_harness_manager_policy(project.id)?
             .map(|policy| GlobalPmPolicyV1 {
@@ -1271,6 +1280,7 @@ impl Store {
                 revoked: policy.revoked,
                 paused: policy.policy.paused,
                 capabilities: policy.policy.capabilities,
+                creation_caps,
             });
         let issues = self.conn.query_row(
             "SELECT

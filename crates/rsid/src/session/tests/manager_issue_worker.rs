@@ -755,6 +755,348 @@ async fn parent_required_refusal_lists_the_live_scope_epics_newest_first_capped(
         .unwrap();
 }
 
+/// #3540: a manager with no live Epic in scope gets a refusal that keeps its
+/// code and names how an Epic comes to exist, not a request for a
+/// `parent_epic_id` it cannot supply.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn zero_live_scope_epics_refusal_names_the_remedy() {
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let issue = new_issue(&p, "no epic anywhere").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE sessions SET status='Archived' WHERE id=?1",
+            [p.epic.to_string()],
+        )
+        .unwrap();
+    let baseline = counts(&p).await;
+    let error = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(issue.display_number, "k-zero", &p))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("manager_issue_worker_parent_required: no live Epic in your scope (0 live)"),
+        "{error}"
+    );
+    assert!(error.contains("allow_create_groups"), "{error}");
+    assert_eq!(counts(&p).await, baseline);
+}
+
+/// #3688: re-scope the Pilot to the whole project (no listed Groups or Epics)
+/// with no live Epic, `allow_create_groups` off and IssueCoordinate granted, so
+/// the manager has nothing launchable and no authority to create a Group.
+/// `archive_group` also retires the Pilot's Group.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn project_wide_scope_without_epics(p: &Pilot, archive_group: bool) {
+    let store = p.manager.store.lock().await;
+    let ids = if archive_group {
+        vec![p.epic, p.group]
+    } else {
+        vec![p.epic]
+    };
+    for id in ids {
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET status='Archived' WHERE id=?1",
+                [id.to_string()],
+            )
+            .unwrap();
+    }
+    let scope = store
+        .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+            group_ids: Vec::new(),
+            project_id: p.project,
+            session_id: p.owner,
+            epic_ids: None,
+            expected_row_version: 1,
+        })
+        .unwrap();
+    assert_eq!(
+        scope.scope_mode,
+        rsi_common::harness_manager::HarnessManagerScopeModeV1::Project
+    );
+    let mut policy = p.policy.clone();
+    policy
+        .capabilities
+        .push(ManagerCapabilityV2::IssueCoordinate);
+    policy.allow_create_groups = false;
+    policy.group_ids = Vec::new();
+    let expected_policy_version = store
+        .get_harness_manager_policy(p.project)
+        .unwrap()
+        .unwrap()
+        .row_version;
+    store
+        .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+            project_id: p.project,
+            expected_scope_version: scope.row_version,
+            expected_policy_version,
+            idempotency_key: "project-wide".into(),
+            policy,
+        })
+        .unwrap();
+}
+
+/// The live Epics of the Pilot's project as (id, parent id, title).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn live_epics(p: &Pilot) -> Vec<(String, Option<String>, Option<String>)> {
+    let store = p.manager.store.lock().await;
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT id, parent_id, title FROM sessions
+             WHERE project_id=?1 AND session_kind='Epic' AND status NOT IN ('Archived','Deleted')",
+        )
+        .unwrap();
+    statement
+        .query_map([p.project.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+/// #3688: the first project manager of a project with no Epic, no Group in its
+/// scope and no `allow_create_groups` launches its first worker with no
+/// operator or global-manager action: the launch provisions a default Group
+/// and Epic, parents the worker under that Epic, and a later launch reuses it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn first_launch_with_no_group_or_epic_provisions_a_default_epic() {
+    let p = pilot().await;
+    project_wide_scope_without_epics(&p, true).await;
+    assert!(live_epics(&p).await.is_empty());
+    let issue = new_issue(&p, "first worker").await;
+
+    let launched = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(issue.display_number, "k-first", &p))
+        .await
+        .unwrap();
+
+    let epics = live_epics(&p).await;
+    assert_eq!(epics.len(), 1, "{epics:?}");
+    let (epic, group, title) = &epics[0];
+    assert_eq!(title.as_deref(), Some("Issue workers"));
+    let (group_kind, group_parent, group_status, group_project): (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    ) = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT session_kind, parent_id, status, project_id FROM sessions WHERE id=?1",
+            [group.as_deref().unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(group_kind, "Group");
+    assert_eq!(group_parent, None);
+    assert_ne!(group_status, "Archived");
+    assert_eq!(group_project, Some(p.project.to_string()));
+    let payload: String = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT payload_json FROM harness_manager_v2_operations WHERE id=?1",
+            [launched.action.operation_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(payload.contains(epic), "{payload}");
+
+    // The next launch finds the one live Epic: nothing more is created.
+    let second = new_issue(&p, "second worker").await;
+    p.manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(second.display_number, "k-second", &p))
+        .await
+        .unwrap();
+    assert_eq!(live_epics(&p).await, epics);
+}
+
+/// #3688: a project that already has a live top-level Group gets the default
+/// Epic under it, not a second Group.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn first_launch_reuses_the_live_group_for_the_default_epic() {
+    let p = pilot().await;
+    project_wide_scope_without_epics(&p, false).await;
+    let issue = new_issue(&p, "group exists").await;
+    let groups_before: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE session_kind='Group'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    p.manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(issue.display_number, "k-group", &p))
+        .await
+        .unwrap();
+
+    let epics = live_epics(&p).await;
+    assert_eq!(epics.len(), 1, "{epics:?}");
+    assert_eq!(epics[0].1, Some(p.group.to_string()));
+    let groups_after: i64 = p
+        .manager
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE session_kind='Group'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(groups_after, groups_before);
+}
+
+/// Every Group and Epic row of the Pilot's project, whatever its status.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn container_rows(p: &Pilot) -> Vec<(String, String, String)> {
+    let store = p.manager.store.lock().await;
+    let mut statement = store
+        .conn
+        .prepare(
+            "SELECT id, session_kind, status FROM sessions
+             WHERE project_id=?1 AND session_kind IN ('Group','Epic') ORDER BY id",
+        )
+        .unwrap();
+    statement
+        .query_map([p.project.to_string()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect()
+}
+
+/// #3786: a project-wide manager with a live grant but without the
+/// SessionCreate capability is refused, and the refused launch leaves no default
+/// Group or Epic in the project.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn first_launch_without_session_create_creates_no_default_containers() {
+    let p = pilot().await;
+    project_wide_scope_without_epics(&p, true).await;
+    {
+        let store = p.manager.store.lock().await;
+        let grant = store
+            .get_harness_manager_policy(p.project)
+            .unwrap()
+            .unwrap();
+        let mut policy = grant.policy.clone();
+        policy
+            .capabilities
+            .retain(|capability| *capability != ManagerCapabilityV2::SessionCreate);
+        store
+            .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                project_id: p.project,
+                expected_scope_version: grant.scope_version,
+                expected_policy_version: grant.row_version,
+                idempotency_key: "no-session-create".into(),
+                policy,
+            })
+            .unwrap();
+    }
+    let issue = new_issue(&p, "no capability").await;
+    let containers = container_rows(&p).await;
+    let baseline = counts(&p).await;
+
+    let error = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(issue.display_number, "k-nocap", &p))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("manager_v2"), "{error}");
+    assert_eq!(container_rows(&p).await, containers);
+    assert!(live_epics(&p).await.is_empty());
+    assert_eq!(counts(&p).await, baseline);
+}
+
+/// #3786: a launch with the capability that admission refuses late (the Issue is
+/// Closed) rolls back with the default Group and Epic it would have created.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn refused_first_launch_leaves_no_default_containers_and_a_retry_provisions_them() {
+    let p = pilot().await;
+    project_wide_scope_without_epics(&p, true).await;
+    let issue = new_issue(&p, "closed before launch").await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE issues SET status='Closed' WHERE id=?1",
+            [issue.id.to_string()],
+        )
+        .unwrap();
+    let containers = container_rows(&p).await;
+    let baseline = counts(&p).await;
+
+    let error = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(
+            p.owner,
+            request(issue.display_number, "k-closed3786", &p),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("issue_unavailable"), "{error}");
+    assert_eq!(container_rows(&p).await, containers);
+    assert!(live_epics(&p).await.is_empty());
+    assert_eq!(counts(&p).await, baseline);
+
+    // An unknown Issue is refused before any container is written too.
+    p.manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(9_999, "k-missing3786", &p))
+        .await
+        .unwrap_err();
+    assert_eq!(container_rows(&p).await, containers);
+
+    // The happy path still provisions the default Epic on a launchable Issue.
+    let open = new_issue(&p, "launchable").await;
+    p.manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(open.display_number, "k-open3786", &p))
+        .await
+        .unwrap();
+    let epics = live_epics(&p).await;
+    assert_eq!(epics.len(), 1, "{epics:?}");
+    assert_eq!(epics[0].2.as_deref(), Some("Issue workers"));
+}
 /// #315: several Epics in scope but exactly one live one is an unambiguous
 /// parent, so the launch needs no `parent_epic_id`.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -1188,11 +1530,11 @@ async fn bound_worker_publishes_a_handoff_when_the_body_is_at_its_ceiling() {
         )
         .contains("invalid_request")
     );
-    // Only the bound worker publishes one; the manager does not.
+    // A caller with no authority over the Issue and no binding is refused.
     assert!(
         code(
             store
-                .agent_append_issue_handoff(p.owner, &handoff("done".into(), "c-mgr"))
+                .agent_append_issue_handoff(Uuid::new_v4(), &handoff("done".into(), "c-none"))
                 .unwrap_err()
         )
         .contains("authority_denied")
@@ -1932,6 +2274,214 @@ async fn assert_changed_replays_conflict(
     }
 }
 
+/// A reviewer job must run the actual source's new tests, including before
+/// that source lands. Explicit manager sources still take precedence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_of_pins_latest_handoff_source_and_preserves_explicit_sources() {
+    for mode in ["inferred", "commit", "path", "rolling"] {
+        let p = pilot().await;
+        grant_issue_coordinate(&p).await;
+        let _origin = rolling_checkout_with_origin(&p);
+        let rolling = git(&p.repo, &["rev-parse", "HEAD"]);
+        std::fs::write(p.repo.join("new-source-test.rs"), "// source-only test\n").unwrap();
+        git(&p.repo, &["add", "new-source-test.rs"]);
+        git(&p.repo, &["commit", "-qm", "source adds a test"]);
+        let source = git(&p.repo, &["rev-parse", "HEAD"]);
+        let implementer = new_issue_with_body(
+            &p,
+            "implementer",
+            format!("Build it.\n## Handoff\ncommit: {rolling}"),
+        )
+        .await;
+        // The newest stored record supersedes the body's older source.
+        p.manager.store.lock().await.conn.execute(
+            "INSERT INTO issue_handoffs (issue_id,sequence,project_id,author_session_id,idempotency_key,body,created_at) VALUES (?1,1,?2,?3,'source-handoff',?4,?5)",
+            rusqlite::params![implementer.id.to_string(), p.project.to_string(), p.owner.to_string(), format!("PIPELINE HANDOFF — IMPLEMENTATION:\ncommit: {source}"), chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+        ).unwrap();
+        let review = new_issue(&p, "review").await;
+        let mut launch = request(review.display_number, "source-review", &p);
+        launch.review_of = Some(implementer.display_number);
+        launch.sandbox_source = match mode {
+            "commit" => Some(ManagerSandboxSourceV1::Commit(rolling.clone())),
+            "path" => Some(ManagerSandboxSourceV1::Path(p.repo.display().to_string())),
+            "rolling" => Some(ManagerSandboxSourceV1::Rolling {}),
+            _ => None,
+        };
+        let control = p.manager.agent_control();
+        let launched = control
+            .agent_manager_launch_issue_worker(p.owner, launch.clone())
+            .await
+            .unwrap();
+        let expected = if matches!(mode, "commit" | "rolling") {
+            &rolling
+        } else {
+            &source
+        };
+        let head = establish_issue_worker(&p, &launched).await;
+        assert_eq!(&head, expected, "{mode}");
+        let worker = p
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(launched.worker_session_id)
+            .unwrap()
+            .unwrap();
+        if mode == "inferred" {
+            assert!(
+                worker
+                    .query
+                    .contains(&format!("pinned to source commit {source}"))
+            );
+            assert_eq!(
+                std::fs::read_to_string(
+                    std::path::Path::new(worker.sandbox_root.as_ref().unwrap())
+                        .join("new-source-test.rs")
+                )
+                .unwrap(),
+                "// source-only test\n"
+            );
+        }
+        // A new implementer handoff cannot retarget an existing launch.
+        p.manager.store.lock().await.conn.execute(
+            "INSERT INTO issue_handoffs (issue_id,sequence,project_id,author_session_id,idempotency_key,body,created_at) VALUES (?1,2,?2,?3,'later-handoff',?4,?5)",
+            rusqlite::params![implementer.id.to_string(), p.project.to_string(), p.owner.to_string(), format!("commit: {rolling}"), chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+        ).unwrap();
+        let replay = control
+            .agent_manager_launch_issue_worker(p.owner, launch.clone())
+            .await
+            .unwrap();
+        assert!(replay.deduplicated);
+        assert_eq!(replay.worker_session_id, launched.worker_session_id);
+        assert_eq!(replay.action.sandbox_source, launched.action.sandbox_source);
+        let mut changed = launch;
+        changed.sandbox_source = Some(ManagerSandboxSourceV1::Commit(source));
+        assert!(
+            launch_refusal(&p, changed)
+                .await
+                .contains("idempotency_conflict")
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_of_without_a_declared_commit_uses_rolling_and_disallows_source_test_jobs() {
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let _origin = rolling_checkout_with_origin(&p);
+    let rolling = git(&p.repo, &["rev-parse", "HEAD"]);
+    std::fs::write(p.repo.join("unpublished"), "local source\n").unwrap();
+    git(&p.repo, &["add", "unpublished"]);
+    git(&p.repo, &["commit", "-qm", "unpublished change"]);
+    let implementer = new_issue_with_body(
+        &p,
+        "implementer without source",
+        format!("Build it.\n## Handoff\nbase_commit: {rolling}\nTests passed."),
+    )
+    .await;
+    let review = new_issue(&p, "review without source").await;
+    let mut launch = request(review.display_number, "review-rolling", &p);
+    launch.review_of = Some(implementer.display_number);
+    launch.brief = "Review only; you may submit one exact test job for the new tests.".into();
+    let launched = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, launch)
+        .await
+        .unwrap();
+    assert_eq!(establish_issue_worker(&p, &launched).await, rolling);
+    let query = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(launched.worker_session_id)
+        .unwrap()
+        .unwrap()
+        .query;
+    assert!(query.contains("Review sandbox: origin/rolling; no exact review source is pinned."));
+    assert!(
+        query.contains(
+            "Do not submit a test job for those tests; this overrides any test-job offer"
+        )
+    );
+}
+
+/// An unavailable handoff commit is advisory; only an explicit unknown
+/// sandbox_source refuses the launch.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_of_with_an_unavailable_commit_uses_rolling_but_explicit_unknown_refuses() {
+    use rsi_common::harness_manager_v2::MANAGER_SANDBOX_SOURCE_COMMIT_UNKNOWN;
+
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let _origin = rolling_checkout_with_origin(&p);
+    let rolling = git(&p.repo, &["rev-parse", "HEAD"]);
+    let unknown = "0123456789abcdef0123456789abcdef01234567";
+    let implementer = new_issue(&p, "implementer with foreign source").await;
+    p.manager.store.lock().await.conn.execute(
+        "INSERT INTO issue_handoffs (issue_id,sequence,project_id,author_session_id,idempotency_key,body,created_at) VALUES (?1,1,?2,?3,'unavailable-source',?4,?5)",
+        rusqlite::params![implementer.id.to_string(), p.project.to_string(), p.owner.to_string(), format!("PIPELINE HANDOFF — IMPLEMENTATION:\ncommit: {unknown}"), chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+    ).unwrap();
+    let review = new_issue(&p, "review of unavailable source").await;
+    let mut launch = request(review.display_number, "review-unavailable", &p);
+    launch.review_of = Some(implementer.display_number);
+    launch.brief = "Review only; you may submit one exact test job for the new tests.".into();
+    let mut explicit = launch.clone();
+    explicit.idempotency_key = "review-explicit-unknown".into();
+    explicit.sandbox_source = Some(ManagerSandboxSourceV1::Commit(unknown.into()));
+    let baseline = counts(&p).await;
+    let row = issue_row(&p, review.id).await;
+    let error = launch_refusal(&p, explicit).await;
+    assert!(
+        error.contains(MANAGER_SANDBOX_SOURCE_COMMIT_UNKNOWN),
+        "{error}"
+    );
+    assert_eq!(counts(&p).await, baseline);
+    assert_eq!(issue_row(&p, review.id).await, row);
+
+    let control = p.manager.agent_control();
+    let launched = control
+        .agent_manager_launch_issue_worker(p.owner, launch.clone())
+        .await
+        .unwrap();
+    let pin: Option<String> = p.manager.store.lock().await.conn.query_row(
+        "SELECT json_extract(payload_json,'$.issue_binding.review_source_commit') FROM harness_manager_v2_operations WHERE id=?1",
+        [launched.action.operation_id.to_string()], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(pin, None);
+    assert_eq!(establish_issue_worker(&p, &launched).await, rolling);
+    let query = p
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(launched.worker_session_id)
+        .unwrap()
+        .unwrap()
+        .query;
+    assert!(query.contains("Review sandbox: origin/rolling; no exact review source is pinned."));
+    assert!(
+        query.contains(
+            "Do not submit a test job for those tests; this overrides any test-job offer"
+        )
+    );
+    assert!(query.contains(&format!(
+        "declared source commit {unknown} could not be resolved in the local repository"
+    )));
+    // An idempotent replay retains the admitted rolling fallback.
+    let replay = control
+        .agent_manager_launch_issue_worker(p.owner, launch)
+        .await
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.worker_session_id, launched.worker_session_id);
+    assert_eq!(replay.action.sandbox_source, launched.action.sandbox_source);
+}
+
 /// #1590: `review_of` copies the implementer Issue's text and COMPLETE latest
 /// handoff (landing filters included, even when oversized) into the bound
 /// reviewer's brief; an unknown reviewed Issue is refused before any effect.
@@ -1995,6 +2545,19 @@ async fn review_of_copies_the_complete_implementer_handoff_into_the_reviewer_bri
     assert!(query.contains("Acceptance: it works."), "{query}");
     assert!(query.contains("LANDING FILTERS: rsid=shard:store-01:test(final_filter_marker)"));
     assert!(query.contains("bytes omitted from the middle"));
+    for guidance in [
+        "AgentGetJob review scope (#604)",
+        "newest four implementer sessions from running/succeeded launches",
+        "each owner's newest scoped_test job",
+        "newest 64 handoffs",
+        "checked at read time",
+        "Recipe jobs and copied IDs alone do not qualify",
+        "job_not_found means absent or inaccessible; it does not reveal which",
+        "Reading a receipt does not prove it verifies the reviewed SHA",
+        "no List, watch, cancel or ownership authority",
+    ] {
+        assert!(query.contains(guidance), "{guidance}");
+    }
     assert!(query.contains(&format!("Issue #{}", review.display_number)));
     assert!(query.len() <= 32_768);
     // A replay reuses the journalled brief even after the reviewed Issue grew.
@@ -2025,6 +2588,132 @@ async fn review_of_copies_the_complete_implementer_handoff_into_the_reviewer_bri
     )
     .await;
     drop(process);
+}
+
+/// #695: a copied manager-authored handoff is context, not a selector source.
+/// Explicit launch selectors/related independently grant the same reads,
+/// including the implementer itself; neither path follows references further.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copied_review_records_require_explicit_live_issue_selection() {
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let implementer = new_issue(&p, "implementer work").await;
+    let dependency = new_issue(&p, "handoff dependency").await;
+    let preceding_only = new_issue(&p, "preceding record dependency").await;
+    let chained = new_issue(&p, "dependency of dependency").await;
+    set_issue_body(
+        &p,
+        dependency.id,
+        format!("Dependency refers to #{}.", chained.display_number),
+    )
+    .await;
+    for (key, text) in [
+        (
+            "preceding-selector",
+            format!("PRECEDING_CONTEXT see #{}.", preceding_only.display_number),
+        ),
+        (
+            "latest-selector",
+            format!("MANAGER_CONTEXT see #{}.", dependency.display_number),
+        ),
+    ] {
+        let mut note = append_request(&implementer, 1, String::new(), key);
+        note.body = None;
+        note.handoff = Some(text);
+        p.manager
+            .store
+            .lock()
+            .await
+            .agent_append_issue_handoff(p.owner, &note)
+            .unwrap();
+    }
+
+    for selection in ["copied-only", "brief", "related"] {
+        let review = new_issue(&p, selection).await;
+        let mut launch = request(review.display_number, selection, &p);
+        launch.review_of = Some(implementer.display_number);
+        match selection {
+            "brief" => {
+                launch.brief = format!(
+                    "Review with #{} and #{}.",
+                    dependency.display_number, implementer.display_number
+                );
+            }
+            "related" => {
+                launch.related = vec![dependency.display_number, implementer.display_number];
+            }
+            _ => {}
+        }
+        let launched = p
+            .manager
+            .agent_control()
+            .agent_manager_launch_issue_worker(p.owner, launch)
+            .await
+            .unwrap();
+        let worker = launched.worker_session_id;
+        let process = crate::session::launch::install_controller_candidate_test_process(worker);
+        p.execute().await.unwrap();
+        let query = p
+            .manager
+            .store
+            .lock()
+            .await
+            .get_session(worker)
+            .unwrap()
+            .unwrap()
+            .query;
+        assert!(query.contains(&format!(
+            "> MANAGER_CONTEXT see #{}.",
+            dependency.display_number
+        )));
+        assert!(query.contains(&format!(
+            "> PRECEDING_CONTEXT see #{}.",
+            preceding_only.display_number
+        )));
+        assert!(query.contains("Issue references only in these daemon-copied records do not grant additional live Issue reads"));
+        assert!(query.contains("review_of alone grants no reverse live read"));
+        assert_eq!(
+            read_issue(&p, worker, review.display_number)
+                .await
+                .unwrap()
+                .issue
+                .id,
+            review.id
+        );
+        for selected in [&dependency, &implementer] {
+            if selection == "copied-only" {
+                assert_read_denied(&p, worker, selected.display_number).await;
+            } else {
+                assert_eq!(
+                    read_issue(&p, worker, selected.display_number)
+                        .await
+                        .unwrap()
+                        .issue
+                        .id,
+                    selected.id
+                );
+                let by_uuid = p
+                    .manager
+                    .store
+                    .lock()
+                    .await
+                    .agent_get_issue(
+                        worker,
+                        &AgentGetIssueRequestV1 {
+                            project_id: None,
+                            issue_id: Some(selected.id),
+                            display_number: None,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(by_uuid.issue.id, selected.id);
+            }
+        }
+        assert_read_denied(&p, worker, preceding_only.display_number).await;
+        assert_read_denied(&p, worker, chained.display_number).await;
+        drop(process);
+    }
 }
 
 /// #1750 fix-forward: a stored handoff record and a handoff in the body are
@@ -2147,12 +2836,15 @@ async fn review_brief_takes_the_newest_handoff_across_record_and_body() {
         .agent_control()
         .agent_update_issue(
             p.owner,
-            append_request(
-                &implementer,
-                version,
-                "## Handoff\nD_SHORT_MARKER scoped_test job j4 exit 0, landing filters".into(),
-                "replace-d",
-            ),
+            AgentUpdateIssueRequestV1 {
+                replace_body: true,
+                ..append_request(
+                    &implementer,
+                    version,
+                    "## Handoff\nD_SHORT_MARKER scoped_test job j4 exit 0, landing filters".into(),
+                    "replace-d",
+                )
+            },
         )
         .await
         .unwrap();
@@ -2213,7 +2905,7 @@ async fn bound_worker_reads_its_review_issues_and_relaunch_brief_carries_them() 
     };
     set_body(
         review.id,
-        "Review it.\n\n## Review handoff\nREVIEW CHANGES\nF1 first_finding_marker\n\nF2 last_finding_marker".into(),
+        format!("Review it.\n\n## Review handoff\nREVIEW CHANGES\nF1 first_finding_marker\n\nF2 last_finding_marker see #{}", other.display_number),
     )
     .await;
     set_body(
@@ -2355,6 +3047,20 @@ async fn bound_worker_reads_its_review_issues_and_relaunch_brief_carries_them() 
         .query;
     assert!(query.contains("F1 first_finding_marker"), "{query}");
     assert!(query.contains("F2 last_finding_marker"), "{query}");
+    assert!(query.contains("Issue references only in these daemon-copied records do not grant additional live Issue reads"));
+    assert!(query.contains(&format!(
+        "F2 last_finding_marker see #{}",
+        other.display_number
+    )));
+    assert_read_denied(&p, successor, other.display_number).await;
+    assert_eq!(
+        read_issue(&p, successor, review.display_number)
+            .await
+            .unwrap()
+            .issue
+            .id,
+        review.id
+    );
     assert!(query.contains(&format!(
         "read Issue #{} with AgentGetIssue",
         huge.display_number
@@ -2547,6 +3253,7 @@ async fn bound_worker_reads_issues_its_body_handoffs_brief_and_launch_reference(
     assert!(query.len() <= 32_768, "{}", query.len());
     let brief_at = query.find("Implement it. Intent").unwrap();
     let related_at = query.find("## Related Issues").unwrap();
+    assert!(query[related_at..].contains("Issue references only in these daemon-copied records do not grant additional live Issue reads"));
     let closing_at = query.find("You are bound to Issue #").unwrap();
     assert!(brief_at < related_at && related_at < closing_at);
     assert!(query.contains(&format!("### Related Issue #{} (", attached.display_number)));
@@ -4125,6 +4832,7 @@ async fn bound_worker_lists_project_summaries_through_rpc_and_native_tool() {
     let expected_summary = |row: &Issue| {
         serde_json::json!({
             "display_number": row.display_number, "id": row.id,
+            "row_version": row.row_version,
             "title": row.title, "labels": row.labels, "status": row.status,
             "priority": row.priority, "created_at": row.created_at,
             "updated_at": row.updated_at
@@ -4188,6 +4896,40 @@ async fn bound_worker_lists_project_summaries_through_rpc_and_native_tool() {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid_request"), "{error}");
+    }
+    // #184: a bare `{}` search names title_contains and the accepted
+    // narrowing filters instead of a bare invalid_request.
+    let bare = tool
+        .execute(serde_json::json!({}), std::path::Path::new("/"))
+        .await;
+    assert!(!bare.success);
+    let bare: serde_json::Value = serde_json::from_str(bare.error_msg.as_deref().unwrap()).unwrap();
+    assert_eq!(bare["validation"]["field"], "title_contains");
+    let next_action = bare["next_action"].as_str().unwrap();
+    assert!(
+        next_action.contains("params.title_contains")
+            && next_action.contains("title_contains, labels or status"),
+        "{next_action}"
+    );
+    // #184 decision: a status-only or labels-only search is a read-only
+    // summary search over the bound project; project_id stays refused above.
+    for narrowing in [
+        serde_json::json!({"status": "Open"}),
+        serde_json::json!({"labels": labels}),
+    ] {
+        let params = crate::agent_issue_validation::decode_list(&narrowing).unwrap();
+        let value =
+            serde_json::to_value(p.manager.agent_list_issues(worker, params).await.unwrap())
+                .unwrap();
+        let rows = value["issues"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["id"] == serde_json::json!(matches.1.id)),
+            "{value}"
+        );
+        assert!(rows.iter().all(|row| row.get("body").is_none()), "{value}");
+        let native = tool.execute(narrowing, std::path::Path::new("/")).await;
+        assert!(native.success, "{}", native.output);
     }
     // The manager has the identical full-record JSON and may omit title_contains.
     let manager_page = p
@@ -4861,4 +5603,810 @@ async fn launch_brief_commit_hint_ignores_body_only_mentions_and_stays_advisory(
     );
     assert!(worker.query.contains("never closure evidence"));
     drop(process);
+}
+
+/// #481: exercise the same host-admission callback as the reconcile loop.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn claim_issue_worker_with_admission(p: &Pilot) -> Option<ManagerActionClaimV2> {
+    p.manager
+        .store
+        .lock()
+        .await
+        .claim_manager_action_with_create_admission(
+            p.manager.program_run_boot_id,
+            p.manager.deploy_drain().is_draining(),
+            &|key, since, target| p.manager.admit_manager_create(key, since, target),
+        )
+        .unwrap()
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn held_issue_worker(p: &Pilot) -> (Issue, AgentManagerLaunchIssueWorkerResultV1) {
+    grant_issue_coordinate(p).await;
+    p.manager
+        .runtime_config
+        .update_field("host_load_admission_threshold", &serde_json::json!(40))
+        .unwrap();
+    p.manager.host_load().set_source(std::sync::Arc::new(|| {
+        crate::host_load::LoadReading::Load1(95.0)
+    }));
+    let issue = new_issue(p, "held Issue work").await;
+    let launched = p
+        .manager
+        .agent_control()
+        .agent_manager_launch_issue_worker(p.owner, request(issue.display_number, "held-issue", p))
+        .await
+        .unwrap();
+    assert!(claim_issue_worker_with_admission(p).await.is_none());
+    assert_eq!(
+        p.receipt(launched.action.operation_id).await.state,
+        ManagerActionStateV2::Queued
+    );
+    (issue, launched)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+async fn release_issue_worker(p: &Pilot) -> ManagerActionClaimV2 {
+    p.manager.host_load().set_source(std::sync::Arc::new(|| {
+        crate::host_load::LoadReading::Load1(0.0)
+    }));
+    claim_issue_worker_with_admission(p)
+        .await
+        .expect("released create is admitted")
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn held_issue_worker_cancelled_before_release_ends_issue_unavailable_without_a_session() {
+    let p = pilot().await;
+    let (issue, launched) = held_issue_worker(&p).await;
+    let mut pending = manager_program_job(&p, "on_terminal", true);
+    pending.wake_mode = WakeMode::OnTerminal(launched.worker_session_id);
+    pending.wake_session_id = Some(p.owner);
+    p.manager
+        .store
+        .lock()
+        .await
+        .insert_scheduled_job(&pending)
+        .unwrap();
+    let before = counts(&p).await.2;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE issues SET status='Cancelled' WHERE id=?1",
+            [issue.id.to_string()],
+        )
+        .unwrap();
+    let claim = release_issue_worker(&p).await;
+    assert!(p.manager.run_claimed_manager_action(claim).await.unwrap());
+    let receipt = p.receipt(launched.action.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Blocked);
+    assert_eq!(
+        receipt.outcome.as_deref(),
+        Some("manager_issue_worker_issue_unavailable")
+    );
+    assert_eq!(counts(&p).await.2, before);
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(launched.worker_session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(issue_row(&p, issue.id).await.0, "Cancelled");
+    assert!(
+        !p.manager
+            .agent_control()
+            .issue_worker_launch_watch_pending(p.owner, launched.worker_session_id)
+            .await
+    );
+    assert!(watches_on(&p, launched.worker_session_id).await.is_empty());
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .queued_manager_create_sessions(16)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn held_issue_worker_closed_or_archived_before_release_ends_issue_unavailable() {
+    for archived in [false, true] {
+        let p = pilot().await;
+        let (issue, launched) = held_issue_worker(&p).await;
+        p.manager
+            .store
+            .lock()
+            .await
+            .conn
+            .execute(
+                "UPDATE issues SET status=?3,archived_at=?2 WHERE id=?1",
+                rusqlite::params![
+                    issue.id.to_string(),
+                    archived
+                        .then(|| chrono::Utc::now()
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+                    if archived { "InProgress" } else { "Closed" }
+                ],
+            )
+            .unwrap();
+        let claim = release_issue_worker(&p).await;
+        p.manager.run_claimed_manager_action(claim).await.unwrap();
+        let receipt = p.receipt(launched.action.operation_id).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Blocked);
+        assert_eq!(
+            receipt.outcome.as_deref(),
+            Some("manager_issue_worker_issue_unavailable")
+        );
+        assert!(
+            p.manager
+                .store
+                .lock()
+                .await
+                .get_session(launched.worker_session_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_issue_worker_with_open_issue_starts_after_release() {
+    let p = pilot().await;
+    let (issue, launched) = held_issue_worker(&p).await;
+    p.manager
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "UPDATE issues SET status='Open' WHERE id=?1",
+            [issue.id.to_string()],
+        )
+        .unwrap();
+    let process = crate::session::launch::install_controller_candidate_test_process(
+        launched.worker_session_id,
+    );
+    let claim = release_issue_worker(&p).await;
+    p.manager.run_claimed_manager_action(claim).await.unwrap();
+    assert_eq!(
+        p.receipt(launched.action.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert_eq!(
+        process
+            .productive_start_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(launched.worker_session_id)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        watches_on(&p, launched.worker_session_id).await,
+        vec![p.owner]
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+fn withdraw_issue_create(
+    launched: &AgentManagerLaunchIssueWorkerResultV1,
+    version: i64,
+    key: &str,
+) -> AgentManagerControlRequestV2 {
+    AgentManagerControlRequestV2::new(
+        ManagerFenceV2 {
+            scope_version: 1,
+            policy_version: 2,
+        },
+        key.into(),
+        ManagerActionV2::WithdrawQueuedCreate {
+            operation_id: launched.action.operation_id,
+            expected_row_version: version,
+        },
+    )
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn withdraw_queued_issue_create_succeeds_and_releases_the_binding() {
+    let p = pilot().await;
+    let (issue, launched) = held_issue_worker(&p).await;
+    let control = p.manager.agent_control();
+    let stale = control
+        .agent_manager_control(
+            p.owner,
+            withdraw_issue_create(&launched, launched.action.row_version + 1, "stale-withdraw"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        stale.to_string().contains("manager_v2_action_changed"),
+        "{stale}"
+    );
+    let request = withdraw_issue_create(&launched, launched.action.row_version, "withdraw");
+    let withdrawal = control
+        .agent_manager_control(p.owner, request.clone())
+        .await
+        .unwrap();
+    // The original stays held. Withdrawal must run through that same queue.
+    p.manager.reconcile_manager_actions_once().await.unwrap();
+    let receipt = p.receipt(launched.action.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Revoked);
+    assert_eq!(
+        receipt.outcome.as_deref(),
+        Some("manager_v2_queued_create_withdrawn")
+    );
+    assert_eq!(
+        p.receipt(withdrawal.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+    assert!(
+        p.manager
+            .store
+            .lock()
+            .await
+            .get_session(launched.worker_session_id)
+            .unwrap()
+            .is_none()
+    );
+    let (status, _, body) = issue_row(&p, issue.id).await;
+    assert_eq!(status, "Open");
+    assert!(body.contains("manager_v2_queued_create_withdrawn"));
+    assert!(body.contains("before worker"));
+    assert!(
+        !control
+            .issue_worker_launch_watch_pending(p.owner, launched.worker_session_id)
+            .await
+    );
+    let replay = control
+        .agent_manager_control(p.owner, request)
+        .await
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.operation_id, withdrawal.operation_id);
+    // A fresh launch now owns the Issue; the withdrawn target never runs.
+    let next = control
+        .agent_manager_launch_issue_worker(
+            p.owner,
+            self::request(issue.display_number, "after-withdraw", &p),
+        )
+        .await
+        .unwrap();
+    assert_ne!(next.worker_session_id, launched.worker_session_id);
+    let next_claim = release_issue_worker(&p).await;
+    assert_eq!(
+        next_claim.id(),
+        next.action.operation_id,
+        "withdrawn admission waiter is released immediately"
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn withdraw_started_issue_create_refuses_and_names_agent_halt() {
+    let p = pilot().await;
+    let (_, launched) = held_issue_worker(&p).await;
+    let _process = crate::session::launch::install_controller_candidate_test_process(
+        launched.worker_session_id,
+    );
+    let claim = release_issue_worker(&p).await;
+    p.manager.run_claimed_manager_action(claim).await.unwrap();
+    let started = p.receipt(launched.action.operation_id).await;
+    let error = p
+        .manager
+        .agent_control()
+        .agent_manager_control(
+            p.owner,
+            withdraw_issue_create(&launched, started.row_version, "withdraw-started"),
+        )
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("manager_v2_action_started_use_agent_halt"),
+        "{text}"
+    );
+    assert!(text.contains("AgentHalt"), "{text}");
+    assert_eq!(
+        p.receipt(launched.action.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_withdrawal_losing_to_admission_preserves_the_started_worker() {
+    let p = pilot().await;
+    let (_, launched) = held_issue_worker(&p).await;
+    let withdrawal = p
+        .manager
+        .agent_control()
+        .agent_manager_control(
+            p.owner,
+            withdraw_issue_create(&launched, launched.action.row_version, "withdraw-race"),
+        )
+        .await
+        .unwrap();
+    let _process = crate::session::launch::install_controller_candidate_test_process(
+        launched.worker_session_id,
+    );
+    let launch_claim = release_issue_worker(&p).await;
+    assert_eq!(launch_claim.id(), launched.action.operation_id);
+    p.manager
+        .run_claimed_manager_action(launch_claim)
+        .await
+        .unwrap();
+    let withdraw_claim = p.claim().await;
+    assert_eq!(withdraw_claim.id(), withdrawal.operation_id);
+    p.manager
+        .run_claimed_manager_action(withdraw_claim)
+        .await
+        .unwrap();
+    let receipt = p.receipt(withdrawal.operation_id).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Blocked);
+    assert_eq!(
+        receipt.outcome.as_deref(),
+        Some("manager_v2_action_started_use_agent_halt")
+    );
+    assert_eq!(
+        p.receipt(launched.action.operation_id).await.state,
+        ManagerActionStateV2::Succeeded
+    );
+}
+
+/// #3052: a manager appends a note to an Issue without sending the body (the
+/// record is the #1750 handoff table, authored by the manager session), and a
+/// closed Issue still takes it; the Issue row is untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_appends_a_note_without_sending_the_body() {
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let issue =
+        new_issue_with_body(&p, "noted", "Original body.\nDepends on #2384 S4.".into()).await;
+    let store = p.manager.store.lock().await;
+    let (status, version, body) = row_in(&store, issue.id);
+    let note = |text: &str, key: &str| AgentUpdateIssueRequestV1 {
+        display_number: Some(issue.display_number),
+        handoff: Some(text.into()),
+        ..AgentUpdateIssueRequestV1::new(version, key.into())
+    };
+
+    let receipt = store
+        .agent_append_issue_handoff(p.owner, &note("result: landed in abc123", "n-1"))
+        .unwrap();
+    assert_eq!(receipt.handoff_sequence, 1);
+    assert!(!receipt.deduplicated);
+    assert_eq!(row_in(&store, issue.id), (status, version, body.clone()));
+    let replay = store
+        .agent_append_issue_handoff(p.owner, &note("result: landed in abc123", "n-1"))
+        .unwrap();
+    assert!(replay.deduplicated);
+
+    store
+        .conn
+        .execute(
+            "UPDATE issues SET status='Closed' WHERE id=?1",
+            [issue.id.to_string()],
+        )
+        .unwrap();
+    let closed = store
+        .agent_append_issue_handoff(p.owner, &note("closed-issue note", "n-2"))
+        .unwrap();
+    assert_eq!(closed.handoff_sequence, 2);
+
+    let read = store
+        .agent_get_issue(
+            p.owner,
+            &AgentGetIssueRequestV1 {
+                project_id: None,
+                issue_id: Some(issue.id),
+                display_number: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(read.handoffs_total, 2);
+    assert_eq!(read.handoffs[1].body, "closed-issue note");
+    assert_eq!(read.handoffs[1].author_session_id, p.owner);
+    assert_eq!(read.issue.body, body);
+}
+
+/// #3052: a manager body update rebuilt from a truncated read is refused with
+/// a typed code and changes nothing; an append, a mid-body edit and an
+/// explicit `replace_body` pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_body_update_that_drops_the_tail_is_refused_unless_replaced() {
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let original = format!(
+        "{}\nAcceptance:\n- a\n- b\nDepends on #2384 S4.",
+        "head ".repeat(400)
+    );
+    let issue = new_issue_with_body(&p, "tail", original.clone()).await;
+    let store = p.manager.store.lock().await;
+    let (status, version, _) = row_in(&store, issue.id);
+    let update = |body: String, replace: bool, version: i64, key: &str| {
+        let mut request = append_request(&issue, version, body, key);
+        request.replace_body = replace;
+        request
+    };
+
+    // The incident: a read cut at 1500 characters, plus the manager's note.
+    let truncated = format!("{}\n\nResult note.", &original[..1500]);
+    let error = store
+        .agent_update_issue(p.owner, &update(truncated.clone(), false, version, "t-1"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("body_would_drop_tail"), "{error}");
+    assert_eq!(row_in(&store, issue.id).1, version);
+
+    // An append keeps the tail.
+    let appended = format!("{original}\n\nResult note.");
+    store
+        .agent_update_issue(p.owner, &update(appended.clone(), false, version, "t-2"))
+        .unwrap();
+    // A mid-body edit keeps it too.
+    let edited = appended.replacen("head head", "HEAD head", 1);
+    store
+        .agent_update_issue(p.owner, &update(edited, false, version + 1, "t-3"))
+        .unwrap();
+    // Dropping the tail on purpose is explicit.
+    store
+        .agent_update_issue(
+            p.owner,
+            &update(truncated.clone(), true, version + 2, "t-4"),
+        )
+        .unwrap();
+    assert_eq!(row_in(&store, issue.id), (status, version + 3, truncated));
+}
+
+/// #3595: an Issue body update that adds or changes a malformed
+/// `rsi-failure-signature` block is refused with the exact parse/enum
+/// diagnostic and changes nothing; a valid block and an unrelated edit of an
+/// Issue that already carries a legacy malformed block both pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_body_update_validates_changed_failure_signature_blocks() {
+    use rsi_common::failure_signature::FENCE_INFO;
+
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let legacy = format!("```{FENCE_INFO}\n{{\"class\":\"flaky\"}}\n```\n");
+    let issue = new_issue_with_body(&p, "sig", format!("Intro.\n{legacy}")).await;
+    let number = issue.display_number;
+    let block = |class: &str| {
+        format!(
+            "```{FENCE_INFO}\n{{\"test_id\":\"a::b\",\"matcher\":{{\"contains\":[\"boom\"]}},\"issue\":{number},\"class\":\"{class}\"}}\n```\n"
+        )
+    };
+    let store = p.manager.store.lock().await;
+    let (_, version, body) = row_in(&store, issue.id);
+
+    // The incident: class `flaky` instead of `flake`, on a new block.
+    let bad = format!("{body}{}", block("flaky"));
+    let error = store
+        .agent_update_issue(p.owner, &append_request(&issue, version, bad, "s-1"))
+        .unwrap_err();
+    let json = crate::error::agent_issue_error_json(error);
+    assert!(json.contains("invalid_failure_signature"), "{json}");
+    assert!(json.contains("unknown variant `flaky`"), "{json}");
+    assert!(json.contains("block 2"), "{json}");
+    assert_eq!(row_in(&store, issue.id).1, version);
+
+    // A valid block is accepted, next to the untouched legacy one.
+    let good = format!("{body}{}", block("flake"));
+    store
+        .agent_update_issue(
+            p.owner,
+            &append_request(&issue, version, good.clone(), "s-2"),
+        )
+        .unwrap();
+    // An unrelated edit that leaves the legacy block alone is not blocked.
+    let edited = format!("{good}\nResult note.");
+    store
+        .agent_update_issue(p.owner, &append_request(&issue, version + 1, edited, "s-3"))
+        .unwrap();
+}
+
+/// #604: a worker launched with `review_of` = N reads (`AgentGetJob`, read only)
+/// the verification jobs of the implementer sessions of Issue N: the job id the
+/// implementer's Issue text names, or the implementer's newest `scoped_test`.
+/// An unnamed older job, a non-verification job, an unrelated session's job
+/// and an unrelated worker's read are all `None` (the verb says `job_not_found`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_worker_reads_the_implementers_verification_jobs_and_nothing_else_604() {
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::{JobParams, JobWake};
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let implementer = new_issue(&p, "implementer work 604").await;
+    let review = new_issue(&p, "review of implementer work 604").await;
+    let other = new_issue(&p, "unrelated work 604").await;
+    let control = p.manager.agent_control();
+    let launch_worker = |number: i64, key: &'static str, review_of: Option<i64>| {
+        let (p, control) = (&p, &control);
+        async move {
+            let mut launch = request(number, key, p);
+            launch.review_of = review_of;
+            let worker = control
+                .agent_manager_launch_issue_worker(p.owner, launch)
+                .await
+                .unwrap()
+                .worker_session_id;
+            let process = crate::session::launch::install_controller_candidate_test_process(worker);
+            p.execute().await.unwrap();
+            (worker, process)
+        }
+    };
+    let (implementer_worker, _impl_process) =
+        launch_worker(implementer.display_number, "j-impl", None).await;
+    let (other_worker, _other_process) = launch_worker(other.display_number, "j-other", None).await;
+    let (reviewer, _review_process) = launch_worker(
+        review.display_number,
+        "j-review",
+        Some(implementer.display_number),
+    )
+    .await;
+
+    let scoped = || -> JobParams {
+        serde_json::from_value(serde_json::json!({
+            "kind": "test", "scoped_test": {"base": "origin/rolling"}
+        }))
+        .unwrap()
+    };
+    let plain = || -> JobParams {
+        serde_json::from_value(serde_json::json!({"kind": "test", "shard": "store-01"})).unwrap()
+    };
+    let (plain_job, named, unnamed, newest, foreign) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = 0u32;
+    let mut add = |store: &crate::store::Store, id: Uuid, owner: Uuid, params: JobParams| {
+        n += 1;
+        store
+            .insert_agent_job(
+                &NewAgentJob {
+                    id,
+                    owner_session_id: owner,
+                    project_id: Some(p.project),
+                    name: None,
+                    params,
+                    cwd: dir.path().display().to_string(),
+                    unit_name: format!("rsi-job-604-{n}"),
+                    log_path: dir.path().join("log").display().to_string(),
+                    status_path: dir.path().join("status").display().to_string(),
+                    idempotency_key: None,
+                    wake: JobWake::None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    };
+    let store = p.manager.store.lock().await;
+    // Oldest to newest. `plain_job` is newest of nothing (not a scoped_test).
+    add(&store, named, implementer_worker, scoped());
+    add(&store, unnamed, implementer_worker, scoped());
+    add(&store, plain_job, implementer_worker, plain());
+    add(&store, newest, implementer_worker, scoped());
+    add(&store, foreign, other_worker, scoped());
+    let readable = |reader: Uuid, id: Uuid| {
+        store
+            .get_agent_job_for_reader(reader, id)
+            .unwrap()
+            .is_some()
+    };
+    // Before the handoff names anything: only the newest scoped_test reads.
+    assert!(readable(reviewer, newest), "newest scoped_test");
+    assert!(!readable(reviewer, named), "named later, not yet named");
+    assert!(!readable(reviewer, unnamed));
+    // The implementer's Issue text now names an older job.
+    store
+        .conn
+        .execute(
+            "UPDATE issues SET body=body || ?2 WHERE id=?1",
+            rusqlite::params![
+                implementer.id.to_string(),
+                format!("\nverified by job {named}")
+            ],
+        )
+        .unwrap();
+    assert!(readable(reviewer, named), "job named in the handoff");
+    assert!(
+        !readable(reviewer, unnamed),
+        "an unnamed older job stays closed"
+    );
+    assert!(!readable(reviewer, plain_job), "not a verification job");
+    // Fail closed: another project member's job, and a naming of a job that is
+    // not the implementer's, never widen the read.
+    assert!(!readable(reviewer, foreign), "unrelated worker's job");
+    store
+        .conn
+        .execute(
+            "UPDATE issues SET body=body || ?2 WHERE id=?1",
+            rusqlite::params![implementer.id.to_string(), format!("\nalso {foreign}")],
+        )
+        .unwrap();
+    assert!(
+        !readable(reviewer, foreign),
+        "naming a foreign job grants nothing"
+    );
+    // An unrelated worker (no review_of) reads none of the implementer's jobs,
+    // and an implementer worker has no reverse read of the reviewer's.
+    assert!(!readable(other_worker, newest));
+    assert!(!readable(other_worker, named));
+    // The review worker's own authority stays read only: cancel is for owners.
+    assert_eq!(
+        store
+            .get_agent_job(newest)
+            .unwrap()
+            .unwrap()
+            .job
+            .owner_session_id,
+        implementer_worker
+    );
+}
+
+/// #649 (post-land review of #604): two more refusals of the review-worker job
+/// read. (a) A reviewer bound to a DIFFERENT Issue (`review_of` = the unrelated
+/// Issue) reads that Issue's implementer jobs, never the first implementer's,
+/// even when the first implementer's Issue text names the job. (b) A session
+/// whose latest launch is no longer a review (a later launch of the same
+/// session without `review_of`) keeps no access.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_worker_job_read_refuses_other_issue_and_non_review_latest_launch_649() {
+    use crate::store::agent_jobs::NewAgentJob;
+    use rsi_common::agent_jobs::{JobParams, JobWake};
+    let p = pilot().await;
+    grant_issue_coordinate(&p).await;
+    let implementer = new_issue(&p, "implementer work 649").await;
+    let review = new_issue(&p, "review of implementer work 649").await;
+    let other = new_issue(&p, "unrelated work 649").await;
+    let other_review = new_issue(&p, "review of unrelated work 649").await;
+    let control = p.manager.agent_control();
+    let launch_worker = |number: i64, key: &'static str, review_of: Option<i64>| {
+        let (p, control) = (&p, &control);
+        async move {
+            let mut launch = request(number, key, p);
+            launch.review_of = review_of;
+            let worker = control
+                .agent_manager_launch_issue_worker(p.owner, launch)
+                .await
+                .unwrap()
+                .worker_session_id;
+            let process = crate::session::launch::install_controller_candidate_test_process(worker);
+            p.execute().await.unwrap();
+            (worker, process)
+        }
+    };
+    let (implementer_worker, _a) = launch_worker(implementer.display_number, "k-impl", None).await;
+    let (other_worker, _b) = launch_worker(other.display_number, "k-other", None).await;
+    let (reviewer, _c) = launch_worker(
+        review.display_number,
+        "k-review",
+        Some(implementer.display_number),
+    )
+    .await;
+    let (other_reviewer, _d) = launch_worker(
+        other_review.display_number,
+        "k-other-review",
+        Some(other.display_number),
+    )
+    .await;
+
+    let scoped = || -> JobParams {
+        serde_json::from_value(serde_json::json!({
+            "kind": "test", "scoped_test": {"base": "origin/rolling"}
+        }))
+        .unwrap()
+    };
+    let (mine, theirs) = (Uuid::new_v4(), Uuid::new_v4());
+    let dir = tempfile::tempdir().unwrap();
+    let mut n = 0u32;
+    let mut add = |store: &crate::store::Store, id: Uuid, owner: Uuid| {
+        n += 1;
+        store
+            .insert_agent_job(
+                &NewAgentJob {
+                    id,
+                    owner_session_id: owner,
+                    project_id: Some(p.project),
+                    name: None,
+                    params: scoped(),
+                    cwd: dir.path().display().to_string(),
+                    unit_name: format!("rsi-job-649-{n}"),
+                    log_path: dir.path().join("log").display().to_string(),
+                    status_path: dir.path().join("status").display().to_string(),
+                    idempotency_key: None,
+                    wake: JobWake::None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    };
+    let store = p.manager.store.lock().await;
+    add(&store, mine, implementer_worker);
+    add(&store, theirs, other_worker);
+    let readable = |reader: Uuid, id: Uuid| {
+        store
+            .get_agent_job_for_reader(reader, id)
+            .unwrap()
+            .is_some()
+    };
+
+    // Positive controls: each reviewer reads the newest job of the implementer
+    // of the Issue it reviews.
+    assert!(readable(reviewer, mine));
+    assert!(readable(other_reviewer, theirs));
+    // (a) A reviewer of a different Issue reads nothing of this implementer's,
+    // also when the implementer's Issue text names the job.
+    assert!(
+        !readable(other_reviewer, mine),
+        "different Issue's reviewer"
+    );
+    store
+        .conn
+        .execute(
+            "UPDATE issues SET body=body || ?2 WHERE id=?1",
+            rusqlite::params![implementer.id.to_string(), format!("\nverified by {mine}")],
+        )
+        .unwrap();
+    assert!(!readable(other_reviewer, mine), "naming grants nothing");
+    // The reverse also holds: this reviewer never reads the other Issue's job.
+    assert!(!readable(reviewer, theirs));
+
+    // (b) A later launch of the same session with no `review_of` ends the
+    // access. The row is a copy of the reviewer's real launch operation with
+    // `review_of` removed and a newer rowid (a relaunch of the same session).
+    let copied = store
+        .conn
+        .execute(
+            "INSERT INTO harness_manager_v2_operations
+               (id, project_id, manager_session_id, scope_version, policy_version,
+                actor_session_id, idempotency_key, fingerprint, kind, payload_json,
+                state, target_session_id, not_before, created_at, updated_at)
+             SELECT ?2, project_id, manager_session_id, scope_version, policy_version,
+                actor_session_id, ?3, fingerprint, kind,
+                json_remove(payload_json,'$.issue_binding.review_of'),
+                state, target_session_id, not_before, created_at, updated_at
+             FROM harness_manager_v2_operations
+             WHERE target_session_id=?1
+               AND json_extract(payload_json,'$.issue_binding.review_of') IS NOT NULL",
+            rusqlite::params![
+                reviewer.to_string(),
+                Uuid::new_v4().to_string(),
+                "649-relaunch"
+            ],
+        )
+        .unwrap();
+    assert_eq!(copied, 1, "one review launch copied");
+    assert!(!readable(reviewer, mine), "latest launch is no review");
+    assert!(
+        readable(other_reviewer, theirs),
+        "an unrelated reviewer keeps its read"
+    );
 }

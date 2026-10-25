@@ -448,7 +448,16 @@ impl<E: NodeEffects> Executor<E> {
             handoff.handoff.blocker.as_deref().unwrap_or_default(),
             handoff.blocker_evidence.as_deref().unwrap_or_default(),
         );
-        let gate = handoff_blocker_gate(handoff.blocker_class, &gate_text);
+        // A declared engineering class is the worker's own classification: only
+        // the question can still name a real gate, never the evidence prose
+        // ("2567s of the 3540s budget went to waiting", #3307).
+        let scanned = match handoff.blocker_class {
+            Some(
+                PipelineBlockerClassV1::TechnicalImpasse | PipelineBlockerClassV1::ForbiddenScope,
+            ) => question,
+            _ => gate_text.as_str(),
+        };
+        let gate = handoff_blocker_gate(handoff.blocker_class, scanned);
         let context = format!(
             "Topology execution `{}`, node `{}` (iteration {}, attempt {}). Blocker class: {}. \
              Evidence: {}",
@@ -1051,6 +1060,33 @@ mod unit_tests {
                 "{text}"
             );
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn engineering_handoff_text_about_a_budget_is_not_a_spend_gate_3307() {
+        use PipelineBlockerClassV1::*;
+        let question = "accept this build-slot-starved, non-test red and enqueue, or re-run once \
+                        the hub is idle?";
+        let evidence = "2567s of the 3540s budget went to waiting for a hub build slot";
+        let all = format!("blocked\n{evidence}\n{question}");
+        // The declared class is trusted: only the question is scanned.
+        assert_eq!(handoff_blocker_gate(Some(TechnicalImpasse), question), None);
+        assert_eq!(
+            handoff_blocker_gate(Some(TechnicalImpasse), &all),
+            None,
+            "whole-word, money-gated matching alone clears the evidence"
+        );
+        assert_eq!(handoff_blocker_gate(Some(ForbiddenScope), question), None);
+        // A suspended run is not spending, and a real gate in the question still gates.
+        assert_eq!(
+            handoff_blocker_gate(Some(TechnicalImpasse), "the suspended job"),
+            None
+        );
+        assert_eq!(
+            handoff_blocker_gate(Some(TechnicalImpasse), "May we spend $20 on a bigger host?"),
+            Some("spend")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

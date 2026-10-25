@@ -15,15 +15,17 @@ use crate::error::{DaemonError, Result};
 use chrono::{SecondsFormat, Utc};
 use rsi_common::cohort_settlement::{
     SOURCE_WORKTREE_SETTLEMENT_MAX_DIAGNOSTIC_BYTES, SOURCE_WORKTREE_SETTLEMENT_MAX_IDENTITY_BYTES,
-    SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS, SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION,
-    SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION, SourceWorktreeCohortSummaryV1,
-    SourceWorktreeDispositionV1, SourceWorktreeGitOidV1, SourceWorktreeRetainedRootV1,
-    SourceWorktreeSettlementAttributionV1, SourceWorktreeSettlementCountsV1,
-    SourceWorktreeSettlementItemV1, SourceWorktreeSettlementOriginV1,
-    SourceWorktreeSettlementPhaseV1, SourceWorktreeSettlementRefusalV1,
-    SourceWorktreeSettlementRunStateV1, SourceWorktreeSettlementRunSummaryV1,
-    SourceWorktreeSettlementRunV1, validate_git_oid, validate_idempotency_key, validate_identity,
-    validate_sha256_digest, validate_source_ref, validate_target_ref,
+    SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS, SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS,
+    SOURCE_WORKTREE_SETTLEMENT_POLICY_VERSION, SOURCE_WORKTREE_SETTLEMENT_SCHEMA_VERSION,
+    SourceWorktreeCohortSummaryV1, SourceWorktreeDispositionV1, SourceWorktreeGitOidV1,
+    SourceWorktreeRetainedRootV1, SourceWorktreeSettlementAttributionV1,
+    SourceWorktreeSettlementCountsV1, SourceWorktreeSettlementItemV1,
+    SourceWorktreeSettlementOriginV1, SourceWorktreeSettlementPhaseV1,
+    SourceWorktreeSettlementRefusalV1, SourceWorktreeSettlementRunStateV1,
+    SourceWorktreeSettlementRunSummaryV1, SourceWorktreeSettlementRunV1,
+    SourceWorktreeUnprovenReasonV1, SourceWorktreeUnprovenSurvivorV1, validate_git_oid,
+    validate_idempotency_key, validate_identity, validate_sha256_digest, validate_source_ref,
+    validate_target_ref, validate_unproven_survivors,
 };
 use rsi_common::types::Sha256Digest;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -2791,6 +2793,105 @@ impl Store {
         limit: usize,
         aliases: &[SourceWorktreeInventoryQuarantineAlias],
     ) -> Result<Vec<SourceWorktreeInventoryRow>> {
+        self.source_worktree_inventory_range(repository_identity, limit, aliases, None, None, None)
+    }
+
+    /// Reuse V120's complete capped identity scan, but prove dependencies and
+    /// inspect Git for only one detail page. Unexamined roots are never items.
+    pub fn source_worktree_inventory_page(
+        &self,
+        repository_identity: &str,
+        after: Option<Uuid>,
+    ) -> Result<(
+        Vec<SourceWorktreeInventoryRow>,
+        Option<rsi_common::cohort_settlement::SourceWorktreeAuditTraversalV1>,
+    )> {
+        use super::source_worktree_v120::SourceWorktreeSnapshotKeyV2;
+        use rsi_common::cohort_settlement::SourceWorktreeAuditTraversalV1;
+        let after_key = after.map(|custody_id| SourceWorktreeSnapshotKeyV2 { custody_id });
+        let capture =
+            self.source_worktree_snapshot_capture(repository_identity, after_key.as_ref())?;
+        let Some(last) = capture.page().items.last() else {
+            if after.is_some() {
+                return Err(DaemonError::InvalidParam(
+                    "audit continuation has no remaining Live roots; restart traversal".into(),
+                ));
+            }
+            return Ok((Vec::new(), None));
+        };
+        let inventory = self.source_worktree_inventory_range(
+            repository_identity,
+            SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS,
+            &[],
+            after,
+            Some(last.key.custody_id),
+            None,
+        )?;
+        // Do not trust a detail read assembled across a concurrent SQLite writer.
+        let fresh =
+            self.source_worktree_snapshot_capture(repository_identity, after_key.as_ref())?;
+        if fresh != capture
+            || inventory.len() != capture.page().items.len()
+            || capture.page().items.iter().any(|item| {
+                !inventory.iter().any(|row| {
+                    row.custody_id == item.key.custody_id
+                        && row.generation == item.generation
+                        && row.sandbox_root == item.sandbox_root
+                        && format!(
+                            "refs/heads/{}",
+                            row.sandbox_branch
+                                .strip_prefix("refs/heads/")
+                                .unwrap_or(&row.sandbox_branch)
+                        ) == item.source_ref
+                })
+            })
+        {
+            return Err(DaemonError::InvalidParam(
+                "source-worktree page changed during inventory; re-audit".into(),
+            ));
+        }
+        let traversal = (after.is_some()
+            || capture.root_count() as usize > SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS)
+            .then(|| SourceWorktreeAuditTraversalV1 {
+                after_custody_id: after,
+                last_custody_id: last.key.custody_id,
+                has_more: capture.page().has_more,
+                snapshot_root_count: capture.root_count(),
+                snapshot_digest: rsi_common::types::Sha256Digest::parse(
+                    capture.repository_snapshot_digest().to_string(),
+                )
+                .expect("V120 snapshot digest is canonical"),
+            });
+        Ok((inventory, traversal))
+    }
+
+    /// Journal replay proves the exact custody identity, including when it is
+    /// beyond the first audit page. It never borrows a neighboring root's proof.
+    pub fn source_worktree_inventory_exact_with_path_aliases(
+        &self,
+        repository_identity: &str,
+        custody_id: Uuid,
+        aliases: &[SourceWorktreeInventoryQuarantineAlias],
+    ) -> Result<Vec<SourceWorktreeInventoryRow>> {
+        self.source_worktree_inventory_range(
+            repository_identity,
+            1,
+            aliases,
+            None,
+            None,
+            Some(custody_id),
+        )
+    }
+
+    fn source_worktree_inventory_range(
+        &self,
+        repository_identity: &str,
+        limit: usize,
+        aliases: &[SourceWorktreeInventoryQuarantineAlias],
+        after: Option<Uuid>,
+        through: Option<Uuid>,
+        exact: Option<Uuid>,
+    ) -> Result<Vec<SourceWorktreeInventoryRow>> {
         validate_identity(repository_identity).map_err(DaemonError::InvalidParam)?;
         if aliases.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_ROOTS {
             return Err(DaemonError::Store(format!(
@@ -2850,6 +2951,9 @@ impl Store {
              FROM sandbox_custody_roots r
              LEFT JOIN sessions s ON s.id=r.owner_session_id AND s.sandbox_custody_id=r.custody_id
              WHERE r.state='live' AND r.repository_identity=?1
+               AND (?3 IS NULL OR r.custody_id>?3)
+               AND (?4 IS NULL OR r.custody_id<=?4)
+               AND (?5 IS NULL OR r.custody_id=?5)
              ORDER BY COALESCE(s.id,r.custody_id),r.custody_id
              LIMIT ?2",
         )?;
@@ -2857,7 +2961,13 @@ impl Store {
         let bounded_limit = i64::try_from(bounded_limit)
             .map_err(|_| DaemonError::InvalidParam("inventory limit exceeds i64".into()))?;
         let rows = statement.query_map(
-            params![repository_identity, bounded_limit],
+            params![
+                repository_identity,
+                bounded_limit,
+                after.map(|id| id.to_string()),
+                through.map(|id| id.to_string()),
+                exact.map(|id| id.to_string())
+            ],
             parse_inventory_row,
         )?;
         let mut inventory = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3675,6 +3785,67 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    /// Append the unproven survivors of a run's orphan scan (#149) after its
+    /// recorded ones, in order, skipping a process (pid and start time) the
+    /// run already names. The store assigns each `sequence` (the caller's is
+    /// ignored) and records at most
+    /// `SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS` per run. Returns how
+    /// many rows it wrote and how many new processes the bound left out.
+    pub fn record_source_worktree_settlement_unproven_survivors(
+        &self,
+        run_id: Uuid,
+        survivors: &[SourceWorktreeUnprovenSurvivorV1],
+    ) -> Result<(usize, usize)> {
+        if survivors.is_empty() {
+            return Ok((0, 0));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut all = load_unproven_survivors_on(&tx, run_id)?;
+        let mut seen: HashSet<(u32, u64)> = all
+            .iter()
+            .map(|survivor| (survivor.pid, survivor.start_time_micros))
+            .collect();
+        let first_new = all.len();
+        let mut over_bound = 0_usize;
+        for survivor in survivors {
+            if !seen.insert((survivor.pid, survivor.start_time_micros)) {
+                continue;
+            }
+            if all.len() >= SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS {
+                over_bound += 1;
+                continue;
+            }
+            let mut survivor = survivor.clone();
+            survivor.sequence = u32::try_from(all.len())
+                .map_err(|_| DaemonError::Store("unproven survivor sequence overflowed".into()))?;
+            all.push(survivor);
+        }
+        validate_unproven_survivors(&all).map_err(DaemonError::InvalidParam)?;
+        for survivor in &all[first_new..] {
+            tx.execute(
+                "INSERT INTO source_worktree_settlement_unproven_survivors (
+                    run_id,sequence,pid,start_time_micros,executable,session_id,custody_id,
+                    sandbox_root,reason
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    run_id.to_string(),
+                    survivor.sequence,
+                    survivor.pid,
+                    i64::try_from(survivor.start_time_micros).map_err(|_| {
+                        DaemonError::InvalidParam("unproven survivor start time exceeds i64".into())
+                    })?,
+                    survivor.executable,
+                    survivor.session_id.map(|id| id.to_string()),
+                    survivor.custody_id.map(|id| id.to_string()),
+                    survivor.sandbox_root,
+                    survivor.reason.as_str(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok((all.len() - first_new, over_bound))
     }
 
     pub fn get_source_worktree_settlement_run(
@@ -5416,6 +5587,7 @@ fn load_run_on(
         counts,
         items,
         retained_roots: load_retained_roots_on(conn, run_id)?,
+        unproven_survivors: load_unproven_survivors_on(conn, run_id)?,
         created_at,
         updated_at,
         finished_at,
@@ -5614,6 +5786,61 @@ fn load_retained_roots_on(
         )));
     }
     Ok(roots)
+}
+
+/// The unproven survivors of a run (#149), bounded like its retained roots. A
+/// run recorded before V188 has none.
+fn load_unproven_survivors_on(
+    conn: &rusqlite::Connection,
+    run_id: Uuid,
+) -> Result<Vec<SourceWorktreeUnprovenSurvivorV1>> {
+    let mut statement = conn.prepare(
+        "SELECT sequence,pid,start_time_micros,executable,session_id,custody_id,sandbox_root,reason
+         FROM source_worktree_settlement_unproven_survivors WHERE run_id=?1 ORDER BY sequence
+         LIMIT ?2",
+    )?;
+    let corrupt = |index: usize, message: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::other(message)),
+        )
+    };
+    let uuid = |index: usize, value: Option<String>| {
+        value
+            .map(|value| Uuid::parse_str(&value).map_err(|error| corrupt(index, error.to_string())))
+            .transpose()
+    };
+    let survivors = statement
+        .query_map(
+            params![
+                run_id.to_string(),
+                i64::try_from(SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS + 1).map_err(
+                    |_| DaemonError::Store("unproven survivor load limit exceeds i64".into())
+                )?
+            ],
+            |row| {
+                let reason: String = row.get(7)?;
+                Ok(SourceWorktreeUnprovenSurvivorV1 {
+                    sequence: row_u32(row, 0)?,
+                    pid: row_u32(row, 1)?,
+                    start_time_micros: row_u64(row, 2)?,
+                    executable: row.get(3)?,
+                    session_id: uuid(4, row.get(4)?)?,
+                    custody_id: uuid(5, row.get(5)?)?,
+                    sandbox_root: row.get(6)?,
+                    reason: SourceWorktreeUnprovenReasonV1::parse(&reason)
+                        .map_err(|message| corrupt(7, message))?,
+                })
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if survivors.len() > SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS {
+        return Err(DaemonError::Store(format!(
+            "settlement receipt exceeds {SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS} unproven survivors"
+        )));
+    }
+    Ok(survivors)
 }
 
 fn parse_run_state(value: &str) -> std::result::Result<SourceWorktreeSettlementRunStateV1, String> {
@@ -6599,6 +6826,130 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn run_record_appends_unproven_survivors_once_bounded_and_immutable() {
+        // #149: the processes a run's orphan scan could not prove read back on
+        // the receipt in order, a repeated scan adds no duplicate, the bound
+        // holds, and the rows can be neither changed, deleted nor replaced.
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = quarantine_fixture(directory.path(), "unproven-survivors");
+        let survivor = |pid: u32, root: bool| SourceWorktreeUnprovenSurvivorV1 {
+            sequence: 99,
+            pid,
+            start_time_micros: 1_700_000_000_000_000 + u64::from(pid),
+            executable: Some(format!("/opt/provider/bin/tool-{pid}")),
+            session_id: root.then_some(fixture.session_id),
+            custody_id: root.then(Uuid::new_v4),
+            sandbox_root: root.then(|| "/sandboxes/held".to_string()),
+            reason: SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos,
+        };
+        let store = &fixture.store;
+        assert!(
+            store
+                .get_source_worktree_settlement_run(fixture.run_id)
+                .unwrap()
+                .unwrap()
+                .unproven_survivors
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .record_source_worktree_settlement_unproven_survivors(
+                    fixture.run_id,
+                    &[survivor(501, true), survivor(502, false)],
+                )
+                .unwrap(),
+            (2, 0)
+        );
+        // A replayed scan sees one of them again and one new process.
+        assert_eq!(
+            store
+                .record_source_worktree_settlement_unproven_survivors(
+                    fixture.run_id,
+                    &[survivor(502, false), survivor(503, false)],
+                )
+                .unwrap(),
+            (1, 0)
+        );
+        let receipt = store
+            .get_source_worktree_settlement_run(fixture.run_id)
+            .unwrap()
+            .unwrap()
+            .validate_wire()
+            .unwrap();
+        let pids: Vec<(u32, u32)> = receipt
+            .unproven_survivors
+            .iter()
+            .map(|survivor| (survivor.sequence, survivor.pid))
+            .collect();
+        assert_eq!(pids, vec![(0, 501), (1, 502), (2, 503)]);
+        assert_eq!(
+            receipt.unproven_survivors[0].session_id,
+            Some(fixture.session_id)
+        );
+        assert_eq!(
+            receipt.unproven_survivors[0].sandbox_root.as_deref(),
+            Some("/sandboxes/held")
+        );
+        assert_eq!(receipt.unproven_survivors[1].sandbox_root, None);
+        assert_eq!(
+            receipt.unproven_survivors[2].reason,
+            SourceWorktreeUnprovenReasonV1::EnvironmentWithheldByMacos
+        );
+
+        let many: Vec<_> = (1000..1100).map(|pid| survivor(pid, false)).collect();
+        assert_eq!(
+            store
+                .record_source_worktree_settlement_unproven_survivors(fixture.run_id, &many)
+                .unwrap(),
+            (
+                SOURCE_WORKTREE_SETTLEMENT_MAX_UNPROVEN_SURVIVORS - 3,
+                100 - 61
+            )
+        );
+        let partial = SourceWorktreeUnprovenSurvivorV1 {
+            sandbox_root: None,
+            ..survivor(7, true)
+        };
+        assert!(
+            store
+                .record_source_worktree_settlement_unproven_survivors(Uuid::new_v4(), &[partial])
+                .is_err()
+        );
+
+        let run_id = fixture.run_id.to_string();
+        for (statement, guard) in [
+            (
+                "UPDATE source_worktree_settlement_unproven_survivors SET pid=9 WHERE run_id=?1",
+                "immutable",
+            ),
+            (
+                "DELETE FROM source_worktree_settlement_unproven_survivors WHERE run_id=?1",
+                "retained",
+            ),
+            (
+                "INSERT OR REPLACE INTO source_worktree_settlement_unproven_survivors
+                    (run_id,sequence,pid,start_time_micros,reason)
+                 VALUES (?1,0,9,0,'environment_withheld_by_macos')",
+                "never replaced",
+            ),
+        ] {
+            let error = store.conn.execute(statement, [&run_id]).unwrap_err();
+            assert!(error.to_string().contains(guard), "{statement}: {error}");
+        }
+        let error = store
+            .conn
+            .execute(
+                "INSERT INTO source_worktree_settlement_unproven_survivors
+                    (run_id,sequence,pid,start_time_micros,session_id,reason)
+                 VALUES (?1,63,9,0,?2,'environment_withheld_by_macos')",
+                params![Uuid::new_v4().to_string(), fixture.session_id.to_string()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("CHECK"), "{error}");
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

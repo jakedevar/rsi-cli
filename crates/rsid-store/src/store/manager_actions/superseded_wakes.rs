@@ -528,6 +528,7 @@ mod tests {
                     armed_at: chrono::Utc::now(),
                     deadline: Some(deadline),
                     repo_dir: None,
+                    delivered_shas: Vec::new(),
                 },
                 false,
             )

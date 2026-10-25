@@ -110,7 +110,7 @@ async fn acquire_writer_admission(identity: &Path, exclusive: bool) -> Result<Tr
 /// link never exempts a different live incarnation from the occupancy check.
 /// Keep the returned guard through provider dispatch and durable publication.
 pub(crate) async fn writer_admission(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::TrackedSession>>>,
     dir: &Path,
     replaced: &[Uuid],
@@ -155,7 +155,7 @@ pub(crate) async fn writer_admission(
 /// maps, grants, custody or providers. Raw source checkouts do not name a
 /// sandboxed session's write tree.
 pub(crate) async fn session_writer_admission(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::TrackedSession>>>,
     session_id: Uuid,
 ) -> Result<Option<TreeAdmissionGuard>> {
@@ -184,7 +184,7 @@ pub(crate) async fn session_writer_admission(
 /// failures count as occupants only of trees their resolvable prefixes could
 /// name. The caller then applies the ordinary/fresh-lineage sharing policy.
 pub(crate) async fn live_occupants(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::TrackedSession>>>,
     identity: &Path,
     lexical: &Path,
@@ -297,7 +297,7 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let sibling = tempfile::tempdir().unwrap();
         std::fs::write(sibling.path().join(".git"), "gitdir: other-worktree").unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -403,7 +403,7 @@ mod tests {
         let outside_alias = other.path().join("broken-alias");
         std::os::unix::fs::symlink(&alias, &outside_alias).unwrap();
         assert!(tree_identity(&outside_alias).is_err());
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));

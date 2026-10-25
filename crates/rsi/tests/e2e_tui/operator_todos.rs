@@ -298,7 +298,7 @@ async fn test_e2e_operator_todo_panel_opens_toggles_and_marks_done() -> E2eResul
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     h.shutdown_daemon();
     if let Err(error) = outcome {
         let artifacts = h.preserve_artifacts(Some(&error.to_string()))?;

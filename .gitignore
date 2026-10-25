@@ -50,6 +50,10 @@ cache/projects.json
 !.rsi/jobs.toml
 !.gemini/commands/auto_build.toml
 !eval/bench/tb2/dataset.toml
+!eval/bench/tb2/runs/*.toml
+!eval/bench/tb2/candidates/*/overlay.toml
+!eval/bench/tb2/candidates/*/run.toml
+!eval/harbor/pyproject.toml
 !.gemini/commands/auto_implement.toml
 !.gemini/commands/auto_plan.toml
 !.gemini/commands/auto_research.toml

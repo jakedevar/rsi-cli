@@ -49,7 +49,8 @@ impl Store {
         Ok(())
     }
 
-    /// List observations filtered by level, excluding soft-deleted.
+    /// List observations filtered by level, excluding soft-deleted and eval-tainted
+    /// ones (see [`Store::prune_eval_observations`]).
     pub fn list_observations_by_level(
         &self,
         level: ObservationLevel,
@@ -59,6 +60,15 @@ impl Store {
             "SELECT id, session_id, project_id, level, content, source_ids, confidence, times_derived, created_at, updated_at
              FROM observations
              WHERE level = ?1 AND deleted_at IS NULL
+             AND observations.id NOT IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)
              ORDER BY created_at DESC
              LIMIT ?2",
         )?;
@@ -80,6 +90,15 @@ impl Store {
             "SELECT id, session_id, project_id, level, content, source_ids, confidence, times_derived, created_at, updated_at
              FROM observations
              WHERE project_id = ?1 AND deleted_at IS NULL
+             AND observations.id NOT IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)
              ORDER BY created_at DESC",
         )?;
 
@@ -100,6 +119,15 @@ impl Store {
             "SELECT id, session_id, project_id, level, content, source_ids, confidence, times_derived, created_at, updated_at
              FROM observations
              WHERE created_at > ?1 AND deleted_at IS NULL
+             AND observations.id NOT IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)
              ORDER BY created_at ASC",
         )?;
 
@@ -109,6 +137,32 @@ impl Store {
             .collect();
 
         Ok(rows)
+    }
+
+    /// Soft-delete every observation that carries benchmark (`is_eval`) task
+    /// content: those extracted from an `is_eval` session and, transitively,
+    /// every deduction/induction/contradiction derived from one (its
+    /// `source_ids` reach a tainted observation). Soft delete only; the rows
+    /// stay for audit. The list and count queries above already exclude the
+    /// same set, so this keeps the table honest and covers readers that do not
+    /// go through them. Returns the number of rows newly deleted.
+    pub fn prune_eval_observations(&self) -> Result<u64> {
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let n = self.conn.execute(
+            "UPDATE observations SET deleted_at = ?1, updated_at = ?1
+             WHERE deleted_at IS NULL
+             AND observations.id IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)",
+            params![now],
+        )?;
+        Ok(n as u64)
     }
 
     /// Soft-delete an observation by ID.
@@ -125,7 +179,16 @@ impl Store {
     pub fn count_observations_since(&self, since: chrono::DateTime<Utc>) -> Result<u64> {
         let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations WHERE created_at > ?1 AND deleted_at IS NULL",
+            "SELECT COUNT(*) FROM observations WHERE created_at > ?1 AND deleted_at IS NULL
+             AND observations.id NOT IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)",
             params![since_str],
             |row| row.get(0),
         )?;
@@ -135,7 +198,16 @@ impl Store {
     /// Count total non-deleted observations in the main store.
     pub fn count_all_observations(&self) -> Result<u64> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL",
+            "SELECT COUNT(*) FROM observations WHERE deleted_at IS NULL
+             AND observations.id NOT IN (
+                 WITH RECURSIVE eval_tainted(id) AS (
+                     SELECT o.id FROM observations o JOIN sessions s ON s.id = o.session_id WHERE s.is_eval = 1
+                     UNION
+                     SELECT d.id FROM eval_tainted t JOIN observations d ON EXISTS (
+                         SELECT 1 FROM json_each(CASE WHEN json_valid(d.source_ids) THEN d.source_ids ELSE '[]' END) j
+                         WHERE j.value = t.id)
+                 )
+                 SELECT id FROM eval_tainted)",
             [],
             |row| row.get(0),
         )?;
@@ -143,11 +215,14 @@ impl Store {
     }
 
     /// List completed/archived sessions that have no explicit observations yet.
+    /// Benchmark (`is_eval`) sessions are never listed: their transcripts hold
+    /// held-out task content that must not reach later sessions.
     pub fn sessions_needing_extraction(&self, limit: usize) -> Result<Vec<Uuid>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id FROM sessions s
              LEFT JOIN observations o ON o.session_id = s.id AND o.level = 'explicit' AND o.deleted_at IS NULL
              WHERE s.status IN ('Completed', 'Archived')
+             AND s.is_eval = 0
              AND o.id IS NULL
              ORDER BY s.updated_at DESC
              LIMIT ?1",
@@ -408,6 +483,270 @@ mod tests {
         let (_dir, store) = test_store();
         let ids = store.sessions_needing_extraction(10).unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn test_sessions_needing_extraction_skips_eval_sessions() {
+        use rsi_common::types::SessionStatus;
+        let (_dir, store) = test_store();
+        let mut normal = crate::test_support::make_test_session();
+        normal.status = SessionStatus::Completed;
+        let mut eval = crate::test_support::make_test_session();
+        eval.status = SessionStatus::Completed;
+        eval.is_eval = true;
+        store.insert_session(&normal).unwrap();
+        store.insert_session(&eval).unwrap();
+
+        let ids = store.sessions_needing_extraction(10).unwrap();
+        assert_eq!(ids, vec![normal.id]);
+    }
+
+    const SHARED: &str = "held-out-task-secret-3325";
+
+    fn obs_for(
+        session_id: Uuid,
+        project_id: Option<Uuid>,
+        level: ObservationLevel,
+        source_ids: Vec<Uuid>,
+    ) -> Observation {
+        Observation {
+            id: Uuid::new_v4(),
+            session_id,
+            project_id,
+            level,
+            content: SHARED.to_string(),
+            source_ids,
+            confidence: None,
+            times_derived: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    struct EvalSeed {
+        project: Uuid,
+        eval_explicit: Observation,
+        eval_deductive: Observation,
+        eval_inductive: Observation,
+        eval_contradiction: Observation,
+        normal_explicit: Observation,
+        normal_deductive: Observation,
+    }
+
+    /// An `is_eval` Completed session and a normal one, each with an explicit
+    /// observation carrying the same content; deduction -> induction chains
+    /// derived from each (derived rows carry the nil session, like the dreamer).
+    fn seed_eval_and_normal(store: &Store) -> EvalSeed {
+        use rsi_common::types::SessionStatus;
+        let project = Uuid::new_v4();
+        let mut normal = crate::test_support::make_test_session();
+        normal.status = SessionStatus::Completed;
+        let mut eval = crate::test_support::make_test_session();
+        eval.status = SessionStatus::Completed;
+        eval.is_eval = true;
+        store.insert_session(&normal).unwrap();
+        store.insert_session(&eval).unwrap();
+
+        let eval_explicit = obs_for(eval.id, Some(project), ObservationLevel::Explicit, vec![]);
+        let eval_deductive = obs_for(
+            Uuid::nil(),
+            Some(project),
+            ObservationLevel::Deductive,
+            vec![eval_explicit.id],
+        );
+        let eval_inductive = obs_for(
+            Uuid::nil(),
+            Some(project),
+            ObservationLevel::Inductive,
+            vec![eval_deductive.id],
+        );
+        let eval_contradiction = obs_for(
+            Uuid::nil(),
+            Some(project),
+            ObservationLevel::Contradiction,
+            vec![eval_explicit.id, Uuid::new_v4()],
+        );
+        let normal_explicit = obs_for(normal.id, Some(project), ObservationLevel::Explicit, vec![]);
+        let normal_deductive = obs_for(
+            Uuid::nil(),
+            Some(project),
+            ObservationLevel::Deductive,
+            vec![normal_explicit.id],
+        );
+        for o in [
+            &eval_explicit,
+            &eval_deductive,
+            &eval_inductive,
+            &eval_contradiction,
+            &normal_explicit,
+            &normal_deductive,
+        ] {
+            store.insert_observation(o).unwrap();
+        }
+        EvalSeed {
+            project,
+            eval_explicit,
+            eval_deductive,
+            eval_inductive,
+            eval_contradiction,
+            normal_explicit,
+            normal_deductive,
+        }
+    }
+
+    fn ids_of(list: Vec<Observation>) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = list.into_iter().map(|o| o.id).collect();
+        ids.sort();
+        ids
+    }
+
+    fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+        ids.sort();
+        ids
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn eval_linked_observations_are_not_listed_or_counted_3325() {
+        let (_dir, store) = test_store();
+        let seed = seed_eval_and_normal(&store);
+
+        let explicit = store
+            .list_observations_by_level(ObservationLevel::Explicit, 100)
+            .unwrap();
+        assert_eq!(ids_of(explicit), vec![seed.normal_explicit.id]);
+        let deductive = store
+            .list_observations_by_level(ObservationLevel::Deductive, 100)
+            .unwrap();
+        assert_eq!(ids_of(deductive), vec![seed.normal_deductive.id]);
+        // Derived from an eval-linked deduction (transitive) and a
+        // contradiction citing an eval-linked source.
+        assert!(
+            store
+                .list_observations_by_level(ObservationLevel::Inductive, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_observations_by_level(ObservationLevel::Contradiction, 100)
+                .unwrap()
+                .is_empty()
+        );
+
+        let by_project = store.list_observations_by_project(seed.project).unwrap();
+        assert_eq!(
+            ids_of(by_project),
+            sorted(vec![seed.normal_explicit.id, seed.normal_deductive.id])
+        );
+        let since = store.list_observations_since_last_dream().unwrap();
+        assert_eq!(
+            ids_of(since),
+            sorted(vec![seed.normal_explicit.id, seed.normal_deductive.id])
+        );
+
+        let epoch = Utc::now() - chrono::Duration::hours(1);
+        assert_eq!(store.count_observations_since(epoch).unwrap(), 2);
+        assert_eq!(store.count_all_observations().unwrap(), 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn prune_eval_observations_soft_deletes_the_whole_tainted_chain_3325() {
+        let (_dir, store) = test_store();
+        let seed = seed_eval_and_normal(&store);
+
+        // A second deduction derived from the same eval-linked source.
+        let late = obs_for(
+            Uuid::nil(),
+            Some(seed.project),
+            ObservationLevel::Deductive,
+            vec![seed.eval_explicit.id],
+        );
+        store.insert_observation(&late).unwrap();
+
+        let pruned = store.prune_eval_observations().unwrap();
+        assert_eq!(
+            pruned, 5,
+            "explicit, deductive x2, inductive, contradiction"
+        );
+        assert_eq!(store.prune_eval_observations().unwrap(), 0, "idempotent");
+
+        // Soft delete: rows stay, flagged deleted.
+        let deleted: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations WHERE deleted_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 5);
+        for id in [
+            seed.eval_explicit.id,
+            seed.eval_deductive.id,
+            seed.eval_inductive.id,
+            seed.eval_contradiction.id,
+            late.id,
+        ] {
+            let at: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT deleted_at FROM observations WHERE id = ?1",
+                    params![id.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(at.is_some(), "{id} should be soft-deleted");
+        }
+        // Normal-session observations are untouched.
+        let normal_live: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM observations
+                 WHERE deleted_at IS NULL AND id IN (?1, ?2)",
+                params![
+                    seed.normal_explicit.id.to_string(),
+                    seed.normal_deductive.id.to_string()
+                ],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(normal_live, 2);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn observation_extracted_before_session_was_marked_eval_is_excluded_3325() {
+        let (_dir, store) = test_store();
+        let mut session = crate::test_support::make_test_session();
+        session.status = rsi_common::types::SessionStatus::Completed;
+        store.insert_session(&session).unwrap();
+        let obs = obs_for(session.id, None, ObservationLevel::Explicit, vec![]);
+        store.insert_observation(&obs).unwrap();
+        assert_eq!(
+            store
+                .list_observations_by_level(ObservationLevel::Explicit, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET is_eval = 1 WHERE id = ?1",
+                params![session.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_observations_by_level(ObservationLevel::Explicit, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.prune_eval_observations().unwrap(), 1);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]

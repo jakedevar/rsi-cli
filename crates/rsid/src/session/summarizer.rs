@@ -10,7 +10,6 @@ use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
 use rsi_common::types::{ConversationEvent, EventType, Role};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Thresholds for triggering summarization.
@@ -100,7 +99,7 @@ fn format_events_for_prompt(events: &[ConversationEvent], max_chars: usize) -> S
 
 /// Generate a short summary from the previous summary + recent messages.
 pub(super) async fn generate_short_summary(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     previous_summary: Option<&str>,
@@ -152,7 +151,7 @@ pub(super) async fn generate_short_summary(
 
 /// Generate a long summary from the previous long summary + messages since last.
 pub(super) async fn generate_long_summary(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     previous_summary: Option<&str>,
@@ -218,7 +217,7 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 
 /// Generate text using Ollama -> CLI fallback (same pattern as title.rs).
 async fn generate_with_fallback(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     prompt: &str,
@@ -316,7 +315,12 @@ async fn generate_ollama(
     };
     let raw = crate::ollama_client::generate(
         http,
-        model,
+        &crate::memory::helper_breaker::HelperCall {
+            purpose: rsi_common::model_control::ModelInvocationPurpose::SessionSummary.as_str(),
+            setting_key: "memory_model_local",
+            model,
+            gate: true,
+        },
         None,
         prompt,
         opts,
@@ -528,13 +532,11 @@ mod http_tests {
     /// this file. A regression in the `GenerateOptions` construction here would
     /// NOT be caught by the `build_body` unit tests in `ollama_client.rs`.
     //
-    // `TEST_OLLAMA_URL_LOCK` is intentionally held across awaits — it exists to
-    // serialise env-var mutation across this binary's HTTP tests.
-    #[allow(clippy::await_holding_lock)]
+    // `temp_env` holds the one process-wide environment lock for the block and
+    // restores `RSI_OLLAMA_URL` after it (#190).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
     #[tokio::test]
     async fn summarizer_generate_ollama_posts_expected_body_shape() {
-        let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/api/generate$"))
@@ -544,31 +546,36 @@ mod http_tests {
             )
             .mount(&server)
             .await;
-        // SAFETY: TEST_OLLAMA_URL_LOCK is held above.
-        unsafe {
-            std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
-        }
-        let http = reqwest::Client::new();
-        super::generate_ollama(&http, "SUMMARIZE PROMPT", 1024, "qwen3:14b")
-            .await
-            .expect("generate_ollama should succeed");
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "expected exactly one request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
-        assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
-        assert_eq!(body["prompt"], serde_json::json!("SUMMARIZE PROMPT"));
-        assert_eq!(body["stream"], serde_json::json!(false));
-        assert_eq!(body["think"], serde_json::json!(false));
-        assert_eq!(body["options"]["num_predict"], serde_json::json!(1024));
-        let t = body["options"]["temperature"]
-            .as_f64()
-            .expect("temperature is f64");
-        assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
-        assert!(body.get("system").is_none(), "system key must be absent");
-        assert!(
-            body.get("keep_alive").is_none(),
-            "keep_alive key must be absent"
-        );
+        temp_env::async_with_vars(
+            [(
+                "RSI_OLLAMA_URL",
+                Some(format!("{}/api/generate", server.uri())),
+            )],
+            async move {
+                let http = reqwest::Client::new();
+                super::generate_ollama(&http, "SUMMARIZE PROMPT", 1024, "qwen3:14b")
+                    .await
+                    .expect("generate_ollama should succeed");
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1, "expected exactly one request");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
+                assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
+                assert_eq!(body["prompt"], serde_json::json!("SUMMARIZE PROMPT"));
+                assert_eq!(body["stream"], serde_json::json!(false));
+                assert_eq!(body["think"], serde_json::json!(false));
+                assert_eq!(body["options"]["num_predict"], serde_json::json!(1024));
+                let t = body["options"]["temperature"]
+                    .as_f64()
+                    .expect("temperature is f64");
+                assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
+                assert!(body.get("system").is_none(), "system key must be absent");
+                assert!(
+                    body.get("keep_alive").is_none(),
+                    "keep_alive key must be absent"
+                );
+            },
+        )
+        .await;
     }
 }

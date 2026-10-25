@@ -25,7 +25,7 @@ export interface InputSnapshot {
 
 type Rule = (s: UiSnapshot) => string | null;
 
-const NEED_OPEN = 'Open a session first (j/k, then Enter)';
+const NEED_OPEN = 'Open a session first: click one in the list (j/k, then Enter)';
 const needOpen: Rule = (s) => (s.open ? null : NEED_OPEN);
 const needDraft: Rule = (s) => {
   if (!s.open) return NEED_OPEN;
@@ -38,8 +38,8 @@ export const INPUT_ACTIONS: readonly ActionSpec[] = [
   { id: 'input-modal', title: 'Edit message in a large editor', group: 'session', menuBreak: true, extraKeys: ['Ctrl-G'], detail: 'The TUI’s Ctrl+G input modal; closing it keeps the text in the message box' },
   { id: 'compile-prompt', title: 'Compile prompt', group: 'session', extraKeys: ['Ctrl-Y'], detail: 'Send the draft to the prompt compiler and preview the result' },
   { id: 'fix-grammar', title: 'Fix grammar', group: 'session', extraKeys: ['Ctrl-Shift-G'], detail: 'Spelling and grammar only, previewed before it replaces the draft' },
-  { id: 'pending-messages', title: 'Pending messages…', group: 'session', detail: 'Queued follow-ups not yet delivered; :pending edit / withdraw <id>' },
-  { id: 'drain-restart', title: 'Restart daemon after turns settle', group: 'session', detail: ':drain requests it, :drain status shows each session' },
+  { id: 'pending-messages', title: 'Pending messages…', group: 'session', detail: 'Queued follow-ups not yet delivered; edit or withdraw them here (:pending)' },
+  { id: 'drain-restart', title: 'Restart daemon after turns settle', group: 'session', detail: 'Waits for the running turns to finish, then restarts the daemon (:drain; :drain status shows each session)' },
   // Go
   { id: 'open-recent-file', title: 'Open recent file…', group: 'go', menuBreak: true, detail: 'gf1..gf9 open the Nth file the session’s tools touched' },
   { id: 'jump-back', title: 'Back in session history', group: 'go', menuBreak: true, extraKeys: ['Ctrl-O'] },
@@ -108,6 +108,11 @@ export const SLICE: SliceSpec<InputActionId> = {
   order: 95,
   actions: INPUT_ACTIONS,
   rules: INPUT_RULES,
+  // routeGlobal (input-model.ts), run from the document keydown listener in actions/input.ts.
+  rawKeys: [
+    'C-o', 'C-i', 'C-h', 'C-l', 'C-0', 'Left', 'Right', 'S-Left', 'S-Right', 'C-Tab', 'C-S-Tab',
+    'C-Left', 'C-Right', 'C-Up', 'C-Down', 'C-S-Left', 'C-S-Right', 'C-S-Up', 'C-S-Down',
+  ],
   keys: INPUT_KEY_BINDINGS,
   prefixCommands: INPUT_PREFIX_COMMANDS,
 };

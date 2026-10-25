@@ -32,6 +32,12 @@ pub(super) async fn submit_prompt(app: &mut App) -> bool {
 }
 
 async fn submit_prompt_with_placement(app: &mut App, placement: LaunchPlacement) -> bool {
+    if super::launch_settings::block_unloaded_grant(
+        app,
+        super::launch_settings::PromptSlot::Regular,
+    ) {
+        return false;
+    }
     // Extract content, purpose, working_dir, and model overrides before closing
     // `typed` is the raw surface content, kept so a rejected ContinueSession can
     // restore the prompt verbatim — `content_for_send` collapses visual wraps.
@@ -214,6 +220,12 @@ pub(super) async fn submit_input_overlay(app: &mut App) -> bool {
 
 async fn submit_input_overlay_with_placement(app: &mut App, placement: LaunchPlacement) -> bool {
     let idx = app.focused_input_idx;
+    if super::launch_settings::block_unloaded_grant(
+        app,
+        super::launch_settings::PromptSlot::Input(idx),
+    ) {
+        return false;
+    }
     let (
         query,
         purpose,

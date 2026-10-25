@@ -5,7 +5,7 @@
 
 use super::Store;
 use crate::error::Result;
-use rsi_common::remote_manager_v2::SeatRoleV2;
+use rsi_common::remote_manager_v2::{IDEMPOTENCY_PREFIX, ItemKindV2, SeatRoleV2};
 use rusqlite::params;
 use uuid::Uuid;
 
@@ -20,6 +20,14 @@ pub struct RemoteConversationRow {
     /// delivered (`metadata.source == "operator"`).
     pub operator: bool,
     pub operator_message_id: Option<Uuid>,
+    /// The phone-chosen idempotency key of that operator message, when the
+    /// message came through the Remote API.
+    pub idempotency_key: Option<Uuid>,
+    /// `Message`, `ToolUse` or `ToolResult`.
+    pub kind: rsi_common::remote_manager_v2::ItemKindV2,
+    pub tool_name: Option<String>,
+    /// The provider call id, only when it fits the wire bound.
+    pub tool_use_id: Option<String>,
     /// At most [`CONTENT_CHARS`] characters of the message.
     pub content: String,
     /// True when the stored message was longer than [`CONTENT_CHARS`].
@@ -86,12 +94,13 @@ impl Store {
         Ok(None)
     }
 
-    /// Up to `limit` conversation messages of `session`, newest first,
+    /// Up to `limit` conversation items of `session`, newest first,
     /// strictly before `before` (`(sequence, event id)`) when given, plus
-    /// whether older ones remain. Only user-role and assistant-role
-    /// `Message` events; provider diagnostics are not the manager's words and
-    /// are skipped. The session must be neither archived nor deleted, so it
-    /// is never in cold storage.
+    /// whether older ones remain. User-role and assistant-role `Message`
+    /// events plus `ToolUse` and `ToolResult` events (#3797; the tool input
+    /// column is never read). Provider diagnostics are not the manager's
+    /// words and are skipped. The session must be neither archived nor
+    /// deleted, so it is never in cold storage.
     pub fn remote_manager_events_before(
         &self,
         session: Uuid,
@@ -105,10 +114,16 @@ impl Store {
         };
         let mut statement = self.conn.prepare(concat!(
             "SELECT e.id, e.sequence, e.role, substr(e.content,1,4096), e.created_at, e.metadata, ",
-            "length(e.content)>4096 ",
+            "length(e.content)>4096, e.event_type, ",
+            "CASE WHEN length(CAST(e.tool_name AS BLOB))<=256 THEN e.tool_name END, ",
+            "CASE WHEN length(CAST(e.tool_use_id AS BLOB))<=256 THEN e.tool_use_id END, ",
+            "(SELECT m.idempotency_key FROM operator_messages m ",
+            "WHERE m.session_id=e.session_id AND m.id=CASE WHEN json_valid(e.metadata) ",
+            "THEN json_extract(e.metadata,'$.operator_message_id') END) ",
             "FROM conversation_events e JOIN sessions s ON s.id=e.session_id ",
             "WHERE e.session_id=?1 AND s.status NOT IN ('Archived','Deleted') ",
-            "AND e.event_type='Message' AND e.role IN ('User','Assistant') ",
+            "AND ((e.event_type='Message' AND e.role IN ('User','Assistant')) ",
+            "OR e.event_type IN ('ToolUse','ToolResult')) ",
             "AND (e.metadata IS NULL OR NOT json_valid(e.metadata) ",
             "OR COALESCE(json_extract(e.metadata,'$.provider_diagnostic'),0)!=1) ",
             "AND (?2 IS NULL OR e.sequence<?2 OR (e.sequence=?2 AND e.id<?3)) ",
@@ -121,11 +136,15 @@ impl Store {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i32>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, bool>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 },
             )?
@@ -135,11 +154,31 @@ impl Store {
         let rows = rows
             .into_iter()
             .map(
-                |(id, sequence, role, content, created_at, metadata, content_cut)| {
+                |(
+                    id,
+                    sequence,
+                    role,
+                    content,
+                    created_at,
+                    metadata,
+                    content_cut,
+                    event_type,
+                    tool_name,
+                    tool_use_id,
+                    idempotency_key,
+                )| {
+                    let kind = match event_type.as_str() {
+                        "ToolUse" => ItemKindV2::ToolUse,
+                        "ToolResult" => ItemKindV2::ToolResult,
+                        _ => ItemKindV2::Message,
+                    };
+                    let message = kind == ItemKindV2::Message;
+                    let role = role.unwrap_or_default();
                     let metadata = metadata
                         .as_deref()
                         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-                    let operator = role == "User"
+                    let operator = message
+                        && role == "User"
                         && metadata
                             .as_ref()
                             .and_then(|value| value.get("source"))
@@ -151,12 +190,21 @@ impl Store {
                         .and_then(serde_json::Value::as_str)
                         .and_then(|raw| Uuid::parse_str(raw).ok())
                         .filter(|_| operator);
+                    let idempotency_key = idempotency_key
+                        .as_deref()
+                        .and_then(|key| key.strip_prefix(IDEMPOTENCY_PREFIX))
+                        .and_then(|raw| Uuid::parse_str(raw).ok())
+                        .filter(|_| operator_message_id.is_some());
                     RemoteConversationRow {
                         id,
                         sequence,
-                        assistant: role == "Assistant",
+                        assistant: message && role == "Assistant",
                         operator,
                         operator_message_id,
+                        idempotency_key,
+                        kind,
+                        tool_name: tool_name.filter(|name| !name.is_empty() && !message),
+                        tool_use_id: tool_use_id.filter(|id| !id.is_empty() && !message),
                         content,
                         content_cut,
                         created_at,

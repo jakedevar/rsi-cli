@@ -115,6 +115,16 @@ fn platform_summary(observation: Option<&rsi_common::satellite::SatelliteObserva
         .unwrap_or_else(|| "unknown".into())
 }
 
+fn activity_summary(observation: Option<&rsi_common::satellite::SatelliteObservationV1>) -> String {
+    let count = |value: Option<u32>| value.map_or_else(|| "unknown".into(), |v| v.to_string());
+    format!(
+        "running: {} · parked: {} · open jobs: {}",
+        count(observation.and_then(|o| o.sessions_running)),
+        count(observation.and_then(|o| o.workers_parked)),
+        count(observation.and_then(|o| o.open_jobs)),
+    )
+}
+
 pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOverlayState) {
     let popup = fixed_centered_rect(
         area,
@@ -283,6 +293,7 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
             {
                 lines.push(Line::from(format!("Last failure: {}", safe(error, 120))));
             }
+            lines.push(Line::from(activity_summary(observation)));
             lines.push(Line::from(peer_scope_line(peer)));
             lines.push(Line::from(format!(
                 "Platform: {}",
@@ -298,14 +309,16 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                         "No peers registered. Press a to add a disabled peer.",
                     ));
                 }
-                let window = state.selected_peer.saturating_sub(8);
+                let visible_peers =
+                    (usize::from(inner.height).saturating_sub(lines.len()) / 2).max(1);
+                let window = state.selected_peer.saturating_sub(visible_peers - 1);
                 for (idx, peer) in state
                     .registry
                     .peers
                     .iter()
                     .enumerate()
                     .skip(window)
-                    .take(20)
+                    .take(visible_peers)
                 {
                     lines.push(row(
                         format!(
@@ -331,6 +344,10 @@ pub(super) fn render(frame: &mut Frame, area: Rect, state: &SatelliteRegistryOve
                             peer.links.len(),
                             launches_suffix(peer.observation.as_ref()).replace(" · ", "  ")
                         ),
+                        idx == state.selected_peer,
+                    ));
+                    lines.push(row(
+                        format!("  {}", activity_summary(peer.observation.as_ref())),
                         idx == state.selected_peer,
                     ));
                 }
@@ -503,7 +520,10 @@ mod tests {
                 serde_json::from_value(serde_json::json!({
                     "state": "healthy", "installation_id": null, "incarnation_id": null,
                     "last_observed_at": null, "last_error": null,
-                    "cached_session_count": 0, "stale": false, "platform": platform
+                    "cached_session_count": 0, "stale": false, "platform": platform,
+                    "sessions_running": platform.as_ref().map(|_| 1),
+                    "workers_parked": platform.as_ref().map(|_| 2),
+                    "open_jobs": platform.as_ref().map(|_| 2)
                 }))
                 .unwrap(),
             );
@@ -525,6 +545,12 @@ mod tests {
             } else {
                 "unknown"
             };
+            let activity = if platform.is_some() {
+                "running: 1 · parked: 2 · open jobs: 2"
+            } else {
+                "running: unknown · parked: unknown · open jobs: unknown"
+            };
+            assert!(shown.contains(activity), "{shown}");
             assert!(shown.contains(&format!("Platform: {expected}")), "{shown}");
             assert!(shown.contains(&format!("platform: {expected}")), "{shown}");
         }
@@ -599,6 +625,9 @@ mod tests {
         let remote_id = SatelliteUuidV1(uuid::Uuid::new_v4());
         let now = chrono::Utc::now();
         let observation = SatelliteObservationV1 {
+            sessions_running: None,
+            workers_parked: None,
+            open_jobs: None,
             platform: None,
             state: "offline".into(),
             installation_id: None,
@@ -611,6 +640,7 @@ mod tests {
                 rsi_common::satellite_manager_policy::SatelliteManagerLaunchesV1 {
                     project_id: uuid::Uuid::new_v4(),
                     launches: 0,
+                    ..Default::default()
                 },
             ],
         };

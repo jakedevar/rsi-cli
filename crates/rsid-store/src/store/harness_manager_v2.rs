@@ -29,6 +29,16 @@ pub(crate) use global_manager_authority::{
 pub fn refused(code: &str) -> DaemonError {
     DaemonError::InvalidParam(code.into())
 }
+/// `manager_v2_session_changed` carrying the row's observed `updated_at`, in
+/// the same RFC3339 form the status views serialize, so a caller can retry
+/// once with the exact fence value instead of guessing (#197). The code stays
+/// the prefix, like the other `code: detail` refusals.
+pub(crate) fn session_changed(observed: chrono::DateTime<Utc>) -> DaemonError {
+    DaemonError::InvalidParam(format!(
+        "manager_v2_session_changed: observed_updated_at={}",
+        observed.to_rfc3339_opts(SecondsFormat::AutoSi, true)
+    ))
+}
 pub fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -457,6 +467,24 @@ impl Store {
             return Err(refused("manager_v2_policy_changed"));
         }
         let updated_at = Utc::now();
+        // #3417: `granted_at` is the daemon's spend baseline. A grant keeps the
+        // baseline of the same provider's saved grant (a raise or renewal
+        // keeps its spend), else starts counting now; a client value is
+        // ignored.
+        let mut policy = request.policy.clone();
+        for grant in &mut policy.provider_grants {
+            grant.granted_at = previous
+                .as_ref()
+                .and_then(|saved| {
+                    saved
+                        .policy
+                        .provider_grants
+                        .iter()
+                        .find(|old| old.provider == grant.provider)
+                })
+                .and_then(|old| old.granted_at)
+                .or(Some(updated_at));
+        }
         let next = actual
             .checked_add(1)
             .ok_or_else(|| refused("manager_v2_version_exhausted"))?;
@@ -464,13 +492,13 @@ impl Store {
             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(project_id) DO UPDATE SET manager_session_id=excluded.manager_session_id,
             scope_version=excluded.scope_version,row_version=excluded.row_version,policy_json=excluded.policy_json,updated_at=excluded.updated_at",
             params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,next,
-                serde_json::to_string(&request.policy)?,updated_at.to_rfc3339_opts(SecondsFormat::Nanos,true)])?;
+                serde_json::to_string(&policy)?,updated_at.to_rfc3339_opts(SecondsFormat::Nanos,true)])?;
         let result = HarnessManagerPolicyConfigV2 {
             project_id: config.project_id,
             manager_session_id: config.manager_session_id,
             scope_version: config.row_version,
             row_version: next,
-            policy: request.policy.clone(),
+            policy,
             updated_at,
             revoked: false,
         };
@@ -514,17 +542,14 @@ impl Store {
         capability: Option<ManagerCapabilityV2>,
     ) -> Result<ManagerAuthorityV2> {
         fence.validate().map_err(refused)?;
-        let (mut config, is_manager) = match self.manager_config_for_caller(caller) {
-            Ok(current) => current,
-            Err(legacy_denial) => {
-                if let Some(authority) =
-                    manager_node_authority::authorize_area_node(self, caller, fence, capability)?
-                {
-                    return Ok(authority);
-                }
-                return Err(legacy_denial);
-            }
-        };
+        // A Task can be both an Epic lead and an area seat. Its own node
+        // grant takes precedence over the legacy lead read path.
+        if let Some(authority) =
+            manager_node_authority::authorize_area_node(self, caller, fence, capability)?
+        {
+            return Ok(authority);
+        }
+        let (mut config, is_manager) = self.manager_config_for_caller(caller)?;
         if !is_manager {
             let epic = self
                 .get_session(caller)?
@@ -970,6 +995,7 @@ impl Store {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let stamp = now();
         let actor = match &origin {
@@ -1313,6 +1339,7 @@ impl Store {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let changed = self.conn.execute(
             "UPDATE harness_manager_v2_operations

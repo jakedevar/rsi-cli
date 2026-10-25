@@ -255,10 +255,12 @@ pub struct LaunchSessionParams {
     #[serde(default)]
     pub is_eval: Option<bool>,
     /// Eval-only: bypass the daemon's ContextPipeline assembly. When `Some(true)`,
-    /// `system_prompt` is used verbatim — no preamble injection, no project
-    /// context, no memory bundle, no git log, no FLYWHEEL.md. Required for
-    /// hermetic eval replays. Default `None` / `Some(false)` preserves the
-    /// production assembly path. See RSI-006.
+    /// the daemon adds no preamble, project context, memory bundle, git log or
+    /// FLYWHEEL.md to `system_prompt`. Required for hermetic eval replays. It
+    /// does NOT skip the Harness base instructions: a Harness-loop launch still
+    /// gets its static base (the worktree base, or the bench base for a
+    /// daemon-set bench launch, #3177) in front of `system_prompt`. Default
+    /// `None` / `Some(false)` preserves the production assembly path. See RSI-006.
     #[serde(default)]
     pub skip_context_pipeline: Option<bool>,
     // ─── P1.6: tag + topology override ─────────────────────
@@ -289,6 +291,22 @@ pub struct LaunchSessionParams {
     /// field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_gates: Option<crate::completion_gates::CompletionGates>,
+    /// Display role of the launched session. Only [`crate::intake_agent::INTAKE_AGENT_ROLE`]
+    /// is launchable this way (operator intake seat, #3787); any other value is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_role: Option<String>,
+}
+
+/// `LaunchIntakeSession` (operator-only, #3787): open a short-lived intake seat
+/// that turns `request` into a triaged Issue in `project_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchIntakeSessionParams {
+    pub project_id: Uuid,
+    /// The operator's words, verbatim.
+    pub request: String,
+    /// Override the seat's model (default: the small `intake_agent::INTAKE_DEFAULT_MODEL`).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1324,6 +1342,16 @@ pub struct ProcessMemoryReport {
     /// Bytes the allocator holds free inside its arenas (retention).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heap_free_bytes: Option<u64>,
+    /// Highest resident set size since the process started (`VmHWM` on Linux).
+    /// A start-up spike that was freed before anyone looked stays visible here
+    /// (#3491).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_peak_bytes: Option<u64>,
+    /// Seconds since the heap counters (`heap_in_use_bytes`, `heap_free_bytes`)
+    /// were sampled; they refresh on the trim timer, so they can lag `rss_bytes`
+    /// by a minute or more (#3491).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heap_sample_age_secs: Option<u64>,
     /// Arena cap applied at startup, when one was set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arena_max: Option<u32>,
@@ -1506,6 +1534,14 @@ pub struct GetProviderRateLimitsParams {
     pub provider: Option<SessionProvider>,
 }
 
+/// Operator assertion that the active account changed. Old telemetry is
+/// ignored until a fresh observation arrives; this does not disable admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClearProviderUsageHoldParams {
+    pub provider: SessionProvider,
+}
+
 /// How a provider's plan windows are being refreshed (Codex only today; Claude
 /// windows arrive on its own stream and have no poll).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1537,6 +1573,21 @@ pub struct GetProviderRateLimitsResponse {
 }
 
 impl ProviderRateLimitSnapshot {
+    /// Empty live update after old account telemetry has been invalidated.
+    #[must_use]
+    pub fn invalidated(provider: SessionProvider, observed_at: DateTime<Utc>) -> Self {
+        Self {
+            provider,
+            observed_at,
+            windows: Vec::new(),
+            status: None,
+            rate_limit_type: None,
+            overage_status: None,
+            is_using_overage: false,
+            stale_reason: None,
+        }
+    }
+
     /// True when the windows are last-known values after a failed refresh.
     #[must_use]
     pub fn is_stale(&self) -> bool {
@@ -2713,7 +2764,8 @@ pub struct AgentCreateIssueParams {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub harness: bool,
     /// #1389: with `harness`, the display number of the Issue in the caller's
-    /// own project this one mirrors; recorded in the provenance line.
+    /// own project this one mirrors; recorded in the provenance line. Refused
+    /// without `harness` (`agent_create_issue_source_issue_requires_harness`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_issue: Option<u32>,
 }
@@ -2806,9 +2858,19 @@ impl Default for AgentListIssuesRequestV1 {
 
 impl AgentListIssuesRequestV1 {
     pub fn validated_limit(&self) -> Result<u32, String> {
+        self.validate().map_err(|(_, message)| message)
+    }
+
+    /// Bounds check of every list field that a serde decode cannot judge. The
+    /// error names the offending top-level field so a refusal can say which
+    /// parameter to correct (kaizen #184).
+    pub fn validate(&self) -> Result<u32, (AgentIssueValidationFieldV1, String)> {
         if let Some(cursor) = &self.cursor {
             if cursor.display_number < 1 || cursor.issue_id.is_nil() {
-                return Err("Issue list cursor is invalid".to_string());
+                return Err((
+                    AgentIssueValidationFieldV1::Cursor,
+                    "Issue list cursor is invalid".to_string(),
+                ));
             }
         }
         if let Some(needle) = &self.title_contains {
@@ -2816,8 +2878,11 @@ impl AgentListIssuesRequestV1 {
                 || needle.len() > AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES
                 || needle.as_bytes().contains(&0)
             {
-                return Err(format!(
-                    "title_contains must be 1..={AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES} NUL-free bytes"
+                return Err((
+                    AgentIssueValidationFieldV1::TitleContains,
+                    format!(
+                        "title_contains must be 1..={AGENT_ISSUE_TITLE_CONTAINS_MAX_BYTES} NUL-free bytes"
+                    ),
                 ));
             }
         }
@@ -2828,13 +2893,19 @@ impl AgentListIssuesRequestV1 {
                     || label.contains('\0')
             })
         {
-            return Err(format!(
-                "labels must contain at most {AGENT_ISSUE_LIST_LABELS_MAX_COUNT} nonblank, NUL-free values of at most {AGENT_ISSUE_LIST_LABEL_MAX_BYTES} bytes each"
+            return Err((
+                AgentIssueValidationFieldV1::Labels,
+                format!(
+                    "labels must contain at most {AGENT_ISSUE_LIST_LABELS_MAX_COUNT} nonblank, NUL-free values of at most {AGENT_ISSUE_LIST_LABEL_MAX_BYTES} bytes each"
+                ),
             ));
         }
         let limit = self.limit.unwrap_or(64);
         if !(1..=256).contains(&limit) {
-            return Err("Issue list limit must be 1..=256".to_string());
+            return Err((
+                AgentIssueValidationFieldV1::Limit,
+                "Issue list limit must be 1..=256".to_string(),
+            ));
         }
         Ok(limit)
     }
@@ -2902,6 +2973,12 @@ pub struct AgentUpdateIssueRequestV1 {
     /// no other field may be set. `expected_row_version` is not checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<String>,
+    /// #3052: a lead or manager `body` update must keep the tail of the
+    /// current body (its last 64 bytes, trailing whitespace ignored); one that
+    /// does not is refused `body_would_drop_tail` unless this is `true`. It
+    /// guards a body rebuilt from a truncated read. Requires `body`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_body: bool,
 }
 
 impl AgentUpdateIssueRequestV1 {
@@ -2923,12 +3000,16 @@ impl AgentUpdateIssueRequestV1 {
             clear_assignee: false,
             project_id: None,
             handoff: None,
+            replace_body: false,
         }
     }
 
     pub fn validate(&self) -> Result<(), String> {
         validate_issue_target(self.issue_id, self.display_number)?;
         validate_issue_mutation_identity(self.expected_row_version, &self.idempotency_key)?;
+        if self.replace_body && self.body.is_none() {
+            return Err("replace_body requires body".to_string());
+        }
         if let Some(handoff) = &self.handoff {
             if self.title.is_some()
                 || self.body.is_some()
@@ -2937,6 +3018,7 @@ impl AgentUpdateIssueRequestV1 {
                 || self.clear_priority
                 || self.assignee.is_some()
                 || self.clear_assignee
+                || self.replace_body
             {
                 return Err("handoff cannot be combined with another field".to_string());
             }
@@ -3142,6 +3224,13 @@ pub enum AgentIssueErrorCodeV1 {
     /// #1545: a bound worker's `body` does not start with the current body
     /// byte for byte.
     BoundIssueNotAppendOnly,
+    /// #3052: a lead or manager `body` update that does not keep the tail of
+    /// the current body (typically one rebuilt from a truncated read), sent
+    /// without `replace_body: true`.
+    BodyWouldDropTail,
+    /// #3595: a published body adds or changes a `rsi-failure-signature` block
+    /// that does not parse or validate; `diagnostic` carries the exact reason.
+    InvalidFailureSignature,
 }
 
 impl AgentIssueErrorCodeV1 {
@@ -3163,6 +3252,8 @@ impl AgentIssueErrorCodeV1 {
             Self::BoundIssueWrongIssue => "bound_issue_wrong_issue",
             Self::BoundIssueFieldNotAllowed => "bound_issue_field_not_allowed",
             Self::BoundIssueNotAppendOnly => "bound_issue_not_append_only",
+            Self::BodyWouldDropTail => "body_would_drop_tail",
+            Self::InvalidFailureSignature => "invalid_failure_signature",
         }
     }
 }
@@ -3206,6 +3297,8 @@ pub enum AgentIssueValidationFieldV1 {
     IncludeIssue,
     /// #2329: the optional status-change note.
     Note,
+    /// #184: the `AgentListIssues` row projection (`summary` or `full`).
+    Fields,
 }
 
 /// One bounded, allowlisted hint for a malformed guarded Issue request.
@@ -3226,7 +3319,98 @@ pub struct AgentIssueErrorV1 {
     pub actual_row_version: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation: Option<AgentIssueValidationV1>,
+    /// #3595: bounded parse/enum diagnostic of an `invalid_failure_signature`
+    /// refusal (serde or validation text of the operator-supplied block).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
     pub next_action: String,
+}
+
+impl AgentIssueValidationFieldV1 {
+    /// The exact request key this field names (the serde snake_case name).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Archive => "archive",
+            Self::Cursor => "cursor",
+            Self::Limit => "limit",
+            Self::Ready => "ready",
+            Self::IssueId => "issue_id",
+            Self::ExpectedRowVersion => "expected_row_version",
+            Self::IdempotencyKey => "idempotency_key",
+            Self::Title => "title",
+            Self::Body => "body",
+            Self::Labels => "labels",
+            Self::Priority => "priority",
+            Self::ClearPriority => "clear_priority",
+            Self::Assignee => "assignee",
+            Self::ClearAssignee => "clear_assignee",
+            Self::AfterSequence => "after_sequence",
+            Self::DisplayNumber => "display_number",
+            Self::Order => "order",
+            Self::TitleContains => "title_contains",
+            Self::ProjectId => "project_id",
+            Self::IncludeIssue => "include_issue",
+            Self::Note => "note",
+            Self::Fields => "fields",
+        }
+    }
+}
+
+/// The `next_action` of an `invalid_request` Issue refusal: it names the
+/// offending field and the fix, in the style of the `AgentSubmitJob`
+/// `job_invalid_params` refusals (kaizen #168, #184). `list` selects the
+/// `AgentListIssues` wording; every other guarded Issue verb gets the generic
+/// per-class text. Static text only: the unknown key a caller sent is never
+/// echoed (the validation hint carries no caller-supplied string).
+pub fn agent_issue_invalid_request_next_action(
+    list: bool,
+    validation: &AgentIssueValidationV1,
+) -> String {
+    let name = validation.field.map(AgentIssueValidationFieldV1::as_str);
+    match (validation.class, validation.field, list) {
+        (AgentIssueValidationClassV1::InvalidShape, _, true) => {
+            "params: must be a JSON object (or omitted); AgentListIssues fields are status, archive, cursor, limit, ready, order, title_contains, labels and fields; search titles with title_contains".to_string()
+        }
+        (AgentIssueValidationClassV1::UnknownField, _, true) => {
+            "params: an unknown field; AgentListIssues accepts only status, archive, cursor, limit, ready, order, title_contains, labels, fields (and project_id for a global manager); search Issue titles with title_contains (there is no `query` field) and narrow with labels or status".to_string()
+        }
+        (AgentIssueValidationClassV1::MissingField, Some(AgentIssueValidationFieldV1::TitleContains), true) => {
+            "params.title_contains: an Issue-bound worker, topology session node or active reviewer searches its own project with title_contains, labels or status (at least one; the others only narrow it) and never sets project_id; add title_contains (1..=128 bytes), for example {\"title_contains\":\"kaizen\"}".to_string()
+        }
+        (AgentIssueValidationClassV1::InvalidField, Some(field), true) => {
+            let fix = match field {
+                AgentIssueValidationFieldV1::Status => "status must be one of Open, InProgress, Closed, Cancelled (exact case)",
+                AgentIssueValidationFieldV1::Archive => "archive must be one of Active, Archived, All (exact case)",
+                AgentIssueValidationFieldV1::Cursor => "cursor must be the next_cursor object of a previous page, unchanged",
+                AgentIssueValidationFieldV1::Limit => "limit must be an integer in 1..=256",
+                AgentIssueValidationFieldV1::Ready => "ready must be true or false",
+                AgentIssueValidationFieldV1::Order => "order must be asc or desc",
+                AgentIssueValidationFieldV1::TitleContains => "title_contains must be 1..=128 NUL-free bytes",
+                AgentIssueValidationFieldV1::Labels => "labels must be an array of at most 16 nonblank, NUL-free strings of at most 64 bytes each",
+                AgentIssueValidationFieldV1::Fields => "fields must be summary or full",
+                AgentIssueValidationFieldV1::ProjectId => "project_id must be a project UUID (a global manager only; omit it otherwise)",
+                _ => "use a field AgentListIssues accepts",
+            };
+            format!("params.{}: invalid value; {fix}", field.as_str())
+        }
+        (AgentIssueValidationClassV1::MissingField, Some(_), _) => {
+            format!("params.{}: required; add it and retry", name.unwrap_or("field"))
+        }
+        (AgentIssueValidationClassV1::InvalidField, Some(_), _) => {
+            format!(
+                "params.{}: invalid value; check its type and bounds with AgentGetAuthorityCatalog {{\"verb\":\"<verb>\"}} and retry",
+                name.unwrap_or("field")
+            )
+        }
+        (AgentIssueValidationClassV1::UnknownField, _, _) => {
+            "params: an unknown field; list this verb's fields with AgentGetAuthorityCatalog {\"verb\":\"<verb>\"} and send only those".to_string()
+        }
+        (AgentIssueValidationClassV1::InvalidShape, _, _) => {
+            "params: must be a JSON object of this verb's fields; see AgentGetAuthorityCatalog {\"verb\":\"<verb>\"}".to_string()
+        }
+        (_, None, _) => "correct the request fields and retry".to_string(),
+    }
 }
 
 /// Operator-only bounded immutable Issue-history read uses exactly the same
@@ -3472,6 +3656,60 @@ pub struct LinkIssueToIdeaResult {
 
 #[cfg(test)]
 mod tests {
+    /// #184: `as_str` is the serde key of every validation field, and the
+    /// list wording names it.
+    #[test]
+    fn issue_validation_field_names_match_serde_and_next_action_names_them() {
+        use AgentIssueValidationFieldV1 as F;
+        for field in [
+            F::Status,
+            F::Archive,
+            F::Cursor,
+            F::Limit,
+            F::Ready,
+            F::IssueId,
+            F::ExpectedRowVersion,
+            F::IdempotencyKey,
+            F::Title,
+            F::Body,
+            F::Labels,
+            F::Priority,
+            F::ClearPriority,
+            F::Assignee,
+            F::ClearAssignee,
+            F::AfterSequence,
+            F::DisplayNumber,
+            F::Order,
+            F::TitleContains,
+            F::ProjectId,
+            F::IncludeIssue,
+            F::Note,
+            F::Fields,
+        ] {
+            assert_eq!(serde_json::json!(field), serde_json::json!(field.as_str()));
+            for list in [false, true] {
+                for class in [
+                    AgentIssueValidationClassV1::MissingField,
+                    AgentIssueValidationClassV1::InvalidField,
+                ] {
+                    let text = agent_issue_invalid_request_next_action(
+                        list,
+                        &AgentIssueValidationV1 {
+                            class,
+                            field: Some(field),
+                        },
+                    );
+                    assert!(text.contains(field.as_str()), "{text}");
+                }
+            }
+        }
+        let bare = AgentIssueValidationV1 {
+            class: AgentIssueValidationClassV1::InvalidShape,
+            field: None,
+        };
+        assert!(agent_issue_invalid_request_next_action(true, &bare).contains("title_contains"));
+    }
+
     use super::*;
 
     #[test]
@@ -4909,6 +5147,8 @@ mod tests {
             AgentIssueErrorCodeV1::BoundIssueWrongIssue,
             AgentIssueErrorCodeV1::BoundIssueFieldNotAllowed,
             AgentIssueErrorCodeV1::BoundIssueNotAppendOnly,
+            AgentIssueErrorCodeV1::BodyWouldDropTail,
+            AgentIssueErrorCodeV1::InvalidFailureSignature,
         ] {
             let error = AgentIssueErrorV1 {
                 code,
@@ -4920,12 +5160,35 @@ mod tests {
                         field: Some(AgentIssueValidationFieldV1::IssueId),
                     },
                 ),
+                diagnostic: (code == AgentIssueErrorCodeV1::InvalidFailureSignature)
+                    .then(|| "block 1: unknown variant".to_string()),
                 next_action: "safe remediation".to_string(),
             };
             let value = serde_json::to_value(&error).unwrap();
             let decoded: AgentIssueErrorV1 = serde_json::from_value(value).unwrap();
             assert_eq!(decoded, error);
         }
+    }
+
+    #[test]
+    fn update_issue_replace_body_needs_a_body_and_stands_apart_from_handoff() {
+        let base = || AgentUpdateIssueRequestV1 {
+            display_number: Some(1),
+            ..AgentUpdateIssueRequestV1::new(1, "k".into())
+        };
+        let mut request = base();
+        request.title = Some("t".into());
+        request.replace_body = true;
+        assert!(request.validate().is_err());
+        request.body = Some("whole body".into());
+        assert!(request.validate().is_ok());
+        let mut note = base();
+        note.handoff = Some("note".into());
+        assert!(note.validate().is_ok());
+        note.replace_body = true;
+        assert!(note.validate().is_err());
+        let wire = serde_json::to_value(base()).unwrap();
+        assert!(wire.get("replace_body").is_none());
     }
 
     #[test]

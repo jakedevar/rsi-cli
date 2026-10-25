@@ -5,6 +5,7 @@ import SwiftUI
 /// answers are off (403/404) it says so and the session stays read-only.
 struct AnswerSectionView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
     let project: WireProject
     let sessionId: String
     /// The read-only decisions of the same session, used to tell multi-select
@@ -26,7 +27,7 @@ struct AnswerSectionView: View {
             case .failed(let error):
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Could not load answer forms. \(error.message)")
-                        .font(.caption).foregroundStyle(.red)
+                        .font(.caption).foregroundStyle(theme.error.color)
                     Button("Retry") { Task { await reload() } }
                         .font(.caption)
                 }
@@ -52,6 +53,8 @@ struct AnswerSectionView: View {
     private func reload() async {
         guard let client = model.client else { return }
         let result = await client.decisionTargets(project: project.id, session: sessionId)
+        // The row went away mid-read: keep what is shown.
+        if case .failed(.cancelled) = result { return }
         if case .ok(let targets) = result {
             model.drafts.sync(
                 project: project.id, session: sessionId, targets: targets.items,
@@ -65,6 +68,7 @@ struct AnswerSectionView: View {
 /// a question, free text, plus Send and the delivery state.
 struct AnswerFormView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
     let project: String
     let sessionId: String
     let target: AnswerTarget
@@ -76,11 +80,11 @@ struct AnswerFormView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(target.kind == .question ? "Question" : "Approval")
-                    .font(.caption2.bold()).foregroundStyle(.secondary)
+                    .font(.caption2.bold()).foregroundStyle(theme.label.color)
                 Text(target.title).font(.subheadline.bold())
             }
             if !target.detail.isEmpty {
-                Text(target.detail).font(.caption)
+                MarkdownText(text: target.detail, font: .caption)
             }
             if let receipt = target.receipt {
                 Text(describePendingReceipt(receipt).message)
@@ -130,11 +134,11 @@ struct AnswerFormView: View {
             .disabled(!state.canEdit)
             Text("\(draft.text.utf8.count) / \(maxAnswerBytes) bytes")
                 .font(.caption2)
-                .foregroundStyle(draft.text.utf8.count > maxAnswerBytes ? .red : .secondary)
+                .foregroundStyle((draft.text.utf8.count > maxAnswerBytes ? theme.error : theme.mutedText).color)
         }
         actions(draft, state)
         if !state.message.isEmpty {
-            Text(state.message).font(.caption).foregroundStyle(color(state.tone))
+            Text(state.message).font(.caption).foregroundStyle(theme.color(state.tone))
                 .accessibilityLabel(state.message)
         }
     }
@@ -172,15 +176,6 @@ struct AnswerFormView: View {
                 // Delivered or stale: read the targets again.
                 await onChanged()
             }
-        }
-    }
-
-    private func color(_ tone: AnswerTone) -> Color {
-        switch tone {
-        case .idle, .busy: .secondary
-        case .ok: .green
-        case .warn: .orange
-        case .error: .red
         }
     }
 }

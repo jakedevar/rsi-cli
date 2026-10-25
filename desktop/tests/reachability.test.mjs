@@ -4,8 +4,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as reg from '../dist/registry.js';
-import { bySection, htmlButtonActions, parityRows, reachability, renderSectionTable } from '../scripts/reachability-lib.mjs';
-import { load, loadBySection } from '../scripts/reachability.mjs';
+import {
+  FORM_COMPLETION, bySection, formCompletion, functionBody, htmlButtonActions, parityRows, reachability, renderSectionTable, smokeStepIds,
+} from '../scripts/reachability-lib.mjs';
+import { generate as generateParity } from '../scripts/parity.mjs';
+import { load, loadBySection, loadForms } from '../scripts/reachability.mjs';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const read = (p) => readFileSync(here(p), 'utf8');
@@ -71,7 +74,7 @@ test('the check fails on an action no surface lists', () => {
 test('by-section: one row per PARITY.md ## section, every linked action reachable', async () => {
   const { sections, problems, parityRows: n } = await loadBySection();
   assert.deepEqual(problems, []);
-  const headings = read('../PARITY.md').split('\n').filter((l) => l.startsWith('## ')).map((l) => l.slice(3).trim());
+  const headings = generateParity({ root: here('../..'), sidecarDir: here('../parity-status.d') }).text.split('\n').filter((l) => l.startsWith('## ')).map((l) => l.slice(3).trim());
   assert.deepEqual(sections.map((s) => s.section), headings);
   assert.equal(sections.reduce((a, s) => a + s.rows, 0), n);
   for (const s of sections) assert.equal(s.rows, s.binding + s.module + s.none, s.section);
@@ -79,7 +82,7 @@ test('by-section: one row per PARITY.md ## section, every linked action reachabl
   for (const name of ['Normal Mode Keybindings', 'Command Mode']) {
     assert.ok(sections.find((s) => s.section === name).direct.actions > 20, name);
   }
-  assert.match(renderSectionTable(sections), /\| Command Mode \| 77 \|/);
+  assert.match(renderSectionTable(sections), /\| Command Mode \| 81 \|/);
 });
 
 test('by-section: an action with no surface is a problem for the section that links it', () => {
@@ -90,4 +93,33 @@ test('by-section: an action with no surface is a problem for the section that li
   assert.equal(ok.sections[0].binding, 1);
   const bad = bySection(rows, [{ id: 'cursor-down', group: 'go', title: 'Down', surfaces: [] }], keys, {}, {});
   assert.equal(bad.problems.length, 1);
+});
+
+// Hub #3280: form completion inside an overlay is audited, not excluded.
+test('the Settings text editor a click opens is saved, staged and cancelled by click (FORM_COMPLETION)', () => {
+  const { rows, problems } = loadForms();
+  assert.deepEqual(problems, []);
+  const editor = rows.find((r) => r.id === 'settings-text-editor');
+  assert.deepEqual(editor.buttons, ['Save', 'Stage', 'Cancel']);
+  assert.equal(editor.ok, true);
+  assert.equal(editor.smoke, 'settings-text-mouse');
+});
+
+test('an editor with only Enter/Esc, or without its smoke steps, is reported', () => {
+  // The pre-#3280 shape of editText: a heading, an input, an error line and a key hint; no buttons.
+  const keysOnly = `function editText(row) {\n  const form = el('form');\n  form.append(input, err, el('div', 'pick-empty', 'Enter saves now, Esc cancels'));\n  form.addEventListener('submit', save);\n}\n`;
+  const none = { smoke: new Set(), e2e: new Set() };
+  const { rows, problems } = formCompletion(FORM_COMPLETION, () => keysOnly, none);
+  assert.equal(rows[0].ok, false);
+  for (const needle of ["no 'Save' button label", "no 'Stage' button label", "no 'Cancel' button label", 'no native <button>', 'no submit button', 'no click-wired Cancel button', 'smoke step settings-text-mouse is missing', 'e2e step settings-text-mouse is missing']) {
+    assert.ok(problems.some((p) => p.includes(needle)), `${needle}: ${problems.join(' | ')}`);
+  }
+  assert.ok(formCompletion(FORM_COMPLETION, () => '', none).problems.some((p) => p.includes('no function editText')));
+});
+
+test('functionBody and smokeStepIds read what the audit needs', () => {
+  const src = 'function a() {\n  x;\n}\nfunction b() {\n  y;\n}\n';
+  assert.equal(functionBody(src, 'b'), 'function b() {\n  y;\n}');
+  assert.equal(functionBody(src, 'c'), null);
+  assert.deepEqual([...smokeStepIds("{ id: 'boot', x }, { id: 'settings-text-mouse' }")], ['boot', 'settings-text-mouse']);
 });

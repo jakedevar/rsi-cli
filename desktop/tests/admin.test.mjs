@@ -14,8 +14,8 @@ import {
   keyRows, loginValue, maskedEcho, mcpForm, mcpRequest, mcpValue, median, moveCursor, newScheduleForm, normalizeTime,
   recurrenceLabel, scheduleRequest, splitList, wakeLabel,
   MAX_ADOPT_PATHS, MAX_REMOTE_PROJECTS, adoptAll, adoptOne, adoptSummary, applyBlock, countsLine, formatBytes, formatScope,
-  linkForm, linkRequest, linkRow, nextSatTab, pageCursor, parseIdList, parseScope, peerForm, peerRequest, peerRow,
-  remoteDeviceEdit, remoteProjectEdit, remoteSummary, satSessionRow, scratchVerdict, settlementApply, settlementKey,
+  linkForm, linkRequest, linkRow, nextSatTab, pageCursor, parseIdList, parseScope, peerForm, peerRequest, peerRow, activitySummary,
+  remoteDeviceEdit, remoteProjectEdit, remoteSummary, satSessionRow, scratchVerdict, receiptItemView, receiptMismatch, receiptView, settlementApply, settlementKey, settlementOrigin, unprovenSurvivorLines,
   toggleLinkEdit, togglePeerEdit,
 } from '../dist/admin-model.js';
 
@@ -320,9 +320,22 @@ test('satellite scope text parses and formats as the TUI', () => {
   assert.equal(nextSatTab('sessions'), 'peers');
 });
 
+test('each satellite peer row shows its activity, as the TUI (#323)', () => {
+  const obs = (extra) => ({ ...satPeer().observation, ...extra });
+  // The TUI's test expectations: counts reported, and nothing reported.
+  const busy = satPeer({ observation: obs({ sessions_running: 1, workers_parked: 2, open_jobs: 2 }) });
+  assert.equal(activitySummary(busy.observation), 'running: 1 · parked: 2 · open jobs: 2');
+  assert.match(peerRow(busy).value, /cached:12  running: 1 · parked: 2 · open jobs: 2$/);
+  assert.equal(activitySummary(satPeer().observation), 'running: unknown · parked: unknown · open jobs: unknown');
+  assert.equal(activitySummary(null), 'running: unknown · parked: unknown · open jobs: unknown');
+  // Zero is a reported count, not unknown; null (a serialised gap) is unknown.
+  assert.equal(activitySummary(obs({ sessions_running: 0, workers_parked: null, open_jobs: 0 })), 'running: 0 · parked: unknown · open jobs: 0');
+});
+
 test('satellite rows show config, observation and links', () => {
-  assert.deepEqual(peerRow(satPeer()), { label: 'mac-mini', value: 'enabled:on  read:on  dispatch:on  state:paired (stale)  links:1  cached:12' });
+  assert.deepEqual(peerRow(satPeer()), { label: 'mac-mini', value: 'enabled:on  read:on  dispatch:on  state:paired (stale)  links:1  cached:12  running: unknown · parked: unknown · open jobs: unknown' });
   assert.match(peerRow(satPeer({ observation: null })).value, /state:unobserved/);
+  assert.match(peerRow(satPeer({ observation: null })).value, /running: unknown · parked: unknown · open jobs: unknown$/);
   assert.deepEqual(linkRow(satPeer().links[0]), { label: '/run/rsi/mini.sock', value: 'dial_home_reverse  ssh:-  trust:known_hosts:mini  enabled:on  priority:1' });
   assert.deepEqual(satSessionRow({ key: {}, summary: { session_id: R, title: null, provider: 'Claude', status: 'Running', working_dir: null, updated_at: ago(120_000) } }, NOW),
     { label: R, value: 'Claude  Running  2m ago' });
@@ -440,6 +453,49 @@ test('settlement apply needs a fresh applyable audit of the selection and the ex
   assert.equal(pageCursor(25, 30, 'PageDown'), 29);
   assert.equal(pageCursor(5, 30, 'K'), 0);
   assert.equal(pageCursor(5, 30, 'j'), 6);
+});
+
+test('a settlement receipt lists each unproven survivor with its root or the cohort repository (#149)', () => {
+  const receipt = {
+    run_id: Q, repository_identity: 'github.com/o/r', canonical_repo_dir: '/repo',
+    unproven_survivors: [
+      { sequence: 0, pid: 4242, start_time_micros: 1, executable: '/opt/hardened/bin/claude', session_id: Q, custody_id: Q,
+        sandbox_root: '/sandboxes/live', reason: 'environment_withheld_by_macos' },
+      { sequence: 1, pid: 4343, start_time_micros: 2, reason: 'environment_withheld_by_macos' },
+    ],
+  };
+  assert.deepEqual(unprovenSurvivorLines(receipt), [
+    'pid 4242 · /opt/hardened/bin/claude · root /sandboxes/live · environment withheld by macOS',
+    'pid 4343 · <executable unknown> · cohort repository /repo · environment withheld by macOS',
+  ]);
+  assert.deepEqual(unprovenSurvivorLines({ ...receipt, unproven_survivors: undefined }), []);
+  assert.deepEqual(unprovenSurvivorLines(null), []);
+  const ops = readFileSync(here('../src/admin-ops.ts'), 'utf8');
+  assert.match(ops, /get_source_worktree_settlement_run/);
+  assert.match(readFileSync(here('../src/admin-model.ts'), 'utf8'), /Programs left running \(unproven survivors\)/);
+});
+
+test('a settlement receipt reads in plain words: phase, refusal, run state and who started it (#276)', () => {
+  const base = { sequence: 5, source_ref: 'refs/heads/rsi/x', phase: 'refused', refusal_code: 'worktree_remove_failed', after_observation: 'dirty' };
+  assert.deepEqual(receiptItemView(base), {
+    title: '#5 refs/heads/rsi/x', status: 'Refused', tone: 'bad', reason: 'Git could not remove the work folder', detail: 'dirty', hint: null,
+  });
+  // A phase or refusal this build does not know still reads as words, never as a blank.
+  const odd = receiptItemView({ ...base, phase: 'half_done', refusal_code: 'new_thing' });
+  assert.equal(odd.status, 'half done');
+  assert.equal(odd.reason, 'new thing');
+  assert.equal(settlementOrigin({ origin: 'automatic' }), 'The daemon, automatically');
+  assert.equal(settlementOrigin({ origin: 'agent', agent_session_id: 'abc' }), 'An agent session (abc)');
+  assert.equal(settlementOrigin(undefined), 'Unknown (a run from before origins were recorded)');
+  const r = { run_id: 'a', repository_identity: 'r', canonical_repo_dir: '/d' };
+  assert.equal(receiptMismatch(r, 'a', 'r', '/d'), null);
+  assert.match(receiptMismatch(r, 'b', 'r', '/d'), /run ID/);
+  assert.match(receiptMismatch(r, 'a', 'x', '/d'), /repository does not match/);
+  assert.match(receiptMismatch(r, 'a', 'r', '/e'), /folder does not match/);
+  const v = receiptView({ ...r, state: 'recovery_required', items: [] });
+  assert.deepEqual(v.facts, [['Started by', 'Unknown (a run from before origins were recorded)'], ['Outcome', 'Needs recovery']]);
+  assert.equal(v.itemsEmpty, 'This run recorded no roots.');
+  assert.deepEqual(v.survivors, []);
 });
 
 test('the settlement phrase is never prefilled', () => {

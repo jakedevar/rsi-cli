@@ -5,12 +5,15 @@ import argparse
 import difflib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 sys.dont_write_bytecode = True
 
@@ -136,6 +139,82 @@ def validate_renumber_proof(repo, base, source, candidate, proof_path, fetched_t
         return proof
     except (ValueError, KeyError, OSError, TypeError, module.Refusal) as error:
         raise GuardError(f"provisional proof refused: {error}") from error
+
+
+MAX_VIRTUAL_BASE_DEPTH = 8
+
+
+def virtual_base(repo, left, right, depth=0):
+    """Return the merge base of two commits as Git itself would reduce it.
+
+    Several merge bases (a criss-cross history) are merged pairwise into one
+    synthetic parentless commit, the way ``git merge`` builds its virtual base.
+    Returns ``None`` when Git cannot say; the caller then keeps the accepted
+    base. The synthetic commit only adds an unreachable object.
+    """
+    result = git(repo, "merge-base", "--all", left, right, check=False)
+    if result.returncode != 0:
+        return None
+    bases = result.stdout.decode().split()
+    if not bases:
+        return None
+    if len(bases) == 1:
+        return bases[0]
+    if depth >= MAX_VIRTUAL_BASE_DEPTH:
+        return None
+    current = bases[0]
+    for other in bases[1:]:
+        inner = virtual_base(repo, current, other, depth + 1)
+        merge_base = [f"--merge-base={inner}"] if inner else []
+        merged = git(repo, "merge-tree", "--write-tree", *merge_base, current, other,
+                     check=False)
+        # Exit 1 is a conflicted merge; its first line is still the tree, and
+        # Git's own virtual base keeps the conflict markers the same way.
+        if merged.returncode not in (0, 1):
+            return None
+        tree = merged.stdout.decode().split("\n", 1)[0].strip()
+        if not OID.fullmatch(tree):
+            return None
+        env = safe_env()
+        for role in ("AUTHOR", "COMMITTER"):
+            env[f"GIT_{role}_NAME"] = "rsi landing guard"
+            env[f"GIT_{role}_EMAIL"] = "landing-guard@invalid"
+            env[f"GIT_{role}_DATE"] = "2000-01-01T00:00:00Z"
+        made = git(repo, "commit-tree", tree, "-m", "virtual merge base", env=env, check=False)
+        if made.returncode != 0:
+            return None
+        current = made.stdout.decode().strip()
+    return current
+
+
+def own_base(repo, base, source, target):
+    """Narrow the accepted base to the source's own delta against ``target``.
+
+    A source that merged an older rolling state carries that state's changes
+    in ``base..source``. When rolling later changed them on purpose, reading
+    them as the source's own insertions flags a reversion that is not one.
+    The merge-base of source and the rolling tip is the newest state the
+    source shares with rolling, so only the source's own changes lie beyond
+    it. When criss-cross merges leave several merge bases, none of them alone
+    is that state: each one misses what the others share, so their virtual
+    merge base is used (what ``git merge`` builds for the candidate). It is
+    used only when the accepted base is that shared state or an ancestor of
+    one of the merge bases; otherwise the accepted base stands (never widen
+    the checked delta). A source already integrated into ``target`` has no
+    delta left to narrow, so its explicit base keeps the full lost-hunk check.
+    """
+    if ancestor(repo, source, target):
+        return base
+    result = git(repo, "merge-base", "--all", source, target, check=False)
+    if result.returncode != 0:
+        return base
+    bases = result.stdout.decode().split()
+    if not bases or not any(ancestor(repo, base, shared) for shared in bases):
+        return base
+    shared = bases[0] if len(bases) == 1 else virtual_base(repo, source, target)
+    if shared and shared != base:
+        return shared
+    return base
 
 
 def lost_hunks(repo, base, source, candidate, proof=None):
@@ -290,6 +369,35 @@ def run_tests(candidate, worktree, commands):
             raise GuardError(f"affected-crate tests failed: {' '.join(args)}")
 
 
+def check_target_reclaim(repo, candidate):
+    """Run the candidate's static guard on committed inputs, before any build.
+
+    Like the pre-push guards, this uses an exported tree so dirty worktree
+    changes cannot hide a bad writer. Older candidate trees predate the guard.
+    """
+    script = "scripts/check-target-reclaim.py"
+    if blob(repo, candidate, script) is None:
+        return
+    paths = [path for path in ("crates", "scripts", "desktop/scripts")
+             if git(repo, "cat-file", "-e", f"{candidate}:{path}", check=False).returncode == 0]
+    archive = git(repo, "archive", candidate, *paths).stdout
+    with tempfile.TemporaryDirectory(prefix="rsi-target-reclaim-guard-") as temporary:
+        root = Path(temporary)
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+            for entry in tree:
+                if not entry.isfile():
+                    continue
+                relative = Path(entry.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise GuardError("unsafe path in candidate archive")
+                dest = root / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(tree.extractfile(entry).read())
+        result = subprocess.run([sys.executable, str(root / script)], text=True, capture_output=True)
+        if result.returncode:
+            raise GuardError("check-target-reclaim failed: " + (result.stdout + result.stderr).strip())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
@@ -314,10 +422,14 @@ def main():
             raise GuardError("accepted source is not an ancestor of candidate")
         if not ancestor(repo, args.target, args.candidate):
             raise GuardError("target tip is not an ancestor of candidate")
+        check_target_reclaim(repo, args.candidate)
         proof = (validate_renumber_proof(repo, args.base, args.source, args.candidate,
                                          args.proof, args.target)
                  if args.proof else None)
-        missing = lost_hunks(repo, args.base, args.source, args.candidate, proof)
+        # A provisional-migration proof is keyed to the accepted base's delta.
+        base = args.base if proof is not None else own_base(
+            repo, args.base, args.source, args.target)
+        missing = lost_hunks(repo, base, args.source, args.candidate, proof)
         packages = affected_crates(repo, args.target, args.candidate)
         commands = test_commands(packages, args.test_filter)
         unchanged = (git(repo, "rev-parse", f"{args.target}^{{tree}}").stdout

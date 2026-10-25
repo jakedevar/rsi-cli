@@ -1,9 +1,9 @@
 [Unit]
-Description=Stop tonight's AWS instances at budget or deadline
+Description=Sweep expired or untagged RSI AWS instances and reconcile spend reservations
 
 [Service]
 Type=oneshot
 EnvironmentFile=-%h/.rsi/cloud/watchdog.env
-ExecStart=%h/.rsi/bin/cloud-watchdog.py $RSI_CLOUD_WATCHDOG_ARGS
+ExecStart=%h/.rsi/bin/rsi-cloud watchdog $RSI_CLOUD_WATCHDOG_ARGS
 StandardOutput=append:%h/.rsi/cloud-watchdog.log
 StandardError=append:%h/.rsi/cloud-watchdog.log

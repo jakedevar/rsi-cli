@@ -1,0 +1,25 @@
+[package]
+name = "rsi-scoped-receipt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "The scoped_test receipt contract (#3621): conformance check, consumer projection, parity comparison and the golden corpus"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsi-scoped-receipt"
+path = "src/main.rs"
+
+# One dependency on purpose: the daemon links this crate in-process, and the
+# Python-free runner (crates/rsi-repo-guards, #423) can depend on it without
+# growing the build every git hook pays for.
+[dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

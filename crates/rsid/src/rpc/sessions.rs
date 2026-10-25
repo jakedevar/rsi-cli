@@ -317,6 +317,42 @@ impl RpcServer {
         Ok(serde_json::json!({ "success": true }))
     }
 
+    /// `LaunchIntakeSession` (operator-only, #3787): open the intake seat on a
+    /// small model with the operator's request, in the project's directory. The
+    /// seat is a plain worker session whose `intake` role binds it to
+    /// `INTAKE_SEAT_AGENT_VERBS`; it can file and read Issues and nothing else.
+    pub(super) async fn handle_launch_intake_session(
+        &self,
+        request: &RpcRequest,
+    ) -> Result<serde_json::Value> {
+        let params: rsi_common::rpc::LaunchIntakeSessionParams =
+            serde_json::from_value(request.params.clone())
+                .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {e}")))?;
+        if request.session_token.is_some() {
+            return Err(DaemonError::InvalidParam(
+                "intake_launch_is_operator_only".to_string(),
+            ));
+        }
+        let text = params.request.trim();
+        if text.is_empty() {
+            return Err(DaemonError::InvalidParam(
+                "intake_request_required".to_string(),
+            ));
+        }
+        let mut inner = request.clone();
+        inner.params = serde_json::json!({
+            "query": rsi_common::intake_agent::intake_seat_query(text),
+            "provider": rsi_common::types::SessionProvider::Claude,
+            "model": params.model.unwrap_or_else(|| {
+                rsi_common::intake_agent::INTAKE_DEFAULT_MODEL.to_string()
+            }),
+            "project_id": params.project_id,
+            "tags": ["intake"],
+            "agent_role": rsi_common::intake_agent::INTAKE_AGENT_ROLE,
+        });
+        self.handle_launch_session(&inner).await
+    }
+
     pub(super) async fn handle_launch_session(
         &self,
         request: &RpcRequest,
@@ -324,13 +360,35 @@ impl RpcServer {
         // params defaults to Null via serde - no unwrap_or needed
         let mut params: LaunchSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {}", e)))?;
-        self.resolve_custom_provider(
-            params.custom_provider_id,
-            &mut params.openai_base_url,
-            &mut params.openai_api_key,
-        )
-        .await?;
-
+        // Route before validating Harness-only options, as for inline URLs.
+        // The launch boundary resolves the credential and retains the reference.
+        if let Some(id) = params.custom_provider_id {
+            let store = self.session_manager.store().lock().await;
+            let row = store
+                .get_custom_provider_record(id)?
+                .filter(|row| row.deleted_at.is_none())
+                .ok_or_else(|| {
+                    DaemonError::InvalidParam("custom provider is not configured".into())
+                })?;
+            if params.openai_base_url.as_deref().is_none_or(str::is_empty) {
+                params.openai_base_url = Some(row.base_url);
+            }
+        }
+        params.provider = crate::session::harness::provider::provider_for_explicit_endpoint(
+            params.provider,
+            params.openai_base_url.as_deref(),
+        )?;
+        // #3787: the display role is not free text; only the intake seat's role
+        // is launchable, and it carries the narrow intake grant.
+        if params
+            .agent_role
+            .as_deref()
+            .is_some_and(|role| role != rsi_common::intake_agent::INTAKE_AGENT_ROLE)
+        {
+            return Err(DaemonError::InvalidParam(
+                "agent_role_not_launchable".to_string(),
+            ));
+        }
         // TaskRabbit was removed as a launchable kind: refuse before any
         // path resolution, custody or persistence side effect.
         crate::session::hierarchy::refuse_removed_session_kind(params.session_kind)
@@ -456,7 +514,7 @@ impl RpcServer {
             completion_gates: params.completion_gates.clone(),
             query: params.query,
             title: params.title,
-            agent_role: None,
+            agent_role: params.agent_role.clone(),
             epic_spawn_ordinal: None,
             working_dir: resolved_working_dir,
             provider: params.provider,
@@ -505,9 +563,15 @@ impl RpcServer {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
 
-        let session_id = self.session_manager.launch_session(config).await?;
+        let session_id = self
+            .session_manager
+            .launch_session_with_custom_provider(config, params.custom_provider_id)
+            .await?;
 
         // ─── P1.6: persist validated tags to session_tags join table ────────────
         if !validated_tags.is_empty() {
@@ -1071,6 +1135,14 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: ContinueSessionParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::Rpc(format!("Invalid params: {}", e)))?;
+
+        // #3978: a prompt to a rotated predecessor belongs to its live successor;
+        // refuse it naming the successor instead of dropping it.
+        self.session_manager
+            .store()
+            .lock()
+            .await
+            .refuse_rotated_predecessor_prompt(params.session_id)?;
 
         // #1049: an operator message to a running Claude turn is queued for the
         // next tool boundary; it never interrupts the in-flight tool call.

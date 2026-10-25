@@ -142,6 +142,13 @@ class ProvisionalMigrationTest(unittest.TestCase):
         self.git(worktree, "commit", "-q", "-m", f"provisional V{version} {label}")
         return self.git(worktree, "rev-parse", "HEAD")
 
+    def commit_extra(self, label, name, text):
+        worktree = Path(self.temp.name) / f"source-{label}"
+        self.write(worktree, name, text)
+        self.git(worktree, "add", name)
+        self.git(worktree, "commit", "-q", "-m", f"extra {name}")
+        return self.git(worktree, "rev-parse", "HEAD")
+
     def candidate(self, source, target):
         unit = RENUMBER.inspect(self.repo, self.base, source, target)
         unit.update(RENUMBER.transform(self.repo, unit))
@@ -154,6 +161,38 @@ class ProvisionalMigrationTest(unittest.TestCase):
             "target": unit["target"], "unit_candidate": candidate,
         }]
         return unit, candidate
+
+    def test_symbolic_commit_arguments_name_full_sha_remedy(self):
+        for argument in ("--base", "--source", "--target"):
+            with self.subTest(argument=argument):
+                arguments = {"--base": self.base, "--source": self.base,
+                             "--target": self.base}
+                arguments[argument] = "HEAD"
+                invocation = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools/rolling-migration-renumber.py"),
+                     "--repo", str(self.repo),
+                     *(value for pair in arguments.items() for value in pair)],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(invocation.returncode, 2)
+                self.assertIn(f"noncanonical commit ID for {argument}", invocation.stderr)
+                self.assertIn("pass a full 40-hex SHA (git rev-parse <ref>)", invocation.stderr)
+
+    def test_missing_ref_arguments_name_full_sha_remedy(self):
+        for argument in ("--base", "--source", "--target"):
+            with self.subTest(argument=argument):
+                arguments = {"--base": self.base, "--source": self.base,
+                             "--target": self.base}
+                arguments[argument] = "refs/heads/missing-ref"
+                invocation = subprocess.run(
+                    [sys.executable, "-I", str(ROOT / "tools/rolling-migration-renumber.py"),
+                     "--repo", str(self.repo),
+                     *(value for pair in arguments.items() for value in pair)],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(invocation.returncode, 2)
+                self.assertIn(f"noncanonical commit ID for {argument}", invocation.stderr)
+                self.assertIn("pass a full 40-hex SHA (git rev-parse <ref>)", invocation.stderr)
 
     def test_two_v130_sources_land_as_v130_v131_with_exact_parents_and_proofs(self):
         first_source = self.source("alpha")
@@ -280,6 +319,31 @@ class ProvisionalMigrationTest(unittest.TestCase):
         with self.assertRaisesRegex(RENUMBER.Refusal, "released prefix|migration block"):
             RENUMBER.discover_target_provisional_units(self.repo, self.base, false_candidate)
 
+    def test_landing_that_inherits_landed_declaration_is_not_a_unit(self):
+        # #3388: the declaration already landed in the first parent through
+        # another source; a later landing built on top of it introduces nothing.
+        migration = self.source("alpha")
+        tree = self.git(self.repo, "rev-parse", f"{migration}^{{tree}}")
+        env = ("-c", "user.name=Migration Test", "-c", "user.email=migration@example.invalid")
+        parent = self.git(self.repo, *env, "commit-tree", tree, "-p", self.base,
+                          "-m", "migration landed through another source")
+        builder = Path(self.temp.name) / "source-alpha"
+        self.write(builder, "docs/stacked.txt", "stacked change\n")
+        self.git(builder, "add", "docs/stacked.txt")
+        self.git(builder, "commit", "-q", "-m", "stacked on unlanded migration")
+        stacked = self.git(builder, "rev-parse", "HEAD")
+        stacked_tree = self.git(self.repo, "rev-parse", f"{stacked}^{{tree}}")
+        target = self.git(self.repo, *env, "commit-tree", stacked_tree,
+                          "-p", parent, "-p", stacked, "-m", "land stacked source")
+        self.assertEqual(
+            RENUMBER.discover_target_provisional_units(self.repo, self.base, target), [])
+
+    def test_landing_that_introduces_declaration_is_still_discovered(self):
+        source = self.source("alpha")
+        unit, candidate = self.candidate(source, self.base)
+        found = RENUMBER.discover_target_provisional_units(self.repo, self.base, candidate)
+        self.assertEqual([item["source"] for item in found], [source])
+
     def test_nonmigration_source_hunk_survives_transform_and_guard(self):
         source = self.source("alpha")
         builder = Path(self.temp.name) / "source-alpha"
@@ -349,6 +413,225 @@ class ProvisionalMigrationTest(unittest.TestCase):
             RENUMBER.inspect(self.repo, self.base, malformed, self.base)
 
 
+class RewindTeardownRenumberTest(unittest.TestCase):
+    """#3343: concurrent migrations insert their own rewind teardown and fixture runs."""
+
+    setUp = ProvisionalMigrationTest.setUp
+    base_store = staticmethod(ProvisionalMigrationTest.base_store)
+    git = staticmethod(ProvisionalMigrationTest.git)
+    write = staticmethod(ProvisionalMigrationTest.write)
+    source = ProvisionalMigrationTest.source
+    candidate = ProvisionalMigrationTest.candidate
+
+    @staticmethod
+    def base_tests():
+        return ("// RSI-RELEASED-MIGRATION-BEGIN: test-catalog\n"
+                "// fixed test catalog\n"
+                "// RSI-RELEASED-MIGRATION-END: test-catalog\n"
+                "const REWIND: i32 = 129;\n"
+                "fn rewind(active: i32, target: i32) {\n"
+                "    if active >= 129 && target < 129 {\n"
+                "        drop_v129();\n"
+                "    }\n"
+                "}\n"
+                "fn fixture(target_version: i32) {\n"
+                "    let scoped = 1;\n"
+                "}\n")
+
+    @staticmethod
+    def block(label, version, tail=""):
+        return (f"    if active >= {version} && target < {version} {{\n"
+                f"        drop_{label}();\n"
+                f"        set_version({version} - 1);\n"
+                f"    }}\n{tail}")
+
+    @staticmethod
+    def fixture_run(label, version, gate=None):
+        return (f"    let {label}_present: bool = connection\n"
+                f"        .query_row(\n"
+                f"            \"SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='{label}')\",\n"
+                f"            [],\n            |row| row.get(0),\n        )\n        .unwrap();\n"
+                f"    assert_eq!(\n        {label}_present,\n"
+                f"        target_version >= {gate or version},\n"
+                f"        \"fixture V{{target_version}}: {label}\"\n    );\n")
+
+    def teardown_source(self, label, block_tail="", fixture=None, attribute=False):
+        """A V130 source adding its rewind teardown block and fixture run to tests.rs."""
+        version = 130
+        source = self.source(label)
+        worktree = Path(self.temp.name) / f"source-{label}"
+        path = "crates/rsid-store/src/store/tests.rs"
+        tests = (worktree / path).read_text()
+        tests = tests.replace("    if active >= 129 && target < 129 {",
+                              self.block(label, version, block_tail) +
+                              "    if active >= 129 && target < 129 {", 1)
+        run = fixture if fixture is not None else self.fixture_run(label, version)
+        tests = tests.replace("    let scoped = 1;\n", run + "    let scoped = 1;\n", 1)
+        sites = [
+            (f"if active >= {version} && target < {version} {{",
+             "if active >= ${VERSION} && target < ${VERSION} {"),
+            (f"set_version({version} - 1);", "set_version(${VERSION} - 1);"),
+        ]
+        if f"target_version >= {version}," in run:
+            sites.append((f"target_version >= {version},", "target_version >= ${VERSION},"))
+        self.write(worktree, path, tests)
+        declaration_path = worktree / f"tools/provisional-migrations/{label}.json"
+        declaration = json.loads(declaration_path.read_text())
+        entry = next(file for file in declaration["files"] if file["path"] == path)
+        entry["source_blob"] = RENUMBER.sha(tests.encode())
+        entry["sites"] += [{"anchor": before, "replacement": after, "scope": "unit"}
+                           for before, after in sites]
+        declaration_path.write_text(json.dumps(declaration, indent=2) + "\n")
+        self.git(worktree, "add", ".")
+        self.git(worktree, "commit", "-q", "-m", f"teardown V{version} {label}")
+        return self.git(worktree, "rev-parse", "HEAD")
+
+    def rewound_tests_text(self, revision):
+        return self.git(self.repo, "show", f"{revision}:crates/rsid-store/src/store/tests.rs")
+
+    def test_concurrent_teardown_blocks_resolve_newest_first_and_prove(self):
+        first_source = self.teardown_source("alpha")
+        second_source = self.teardown_source("beta")
+        first, first_candidate = self.candidate(first_source, self.base)
+        second, final = self.candidate(second_source, first_candidate)
+        tests = self.rewound_tests_text(final)
+        order = [tests.index(f"if active >= {version} && target < {version} {{")
+                 for version in (131, 130, 129)]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("drop_beta();\n        set_version(131 - 1);", tests)
+        self.assertIn("drop_alpha();\n        set_version(130 - 1);", tests)
+        self.assertIn("beta_present,\n        target_version >= 131,", tests)
+        self.assertIn("alpha_present,\n        target_version >= 130,", tests)
+        self.assertIn("const REWIND: i32 = 131;", tests)
+        for unit, intermediate in ((first, first_candidate), (second, final)):
+            proof = RENUMBER.prove(self.repo, unit, intermediate, final)
+            self.assertEqual(LANDING_GUARD.lost_hunks(
+                self.repo, self.base, unit["source"], final, proof), [])
+
+    def test_three_concurrent_teardown_blocks_keep_descending_order(self):
+        tip = self.base
+        for label in ("alpha", "beta", "gamma"):
+            _unit, tip = self.candidate(self.teardown_source(label), tip)
+        tests = self.rewound_tests_text(tip)
+        positions = [tests.index(f"if active >= {version} && target < {version} {{")
+                     for version in (132, 131, 130, 129)]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_undeclared_line_after_the_source_block_refuses(self):
+        first_source = self.teardown_source("alpha")
+        second_source = self.teardown_source("beta", block_tail="    semantic_change();\n")
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(second_source, first_candidate)
+
+    def test_undeclared_line_after_the_target_block_refuses(self):
+        first_source = self.teardown_source("alpha", block_tail="    semantic_change();\n")
+        second_source = self.teardown_source("beta")
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(second_source, first_candidate)
+
+    def test_fixture_run_without_the_units_version_gate_refuses(self):
+        first_source = self.teardown_source("alpha")
+        ungated = self.teardown_source("beta", fixture=self.fixture_run("beta", 130, gate=7))
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(ungated, first_candidate)
+
+    def test_fixture_run_that_is_not_whole_statements_refuses(self):
+        first_source = self.teardown_source("alpha")
+        torn = self.fixture_run("beta", 130) + "    assert_eq!(\n"
+        second_source = self.teardown_source("beta", fixture=torn)
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(second_source, first_candidate)
+
+    def test_fixture_run_with_an_extra_statement_refuses(self):
+        for extra in ("    semantic_change();\n",
+                      "    connection.execute_batch(\"DROP TABLE t;\").unwrap();\n",
+                      "    let leak = connection.query_row(\"DELETE FROM t\", [], |row| row.get(0)).unwrap();\n"):
+            for position in ("before", "after"):
+                run = self.fixture_run("beta", 130)
+                run = extra + run if position == "before" else run + extra
+                with self.subTest(extra=extra, position=position):
+                    self.assertFalse(RENUMBER.fixture_insertion_declared(
+                        [run.encode()], [130]))
+
+    def test_fixture_run_shapes_are_accepted(self):
+        plain = self.fixture_run("beta", 130).encode()
+        self.assertTrue(RENUMBER.fixture_insertion_declared([plain], [130]))
+        counted = (b"    let n: i64 = connection\n        .query_row(\n"
+                   b"            \"SELECT COUNT(*) FROM sqlite_master\",\n"
+                   b"            [],\n            |row| row.get(0),\n        )\n        .unwrap();\n"
+                   b"    assert_eq!(\n        n,\n"
+                   b"        if target_version >= 130 { 3 } else { 0 },\n"
+                   b"        \"fixture V{target_version}: n\"\n    );\n")
+        self.assertTrue(RENUMBER.fixture_insertion_declared([plain, counted], [130]))
+        self.assertFalse(RENUMBER.fixture_insertion_declared([counted], [131]))
+        contained = (b"    let sql: String = connection.query_row(\n"
+                     b"        \"SELECT sql FROM sqlite_master\", [], |row| row.get::<_, String>(0)\n"
+                     b"    ).unwrap();\n"
+                     b"    assert_eq!(sql.contains(\"column\"), target_version >= 130,\n"
+                     b"        \"fixture V{target_version}: sql\");\n")
+        self.assertTrue(RENUMBER.fixture_insertion_declared([plain, counted, contained], [130]))
+
+    def test_fixture_run_with_unpaired_queries_refuses(self):
+        run = self.fixture_run("beta", 130)
+        probe = ('    let unused = connection.query_row("SELECT 1", [], '
+                 '|row| row.get(0)).unwrap();\n')
+        query, assertion = run.split("    assert_eq!", 1)
+        assertion = "    assert_eq!" + assertion
+        cases = {
+            "extra query before pair": probe + run,
+            "extra query before assertion": query + probe + assertion,
+            "trailing query": run + probe,
+            "query alone": probe,
+            "assertion alone": assertion,
+            "wrong identifier": query + assertion.replace("beta_present", "other_present"),
+            "extra assertion": run + assertion,
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self.assertFalse(RENUMBER.fixture_insertion_declared([text.encode()], [130]))
+
+    def test_concurrent_fixture_run_with_unpaired_query_refuses(self):
+        first_source = self.teardown_source("alpha")
+        padded = ('    let unused = connection.query_row("SELECT 1", [], '
+                  '|row| row.get(0)).unwrap();\n' + self.fixture_run("beta", 130))
+        second_source = self.teardown_source("beta", fixture=padded)
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(second_source, first_candidate)
+
+    def test_concurrent_fixture_run_with_an_extra_statement_refuses(self):
+        first_source = self.teardown_source("alpha")
+        padded = self.fixture_run("beta", 130) + "    semantic_change();\n"
+        second_source = self.teardown_source("beta", fixture=padded)
+        _first, first_candidate = self.candidate(first_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, "unproved migration conflict"):
+            self.candidate(second_source, first_candidate)
+
+    def test_teardown_block_parser_and_ordering(self):
+        text = (self.block("a", 12) + self.block("b", 11)).encode()
+        self.assertEqual(sorted(RENUMBER.teardown_blocks(text)), [11, 12])
+        newer, older = self.block("n", 14).encode(), self.block("o", 13).encode()
+        merged = RENUMBER.ordered_teardown_insertions([older], [newer])
+        self.assertEqual(merged, [newer, older])
+        self.assertIsNone(RENUMBER.ordered_teardown_insertions(
+            [older], [newer + b"    extra();\n"]))
+        self.assertIsNone(RENUMBER.ordered_teardown_insertions([older], [older]))
+        with self.assertRaises(RENUMBER.Refusal):
+            RENUMBER.teardown_blocks(b"    if active >= 5 && target < 5 {\n        open();\n")
+
+    def test_attribute_lines_above_a_declared_site_belong_to_it(self):
+        data = b"keep();\n#[cfg(test)]\n#[allow(dead_code)]\nconst X: i32 = 7;\n"
+        self.assertEqual(RENUMBER.attribute_lines_start(data, data.index(b"const")),
+                         data.index(b"#[cfg"))
+        plain = b"keep();\nconst X: i32 = 7;\n"
+        self.assertEqual(RENUMBER.attribute_lines_start(plain, plain.index(b"const")),
+                         plain.index(b"const"))
+
+
 MIGRATIONS = "crates/rsid-store/src/store/migrations"
 
 
@@ -358,6 +641,7 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
     git = staticmethod(ProvisionalMigrationTest.git)
     write = staticmethod(ProvisionalMigrationTest.write)
     candidate = ProvisionalMigrationTest.candidate
+    commit_extra = ProvisionalMigrationTest.commit_extra
 
     V0 = ("impl Store {\n    fn migrate_v000(&self, version: i32) -> Result<()> {\n"
           "        // V0: Original schema\n        // original\n        Ok(())\n    }\n}\n")
@@ -431,6 +715,23 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         self.git(worktree, "add", ".")
         self.git(worktree, "commit", "-q", "-m", f"provisional V130 {label}")
         return self.git(worktree, "rev-parse", "HEAD")
+
+    def test_two_provisional_targets_need_publication_before_pair_proof_3406(self):
+        first = self.source("alpha", deferred_pin=True)
+        second = self.source("beta", deferred_pin=True)
+        for source in (first, second):
+            unit = RENUMBER.inspect(self.repo, self.base, source, self.base)
+            self.assertEqual(unit["old_version"], 130)
+        # The raw queued target is not a released target yet. Its refusal is
+        # not evidence of a source conflict: the real publication order works.
+        with self.assertRaisesRegex(RENUMBER.Refusal,
+                                    f"invalid migration inventory at {first}:"):
+            RENUMBER.inspect(self.repo, self.base, second, first)
+        _, published_first = self.candidate(first, self.base)
+        unit, final = self.candidate(second, published_first)
+        self.assertEqual(unit["old_version"], 130)
+        self.assertEqual(unit["new_version"], 131)
+        self.assertEqual(RENUMBER.revision_inventory(self.repo, final)["latest_schema_version"], 131)
 
     def test_deferred_pin_passes_guard_and_inspects_next_number(self):
         first_source = self.source("alpha")
@@ -510,13 +811,6 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
                              self.git(worktree, "rev-parse", "HEAD"), self.base)
         self.assertTrue(source)
 
-    def commit_extra(self, label, name, text):
-        worktree = Path(self.temp.name) / f"source-{label}"
-        self.write(worktree, name, text)
-        self.git(worktree, "add", name)
-        self.git(worktree, "commit", "-q", "-m", f"extra {name}")
-        return self.git(worktree, "rev-parse", "HEAD")
-
     def test_unchanged_literal_and_cargo_lock_do_not_block_a_renumbered_landing(self):
         first_source = self.source("alpha")
         second_source = self.commit_extra(
@@ -568,6 +862,196 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
             capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["renumber_noop"])
+
+    def malformed_declaration_source(self, label):
+        """A source whose tests.rs file entry lacks ``path_template`` (#3304)."""
+        self.source(label)
+        worktree = Path(self.temp.name) / f"source-{label}"
+        name = f"tools/provisional-migrations/{label}.json"
+        data = json.loads((worktree / name).read_text())
+        tests = next(f for f in data["files"] if f["path"].endswith("tests.rs"))
+        del tests["path_template"]
+        return self.commit_extra(label, name, json.dumps(data, indent=2) + "\n")
+
+    def test_malformed_declaration_refuses_when_no_renumber_is_needed(self):
+        source = self.malformed_declaration_source("alpha")
+        # The source is already rolling head + 1, so the renumber path never reads
+        # its file entries; the shape check must still refuse it.
+        with self.assertRaises(RENUMBER.Refusal) as refused:
+            RENUMBER.inspect(self.repo, self.base, source, self.base, allow_noop=True)
+        message = str(refused.exception)
+        self.assertIn("tools/provisional-migrations/alpha.json", message)
+        self.assertIn("crates/rsid-store/src/store/tests.rs", message)
+        self.assertIn("missing key `path_template`", message)
+        result = self.transform_result(source, self.base)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("missing key `path_template`", result.stderr)
+
+    def malformed_value_source(self, label, mutate):
+        """A source whose declaration keeps every key but carries a bad value (#3304)."""
+        self.source(label)
+        worktree = Path(self.temp.name) / f"source-{label}"
+        name = f"tools/provisional-migrations/{label}.json"
+        data = json.loads((worktree / name).read_text())
+        mutate(data)
+        return self.commit_extra(label, name, json.dumps(data, indent=2) + "\n")
+
+    def test_malformed_declaration_values_refuse_when_no_renumber_is_needed(self):
+        def first_site(data):
+            return next(f for f in data["files"] if f["sites"])["sites"][0]
+
+        cases = {
+            "schema": (lambda d: d.update(schema_version=2), "`schema_version` must be 1"),
+            "version": (lambda d: d.update(version=d["version"] + 5), "does not match the migration"),
+            "scope": (lambda d: first_site(d).update(scope="bogus"), "`scope` must be"),
+            "replacement": (lambda d: first_site(d).update(replacement="nothing"), "`replacement` must be"),
+            "blob": (lambda d: d["files"][0].update(source_blob="0" * 64), "`source_blob`"),
+            "template": (lambda d: d["files"][0].update(path_template="elsewhere.rs"), "`path_template`"),
+        }
+        for label, (mutate, expected) in cases.items():
+            with self.subTest(label):
+                source = self.malformed_value_source(label, mutate)
+                with self.assertRaises(RENUMBER.Refusal) as refused:
+                    RENUMBER.inspect(self.repo, self.base, source, self.base, allow_noop=True)
+                self.assertIn(expected, str(refused.exception))
+                self.assertIn(f"tools/provisional-migrations/{label}.json", str(refused.exception))
+
+    def test_declaration_limits_refuse_when_no_renumber_is_needed(self):
+        """The no-renumber path enforces the limits the renumber path does (#3329)."""
+        def duplicate_path(data):
+            data["files"].append(json.loads(json.dumps(data["files"][0])))
+
+        def duplicate_destination(data):
+            twin = json.loads(json.dumps(data["files"][0]))
+            twin["path"] = "elsewhere/twin.rs"
+            data["files"].append(twin)
+
+        def too_many_files(data):
+            for index in range(RENUMBER.MAX_DECLARED_FILES + 1):
+                twin = json.loads(json.dumps(data["files"][0]))
+                twin["path"] = f"elsewhere/f{index}.rs"
+                twin["path_template"] = f"elsewhere/f{index}.rs"
+                data["files"].append(twin)
+
+        def too_many_sites(data):
+            entry = next(f for f in data["files"] if f["sites"])
+            site = dict(entry["sites"][0])
+            entry["sites"] = [site] * (RENUMBER.MAX_SITES + 1)
+
+        cases = {
+            "duppath": (duplicate_path, "duplicate `path`"),
+            "dupdest": (duplicate_destination, "duplicate destination"),
+            "manyfiles": (too_many_files, "`files` has"),
+            "manysites": (too_many_sites, "`sites` of"),
+            "bigbytes": (None, "byte limit"),
+        }
+        for label, (mutate, expected) in cases.items():
+            with self.subTest(label):
+                self.source(label)
+                name = f"tools/provisional-migrations/{label}.json"
+                worktree = Path(self.temp.name) / f"source-{label}"
+                data = json.loads((worktree / name).read_text())
+                if mutate:
+                    mutate(data)
+                    text = json.dumps(data, separators=(",", ":")) + "\n"
+                else:
+                    text = json.dumps(data, indent=2) + "\n" + " " * RENUMBER.MAX_DECLARATION_BYTES
+                source = self.commit_extra(label, name, text)
+                for allow_noop in (True, False):
+                    with self.assertRaises(RENUMBER.Refusal) as refused:
+                        RENUMBER.inspect(self.repo, self.base, source, self.base, allow_noop=allow_noop)
+                    self.assertIn(expected, str(refused.exception))
+                    self.assertIn(name, str(refused.exception))
+
+    def test_static_guard_refuses_added_malformed_declaration(self):
+        source = self.malformed_declaration_source("alpha")
+        checked = subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py"),
+             self.base, source], cwd=self.repo, capture_output=True, text=True, check=False)
+        self.assertNotEqual(checked.returncode, 0, checked.stdout)
+        self.assertIn("missing key `path_template`", checked.stderr + checked.stdout)
+        self.assertIn("tools/provisional-migrations/alpha.json", checked.stderr + checked.stdout)
+
+    def test_already_landed_malformed_declaration_is_not_revalidated(self):
+        # A declaration byte-identical on the target already landed (#3235 shipped
+        # one); stacked sources carrying it must not be refused for it.
+        source = self.malformed_declaration_source("alpha")
+        unit = RENUMBER.inspect(self.repo, self.base, source, source, allow_noop=True)
+        self.assertTrue(unit["renumber_noop"])
+
+    def test_prior_unit_failure_names_the_source_that_owns_the_declaration(self):
+        first_source = self.source("alpha")
+        _first, first_candidate = self.candidate(first_source, self.base)
+        owner = self.malformed_declaration_source("gamma")
+        second_source = self.source("beta")
+        unit = RENUMBER.inspect(self.repo, self.base, second_source, first_candidate)
+        unit["prior_units"] = [{"base": self.base, "source": owner, "target": self.base,
+                                "unit_candidate": first_candidate}]
+        unit["_verified_target_units"] = []
+        filename = f"{MIGRATIONS}/v130.rs"
+        target = RENUMBER.show(self.repo, first_candidate, filename)
+        with self.assertRaises(RENUMBER.Refusal) as refused:
+            RENUMBER.target_migration_mask(self.repo, unit, filename, target)
+        message = str(refused.exception)
+        self.assertIn(owner, message)
+        self.assertNotIn(second_source, message)
+        self.assertIn("missing key `path_template`", message)
+
+    def landed_malformed_target(self):
+        """A rolling tip whose first-parent chain merged a malformed declaration (#3344)."""
+        owner = self.malformed_declaration_source("gamma")
+        tree = self.git(self.repo, "rev-parse", f"{owner}^{{tree}}")
+        return owner, self.git(
+            self.repo, "-c", "user.name=Migration Test",
+            "-c", "user.email=migration@example.invalid", "commit-tree", tree,
+            "-p", self.base, "-p", owner, "-m", "landed malformed declaration")
+
+    def test_landed_malformed_declaration_masks_nothing_in_target_history(self):
+        _owner, target = self.landed_malformed_target()
+        self.assertEqual(
+            RENUMBER.discover_target_provisional_units(self.repo, self.base, target), [])
+
+    def test_landed_malformed_declaration_does_not_block_target_masking(self):
+        _owner, target = self.landed_malformed_target()
+        source = self.source("beta")
+        unit = RENUMBER.inspect(self.repo, self.base, source, target)
+        self.assertEqual(unit["new_version"], 131)
+        unit["prior_units"] = []
+        filename = "crates/rsid-store/src/store/tests.rs"
+        mask = RENUMBER.target_migration_mask(
+            self.repo, unit, filename, RENUMBER.show(self.repo, target, filename))
+        self.assertEqual(unit["_verified_target_units"], [])
+        # The malformed declaration proves no site, so it masks no tests.rs line.
+        self.assertFalse(any(mask))
+
+    def landed_unprovable_target(self):
+        """A rolling tip whose landed unit carries an undeclared version site (#3400)."""
+        self.source("gamma")
+        owner = self.commit_extra(
+            "gamma", "crates/rsid-store/src/store/extra.rs", "const SCHEMA: i32 = 130;\n")
+        with self.assertRaisesRegex(RENUMBER.Refusal, "undeclared version-bearing"):
+            RENUMBER.inspect(self.repo, self.base, owner, owner)
+        tree = self.git(self.repo, "rev-parse", f"{owner}^{{tree}}")
+        return owner, self.git(
+            self.repo, "-c", "user.name=Migration Test",
+            "-c", "user.email=migration@example.invalid", "commit-tree", tree,
+            "-p", self.base, "-p", owner, "-m", "landed unprovable declaration")
+
+    def test_landed_unprovable_unit_is_skipped_in_target_history(self):
+        _owner, target = self.landed_unprovable_target()
+        self.assertEqual(
+            RENUMBER.discover_target_provisional_units(self.repo, self.base, target), [])
+
+    def test_landed_unprovable_unit_does_not_refuse_a_later_source(self):
+        _owner, target = self.landed_unprovable_target()
+        source = self.source("beta")
+        unit = RENUMBER.inspect(self.repo, self.base, source, target)
+        self.assertEqual(unit["new_version"], 131)
+        unit["prior_units"] = []
+        filename = "crates/rsid-store/src/store/tests.rs"
+        RENUMBER.target_migration_mask(
+            self.repo, unit, filename, RENUMBER.show(self.repo, target, filename))
+        self.assertEqual(unit["_verified_target_units"], [])
 
     def stacked_source_and_landed_target(self, differing_content=False, advance=False):
         migration = self.source("alpha")
@@ -660,6 +1144,140 @@ class PerFileProvisionalMigrationTest(unittest.TestCase):
         self.assertIn("re-merge the source onto origin/rolling", result.stderr)
         self.assertIn("retain rolling's released migration", result.stderr)
         self.assertIn("re-submit the merged commit", result.stderr)
+
+
+class LandedSameNumberRenumberTest(unittest.TestCase):
+    """#3444: the ea59f380d / 7774e07c4 conflict, independent of those Git objects."""
+
+    git = staticmethod(ProvisionalMigrationTest.git)
+    write = staticmethod(ProvisionalMigrationTest.write)
+
+    def setUp(self):
+        self.fixture = json.loads((Path(__file__).parent / "fixtures" /
+                                   "landed-v189-renumber.json").read_text())
+        self.temp = scratch_tempdir(prefix="rsi-renumber-landed-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.repo = Path(self.temp.name) / "repo"
+        self.repo.mkdir()
+        self.git(self.repo, "init", "-q", "-b", "rolling")
+        self.git(self.repo, "config", "user.name", "Migration Test")
+        self.git(self.repo, "config", "user.email", "migration@example.invalid")
+        self.write(self.repo, RENUMBER.STORE, "// runner only\n")
+        self.write(self.repo, "crates/rsid-store/src/store/cohort_settlement.rs", "")
+        self.write(self.repo, RENUMBER.STORE_TESTS, self.render_tests("base"))
+        self.write(self.repo, f"{MIGRATIONS}/v000.rs", PerFileProvisionalMigrationTest.V0)
+        self.write(self.repo, f"{MIGRATIONS}/v188.rs",
+                   PerFileProvisionalMigrationTest.V129.replace("129", "188"))
+        self.inventory(self.repo)
+        self.git(self.repo, "add", ".")
+        self.git(self.repo, "commit", "-q", "-m", "base V188")
+        self.base = self.git(self.repo, "rev-parse", "HEAD")
+
+    def render_tests(self, label):
+        excerpt = self.fixture[label]
+        return ("// RSI-RELEASED-MIGRATION-BEGIN: test-catalog\n// fixed\n"
+                "// RSI-RELEASED-MIGRATION-END: test-catalog\n" +
+                excerpt["constants"] + "\nfn rewind(active: i32, target: i32) {\n" +
+                (excerpt["teardown"] if label != "base" else "") +
+                self.fixture["base"]["teardown"] + "}\n")
+
+    def inventory(self, repo):
+        names = [RENUMBER.STORE, RENUMBER.STORE_TESTS,
+                 "crates/rsid-store/src/store/cohort_settlement.rs"]
+        names += [p.relative_to(repo).as_posix() for p in (repo / MIGRATIONS).glob("v*.rs")]
+        manifest = RENUMBER.guard.inventory({name: (repo / name).read_text() for name in names})
+        self.write(repo, RENUMBER.MANIFEST, json.dumps(manifest, indent=2) + "\n")
+
+    def source(self, label, extra=""):
+        worktree = Path(self.temp.name) / label
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(worktree), self.base)
+        tests = self.render_tests(label).replace("const FLEET_INDEX_SCHEMA_VERSION:",
+                                               extra + "const FLEET_INDEX_SCHEMA_VERSION:")
+        migration = self.fixture[label]["migration"]
+        unit_path = f"{MIGRATIONS}/v189.rs"
+        self.write(worktree, RENUMBER.STORE_TESTS, tests)
+        self.write(worktree, unit_path, migration)
+        self.inventory(worktree)
+        test_sites = [
+            ("const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 189;",
+             "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};", "head"),
+            ("if active >= 189 && target < 189 {",
+             "if active >= ${VERSION} && target < ${VERSION} {", "unit"),
+            ('.pragma_update(None, "user_version", 189 - 1)',
+             '.pragma_update(None, "user_version", ${VERSION} - 1)', "unit"),
+        ]
+        if label == "landed":
+            test_sites.append(("pub(crate) const SESSION_START_PREAMBLE_SCHEMA_VERSION: i32 = 189;",
+                               "pub(crate) const SESSION_START_PREAMBLE_SCHEMA_VERSION: i32 = ${VERSION};",
+                               "unit"))
+        entries = [
+            (RENUMBER.STORE_TESTS, tests, RENUMBER.STORE_TESTS, test_sites),
+            (unit_path, migration, f"{MIGRATIONS}/v${{VERSION}}.rs", [
+                ("fn migrate_v189(", "fn migrate_v${VERSION}(", "unit"),
+                ("if version < 189 {", "if version < ${VERSION} {", "unit"),
+                ('tx.pragma_update(None, "user_version", 189)?;',
+                 'tx.pragma_update(None, "user_version", ${VERSION})?;', "unit"),
+            ]),
+        ]
+        declaration = {"schema_version": 1, "version": 189, "files": [
+            {"path": name, "path_template": template, "source_blob": RENUMBER.sha(content.encode()),
+             "sites": [{"anchor": before, "replacement": after, "scope": scope}
+                       for before, after, scope in sites]}
+            for name, content, template, sites in entries]}
+        self.write(worktree, f"tools/provisional-migrations/{label}.json",
+                   json.dumps(declaration, indent=2) + "\n")
+        self.git(worktree, "add", ".")
+        self.git(worktree, "commit", "-q", "-m", f"V189 {label}")
+        return self.git(worktree, "rev-parse", "HEAD")
+
+    def candidate(self, source, target):
+        unit = RENUMBER.inspect(self.repo, self.base, source, target)
+        unit.update(RENUMBER.transform(self.repo, unit))
+        # No in-memory prior_units: reconstruct the landed unit from Git history.
+        candidate = RENUMBER.build_candidate(self.repo, unit, Path(self.temp.name))["candidate"]
+        return unit, candidate
+
+    def test_landed_v189_collision_preserves_constants_and_orders_teardowns(self):
+        landed_source = self.source("landed")
+        source = self.source("source")
+        _first, target = self.candidate(landed_source, self.base)
+        unit, candidate = self.candidate(source, target)
+        self.assertEqual((unit["old_version"], unit["new_version"]), (189, 190))
+        tests = RENUMBER.show(self.repo, candidate, RENUMBER.STORE_TESTS)
+        self.assertIn(self.fixture["landed"]["constants"].split("\n", 1)[1].encode(), tests)
+        self.assertIn(b"const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 190;", tests)
+        newest = self.fixture["source"]["teardown"].replace("189", "190").encode()
+        self.assertIn(newest + self.fixture["landed"]["teardown"].encode(), tests)
+        self.assertEqual(RENUMBER.show(self.repo, candidate, f"{MIGRATIONS}/v189.rs"),
+                         self.fixture["landed"]["migration"].encode())
+        self.assertEqual(RENUMBER.show(self.repo, candidate, f"{MIGRATIONS}/v190.rs"),
+                         self.fixture["source"]["migration"].replace("189", "190").encode())
+        proof = RENUMBER.prove(self.repo, unit, candidate, candidate)
+        self.assertEqual(LANDING_GUARD.lost_hunks(self.repo, self.base, source, candidate, proof), [])
+
+    def test_source_schema_constant_and_attribute_move_with_its_unit(self):
+        source = self.source("landed")
+        _first, target = self.candidate(self.source("source"), self.base)
+        _unit, candidate = self.candidate(source, target)
+        tests = RENUMBER.show(self.repo, candidate, RENUMBER.STORE_TESTS)
+        constant = self.fixture["landed"]["constants"].split("\n", 1)[1].replace("189", "190")
+        self.assertIn(constant.encode(), tests)
+        newest = self.fixture["landed"]["teardown"].replace("189", "190").encode()
+        self.assertIn(newest + self.fixture["source"]["teardown"].encode(), tests)
+
+    def assert_nonunit_line_refuses(self, side):
+        extra = "const UNRELATED: i32 = 7;\n"
+        landed_source = self.source("landed", extra if side == "landed" else "")
+        source = self.source("source", extra if side == "source" else "")
+        _first, target = self.candidate(landed_source, self.base)
+        with self.assertRaisesRegex(RENUMBER.Refusal, f"unproved migration conflict: {RENUMBER.STORE_TESTS}"):
+            self.candidate(source, target)
+
+    def test_extra_nonunit_line_in_landed_constant_hunk_refuses(self):
+        self.assert_nonunit_line_refuses("landed")
+
+    def test_extra_nonunit_line_in_source_constant_hunk_refuses(self):
+        self.assert_nonunit_line_refuses("source")
 
 
 if __name__ == "__main__":

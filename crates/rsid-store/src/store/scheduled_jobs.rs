@@ -312,6 +312,43 @@ impl Store {
         Ok(to_disable)
     }
 
+    /// Commit an external halt's durable intent and withdraw the owner's
+    /// unprotected resume/when wakes atomically. Callers serialize against
+    /// continuation delivery with the target's spawn guard. An operator pause
+    /// may be published before taking that guard to fence in-flight launches.
+    /// This record is audit history, not a fence on later explicit continues.
+    pub fn record_session_halt(
+        &self,
+        owner: Uuid,
+        operator_pause: Option<super::manager_actions::OperatorPause>,
+    ) -> Result<Vec<Uuid>> {
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        if self.get_session(owner)?.is_none() {
+            return Err(DaemonError::SessionNotFound(owner));
+        }
+        let candidates = self.owned_wake_rows_by_mode(owner, "resume")?;
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .filter(|row| !row.protected && !row.internal)
+            .map(|row| row.id)
+            .collect();
+        let at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.set_daemon_setting(&format!("session_halt_requested:{owner}"), &at)?;
+        if let Some(pause) = operator_pause {
+            self.set_operator_pause(owner, pause)?;
+        }
+        disable_scheduled_jobs_conn(&tx, &ids)?;
+        for id in &ids {
+            tx.execute(
+                "UPDATE scheduled_jobs SET schedule_json = json_set(
+                    schedule_json, '$.disabled_reason', 'disabled_by_halt') WHERE id = ?1",
+                [id.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// Owners that hold an enabled internal background-process wake
     /// (`background-process-<owner>`), in one indexed read. Startup withdraws
     /// exactly these instead of opening a write transaction per session (#2375).
@@ -473,10 +510,25 @@ impl Store {
                 name: job.name,
                 mode: mode.to_string(),
                 watch_session_id,
-                deadline: when_state.as_ref().and_then(|state| state.deadline),
+                deadline: match (
+                    when_state.as_ref().and_then(|state| state.deadline),
+                    self.busy_wake_deadline(job.id)?,
+                ) {
+                    (Some(predicate), Some(busy)) => Some(predicate.min(busy)),
+                    (predicate, busy) => predicate.or(busy),
+                },
                 when: when_state.map(|state| state.predicate),
                 next_fire_at: job.next_fire_at,
                 enabled: job.enabled,
+                disabled_reason: if job.enabled {
+                    None
+                } else {
+                    self.conn.query_row(
+                        "SELECT json_extract(schedule_json, '$.disabled_reason') FROM scheduled_jobs WHERE id = ?1",
+                        [job.id.to_string()],
+                        |row| row.get(0),
+                    )?
+                },
                 created_at: job.created_at,
                 protected,
                 pending_message,
@@ -574,16 +626,16 @@ impl Store {
     /// Enabled jobs of `owner` with the given stored `wake_mode`.
     fn owned_wake_rows_by_mode(&self, owner: Uuid, mode: &str) -> Result<Vec<OwnedWakeRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM scheduled_jobs
+            "SELECT id, name FROM scheduled_jobs
              WHERE wake_session_id = ?1 AND wake_mode = ?2 AND enabled = 1",
         )?;
         let ids = stmt
             .query_map(params![owner.to_string(), mode], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(ids.len());
-        for id in ids {
+        for (id, name) in ids {
             let id = Uuid::parse_str(&id)
                 .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))?;
             let protected = self.program_guard_owner_for_job_id(&id)?.is_some()
@@ -592,7 +644,7 @@ impl Store {
                 id,
                 enabled: true,
                 protected,
-                internal: false,
+                internal: is_background_process_wake_name(&name),
             });
         }
         Ok(rows)
@@ -1153,6 +1205,144 @@ impl Store {
         })
     }
 
+    /// Deadline of an unspent busy-target hold, retained across daemon restarts.
+    pub fn busy_wake_deadline(&self, id: Uuid) -> Result<Option<DateTime<Utc>>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT json_extract(schedule_json,'$.busy_target_hold.deadline')
+             FROM scheduled_jobs WHERE id=?1 AND (enabled=0 OR
+                 json_extract(schedule_json,'$.busy_target_hold.epoch')=updated_at)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|at| {
+                DateTime::parse_from_rfc3339(&at)
+                    .map(|at| at.with_timezone(&Utc))
+                    .map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Capture the original due time before a busy deferral moves it. The
+    /// caller holds the shared store lock and has checked the wake's epoch.
+    /// An edit changes the epoch; a successful delivery clears the hold.
+    pub fn start_busy_wake_hold(&self, job: &ScheduledJob) -> Result<DateTime<Utc>> {
+        if let Some(deadline) = self.busy_wake_deadline(job.id)? {
+            return Ok(deadline);
+        }
+        let deadline = job.next_fire_at + BUSY_TARGET_WAKE_MAX_HOLD;
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET schedule_json=json_set(
+                 schedule_json,'$.busy_target_hold',json(?2))
+             WHERE id=?1 AND enabled=1 AND updated_at=?3",
+            params![job.id.to_string(), serde_json::json!({
+                "epoch": job.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                "first_due_at": job.next_fire_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                "deadline": deadline.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            }).to_string(), job.updated_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+        )?;
+        Ok(deadline)
+    }
+
+    /// Reuse the ordinary undelivered-wake recovery owner before retiring an
+    /// expired busy wake. A failed notice write keeps it armed; a crash after
+    /// the notice is safe because escalation is idempotent by original id.
+    /// The caller keeps the shared store lock through this fenced settlement.
+    pub fn settle_busy_wake_deadline(
+        &self,
+        job: &ScheduledJob,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(current) = self.get_scheduled_job(&job.id)? else {
+            return Ok(false);
+        };
+        if !current.enabled || current.updated_at != job.updated_at {
+            return Ok(false);
+        }
+        if !self
+            .busy_wake_deadline(job.id)?
+            .is_some_and(|deadline| now >= deadline)
+        {
+            return Ok(false);
+        }
+        self.escalate_undelivered_wake(
+            job,
+            "wake_recoverable: busy_target_deadline; target stayed busy for the one-hour hold \
+             from first due time; no delivery retry spent. Preserve the original result and \
+             inspect the target before arranging an authorized continuation",
+            now,
+        )?;
+        let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let changed = self.conn.execute(
+            "UPDATE scheduled_jobs SET enabled=0,last_fired_at=?2,updated_at=?2,
+                 schedule_json=json_set(schedule_json,'$.disabled_reason','wake_recoverable')
+             WHERE id=?1 AND enabled=1 AND updated_at=?3",
+            params![
+                job.id.to_string(),
+                stamp,
+                job.updated_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// #189: the operator input of a live wake target that already deferred
+    /// this self-wake once (`$.self_wake_input_seen`, daemon-owned, no DDL).
+    pub fn self_wake_input_seen(&self, id: Uuid) -> Result<Option<SelfWakeInputSeenV1>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(schedule_json)
+                        THEN json_extract(schedule_json,'$.self_wake_input_seen') END
+                 FROM scheduled_jobs WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// #189: a live target refused this self-wake `continuation_turn_changed`
+    /// because it took newer input: it is busy, not gone. Record that the
+    /// target has received its input through its current last event, bound to
+    /// this arming (`last_fired_at`, else `created_at`), so the next capture
+    /// refuses only for input after it and the wake is delivered at the
+    /// target's next idle point. Touches neither `enabled`, `next_fire_at`,
+    /// `last_fired_at` nor `updated_at`. Returns the cursor, or `None` when
+    /// the row is gone or disabled.
+    pub fn acknowledge_self_wake_input(&self, id: Uuid, target: Uuid) -> Result<Option<i64>> {
+        let Some(job) = self.get_scheduled_job(&id)? else {
+            return Ok(None);
+        };
+        if !job.enabled {
+            return Ok(None);
+        }
+        let seen = SelfWakeInputSeenV1 {
+            through_sequence: self.conversation_max_sequence(target)?,
+            armed_at: job
+                .last_fired_at
+                .unwrap_or(job.created_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        };
+        let json =
+            serde_json::to_string(&seen).map_err(|error| DaemonError::Store(error.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.self_wake_input_seen',json(?2))
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)",
+            params![id.to_string(), json],
+        )?;
+        Ok((changed == 1).then_some(seen.through_sequence))
+    }
+
     pub fn custody_contention(&self, id: Uuid) -> Result<Option<CustodyContentionV1>> {
         let raw: Option<Option<String>> = self
             .conn
@@ -1218,12 +1408,13 @@ impl Store {
         // An accepted delivery also resets the refusal count (#653).
         self.conn.execute(
             "UPDATE scheduled_jobs
-             SET schedule_json=json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention','$.delivery_claim')
+             SET schedule_json=json_remove(schedule_json,'$.continuation_retry','$.watch_refusal','$.custody_contention','$.delivery_claim','$.busy_target_hold')
              WHERE id=?1 AND json_valid(schedule_json)
                AND (json_extract(schedule_json,'$.continuation_retry') IS NOT NULL
                     OR json_extract(schedule_json,'$.watch_refusal') IS NOT NULL
                     OR json_extract(schedule_json,'$.custody_contention') IS NOT NULL
-                    OR json_extract(schedule_json,'$.delivery_claim') IS NOT NULL)",
+                    OR json_extract(schedule_json,'$.delivery_claim') IS NOT NULL
+                    OR json_extract(schedule_json,'$.busy_target_hold') IS NOT NULL)",
             params![id.to_string()],
         )?;
         Ok(())
@@ -1350,6 +1541,11 @@ impl Store {
             sets.push(format!("schedule_json = ?{idx}"));
             values.push(Box::new(json));
             idx += 1;
+        }
+        if updates.enabled == Some(true) && updates.schedule.is_none() {
+            sets.push(
+                "schedule_json = json_remove(schedule_json, '$.disabled_reason')".to_string(),
+            );
         }
         if let Some(enabled) = updates.enabled {
             sets.push(format!("enabled = ?{idx}"));
@@ -1570,6 +1766,7 @@ impl Store {
         let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         tx.execute(
             "UPDATE scheduled_jobs SET enabled = 1 - enabled,
+             schedule_json = json_remove(schedule_json, '$.disabled_reason'),
              updated_at = ?1 WHERE id = ?2",
             params![now, id.to_string()],
         )?;
@@ -2003,6 +2200,7 @@ impl Store {
     /// predicate names must exist and belong to the wake's owner, or have
     /// settled under a published rotation predecessor of the owner's live
     /// manager seat (#132; [`Store::job_watchable_by`])
+    /// or a scoped test/build job of an explicit Issue-worker predecessor (#584)
     /// (`wake_when_job_not_found` otherwise, so a foreign id is
     /// indistinguishable from an unknown one), the owner's enabled predicate
     /// wakes stay under the cap, an explicit name replaces the owner's earlier
@@ -2196,6 +2394,49 @@ impl Store {
             .transpose()
     }
 
+    /// Delivered provider-window episode subjects, retained in wake receipts so
+    /// a daemon restart does not repeat a warning for this manager.
+    pub fn provider_window_warning_subjects(
+        &self,
+        owner: Uuid,
+        at: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT warning.value FROM scheduled_jobs job,
+             json_each(CASE WHEN json_valid(job.schedule_json) THEN job.schedule_json ELSE '{}' END,
+                       '$.provider_window_warnings') warning
+             WHERE job.wake_session_id=?1 AND warning.type='text'
+             ORDER BY job.updated_at DESC LIMIT 512",
+        )?;
+        let subjects = stmt
+            .query_map([owner.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(subjects
+            .into_iter()
+            .filter(|subject| {
+                subject
+                    .rsplit(':')
+                    .next()
+                    .and_then(|reset| reset.parse::<i64>().ok())
+                    .is_some_and(|reset| reset > at.timestamp())
+            })
+            .collect())
+    }
+
+    /// Record only successful health-wake deliveries; held or refused attempts
+    /// leave no receipt and remain eligible to warn.
+    pub fn record_provider_window_warnings(&self, id: Uuid, subjects: &[String]) -> Result<()> {
+        let json = serde_json::to_string(subjects)?;
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET schedule_json=json_set(schedule_json,
+                '$.provider_window_warnings',json(?2))
+             WHERE id=?1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when.predicate.health_anomaly') IS NOT NULL",
+            params![id.to_string(), json],
+        )?;
+        Ok(())
+    }
+
     /// Test fixture: replace a row's predicate state (for example to expire
     /// its deadline without waiting).
     #[cfg(any(test, feature = "test-seam"))]
@@ -2246,6 +2487,146 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// #3387: mark an armed topology settle wake quiet-capable (the
+    /// daemon-owned `$.quiet_settle` record). Only the daemon's default arm
+    /// calls it; a wake the owner armed itself never carries the record, so it
+    /// keeps waking at once.
+    pub fn mark_quiet_settle(&self, id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.quiet_settle',json('{}'))
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when.predicate.topology_execution_settled')
+                   IS NOT NULL",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The quiet-settle record of a wake row; `None` for every row that is not
+    /// a quiet-capable settle wake.
+    pub fn quiet_settle_state(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<rsi_common::wake_predicate::QuietSettle>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(schedule_json)
+                        THEN json_extract(schedule_json,'$.quiet_settle') END
+                 FROM scheduled_jobs WHERE id=?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.flatten()
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| DaemonError::Store(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Hold a clean success in the digest: record it on the row and move the
+    /// row's next check to the batch deadline.
+    pub fn hold_quiet_settle(
+        &self,
+        id: Uuid,
+        held: &rsi_common::wake_predicate::QuietHeld,
+        next_fire_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let json =
+            serde_json::to_string(held).map_err(|error| DaemonError::Store(error.to_string()))?;
+        self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET schedule_json=json_set(schedule_json,'$.quiet_settle.held',json(?2)),
+                 next_fire_at=?3
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.quiet_settle') IS NOT NULL",
+            params![
+                id.to_string(),
+                json,
+                next_fire_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The owner's held clean successes, oldest first, other than `exclude`
+    /// (the wake being delivered). Read-only: a delivery that is refused and
+    /// retried reads them again, and [`Store::retire_quiet_settles`] runs only
+    /// after the owner took the turn.
+    pub fn held_quiet_settles(
+        &self,
+        owner: Uuid,
+        exclude: Uuid,
+    ) -> Result<Vec<(Uuid, rsi_common::wake_predicate::QuietHeld)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, json_extract(schedule_json,'$.quiet_settle.held')
+             FROM scheduled_jobs
+             WHERE wake_session_id=?1 AND enabled=1 AND id<>?2 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.quiet_settle.held') IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![owner.to_string(), exclude.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut held = rows
+            .into_iter()
+            .map(|(id, json)| {
+                let id = Uuid::parse_str(&id)
+                    .map_err(|e| DaemonError::Store(format!("invalid scheduled job id: {e}")))?;
+                let held: rsi_common::wake_predicate::QuietHeld = serde_json::from_str(&json)
+                    .map_err(|error| DaemonError::Store(error.to_string()))?;
+                Ok((id, held))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        held.sort_by_key(|(_, held)| held.at);
+        Ok(held)
+    }
+
+    /// Retire held quiet settles whose lines a delivered wake carried.
+    pub fn retire_quiet_settles(&self, ids: &[Uuid]) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        disable_scheduled_jobs_conn(&tx, ids)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// #217: settle a delivered intermediate firing of a `fire: "each"`
+    /// rolling wake. In one write: record every commit reported so far under
+    /// `$.wake_when.delivered_shas`, clear the delivery claim and retry state
+    /// (as an ordinary delivery does), stamp `last_fired_at`, and keep the row
+    /// enabled, due again at `next_fire_at`. Returns false (nothing written)
+    /// when the row is gone, disabled or not a predicate wake.
+    pub fn settle_wake_when_each_firing(
+        &self,
+        id: Uuid,
+        delivered: &[String],
+        fired_at: DateTime<Utc>,
+        next_fire_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let delivered = serde_json::to_string(delivered)
+            .map_err(|error| DaemonError::Store(error.to_string()))?;
+        let changed = self.conn.execute(
+            "UPDATE scheduled_jobs
+             SET last_fired_at=?2, next_fire_at=?3, updated_at=?2,
+                 schedule_json=json_set(
+                     json_remove(schedule_json,'$.continuation_retry','$.watch_refusal',
+                                 '$.custody_contention','$.delivery_claim','$.busy_target_hold'),
+                     '$.wake_when.delivered_shas', json(?4))
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.wake_when') IS NOT NULL",
+            params![
+                id.to_string(),
+                fired_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                next_fire_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                delivered,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
 }
 
 #[cfg(test)]
@@ -2280,6 +2661,82 @@ mod tests {
             wake_mode,
             wake_session_id,
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn halt_wake_reason_clears_on_explicit_rearm() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = Uuid::new_v4();
+        store
+            .insert_session(&crate::test_support::test_session(owner, "/tmp".into()))
+            .unwrap();
+        let wake = mk_job(WakeMode::Resume, Some(owner));
+        store.insert_scheduled_job(&wake).unwrap();
+        for toggle in [false, true] {
+            store.record_session_halt(owner, None).unwrap();
+            let views = store.list_owned_wake_views(owner, true, 10).unwrap();
+            assert_eq!(
+                views[0].disabled_reason.as_deref(),
+                Some("disabled_by_halt")
+            );
+            if toggle {
+                assert!(store.toggle_scheduled_job(&wake.id).unwrap());
+            } else {
+                store
+                    .update_scheduled_job(
+                        &wake.id,
+                        &ScheduledJobUpdate {
+                            enabled: Some(true),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+            store
+                .cancel_owned_scheduled_jobs(owner, Some(wake.id), None)
+                .unwrap();
+            assert_eq!(
+                store.list_owned_wake_views(owner, true, 10).unwrap()[0].disabled_reason,
+                None
+            );
+            assert!(store.toggle_scheduled_job(&wake.id).unwrap());
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn halt_intent_pause_and_wake_disabling_roll_back_together() {
+        let store = Store::open_in_memory().unwrap();
+        let owner = Uuid::new_v4();
+        store
+            .insert_session(&crate::test_support::test_session(owner, "/tmp".into()))
+            .unwrap();
+        let wake = mk_job(WakeMode::Resume, Some(owner));
+        store.insert_scheduled_job(&wake).unwrap();
+        store.conn.execute_batch(
+            "CREATE TEMP TRIGGER reject_halt_reason BEFORE UPDATE OF schedule_json ON scheduled_jobs
+             BEGIN SELECT RAISE(ABORT, 'injected halt failure'); END;"
+        ).unwrap();
+        assert!(
+            store
+                .record_session_halt(
+                    owner,
+                    Some(super::super::manager_actions::OperatorPause::Hard)
+                )
+                .is_err()
+        );
+        assert!(store.get_scheduled_job(&wake.id).unwrap().unwrap().enabled);
+        assert_eq!(
+            store.get_operator_pause(owner).unwrap(),
+            super::super::manager_actions::OperatorPause::None
+        );
+        assert_eq!(
+            store
+                .get_daemon_setting(&format!("session_halt_requested:{owner}"))
+                .unwrap(),
+            None
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -3114,6 +3571,11 @@ mod tests {
     }
 }
 
+/// A busy wake gets one hour from its first due time: long turns can finish,
+/// but a never-idle target must give its retained result a recovery owner.
+/// Persisted on the wake before the first 30-second deferral; never renewed.
+pub const BUSY_TARGET_WAKE_MAX_HOLD: chrono::Duration = chrono::Duration::hours(1);
+
 /// K2 retry bound: the 8th consecutive retryable refusal exhausts the wake.
 pub(crate) const CONTINUATION_RETRY_MAX_ATTEMPTS: u32 = 7;
 
@@ -3130,6 +3592,24 @@ pub struct ContinuationRetryV1 {
     pub first_refused_at: String,
     pub last_code: String,
     pub last_tip: Option<Uuid>,
+}
+
+/// Daemon-owned input cursor of a self-wake whose live target was busy
+/// (`$.self_wake_input_seen`, #189). It applies only to the arming it names:
+/// a later fire moves `last_fired_at` and so retires it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelfWakeInputSeenV1 {
+    pub through_sequence: i64,
+    pub armed_at: String,
+}
+
+impl SelfWakeInputSeenV1 {
+    /// The arming instant this cursor belongs to (`None` if unreadable).
+    pub fn armed_at(&self) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&self.armed_at)
+            .ok()
+            .map(|at| at.with_timezone(&Utc))
+    }
 }
 
 /// Daemon-owned delivery claim of a scheduled resume (`$.delivery_claim`,

@@ -46,6 +46,9 @@ targets:
       - path: RSIRemoteTests
       - path: ../contracts/v1/fixtures/corpus.json
         buildPhase: resources
+      # The TUI theme source, read by ThemeTests to check the ported palettes.
+      - path: ../../crates/rsi/src/ui/theme.rs
+        buildPhase: resources
       # The v2 contract fixtures, as a folder: Bundle subdirectory "fixtures".
       - path: ../contracts/v2/fixtures
         type: folder

@@ -775,6 +775,18 @@ fn reserve_sessions(
     config: &rsi_common::harness_manager::HarnessManagerConfigV1,
     count: usize,
 ) {
+    seed_sessions(store, config, count, ManagerActionStateV2::Queued);
+}
+
+/// Like [`reserve_sessions`] for creations that have already settled: a queued
+/// reservation stays charged until it settles (#3495), so a test of window
+/// expiry charges settled creations.
+fn seed_sessions(
+    store: &Store,
+    config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    count: usize,
+    state: ManagerActionStateV2,
+) {
     for index in 0..count {
         store
             .seed_manager_action_for_test(
@@ -786,7 +798,7 @@ fn reserve_sessions(
                     launch: super::tests::launch(),
                     sandbox_source: None,
                 },
-                ManagerActionStateV2::Queued,
+                state,
                 None,
             )
             .unwrap();
@@ -873,6 +885,56 @@ fn creation_budgets_charge_the_origin_and_its_ancestors_never_a_descendant() {
         9,
     );
     let _ = nodes;
+}
+
+/// #3497: a topology launch refused by an ancestor's spent window carries
+/// that ancestor's window, the slots the launch needs and the refill time, and
+/// is admitted once enough of the ancestor's charged creations expire.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn an_ancestor_window_refusal_names_the_needed_slots_and_refill_then_admits_after_expiry() {
+    let store = Store::open_in_memory().unwrap();
+    let a = project(&store, "A");
+    let seats = [session(&store, None), session(&store, None)];
+    let mut nodes: Vec<PortfolioNodeV1> = Vec::new();
+    for (depth, (label, cap)) in [("swarm", 4), ("global", 3)].into_iter().enumerate() {
+        let mut request =
+            level_request(label, seats[depth], &[a], nodes.last(), depth as u16, label);
+        request.policy.max_created_sessions = cap;
+        nodes.push(create(&store, &request).unwrap());
+    }
+    let configs: Vec<_> = seats
+        .iter()
+        .map(|seat| acting_config(&store, *seat, a))
+        .collect();
+    // The global's three launches spend the swarm's window.
+    seed_sessions(&store, &configs[1], 3, ManagerActionStateV2::Succeeded);
+    let now = chrono::Utc::now();
+    let error = store
+        .manager_ancestor_creation_allowance_at(&configs[1], false, 2, 0, now)
+        .unwrap_err()
+        .to_string();
+    let detail = CreationCapRefusalV1::parse(&error).unwrap_or_else(|| panic!("{error}"));
+    assert_eq!(detail.code, "manager_ancestor_allowance_exceeded");
+    assert_eq!(detail.node_id, nodes[0].node_id);
+    assert_eq!((detail.used, detail.limit, detail.needed), (3, 4, 2));
+    assert_eq!(detail.window_hours, Some(24));
+    let frees = chrono::DateTime::parse_from_rfc3339(detail.next_free_at.as_deref().expect(&error))
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(
+        frees > now + chrono::Duration::hours(23) && frees < now + chrono::Duration::hours(25),
+        "{error}"
+    );
+    store
+        .manager_ancestor_creation_allowance_at(
+            &configs[1],
+            false,
+            2,
+            0,
+            frees + chrono::Duration::seconds(1),
+        )
+        .expect("admitted once enough creations left the window");
 }
 
 /// #2502: an own-node creation refusal names the node, the cap field,

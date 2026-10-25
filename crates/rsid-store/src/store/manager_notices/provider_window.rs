@@ -5,8 +5,20 @@ use rsi_common::types::SessionProvider;
 
 const WORK_EVENT: &str = "provider_window_work";
 const RESUMED_EVENT: &str = "provider_window_wake_resumed";
+const RELEASED_EVENT: &str = "provider_window_wake_released";
+/// Wakes released due at the same instant: the manager concurrency cap, so a
+/// released backlog does not meet the admission gate all at once (#3289).
+const RELEASE_BATCH: usize = 4;
+/// Gap between released batches.
+const RELEASE_STAGGER: chrono::Duration = chrono::Duration::seconds(30);
 const ITEM_LIMIT: usize = 32;
 const EPISODE_BATCH: i64 = 32;
+
+fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
 
 impl Store {
     /// Record a parked wake or Reserved launch once per provider/reset episode.
@@ -267,6 +279,168 @@ impl Store {
         }
         notice.state = state;
         Ok(())
+    }
+
+    /// #3289: re-arm wakes held for a provider plan window as soon as the
+    /// provider shows capacity again, instead of leaving them parked until the
+    /// stored reset time. Capacity is shown by either a stored window that no
+    /// longer reads exhausted (a fresh `rate_limit_event`) or a model turn of
+    /// that provider that completed without a refusal after the wake was held
+    /// (and after any earlier release of it). Released wakes are due now,
+    /// `RELEASE_BATCH` at a time, `RELEASE_STAGGER` apart; the episode's
+    /// `resumed` notice is published once. A wake the release does not move
+    /// (not held, already due, already resumed) is untouched.
+    pub fn release_provider_window_holds(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>> {
+        let mut statement = self.conn.prepare(
+            "SELECT h.project_id,h.subject_id,h.state_json
+             FROM harness_manager_notices h
+             WHERE h.kind='ledger_change' AND h.subject_id LIKE 'provider_window:%'
+               AND h.subject_version='hold'
+               AND NOT EXISTS(SELECT 1 FROM harness_manager_notices r
+                 WHERE r.project_id=h.project_id AND r.kind=h.kind
+                   AND r.subject_id=h.subject_id AND r.subject_version='recovery')
+             GROUP BY h.project_id,h.subject_id ORDER BY h.sequence LIMIT ?1",
+        )?;
+        let episodes = statement
+            .query_map([EPISODE_BATCH], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut notices = Vec::new();
+        let mut released = 0usize;
+        for (project, subject, state) in episodes {
+            let state: Value = serde_json::from_str(&state)?;
+            let provider: SessionProvider = serde_json::from_value(state["provider"].clone())?;
+            let project = Uuid::parse_str(&project)
+                .map_err(|_| refused("manager_invalid_stored_identity"))?;
+            let Some(config) = self.provider_window_notice_config(project)? else {
+                continue;
+            };
+            let cleared = self
+                .provider_usage_window_hold_until(provider, now)?
+                .is_none();
+            let mut statement = self.conn.prepare(
+                "SELECT json_extract(e.payload_json,'$.id'), e.created_at, j.next_fire_at
+                 FROM harness_manager_v2_events e
+                 JOIN scheduled_jobs j ON j.id=json_extract(e.payload_json,'$.id') AND j.enabled=1
+                 WHERE e.project_id=?1 AND e.kind=?2 AND e.record_key=?3
+                   AND json_extract(e.payload_json,'$.kind')='wake'
+                   AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_events r
+                     WHERE r.project_id=e.project_id AND r.kind=?4 AND r.record_key=e.record_key
+                       AND json_extract(r.payload_json,'$.id')=json_extract(e.payload_json,'$.id'))
+                 ORDER BY e.sequence",
+            )?;
+            let held = statement
+                .query_map(
+                    params![project.to_string(), WORK_EVENT, subject, RESUMED_EVENT],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(statement);
+            let mut released_here = false;
+            for (wake, held_at, next_fire_at) in held {
+                let (Ok(wake), Some(held_at), Some(next_fire_at)) = (
+                    Uuid::parse_str(&wake),
+                    parse_rfc3339(&held_at),
+                    parse_rfc3339(&next_fire_at),
+                ) else {
+                    continue;
+                };
+                if next_fire_at <= now {
+                    continue;
+                }
+                let last_release: Option<(String, String)> = self
+                    .conn
+                    .query_row(
+                        "SELECT created_at, json_extract(payload_json,'$.due_at')
+                         FROM harness_manager_v2_events
+                         WHERE project_id=?1 AND kind=?2 AND json_extract(payload_json,'$.id')=?3
+                         ORDER BY sequence DESC LIMIT 1",
+                        params![project.to_string(), RELEASED_EVENT, wake.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let last_release = last_release
+                    .and_then(|(at, due)| Some((parse_rfc3339(&at)?, parse_rfc3339(&due)?)));
+                // A released wake waiting for its staggered slot is not
+                // moved again.
+                if last_release.is_some_and(|(_, due_at)| due_at >= now) {
+                    continue;
+                }
+                let capacity = match last_release {
+                    // A refused release needs evidence newer than that release:
+                    // a completed turn, a new account, or fresh cleared windows.
+                    Some((released_at, _)) if released_at >= held_at => {
+                        self.provider_turn_completed_since(provider, released_at)?
+                            || (cleared
+                                && self.provider_capacity_observed_since(provider, released_at)?)
+                    }
+                    _ => cleared || self.provider_turn_completed_since(provider, held_at)?,
+                };
+                if !capacity {
+                    continue;
+                }
+                let step = i32::try_from(released / RELEASE_BATCH).unwrap_or(i32::MAX);
+                let due_at = now + RELEASE_STAGGER * step;
+                released += 1;
+                self.manager_v2_event(
+                    &config,
+                    None,
+                    RELEASED_EVENT,
+                    &subject,
+                    2,
+                    &json!({"id": wake, "due_at": due_at}),
+                )?;
+                self.defer_wake_when(wake, due_at)?;
+                released_here = true;
+            }
+            if released_here {
+                let reset = serde_json::from_value(state["reset_at"].clone())?;
+                let mut resumed =
+                    self.provider_window_snapshot(project, &subject, provider, reset, true)?;
+                resumed["phase"] = json!("resumed");
+                resumed["detail"] = json!(format!(
+                    "Provider {provider:?} accepted work again before {reset}; {released} held wakes were re-armed to run now."
+                ));
+                if let Some(job) =
+                    self.insert_provider_window_notice(&config, &subject, "resumed", &resumed)?
+                {
+                    notices.push(job);
+                }
+            }
+        }
+        self.release_unmanaged_provider_window_wakes(now)?;
+        Ok(notices)
+    }
+
+    /// A model turn of `provider` completed, with no error class, after `since`.
+    fn provider_turn_completed_since(
+        &self,
+        provider: SessionProvider,
+        since: DateTime<Utc>,
+    ) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_invocations
+             WHERE invocation_kind='session_lifecycle' AND status='completed'
+               AND error_class IS NULL AND session_id IS NOT NULL
+               AND lower(provider)=lower(?1) AND completed_at > ?2)",
+            params![
+                serde_json::to_value(provider)?.as_str().unwrap_or_default(),
+                since.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ],
+            |row| row.get(0),
+        )?)
     }
 
     /// Scheduler reconciliation publishes recovery once all parked work has

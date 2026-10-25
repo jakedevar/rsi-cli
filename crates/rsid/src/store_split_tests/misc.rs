@@ -173,7 +173,9 @@ fn discovery_only_catalog_identity_survives_store_reopen() {
 #[tokio::test]
 #[allow(clippy::unwrap_used)]
 async fn d04_uuidv5_domains_and_display_numbers_are_unchanged() {
-    let store = std::sync::Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+    let store = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().unwrap(),
+    ));
     let active = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let completed = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let (sender, _receiver) = tokio::sync::mpsc::channel(1);

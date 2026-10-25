@@ -54,6 +54,7 @@ pub(crate) mod app_server_control;
 /// The bounded control worker that commits the plane's in-memory seals to
 /// durable storage (C-P2-15). Crate-private for the same reason as the plane.
 pub(crate) mod app_server_seal_worker;
+pub mod bench;
 pub use rsid_store::{bedrock, bedrock_setup, bus};
 pub mod claude;
 #[doc(hidden)]
@@ -75,6 +76,7 @@ pub use rsid_core::{
 };
 pub mod governor;
 pub mod graph_exec;
+pub(crate) mod host_tuning_probe;
 pub(crate) use rsid_store::idea_control;
 pub mod agent_scratch_reclaim;
 pub mod instance_guard;
@@ -104,7 +106,9 @@ pub mod observation;
 pub mod ollama_client;
 pub mod openai;
 pub mod openrouter;
+pub mod openrouter_spend;
 pub mod operator_config;
+pub mod paste_retention; // #86: retention for UploadPasteImage images.
 pub mod pioneer;
 pub mod qa_target_trim;
 pub mod release_target;
@@ -130,6 +134,7 @@ pub(crate) mod project_files;
 /// Daemon start: the project-file trash's one bounded 7-day prune pass
 /// (local #120).
 pub use project_files::write::prune_project_file_trash_at_start;
+pub mod daemon_lifecycle; // #3480: daemon start/stop journal behind `daemon_restart_loop`.
 pub mod project_workflow;
 pub mod prompt_compile;
 /// The operator prompt-file store `~/.rsi/prompts` behind the operator-only
@@ -147,6 +152,7 @@ pub mod reconciliation;
 pub mod recursive_dag;
 pub mod remote_control;
 pub mod session_start_preamble;
+pub mod signal_sender;
 pub mod startup_clock;
 pub mod supervisor_shutdown;
 // Bounded source projections for operator-only Remote reads.
@@ -160,16 +166,25 @@ pub mod deploy;
 pub mod deploy_drain;
 pub mod deploy_operator;
 pub mod deploy_staging_prune;
+pub mod external_report_sync; // #3789: GitHub external-report import.
 pub mod friction;
 pub mod health_anomaly; // #2747: the `when.health_anomaly` evaluator.
 pub mod host_load;
 pub mod host_memory; // #2937: macOS memory source and the daemon-side build capacity gate.
 pub mod host_pressure; // #2562: the shared thermal + disk-pressure admission predicate.
+pub mod lander_env_policy; // #3391: the allowlisted environment of the lander and its gate children.
 pub mod manager_wake; // #2494: when the manager coordinator runs a pass.
 pub mod provider_status;
 pub(crate) mod provider_stream_health;
+/// #452: provisional-migration fixtures driven through the real `rsi-repo-guard`.
+#[cfg(all(
+    test,
+    any(not(feature = "test-shard-mode"), feature = "test-shard-other-01")
+))]
+mod provisional_fixture;
 #[allow(dead_code)]
 pub(crate) mod remote_read;
+pub mod repo_guard_call; // #361: the Python-free repository guards (released migrations, renumber) as a bounded child process.
 pub mod rolling_queue;
 pub mod rpc;
 pub use rsid_store::sandbox;
@@ -200,12 +215,26 @@ pub mod watchdog;
 /// Start the hub's bounded satellite observation loop after the store is ready.
 /// Peers remain inert until the operator enables a paired peer and a link.
 pub fn start_satellite_hub_poller(
-    store: std::sync::Arc<tokio::sync::Mutex<store::Store>>,
+    store: std::sync::Arc<rsid_core::store_lock::Mutex<store::Store>>,
     runtime_config: std::sync::Arc<config::RuntimeConfig>,
 ) {
     tokio::spawn(satellite::hub::run_hub_poller(
         store,
         runtime_config,
         rsi_common::identity::data_path("satellites", "satellites"),
+    ));
+}
+
+/// Start the hub's satellite ENQUEUE intake (#3345): fetch, conflict probe,
+/// enqueue and reply for every parseable `ENQUEUE` report a satellite sends.
+pub fn start_satellite_enqueue_intake(
+    store: std::sync::Arc<rsid_core::store_lock::Mutex<store::Store>>,
+    control: session::agent_verbs::AgentControlHandle,
+    runtime_config: std::sync::Arc<config::RuntimeConfig>,
+) {
+    tokio::spawn(satellite::enqueue_intake::run_enqueue_intake_loop(
+        store,
+        control,
+        runtime_config,
     ));
 }

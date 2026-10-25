@@ -1551,6 +1551,10 @@ pub(crate) fn codex_lifecycle_hook_trust_hash(
     command: &str,
 ) -> Option<String> {
     let (_, _, event_name) = codex_lifecycle_hook_ids(event)?;
+    Some(codex_named_hook_trust_hash(event_name, command))
+}
+
+fn codex_named_hook_trust_hash(event_name: &str, command: &str) -> String {
     let identity = serde_json::json!({
         "event_name": event_name,
         "hooks": [{
@@ -1560,7 +1564,7 @@ pub(crate) fn codex_lifecycle_hook_trust_hash(
             "async": false,
         }],
     });
-    Some(codex_hook_identity_hash(&identity))
+    codex_hook_identity_hash(&identity)
 }
 
 /// #2766: the `-c` override installing `command` as the Codex lifecycle hook
@@ -1571,6 +1575,10 @@ pub(crate) fn codex_lifecycle_hook_override(
     command: &str,
 ) -> Option<String> {
     let (hook_event, _, _) = codex_lifecycle_hook_ids(event)?;
+    Some(codex_named_hook_override(hook_event, command))
+}
+
+fn codex_named_hook_override(hook_event: &str, command: &str) -> String {
     let mut handler = toml::map::Map::new();
     handler.insert("type".into(), toml::Value::String("command".into()));
     handler.insert("command".into(), toml::Value::String(command.into()));
@@ -1586,10 +1594,10 @@ pub(crate) fn codex_lifecycle_hook_override(
         "hooks".into(),
         toml::Value::Array(vec![toml::Value::Table(handler)]),
     );
-    Some(format!(
+    format!(
         "hooks.{hook_event}={}",
         toml::Value::Array(vec![toml::Value::Table(group)])
-    ))
+    )
 }
 
 /// #2766: the lifecycle hooks `hooks/list` must report for `command` and
@@ -1598,21 +1606,34 @@ pub(crate) fn codex_lifecycle_hook_expectations(
     command: &str,
     events: &[LifecycleHookEvent],
 ) -> Vec<(&'static str, String)> {
-    events
+    let mut expectations: Vec<_> = events
         .iter()
         .filter_map(|event| {
             let (_, key, _) = codex_lifecycle_hook_ids(*event)?;
             Some((key, codex_lifecycle_hook_trust_hash(*event, command)?))
         })
-        .collect()
+        .collect();
+    if events.contains(&LifecycleHookEvent::SessionStart) {
+        expectations.push((
+            CODEX_PROMPT_FALLBACK_HOOK_KEY,
+            codex_named_hook_trust_hash(
+                "user_prompt_submit",
+                &format!("{command} --session-start-fallback"),
+            ),
+        ));
+    }
+    expectations
 }
+
+const CODEX_PROMPT_FALLBACK_HOOK_KEY: &str = "/<session-flags>/config.toml:user_prompt_submit:0:0";
 
 /// #2766: whether `key` is the trust key of a Codex lifecycle hook.
 pub(crate) fn is_codex_lifecycle_hook_key(key: &str) -> bool {
-    LifecycleHookEvent::ALL
-        .into_iter()
-        .filter_map(codex_lifecycle_hook_ids)
-        .any(|(_, lifecycle_key, _)| lifecycle_key == key)
+    key == CODEX_PROMPT_FALLBACK_HOOK_KEY
+        || LifecycleHookEvent::ALL
+            .into_iter()
+            .filter_map(codex_lifecycle_hook_ids)
+            .any(|(_, lifecycle_key, _)| lifecycle_key == key)
 }
 
 /// #2766: the `-c` values a Codex launch passes for `command` with the
@@ -1637,6 +1658,12 @@ pub(crate) fn codex_session_hook_overrides_with_lifecycle(
             .iter()
             .filter_map(|event| codex_lifecycle_hook_override(*event, command)),
     );
+    if events.contains(&LifecycleHookEvent::SessionStart) {
+        overrides.push(codex_named_hook_override(
+            "UserPromptSubmit",
+            &format!("{command} --session-start-fallback"),
+        ));
+    }
     let state = codex_session_hook_expectations(command)
         .into_iter()
         .chain(lifecycle)
@@ -2789,6 +2816,10 @@ fn filter_correlated_codex_stderr(
     records
         .into_iter()
         .filter(|record| {
+            if is_codex_nonfatal_mcp_auth_diagnostic(record) {
+                tracing::debug!("Codex CLI: suppressed non-fatal MCP server auth-required stderr");
+                return false;
+            }
             let Some((tool, payload)) = recoverable_codex_router_failure(record) else {
                 return true;
             };
@@ -2952,8 +2983,10 @@ fn codex_generic_unless_deferred(
     let Some(session_id) = config.rsi_session_id else {
         return Some(generic);
     };
-    if session_start_hook && crate::session_start_preamble::fits(&generic) {
-        crate::session_start_preamble::defer(session_id, generic);
+    if session_start_hook
+        && crate::session_start_preamble::fits(&generic)
+        && crate::session_start_preamble::defer(session_id, generic.clone())
+    {
         return None;
     }
     // This first turn carries the preamble itself; nothing stays owed.
@@ -3070,6 +3103,24 @@ fn is_codex_nonfatal_rollout_recorder_diagnostic(line: &str) -> bool {
         return false;
     };
     !thread_id.is_empty() && !thread_id.contains(' ')
+}
+
+/// Non-fatal MCP server auth diagnostic (#3122).
+///
+/// A user-config MCP server with no valid credential (for example a hosted
+/// server answering `invalid_token`) makes the CLI's rmcp transport worker log
+/// `worker quit with fatal: Transport channel closed, when AuthRequired(...)`
+/// at launch. Only that one server's transport ends; the turn is healthy, so
+/// recording the line as a "Provider diagnostic" only adds noise and can land
+/// after the final handoff as the session's last Message. The match is on a
+/// whole grouped record (the CLI may wrap the detail over several lines) and
+/// requires the rmcp worker prefix plus `AuthRequired(`, so any other stderr
+/// stays visible.
+fn is_codex_nonfatal_mcp_auth_diagnostic(record: &str) -> bool {
+    let trimmed = record.trim();
+    let payload = codex_timestamped_error_payload(trimmed).unwrap_or(trimmed);
+    payload.starts_with("rmcp::transport::worker: worker quit with fatal:")
+        && payload.contains("AuthRequired(")
 }
 
 pub(crate) fn codex_stderr_suppression_reason(line: &str) -> Option<&'static str> {
@@ -3293,9 +3344,11 @@ fn map_codex_json_to_stream_event_inner(
                         // context-window input, so context % continues to use
                         // the normalized input token estimate above.
                         "output_tokens": usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        // Metric-only: raw full-prompt tokens before cache subtraction.
-                        // Accumulated by the monitor into total_prompt_tokens.
+                        // Metric-only: raw thread-lifetime prompt, including
+                        // earlier exec resume launches. Copy it into the session
+                        // total; adding it again charges old turns to this one.
                         "prompt_tokens_total": reported_input,
+                        "prompt_tokens_cumulative": true,
                     },
                     "subtype": "turn_completed",
                     "provider_event_type": "turn.completed",
@@ -3497,6 +3550,9 @@ mod tests {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 
@@ -4803,13 +4859,23 @@ mod tests {
             .find_map(|table| table["hooks"].get("state"))
             .expect("hook state");
         assert!(state.get(CODEX_SESSION_START_HOOK_KEY).is_some(), "{state}");
+        let fallback = overrides
+            .iter()
+            .find_map(|table| table["hooks"].get("UserPromptSubmit"))
+            .expect("prompt fallback installed");
+        let command = fallback[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.ends_with("--session-start-fallback"));
+        assert_eq!(
+            state[CODEX_PROMPT_FALLBACK_HOOK_KEY]["trusted_hash"].as_str(),
+            Some(codex_named_hook_trust_hash("user_prompt_submit", command).as_str())
+        );
 
         assert_eq!(launch_payload(&client, &config, false), "do the thing");
-        assert_eq!(
-            crate::session_start_preamble::claim_for_hook(session, "startup"),
-            Some(generic)
-        );
-        // Delivered: the next turn's stdin is the plain query again.
+        let claim = crate::session_start_preamble::claim_part_for_hook(session, "startup", None)
+            .expect("served preamble");
+        assert_eq!(claim.text, generic);
+        assert!(crate::session_start_preamble::confirm_part(session, &claim).is_some());
+        // Confirmed: the next turn's stdin is the plain query again.
         assert_eq!(launch_payload(&client, &config, true), "do the thing");
         crate::session_start_preamble::forget(session);
     }
@@ -7060,6 +7126,25 @@ done
             codex_stderr_suppression_reason(line),
             Some("deprecated collab feature flag")
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn test_codex_mcp_auth_required_stderr_is_dropped_and_real_errors_stay() {
+        // #3122: the shape a hosted MCP server with no credential logs at
+        // every launch, wrapped over two lines.
+        let auth = "2026-10-19T06:09:17.000000Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: \"Bearer error=invalid_token\" })".to_string();
+        let quota = "2026-10-19T06:09:18.000000Z ERROR codex_core: Quota exceeded.".to_string();
+        let unrelated_worker = "2026-10-19T06:09:19.000000Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Io(broken pipe)".to_string();
+        let records = group_codex_stderr_records(vec![
+            auth,
+            "Firecrawl credentials required".to_string(),
+            quota.clone(),
+            unrelated_worker.clone(),
+        ]);
+        let mut correlation = CodexStderrCorrelation::default();
+        let remaining = filter_correlated_codex_stderr(records, &mut correlation);
+        assert_eq!(remaining, vec![quota, unrelated_worker]);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

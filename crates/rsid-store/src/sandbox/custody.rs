@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 /// Shared only with the custody boundary. An effect retains this handle, never
 /// a mutable Store borrow, so provider/task lifetimes cannot pin SQLite.
-pub(crate) type CustodyStore = Arc<Mutex<Store>>;
+pub(crate) type CustodyStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 /// Reclaim queues each short SQL phase on Tokio's FIFO Store mutex. Filesystem
 /// and Git work runs between phases without either Store or a root stripe.
@@ -450,7 +450,7 @@ impl CustodyExecutionRuntime {
     /// blocking the runtime thread under it (#1172).
     async fn settle_and_classify_rotation_refusal(
         &self,
-        mut store: tokio::sync::MutexGuard<'_, Store>,
+        mut store: rsid_core::store_lock::LabeledGuard<'_, Store>,
         candidate: &RotationCustodyCandidate,
         predecessor: &Session,
         successor_id: Uuid,
@@ -1172,6 +1172,22 @@ impl CustodyExecutionRuntime {
         crate::store::manager_successions::VerifiedManagerHandoff,
         String,
     )> {
+        // Hub #3315: a home seat, or any seat working in the home directory,
+        // never reaches git: `$HOME` is the operator's own repository.
+        {
+            use rsi_common::types::Project;
+            let store = self.store.lock().await;
+            let home = store
+                .get_project(Project::HOME_ID)?
+                .and_then(|home| home.path);
+            if predecessor.project_id.is_some_and(Project::is_home_id)
+                || home.is_some_and(|home| home == predecessor.working_dir)
+            {
+                return Err(crate::store::harness_manager_v2::refused(
+                    Project::HOME_SUCCESSION_REFUSED,
+                ));
+            }
+        }
         let transition = SandboxCustodyTransitionV1::AgentSpawnChild;
         let authenticate = |store: &mut Store, root: Option<CustodyRootGuard>| -> Result<_> {
             match CustodyService::classify_for_transition(predecessor, transition)? {
@@ -1200,19 +1216,24 @@ impl CustodyExecutionRuntime {
             authenticate(&mut store, root)
         }
         .map_err(source_error)?;
-        let cwd = before.as_ref().map_or_else(
-            || predecessor.working_dir.clone(),
-            |c| PathBuf::from(&c.sandbox_root),
-        );
+        // A seat with custody reads its own sandbox, anchored at its HEAD, as
+        // before. A seat with none (a reseated seat in a shared root) may
+        // anchor the handoff at its private ref instead of committing there.
+        let (cwd, handoff_ref) = match before.as_ref() {
+            Some(custody) => (PathBuf::from(&custody.sandbox_root), None),
+            None => (
+                predecessor.working_dir.clone(),
+                Some(git_worktree::manager_handoff_ref(predecessor.id)),
+            ),
+        };
         let frozen = handoff.clone();
-        let content =
-            tokio::task::spawn_blocking(move || git_worktree::read_manager_handoff(&cwd, &frozen))
-                .await
-                .map_err(|_| {
-                    crate::store::harness_manager_v2::refused(
-                        "manager_succession_handoff_unavailable",
-                    )
-                })??;
+        let content = tokio::task::spawn_blocking(move || {
+            git_worktree::read_manager_handoff(&cwd, &frozen, handoff_ref.as_deref())
+        })
+        .await
+        .map_err(|_| {
+            crate::store::harness_manager_v2::refused("manager_succession_handoff_unavailable")
+        })??;
         let after = {
             let (mut store, root) = lock_store_then_session_root(&self.store, predecessor.id).await;
             authenticate(&mut store, root)

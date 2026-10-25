@@ -1220,8 +1220,12 @@ impl HarnessTool for RsiControlReadSessionEventsTool {
     fn description(&self) -> &str {
         "Read a bounded page of a session's conversation events (tail, or forward from \
          after_sequence) plus its final assistant message and terminal reason. Set \
-         final_message_full to return up to 32768 characters of the final message. Scope: \
-         your own child, a child of an Epic you lead, or a session in your manager scope."
+         final_message_full to return up to 32768 characters of the final message; set full_fields to \
+         raise the per-event content, tool_input and metadata clip from 2000 to 262144 characters. Scope: \
+         your own child, a child of an Epic you lead, a session in your manager scope, or (Issue-bound \
+         worker, live binding) a same-project non-manager session that created your bound Issue or is cited by full lowercase UUID \
+         in its body, launch brief or newest 64 handoffs authored outside your continuation lineage. \
+         Manager seats, including former seats and their continuations, are excluded."
     }
 
     fn parameters_json(&self) -> &str {
@@ -1479,7 +1483,7 @@ impl HarnessTool for RsiControlIssueTool {
                         .await
                 }
                 Err(validation) => {
-                    let error = crate::error::agent_issue_invalid_request(validation);
+                    let error = crate::error::agent_issue_list_invalid_request(validation);
                     note_native_refusal(&self.control, self.caller_session_id, self.name(), &error)
                         .await;
                     return err(crate::error::agent_issue_error_json(error));
@@ -2321,7 +2325,7 @@ mod tests {
         use std::sync::Arc;
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let (tx, _rx) = tokio::sync::mpsc::channel(4);

@@ -38,13 +38,13 @@ export interface FilesSnapshot {
 
 type Rule = (s: UiSnapshot) => string | null;
 
-const NEED_EXPLORER = 'Open the file explorer first (<Space>e)';
+const NEED_EXPLORER = 'Open the file explorer first (choose “File explorer” in Actions; <Space>e)';
 const root: Rule = (s) => (s.files?.hasRoot ? null : (s.files?.noRoot ?? 'No project folder to show'));
 const explorer: Rule = (s) => (s.files?.explorer ? null : NEED_EXPLORER);
 const target: Rule = (s) => (s.files?.target ? null : 'Select a file in the explorer or open one in the viewer first');
 
 const viewing: Rule = (s) => (s.files?.viewer ? null : 'No file is open in the viewer');
-const editing: Rule = (s) => (s.files?.editing ? null : 'The file is not being edited (press i in the viewer, or Edit)');
+const editing: Rule = (s) => (s.files?.editing ? null : 'The file is not being edited (choose Edit file; i starts the editor in the viewer)');
 const selection: Rule = (s) => explorer(s) ?? (s.files?.selection ? null : 'Select a file or folder in the explorer first');
 
 export const FILES_RULES: Readonly<Record<FilesActionId, Rule>> = {
@@ -86,9 +86,9 @@ export const FILES_ACTIONS: readonly ActionSpec[] = [
     checked: (s) => s.files?.explorer ?? false,
   },
   { id: 'files-find', title: 'Find file…', group: 'view', detail: 'Fuzzy file picker over the project (git ls-files: tracked plus untracked, not ignored)' },
-  { id: 'files-close-viewer', title: 'Close file viewer', group: 'view', extraKeys: ['q', ':q'], detail: 'In the viewer: q, <Space>q or :q (:q! discards unsaved changes)' },
-  { id: 'files-edit', title: 'Edit file', group: 'view', detail: 'In the viewer: i a o A I O start the editor (Vim keys); then :w saves, :wq saves and closes, :w! overwrites a file that changed on disk, :e! reloads it, Esc leaves a clean buffer' },
-  { id: 'files-save', title: 'Save file', group: 'view', extraKeys: ['Ctrl-S', ':w'], detail: 'Refused when the file changed on disk since it was opened (:w! overwrites, :e! reloads)' },
+  { id: 'files-close-viewer', title: 'Close file viewer', group: 'view', extraKeys: ['q', ':q'], detail: 'Closes the viewer (q, <Space>q or :q; :q! discards unsaved changes)' },
+  { id: 'files-edit', title: 'Edit file', group: 'view', plainDetail: 'Edit the open file in the viewer; Save file (Ctrl-S) keeps the changes', detail: 'In the viewer: i a o A I O start the editor (Vim keys); then :w saves, :wq saves and closes, :w! overwrites a file that changed on disk, :e! reloads it, Esc leaves a clean buffer' },
+  { id: 'files-save', title: 'Save file', group: 'view', extraKeys: ['Ctrl-S', ':w'], detail: 'Refused when the file changed on disk since it was opened (:w! overwrites; :e! reloads)' },
   { id: 'files-save-force', title: 'Save file, overwriting the disk copy', group: 'view', noMenu: true, extraKeys: [':w!'], detail: 'Saves even though the file changed on disk' },
   { id: 'files-reload', title: 'Reload file from disk', group: 'view', noMenu: true, extraKeys: [':e!'], detail: 'Discards the unsaved buffer and reads the file again' },
   { id: 'files-add', title: 'New file…', group: 'view', menuBreak: true, detail: 'In the tree: a. In the selected folder (or beside the selected file); end the name with / for a folder' },

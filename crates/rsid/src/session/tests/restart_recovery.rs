@@ -268,3 +268,98 @@ async fn restart_recovery_queues_one_manager_resume_notice_unless_one_already_ex
         "the existing resume wake suppresses a recovery wake"
     );
 }
+
+/// #3426: a restart-drain refusal of the journal's dispatch is a hold, not a
+/// failure. The intent stays `claimed` (and the session keeps no
+/// `dispatch_failed` reason) so the next pass continues it; a real dispatch
+/// error on that next pass still records `dispatch_failed`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn restart_drain_refusal_leaves_the_intent_pending_for_the_next_pass() {
+    let (mut manager, dir) = manager();
+    let mut row = bare_session(Uuid::new_v4());
+    row.provider = SessionProvider::Codex;
+    row.status = SessionStatus::Running;
+    row.working_dir = dir.path().to_path_buf();
+    // A nonexistent thread fails rollout validation before any subprocess
+    // runs: the "real" dispatch error of the second pass.
+    row.claude_session_id = Some(row.id.to_string());
+    let binary = std::env::current_exe().unwrap();
+    manager.codex_client = Some(CodexClient::with_paths_for_test(
+        binary.clone(),
+        binary,
+        std::sync::Arc::clone(&manager.runtime_config),
+    ));
+    insert_row(&manager, &row).await;
+    let invocation = Uuid::new_v4();
+    {
+        let store = manager.store.lock().await;
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .execute(
+                "INSERT INTO model_invocations
+                 (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+                  trigger_source,session_id,created_at)
+                 VALUES(?1,'session.launch.fresh','session_lifecycle','foreground','paid_capable','admitted','running',
+                        'launch_session',?2,?3)",
+                rusqlite::params![invocation.to_string(), row.id.to_string(), at],
+            )
+            .unwrap();
+        store
+            .set_session_model_invocation(row.id, Some(invocation))
+            .unwrap();
+        let boot = Uuid::new_v4();
+        assert!(store.record_restart_intent(row.id, boot).unwrap());
+        store.mark_restart_interrupt_sent(row.id, boot).unwrap();
+    }
+    manager.restore_sessions().await.unwrap();
+
+    manager
+        .restart_draining
+        .store(true, std::sync::atomic::Ordering::Release);
+    manager
+        .reconcile_restart_intents_at_startup()
+        .await
+        .unwrap();
+    let intent_state = |manager: &SessionManager| {
+        let store = manager.store.try_lock().unwrap();
+        store
+            .conn
+            .query_row(
+                "SELECT state,COALESCE(outcome,'') FROM daemon_restart_intents WHERE session_id=?1",
+                [row.id.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap()
+    };
+    let (state, outcome) = intent_state(&manager);
+    assert_eq!(state, "claimed", "held for the drain, not failed");
+    assert_ne!(outcome, "dispatch_failed");
+    let persisted = manager
+        .store
+        .lock()
+        .await
+        .get_session(row.id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        persisted.stop_reason.as_deref(),
+        Some("daemon_restart_resume:dispatch_failed")
+    );
+
+    // The next incarnation (no drain) picks the same intent up again; the
+    // missing thread is a real dispatch failure.
+    manager
+        .restart_draining
+        .store(false, std::sync::atomic::Ordering::Release);
+    manager
+        .reconcile_restart_intents_at_startup()
+        .await
+        .unwrap();
+    let (state, outcome) = intent_state(&manager);
+    assert_eq!(
+        (state.as_str(), outcome.as_str()),
+        ("failed", "dispatch_failed")
+    );
+}

@@ -11,6 +11,7 @@ mod health_tests;
 mod integration_refusal;
 #[path = "issue_541_tests.rs"]
 mod issue_541_tests;
+mod lead_fence_tests;
 #[path = "lead_review_tests.rs"]
 mod lead_review_tests;
 mod live_bookkeeping;
@@ -2996,6 +2997,8 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
         uptime_seconds: 3_600,
         schema_version: Some(140),
         sessions_running: 2,
+        workers_parked: Some(2),
+        open_jobs: Some(2),
         sessions_waiting_approval: 1,
         disk_free_bytes: Some(10_000_000),
         load_avg_1m_milli: Some(1_500),
@@ -3005,10 +3008,22 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
         last_deploy: None,
         missing_provider_clis: Vec::new(),
         manager_launches: Vec::new(),
+        governor_disk: None,
+        manager_policies: Some(vec![
+            rsi_common::satellite_manager_policy::SatelliteManagerLaunchesV1 {
+                project_id: f.project,
+                launches: 0,
+                manager_session_id: Some(f.manager),
+                scope_version: Some(3),
+                policy_version: Some(7),
+                allowed_launches: Some(0),
+            },
+        ]),
         qa_admission: None,
         provider_logins: Vec::new(),
         provider_faults: Vec::new(),
         store_probe_elapsed_ms: None,
+        usage: Vec::new(),
         latest_watchdog_trip: Some(rsi_common::satellite::SatelliteWatchdogTripV1 {
             restart_id: rsi_common::satellite::SatelliteUuidV1(laptop),
             observed_at: chrono::Utc::now(),
@@ -3039,6 +3054,18 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
     assert!(laptop_row["last_contact_at"].is_string());
     assert_eq!(laptop_row["health"]["daemon_version"], "1.2.3");
     assert_eq!(
+        laptop_row["health"]["manager_policies"],
+        serde_json::to_value(&health.manager_policies).unwrap()
+    );
+    assert_eq!(
+        laptop_row["health"]["manager_policies"][0]["policy_version"],
+        7
+    );
+    assert_eq!(
+        laptop_row["health"]["manager_policies"][0]["allowed_launches"],
+        0
+    );
+    assert_eq!(
         laptop_row["health"]["latest_watchdog_trip"]["restart_id"],
         laptop.to_string()
     );
@@ -3054,6 +3081,25 @@ fn satellites_inspect_reports_health_and_unreachable_peers() {
     assert_eq!(laptop_row["health"]["uptime_seconds"], 3_600);
     assert_eq!(laptop_row["health"]["schema_version"], 140);
     assert_eq!(laptop_row["health"]["sessions_running"], 2);
+    assert_eq!(laptop_row["health"]["workers_parked"], 2);
+    assert_eq!(laptop_row["health"]["open_jobs"], 2);
+    let registry = f.store.satellite_registry_view().unwrap();
+    let observation = registry
+        .peers
+        .iter()
+        .find(|p| p.config.peer_id.0 == laptop)
+        .unwrap()
+        .observation
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        (
+            observation.sessions_running,
+            observation.workers_parked,
+            observation.open_jobs
+        ),
+        (Some(2), Some(2), Some(2))
+    );
     assert_eq!(laptop_row["health"]["sessions_waiting_approval"], 1);
     assert_eq!(laptop_row["health"]["disk_free_bytes"], 10_000_000);
     assert_eq!(laptop_row["health"]["load_avg_1m"], 1.5);

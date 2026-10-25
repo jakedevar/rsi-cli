@@ -36,9 +36,10 @@ pub const WORKER_ROSTER_MAX_LIMIT: u32 = 256;
 /// `truncated` says when older workers were not looked at.
 pub const WORKER_ROSTER_SCAN_CAP: usize = 512;
 /// A `stranded` worker idle for longer than this many days is left out of the
-/// default view (no `states` filter, #2362): it is history, not an action item,
-/// and it buries the strands that are. Naming `stranded` in `states` lists
-/// every one; the result's `stale_stranded_hidden` counts the omitted rows.
+/// default view (no `states` filter or `fields: full`, #2362): it is history,
+/// and it buries the strands that need action. Naming `stranded` in `states` lists
+/// every one, as does `fields: full`; the result's `stale_stranded_hidden`
+/// counts the omitted rows.
 pub const WORKER_ROSTER_STALE_STRANDED_DAYS: i64 = 7;
 
 /// What a worker is doing, derived. The first four are the live states a
@@ -62,7 +63,9 @@ pub enum WorkerRosterStateV1 {
     /// The latest turn carries a final `RESULT`/`PIPELINE HANDOFF`, or (#2362)
     /// the worker published a handoff on an Issue (`AgentUpdateIssue
     /// {handoff}`) and nothing is left to resume it: a reviewer that wrote its
-    /// verdict to the review Issue but omitted the marker is done, not stranded.
+    /// verdict to the review Issue but omitted the marker is done. A submitted
+    /// DB review receipt or membership in a settled topology execution also
+    /// finishes a completed worker with no wake obligation.
     FinalHandoff,
     /// `Failed` or `Interrupted`.
     Failed,
@@ -87,13 +90,18 @@ impl WorkerRosterStateV1 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentWorkerRosterRequestV1 {
+    /// `summary` (default) omits finished workers idle for over an hour and
+    /// stale strands. `full` or nonempty `states` restores matching history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<WorkerRosterFieldsV1>,
     /// The project whose workers to list: its appointed manager, or a
     /// portfolio seat whose grant covers it. Omitted, a project's appointed
     /// manager lists its own project's workers and any other caller lists the
     /// workers it launched itself.
     #[serde(default)]
     pub project_id: Option<Uuid>,
-    /// Only workers in these derived states. Empty means every state.
+    /// Only workers in these derived states, including old history. Empty
+    /// uses the summary view unless `fields` is `full`.
     #[serde(default)]
     pub states: Vec<WorkerRosterStateV1>,
     /// Page size, 1..=256; default 64. Workers are newest activity first.
@@ -101,7 +109,19 @@ pub struct AgentWorkerRosterRequestV1 {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRosterFieldsV1 {
+    Summary,
+    Full,
+}
+
 impl AgentWorkerRosterRequestV1 {
+    #[must_use]
+    pub fn full_history(&self) -> bool {
+        self.fields == Some(WorkerRosterFieldsV1::Full) || !self.states.is_empty()
+    }
+
     /// # Errors
     /// [`WORKER_ROSTER_INVALID_REQUEST`].
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -157,6 +177,9 @@ pub struct AgentJobSummaryV1 {
     pub refusal: Option<String>,
     /// `result.receipt.head`, when the result carries one.
     pub receipt_head: Option<String>,
+    /// `result.receipt.failure_class`: signal-only compile/test interruptions (#516).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// `result.receipt.merges_cleanly_onto_rolling` (#348): whether the
     /// receipt's head merged onto `origin/rolling` when the job ended. Absent
     /// for a receipt that predates the field or when git could not say.
@@ -166,6 +189,11 @@ pub struct AgentJobSummaryV1 {
     /// [`ROSTER_CONFLICT_PATHS_MAX`] of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflict_paths: Vec<String>,
+    /// #582: the live capacity hold of a running job (disk floor, free bytes,
+    /// floor, reclaimable candidates), overlaid by the daemon from the
+    /// governor; the store never fills it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<crate::agent_jobs::JobHoldV1>,
 }
 
 /// At most this many conflicted paths ride on a roster job summary.
@@ -214,7 +242,8 @@ pub struct RosterWorkerV1 {
     /// True when the worker's final handoff is on record: the latest turn
     /// carries a final `RESULT`/`PIPELINE HANDOFF` (not a provisional one while a
     /// job-result wake is still owed, #3090), or it published an Issue
-    /// handoff and nothing will resume it (`state` is then `final_handoff`).
+    /// handoff, submitted a DB review receipt or belongs to a settled topology
+    /// execution and nothing will resume it (`state` is then `final_handoff`).
     pub final_handoff: bool,
 }
 
@@ -244,10 +273,16 @@ pub struct AgentWorkerRosterResultV1 {
     /// More workers matched, or were left unexamined, than this page holds.
     pub truncated: bool,
     /// `stranded` workers idle for over [`WORKER_ROSTER_STALE_STRANDED_DAYS`]
-    /// that the default view (empty `states`) left out; ask for `stranded`
-    /// explicitly to list them.
+    /// that the summary view left out; ask for `stranded` explicitly or
+    /// `fields: full` to list them. Counts only candidates examined before
+    /// the page or scan bound stopped the read.
     #[serde(default)]
     pub stale_stranded_hidden: u32,
+    /// `final_handoff`/`failed` workers idle for over an hour omitted by the
+    /// summary view, among candidates examined before the page or scan bound.
+    /// These are excluded from `count` and `counts`, which describe the page.
+    #[serde(default)]
+    pub hidden_finished: u32,
 }
 
 #[cfg(test)]
@@ -288,6 +323,38 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<AgentWorkerRosterRequestV1>(
+                serde_json::json!({"fields": "verbose"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fields_and_states_select_summary_or_full_history() {
+        for (value, full) in [
+            (serde_json::json!({}), false),
+            (serde_json::json!({"fields": null}), false),
+            (
+                serde_json::json!({"fields": "summary", "states": []}),
+                false,
+            ),
+            (serde_json::json!({"fields": "full"}), true),
+            (serde_json::json!({"states": ["final_handoff"]}), true),
+            (
+                serde_json::json!({"fields": "summary", "states": ["failed"]}),
+                true,
+            ),
+        ] {
+            let request: AgentWorkerRosterRequestV1 =
+                serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(request.validate(), Ok(()));
+            assert_eq!(request.full_history(), full, "{value}");
+            let roundtrip: AgentWorkerRosterRequestV1 =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            assert_eq!(roundtrip, request);
+        }
     }
 
     #[test]

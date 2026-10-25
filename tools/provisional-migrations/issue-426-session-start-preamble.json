@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "version": 189,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v189.rs",
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs",
+      "source_blob": "sha256:8c6984056350b5f5e9dbb87e8e0ec22465a02dc7dfed98c37e6800013cf50af0",
+      "sites": [
+        {
+          "anchor": "fn migrate_v189(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 189 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 189)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "path_template": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:850c8fff781d6e14c643fd2faa21918844061d40061a4586130ed92ca29591e4",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 189;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 189 && target < 189 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": ".pragma_update(None, \"user_version\", 189 - 1)",
+          "replacement": ".pragma_update(None, \"user_version\", ${VERSION} - 1)",
+          "scope": "unit"
+        },
+        {
+          "anchor": "target_version >= 189,",
+          "replacement": "target_version >= ${VERSION},",
+          "scope": "unit"
+        },
+        {
+          "anchor": "pub(crate) const SESSION_START_PREAMBLE_SCHEMA_VERSION: i32 = 189;",
+          "replacement": "pub(crate) const SESSION_START_PREAMBLE_SCHEMA_VERSION: i32 = ${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "crates/rsid/AGENTS.md",
+      "path_template": "crates/rsid/AGENTS.md",
+      "source_blob": "sha256:502e77b8ff6e8796e888bfb722433af3b7e23455d89cdf9f073e403f878fab42",
+      "sites": [
+        {
+          "anchor": "(migration V189;",
+          "replacement": "(migration V${VERSION};",
+          "scope": "unit"
+        }
+      ]
+    },
+    {
+      "path": "docs/agents/rsid-rpc-contracts.md",
+      "path_template": "docs/agents/rsid-rpc-contracts.md",
+      "source_blob": "sha256:fd6e9092ceb6fd616b932404580eb84d49e7620bfc9210f1a69bc17bdd306704",
+      "sites": [
+        {
+          "anchor": "table (migration V189).",
+          "replacement": "table (migration V${VERSION}).",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

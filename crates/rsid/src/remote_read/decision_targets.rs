@@ -17,7 +17,6 @@ use rsi_common::remote_read::{DecimalI64, Text};
 use rsi_common::rpc::RpcRequest;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -36,7 +35,7 @@ pub(super) fn parse_request(rpc: &RpcRequest) -> Result<RemoteGetDecisionTargets
 /// the Store lock for the bounded page walk and releases it before transport.
 pub(super) fn spawn_decision_targets_read(
     limiter: &RemoteReadLimiter,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     request: RemoteGetDecisionTargetsV1,
 ) -> Result<JoinHandle<RemoteReadCompleted<RemoteGetDecisionTargetsResponseV1>>> {
     limiter.spawn(move |budget| {

@@ -23,4 +23,4 @@
 set -u
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || exit 2
-exec python3 tools/check_identity_assertions.py "$@"
+exec "$ROOT/scripts/repo-guard" identity-assertions "$@"

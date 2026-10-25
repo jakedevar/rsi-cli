@@ -11,8 +11,10 @@ manager saw it at 41 and 83 minutes and let it continue; the operator stopped
 it. Do not repeat that:
 
 - **Every wake, read the top CPU consumers**: `uptime`, then
-  `ps -eo pid,etimes,pcpu,comm --sort=-pcpu | head` (or `systemd-cgtop`), and
-  any `runaway_process` notice in your inbox. The daemon's CPU-time andon
+  `ps -A -o pid=,etime=,pcpu=,comm= | LC_ALL=C sort -k3,3nr | head -n 10`
+  on Linux or macOS (PID, elapsed time, CPU percentage and command; highest CPU
+  first), and any `runaway_process` notice in your inbox. On Linux,
+  `systemd-cgtop` also shows usage by service scope. The daemon's CPU-time andon
   samples each agent process tree once a minute; past the operator's
   `cpu_andon_cpu_minutes` (default 240) or when one tree dominates a host load
   of `cpu_andon_host_load` (default 40) it records a friction event and
@@ -65,7 +67,17 @@ it. Do not repeat that:
 - **Launch a worker by hand** (only when the default route below does not fit,
   with the reason noted on the Issue). Use `AgentManagerLaunchIssueWorker`
   (Issue-bound: the daemon sets the parent Epic, brief and binding, and arms
-  your terminal watch). A worker is a leaf; do not assign it as a lead. Read
+  your terminal watch once the session exists). Save `action.operation_id`,
+  `worker_session_id`, action state and watch state together. `queued`/`running`
+  with `watch:"pending_launch"` can precede session creation: use
+  `AgentManagerGetAction {operation_id}` to inspect `held.reason` (for example,
+  `disk_pressure`), address the hold and let the existing launch proceed.
+  Do not use `AgentGetStatus` as a launch probe or add another terminal watch.
+  If a probe returned `session_not_found`, recover through the saved action,
+  not a guessed successor id or a duplicate launch. Once the session exists,
+  use `AgentWorkerRoster`/`AgentGetProgress` for its current state; a terminal
+  failed/blocked/revoked launch is handled from its action receipt and Issue
+  note. A worker is a leaf; do not assign it as a lead. Read
   its result from git (branch `rsi/<worker-session-id>`) and its final line.
   Close a hand-driven Issue when its landing publishes; a starter closes its own.
 - **Default route: the bundled issue-pipeline starters (#2304).** An ordinary
@@ -109,6 +121,16 @@ it. Do not repeat that:
   Adoption evidence and the measured turns/cost comparison:
   `thoughts/shared/notes/2026-10-15-2304-adoption.md`; the older route
   acceptance is `thoughts/shared/notes/2026-10-14-2238-acceptance.md`.
+- **Lost Epic lead (#3907).** Recover an empty lead slot or an archived/deleted
+  lead with one `AgentManagerControl` `replace_lead` action, using the current
+  lead fence, query and launch choice. The daemon publishes lead authority
+  before the replacement's first provider turn. An empty slot forks published
+  `origin/rolling`; a retained predecessor uses its normal handover source.
+  Do not use `create_session` followed by `assign_lead` for this recovery: the
+  intervening first turn has only worker authority. If the source is unavailable,
+  restore the Epic repository/published `origin/rolling` and retry `replace_lead`.
+  A failed launch retains the replacement as the recoverable lead; inspect its
+  action receipt before deciding the next recovery.
 - **Worker sandbox base (#1195).** A `create_session` (and
   `AgentManagerLaunchIssueWorker`) sandbox branches from the freshly fetched
   `origin/rolling` tip by default, never from the shared checkout's local
@@ -122,8 +144,10 @@ it. Do not repeat that:
   other seat state in `~/.rsi/mgr/<seat>/`. Reserve `target/` for Cargo outputs;
   detached jobs may outlive a provider turn, and cache reclaim must retain
   targets with a live consumer or unknown top-level content (#1429).
-  Submit integration and release builds through `AgentSubmitJob` with the
-  integration worktree as `worktree`: integration jobs get a registered target
+  The appointed manager submits integration and release builds through
+  `AgentSubmitJob` with the integration worktree as `worktree`; workers cannot
+  submit jobs there (`job_directory_not_allowed`). Integration jobs get a
+  registered target
   under `~/.rsi/build-targets/` (#1864), while manager release builds reuse
   #1218's persistent `~/.rsi/staging/release-target` and its admission lock.
   The job log's `rsi-build-target` line records the selected target. Integration
@@ -145,7 +169,16 @@ it. Do not repeat that:
   `scoped_test`), and baseline reds alone never block. A fix for a known red also
   passes `fixes_issue: <N>` (the red Issue; a qa Issue's `Failing tests:` line
   names the tests) or `fixes_tests: [..]`: the gate then requires those tests
-  green and refuses `claimed_fix_still_red` otherwise (#2167). The lander merges, compiles, runs
+  green and refuses `claimed_fix_still_red` otherwise (#2167). Expedite an
+  incident or red-QA fix that cannot wait behind the queue with `expedite:
+  {reason}` (appointed manager only; reason required, 1-256 bytes, recorded and
+  shown in `AgentListRollingQueue`): the entry is admitted into the next batch
+  ahead of ordinary queued entries, and never preempts a gating batch. At most
+  2 live expedited entries per project (`queue_expedite_cap_reached` lists
+  them); a `fixes_issue` naming an open `qa` Issue expedites by itself, and past
+  the cap stays ordinary with an `expedite_warning`. Never reorder the queue
+  with hand-built merge commits or `supersedes` bundles of unrelated changes
+  (#3487). The lander merges, compiles, runs
   the filtered tests and publishes fast-forward only; do not run a separate
   workspace check, hand-pick tests, merge by hand or push `rolling` yourself.
   The queue wakes you once with the outcome (published or refused, with
@@ -153,7 +186,8 @@ it. Do not repeat that:
   `source_session_id` (the worker is never woken): arm no `sha_on_rolling` for
   your own enqueue, that is a second manager turn for one landing (#2405). Keep
   `sha_on_rolling` and `issue_closed` for a dependency's landing you did not
-  enqueue, and `jobs_terminal` for jobs: one `mode:"when"` wake, never one wake
+  enqueue (several SHAs: one `shas_on_rolling` wake with `fire:"each"`, which
+  fires once per landing; the seat cap is 16 `when` wakes, `wake_when_cap_reached`), and `jobs_terminal` for jobs: one `mode:"when"` wake, never one wake
   per job. A rejected
   fast-forward means the lander retries on the new tip; resubmit if it reports
   not published. Landed means `git merge-base --is-ancestor <SHA>
@@ -171,7 +205,7 @@ it. Do not repeat that:
 - **Migrations.** A new migration is one file
   `crates/rsid-store/src/store/migrations/vNNN.rs` and takes the tip's schema head
   (highest `vNNN.rs`) + 1 at merge time: renumber in landing order with
-  `tools/rolling-migration-renumber.py` (file name, `migrate_vNNN`, the
+  `scripts/repo-guard rolling-migration-renumber` (file name, `migrate_vNNN`, the
   `if version < N` block, `PRAGMA user_version`, test rewind constants), run
   the guard against `origin/rolling` (the pin file is derived by the lander at publication, #1949: nobody hand-edits it or runs `--refresh` per migration; a merge conflict on an old source's pin is cleared by running `--refresh` over the markers). Released migrations are immutable.
 - **Review.** Pre-merge review only for new migrations and credential, IAM or
@@ -201,6 +235,14 @@ it. Do not repeat that:
 
 ## Satellite (arch-laptop)
 
+- A hub brief asking the satellite to converge on, build from or review a hub
+  source names a fetchable commit: one on `origin/rolling`, or on a pushed
+  branch named in the brief. When that is impossible, give a portable content
+  fallback (paths plus blob ids the satellite can check). Write hub Issue
+  numbers as `hub #N`: bare `#N` means a satellite Issue, and the satellite
+  cannot read hub Issues (#292). A satellite manager receiving an unfetchable
+  source (`upload-pack: not our ref`) reports it once with `AgentReportToHub`
+  kind `result`, naming the SHA, and proceeds on a blob fallback when one exists.
 - A brief for a mirrored or older Issue must ask the worker to first check
   current `origin/rolling` with `git log -S<symbol>` or the cited file; if the
   work already landed, publish a handoff naming the covering commit and end
@@ -220,10 +262,21 @@ it. Do not repeat that:
   The laptop manager reads each report's fate in its own `AgentGetDaemonInfo`
   `hub_reports` (`queued`, `fetched`, `held` with the hub's reason,
   `delivered`, `refused`, or the typed failure `undelivered`), and
-  `AgentReportToHub` itself refuses `satellite_report_hub_unreachable` while
-  the hub is not pulling; at 32 pending it refuses `satellite_report_queue_full` with
+  `AgentReportToHub` still accepts a report while the hub is not pulling: the receipt is
+  `queued` with reason `hub_not_pulling` (#530), it keeps its place in the daemon's durable
+  backlog and goes out in arrival order on the next pull, so do not hold reports in /tmp
+  files or re-send them by hand (the `hub_not_pulling` anomaly is the alarm); at 32 pending it refuses `satellite_report_queue_full` with
   the depth, oldest pending age, per-kind counts and `last_hub_pull_at` (#135), so wait
   for acknowledgements and never re-send a pending ENQUEUE or DEPLOY-READY. OUTBOX.md stays the fallback you read on every wake.
+- **Satellite ENQUEUE intake is the daemon's (#3345).** A parseable `ENQUEUE <sha>
+  [branch=] [issue=#N] [fixes=#N]` report is fetched, probed against rolling and the
+  queue, enqueued with `derive_filters` and answered to the satellite by the daemon
+  (`docs/satellites.md`, "ENQUEUE intake"); do not fetch, `merge-tree`, enqueue or
+  mail "PUBLISHED" by hand. Read the `satellite_intake:*` digest notices; they wake
+  you only for a held pre-merge review (migration, credential/IAM/network), a refusal,
+  a stalled intake or a source wanting a post-land review. Hold a source with
+  `rolling_queue_enabled` off or `AgentCancelRollingQueueEntry`. An ENQUEUE the grammar
+  does not parse is still a plain notice you handle by hand.
 - Satellite work that needs hub verification (#2732): its commit is a fetched
   object the hub has not verified. Start `issue-pipeline-post-review` with
   `base_commit` set to that SHA. The implement worker verifies the head
@@ -238,14 +291,40 @@ it. Do not repeat that:
 - **Deploy route: who does what (#171).** The satellite's rsid is never restarted
   from inside a session that daemon manages (2026-09-28 outage), so the route is
   fixed and every brief to the laptop names it:
-  1. The laptop builds and stages: `scripts/install-release.sh --stage-dir
-     ~/.rsi/staging/bin-<sha>` (an allowed deploy root there; `--no-restart` alone
-     still overwrites the live install, #136). DIR must be new or empty (a non-empty
-     DIR is refused) and becomes the `binaries_dir`; its layout is in "Deploys" below
-     (#262). It then reports DEPLOY READY with `AgentReportToHub` kind
-     `deploy_ready` (sha, staged path).
-  2. The hub restarts it over the link: `AgentRequestDeploy {sha, binaries_dir:
-     "<path on the satellite>", idempotency_key, peer_id: <the satellite's peer id>}`
+  1. The laptop manager submits both pinned release build jobs from its local
+     integration worktree and verifies their completed receipts as described in
+     "Deploys" below. Before launching a deploy worker, check
+     `AgentGetAuthorityCatalog {verb:"AgentSubmitJob"}`: `worktree` is
+     appointed-manager-only (#661), and a brief grants no authority. A worker
+     may prepare/check disk and source, then stage and verify using the receipts;
+     its brief must not assign either worktree build job. If the receipts are
+     not ready, finish preparation and return to the manager for the builds.
+     A staging brief supplies the exact SHA, clean source worktree path, both
+     successful build results (including `source_head`, `source_dirty` and
+     `target_dir`), and a new absolute staging path; do not require the worker
+     to read or watch manager-owned jobs. Stage from that worktree with
+     `scripts/install-release.sh --stage-dir ~/.rsi/staging/bin-<sha>
+     --link-only --build-receipt <receipt.json>` (an allowed deploy root there;
+     `--no-restart` alone still overwrites the live install, #136).
+     DIR must be new or empty (a non-empty DIR is refused) and becomes the
+     `binaries_dir`; its layout is in "Deploys" below
+     (#262). The worker returns the verified absolute `binaries_dir` and SHA;
+     the laptop manager then reports DEPLOY READY with `AgentReportToHub {kind:
+     "deploy_ready", text: "DEPLOY READY <sha>", binaries_dir:
+     "<absolute staged path on the satellite>"}`. Expand `~` on the satellite
+     before sending; the satellite daemon also expands a leading `~/`, resolves
+     symlinks, and requires an existing directory under its staging root. The
+     report's typed `binaries_dir` reaches the hub as that absolute path.
+     A satellite daemon older than the typed field refuses it (`invalid_input` at
+     `params.binaries_dir`): send the same report without the field and put one
+     `binaries_dir=<absolute path>` token in the text (no `~`, no `..`, no
+     spaces). The hub records it as the report's `binaries_dir` with
+     `binaries_dir_source: "legacy_text"` and a `legacy_note`; without a valid
+     token it refuses `satellite_report_binaries_dir_required_add_binaries_dir_to_text`
+     (#237).
+  2. The hub copies `binaries_dir` from the report in its inbox and restarts it
+     over the link: `AgentRequestDeploy {sha, binaries_dir:
+     "<absolute binaries_dir from the report>", idempotency_key, peer_id: <the satellite's peer id>}`
      (#1017). This needs the operator-granted `Deploy` capability, the peer paired
      with dispatch enabled and a declared scope, and this hub's installation on the
      satellite's inbound allowlist (`PutSatelliteInboundPolicy`) with a live scope
@@ -281,12 +360,44 @@ it. Do not repeat that:
   to change the route. Hub managers: write briefs that match the route above, so
   none conflicts.
 
-## Cloud (AWS): retired
+## Cloud (AWS): within the daemon spend caps
 
-- Standing operator directive (2026-10-08): no AWS. Do not run
-  `scripts/cloud-gate.sh`, `scripts/cloud-sweep.sh` or `AgentSubmitJob`
-  `cloud_gate`/`cloud_sweep` jobs. Heavy runs and QA sweeps go to the hub's
-  daemon jobs and the arch-laptop satellite.
+- Standing directive 3a2ec445 replaces the 2026-10-08 "no AWS" rule: AWS runs
+  are allowed within the daemon's cloud spend settings
+  (`cloud_spend_daily_cap_usd`, `cloud_spend_stop_line_usd`; operator-only,
+  mirrored to `~/.rsi/cloud/spend-caps.json`). Plan: `thoughts/shared/plans/2026-10-21-3460-aws-throughput.md`.
+- Spot only (max $0.75/h, about $0.62/h observed). `scripts/cloud-gate.sh`
+  reserves `lifetime x $0.7813/h` in `~/.rsi/cloud/spend.md` before it applies
+  and refuses at either cap; the reservation is replaced by the actual cost at
+  stop. A host AWS takes back ends the job without a verdict
+  (`spot_interrupted`, INCOMPLETE): rerun it; it never means red.
+- Use `AgentSubmitJob` `cloud_sweep` for full-library QA (`make
+  rolling-library-qa`, 120-minute host, about $1.56 reserved) when the hub or
+  the satellite is saturated. The `cloud_gate` kind is not used: it lands
+  outside the merge queue.
+- Build lane (#3844), Python-free: the same `cloud_sweep` kind with
+  `"lane":"build"` builds one rolling-tip SHA on one spot host (60-minute
+  lifetime, about $0.78 reserved), then destroys it. Submit it as the manager
+  or Epic lead (same authority and admission as the QA sweep):
+  `AgentSubmitJob {"kind":"cloud_sweep","wake":"none","params":{"sha":"<40-hex
+  current rolling tip>","lane":"build"}}`, then one `AgentScheduleWake
+  {"mode":"when","when":{"jobs_terminal":["<job id>"]},"timeout_seconds":5400,
+  "message":"cloud build finished: read the receipt"}`. The host runs
+  `cargo build --workspace --locked`, then `cargo nextest run -p rsi-common -p
+  rsid-core --lib` (`cargo test` if nextest is absent). The job result's
+  `sweep.verdict` is `GREEN`, `RED` (`sweep.build.failing_step` is `build` or
+  `test`) or `INCOMPLETE` (never red): a spot interruption, a failed `checkout`
+  or `toolchain` step, or a typed refusal (`cloud_prereq_missing_<what>` for
+  terraform, aws, the aws profile, rsi-cloud, `gate.tfvars` or the ssh
+  identity; `cloud_spend_refused`; `cloud_gate_busy`;
+  `sweep_sha_not_rolling_tip`). `sweep.build` carries the step exit codes,
+  instance type, host seconds, reserved and actual USD from the ledger and the
+  leftover-instance check; the tails are in `~/.rsi/cloud/results/build-<sha>/`.
+  The first real run follows the deploy of this lane and the operator's IAM
+  steps; no `.py` runs on this lane, hub or host.
+- Never spend past the settings or raise them: the caps are the operator's.
+  Read the ledger and cap lines in the receipt; a `cloud_spend_refused` refusal
+  means wait for the next UTC day or report the cap up.
 
 ## QA and the canary
 
@@ -319,16 +430,20 @@ you once; `peer_id` deploys a paired satellite over the link. It needs the
 operator's Deploy grant (and, for the laptop, the hub on its inbound allowlist
 with a scope root). Confirm with `AgentGetDaemonInfo`. A restart interrupts any worker
 still mid-turn (provider processes are not re-adopted; the turn is resumed
-after the restart), so the deploy waits for workers. It holds new worker starts,
-your own creates included, for at most the operator's `deploy_drain_hold_secs`
-(default 600 s), then waits for a lull without holding anything until
-`max_wait_secs` (#1320, #1311). When a busy fleet never reaches a lull, send
-`interrupt_workers: true` (#1461, keep `max_wait_secs` above the hold): past the
-hold a worker mid-turn stops blocking, the restart interrupts it, the existing
-post-restart path resumes it with a continue prompt, the outcome wake names the
-interrupted worker sessions and each is a `deploy_interrupt` friction event; a
-landing or a local test/build/landing job still blocks, so use it when the
-fixes are worth interrupting workers for. A satellite deploy (`peer_id`) takes `interrupt_workers` and `max_wait_secs` too (#2587; a laptop worker's single long turn otherwise times the deploy out); a satellite build that predates it answers `satellite_deploy_interrupt_unsupported`. Send the same SHA and idempotency key with `cancel: true` (omit
+after the restart). A peer deploy (`peer_id`) defaults to interrupt-and-resume
+once the satellite's `deploy_drain_hold_secs` has passed (default 600 s).
+Omit `interrupt_workers` for that default; explicit `interrupt_workers: false`
+keeps the wait-for-lull behaviour. Local hub deploys still default to waiting
+for a lull; use `interrupt_workers: true` when interruption is warranted.
+Keep `max_wait_secs` above the hold. Ordinary test/scoped-test jobs requeue
+under the same id and wake after at most the lesser of 300 s and the hold;
+landing, release-build and protected jobs still block. The receipt names
+expected interrupted sessions and requeued jobs while staged, then actual
+interrupted sessions and `requeued_jobs`; the outcome wake names both actual
+sets. The restart journal resumes interrupted turns with a continue prompt.
+A satellite build without `deploy_interrupt` answers
+`satellite_deploy_interrupt_unsupported`; explicit false remains compatible.
+Send the same SHA and idempotency key with `cancel: true` (omit
 `interrupt_workers`) to withdraw a deploy you no longer want to wait for; a held create shows
 `held.reason: deploy_draining` in `AgentManagerGetAction`. Until those grants exist,
 use the manual steps below or the hub script `~/.rsi/mgr/deploy-hub-c7b1-v2.sh`
@@ -338,29 +453,86 @@ environment). The satellite has no manual restart of its own: see "Satellite
 exited rsid, which then shows as a `<defunct>` zombie that `pgrep` still
 finds. Stop it with SIGTERM to the supervisor (its trap forwards TERM).
 
-1. Build from the recurring detached integration worktree at the deploy SHA:
-   `AgentSubmitJob {"kind":"build","worktree":"<integration-worktree>",
-   "params":{"command":"build","workspace":true,"release":true,"sha":"<deploy sha>"},"wake":"none"}`.
-   The job compiles exactly that commit (hub #2954): do not move the integration
-   worktree while it runs, or it fails `job_source_moved`. Arm one
-   `when.jobs_terminal` wake and verify exit 0 on resumption; the receipt's
-   `result.source_head` is the commit that was built. Read the
-   daemon-selected target from the job log's `rsi-build-target` line. Its release
-   output remains warm for the next deploy; never substitute a shared or
-   ad-hoc Cargo target. Installed binaries live where the installer links them;
-   `AgentRequestDeploy` installs into `~/.local/bin`. Targets backing installed
-   links remain live consumers and must be retained.
+1. The appointed manager on the build host submits ONE release build job from
+   the recurring detached integration worktree at the deploy SHA. Check the
+   live `AgentGetAuthorityCatalog {verb:"AgentSubmitJob"}` before delegating:
+   `worktree` is manager-only, so workers only prepare or stage/verify with
+   completed receipts; never assign them this job submission (#661).
+   Never use `workspace:true` for a deploy release: Cargo would unify
+   `rsi-repo-guards`' `serde_json/preserve_order` into `rsid`, changing Maps
+   and starter digests. Never submit per-package release jobs either
+   (`package`+`bins`, one job per member): they share one release target, and
+   a batch of nine left only the last two members' binaries in `release/`
+   (#3993), so the installer refused for a missing `rsid`. The daemon refuses
+   a manager's package-scoped or `workspace:true` release `build`
+   (`job_invalid_params`, `params.package` or `params.workspace`, #4045) and
+   names this route. Submit the aggregate
+   `release_members` request (the inventory is the member list):
+
+   ```json
+   {"kind":"build","worktree":"<integration-worktree>","wake":"owner",
+    "params":{"command":"build","release":true,"sha":"<deploy sha>",
+     "release_members":[
+      {"package":"rsi","bins":["rsi"]},
+      {"package":"rsid","bins":["rsid","rsi-build-rustc","rsi-rolling-land"]},
+      {"package":"rsi-common","bins":["rsi-rpc","rsi-agent-mcp","rsi-contract-validate","rsi-known-failure"]},
+      {"package":"rsi-remote","bins":["rsi-remote"]},
+      {"package":"rsi-turn-shim","bins":["rsi-turn-shim"]},
+      {"package":"rsi-socket-hold","bins":["rsi-socket-hold"]},
+      {"package":"rsi-cloud","bins":["rsi-cloud"]},
+      {"package":"rsi-repo-guards","bins":["rsi-repo-guard"]},
+      {"package":"rsi-eval","bins":["rsi-eval"]}]}}
+   ```
+
+   Omit `package`, `bins` and `workspace` at the top level. Each member runs in
+   its own Cargo invocation under one build slot, one daemon-selected target
+   and one clean source fence, preserving the installer's feature isolation
+   (rsid never shares a Cargo invocation with `rsi-repo-guards`); the first
+   failure stops the job. Start from a clean tree at the pinned SHA and do not
+   move or edit the integration worktree while it runs (`job_source_moved`).
+   Verify the receipt: exit 0, no refusal, `source_head` equal to the deploy
+   SHA, `source_dirty:false`, the `target_dir` matching the log's
+   `rsi-build-target` line, and complete `result.release_members` coverage.
+   This aggregate receipt is the installer's staging input, which refuses
+   missing or incomplete member coverage, including stale binaries in a warm
+   target. Before the daemon with `release_members` is live (the catalog does
+   not list it), there is no supported multi-member route: do not fall back to
+   per-package jobs or a workspace build (the daemon refuses both); wait for
+   that daemon and say so in the handoff.
+   The release target remains warm for the next deploy; never substitute a
+   shared or ad-hoc Cargo target. Installed binaries live where the installer
+   links them; `AgentRequestDeploy` installs into `~/.local/bin`. Targets
+   backing installed links remain live consumers and must be retained.
 2. Quiet point: no lander or integration push mid-flight, and no worker you
    care about mid-turn. Tell the operator first; their TUI reconnects.
 3. Submit `AgentRequestDeploy` using the verified binaries under the job's
    daemon-selected target and the pinned SHA. Stage them first, from the
-   deploy worktree, with `CARGO_TARGET_DIR=<job target>
-   scripts/install-release.sh --stage-dir ~/.rsi/staging/bin-<sha9> --link-only
-   --allow-foreign-build` (the build job records no installer provenance, so
-   `--allow-foreign-build` is required; it reuses the job's binaries, verified
-   byte-identical 2026-10-18). It adds every non-cargo member at the top level:
+   deploy worktree, with `scripts/install-release.sh --stage-dir
+   ~/.rsi/staging/bin-<sha9> --link-only --build-receipt <receipt.json>` (#157;
+   the build job leaves no installer record, so pass its result JSON: `exit_code`
+   0, `source_head`, `source_dirty` false, and `target_dir`. The script links only
+   when `source_head` is the deploy worktree's HEAD, the tree is clean and the
+   staged rsid embeds that sha; `--allow-foreign-build` is no longer needed and
+   turns the check off). The script looks for the binaries in the receipt's
+   `target_dir`, the target the job really built in (#282), so your shell's own
+   stamped `CARGO_TARGET_DIR` (a sandbox target) does not matter. That path is
+   untrusted input (#3513): it must be absolute and, with symlinks and `..`
+   resolved, equal `~/.rsi/staging/release-target` or your checkout's own cargo
+   target, or the script refuses before any lock, binary run or copy. A receipt
+   without `target_dir` (a job from before #282) is refused unless you pass
+   `--target-dir <the job log's rsi-build-target line>` (absolute, canonical, an
+   existing directory; #3514). When the binaries are missing the error names the
+   expected path, never `--allow-foreign-build`). It adds every non-cargo member at the top level:
    `scripts/rsid-supervisor.sh`, the full `scripts/cargo-slot`,
-   `scripts/target-pool` and `scripts/rsi-spill` (#2958). Never hand-copy a
+   `scripts/target-pool` and `scripts/rsi-spill` (#2958).
+   `rsi-repo-guard` (the Rust repo-guard executable the lander and queue
+   probe run as a bounded sibling and fail closed without, #451) must be built
+   in a separate Cargo invocation from `rsid`, because `rsi-repo-guards` enables
+   `serde_json/preserve_order` and Cargo unifies features across one build,
+   which reorders every `serde_json::Map` in `rsid`. Step 1's aggregate
+   `release_members` job enforces that separation; verify its receipt before
+   staging. A target without it stages without it
+   and the deploy receipt names it in `skipped`. Never hand-copy a
    member list: a copy script that predates a new member skips it without
    failing (the b7262e75b hub deploy reported
    `Skipped (not in binaries_dir): rsi-spill`). The
@@ -395,6 +567,8 @@ finds. Stop it with SIGTERM to the supervisor (its trap forwards TERM).
    target, and `<integration-worktree>` to its source worktree:
    `systemd-run --user --unit=rsi-deploy-env-$(date +%s) --collect --working-directory=<integration-worktree> -E TUIPID=$(pgrep -x rsi|head -1) /bin/bash -c 'while IFS= read -r -d "" kv; do case "$kv" in RSI_SESSION_*) ;; *) export "$kv";; esac; done < /proc/$TUIPID/environ; export CARGO_TARGET_DIR=<job-target>; exec ./scripts/install-release.sh --link-only'`.
    Verify health after it completes; a health-check timeout requires inspection.
+   Staging needs no Python (#3742): receipt parsing, the target lock, path resolution and the
+   manifest use bash, awk, `flock` and `sha256sum`/`shasum`; do not hand-roll a staging script to avoid it.
 4. Re-dispatch any worker the restart cut off. Resuming a session with a very
    large context right after a restart failed three times on 2026-09-29.
 
@@ -452,7 +626,13 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
     `expected.custody_generation`, from the LAST Overview page;
   - a `launch` (provider, model, effort);
   - a handoff committed at your sandbox HEAD (`source_commit`,
-    `relative_path`, `blob_oid`).
+    `relative_path`, `blob_oid`). A seat with no sandbox (a reseated seat
+    in the shared root) never commits there: it writes the commit with
+    plumbing in its working directory (`git hash-object -w <file>`,
+    `printf '100644 blob <blob>\t<name>\n' | git mktree`,
+    `git commit-tree -m handoff <tree>`) and points
+    `git update-ref refs/rsi/manager-handoff/<your session id> <commit>` at
+    it; the daemon anchors the handoff at that ref (#172).
 
   Receive the queued receipt, then end your turn.
 - Your own enabled `resume` wakes do not block it, and you do not cancel them
@@ -476,6 +656,11 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
   those instead of cancelling around them.
 - The handoff carries the current state, exact SHAs, open Issues, the kaizen filed, fixed and still open, and the next
   actions, and names this skill's path.
+  List pending launches separately from running/parked workers, with each
+  operation id, reserved worker id, last observed action/watch state and hold
+  reason. Carry the worker's current tip and observed state for follow-up work;
+  the successor refreshes them before mail or continuation, rather than treating
+  handoff ids as proof that a worker exists or is still live.
 - A successor reads its predecessor's transcript with `AgentReadSessionEvents`
   and the predecessor's full session id (read-only; no other verb widens). Every
   earlier holder of your own project's manager slot is readable: a seat that
@@ -523,13 +708,15 @@ Execute or Full project control, confirm the capability rows, and save with `s`.
 - A `create_session` receipt `blocked` / `manager_v2_lifecycle_unconfirmed` is
   the catch-all for an unmapped launch error (`safe_action_error` in
   `session/manager_actions.rs`). Read the real one in `~/.rsi/daemon.log`
-  (`grep <operation_id>`). On 2026-09-29 it was `sandbox_capacity_refused`: the
-  operator Settings cycle "Maximum sandbox roots" (512 → 16384, then it wraps
-  back to 512) had wrapped to 512 while about 1,490 sandbox roots were live, so
-  every new worker sandbox was refused. The same cap refuses `succeed_manager`
-  (the successor gets its own sandbox custody), so a manager cannot hand off
-  either. Ask the operator to set it at or above the live count; agents cannot
-  change daemon settings.
+  (`rg <operation_id>`). Sandbox refusals now have typed outcomes: a free-space
+  shortage holds the create as `sandbox_free_space`; the root-count cap ends
+  `manager_v2_sandbox_source_root_limit`. A sandbox `git worktree add` timeout
+  (#495) cleans its unpublished allocation and holds the same create for 30 s
+  as `sandbox_git_timeout` (`held.release_by` names the retry time). The ordinary
+  admission loop retries it at most three times; do not relaunch a queued hold.
+  Exhaustion ends `blocked` / `sandbox_git_timeout`, and `next_step` says to
+  relaunch under a new key. `sandbox_git_timeout_cleanup_required` means residue
+  could not be safely removed: inspect and clean it before relaunching.
   When the cause is that no launch happened at all (no session row for the
   receipt's `target_session_id`), `settle_uncertain_action` with that receipt's
   `row_version` closes it as `failed` (#1716); relaunch under a new key. A held

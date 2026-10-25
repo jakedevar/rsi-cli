@@ -4,6 +4,7 @@
 // open picker or the run view. Daemon text is set with textContent only.
 import { dispatch } from './commands.js';
 import { $, el, toast } from './dom.js';
+import { rememberOpener, returnFocus, shouldBlurAfterClick } from './focus-return.js';
 import { type GraphLayout, type Point, layoutWorkflowGraph, right, viewportOrigin } from './graph-layout.js';
 import {
   type Draft, type EditField, type ExecutionSnapshot, type PickerKind, type Review, type ValidationReport,
@@ -11,12 +12,16 @@ import {
   commitAuthoredEdit, decodeDefinition, executionBadge, executionStates, fieldValue, graphKey, isAuthored,
   bindFailureMessage, isExecutionActive, isTopologyRun, newDraft, sessionToBind, nodeBadge, nodeEdges, nodeEditable, nodeStrategies, nodeTypeGlyph,
   openReview, replaceBridged, runViewText, savedPickerEntries, truncateLabel, effectiveTopology, workflowDocument,
+  GRAPH_BUTTON_TITLES, graphEdgeHints, graphEmptyLines, graphFooterHints, graphPickerHints, graphStatusLine,
 } from './graph-model.js';
 import { type StarterTemplate, graphsApi } from './graphs-api.js';
 import { type Row, idOf, str } from './dag-model.js';
 import { state, uiChanged } from './state.js';
-import { focusOwnsKey, paneKeyAllowed } from './modal-gate.js';
-import { isVimKeysOn } from './vimkeys.js';
+import { ownProjects } from './project-model.js';
+import { focusOwnsKey, paneKeyAllowed, paneKeyName } from './modal-gate.js';
+import { emptyText } from './empty-states.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
+import { syncListbox } from './listbox-a11y.js';
 
 const CW = 8;
 const CH = 18;
@@ -86,22 +91,51 @@ function setReview(r: Review): void {
 
 function currentProject(): string | null {
   const open = state.sessions.find((s) => s.id === (state.cursorId ?? state.selectedId));
-  return open?.project_id ?? state.projects[0]?.id ?? null;
+  return open?.project_id ?? ownProjects(state.projects)[0]?.id ?? null;
+}
+
+// ---------- last run per workflow ----------
+
+// The TUI keeps each graph draft's last execution across restarts (GraphDraft.last_execution_id in its saved
+// state) and shows that run when the draft is reopened. The desktop keeps the same link, workflow id to
+// execution id, in localStorage; rsid stays the authority for the run itself (GetWorkflowExecution).
+const LAST_RUN_KEY = 'rsi.graph.lastExecution';
+
+function storage(): Storage | undefined {
+  try { return window.localStorage; } catch { return undefined; }
+}
+
+function lastRuns(): Record<string, string> {
+  try {
+    const all: unknown = JSON.parse(storage()?.getItem(LAST_RUN_KEY) ?? '{}');
+    return all && typeof all === 'object' && !Array.isArray(all) ? all as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberLastRun(workflowId: string | null, executionId: string | null): void {
+  if (!workflowId) return;
+  const all = lastRuns();
+  if (executionId) all[workflowId] = executionId;
+  else delete all[workflowId];
+  try { storage()?.setItem(LAST_RUN_KEY, JSON.stringify(all)); } catch { /* storage full or off: the link is lost, the run is not */ }
 }
 
 // ---------- open / close ----------
 
 async function loadSavedDraft(workflowId: string, fallbackProject: string | null): Promise<Draft> {
+  const executionId = lastRuns()[workflowId] ?? null;
   try {
     const { document } = await graphsApi.getWorkflow(workflowId);
     const row = document.workflow;
     const { workflow, error } = decodeDefinition(document.definition, row.title);
     if (error) toast(error);
-    return newDraft(workflow, { workflowId: row.id, projectId: row.project_id ?? fallbackProject });
+    return newDraft(workflow, { workflowId: row.id, projectId: row.project_id ?? fallbackProject, executionId });
   } catch (e) {
     const row = pane.workflows.find((w) => w.id === workflowId);
     toast(`workflow load failed: ${String(e)}`);
-    return newDraft(decodeDefinition(null, row?.title ?? 'Untitled Workflow').workflow, { workflowId, projectId: row?.project_id ?? fallbackProject });
+    return newDraft(decodeDefinition(null, row?.title ?? 'Untitled Workflow').workflow, { workflowId, projectId: row?.project_id ?? fallbackProject, executionId });
   }
 }
 
@@ -122,6 +156,7 @@ export async function openGraphReview(): Promise<void> {
 
 function show(r: Review): void {
   setReview(r);
+  if (!pane.open) rememberOpener('graph-review');
   pane.open = true;
   pane.dashboard = false;
   document.querySelector<HTMLElement>('.layout')!.hidden = true;
@@ -139,6 +174,7 @@ export function closeGraphReview(): void {
   window.clearTimeout(pane.pollTimer);
   view().hidden = true;
   document.querySelector<HTMLElement>('.layout')!.hidden = false;
+  returnFocus('graph-review');
   uiChanged();
 }
 
@@ -154,6 +190,7 @@ async function resyncExecution(notify: boolean): Promise<void> {
       pane.executions.set(id, lookup.execution);
     } else {
       pane.executions.delete(id);
+      if (lastRuns()[r.draft.workflowId ?? ''] === id) rememberLastRun(r.draft.workflowId, null);
       if (pane.review?.draft.executionId === id) setReview({ ...pane.review, draft: { ...pane.review.draft, executionId: null } });
       if (notify) toast(lookup.status === 'expired' ? `workflow execution expired: ${id}` : `workflow execution not found: ${id}`);
     }
@@ -221,6 +258,7 @@ export async function runDraft(): Promise<void> {
     const ack = await graphsApi.executeWorkflow(draft.workflowId!, draft.workflow, draft.projectId);
     pane.executions.set(ack.execution_id, ackSnapshot(ack, draft.workflow.name));
     setReview({ ...pane.review!, draft: { ...pane.review!.draft, executionId: ack.execution_id } });
+    rememberLastRun(draft.workflowId, ack.execution_id);
     toast(`Workflow started (exec ${ack.execution_id.slice(0, 8)})`, true);
     await bindSelectedSession(draft.workflowId!);
     void resyncExecution(false);
@@ -267,6 +305,7 @@ export async function interruptRun(): Promise<void> {
 export async function openRunView(executionId: string, workflowId: string, projectId: string | null): Promise<void> {
   onOpen?.();
   const draft = await loadSavedDraft(workflowId, projectId);
+  rememberLastRun(workflowId, executionId);
   show(openReview({ ...draft, executionId }));
   await resyncExecution(false);
 }
@@ -393,7 +432,7 @@ function handleKey(key: string, ctrl: boolean, shift: boolean): boolean {
   if (!r || !pane.layout) return false;
   const executing = isExecutionActive(execution()?.status);
   const kind = r.mode.kind === 'picker' ? r.mode.picker : null;
-  const res = graphKey(r, { key, ctrl, shift }, { layout: pane.layout, executing, pickerCount: kind ? pickerCount(kind) : 0 });
+  const res = graphKey(r, { key, ctrl, shift }, { layout: pane.layout, executing, pickerCount: kind ? pickerCount(kind) : 0, escCloses: !isVimKeysOn() });
   if (!res.handled) return false;
   const editsBefore = r.history.length;
   setReview(res.review);
@@ -450,7 +489,8 @@ function drawCanvas(host: HTMLElement): void {
   host.replaceChildren();
   if (r.draft.workflow.nodes.length === 0) {
     const empty = el('div', 'graph-empty');
-    empty.append(el('h3', '', 'Empty graph'), el('p', '', 't  open a starter topology'), el('p', '', 'o  open a saved workflow'), el('p', '', 'q  close'));
+    const text = graphEmptyLines(isVimKeysOn());
+    empty.append(el('h3', '', text.title), ...text.lines.map((l) => el('p', '', l)));
     host.append(empty);
     return;
   }
@@ -522,7 +562,7 @@ function kv(dl: HTMLElement, k: string, v: string): void {
 function drawDetail(side: HTMLElement): void {
   const r = pane.review!;
   const node = r.draft.workflow.nodes[r.selected];
-  if (!node) { side.append(el('p', 'meta', 'No node selected.')); return; }
+  if (!node) { side.append(el('p', 'meta', emptyText('graph-node'))); return; }
   side.append(el('h3', '', `${nodeTypeGlyph(node.type, r.collapsed.includes(node.id))} ${node.name}`));
   const dl = el('dl', 'gv-facts');
   kv(dl, 'id', node.id);
@@ -554,15 +594,18 @@ function drawDetail(side: HTMLElement): void {
   const ul = el('ul', 'gv-edges');
   edges.forEach(({ edge }, i) => {
     const li = el('li', i === r.selectedEdge && mode.kind === 'detail' ? 'sel' : '');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(i === r.selectedEdge && mode.kind === 'detail'));
+    li.dataset.index = String(i);
     const port = (p: string | null | undefined) => (p ? `.${p}` : '');
     li.textContent = `${edge.source}${port(edge.source_port)} → ${edge.target}${port(edge.target_port)}${edge.label ? `  [${edge.label}]` : ''}`;
     ul.append(li);
   });
   if (edges.length === 0) ul.append(el('li', 'meta', 'no edges'));
   side.append(ul);
-  side.append(el('p', 'meta', isAuthored(r.draft)
-    ? 'i name  I instructions  j/k edge  x delete edge  [ ] follow edge  Esc back'
-    : 'I instructions  s/S strategies  j/k edge  [ ] follow edge  Esc back'));
+  // The pane holds focus and the arrows move the highlighted edge (local #330).
+  syncListbox(ul, view(), { label: 'Edges' });
+  side.append(el('p', 'meta', graphEdgeHints(isAuthored(r.draft), isVimKeysOn(), currentPlatform())));
 }
 
 const FIELD_LABEL: Record<EditField, string> = { name: 'Name', instructions: 'Instructions', integration: 'Integration strategy', verification: 'Verification strategy' };
@@ -572,7 +615,8 @@ function editBox(field: EditField): HTMLElement {
   const box = el('div', 'gv-edit');
   box.append(el('h4', '', `Edit ${FIELD_LABEL[field]}`));
   const input = field === 'name' ? el('input') : el('textarea');
-  if (input instanceof HTMLInputElement) { input.type = 'text'; input.dataset.vim = 'on'; }
+  if (input instanceof HTMLInputElement) input.type = 'text';
+  input.dataset.vim = 'off'; // a plain box, as the TUI's field editor (no Vim modes), so one Esc cancels the edit
   input.value = r.buffer;
   input.spellcheck = false;
   input.className = 'gv-edit-input';
@@ -608,6 +652,9 @@ function drawPicker(side: HTMLElement, kind: PickerKind, index: number): void {
       : pane.recursive.map((g) => ({ label: str(g, 'title') ?? idOf(g) ?? '?', detail: `${str(g, 'status') ?? '-'} · ${(idOf(g) ?? '').slice(0, 8)}` }));
   items.forEach((it, i) => {
     const li = el('li', i === index ? 'sel' : '');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(i === index));
+    li.dataset.index = String(i);
     li.append(el('span', 'gv-pick-label', it.label), el('span', 'gv-pick-detail', it.detail));
     li.addEventListener('click', () => { if (pane.review?.mode.kind === 'picker') { setReview({ ...pane.review, mode: { ...pane.review.mode, index: i } }); draw(); } });
     li.addEventListener('dblclick', () => void choose(kind, i));
@@ -615,6 +662,7 @@ function drawPicker(side: HTMLElement, kind: PickerKind, index: number): void {
   });
   if (items.length === 0) ul.append(el('li', 'meta', kind === 'saved' ? 'No saved workflows' : kind === 'recursive' ? 'No recursive graphs' : 'Loading…'));
   side.append(ul);
+  syncListbox(ul, view(), { label: title });
   window.setTimeout(() => ul.children[index]?.scrollIntoView({ block: 'nearest' }), 0);
   if (kind === 'topology') {
     const t = pane.starters[index];
@@ -625,7 +673,7 @@ function drawPicker(side: HTMLElement, kind: PickerKind, index: number): void {
       else void previewStarter(t.name);
     }
   }
-  side.append(el('p', 'meta', 'j/k move  g/G ends  PageDown/PageUp page  Enter open  Esc back'));
+  side.append(el('p', 'meta', graphPickerHints(isVimKeysOn(), currentPlatform())));
 }
 
 /** A small read-only drawing of a workflow (the starter preview). */
@@ -678,6 +726,7 @@ function draw(): void {
   drawCanvas(canvas);
   const side = root.querySelector<HTMLElement>('.graph-side')!;
   side.replaceChildren();
+  root.removeAttribute('aria-activedescendant'); // the edge / picker list below sets it again when it is drawn (local #330)
   if (r.mode.kind === 'picker') drawPicker(side, r.mode.picker, r.mode.index);
   else if (r.mode.kind === 'detail' || r.mode.kind === 'edit') drawDetail(side);
   else {
@@ -698,10 +747,8 @@ function draw(): void {
   }
   if (ex) drawRun(side, ex);
   const status = root.querySelector<HTMLElement>('.graph-status')!;
-  const keys = r.draft.workflow.nodes.length === 0
-    ? 't starter  o saved  H/J/K/L pan  c follow  q close'
-    : 'h/j/k/l move  [ ] edges  g/G ends  Enter detail  d delete  u undo  z fold  t/o/R pickers  r run  x interrupt  H/J/K/L pan  c follow  Tab dashboard  q close';
-  status.textContent = `${r.follow ? 'camera: follow' : `camera: manual (${r.pan.x},${r.pan.y})`} · node ${r.draft.workflow.nodes.length === 0 ? 0 : r.selected + 1}/${r.draft.workflow.nodes.length} · ${keys}`;
+  const keys = graphFooterHints(r.draft.workflow.nodes.length === 0, isVimKeysOn(), currentPlatform());
+  status.textContent = `${graphStatusLine(r, r.draft.workflow.nodes.length)} · ${keys}`;
 }
 
 // ---------- wiring ----------
@@ -731,9 +778,9 @@ function build(): HTMLElement {
   };
   head.append(
     el('h1', '', 'Graph review'), el('span', 'graph-head-title'), el('span', 'spacer'),
-    btn('Starter (t)', 't', 'Open a starter topology'), btn('Saved (o)', 'o', 'Open a saved workflow'),
-    btn('Recursive (R)', 'R', 'Open a recursive graph read-only'), btn('Run (r)', 'r', 'Save, check and run the workflow'),
-    btn('Interrupt (x)', 'x', 'Interrupt the running execution'), btn('Close (q)', 'q', 'Close graph review'),
+    btn('Starter (t)', 't', GRAPH_BUTTON_TITLES.t), btn('Saved (o)', 'o', GRAPH_BUTTON_TITLES.o),
+    btn('Recursive (R)', 'R', GRAPH_BUTTON_TITLES.R), btn('Run (r)', 'r', GRAPH_BUTTON_TITLES.r),
+    btn('Interrupt (x)', 'x', GRAPH_BUTTON_TITLES.x), btn('Close (q)', 'q', GRAPH_BUTTON_TITLES.q),
   );
   const body = el('div', 'graph-body');
   body.append(el('div', 'graph-canvas'), el('aside', 'graph-side'));
@@ -741,7 +788,7 @@ function build(): HTMLElement {
   head.addEventListener('click', (ev) => {
     const b = (ev.target as HTMLElement).closest<HTMLButtonElement>('[data-gkey]');
     if (!b) return;
-    window.setTimeout(() => b.blur(), 0);
+    if (shouldBlurAfterClick(ev.detail, isVimKeysOn())) window.setTimeout(() => b.blur(), 0);
     const k = b.dataset.gkey!;
     if (k === 'x') { void interruptRun(); return; }
     // From the canvas: leave a picker or the detail first, as the keys do.
@@ -766,7 +813,7 @@ export function initGraphReview(): void {
     if (ev.metaKey || ev.altKey || isTyping(target) || engineBusy()) return;
     if (ev.key === 'Enter' && target?.closest('button')) return;
     if (ev.key === ' ' || ev.key === ':') return;
-    if (handleKey(ev.key, ev.ctrlKey, ev.shiftKey)) {
+    if (handleKey(paneKeyName(ev), ev.ctrlKey, ev.shiftKey)) {
       ev.preventDefault();
       ev.stopImmediatePropagation();
     }

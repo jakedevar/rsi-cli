@@ -47,12 +47,10 @@ pub fn opener(url: &str) -> (&'static str, Vec<String>) {
     }
 }
 
-#[tauri::command]
-pub fn open_url(url: String) -> Result<Value, String> {
-    let url = checked_url(&url)?;
-    let (program, args) = opener(&url);
+/// Start the platform opener with a fixed argv and no shell, and reap it when it exits.
+fn spawn_opener(program: &str, args: &[String]) -> Result<(), String> {
     let mut child = Command::new(program)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -62,7 +60,30 @@ pub fn open_url(url: String) -> Result<Value, String> {
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_url(url: String) -> Result<Value, String> {
+    let url = checked_url(&url)?;
+    let (program, args) = opener(&url);
+    spawn_opener(program, &args)?;
     Ok(json!({ "opened": url }))
+}
+
+/// The System Settings pane for notifications (local #300), the one non-web address the opener may
+/// receive. It is fixed here, never taken from the page; macOS 13 and later open the Notifications
+/// pane, an older macOS opens System Preferences.
+pub const NOTIFICATION_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
+
+/// Open System Settings › Notifications (the Settings row for a refused notification permission).
+#[tauri::command]
+pub fn open_notification_settings() -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("System Settings › Notifications is a macOS pane".into());
+    }
+    spawn_opener("open", &[NOTIFICATION_SETTINGS_URL.to_string()])
 }
 
 #[cfg(test)]
@@ -85,6 +106,18 @@ mod tests {
         assert!(checked_url("https://a\u{7}").is_err());
         assert!(checked_url(&format!("https://{}", "a".repeat(MAX_URL_BYTES))).is_err());
         assert!(checked_url("-a").is_err());
+    }
+
+    #[test]
+    fn the_notification_pane_address_is_fixed_and_not_a_web_link() {
+        assert!(NOTIFICATION_SETTINGS_URL.starts_with("x-apple.systempreferences:"));
+        assert!(
+            !NOTIFICATION_SETTINGS_URL
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        );
+        // The page-facing opener still refuses it: only open_notification_settings may send it.
+        assert!(checked_url(NOTIFICATION_SETTINGS_URL).is_err());
     }
 
     #[test]

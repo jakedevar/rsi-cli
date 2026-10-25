@@ -249,7 +249,11 @@ mod tests {
             ids
         );
         assert_eq!(model.flow.failed, 1);
-        assert_eq!(model.operator_queue[0].status, SessionStatus::Failed);
+        // A failed session is history, not an operator gate (#3427): it is
+        // counted and listed among recent changes, and `needs_you` stays 0.
+        assert_eq!(model.flow.needs_you, 0);
+        assert_eq!(model.flow.recent, 3);
+        assert_eq!(model.recent_changes[1].status, SessionStatus::Failed);
     }
 
     #[test]

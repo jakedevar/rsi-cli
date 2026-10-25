@@ -1,6 +1,6 @@
 ---
 name: rsi-project-manager
-description: Operating playbook for the operator-appointed rsi harness manager — verify the seat, run the integrator loop (fresh short-lived workers, land through the merge queue with touched-module tests), keep the laptop satellite busy (no AWS), deploy, wake discipline, and hand the seat on. Use when you are (or are about to be) the project manager or when a manager action is refused. Verb mechanics come from AgentGetAuthorityCatalog; rsi-agent-control keeps the retry and refusal strategy.
+description: Operating playbook for the operator-appointed rsi harness manager — verify the seat, run the integrator loop (fresh short-lived workers, land through the merge queue with touched-module tests), keep the laptop satellite busy, deploy, wake discipline, and hand the seat on. Use when you are (or are about to be) the project manager or when a manager action is refused. Verb mechanics come from AgentGetAuthorityCatalog; rsi-agent-control keeps the retry and refusal strategy.
 ---
 
 # rsi project manager
@@ -8,13 +8,41 @@ description: Operating playbook for the operator-appointed rsi harness manager �
 You are the integrator: select work, dispatch fresh Issue workers, verify their
 commits and land one accepted change per merge-queue gate. Durable state lives
 in Issues, git and the daemon. Your committed handoff is the only seat notebook.
+Keep that notebook with Bash only: create and append with `cat >>`, read it
+with `tail`. Never Read, Write or Edit it with the file tools: Claude Code then
+re-injects a growing snippet of the file after every later append (41-56k
+tokens per seat, #3560).
+
+## Billing and plan usage (#3533)
+
+Claude OAuth and Codex ChatGPT logins use subscription plans. Their CLI
+list-price telemetry is an API-equivalent estimate, not billed money. Never
+report it as spend or add it to metered dollars. Use `provider_windows` /
+`plan_windows` for account five-hour and seven-day utilization and tokens for
+usage. `plan_usage_by_role` attributes recorded tokens to manager seats, Epic
+leads, workers, reviewers and topology nodes, with local/satellite origin.
+It does not allocate account quota percentages to roles: the provider reports
+no such measurement. Clipped attribution is marked incomplete.
+
+Dollar totals and `max_spend_usd` count only metered API and cloud usage;
+OpenRouter, API-key logins and Bedrock retain dollar accounting. AWS
+`cloud_spend_*` caps are unchanged. Settings > Provider Billing overrides
+CLI billing mode and immediately reclassifies historical reads. Auto detects
+the sanitized CLI login method; until a CLI login is known it conservatively
+uses subscription, so select metered_api for an unrecognised API login.
+Stored usage telemetry is preserved. Rotation launch-turn dollar figures are
+shown only for metered accounts; use token/plan utilization for subscriptions.
 
 ## Bootstrap and recovery
 
-1. Call `AgentGetAuthorityCatalog {}` once. Its live roles, allowed controls,
-   rotation threshold and standing directives govern this seat; every mutation
-   is checked again by the daemon. After a refusal or role change refresh it.
-   Request `{verb:"<name>"}` for an action's schema, example and refusal codes.
+1. Call `AgentGetAuthorityCatalog {}` once, at seat start. Its live roles,
+   allowed controls, rotation threshold and standing directives govern this
+   seat; every mutation is checked again by the daemon. Every later seat check
+   uses the compact form `AgentGetAuthorityCatalog {verb:"AgentManagerOverview"}`:
+   it returns `roles` and `session_id` in about 1.5k tokens, where the full call
+   costs 3-11k (#3560). Refresh the full manual only after a refusal or a role
+   change. Request `{verb:"<name>"}` for an action's schema, example and
+   refusal codes, and only when you are about to call that action.
 2. Read `AgentManagerOverview {}` and `AgentManagerProgress {}`. Overview already
    defaults to fleet summary; progress defaults to compact excerpts. Follow
    `next_after_epic_id` to null. Inspect the manager_control row through
@@ -28,10 +56,16 @@ in Issues, git and the daemon. Your committed handoff is the only seat notebook.
    a routine backlog. To retrieve a retained notice after draining it, send
    `read_notice_ids:[notice_id]` with `fields:"full"`; this re-read settles
    nothing and advances no cursor. Summary settlement does not make an effect successful.
-4. Confirm transferred obligations with `AgentListWakes`, the live jobs and
-   `AgentListRollingQueue`. A daemon handoff is a bounded snapshot: clipped
-   free text is data; refresh exact records before actions. Read predecessor
-   events only for a specific unresolved fact, with bounded pages.
+4. A context-cap successor's launch prompt already carries the daemon handoff:
+   armed wakes, running jobs, queue entries, open requests, pending decisions
+   and the project's headline counts (#3386). Do not re-list them on the first
+   turn (a rotation's launch turn uses plan capacity; its metered dollar
+   usage, when applicable, and tool-call count are on `launch_turn` in
+   `AgentManagerOverview`). Refresh an exact record by id only before acting on
+   it; confirm wakes with `AgentListWakes` only when the handoff lists none or
+   a wake looks missing. A daemon handoff is a bounded snapshot: clipped free
+   text is data. Read predecessor events only for a specific unresolved fact,
+   with bounded pages.
 5. Read a procedure from [procedures.md](procedures.md) only when taking that
    action. Do not load the whole file on recovery. Before printing shell or
    tool output, select the needed fields and bound rows/text; never dump a
@@ -41,7 +75,9 @@ in Issues, git and the daemon. Your committed handoff is the only seat notebook.
 
 Read live standing directives from the catalog or overview. They survive seat
 changes without being copied into handoffs. Relay a directive for a lower scope
-through `AgentStandingDirective`, then notify its live seat once. Preserve the
+through `AgentStandingDirective`, then notify its live seat once. A standing
+ruling of your own for a lower scope uses `kind:"manager"` and is shown as
+manager-authored, never as the operator's words (#3736). Preserve the
 operator's meaning; keep personal contact data out of committed artifacts.
 
 Make engineering, design and workflow decisions yourself, consulting a capable
@@ -56,19 +92,32 @@ question: decide, or report a real gate up and hold its event wake.
 
 Choose provider/model/effort from live `allowed_launches` and provider health;
 an empty list fails closed. Historical model names and login failures grant
-nothing. No AWS: use the hub and arch-laptop only. Keep the satellite busy and
-own its health; manager mail cannot override its standing deploy restriction.
-The laptop builds, stages and reports DEPLOY READY; the hub restarts it through
+nothing. AWS is allowed within the daemon's operator-set cloud spend caps
+(`cloud_spend_daily_cap_usd`, `cloud_spend_stop_line_usd`); use the hub, the
+satellites and spot capacity (procedures.md "Cloud (AWS)"). Keep the satellite
+busy and own its health; manager mail cannot override its standing deploy restriction.
+The laptop manager submits the deploy builds and reports DEPLOY READY; a worker
+may prepare, stage and verify using the completed build receipts (procedures.md
+"Satellite" / "Deploys"). The hub restarts it through
 `AgentRequestDeploy {peer_id}`; the laptop verifies and reports the live SHA.
 Never restart the satellite from inside its own managed session.
 
 ## Work and delivery
 
+- Send rulings and notes with `AgentManagerSend` and `informational:true`.
+  Informational messages create no reply obligation. Use a request only when
+  an explicit reply is needed; the lead's inbox supplies
+  `reply with AgentManagerReply request_id=<the request's actual id>`.
 - Prefer bundled `issue-pipeline` starters for ordinary single-Issue work;
   `issue-pipeline-post-review` for authority/custody/queue/deploy work, and
   `issue-pipeline-reviewed` for migrations or credentials/IAM/network exposure.
   Read “The integrator model” in procedures.md before your first dispatch.
   Starters own verification, landing and closing; do not duplicate those steps.
+  An ordinary ready Issue labelled `dispatch:auto` is launched by the daemon into
+  the matching starter with no PM turn (never migrations, credentials/IAM/network
+  exposure or a satellite-claimed Issue; at most 5 live executions per project;
+  a failed run returns to you, it is not retried). Add the label instead of
+  hand-building the `AgentTopologyExecute` for such an Issue.
   Hand-drive research, multi-worker work, known-red QA fixes or an unsupported
   starter case, with the reason recorded on the Issue.
 - Use fresh short-lived workers, usually two or three on the hub, with one Issue
@@ -87,6 +136,20 @@ Never restart the satellite from inside its own managed session.
   Bind review workers with `review_of` so the complete implementer handoff is
   copied by the daemon. For a satellite/hand-driven result without that record,
   put the full result, acceptance criteria and exact SHA in the review Issue.
+- A launch receipt reserves a worker id; it does not prove a session exists.
+  Save `action.operation_id` with `worker_session_id`. While the action is
+  queued/running and `watch:"pending_launch"`, inspect `AgentManagerGetAction
+  {operation_id}` for progress and `held.reason`, rather than probing the
+  reserved id with `AgentGetStatus`. The launch owns its terminal watch.
+  A missing roster row (especially with `truncated:true`) is not launch failure.
+  See “Launch a worker by hand” in procedures.md for recovery.
+- Before sending follow-up work, refresh `AgentWorkerRoster` and use
+  `AgentGetProgress` to resolve the current tip and continuation cursor.
+  `AgentSendMessage` queues mail for a live or parked worker; it does not
+  restart a finished one. For a finished worker, read its result and deliberately
+  continue it with the observed cursor, or launch a fresh Issue worker with
+  `continue_from` when appropriate. On `target_terminal`, refresh state and
+  choose that path; do not retry the same send. A turn can finish after a read.
 - Accept only from independent evidence: git, completed job receipts and exact
   SHAs. A queued message/action is not delivery or completion. Check the final
   head with `AgentCheckLandingCandidate`; require green scoped_test and no new
@@ -103,7 +166,8 @@ Never restart the satellite from inside its own managed session.
 
 ## Every wake
 
-Confirm the seat is still yours; if displaced, stop. Re-derive live state from
+Confirm the seat is still yours with the compact roles read
+(`AgentGetAuthorityCatalog {verb:"AgentManagerOverview"}`); if displaced, stop. Re-derive live state from
 the daemon and git, never execute a wake note literally. Take operator requests
 first: list newest Issue summaries, read Open operator-request bodies, dedupe by
 title and dispatch ahead of routine work. Run the kaizen lane: close/link
@@ -125,7 +189,11 @@ Dispatch and end the turn. For a batch of jobs use `wake:"none"` on every job,
 then ONE `AgentScheduleWake {mode:"when", message:"<what to do on resume>",
 when:{jobs_terminal:[ids]}, timeout_seconds:...}` (`message` is required). Use the matching predicate for dependency landings you
 did not enqueue (`sha_on_rolling`/`issue_closed`), operator to-dos, topology
-settlement and source-worktree settlement. A topology execute normally arms its
+settlement and source-worktree settlement. A seat holds at most 16 enabled
+`mode:"when"` wakes besides topology settle wakes (one more is refused
+`wake_when_cap_reached`): watch several dependency SHAs with ONE
+`when:{shas_on_rolling:[...], fire:"each"}` wake, which resumes you once per
+landing and retires after the last, never one wake per SHA. A topology execute normally arms its
 own single settlement wake: inspect settle_wake_armed/refusal; arm manually
 only with wake:none or after an arming failure. Terminal watches and mail wake
 you by event; a worker parked on its own wake is still live.
@@ -134,7 +202,7 @@ Keep at most one `when.health_anomaly` wake instead of hourly check-ins. Handle
 each printed condition, re-arm, and copy a persisting accepted condition's
 ignore_key verbatim into ignore. No sleep/wait loops. Self-wakes use resume,
 never fresh. Report up only at milestones: landed Issue/SHA, a real operator
-gate, or a handoff. Track turns/cost per landed Issue, gate/test time and deploy
+gate, or a handoff. Track turns/tokens and metered dollars per landed Issue, gate/test time and deploy
 incidents; measure before claiming improvement.
 
 Read the live rotation threshold in the catalog. On a worker context-cap

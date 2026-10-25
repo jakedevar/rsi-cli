@@ -59,6 +59,13 @@ impl RootWorld {
         let now = chrono::Utc::now();
         {
             let store = manager.store.lock().await;
+            // These succession fixtures exercise metered budget floors and unknown usage.
+            store
+                .set_daemon_setting("claude_billing_mode", "metered_api")
+                .unwrap();
+            store
+                .set_daemon_setting("codex_billing_mode", "metered_api")
+                .unwrap();
             crate::store::daemon_settings::persist_runtime_config_field(
                 &store,
                 &manager.runtime_config,
@@ -1008,6 +1015,20 @@ async fn manager_root_runtime_drain_deferral_rechecks_policy_after_active_owner_
     assert_eq!(charge, (1, 0));
 }
 
+/// #235: a succession's seat sessions fill no worker slot of the seat's own
+/// cap; they are listed apart in the resources view (`listed` of them).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+fn assert_seat_listed_not_counted(resources: &serde_json::Value, listed: usize) {
+    assert_eq!(resources["active_sessions"], 0, "{resources}");
+    assert_eq!(
+        resources["excluded_manager_seat_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(listed),
+        "{resources}"
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_and_policy() {
@@ -1148,7 +1169,11 @@ async fn manager_root_runtime_downgrade_escalation_preserves_dirty_custody_mail_
             assert_eq!(inbox.messages[0].message, "Pending exact manager exchange");
             assert_eq!(inbox.messages[0].sender_session_id, w.owner);
             let resources = store.manager_v2_resource_snapshot(&config).unwrap();
-            assert_eq!(resources["active_sessions"], 1);
+            assert_seat_listed_not_counted(&resources, 1);
+            assert_eq!(
+                resources["excluded_manager_seat_ids"][0],
+                candidate.id.to_string()
+            );
             assert!(resources["unknown_spend_observations"].as_u64().unwrap() > 0);
             candidate
         };
@@ -1288,9 +1313,119 @@ async fn manager_root_runtime_committed_blob_refuses_mismatch_symlink_and_bounds
             blob_oid: h1_7g_git(w.dir.path(), &["rev-parse", &format!("HEAD:{path}")]),
         };
         assert!(
-            crate::sandbox::git_worktree::read_manager_handoff(w.dir.path(), &handoff).is_err()
+            crate::sandbox::git_worktree::read_manager_handoff(w.dir.path(), &handoff, None)
+                .is_err()
         );
     }
+}
+
+/// hub #3778: a seat that commits once more after `succeed_manager` was
+/// accepted still settles while HEAD descends from `source_commit` and the
+/// handoff blob is unchanged there. A changed blob, a deleted handoff and a
+/// HEAD that does not descend from `source_commit` keep refusing
+/// `manager_succession_handoff_head_changed`; the bytes returned are always the
+/// accepted blob.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn settlement_accepts_a_descended_head_with_the_handoff_blob_unchanged_3778() {
+    let w = RootWorld::new().await;
+    let dir = w.dir.path();
+    let read = |handoff: &ManagerCommittedHandoffV2| {
+        crate::sandbox::git_worktree::read_manager_handoff(dir, handoff, None)
+    };
+    let refusal = |handoff: &ManagerCommittedHandoffV2| {
+        crate::session::manager_actions::safe_action_error(&read(handoff).unwrap_err())
+    };
+    let accepted = read(&w.handoff).unwrap();
+    assert_eq!(accepted, "Continue the committed manager work.\n");
+
+    // A sibling of the accepted commit: same tree, but HEAD does not descend
+    // from it once HEAD moves elsewhere.
+    let sibling = h1_7g_git(
+        dir,
+        &[
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            &w.handoff.source_commit,
+            "-m",
+            "sibling",
+        ],
+    );
+
+    // A later commit that leaves the handoff file alone (the seat log line).
+    std::fs::write(dir.join("seat.log"), "one more line\n").unwrap();
+    h1_7g_git(dir, &["add", "seat.log"]);
+    h1_7g_git(dir, &["commit", "-qm", "seat log"]);
+    assert_ne!(
+        h1_7g_git(dir, &["rev-parse", "HEAD"]),
+        w.handoff.source_commit
+    );
+    assert_eq!(read(&w.handoff).unwrap(), accepted);
+
+    // A source that HEAD does not descend from is refused, blob unchanged.
+    let sideways = ManagerCommittedHandoffV2 {
+        source_commit: sibling,
+        ..w.handoff.clone()
+    };
+    assert_eq!(
+        refusal(&sideways),
+        "manager_succession_handoff_head_changed"
+    );
+
+    // A changed handoff blob at the descended HEAD is refused.
+    std::fs::write(dir.join("handoff.md"), "Rewritten after acceptance.\n").unwrap();
+    h1_7g_git(dir, &["commit", "-qam", "rewrite handoff"]);
+    assert_eq!(
+        refusal(&w.handoff),
+        "manager_succession_handoff_head_changed"
+    );
+
+    // So is a deleted handoff.
+    h1_7g_git(dir, &["rm", "-q", "handoff.md"]);
+    h1_7g_git(dir, &["commit", "-qm", "delete handoff"]);
+    assert_eq!(
+        refusal(&w.handoff),
+        "manager_succession_handoff_head_changed"
+    );
+}
+
+/// hub #3778 / #641: the queued notice is cleared in the settled receipt.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_succession_receipt_clears_commit_nothing_after_settlement_641() {
+    let w = RootWorld::new().await;
+    let request = w
+        .request(
+            w.owner,
+            "commit-nothing-3778",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (receipt, root) = w.enqueue(w.owner, request).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    assert!(
+        receipt
+            .outcome_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("commit nothing after this"))
+    );
+    w.terminal(w.owner).await;
+    let process = install_controller_candidate_test_process(root.candidate_session_id);
+    assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+    {
+        let store = w.manager.store.lock().await;
+        let settled = store
+            .manager_action_operation(root.operation_id)
+            .unwrap()
+            .unwrap()
+            .receipt;
+        assert_eq!(settled.state, ManagerActionStateV2::Succeeded);
+        assert_eq!(settled.outcome_detail, None);
+    }
+    w.stop_scripted(root.candidate_session_id, &process).await;
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
@@ -1373,34 +1508,13 @@ async fn manager_root_runtime_policy_changes_before_and_after_effect_stop_exact_
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknown_spend_refuse() {
-    for case in 0..10 {
+    // Cases 1 and 8 (the shared and provider worker caps) moved to
+    // `manager_root_succession_at_full_worker_capacity_is_admitted_241`:
+    // a succession is no longer refused for worker capacity (#241).
+    for case in [0, 2, 3, 4, 5, 6, 7, 9] {
         let w = RootWorld::new().await;
         match case {
             0 => w.policy(|p| p.max_created_sessions = 0).await,
-            1 | 8 => {
-                if case == 8 {
-                    // Isolate the provider ceiling from the shared ceiling.
-                    w.policy(|p| p.max_active_sessions = 2).await;
-                }
-                let store = w.manager.store.lock().await;
-                let mut group = test_session(Uuid::new_v4());
-                group.project_id = Some(w.project);
-                group.session_kind = SessionKind::Group;
-                group.parent_id = None;
-                group.status = SessionStatus::Completed;
-                store.insert_session(&group).unwrap();
-                let mut epic = group.clone();
-                epic.id = Uuid::new_v4();
-                epic.session_kind = SessionKind::Epic;
-                epic.parent_id = Some(group.id);
-                store.insert_session(&epic).unwrap();
-                let mut live = epic.clone();
-                live.id = Uuid::new_v4();
-                live.parent_id = Some(epic.id);
-                live.session_kind = SessionKind::Feature;
-                live.status = SessionStatus::Running;
-                store.insert_session(&live).unwrap();
-            }
             2 => w.policy(|p| p.max_spend_usd = Some(100.0)).await,
             3 => {
                 w.policy(|p| {
@@ -1510,6 +1624,116 @@ async fn manager_root_runtime_current_zero_caps_choice_global_disable_and_unknow
     }
 }
 
+/// #241: a manager whose workers fill its cap (N for both the shared and the
+/// Codex provider cap) still hands its seat on. The candidate is admitted and
+/// started, and the resources view lists it as a seat, not a worker.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_root_succession_at_full_worker_capacity_is_admitted_241() {
+    const N: u16 = 2;
+    let w = RootWorld::new().await;
+    w.policy(|p| {
+        p.max_active_sessions = N;
+        p.provider_limits = vec![ManagerProviderLimitV2 {
+            provider: SessionProvider::Codex,
+            max_active: N,
+        }];
+    })
+    .await;
+    let mut workers = {
+        let store = w.manager.store.lock().await;
+        let mut group = test_session(Uuid::new_v4());
+        group.project_id = Some(w.project);
+        group.session_kind = SessionKind::Group;
+        group.parent_id = None;
+        group.status = SessionStatus::Completed;
+        store.insert_session(&group).unwrap();
+        let mut epic = group.clone();
+        epic.id = Uuid::new_v4();
+        epic.session_kind = SessionKind::Epic;
+        epic.parent_id = Some(group.id);
+        store.insert_session(&epic).unwrap();
+        (0..N)
+            .map(|_| {
+                let mut live = epic.clone();
+                live.id = Uuid::new_v4();
+                live.parent_id = Some(epic.id);
+                live.session_kind = SessionKind::Feature;
+                live.provider = SessionProvider::Codex;
+                live.status = SessionStatus::Running;
+                store.insert_session(&live).unwrap();
+                live.id.to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    workers.sort();
+    {
+        // The cap is full: one more worker is refused.
+        let store = w.manager.store.lock().await;
+        let config = store.get_harness_manager(w.project).unwrap().unwrap();
+        let resources = store.manager_v2_resource_snapshot(&config).unwrap();
+        assert_eq!(resources["active_sessions"], N, "{resources}");
+        let refusal = store
+            .manager_v2_resource_gate(&config, None, SessionProvider::Codex, None)
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("manager_v2_concurrency_capacity"),
+            "{refusal}"
+        );
+    }
+    let request = w
+        .request(
+            w.owner,
+            "succeed-at-cap",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (receipt, root) = w.enqueue(w.owner, request).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    w.terminal(w.owner).await;
+    let script = install_controller_candidate_test_process(root.candidate_session_id);
+    let claim = w.claim().await;
+    if let Err(error) = w.manager.execute_manager_action(&claim).await {
+        panic!(
+            "succession at full worker capacity refused: {error:?}, receipt {:?}",
+            w.manager
+                .store
+                .lock()
+                .await
+                .manager_action_operation(root.operation_id)
+                .unwrap()
+                .map(|op| op.receipt)
+        );
+    }
+    {
+        let store = w.manager.store.lock().await;
+        let config = store.get_harness_manager(w.project).unwrap().unwrap();
+        assert_eq!(config.current_session_id, Some(root.candidate_session_id));
+        let resources = store.manager_v2_resource_snapshot(&config).unwrap();
+        assert_eq!(resources["active_sessions"], N, "{resources}");
+        let mut counted = resources["counted_session_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        counted.sort();
+        assert_eq!(counted, workers, "{resources}");
+        assert_eq!(
+            resources["excluded_manager_seat_ids"],
+            serde_json::json!([root.candidate_session_id.to_string()]),
+            "{resources}"
+        );
+    }
+    assert_eq!(script.productive_start_count.load(Ordering::SeqCst), 1);
+    drop_controller_candidate_test_process(root.candidate_session_id);
+    drop_controller_candidate_test_stream(root.candidate_session_id);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_writer() {
@@ -1610,13 +1834,13 @@ async fn manager_root_runtime_deferred_establishment_rechecks_pause_and_cleans_w
                 .unwrap();
             assert_eq!(pending.state, ManagerRootState::CleanupRequired);
             assert!(pending.effect_claimed);
-            assert_eq!(
-                reopened
+            assert_seat_listed_not_counted(
+                &reopened
                     .manager_v2_resource_snapshot(
-                        &reopened.get_harness_manager(w.project).unwrap().unwrap()
+                        &reopened.get_harness_manager(w.project).unwrap().unwrap(),
                     )
-                    .unwrap()["active_sessions"],
-                1
+                    .unwrap(),
+                1,
             );
             assert_eq!(
                 reopened
@@ -1748,7 +1972,7 @@ async fn manager_root_runtime_unpublished_admission_reopen_settles_without_resen
                     &store.get_harness_manager(w.project).unwrap().unwrap(),
                 )
                 .unwrap();
-            assert_eq!(snapshot["active_sessions"], 1);
+            assert_seat_listed_not_counted(&snapshot, 1);
             store
                 .record_manager_root_spend_floor(w.owner, 7.25)
                 .unwrap();
@@ -1772,7 +1996,7 @@ async fn manager_root_runtime_unpublished_admission_reopen_settles_without_resen
                     .unwrap();
                 let current = store.get_harness_manager(w.project).unwrap().unwrap();
                 let retained = store.manager_v2_resource_snapshot(&current).unwrap();
-                assert_eq!(retained["active_sessions"], 1);
+                assert_seat_listed_not_counted(&retained, 1);
                 assert!(retained["known_spend_usd"].as_f64().unwrap() >= 7.25);
             }
         }
@@ -1884,8 +2108,9 @@ async fn manager_root_runtime_live_source_scope_epoch_custody_human_recovery_fen
                 w.manager.store.lock().await.conn.execute("UPDATE manager_authority_epochs SET epoch=epoch+1 WHERE project_id=?1", [w.project.to_string()]).unwrap();
             }
             2 => {
-                std::fs::write(w.dir.path().join("README.md"), "new committed source\n").unwrap();
-                h1_7g_git(w.dir.path(), &["add", "README.md"]); h1_7g_git(w.dir.path(), &["commit", "-qm", "source advances while admission waits"]);
+                // hub #3778: only a source advance that changes the accepted handoff blob fences the successor; an unrelated later commit is accepted (see settlement_accepts_a_descended_head_with_the_handoff_blob_unchanged_3778).
+                std::fs::write(w.dir.path().join("handoff.md"), "handoff rewritten while admission waits\n").unwrap();
+                h1_7g_git(w.dir.path(), &["add", "handoff.md"]); h1_7g_git(w.dir.path(), &["commit", "-qm", "source handoff changes while admission waits"]);
             }
             3 => std::fs::rename(candidate_root.join(".git"), candidate_root.join("retained-git-entry")).unwrap(),
             4 => w.manager.store.lock().await.update_session_pending_question_json(w.owner, Some(r#"{"questions":[{"question":"Choose the next action","header":"Operator","options":[],"multi_select":false}]}"#)).unwrap(),
@@ -2037,7 +2262,14 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
             None,
         )
         .await;
-    let (_, root) = w.enqueue(w.owner, request).await;
+    let (receipt, root) = w.enqueue(w.owner, request).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    assert!(
+        receipt
+            .outcome_detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("commit nothing after this"))
+    );
     w.terminal(w.owner).await;
     let scripted = install_controller_candidate_test_process(root.candidate_session_id);
     let (reached, resume) = install_controller_candidate_test_pause(
@@ -2078,13 +2310,13 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
                 .raw_status,
             "running"
         );
-        assert_eq!(
-            store
+        assert_seat_listed_not_counted(
+            &store
                 .manager_v2_resource_snapshot(
-                    &store.get_harness_manager(w.project).unwrap().unwrap()
+                    &store.get_harness_manager(w.project).unwrap().unwrap(),
                 )
-                .unwrap()["active_sessions"],
-            1
+                .unwrap(),
+            1,
         );
     }
     assert!(scripted.alive.load(Ordering::SeqCst));
@@ -2104,6 +2336,7 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
             .unwrap()
             .receipt;
         assert_eq!(current.state, ManagerActionStateV2::Uncertain);
+        assert_eq!(current.outcome_detail, None);
         let final_receipt_version = current.row_version + 1;
         store
             .conn
@@ -2188,6 +2421,13 @@ async fn manager_root_runtime_failed_checked_stop_completes_when_notice_transpor
                 .state,
             ManagerRootState::Failed
         );
+        let settled = store
+            .manager_action_operation(root.operation_id)
+            .unwrap()
+            .unwrap()
+            .receipt;
+        assert_eq!(settled.state, ManagerActionStateV2::Failed);
+        assert_eq!(settled.outcome_detail, None);
         let pending_final_version: i64 = store
             .conn
             .query_row(
@@ -2475,4 +2715,630 @@ async fn manager_root_runtime_refused_succession_on_a_finished_seat_is_a_health_
     }
     let _ = process;
     drop_controller_candidate_test_process(root.candidate_session_id);
+}
+
+/// #640: without a private ref, an unchanged handoff in a shared-HEAD ancestor
+/// is accepted and the successor forks from that exact source commit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandboxless_seat_accepts_a_shared_head_ancestor_without_a_private_ref_640() {
+    let w = RootWorld::new().await;
+    let dir = w.dir.path();
+    std::fs::write(dir.join("shared.log"), "Later shared-root work.\n").unwrap();
+    h1_7g_git(dir, &["add", "shared.log"]);
+    h1_7g_git(dir, &["commit", "-qm", "advance shared HEAD"]);
+    let shared_head = h1_7g_git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        h1_7g_git(dir, &["rev-parse", "HEAD^"]),
+        w.handoff.source_commit
+    );
+    let anchor = crate::sandbox::git_worktree::manager_handoff_ref(w.owner);
+    assert_eq!(
+        crate::sandbox::git_worktree::read_manager_handoff(dir, &w.handoff, Some(&anchor)).unwrap(),
+        "Continue the committed manager work.\n"
+    );
+    let request = w
+        .request(
+            w.owner,
+            "shared-ancestor-640",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let (receipt, succession) = w.enqueue(w.owner, request).await;
+    assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+    w.terminal(w.owner).await;
+    let process = install_controller_candidate_test_process(succession.candidate_session_id);
+    assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+    {
+        let store = w.manager.store.lock().await;
+        let current = store
+            .manager_succession(succession.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.state, ManagerRootState::Committed);
+        let custody = store
+            .live_custody_for_session(succession.candidate_session_id)
+            .unwrap();
+        assert_eq!(custody.source_commit, w.handoff.source_commit);
+        assert_eq!(
+            h1_7g_git(
+                std::path::Path::new(&custody.sandbox_root),
+                &["rev-parse", "HEAD"]
+            ),
+            w.handoff.source_commit
+        );
+    }
+    assert_eq!(h1_7g_git(dir, &["rev-parse", "HEAD"]), shared_head);
+    let _ = process;
+    drop_controller_candidate_test_process(succession.candidate_session_id);
+}
+
+/// #640: shared HEAD descending from the handoff commit is insufficient when
+/// its handoff blob changed and no private ref anchors the accepted commit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_sandboxless_seat_refuses_a_changed_shared_head_blob_without_a_private_ref_640() {
+    let w = RootWorld::new().await;
+    let dir = w.dir.path();
+    std::fs::write(dir.join("handoff.md"), "Changed in shared HEAD.\n").unwrap();
+    h1_7g_git(dir, &["commit", "-qam", "change shared handoff"]);
+    assert_eq!(
+        h1_7g_git(dir, &["rev-parse", "HEAD^"]),
+        w.handoff.source_commit
+    );
+    let request = w
+        .request(
+            w.owner,
+            "changed-shared-blob-640",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    let refused = w
+        .manager
+        .agent_control()
+        .agent_manager_control(w.owner, request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        crate::session::manager_actions::safe_action_error(&refused),
+        "manager_succession_handoff_head_changed"
+    );
+}
+
+/// #172 (hub #3328): a sandboxless project manager seat (a reseated seat in
+/// the shared project root, where no agent commits) writes its handoff commit
+/// with plumbing only and points its private handoff ref at it. The root's
+/// HEAD, index, branches and status are unchanged, `succeed_manager` anchors
+/// the handoff at the ref and the successor is established; without the ref
+/// the same unrelated handoff commit is refused at HEAD.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sandboxless_manager_seat_succeeds_from_its_private_handoff_ref_172() {
+    fn plumbing(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> String {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run git");
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(stdin.unwrap_or("").as_bytes()).unwrap();
+        drop(input);
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    let w = RootWorld::new().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let root = w.dir.path().to_path_buf();
+        let observe = || {
+            (
+                h1_7g_git(&root, &["rev-parse", "HEAD"]),
+                std::fs::read(root.join(".git/index")).unwrap(),
+                h1_7g_git(&root, &["for-each-ref", "refs/heads"]),
+                h1_7g_git(&root, &["--no-optional-locks", "status", "--porcelain"]),
+            )
+        };
+        let before = observe();
+        let scratch = tempfile::tempdir().unwrap();
+        let file = scratch.path().join("seat-handoff.md");
+        std::fs::write(&file, "Handoff anchored at the seat's private ref.\n").unwrap();
+        let blob = plumbing(&root, &["hash-object", "-w", file.to_str().unwrap()], None);
+        let tree = plumbing(
+            &root,
+            &["mktree"],
+            Some(&format!("100644 blob {blob}\thandoff.md\n")),
+        );
+        let commit = plumbing(
+            &root,
+            &[
+                "-c",
+                "user.name=seat",
+                "-c",
+                "user.email=seat@rsi.local",
+                "commit-tree",
+                "-m",
+                "handoff",
+                &tree,
+            ],
+            None,
+        );
+        let handoff = ManagerCommittedHandoffV2 {
+            source_commit: commit.clone(),
+            relative_path: "handoff.md".into(),
+            blob_oid: blob,
+        };
+        let mut request = w
+            .request(
+                w.owner,
+                "ref-anchored",
+                SessionProvider::Codex,
+                "gpt-6-astra",
+                None,
+            )
+            .await;
+        if let ManagerActionV2::SucceedManager { handoff: h, .. } = &mut request.operation {
+            *h = handoff;
+        }
+        // No ref yet: the commit is not an ancestor of HEAD, so HEAD refuses it.
+        let refused = w
+            .manager
+            .agent_control()
+            .agent_manager_control(w.owner, request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::session::manager_actions::safe_action_error(&refused),
+            "manager_succession_handoff_head_changed"
+        );
+        let anchor = crate::sandbox::git_worktree::manager_handoff_ref(w.owner);
+        assert_eq!(anchor, format!("refs/rsi/manager-handoff/{}", w.owner));
+        plumbing(&root, &["update-ref", &anchor, &commit], None);
+        assert_eq!(
+            observe(),
+            before,
+            "plumbing leaves HEAD, index, branches and status"
+        );
+
+        let (receipt, succession) = w.enqueue(w.owner, request).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+        w.terminal(w.owner).await;
+        let process = install_controller_candidate_test_process(succession.candidate_session_id);
+        assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+        {
+            let store = w.manager.store.lock().await;
+            let current = store
+                .manager_succession(succession.operation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.state, ManagerRootState::Committed);
+            assert_eq!(
+                store
+                    .get_harness_manager(w.project)
+                    .unwrap()
+                    .unwrap()
+                    .current_session_id,
+                Some(succession.candidate_session_id)
+            );
+            let candidate = store
+                .get_session(succession.candidate_session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(candidate.continued_from, Some(w.owner));
+        }
+        // The daemon left the shared root's HEAD, index and tree alone; the
+        // only new branch is the successor's own sandbox branch (#169).
+        let after = observe();
+        assert_eq!(
+            (&after.0, &after.1, &after.3),
+            (&before.0, &before.1, &before.3)
+        );
+        let own = format!("refs/heads/rsi/{}", succession.candidate_session_id);
+        let branches: Vec<&str> = after
+            .2
+            .lines()
+            .filter(|line| !line.ends_with(own.as_str()))
+            .collect();
+        assert_eq!(branches, before.2.lines().collect::<Vec<_>>());
+        w.stop_scripted(succession.candidate_session_id, &process)
+            .await;
+    })
+    .await
+    .expect("ref-anchored succession settles within the fixture deadline");
+}
+
+/// #185: once a sandboxless seat's successor is published, the daemon prunes
+/// the handoff refs of that lineage's predecessors older than the kept two
+/// (`MANAGER_HANDOFF_REFS_KEPT`), matched by the session ids and commits the
+/// store recorded. The just-read ref and the one before it stay, a ref moved
+/// since it was recorded stays, another lineage's ref and `refs/heads` stay.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_published_succession_prunes_aged_out_handoff_refs_of_its_lineage_185() {
+    let w = RootWorld::new().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let root = w.dir.path().to_path_buf();
+        let recorded = w.handoff.source_commit.clone();
+        let moved = h1_7g_git(&root, &["commit-tree", "HEAD^{tree}", "-m", "moved"]);
+        // Published lineage behind the live seat: older1 -> owner,
+        // older2 -> older1, older3 -> older2 (newest first from the owner).
+        let (older1, older2, older3, foreign) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        {
+            let store = w.manager.store.lock().await;
+            let stamp = crate::store::harness_manager_v2::now();
+            store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            for (predecessor, candidate) in [(older1, w.owner), (older2, older1), (older3, older2)]
+            {
+                let frozen = serde_json::json!({
+                    "predecessor": {"working_dir": root},
+                    "predecessor_custody": null,
+                    "handoff": {"source_commit": recorded},
+                });
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO manager_root_successions
+                         (operation_id,project_id,manager_session_id,predecessor_session_id,
+                          candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,
+                          policy_version,authority_epoch,frozen_json,state,row_version,
+                          published_epoch,created_at,updated_at)
+                         VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,?7,'committed',1,1,?8,?8)",
+                        rusqlite::params![
+                            Uuid::new_v4().to_string(),
+                            w.project.to_string(),
+                            predecessor.to_string(),
+                            candidate.to_string(),
+                            Uuid::new_v4().to_string(),
+                            Uuid::new_v4().to_string(),
+                            frozen.to_string(),
+                            stamp
+                        ],
+                    )
+                    .unwrap();
+            }
+            store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        }
+        let handoff_ref = crate::sandbox::git_worktree::manager_handoff_ref;
+        for id in [w.owner, older1, older2, foreign] {
+            h1_7g_git(&root, &["update-ref", &handoff_ref(id), &recorded]);
+        }
+        // Recorded at `recorded`, since moved: never the daemon's to delete.
+        h1_7g_git(&root, &["update-ref", &handoff_ref(older3), &moved]);
+        let heads = h1_7g_git(&root, &["for-each-ref", "refs/heads"]);
+
+        let request = w
+            .request(
+                w.owner,
+                "prune-refs",
+                SessionProvider::Codex,
+                "gpt-6-astra",
+                None,
+            )
+            .await;
+        let (receipt, succession) = w.enqueue(w.owner, request).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Queued);
+        w.terminal(w.owner).await;
+        let process = install_controller_candidate_test_process(succession.candidate_session_id);
+        assert_eq!(w.manager.reconcile_manager_actions_once().await.unwrap(), 1);
+        let live = succession.candidate_session_id;
+        let lineage = w
+            .manager
+            .store
+            .lock()
+            .await
+            .manager_handoff_lineage(live, 16)
+            .unwrap();
+        assert_eq!(
+            lineage.iter().map(|hop| hop.session_id).collect::<Vec<_>>(),
+            vec![w.owner, older1, older2, older3]
+        );
+        let refs = || {
+            h1_7g_git(
+                &root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/rsi/",
+                ],
+            )
+        };
+        // The publication prunes off its own path; wait for it.
+        while refs().contains(&handoff_ref(older2)) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut expected = vec![
+            format!("{} {recorded}", handoff_ref(w.owner)),
+            format!("{} {recorded}", handoff_ref(older1)),
+            format!("{} {moved}", handoff_ref(older3)),
+            format!("{} {recorded}", handoff_ref(foreign)),
+        ];
+        expected.sort();
+        let mut listed: Vec<String> = refs().lines().map(str::to_owned).collect();
+        listed.sort();
+        assert_eq!(listed, expected);
+        let own = format!("refs/heads/rsi/{live}");
+        let after: Vec<String> = h1_7g_git(&root, &["for-each-ref", "refs/heads"])
+            .lines()
+            .filter(|line| !line.ends_with(own.as_str()))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(after, heads.lines().map(str::to_owned).collect::<Vec<_>>());
+        // A second pass over the same lineage finds nothing left to prune.
+        assert!(
+            crate::session::manager_succession::prune_manager_handoff_refs(&w.manager.store, live)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        w.stop_scripted(live, &process).await;
+    })
+    .await
+    .expect("handoff-ref prune settles within the fixture deadline");
+}
+
+/// #505: catch-up reaches beyond the former 256-hop limit, retaining only the
+/// audit window, live/pending refs, moved refs and refs outside this lineage.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn handoff_ref_catch_up_covers_300_predecessors_in_bounded_pages_505() {
+    use crate::store::manager_successions::{
+        MANAGER_HANDOFF_LINEAGE_BATCH, ManagerHandoffLineageCursor,
+    };
+    let w = RootWorld::new().await;
+    let root = w.dir.path();
+    let recorded = &w.handoff.source_commit;
+    let moved = h1_7g_git(root, &["commit-tree", "HEAD^{tree}", "-m", "moved"]);
+    let older: Vec<Uuid> = (0..300).map(|_| Uuid::new_v4()).collect();
+    let pending = Uuid::new_v4();
+    let foreign = Uuid::new_v4();
+    {
+        let store = w.manager.store.lock().await;
+        let stamp = crate::store::harness_manager_v2::now();
+        store
+            .conn
+            .execute_batch("PRAGMA foreign_keys=OFF; BEGIN")
+            .unwrap();
+        // Published rows are the immutable source records, as in the #185
+        // fixture above; no provider launch or synthetic operation is needed.
+        for (index, predecessor) in older.iter().enumerate() {
+            let candidate = if index == 0 {
+                w.owner
+            } else {
+                older[index - 1]
+            };
+            let frozen = serde_json::json!({
+                "predecessor": {"working_dir": root},
+                "predecessor_custody": null,
+                "handoff": {"source_commit": recorded},
+            });
+            store
+                .conn
+                .execute(
+                    "INSERT INTO manager_root_successions
+                 (operation_id,project_id,manager_session_id,predecessor_session_id,
+                  candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,
+                  policy_version,authority_epoch,frozen_json,state,row_version,
+                  published_epoch,created_at,updated_at)
+                 VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,?7,'committed',1,1,?8,?8)",
+                    rusqlite::params![
+                        Uuid::new_v4().to_string(),
+                        w.project.to_string(),
+                        predecessor.to_string(),
+                        candidate.to_string(),
+                        Uuid::new_v4().to_string(),
+                        Uuid::new_v4().to_string(),
+                        frozen.to_string(),
+                        stamp
+                    ],
+                )
+                .unwrap();
+        }
+        // Even a pending succession involving an old seat protects that ref;
+        // its unpublished candidate is never followed as a lineage edge.
+        store
+            .conn
+            .execute(
+                "INSERT INTO manager_root_successions
+             (operation_id,project_id,manager_session_id,predecessor_session_id,
+              candidate_session_id,launch_attempt_id,model_invocation_id,scope_version,
+              policy_version,authority_epoch,frozen_json,state,row_version,created_at,updated_at)
+             VALUES(?1,?2,?3,?3,?4,?5,?6,1,1,1,'{}','reserved',1,?7,?7)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    w.project.to_string(),
+                    older[270].to_string(),
+                    pending.to_string(),
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    stamp
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("COMMIT; PRAGMA foreign_keys=ON")
+            .unwrap();
+
+        let mut cursor = ManagerHandoffLineageCursor::new(w.owner);
+        let first = store
+            .manager_handoff_lineage_page(&mut cursor, usize::MAX)
+            .unwrap();
+        let second = store
+            .manager_handoff_lineage_page(&mut cursor, usize::MAX)
+            .unwrap();
+        assert_eq!(first.len(), MANAGER_HANDOFF_LINEAGE_BATCH);
+        assert_eq!(second.len(), 44);
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .map(|hop| hop.session_id)
+                .collect::<Vec<_>>(),
+            older
+        );
+        assert!(second[270 - MANAGER_HANDOFF_LINEAGE_BATCH].protected);
+        assert!(
+            store
+                .manager_handoff_lineage_page(&mut cursor, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let handoff_ref = crate::sandbox::git_worktree::manager_handoff_ref;
+    // Seed every recorded ref in one plumbing call, avoiding 300 subprocesses.
+    let updates: String = older
+        .iter()
+        .copied()
+        .chain([w.owner, pending, foreign])
+        .map(|id| {
+            format!(
+                "update {} {}\n",
+                handoff_ref(id),
+                if id == older[280] {
+                    moved.as_str()
+                } else {
+                    recorded.as_str()
+                }
+            )
+        })
+        .collect();
+    let mut child = Command::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), updates.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    assert!(child.wait().unwrap().success());
+    let heads = h1_7g_git(root, &["for-each-ref", "refs/heads"]);
+
+    let mut pruned =
+        crate::session::manager_succession::prune_manager_handoff_refs(&w.manager.store, w.owner)
+            .await
+            .unwrap();
+    let mut eligible: Vec<Uuid> = older
+        .iter()
+        .copied()
+        .skip(2)
+        .filter(|id| *id != older[270] && *id != older[280])
+        .collect();
+    pruned.sort();
+    eligible.sort();
+    assert_eq!(pruned, eligible);
+    let mut expected: Vec<String> = [w.owner, older[0], older[1], older[270], pending, foreign]
+        .into_iter()
+        .map(|id| format!("{} {recorded}", handoff_ref(id)))
+        .collect();
+    expected.push(format!("{} {moved}", handoff_ref(older[280])));
+    expected.sort();
+    let mut listed: Vec<String> = h1_7g_git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/rsi/manager-handoff/",
+        ],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    listed.sort();
+    assert_eq!(listed, expected);
+    assert_eq!(h1_7g_git(root, &["for-each-ref", "refs/heads"]), heads);
+    assert!(
+        crate::session::manager_succession::prune_manager_handoff_refs(&w.manager.store, w.owner)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Hub #3315: a home seat's `succeed_manager` is refused with its own code
+/// before any git runs, and the operator's home repository is untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn a_home_seat_succeed_manager_is_refused_before_any_git_in_home_3315() {
+    let w = RootWorld::new().await;
+    let home = w.dir.path().to_path_buf();
+    let before = (
+        h1_7g_git(&home, &["rev-parse", "HEAD"]),
+        std::fs::read(home.join(".git/index")).unwrap(),
+        h1_7g_git(&home, &["for-each-ref"]),
+    );
+    let request = w
+        .request(
+            w.owner,
+            "home-seat",
+            SessionProvider::Codex,
+            "gpt-6-astra",
+            None,
+        )
+        .await;
+    {
+        let store = w.manager.store.lock().await;
+        store.ensure_home_project(&home).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET project_id=?2 WHERE id=?1",
+                rusqlite::params![w.owner.to_string(), Project::HOME_ID.to_string()],
+            )
+            .unwrap();
+    }
+    let refused = w
+        .manager
+        .agent_control()
+        .agent_manager_control(w.owner, request)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(Project::HOME_SUCCESSION_REFUSED),
+        "{refused}"
+    );
+    let source = w
+        .manager
+        .store
+        .lock()
+        .await
+        .get_session(w.owner)
+        .unwrap()
+        .unwrap();
+    let handoff = w
+        .manager
+        .custody_execution_runtime()
+        .prepare_manager_handoff(&source, &w.handoff)
+        .await
+        .unwrap_err();
+    assert!(
+        handoff
+            .to_string()
+            .contains(Project::HOME_SUCCESSION_REFUSED),
+        "{handoff}"
+    );
+    let after = (
+        h1_7g_git(&home, &["rev-parse", "HEAD"]),
+        std::fs::read(home.join(".git/index")).unwrap(),
+        h1_7g_git(&home, &["for-each-ref"]),
+    );
+    assert_eq!(after, before);
 }

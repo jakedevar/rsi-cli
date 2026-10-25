@@ -1,0 +1,15 @@
+# Run config (#3181): the S10 step-1 smoke. The Rust runner's oracle agent (#3681) replays each
+# task's reference solution on the 5 smoke tasks, so no model is called and the run
+# costs $0. It proves the runner, Docker, the shard transport and the record end to end
+# before any paid trial. Submit it with `AgentSubmitJob {kind:"bench", params:{config:
+# "eval/bench/tb2/runs/smoke-oracle.toml", budget_usd: 1}}` (the budget is not spent).
+schema_version = 1
+name = "smoke-oracle"
+description = "Oracle agent on the 5 smoke tasks: $0, no model"
+host = "ssh://arch-laptop"
+split = "smoke"
+k = 1
+concurrency = 4
+
+[agent]
+kind = "oracle"

@@ -23,9 +23,9 @@
 //!   - other IO error: logged at warn; falls through to base (or `None`).
 //!   - `None` is never an error: launch is never aborted by preamble loading.
 //!
-//! [`harness_root`] (the daemon's own checkout, discovered once per process) no
-//! longer feeds any session text; it remains for tools and tests that need the
-//! rsi repo's files.
+//! [`harness_root`] (the daemon's own checkout, discovered once per process)
+//! supplies optional role-playbook references through `role_playbook`; it does
+//! not replace a session's project rules or distribute playbook resources.
 
 use super::agent_verbs::agent_authority::{AgentAuthorityProjection, is_baseline_verb};
 use crate::error::{DaemonError, Result};
@@ -396,7 +396,7 @@ continuation (never `fresh` on your own session), `fresh` only for a \
 best-effort post-terminal root launch that carries no lead authority, \
 `on_terminal` for a child watch, `program_guard` for the unattended-program \
 sentinel, or `when` for a wait the daemon evaluates itself (`when.jobs_terminal` \
-job ids you own, `when.sha_on_rolling`, `when.issue_closed` (an Issue number, no SHA needed), `when.todo_closed` (an operator to-do id in your scope; no polling for the operator), `when.topology_execution_settled` (a topology execution id; it succeeded, failed, was cancelled or blocked), `when.settlement_run_settled` (the run id `AgentApplySourceWorktreeCohort` returned; the run finished), or `when.health_anomaly` (a manager seat only: `{}`; the daemon checks health every minute with no model turn and resumes you once per anomaly set, in place of an hourly check-in); optional `timeout_seconds`): submit a \
+job ids you own, `when.sha_on_rolling`, `when.shas_on_rolling` (1-32 distinct commit ids; once all are on rolling, with each SHA's state), `when.issue_closed` (an Issue number, no SHA needed), `when.todo_closed` (an operator to-do id in your scope; no polling for the operator), `when.topology_execution_settled` (a topology execution id; it succeeded, failed, was cancelled or blocked), `when.settlement_run_settled` (the run id `AgentApplySourceWorktreeCohort` returned; the run finished), or `when.health_anomaly` (a manager seat only: `{}`; the daemon checks health every minute with no model turn and resumes you once per anomaly set, in place of an hourly check-in); optional `timeout_seconds`): submit a \
 batch of `AgentSubmitJob` jobs with `wake:\"none\"` and arm ONE `when` wake, so you \
 are resumed once when the last job ends instead of once per job. An explicit \
 `name` replaces your earlier enabled wake of that name.
@@ -476,6 +476,15 @@ pub(crate) fn render_authority_catalog(
     projection: &AgentAuthorityProjection,
     requested: Option<Verb>,
 ) -> Result<AgentAuthorityCatalogV1> {
+    render_authority_catalog_with_root(session_id, projection, requested, harness_root())
+}
+
+fn render_authority_catalog_with_root(
+    session_id: uuid::Uuid,
+    projection: &AgentAuthorityProjection,
+    requested: Option<Verb>,
+    harness: Option<&Path>,
+) -> Result<AgentAuthorityCatalogV1> {
     check_guidance_ids(projection)?;
     let mut guidance = vec![EMBEDDED_COMMON.trim(), EMBEDDED_WORKER.trim()];
     let mut roles = vec!["worker".to_string()];
@@ -489,6 +498,32 @@ pub(crate) fn render_authority_catalog(
             }
         }
     }
+    let mut references = Vec::new();
+    let mut identifiers = Vec::new();
+    if !projection.pending && requested.is_none() {
+        use rsi_common::daemon_handoff::CoordinatorSeatV1;
+        for id in &projection.guidance_ids {
+            let seat = match *id {
+                "manager" => CoordinatorSeatV1::ProjectManager,
+                "epic_lead" => CoordinatorSeatV1::EpicLead {
+                    epic_id: uuid::Uuid::nil(),
+                },
+                "global_manager" | "portfolio_manager" => CoordinatorSeatV1::GlobalManager,
+                _ => continue,
+            };
+            if identifiers.contains(&seat.playbook()) {
+                continue;
+            }
+            identifiers.push(seat.playbook());
+            let location = super::role_playbook::resolve(harness, seat);
+            references.push(format!(
+                "Role playbook identifier (harness-relative): `{}`. {}",
+                seat.playbook(),
+                location.reference()
+            ));
+        }
+    }
+    guidance.extend(references.iter().map(String::as_str));
     let controls: Vec<AgentAuthorityControlV1> = advertised_verbs(projection)
         .map(|verb| {
             let descriptor = verb.descriptor();
@@ -820,9 +855,10 @@ pub fn startup_parts(kind: SessionKind, project_dir: &Path) -> Vec<String> {
     if let Some(router) = load_orchestration_router(project_dir) {
         parts.push(router);
     }
-    if let Some(preamble) = load(kind, project_dir) {
+    if let Some(preamble) = load_project_preamble(project_dir, kind) {
         parts.push(preamble);
     }
+    parts.push(load_generic(Some(project_dir)));
     parts
 }
 
@@ -987,6 +1023,93 @@ mod tests {
                 "assigned_reviewer",
             ],
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+    #[test]
+    fn catalog_uses_selected_harness_references_and_preserves_pending_and_verb_views() {
+        use rsi_common::daemon_handoff::{CoordinatorSeatV1, PlaybookLocationV1};
+        let temp = crate::test_support::disk_backed_tempdir("catalog-playbooks");
+        let harness = temp.path().join("harness");
+        let caller_project = temp.path().join("other-project");
+        let mut projection = all_roles_projection();
+        projection.is_global_manager = true;
+        projection
+            .guidance_ids
+            .extend(["global_manager", "portfolio_manager"]);
+        let mut expected = Vec::new();
+        for seat in [
+            CoordinatorSeatV1::ProjectManager,
+            CoordinatorSeatV1::EpicLead {
+                epic_id: uuid::Uuid::from_u128(1),
+            },
+            CoordinatorSeatV1::GlobalManager,
+        ] {
+            for root in [&harness, &caller_project] {
+                let path = root.join(seat.playbook());
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"fixture role playbook").unwrap();
+            }
+            let path = harness.join(seat.playbook()).canonicalize().unwrap();
+            let location = super::super::role_playbook::resolve(Some(&harness), seat);
+            assert_eq!(
+                location,
+                PlaybookLocationV1::Resolved {
+                    path: path.to_str().unwrap().into()
+                }
+            );
+            expected.push(location.reference());
+        }
+        let id = uuid::Uuid::from_u128(1);
+        let catalog =
+            render_authority_catalog_with_root(id, &projection, None, Some(&harness)).unwrap();
+        assert_eq!(
+            catalog.roles,
+            [
+                "worker",
+                "epic_lead",
+                "manager",
+                "assigned_reviewer",
+                "global_manager",
+                "portfolio_manager"
+            ]
+        );
+        for reference in expected {
+            assert!(catalog.guidance.contains(&reference));
+        }
+        let mut summary = catalog.clone();
+        summary.summarize();
+        assert_eq!(summary.guidance, catalog.guidance);
+        let unavailable = render_authority_catalog_with_root(id, &projection, None, None).unwrap();
+        assert!(
+            unavailable
+                .guidance
+                .contains("Use the binary-shipped role guidance in AgentGetAuthorityCatalog")
+        );
+        assert!(
+            unavailable
+                .guidance
+                .contains("The full playbook/resources were not delivered")
+        );
+
+        let verb = render_authority_catalog_with_root(
+            id,
+            &projection,
+            Some(Verb::GetStatus),
+            Some(&harness),
+        )
+        .unwrap();
+        assert_eq!(verb.guidance, String::new());
+        assert!(verb.controls.is_empty());
+        assert_eq!(verb.control.unwrap().method, "AgentGetStatus");
+        projection.pending = true;
+        let pending =
+            render_authority_catalog_with_root(id, &projection, None, Some(&harness)).unwrap();
+        let pending_without_files =
+            render_authority_catalog_with_root(id, &projection, None, None).unwrap();
+        assert_eq!(pending, pending_without_files);
+        assert_eq!(pending.roles, ["worker"]);
+        assert!(pending.guidance.contains(PENDING_PUBLICATION_NOTE));
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -1722,6 +1845,18 @@ mod tests {
         assert_eq!(
             load_orchestration_router(project.path()).as_deref(),
             Some("PROJECT ROUTER")
+        );
+        assert_eq!(
+            startup_parts(SessionKind::Bug, project.path()),
+            vec![
+                "PROJECT ROUTER".to_string(),
+                "PROJECT BASE\n\nPROJECT BUG".to_string(),
+                load_generic(Some(project.path()))
+            ]
+        );
+        assert_eq!(
+            startup_parts(SessionKind::Bug, project.path()).join("\n\n"),
+            format!("PROJECT ROUTER\n\n{bug}")
         );
 
         // A session started in a subdirectory of the repo resolves the same files.

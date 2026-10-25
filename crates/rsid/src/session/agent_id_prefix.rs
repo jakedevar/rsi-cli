@@ -153,7 +153,7 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
-    type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+    type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
     fn id(text: &str) -> Uuid {
         Uuid::parse_str(text).expect("uuid")
@@ -174,6 +174,7 @@ mod tests {
             project_id: None,
             name: None,
             params: JobParams::Build(BuildJobParams {
+                release_members: Vec::new(),
                 command: BuildCommand::Check,
                 package: None,
                 workspace: true,
@@ -182,6 +183,7 @@ mod tests {
                 no_default_features: false,
                 features: Vec::new(),
                 shards: Vec::new(),
+                bins: Vec::new(),
                 cpu_quota_percent: None,
                 sha: None,
             }),

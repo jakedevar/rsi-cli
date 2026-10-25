@@ -24,6 +24,14 @@ impl RpcServer {
             let installation_id = store.satellite_installation_id()?;
             // Health is additive: a failed read must not hide the identity.
             let health = crate::satellite::health(&store).ok().map(|mut health| {
+                health.governor_disk = Some(rsi_common::satellite::SatelliteGovernorDiskV1 {
+                    free_bytes: qa_host.build.disk_free_bytes,
+                    floor_bytes: qa_host
+                        .build
+                        .disk_floor_gib
+                        .saturating_mul(rsi_common::satellite_qa::GIB_BYTES),
+                    oldest_wait_seconds: qa_host.build.disk_wait_seconds,
+                });
                 health.qa_admission =
                     crate::rolling_queue::satellite_qa::admission(&store, &qa_host).ok();
                 health

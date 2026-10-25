@@ -2,11 +2,11 @@
 //!
 //! The operator owns two dollar caps as daemon settings
 //! (`cloud_spend_stop_line_usd`, `cloud_spend_daily_cap_usd`). rsid mirrors
-//! them into `spend-caps.json` next to the ledger so `scripts/cloud-spend.py`
+//! them into `spend-caps.json` next to the ledger so `rsi-cloud spend`
 //! (called by `scripts/cloud-gate.sh`) reads the operator's value instead of a
 //! hard-coded one. This module parses the human-written ledger
 //! (`~/.rsi/cloud/spend.md`) into the per-run and per-day view the operator
-//! RPC (`GetCloudSpend`) and the Settings row show. `scripts/cloud-spend.py`
+//! RPC (`GetCloudSpend`) and the Settings row show. `rsi-cloud spend`
 //! parses the same ledger with the same rules.
 
 use chrono::NaiveDate;
@@ -218,7 +218,10 @@ Gate window i-c: stop 2026-09-30T00:09:47Z, est compute $1.25 at $1.78/h; ok.\n"
         assert_eq!(report.grant_usd, Some(100.0));
         assert_eq!(report.header_stop_line_usd, Some(90.0));
         assert_eq!(
-            report.runs.last().map(|run| (run.label.as_str(), run.est_usd)),
+            report
+                .runs
+                .last()
+                .map(|run| (run.label.as_str(), run.est_usd)),
             Some(("Gate window i-c", 1.25))
         );
         assert_eq!(
@@ -227,7 +230,11 @@ Gate window i-c: stop 2026-09-30T00:09:47Z, est compute $1.25 at $1.78/h; ok.\n"
                 .iter()
                 .map(|d| (d.date.as_str(), d.est_usd))
                 .collect::<Vec<_>>(),
-            vec![("2026-09-28", 0.53), ("2026-09-29", 3.5), ("2026-09-30", 1.25)]
+            vec![
+                ("2026-09-28", 0.53),
+                ("2026-09-29", 3.5),
+                ("2026-09-30", 1.25)
+            ]
         );
         assert!(!report.stop_line_reached && !report.daily_cap_reached);
     }

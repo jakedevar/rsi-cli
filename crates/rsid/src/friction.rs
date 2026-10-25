@@ -117,7 +117,7 @@ fn friction_line_declares_none(line: &str) -> bool {
 }
 
 /// Record one event; friction telemetry never fails the observed operation.
-pub async fn note(store: &tokio::sync::Mutex<Store>, event: NewFrictionEventV1) {
+pub async fn note(store: &rsid_core::store_lock::Mutex<Store>, event: NewFrictionEventV1) {
     if let Err(error) = store.lock().await.record_friction_event(&event) {
         tracing::warn!(signature = %event.signature, %error, "friction event not recorded");
     }
@@ -142,6 +142,8 @@ pub async fn run_andon_loop(manager: Arc<SessionManager>) {
     let mut interval = andon_ticker();
     loop {
         interval.tick().await;
+        // #261: a helper outage opened by a caller without the store.
+        crate::memory::helper_breaker::drain_friction(manager.store()).await;
         let swept = manager.store().lock().await.andon_sweep(chrono::Utc::now());
         match swept {
             Ok(filed) => {

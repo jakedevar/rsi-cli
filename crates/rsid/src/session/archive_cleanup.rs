@@ -662,7 +662,7 @@ fn archive_cleanup_route_applies(session: &Session) -> bool {
 }
 
 fn resume_or_start_cleanup_blocking(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     sandbox_base: &Path,
     session_id: Uuid,
 ) -> Result<ArchiveCleanupReceiptV1> {
@@ -713,7 +713,7 @@ fn resume_or_start_cleanup_blocking(
 }
 
 fn resume_run_with_repository_lock(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     sandbox_base: &Path,
     run: ArchiveCleanupRun,
 ) -> Result<ArchiveCleanupReceiptV1> {
@@ -723,7 +723,7 @@ fn resume_run_with_repository_lock(
 }
 
 fn resume_run_locked(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     sandbox_base: &Path,
     mut run: ArchiveCleanupRun,
 ) -> Result<ArchiveCleanupReceiptV1> {
@@ -1159,7 +1159,7 @@ fn resume_run_locked(
 }
 
 fn load_candidate(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: Uuid,
 ) -> Result<(Session, PersistedCustody)> {
     let store = store.blocking_lock_checked()?;
@@ -1181,7 +1181,7 @@ fn load_candidate(
 }
 
 fn prove_original_candidate(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     sandbox_base: &Path,
     session: &Session,
     custody: &PersistedCustody,
@@ -1325,7 +1325,7 @@ fn prove_original_candidate(
 }
 
 fn candidate_inventory(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session: &Session,
     custody: &PersistedCustody,
 ) -> Result<crate::store::cohort_settlement::SourceWorktreeInventoryRow> {
@@ -1444,7 +1444,7 @@ fn intent_matches_run(intent: &NewArchiveCleanupIntent, run: &ArchiveCleanupRun)
 }
 
 fn prove_quarantine_candidate(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
 ) -> Result<ArchiveRemovalAuthorityV1> {
     let origin = Path::new(&run.canonical_repo_dir);
@@ -1526,7 +1526,7 @@ fn prove_quarantine_candidate(
 }
 
 fn validate_run_inventory(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
 ) -> Result<()> {
     let (session, custody) = load_candidate(store, run.session_id)?;
@@ -1563,7 +1563,7 @@ fn validate_run_inventory(
 }
 
 fn run_dependency_digest(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
 ) -> Result<String> {
     let store = store.blocking_lock_checked()?;
@@ -1670,7 +1670,7 @@ fn canonical_marker(marker: &ArchiveRemovalAuthorityV1) -> Result<String> {
 }
 
 fn terminalize_run(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
     phase: ArchiveCleanupPhaseV1,
     code: ArchiveCleanupSafeCodeV1,
@@ -1758,7 +1758,7 @@ fn classify_effect_error(error: DaemonError, run: &ArchiveCleanupRun) -> DaemonE
 }
 
 fn terminal_effect_error(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     run: &ArchiveCleanupRun,
     code: ArchiveCleanupSafeCodeV1,
     detail: &str,
@@ -1847,7 +1847,7 @@ mod tests {
 
     struct CleanupFixture {
         _temp: tempfile::TempDir,
-        store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
         sandbox_base: PathBuf,
         database: PathBuf,
         repository: PathBuf,
@@ -1968,7 +1968,7 @@ mod tests {
                 .expect("insert live custody session");
             Self {
                 _temp: temp,
-                store: Arc::new(tokio::sync::Mutex::new(store)),
+                store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
                 sandbox_base,
                 database,
                 repository,
@@ -2149,7 +2149,7 @@ mod tests {
                 memory_dir.to_path_buf(),
                 memory_db.to_path_buf(),
             );
-            let main_store = Arc::new(tokio::sync::Mutex::new(
+            let main_store = Arc::new(rsid_core::store_lock::Mutex::new(
                 crate::store::Store::open_test_fixture(&self.database).expect("memory main store"),
             ));
             let (tx, rx) = tokio::sync::mpsc::channel(8);

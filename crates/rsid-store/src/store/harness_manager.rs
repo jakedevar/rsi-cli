@@ -257,8 +257,9 @@ pub(super) const MANAGER_REQUEST_ROW: &str = "request_id IS NULL AND request_fin
 
 /// Settlement markers (#664). Each is an append-only v2 record keyed by the
 /// request id in the request's own (project, anchor, scope) — never a message
-/// rewrite. `request_settle` is a settlement (today only the daemon's
-/// `lead_replaced` orphan disposition); `request_released` is the permanent
+/// rewrite. `request_settle` is a settlement (the daemon's `lead_replaced`
+/// orphan disposition or the sending manager's `withdrawn` disposition);
+/// `request_released` is the permanent
 /// capacity release written when the lead reports a terminal state.
 pub(super) const REQUEST_SETTLE_KIND: &str = "request_settle";
 pub(super) const REQUEST_RELEASED_KIND: &str = "request_released";
@@ -388,6 +389,10 @@ struct NodeMailAddress {
 
 const NODE_MAIL_ADDRESS_KIND: &str = "node_mail_address";
 const NODE_MAIL_READ_KIND: &str = "node_mail_read";
+/// #3363: a manager principal has been shown this lead notice. Keyed by the
+/// message id under the stable manager principal, so it carries across seat
+/// succession; a default inbox read then returns only unread notices.
+const LEAD_NOTICE_READ_KIND: &str = "lead_notice_read";
 
 impl StoredMessage {
     /// Lead-origin informational notice (#404), fixed at insert time.
@@ -442,6 +447,7 @@ fn read_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
             })?,
             replied: false,
             informational: request_fingerprint.starts_with(MANAGER_INFO_FINGERPRINT_PREFIX),
+            reply_instruction: None,
             readdressed_from: None,
             standing_root_id: None,
         },
@@ -743,6 +749,17 @@ impl Store {
         epic: Uuid,
         caller: Uuid,
     ) -> Result<()> {
+        self.mark_manager_mail_read_kind(config, NODE_MAIL_READ_KIND, message, epic, caller)
+    }
+
+    fn mark_manager_mail_read_kind(
+        &self,
+        config: &HarnessManagerConfigV1,
+        kind: &str,
+        message: Uuid,
+        epic: Uuid,
+        caller: Uuid,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO harness_manager_v2_events(project_id,manager_session_id,scope_version,
              actor_session_id,kind,record_key,row_version,payload_json,created_at)
@@ -754,7 +771,7 @@ impl Store {
                 config.manager_session_id.to_string(),
                 config.row_version,
                 caller.to_string(),
-                NODE_MAIL_READ_KIND,
+                kind,
                 message.to_string(),
                 serde_json::json!({"epic_id":epic}).to_string(),
                 stamp()
@@ -1711,6 +1728,8 @@ impl Store {
         // #2469: open requests of the replaced tuple follow to the live seat.
         if let Some(previous) = &previous {
             self.adopt_open_manager_requests(previous, &config)?;
+            // #3274: the open topology executions of the displaced seat follow.
+            self.adopt_displaced_seat_executions(previous, &config)?;
         }
         self.sync_legacy_manager_root_on(tx, project_id)?;
         let config = self
@@ -2349,13 +2368,21 @@ impl Store {
                 .notice_kind
                 .as_deref()
                 .is_none_or(|kind| kind == "message");
+        // #3363: a routine manager read returns each informational lead notice
+        // once. Replays (`include_sent`, an exact request, `fields:"full"`)
+        // and node-addressed reads still see the whole history.
+        let hide_read_lead_notices = is_manager && node.is_none() && !include_sent;
         let query = format!(
             "SELECT {MESSAGE_COLUMNS} FROM harness_manager_messages m
             WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3 AND sequence>?4
             AND (?5 IS NULL OR epic_id=?5) AND (?6 IS NULL
               OR id IN (SELECT value FROM json_each(?6)) OR request_id IN (SELECT value FROM json_each(?6)))
             AND (?10 OR request_id IS NOT NULL
-                OR substr(request_fingerprint,1,length(?11))=?11)
+                OR (substr(request_fingerprint,1,length(?11))=?11
+                    AND (?13=0 OR NOT EXISTS (
+                        SELECT 1 FROM harness_manager_v2_events r
+                        WHERE r.project_id=m.project_id AND r.manager_session_id=m.manager_session_id
+                        AND r.scope_version=m.scope_version AND r.kind=?12 AND r.record_key=m.id))))
             AND (?8=0 OR (?9 IS NULL AND NOT EXISTS (
                 SELECT 1 FROM harness_manager_v2_events a WHERE a.project_id=m.project_id
                 AND a.manager_session_id=m.manager_session_id AND a.scope_version=m.scope_version
@@ -2384,7 +2411,9 @@ impl Store {
                         is_manager as i64,
                         node.map(|id| id.to_string()),
                         include_sent,
-                        LEAD_NOTICE_FINGERPRINT_PREFIX
+                        LEAD_NOTICE_FINGERPRINT_PREFIX,
+                        LEAD_NOTICE_READ_KIND,
+                        i64::from(hide_read_lead_notices)
                     ],
                     read_message,
                 )?
@@ -2417,7 +2446,38 @@ impl Store {
                 };
                 record.public.readdressed_from = readdressed_from;
                 record.public.standing_root_id = standing_root_id;
+                // Use the live attention predicate, including running/reopened
+                // requests and excluding informational or settled mail.
+                if !is_manager
+                    && self.conn.query_row(
+                        &format!(
+                            "SELECT EXISTS(SELECT 1 FROM harness_manager_messages m
+                             WHERE m.id=?1 AND {})",
+                            manager_request_unanswered_sql()
+                        ),
+                        [record.public.message_id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )?
+                {
+                    record.public.reply_instruction = Some(format!(
+                        "reply with AgentManagerReply request_id={}",
+                        record.public.message_id
+                    ));
+                }
                 messages.push(record.public);
+            }
+        }
+        if is_manager && node.is_none() && read_messages {
+            for message in &messages {
+                if message.request_id.is_none() {
+                    self.mark_manager_mail_read_kind(
+                        &config,
+                        LEAD_NOTICE_READ_KIND,
+                        message.message_id,
+                        message.epic_id,
+                        caller,
+                    )?;
+                }
             }
         }
         let mut routes_read = BTreeSet::new();
@@ -2454,7 +2514,7 @@ impl Store {
         if node.is_some() && !request.read_notice_ids.is_empty() {
             return Err(refused("manager_notice_not_authorized"));
         }
-        let (notices, more_notices, next_after_notice_sequence) = if node.is_some() {
+        let (mut notices, more_notices, next_after_notice_sequence) = if node.is_some() {
             (Vec::new(), false, None)
         } else if !request.read_notice_ids.is_empty() {
             // #3068: an exact re-read pages and drains nothing else.
@@ -2471,6 +2531,35 @@ impl Store {
         } else {
             self.retrieve_manager_notices_page(&config, caller, is_manager, request)?
         };
+        // #3914: the message page can contain only mail for former leads,
+        // filtered out after LIMIT. A message notice must still carry its
+        // body, including on exact re-reads of already-retained ID-only notices.
+        // Project at read time so scope/lead changes cannot expose stale mail.
+        if !is_manager && request.fields != AgentManagerInboxFieldsV1::Summary {
+            for notice in &mut notices {
+                if notice.kind != "message" {
+                    continue;
+                }
+                let Ok(id) = Uuid::parse_str(&notice.subject_id) else {
+                    continue;
+                };
+                let Some(record) = self.get_manager_message(id)? else {
+                    continue;
+                };
+                if Some(record.public.epic_id) == notice.epic_id
+                    && record.public.request_id.is_none()
+                    && !record.is_lead_notice()
+                    && self.manager_message_live(&config, &record)?
+                    && let Some(state) = notice.state.as_object_mut()
+                {
+                    state.insert("message".into(), serde_json::json!(record.public.message));
+                    state.insert(
+                        "informational".into(),
+                        serde_json::json!(record.public.informational),
+                    );
+                }
+            }
+        }
         let manager_seat = self.manager_seat_state(&config)?;
         tx.commit()?;
         // #1266: read after the retrieval commits (lineage reads open their
@@ -4920,6 +5009,7 @@ impl Store {
     }
 }
 
+mod execution_adoption;
 mod seat_mail_adoption;
 
 #[cfg(test)]
@@ -5500,6 +5590,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let withdraw = AgentManagerUpdateRequestV2 {
+            project_id: None,
+            fence: ManagerFenceV2 {
+                scope_version: 1,
+                policy_version: 1,
+            },
+            idempotency_key: "area-request-withdraw".into(),
+            change: ManagerUpdateV2::RequestWithdraw {
+                request_id: sent.message_id,
+                expected_row_version: 1,
+                reason: "Replaced by the revised area request".into(),
+            },
+        };
+        // The covering project manager is a different sending slot.
+        let error = f
+            .store
+            .manager_v2_commit_update(f.manager, &withdraw, &LedgerObservation::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("manager_v2_request_out_of_scope")
+        );
+        f.store
+            .manager_v2_commit_update(seat, &withdraw, &LedgerObservation::default())
+            .unwrap();
+        let rows = f
+            .store
+            .manager_v2_request_rows(&authority.config, Some(f.epics[0]), "", 32, false)
+            .unwrap();
+        assert_eq!(rows[0]["settlement"], "withdrawn");
+        assert_eq!(rows[0]["unanswered"], false);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -7566,8 +7688,10 @@ mod tests {
         );
         // Restoring the predecessor atomically retires its receipt. A later
         // ordinary archive cannot resurrect the old successor's authority.
+        // #667 fences the API writers, so the unfenced transition the V103
+        // trigger backstops is simulated with the raw test seam (#4005).
         f.store
-            .update_session_status(f.manager, SessionStatus::Completed)
+            .unfenced_status_write_for_test(f.manager, SessionStatus::Completed)
             .unwrap();
         f.store
             .update_session_status(f.manager, SessionStatus::Archived)

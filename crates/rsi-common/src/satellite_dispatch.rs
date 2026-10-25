@@ -66,13 +66,20 @@ const REMOTE_STOP_REASON_MAX_BYTES: usize = 64;
 /// the session recorded no reason.
 #[must_use]
 pub fn remote_terminal_refusal(status: &str, stop_reason: Option<&str>) -> String {
-    let status: String = status
-        .chars()
-        .filter(|c| c.is_ascii_lowercase() || *c == '_')
-        .collect();
-    let reason: String = stop_reason
-        .unwrap_or_default()
-        .chars()
+    remote_terminal_refusal_with_terminal(status, stop_reason, None)
+}
+
+/// Marker that precedes the target's persisted `terminal_reason` inside the
+/// third (reason) slot of a `remote_terminal` refusal (hub #3859):
+/// `remote_terminal|failed|<stop reason>;terminal_reason=<terminal reason>`.
+/// It stays inside the existing three-part wire, so a hub that predates it
+/// shows the whole slot as the stop reason and still parses the token.
+pub const REMOTE_TERMINAL_REASON_MARKER: &str = ";terminal_reason=";
+
+/// Reduce free text to a short wire token: ASCII letters, digits and
+/// `_ - . :` only, at most `max` bytes. Anything else becomes `_`.
+fn wire_token(text: &str, max: usize) -> String {
+    text.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':') {
                 c
@@ -80,16 +87,146 @@ pub fn remote_terminal_refusal(status: &str, stop_reason: Option<&str>) -> Strin
                 '_'
             }
         })
-        .take(REMOTE_STOP_REASON_MAX_BYTES)
+        .take(max)
+        .collect()
+}
+
+/// [`remote_terminal_refusal`] that also carries the target's persisted
+/// `terminal_reason` (for example `api_error` for a provider weekly limit),
+/// reduced to the same token alphabet, when the session recorded one.
+#[must_use]
+pub fn remote_terminal_refusal_with_terminal(
+    status: &str,
+    stop_reason: Option<&str>,
+    terminal_reason: Option<&str>,
+) -> String {
+    let status: String = status
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || *c == '_')
         .collect();
+    let reason = wire_token(
+        stop_reason.unwrap_or_default(),
+        REMOTE_STOP_REASON_MAX_BYTES,
+    );
     let reason = if reason.is_empty() {
         "none".into()
     } else {
         reason
     };
+    let terminal = wire_token(
+        terminal_reason.unwrap_or_default(),
+        REMOTE_STOP_REASON_MAX_BYTES,
+    );
+    let terminal = if terminal.is_empty() {
+        String::new()
+    } else {
+        format!("{REMOTE_TERMINAL_REASON_MARKER}{terminal}")
+    };
     format!(
-        "{SATELLITE_WAITING_REMOTE_TERMINAL}{REMOTE_TERMINAL_SEP}{status}{REMOTE_TERMINAL_SEP}{reason}"
+        "{SATELLITE_WAITING_REMOTE_TERMINAL}{REMOTE_TERMINAL_SEP}{status}{REMOTE_TERMINAL_SEP}{reason}{terminal}"
     )
+}
+
+/// Split the reason slot of a `remote_terminal` wait into the stop reason and
+/// the target's `terminal_reason`, when the satellite carried one.
+#[must_use]
+pub fn split_terminal_reason(slot: &str) -> (&str, Option<&str>) {
+    match slot.split_once(REMOTE_TERMINAL_REASON_MARKER) {
+        Some((stop, terminal)) if !terminal.is_empty() => (stop, Some(terminal)),
+        _ => (slot, None),
+    }
+}
+
+/// Tag that opens the typed report a satellite queues when its appointed
+/// manager seat is not live (hub #3859). The report is a `RESULT` line.
+pub const SATELLITE_MANAGER_SEAT_FAILED_TAG: &str = "satellite_manager_seat_failed";
+/// Longest provider limit text carried in a seat report, in bytes.
+const SEAT_REPORT_LIMIT_TEXT_MAX_BYTES: usize = 160;
+
+/// What a satellite reports about its failed manager seat. Every field is
+/// daemon-observed; the line holds ids, tokens, a timestamp and one short
+/// provider limit sentence, never credentials or personal data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SatelliteManagerSeatFailedV1<'a> {
+    pub project: Uuid,
+    /// The satellite's own installation id (the hub's peer).
+    pub peer: Option<Uuid>,
+    pub seat: Uuid,
+    /// `down`, `recovering` or `exhausted`.
+    pub state: &'a str,
+    pub terminal_reason: Option<&'a str>,
+    /// The seat's typed reason (`manager_seat_usage_limit_hold`, ...).
+    pub reason: &'a str,
+    /// When the provider window resets, when the daemon knows it.
+    pub reset_at: Option<DateTime<Utc>>,
+    /// The provider's own limit sentence, when the daemon recorded one.
+    pub limit_text: Option<&'a str>,
+}
+
+/// The short provider limit sentence worth carrying, or `None`: one line, no
+/// control characters, at most 160 bytes, and only text that talks about a
+/// limit, quota or reset (any other error text may hold anything).
+#[must_use]
+pub fn seat_report_limit_text(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    if !["limit", "quota", "reset", "usage"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        return None;
+    }
+    let one_line: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('"', "'");
+    let mut end = one_line.len().min(SEAT_REPORT_LIMIT_TEXT_MAX_BYTES);
+    while !one_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = one_line[..end].trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+impl SatelliteManagerSeatFailedV1<'_> {
+    /// The single `RESULT` line:
+    /// `satellite_manager_seat_failed project=<uuid> peer=<uuid|none>
+    /// seat=<uuid> state=<..> terminal_reason=<tok|none> reason=<tok>
+    /// reset_at=<rfc3339|none> limit="<text>"`. Always valid report text and
+    /// at most 1024 bytes (the limit text is the only free part and is cut
+    /// first).
+    #[must_use]
+    pub fn report_text(&self) -> String {
+        let token = |text: Option<&str>| {
+            text.map(|t| wire_token(t, REMOTE_STOP_REASON_MAX_BYTES))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "none".into())
+        };
+        let reset = self.reset_at.map_or_else(
+            || "none".to_string(),
+            |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        let peer = self
+            .peer
+            .map_or_else(|| "none".to_string(), |peer| peer.to_string());
+        let mut text = format!(
+            "{SATELLITE_MANAGER_SEAT_FAILED_TAG} project={} peer={peer} seat={} state={} \
+             terminal_reason={} reason={} reset_at={reset}",
+            self.project,
+            self.seat,
+            token(Some(self.state)),
+            token(self.terminal_reason),
+            token(Some(self.reason)),
+        );
+        let limit = self.limit_text.and_then(seat_report_limit_text);
+        if let Some(limit) = limit {
+            text.push_str(&format!(" limit=\"{limit}\""));
+        }
+        text
+    }
 }
 
 /// The `remote_terminal|<status>|<reason>` token inside a refusal message or a
@@ -636,12 +773,14 @@ pub const SATELLITE_REPORT_RETAINED_MAX_PER_PEER: i64 = 2048;
 /// hub, or not the appointed manager. Static text, nothing about the satellite.
 pub const SATELLITE_REPORT_NOT_AUTHORIZED: &str = "satellite_report_not_authorized";
 pub const SATELLITE_REPORT_INVALID: &str = "satellite_report_invalid";
+pub const SATELLITE_REPORT_BINARIES_DIR_REQUIRED: &str = "satellite_report_binaries_dir_required";
+pub const SATELLITE_REPORT_BINARIES_DIR_NOT_ABSOLUTE: &str =
+    "satellite_report_binaries_dir_not_absolute";
+pub const SATELLITE_REPORT_BINARIES_DIR_UNRESOLVABLE: &str =
+    "satellite_report_binaries_dir_unresolvable";
+pub const SATELLITE_REPORT_BINARIES_DIR_NOT_ALLOWED: &str =
+    "satellite_report_binaries_dir_not_allowed";
 pub const SATELLITE_REPORT_QUEUE_FULL: &str = "satellite_report_queue_full";
-/// Typed refusal of a new report while the hub is demonstrably not pulling:
-/// the oldest queued report is past [`SATELLITE_REPORT_UNDELIVERED_AFTER_SECS`]
-/// and no hub pull has been seen for as long. The manager keeps the report
-/// (for example in its own outbox note) instead of trusting a `queued` receipt.
-pub const SATELLITE_REPORT_HUB_UNREACHABLE: &str = "satellite_report_hub_unreachable";
 /// A report nothing has happened to for this long is `undelivered`. The hub
 /// pulls every 15 seconds, so this is twelve missed pulls.
 pub const SATELLITE_REPORT_UNDELIVERED_AFTER_SECS: i64 = 180;
@@ -696,13 +835,29 @@ pub fn validate_satellite_report_text(text: &str) -> Result<(), &'static str> {
 pub struct AgentReportToHubRequestV1 {
     pub kind: SatelliteReportKindV1,
     pub text: String,
+    /// Required for deploy_ready only. The satellite expands ~/ and resolves
+    /// this existing directory under its own staging root before queueing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries_dir: Option<String>,
 }
 
 impl AgentReportToHubRequestV1 {
     /// # Errors
-    /// The stable code of the invalid text.
+    /// The stable code of invalid text or a missing/wrong-kind source field.
     pub fn validate(&self) -> Result<(), &'static str> {
-        validate_satellite_report_text(&self.text)
+        validate_satellite_report_text(&self.text)?;
+        validate_report_source(self.kind, self.binaries_dir.as_deref())
+    }
+}
+
+fn validate_report_source(
+    kind: SatelliteReportKindV1,
+    dir: Option<&str>,
+) -> Result<(), &'static str> {
+    match (kind, dir) {
+        (SatelliteReportKindV1::DeployReady, None) => Err(SATELLITE_REPORT_BINARIES_DIR_REQUIRED),
+        (SatelliteReportKindV1::DeployReady, Some(_)) | (_, None) => Ok(()),
+        (_, Some(_)) => Err(SATELLITE_REPORT_INVALID),
     }
 }
 
@@ -714,6 +869,12 @@ pub struct AgentReportToHubReceiptV1 {
     /// Read what became of it in `AgentGetDaemonInfo` `hub_reports`
     /// (`delivered`, `held`, `refused` or the typed failure `undelivered`).
     pub state: String,
+    /// Why the report is queued but not yet fetched (#530): `hub_not_pulling`
+    /// when it was accepted while the hub had not pulled for longer than a
+    /// report may wait. It keeps its place in the durable backlog and goes out,
+    /// in arrival order, on the next pull. Absent for an ordinary receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Advisory only, never a refusal (#276): `sha_not_on_origin: <sha>` for
     /// each 40-hex SHA the report text names that no origin ref the
     /// satellite can see contains, so the hub could not fetch it.
@@ -819,9 +980,10 @@ pub struct SatelliteReportStatusV1 {
     /// until the first pull since this daemon started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_hub_pull_at: Option<String>,
-    /// Whether a new report would be accepted: false once the hub has not
-    /// pulled for [`SATELLITE_REPORT_UNDELIVERED_AFTER_SECS`] with a report
-    /// waiting (`AgentReportToHub` then refuses `satellite_report_hub_unreachable`).
+    /// Whether the hub is fetching reports: false once it has not pulled for
+    /// [`SATELLITE_REPORT_UNDELIVERED_AFTER_SECS`] with a report waiting
+    /// (`AgentReportToHub` then still accepts a report, with receipt reason
+    /// `hub_not_pulling`, #530).
     pub hub_pulling: bool,
     /// Depth, oldest pending report and per-kind counts (#135).
     #[serde(default)]
@@ -909,6 +1071,58 @@ pub struct SatelliteReportV1 {
     pub report_id: Uuid,
     pub kind: SatelliteReportKindV1,
     pub text: String,
+    /// Absolute path on the satellite, resolved before enqueueing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binaries_dir: Option<String>,
+}
+
+impl SatelliteReportV1 {
+    /// Validate a pulled report without consulting the hub's filesystem.
+    /// # Errors
+    /// The stable report or binaries-directory refusal code.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_satellite_report_text(&self.text)?;
+        validate_report_source(self.kind, self.binaries_dir.as_deref())?;
+        if self
+            .binaries_dir
+            .as_deref()
+            .is_some_and(|dir| !std::path::Path::new(dir).is_absolute())
+        {
+            return Err(SATELLITE_REPORT_BINARIES_DIR_NOT_ABSOLUTE);
+        }
+        Ok(())
+    }
+}
+
+/// #237: the hub's refusal of a DEPLOY-READY that has neither the typed
+/// `binaries_dir` nor one valid [`SATELLITE_REPORT_LEGACY_BINARIES_DIR_TOKEN`]
+/// in its text. Only a satellite whose `AgentReportToHub` predates the typed
+/// field sends such a report, and the verdict reason (a static snake_case
+/// class of at most 64 bytes) is all it records, so the class names the
+/// fallback: add `binaries_dir=<absolute path>` to the text.
+pub const SATELLITE_REPORT_BINARIES_DIR_REQUIRED_ADD_TO_TEXT: &str =
+    "satellite_report_binaries_dir_required_add_binaries_dir_to_text";
+
+/// #237: the text token that carries `binaries_dir` in a DEPLOY-READY from a
+/// satellite whose schema refuses the typed field.
+pub const SATELLITE_REPORT_LEGACY_BINARIES_DIR_TOKEN: &str = "binaries_dir=";
+
+/// #237: the satellite binaries directory a legacy DEPLOY-READY names in its
+/// text, or `None`. Strict: the text holds `binaries_dir=` exactly once, as
+/// the start of a whitespace-separated word, and the rest of that word is an
+/// absolute path with no `~` and no `..`. The hub never expands or resolves
+/// it; the deploy on the satellite checks it against its own staging root.
+#[must_use]
+pub fn legacy_report_text_binaries_dir(text: &str) -> Option<&str> {
+    let token = SATELLITE_REPORT_LEGACY_BINARIES_DIR_TOKEN;
+    if text.matches(token).count() != 1 {
+        return None;
+    }
+    let dir = text
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(token))?;
+    let absolute = std::path::Path::new(dir).is_absolute();
+    (absolute && !dir.contains('~') && !dir.contains("..")).then_some(dir)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,6 +1145,79 @@ mod tests {
             expires_at: None,
             issue_refs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn deploy_ready_requires_a_typed_path_and_other_report_kinds_keep_their_wire_shape() {
+        for kind in ["enqueue", "result"] {
+            let value = serde_json::json!({"kind": kind, "text": "report"});
+            let request: AgentReportToHubRequestV1 = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(request.validate(), Ok(()));
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let mut request: AgentReportToHubRequestV1 = serde_json::from_value(
+            serde_json::json!({"kind": "deploy_ready", "text": "DEPLOY READY"}),
+        )
+        .unwrap();
+        assert_eq!(
+            request.validate(),
+            Err(SATELLITE_REPORT_BINARIES_DIR_REQUIRED)
+        );
+        request.binaries_dir = Some("~/.rsi/staging/bin-test".into());
+        assert_eq!(
+            request.validate(),
+            Ok(()),
+            "the satellite expands before queueing"
+        );
+        request.kind = SatelliteReportKindV1::Result;
+        assert_eq!(request.validate(), Err(SATELLITE_REPORT_INVALID));
+    }
+
+    /// #237: an older satellite carries its binaries directory as one text
+    /// token; only a single absolute path without `~` or `..` is taken.
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_deploy_ready_text_token_is_parsed_strictly() {
+        for (text, expected) in [
+            (
+                "DEPLOY READY abc binaries_dir=/home/u/.rsi/staging/bin-abc",
+                Some("/home/u/.rsi/staging/bin-abc"),
+            ),
+            (
+                "binaries_dir=/home/u/.rsi/staging/bin-abc\nbuilt from abc",
+                Some("/home/u/.rsi/staging/bin-abc"),
+            ),
+            ("DEPLOY READY abc", None),
+            ("DEPLOY READY binaries_dir=", None),
+            ("DEPLOY READY binaries_dir=.rsi/staging/bin-abc", None),
+            ("DEPLOY READY binaries_dir=~/.rsi/staging/bin-abc", None),
+            ("DEPLOY READY binaries_dir=/home/u/~/bin-abc", None),
+            (
+                "DEPLOY READY binaries_dir=/home/u/.rsi/staging/../bin",
+                None,
+            ),
+            ("DEPLOY READY binaries_dir=/a/bin binaries_dir=/b/bin", None),
+            ("DEPLOY READY binaries_dir=/a/bin binaries_dir=/a/bin", None),
+            ("DEPLOY READY x,binaries_dir=/a/bin", None),
+        ] {
+            assert_eq!(legacy_report_text_binaries_dir(text), expected, "{text}");
+        }
+    }
+
+    /// #237: the legacy refusal travels as a verdict reason, which an older
+    /// satellite validates as a short snake_case class.
+    #[test]
+    fn the_legacy_binaries_dir_refusal_is_a_valid_verdict_reason() {
+        let outcome = SatelliteReportOutcomeV1 {
+            report_id: Uuid::new_v4(),
+            verdict: SatelliteReportVerdictV1::Refused,
+            reason: SATELLITE_REPORT_BINARIES_DIR_REQUIRED_ADD_TO_TEXT.into(),
+        };
+        assert_eq!(outcome.validate(), Ok(()));
+        assert!(
+            SATELLITE_REPORT_BINARIES_DIR_REQUIRED_ADD_TO_TEXT
+                .ends_with("add_binaries_dir_to_text")
+        );
     }
 
     #[test]
@@ -965,6 +1252,26 @@ mod tests {
             remote_terminal_refusal("deleted", None),
             "remote_terminal|deleted|none"
         );
+        // hub #3859: the target's terminal_reason rides in the reason slot.
+        let with_terminal =
+            remote_terminal_refusal_with_terminal("failed", Some("end_turn"), Some("api_error"));
+        assert_eq!(
+            with_terminal,
+            "remote_terminal|failed|end_turn;terminal_reason=api_error"
+        );
+        let message = format!("Policy denied: {with_terminal}");
+        let token = find_remote_terminal(&message).unwrap();
+        let (_, status, slot) = split_waiting_for(token);
+        assert_eq!(status.as_deref(), Some("failed"));
+        assert_eq!(
+            split_terminal_reason(&slot.unwrap()),
+            ("end_turn", Some("api_error"))
+        );
+        assert_eq!(split_terminal_reason("end_turn"), ("end_turn", None));
+        assert_eq!(
+            remote_terminal_refusal_with_terminal("failed", None, Some("a b|c")),
+            "remote_terminal|failed|none;terminal_reason=a_b_c"
+        );
         // Other waits and refusals are not terminal.
         assert!(find_remote_terminal("Policy denied: busy").is_none());
         assert_eq!(
@@ -991,10 +1298,12 @@ mod tests {
         let receipt = AgentReportToHubReceiptV1 {
             report_id: Uuid::new_v4(),
             state: "queued".into(),
+            reason: None,
             warnings: Vec::new(),
         };
         let value = serde_json::to_value(&receipt).unwrap();
         assert!(value.get("warnings").is_none());
+        assert!(value.get("reason").is_none());
     }
 
     #[test]
@@ -1230,5 +1539,61 @@ mod tests {
         assert_eq!(wire["state"], "undelivered");
         assert_eq!(wire["kind"], "deploy_ready");
         assert_eq!(wire["reason"], "hub_not_pulling");
+    }
+
+    #[test]
+    fn seat_failed_report_is_one_short_typed_line() {
+        let (project, peer, seat) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        use chrono::TimeZone;
+        let reset = Utc.with_ymd_and_hms(2026, 10, 27, 9, 0, 0).unwrap();
+        let report = SatelliteManagerSeatFailedV1 {
+            project,
+            peer: Some(peer),
+            seat,
+            state: "recovering",
+            terminal_reason: Some("api_error"),
+            reason: "manager_seat_usage_limit_hold",
+            reset_at: Some(reset),
+            limit_text: Some("You've hit your weekly limit \u{b7} resets Oct 27,\n9am"),
+        };
+        let text = report.report_text();
+        assert_eq!(
+            text,
+            format!(
+                "satellite_manager_seat_failed project={project} peer={peer} seat={seat} \
+                 state=recovering terminal_reason=api_error \
+                 reason=manager_seat_usage_limit_hold reset_at=2026-10-27T09:00:00Z \
+                 limit=\"You've hit your weekly limit \u{b7} resets Oct 27, 9am\""
+            )
+        );
+        assert_eq!(validate_satellite_report_text(&text), Ok(()));
+        assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn seat_failed_report_without_facts_says_none_and_stays_bounded() {
+        let report = SatelliteManagerSeatFailedV1 {
+            project: Uuid::nil(),
+            peer: None,
+            seat: Uuid::nil(),
+            state: "down",
+            terminal_reason: None,
+            reason: &"r".repeat(500),
+            reset_at: None,
+            // Text that does not talk about a limit is never carried.
+            limit_text: Some("token sk-secret in /home/someone/file"),
+        };
+        let text = report.report_text();
+        assert!(text.contains("peer=none") && text.contains("terminal_reason=none"));
+        assert!(text.contains("reset_at=none") && !text.contains("limit="));
+        assert!(!text.contains("secret"));
+        assert!(
+            text.len() <= SATELLITE_REPORT_TEXT_MAX_BYTES,
+            "{}",
+            text.len()
+        );
+        let long =
+            seat_report_limit_text(&format!("usage limit {}", "\u{e9}".repeat(400))).unwrap();
+        assert!(long.len() <= 160 && long.starts_with("usage limit"));
     }
 }

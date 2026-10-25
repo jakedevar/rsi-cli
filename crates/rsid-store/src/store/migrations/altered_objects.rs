@@ -27,6 +27,7 @@ pub(crate) const MIGRATION_ALTERED_OBJECTS_COMPLETE_ABOVE: i32 = 160;
 #[cfg(test)]
 #[rustfmt::skip]
 pub(crate) const MIGRATION_ALTERED_OBJECTS: &[(i32, &[&str])] = &[
+    (185, &["rolling_queue_entries"]),
     // #1909: the Deleted-owner status constraint rebuilds the items table.
     (168, &["source_worktree_settlement_items"]),
     // #2012: the launch record gains its worker scope.
@@ -62,6 +63,8 @@ pub(crate) const MIGRATION_ALTERED_OBJECTS: &[(i32, &[&str])] = &[
     ),
     // RSI-RELEASED-MIGRATION-END: v180-deploy-request-identity-altered-objects
     (182, &["topologies", "sqlite_autoindex_topologies_2"]),
+    // #3181: the jobs table is rebuilt to admit the `bench` kind.
+    (187, &["agent_jobs", "agent_jobs_owner_key", "agent_jobs_by_state", "agent_jobs_by_owner", "agent_jobs_no_delete", "agent_jobs_terminal_immutable", "agent_jobs_rebuild_old"]),
 ];
 
 /// Names of the objects altered by migrations above `version`.

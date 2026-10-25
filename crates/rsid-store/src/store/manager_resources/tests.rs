@@ -1090,6 +1090,15 @@ fn manager_v2_resources_actions_share_scoped_capacity_cost_unknowns_and_provider
             params![repo.path().to_str().unwrap(), config.project_id.to_string()],
         )
         .unwrap();
+    // A manager create resolves its worker source from the target project's
+    // registered repository (#617), not from the parent session's directory.
+    store
+        .conn
+        .execute(
+            "UPDATE projects SET path=?1 WHERE id=?2",
+            params![repo.path().to_str().unwrap(), config.project_id.to_string()],
+        )
+        .unwrap();
     let outside = clone_session(&store, &lead, group(&store, &config), SessionKind::Epic);
     let unrelated = clone_session(&store, &lead, outside.id, SessionKind::Task);
     store
@@ -2120,10 +2129,22 @@ fn manager_v2_resources_reports_created_session_usage_against_the_quota() {
         )
         .unwrap();
     let row = store.manager_v2_resource_snapshot(&config).unwrap();
+    // #3416: the count is the rolling window's, with the lifetime total beside it.
+    let created = &row["created_sessions"];
     assert_eq!(
-        row["created_sessions"],
-        serde_json::json!({"used":2,"limit":5,"remaining":3})
+        (
+            created["used"].clone(),
+            created["limit"].clone(),
+            created["remaining"].clone()
+        ),
+        (
+            serde_json::json!(2),
+            serde_json::json!(5),
+            serde_json::json!(3)
+        )
     );
+    assert_eq!(created["window_hours"], 24);
+    assert_eq!(created["lifetime_total"], 2);
 }
 
 #[cfg(test)]
@@ -2297,8 +2318,28 @@ fn seed_topology_launches(
     scope_version: i64,
     launches: usize,
 ) {
+    seed_topology_launches_at(
+        store,
+        project,
+        requester,
+        scope_version,
+        launches,
+        Utc::now(),
+    );
+}
+
+/// [`seed_topology_launches`] created at `at` (#3416: the rolling window).
+#[cfg(test)]
+fn seed_topology_launches_at(
+    store: &Store,
+    project: Uuid,
+    requester: Uuid,
+    scope_version: i64,
+    launches: usize,
+    at: chrono::DateTime<Utc>,
+) {
     let execution = Uuid::new_v4();
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let now = at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     store
         .conn
         .execute(
@@ -2556,4 +2597,725 @@ fn usage_window_hold_until_is_the_latest_exhausted_reset() {
         .unwrap()
         .expect("held");
     assert_eq!(unknown, now + chrono::Duration::minutes(5));
+}
+
+/// #235: `max_active_sessions` caps the workers a manager launches. The
+/// manager's own seat lineage (the outgoing seat still `Running` during a
+/// succession and the new tip, both resource origins) fills no slot and its
+/// own calls are never refused by the cap; the snapshot and the refusal name
+/// the counted ids and the excluded seat ids.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_seat_lineage_fills_no_worker_slot_and_the_refusal_names_the_counted_sessions_235() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            max_active_sessions: 3,
+            ..Default::default()
+        },
+    );
+    let epic = config.epic_ids[0];
+    // The outgoing seat is still Running while its successor already runs.
+    let outgoing = config.manager_session_id;
+    store
+        .update_session_status(outgoing, SessionStatus::Running)
+        .unwrap();
+    let mut tip = store.get_session(outgoing).unwrap().unwrap();
+    tip.id = Uuid::new_v4();
+    tip.continued_from = Some(outgoing);
+    tip.rotation_depth += 1;
+    tip.status = SessionStatus::Running;
+    store.insert_session(&tip).unwrap();
+    // Both are resource origins of the seat (a root succession records the
+    // requesting seat and its candidate), so both are cohort members.
+    for (session, predecessor) in [(outgoing, None), (tip.id, Some(outgoing))] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO manager_root_resource_origins(session_id,project_id,manager_session_id,
+                   scope_version,predecessor_session_id,provider,zero_origin,known_floor_usd,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,0,0,?7)",
+                params![
+                    session.to_string(),
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    predecessor.map(|id: Uuid| id.to_string()),
+                    serde_json::to_value(tip.provider).unwrap().as_str().unwrap(),
+                    super::super::harness_manager_v2::now()
+                ],
+            )
+            .unwrap();
+    }
+    let worker = |store: &Store| {
+        let mut next = clone_session(store, &lead, epic, SessionKind::Feature);
+        next.status = SessionStatus::Running;
+        store
+            .update_session_status(next.id, SessionStatus::Running)
+            .unwrap();
+        next
+    };
+    let first = worker(&store);
+    let second = worker(&store);
+    let ids = |value: &Value| -> std::collections::BTreeSet<String> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let set = |sessions: &[Uuid]| -> std::collections::BTreeSet<String> {
+        sessions.iter().map(Uuid::to_string).collect()
+    };
+    let snapshot = store.manager_v2_resource_snapshot(&config).unwrap();
+    assert_eq!(snapshot["active_sessions"], 2);
+    assert_eq!(
+        snapshot["active_by_provider"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|n| n.as_u64().unwrap())
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(
+        ids(&snapshot["counted_session_ids"]),
+        set(&[first.id, second.id])
+    );
+    assert_eq!(
+        ids(&snapshot["excluded_manager_seat_ids"]),
+        set(&[outgoing, tip.id])
+    );
+    // Two workers and two seat sessions under a cap of three: a third
+    // worker is admitted.
+    store
+        .manager_v2_resource_gate(&config, Some(epic), tip.provider, None)
+        .unwrap();
+    let third = worker(&store);
+    assert_eq!(
+        store.manager_v2_resource_snapshot(&config).unwrap()["active_sessions"],
+        3
+    );
+    // The fourth is refused, and the refusal names what filled the cap.
+    let refusal = store
+        .manager_v2_resource_gate(&config, Some(epic), tip.provider, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal
+            .contains("manager_v2_concurrency_capacity: active_sessions=3 max_active_sessions=3"),
+        "{refusal}"
+    );
+    let counted = refusal
+        .split("counted=[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap();
+    assert_eq!(
+        counted
+            .split(',')
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>(),
+        set(&[first.id, second.id, third.id]),
+        "{refusal}"
+    );
+    let excluded = refusal
+        .split("excluded_manager_seat=[")
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap();
+    assert_eq!(
+        excluded
+            .split(',')
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>(),
+        set(&[outgoing, tip.id]),
+        "{refusal}"
+    );
+    // The seat's own calls are not refused by the worker cap, through the
+    // gate and through Model Control admission.
+    store
+        .manager_v2_resource_gate_for_session(tip.id, tip.provider)
+        .unwrap();
+    store
+        .manager_v2_resource_gate_for_session(outgoing, tip.provider)
+        .unwrap();
+    admitted(&store, &tip);
+    // A worker's continuation still replaces its own slot.
+    store
+        .manager_v2_resource_gate_for_session(first.id, first.provider)
+        .unwrap();
+}
+
+/// #3416: the created-session quota is a rolling window. A seat with M
+/// creations inside the window is refused with the window, the count and the
+/// next-free time; once the oldest leaves the window (injected clock) admission
+/// resumes with no operator action; a successor inherits the grant and the
+/// predecessor's in-window creations still count; the lifetime total is
+/// reported beside the window count and never compared with the limit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn manager_v2_created_sessions_quota_refills_as_creations_leave_the_window() {
+    use rsi_common::manager_budget::CreationCapRefusalV1;
+    let store = Store::open_in_memory().unwrap();
+    let launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-sonnet-4-6".into(),
+        effort: None,
+    };
+    let (pm, _lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            capabilities: vec![ManagerCapabilityV2::SessionCreate],
+            max_created_sessions: 3,
+            created_sessions_window_hours: 24,
+            allowed_launches: vec![launch],
+            ..Default::default()
+        },
+    );
+    let successor = Uuid::new_v4();
+    let mut next = store.get_session(pm.manager_session_id).unwrap().unwrap();
+    next.id = successor;
+    next.continued_from = Some(pm.manager_session_id);
+    store.insert_session(&next).unwrap();
+
+    let now = Utc::now();
+    let ago = |hours: i64| now - chrono::Duration::hours(hours);
+    // Two creations a month ago (lifetime only), then three inside the
+    // window: the oldest 20 h ago by the predecessor, the others by its
+    // successor.
+    seed_topology_launches_at(
+        &store,
+        pm.project_id,
+        pm.manager_session_id,
+        pm.row_version,
+        2,
+        ago(720),
+    );
+    seed_topology_launches_at(
+        &store,
+        pm.project_id,
+        pm.manager_session_id,
+        pm.row_version,
+        1,
+        ago(20),
+    );
+    seed_topology_launches_at(&store, pm.project_id, successor, pm.row_version, 2, ago(2));
+
+    let grant = store
+        .get_harness_manager_policy(pm.project_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(grant.policy.created_sessions_window_hours, 24);
+    let authority = crate::store::harness_manager_v2::ManagerAuthorityV2 {
+        config: pm.clone(),
+        grant,
+        caller: successor,
+        is_manager: true,
+    };
+    let usage = store
+        .manager_v2_created_window_usage_at(&pm, 24, 3, now)
+        .unwrap();
+    assert_eq!((usage.used, usage.lifetime), (3, 5), "{usage:?}");
+    // The oldest in-window creation leaves 24 h after it was made.
+    let frees =
+        (ago(20) + chrono::Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    assert_eq!(usage.next_free_at.as_deref(), Some(frees.as_str()));
+
+    // Refused at the window's limit, naming the window, count and next-free.
+    let error = store
+        .manager_action_creation_budget_at(&authority, false, false, now)
+        .unwrap_err()
+        .to_string();
+    let detail = CreationCapRefusalV1::parse(&error).unwrap_or_else(|| panic!("{error}"));
+    assert_eq!(detail.cap_field, "max_created_sessions");
+    assert_eq!((detail.used, detail.limit), (3, 3));
+    assert_eq!(detail.window_hours, Some(24));
+    assert_eq!(detail.next_free_at.as_deref(), Some(frees.as_str()));
+    assert!(
+        detail
+            .window_summary()
+            .unwrap()
+            .starts_with("3 of 3 created in the last 24 h; next slot frees at "),
+        "{detail:?}"
+    );
+
+    // Four hours past the oldest in-window creation's expiry, one slot is free.
+    let later = ago(20) + chrono::Duration::hours(24) + chrono::Duration::minutes(1);
+    let after = store
+        .manager_v2_created_window_usage_at(&pm, 24, 3, later)
+        .unwrap();
+    assert_eq!((after.used, after.lifetime), (2, 5), "{after:?}");
+    store
+        .manager_action_creation_budget_at(&authority, false, false, later)
+        .expect("admission resumes once the oldest creation left the window");
+
+    // A longer window still sees the month-old creations; a shorter one does not.
+    let wide = store
+        .manager_v2_created_window_usage_at(&pm, 24 * 40, 3, now)
+        .unwrap();
+    assert_eq!(wide.used, 5);
+
+    // The snapshot reports the window, the next-free time and the lifetime
+    // total beside the windowed count.
+    let snapshot = store.manager_v2_resource_snapshot(&pm).unwrap();
+    let created = &snapshot["created_sessions"];
+    assert_eq!(created["used"], 3);
+    assert_eq!(created["limit"], 3);
+    assert_eq!(created["window_hours"], 24);
+    assert_eq!(created["lifetime_total"], 5);
+    assert!(
+        created["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("3 of 3 created in the last 24 h; next slot frees at "),
+        "{created}"
+    );
+}
+
+/// #3495: a queued or running creation has not made its session yet, so its
+/// reservation stays charged however long it was held back; once the session
+/// exists the charge runs a full window from the actual creation, exactly
+/// once. Uncreated refusals stay free.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+#[allow(clippy::unwrap_used)] // Fixture setup and exact usage assertions must fail immediately.
+fn held_creation_reservations_stay_charged_and_count_from_actual_creation() {
+    use rsi_common::manager_budget::CreationCapRefusalV1;
+    let store = Store::open_in_memory().unwrap();
+    let (pm, _lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            capabilities: vec![ManagerCapabilityV2::SessionCreate],
+            max_created_sessions: 1,
+            created_sessions_window_hours: 1,
+            ..Default::default()
+        },
+    );
+    let grant = store
+        .get_harness_manager_policy(pm.project_id)
+        .unwrap()
+        .unwrap();
+    let authority = crate::store::harness_manager_v2::ManagerAuthorityV2 {
+        config: pm.clone(),
+        grant,
+        caller: pm.manager_session_id,
+        is_manager: true,
+    };
+    let stamp = |t: chrono::DateTime<Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let now = Utc::now();
+    let hours_ago = |h: i64| now - chrono::Duration::hours(h);
+    let worker = |query: &str| ManagerActionV2::CreateSession {
+        parent_id: pm.epic_ids[0],
+        kind: SessionKind::Task,
+        query: query.into(),
+        launch: ManagerLaunchChoiceV2 {
+            provider: rsi_common::types::SessionProvider::Claude,
+            model: "fixture-model".into(),
+            effort: None,
+        },
+        sandbox_source: None,
+    };
+    let set_created = |operation: Uuid, at: chrono::DateTime<Utc>| {
+        store
+            .conn
+            .execute(
+                "UPDATE harness_manager_v2_operations SET created_at=?2,updated_at=?2 WHERE id=?1",
+                params![operation.to_string(), stamp(at)],
+            )
+            .unwrap();
+    };
+    let used_at = |at: chrono::DateTime<Utc>| {
+        store
+            .manager_v2_created_window_usage_at(&pm, 1, 1, at)
+            .unwrap()
+            .used
+    };
+
+    // Uncreated refusals and rejected reservations are free whatever their age.
+    let blocked = store
+        .seed_manager_action_with_context_for_test(
+            &pm,
+            worker("blocked"),
+            ManagerActionStateV2::Blocked,
+            Some(Uuid::new_v4()),
+            pm.manager_session_id,
+        )
+        .unwrap();
+    set_created(blocked, hours_ago(5));
+    assert_eq!(used_at(now), 0);
+
+    // Held past the window: still charged while queued, own and ancestor view.
+    let held = store
+        .seed_manager_action_with_context_for_test(
+            &pm,
+            worker("held"),
+            ManagerActionStateV2::Queued,
+            Some(Uuid::new_v4()),
+            pm.manager_session_id,
+        )
+        .unwrap();
+    set_created(held, hours_ago(3));
+    assert_eq!(used_at(now), 1, "a held reservation must not age out");
+    assert_eq!(used_at(now + chrono::Duration::hours(10)), 1);
+    let error = store
+        .manager_action_creation_budget_at(&authority, false, false, now)
+        .unwrap_err()
+        .to_string();
+    let detail = CreationCapRefusalV1::parse(&error).unwrap_or_else(|| panic!("{error}"));
+    assert_eq!((detail.used, detail.limit), (1, 1), "{detail:?}");
+    let charges = store
+        .portfolio_creation_charges(pm.project_id, false, "", now)
+        .unwrap();
+    assert_eq!(
+        charges.iter().map(|(at, _)| at.clone()).collect::<Vec<_>>(),
+        vec![stamp(now)],
+        "an ancestor sees the reservation as charged now"
+    );
+    // The same reservation, running, is charged the same way.
+    store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_operations SET state='running' WHERE id=?1",
+            params![held.to_string()],
+        )
+        .unwrap();
+    assert_eq!(used_at(now), 1);
+
+    // Creation happens now: the entity binds at the actual creation.
+    let session = {
+        let mut session = store.get_session(pm.manager_session_id).unwrap().unwrap();
+        session.id = Uuid::new_v4();
+        session.continued_from = None;
+        store.insert_session(&session).unwrap();
+        session.id
+    };
+    store
+        .conn
+        .execute(
+            "UPDATE harness_manager_v2_operations SET state='succeeded',target_session_id=?2 WHERE id=?1",
+            params![held.to_string(), session.to_string()],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO harness_manager_v2_entities(session_id,operation_id,project_id,manager_session_id,scope_version,policy_version,kind,created_at) VALUES(?1,?2,?3,?4,?5,1,'session',?6)",
+            params![
+                session.to_string(),
+                held.to_string(),
+                pm.project_id.to_string(),
+                pm.manager_session_id.to_string(),
+                pm.row_version,
+                stamp(now)
+            ],
+        )
+        .unwrap();
+    // Counted from creation, not from the reservation made three hours ago.
+    assert_eq!(used_at(now), 1);
+    assert_eq!(used_at(now + chrono::Duration::minutes(59)), 1);
+    assert_eq!(used_at(now + chrono::Duration::minutes(61)), 0);
+    let usage = store
+        .manager_v2_created_window_usage_at(&pm, 1, 1, now)
+        .unwrap();
+    let frees = stamp(now + chrono::Duration::hours(1));
+    assert_eq!(usage.next_free_at.as_deref(), Some(frees.as_str()));
+    assert_eq!(usage.lifetime, 1, "charged exactly once");
+    let charges = store
+        .portfolio_creation_charges(pm.project_id, false, "", now + chrono::Duration::hours(2))
+        .unwrap();
+    assert_eq!(
+        charges.iter().map(|(at, _)| at.clone()).collect::<Vec<_>>(),
+        vec![stamp(now)],
+        "an ancestor counts the creation from the session's actual creation"
+    );
+}
+
+/// #3497: a topology launch of N session nodes is judged against the same
+/// rolling window as a lifecycle creation: the refusal names the window, the
+/// count, the N slots it needs and when enough of the oldest creations have
+/// left the window (injected clock), and the launch is admitted then with no
+/// operator change.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn a_multi_node_topology_launch_is_refused_with_the_refill_time_and_admitted_after_expiry() {
+    use rsi_common::manager_budget::CreationCapRefusalV1;
+    let store = Store::open_in_memory().unwrap();
+    let launch = ManagerLaunchChoiceV2 {
+        provider: SessionProvider::Claude,
+        model: "claude-sonnet-4-6".into(),
+        effort: None,
+    };
+    let (pm, _lead) = fixture(
+        &store,
+        ManagerPolicyV2 {
+            capabilities: vec![ManagerCapabilityV2::SessionCreate],
+            max_created_sessions: 3,
+            created_sessions_window_hours: 24,
+            allowed_launches: vec![launch],
+            ..Default::default()
+        },
+    );
+    let now = Utc::now();
+    let ago = |hours: i64| now - chrono::Duration::hours(hours);
+    let frees = |hours: i64| {
+        (ago(hours) + chrono::Duration::hours(24))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+    };
+    seed_topology_launches_at(
+        &store,
+        pm.project_id,
+        pm.manager_session_id,
+        pm.row_version,
+        1,
+        ago(20),
+    );
+    seed_topology_launches_at(
+        &store,
+        pm.project_id,
+        pm.manager_session_id,
+        pm.row_version,
+        2,
+        ago(2),
+    );
+    let allowance = |needed: i64, counted: i64, at| {
+        store.manager_topology_creation_allowance_at(&pm, 3, 24, needed, counted, at)
+    };
+
+    // One node needs the oldest creation to leave; two need the second oldest.
+    for (needed, frees_at) in [(1, frees(20)), (2, frees(2)), (3, frees(2))] {
+        let error = allowance(needed, 0, now).unwrap_err().to_string();
+        let detail = CreationCapRefusalV1::parse(&error).unwrap_or_else(|| panic!("{error}"));
+        assert_eq!(detail.code, "manager_v2_creation_limit");
+        assert_eq!((detail.used, detail.limit, detail.needed), (3, 3, needed));
+        assert_eq!(detail.window_hours, Some(24));
+        assert_eq!(
+            detail.next_free_at.as_deref(),
+            Some(frees_at.as_str()),
+            "needed {needed}: {error}"
+        );
+    }
+    // A relaunch of an already charged attempt needs no new slot.
+    allowance(1, 1, now).expect("a charged attempt is not charged twice");
+
+    // After the oldest left the window, one node fits and two do not.
+    let after_oldest = ago(20) + chrono::Duration::hours(24) + chrono::Duration::minutes(1);
+    allowance(1, 0, after_oldest).expect("one slot freed");
+    assert!(allowance(2, 0, after_oldest).is_err());
+    // After the rest left, the whole allowance is free again.
+    let after_all = ago(2) + chrono::Duration::hours(24) + chrono::Duration::minutes(1);
+    allowance(3, 0, after_all).expect("the window refilled");
+}
+
+/// #3416: a policy saved before the window field existed reads as 24 h.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn a_policy_without_a_window_reads_as_twenty_four_hours() {
+    let mut value = serde_json::to_value(ManagerPolicyV2::default()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("created_sessions_window_hours");
+    let policy: ManagerPolicyV2 = serde_json::from_value(value).unwrap();
+    assert_eq!(policy.created_sessions_window_hours, 24);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn subscription_history_does_not_consume_metered_budget_or_make_spend_unknown() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+    store
+        .set_daemon_setting("claude_billing_mode", "subscription")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "subscription")
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET cost_usd=2500 WHERE id=?1",
+            [lead.id.to_string()],
+        )
+        .unwrap();
+    update_policy(&store, &config, |policy| policy.max_spend_usd = Some(1.0));
+    let snapshot = store.manager_v2_resource_snapshot(&config).unwrap();
+    assert_eq!(snapshot["known_spend_usd"], 0.0);
+    assert_eq!(snapshot["unknown_spend_observations"], 0);
+    assert!(
+        store
+            .manager_v2_resource_gate(&config, None, lead.provider, Some(lead.id))
+            .is_ok()
+    );
+    store
+        .set_daemon_setting("claude_billing_mode", "metered_api")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "metered_api")
+        .unwrap();
+    let metered = store.manager_v2_resource_snapshot(&config).unwrap();
+    assert!(metered["known_spend_usd"].as_f64().unwrap() >= 2500.0);
+    assert!(
+        store
+            .manager_v2_resource_gate(&config, None, lead.provider, Some(lead.id))
+            .is_err()
+    );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn metered_calls_inside_subscription_sessions_keep_their_budget_charge() {
+    let store = Store::open_in_memory().unwrap();
+    let (config, lead) = fixture(&store, ManagerPolicyV2::default());
+    store
+        .set_daemon_setting("claude_billing_mode", "subscription")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "subscription")
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET cost_usd=2500 WHERE id=?1",
+            [lead.id.to_string()],
+        )
+        .unwrap();
+    store.conn.execute("INSERT INTO model_invocations(id,session_id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,provider,model,created_at,estimated_cost_usd)
+        VALUES(?1,?2,'text.generate.rpc','direct_text','foreground','paid_capable','admitted','completed','test','OpenRouter','test-model',?3,3.0)",params![Uuid::new_v4().to_string(),lead.id.to_string(),Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos,true)]).unwrap();
+    update_policy(&store, &config, |policy| policy.max_spend_usd = Some(1.0));
+    let snapshot = store.manager_v2_resource_snapshot(&config).unwrap();
+    assert_eq!(snapshot["known_spend_usd"], 3.0);
+    assert_eq!(snapshot["unknown_spend_observations"], 0);
+    assert!(
+        store
+            .manager_v2_resource_gate(&config, None, lead.provider, Some(lead.id))
+            .is_err()
+    );
+}
+
+#[cfg(test)]
+fn codex_seven_day_snapshot(observed_at: DateTime<Utc>, reset: i64) -> ProviderRateLimitSnapshot {
+    ProviderRateLimitSnapshot {
+        provider: SessionProvider::Codex,
+        status: Some("rejected".into()),
+        rate_limit_type: None,
+        overage_status: None,
+        is_using_overage: false,
+        observed_at,
+        windows: vec![ProviderRateLimitWindow {
+            window_key: "seven_day".into(),
+            utilization: 1.0,
+            resets_at_epoch: Some(reset),
+        }],
+        stale_reason: None,
+    }
+}
+
+/// #4023: a stale exhausted window recorded for the previous account stops
+/// refusing launches once a newer account change is observed.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn usage_gate_admits_after_an_account_change_newer_than_the_window() {
+    let store = Store::open_in_memory().unwrap();
+    let now = Utc::now();
+    let reset = now.timestamp() + 5 * 24 * 3600;
+    // The previous account's baseline, then its exhausted window.
+    store
+        .observe_provider_rate_limit_account(SessionProvider::Codex, "old-account", now)
+        .unwrap();
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &codex_seven_day_snapshot(now + chrono::Duration::seconds(1), reset),
+            None,
+        )
+        .unwrap();
+    let refusal = store
+        .manager_v2_provider_usage_gate(SessionProvider::Codex)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("manager_v2_provider_usage_limit"),
+        "{refusal}"
+    );
+    // The login changed to another account after the window was recorded.
+    assert!(
+        store
+            .observe_provider_rate_limit_account(
+                SessionProvider::Codex,
+                "new-account",
+                Utc::now() + chrono::Duration::seconds(5),
+            )
+            .unwrap()
+    );
+    store
+        .manager_v2_provider_usage_gate(SessionProvider::Codex)
+        .expect("a stale window of the previous account must not refuse");
+}
+
+/// #4023: a window recorded after the login change is real current evidence and
+/// still refuses; the refusal names the window kind, its reset and its source.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn usage_gate_still_refuses_a_window_recorded_after_the_account_change() {
+    let store = Store::open_in_memory().unwrap();
+    let now = Utc::now();
+    let reset = now.timestamp() + 5 * 24 * 3600;
+    store
+        .observe_provider_rate_limit_account(SessionProvider::Codex, "old-account", now)
+        .unwrap();
+    store
+        .observe_provider_rate_limit_account(
+            SessionProvider::Codex,
+            "new-account",
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &codex_seven_day_snapshot(now + chrono::Duration::seconds(2), reset),
+            None,
+        )
+        .unwrap();
+    let refusal = store
+        .manager_v2_provider_usage_gate(SessionProvider::Codex)
+        .unwrap_err()
+        .to_string();
+    for part in [
+        "manager_v2_provider_usage_limit",
+        "seven_day",
+        &DateTime::from_timestamp(reset, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "codex plan-window poll",
+        "account identity recorded",
+        "ClearProviderUsageHold (TUI <Space>hu)",
+    ] {
+        assert!(refusal.contains(part), "missing {part:?} in {refusal}");
+    }
+}
+
+/// #4023: with no stored account identity the refusal says so, so the manager
+/// can tell the gap from a real limit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+#[test]
+fn usage_gate_refusal_names_a_missing_account_identity() {
+    let store = Store::open_in_memory().unwrap();
+    let now = Utc::now();
+    store
+        .upsert_provider_rate_limit_snapshot(
+            &codex_seven_day_snapshot(now, now.timestamp() + 3600),
+            None,
+        )
+        .unwrap();
+    let hold = store
+        .provider_usage_window_hold(SessionProvider::Codex, now)
+        .unwrap()
+        .expect("held");
+    assert!(!hold.account_identity_recorded);
+    assert!(
+        hold.describe(SessionProvider::Codex)
+            .contains("account identity not recorded")
+    );
 }

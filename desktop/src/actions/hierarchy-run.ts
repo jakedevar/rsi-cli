@@ -337,6 +337,7 @@ async function openEntityForm(kind: EntityKind): Promise<void> {
     const choices = parentChoices(d.kind, currentSessions() as HierSession[]);
     openPicker({
       title: `Parent for the ${d.kind}`,
+      keyTable: 'Parent Picker',
       hint: 'Type to filter · Up/Down move · Enter sets the parent · Esc closes',
       filterable: true,
       emptyText: 'No legal parent for this kind',

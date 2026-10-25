@@ -251,6 +251,43 @@ pub(crate) fn settled_outcome(
     Ok(Some(outcome))
 }
 
+/// #3387: whether a `succeeded` execution's outcome asks nothing of its
+/// owner: the input Issue is Closed, no node failed, no land's Issue close was
+/// refused, every review settled approved, and the run filed no follow-up.
+/// Anything else, including an outcome with no input Issue, wakes the owner.
+pub(crate) fn is_clean_success(outcome: &AgentTopologyOutcomeV1) -> bool {
+    outcome
+        .issue
+        .as_ref()
+        .is_some_and(|issue| issue.status.as_deref() == Some("Closed"))
+        && outcome.failures.is_empty()
+        && outcome.followups.is_empty()
+        && outcome
+            .lands
+            .iter()
+            .all(|land| land.issue_close_refused.is_none())
+        && outcome
+            .reviews
+            .iter()
+            .all(|review| review.verdict == "approved")
+}
+
+/// #3387: the one-line digest entry of a clean success: execution, Issue and
+/// the SHA each land published.
+pub(crate) fn digest_line(execution_id: Uuid, outcome: &AgentTopologyOutcomeV1) -> String {
+    let mut line = format!("execution {execution_id} succeeded");
+    if let Some(issue) = &outcome.issue {
+        line.push_str(&format!(
+            "; issue #{} \"{}\" Closed",
+            issue.display_number, issue.title
+        ));
+    }
+    for sha in outcome.lands.iter().filter_map(|l| l.landed_sha.as_deref()) {
+        line.push_str(&format!("; landed {sha}"));
+    }
+    line
+}
+
 /// #2584: what had already happened when a node failure ended the execution:
 /// the SHA each land node published and each review's verdict, so a failure
 /// after the source landed does not read as a bare `failed`. `None` when

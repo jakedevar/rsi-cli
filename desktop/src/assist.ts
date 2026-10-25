@@ -6,7 +6,7 @@
 // Daemon text is set with textContent only.
 import { invoke } from './api.js';
 import type { Invocation } from './commands.js';
-import { el, toast } from './dom.js';
+import { el, renderMessage, toast } from './dom.js';
 import {
   type CardState, type CardWho, type DialecticSource, type MemoryResult, type Turn,
   activeProject, addFact, ask, assistRefusal, cancelEdit, cardNavKey, cardTitle, commitEdit, escapeAction,
@@ -17,7 +17,10 @@ import {
 import { isReadOnly, projectName, selected } from './state.js';
 import { button, dialogEl, focusDialog, overlayKey } from './actions/detail.js';
 import type { AssistActionId, AssistSnapshot } from './actions/assist.js';
+import { emptyText } from './empty-states.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
+import { loadView } from './view-load.js';
 
 const CSS = `
 .assist-dialog { width: min(760px, 92vw); }
@@ -31,7 +34,7 @@ const CSS = `
 .assist-result-snippet { color: var(--subtext); font-size: 12px; white-space: pre-wrap; max-height: 5.4em; overflow: hidden; }
 .assist-log { max-height: 48vh; min-height: 120px; overflow: auto; padding: 6px; margin-bottom: 8px; background: var(--mantle); border: 1px solid var(--surface0); border-radius: 6px; }
 .assist-msg { margin: 0 0 8px; white-space: pre-wrap; word-break: break-word; }
-.assist-msg .who { display: block; font-size: 11px; color: var(--overlay0); }
+.assist-msg .who { display: block; font-size: 11px; color: var(--muted); }
 .assist-msg.user .who { color: var(--blue); }
 .assist-msg.assistant .who { color: var(--green); }
 .assist-source-text { max-height: 7em; overflow: auto; margin: 0 0 8px; padding: 6px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; background: var(--crust); border-radius: 6px; color: var(--subtext); }
@@ -39,7 +42,7 @@ const CSS = `
 .assist-sources { list-style: none; margin: 0 0 8px; padding: 0; font-size: 12px; color: var(--subtext); }
 .card-facts { list-style: none; margin: 0 0 8px; padding: 0; max-height: 56vh; overflow: auto; counter-reset: fact; }
 .card-fact { display: flex; gap: 8px; padding: 4px 8px; border-radius: 6px; cursor: pointer; }
-.card-fact::before { counter-increment: fact; content: counter(fact) "."; color: var(--overlay0); min-width: 2em; text-align: right; }
+.card-fact::before { counter-increment: fact; content: counter(fact) "."; color: var(--muted); min-width: 2em; text-align: right; }
 .card-fact.sel { background: var(--surface0); }
 .card-fact .assist-input { flex: 1; }
 .card-fact.pending { outline: 1px dashed var(--red); }
@@ -112,6 +115,7 @@ function openMemorySearch(): void {
       return li;
     }));
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, input);
   };
 
   const search = (): void => {
@@ -128,7 +132,7 @@ function openMemorySearch(): void {
     }, (e: unknown) => {
       if (mine !== seq) return;
       results = [];
-      status.textContent = `Memory search failed: ${String(e)}`;
+      renderMessage(status, `Memory search failed: ${String(e)}`);
       draw();
     });
   };
@@ -138,8 +142,8 @@ function openMemorySearch(): void {
     if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
     if (ev.isComposing) return;
     const ctrl = ev.ctrlKey || ev.metaKey;
-    if (ev.key === 'ArrowDown' || (ctrl && ev.key === 'n')) { ev.preventDefault(); sel = moveSelection(results.length, sel, 1); draw(); }
-    else if (ev.key === 'ArrowUp' || (ctrl && ev.key === 'p')) { ev.preventDefault(); sel = moveSelection(results.length, sel, -1); draw(); }
+    if (ev.key === 'ArrowDown' || (ctrl && (ev.key === 'n' || ev.key === 'j'))) { ev.preventDefault(); sel = moveSelection(results.length, sel, 1); draw(); }
+    else if (ev.key === 'ArrowUp' || (ctrl && (ev.key === 'p' || ev.key === 'k'))) { ev.preventDefault(); sel = moveSelection(results.length, sel, -1); draw(); }
     else if (ev.key === 'Escape') { ev.preventDefault(); dlg.close(); }
   };
   const close = button('Close');
@@ -148,7 +152,7 @@ function openMemorySearch(): void {
   actions.append(close);
   const box = el('div', 'launch-form');
   box.append(el('h2', undefined, 'Memory search'), input, status, list, actions,
-    hint('Type to search the daemon’s memory index (ten best). Up/Down or Ctrl-N/Ctrl-P move, Esc closes.'));
+    hint('Type to search the daemon’s memory index (ten best). Up/Down, Ctrl-N/Ctrl-P or Ctrl-J/Ctrl-K move, Esc closes.'));
   dlg.replaceChildren(box);
   draw();
   dlg.showModal();
@@ -253,6 +257,9 @@ interface ConversationOptions {
   id: string;
   title: string;
   placeholder: string;
+  /** The names of the log region and of the input: the placeholder is only a hint and goes once text is typed (local #326). */
+  logLabel: string;
+  inputLabel: string;
   /** The text the chat is about (AI chat), shown above the log. */
   sourceText?: string;
   prefill?: string;
@@ -267,12 +274,14 @@ function openConversation(o: ConversationOptions): void {
   const dlg = dialogEl(o.id);
   dlg.classList.add('assist-dialog');
   const log = el('div', 'assist-log');
+  log.setAttribute('role', 'log');
+  log.setAttribute('aria-label', o.logLabel);
   log.setAttribute('aria-live', 'polite');
   log.tabIndex = 0;
   const input = el('input', 'assist-input');
   input.type = 'text';
   input.placeholder = o.placeholder;
-  input.setAttribute('aria-label', o.placeholder);
+  input.setAttribute('aria-label', o.inputLabel);
   input.value = o.prefill ?? '';
   const sourcesBtn = button('Sources (s)');
   const sourcesList = el('ul', 'assist-sources');
@@ -360,6 +369,8 @@ function openAiChat(source: HTMLTextAreaElement): void {
     id: 'ai-chat-dialog',
     title: 'AI chat',
     placeholder: 'Ask about this text…',
+    logLabel: 'AI chat conversation',
+    inputLabel: 'Question about this text',
     sourceText,
     withSources: false,
     send: async (turns) => {
@@ -379,6 +390,8 @@ function openDialectic(prefill: string): void {
     id: 'dialectic-dialog',
     title: 'Ask (dialectic)',
     placeholder: 'Ask about what rsi has learned…',
+    logLabel: 'Dialectic conversation',
+    inputLabel: 'Question for the Dialectic',
     prefill,
     scope: projectId ? `Project: ${name ?? projectId.slice(0, 8)}` : 'All projects',
     withSources: true,
@@ -427,16 +440,17 @@ async function addCardFact(who: CardWho, fact: string): Promise<void> {
   }
 }
 
-async function openCardEditor(who: CardWho): Promise<void> {
+function openCardEditor(who: CardWho): Promise<void> {
   const ref = cardRef(who);
-  if (!ref) { toast('No active project — select a project first'); return; }
-  let facts: string[];
-  try {
-    facts = await loadFacts(ref);
-  } catch (e) {
-    toast(`Failed to load ${who === 'user' ? 'user ' : ''}card: ${String(e)}`);
-    return;
-  }
+  if (!ref) { toast('No active project — select a project first'); return Promise.resolve(); }
+  return loadView({
+    key: `card-${who}`, title: ref.title, failed: `Failed to load ${who === 'user' ? 'user ' : ''}card`,
+    read: () => loadFacts(ref),
+    open: (facts) => showCardEditor(ref, facts),
+  });
+}
+
+function showCardEditor(ref: CardRef, facts: string[]): void {
   let st: CardState = openCard(facts);
   const dlg = dialogEl('card-dialog');
   dlg.classList.add('assist-dialog');
@@ -472,10 +486,11 @@ async function openCardEditor(who: CardWho): Promise<void> {
       }
       return li;
     }));
-    if (st.facts.length === 0) list.append(el('li', 'pick-empty', 'No facts yet: a adds one.'));
+    if (st.facts.length === 0) list.append(el('li', 'pick-empty', emptyText('assist-facts')));
     status.textContent = st.editing !== null ? 'Enter commits (empty deletes), Esc cancels'
       : st.pendingDelete ? 'd again deletes the fact' : `${st.facts.length}/40 facts`;
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, dlg);
     if (editor) { const ed: HTMLInputElement = editor; ed.focus(); ed.setSelectionRange(ed.value.length, ed.value.length); }
     else focusDialog(dlg);
   };

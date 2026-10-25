@@ -653,6 +653,53 @@ pub(crate) fn api_route_event(
     )
 }
 
+/// #3177: the typed System row of a route-audit stream event: a Harness-to-Codex
+/// `route_fallback`, a `credential_cli_exposure`, or the `bench_build_digest` of
+/// a bench launch. They are persisted (they were stream-only before), so the
+/// post-run bench audit can read from the store whether a session ever left the
+/// Harness. `None` for any other event.
+pub(crate) fn route_audit_event(
+    stream: &StreamEvent,
+    session_id: Uuid,
+    sequence: &mut i32,
+) -> Option<ConversationEvent> {
+    use rsi_common::bench_profile::{
+        BENCH_BUILD_DIGEST_KIND, CREDENTIAL_CLI_EXPOSURE_KIND, ROUTE_FALLBACK_KIND,
+    };
+    let kind = match stream.event_type.as_str() {
+        kind @ (ROUTE_FALLBACK_KIND | CREDENTIAL_CLI_EXPOSURE_KIND) => kind,
+        crate::session::harness::build_digest::BUILD_DIGEST_STREAM_EVENT => BENCH_BUILD_DIGEST_KIND,
+        _ => return None,
+    };
+    let detail = |key: &str| {
+        stream
+            .data
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let content = match kind {
+        ROUTE_FALLBACK_KIND => format!(
+            "Route fallback: {} to {} ({})",
+            detail("from"),
+            detail("to"),
+            detail("reason")
+        ),
+        CREDENTIAL_CLI_EXPOSURE_KIND => {
+            format!("A credential was exposed to a CLI ({})", detail("reason"))
+        }
+        _ => format!("Harness build digest: {}", detail("harness_build_digest")),
+    };
+    let mut health = json!({ "kind": kind });
+    if let (Value::Object(map), Value::Object(data)) = (&mut health, &stream.data) {
+        for (key, value) in data {
+            map.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    Some(health_event(session_id, sequence, content, health))
+}
+
 fn health_event(
     session_id: Uuid,
     sequence: &mut i32,

@@ -77,6 +77,9 @@ pub struct ContinuationFenceV1 {
     /// Classification and turn from one restart-cut observation (#1728).
     /// `None` skips this check for callers other than topology recovery.
     pub observed_restart_cut: Option<RestartCutFenceV1>,
+    /// A self-wake observes the current cursor at delivery. Only operator
+    /// input after that cursor supersedes it; daemon/provider events do not.
+    pub self_wake_event_sequence: Option<i64>,
 }
 
 /// The facts that justified a topology restart resume. Event sequence alone
@@ -181,7 +184,132 @@ impl Store {
             lead_generation: epic.map(|(_, generation)| generation),
             authority,
             observed_restart_cut: None,
+            self_wake_event_sequence: None,
         }))
+    }
+
+    /// Capture a scheduled delivery from fresh durable state. Resume/when
+    /// rows belong to their wake_session_id; unlike a child watch or manager
+    /// message, a self-wake cannot authorize a different lineage tip (#360).
+    pub fn capture_scheduled_continuation_fence(
+        &self,
+        origin: Uuid,
+        job_ids: &[Uuid],
+    ) -> Result<Option<ContinuationFenceV1>> {
+        let Some(mut fence) =
+            self.capture_continuation_fence(origin, ContinuationAuthorityV1::Automated)?
+        else {
+            return Ok(None);
+        };
+        for id in job_ids {
+            let Some(job) = self.get_scheduled_job(id)? else {
+                continue; // The exact-row owner check supplies its refusal.
+            };
+            if job.wake_mode != rsi_common::types::WakeMode::Resume
+                || job.wake_session_id != Some(origin)
+                || self.is_global_message(*id)?
+            {
+                continue;
+            }
+            if fence.tip != origin {
+                // Preserve terminal retirement/disabled-row refusals before
+                // the retryable tip refusal, just as guarded delivery does.
+                self.check_scheduled_wake_owner(fence.tip, job_ids)?;
+                return Err(refused(CONTINUATION_TIP_CHANGED));
+            }
+            // Re-read at delivery, never reuse the arming turn's event or
+            // custody cursor. Custody is authenticated by the resume path.
+            let sequence = self.conversation_max_sequence(origin)?;
+            // #482: a carried predicate was armed in a different transcript.
+            // The seat publication authenticates the successor's existing
+            // history; only input after that boundary can supersede it.
+            let transfer_sequence: Option<i64> = self.conn.query_row(
+                "SELECT CASE WHEN json_extract(schedule_json,'$.self_wake_transfer.owner')=?2
+                         THEN json_extract(schedule_json,'$.self_wake_transfer.event_sequence') END
+                 FROM scheduled_jobs WHERE id=?1",
+                rusqlite::params![id.to_string(), origin.to_string()],
+                |row| row.get(0),
+            )?;
+            let armed_at = job.last_fired_at.unwrap_or(job.created_at);
+            // #189: input a refusal of this arming already deferred the wake
+            // for is not new: the busy target got it first, so only input
+            // after that cursor refuses again.
+            let seen = self
+                .self_wake_input_seen(*id)?
+                .filter(|seen| seen.armed_at() == Some(armed_at))
+                .map(|seen| seen.through_sequence);
+            if self.self_wake_has_newer_operator_input(
+                origin,
+                sequence,
+                Some(armed_at),
+                seen,
+                transfer_sequence,
+            )? {
+                return Err(refused(CONTINUATION_TURN_CHANGED));
+            }
+            fence.self_wake_event_sequence = Some(sequence);
+        }
+        Ok(Some(fence))
+    }
+
+    /// Plain user turns and explicitly attributed boundary messages are
+    /// operator input. Daemon envelopes (restart/deploy/wake delivery) and
+    /// provider/System output may advance the transcript without cancelling
+    /// a worker's result wake. The sequence arm also catches input persisted
+    /// after capture with an older timestamp. Input at or below either the
+    /// acknowledged deferral cursor (#189) or successor baseline (#482)
+    /// never counts; both boundaries remain valid when they coexist.
+    fn self_wake_has_newer_operator_input(
+        &self,
+        target: Uuid,
+        sequence: i64,
+        armed_at: Option<chrono::DateTime<chrono::Utc>>,
+        seen: Option<i64>,
+        transfer_sequence: Option<i64>,
+    ) -> Result<bool> {
+        let mut statement = self.conn.prepare(
+            "SELECT content, metadata, created_at, sequence FROM conversation_events
+             WHERE session_id=?1 AND role='User'
+               AND (sequence>?2 OR ?3 IS NOT NULL)
+               AND sequence>?4",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![
+                target.to_string(),
+                sequence,
+                armed_at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+                seen.unwrap_or(i64::MIN)
+                    .max(transfer_sequence.unwrap_or(i64::MIN)),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (content, metadata, timestamp, event_sequence) = row?;
+            // Stored RFC3339 fractions and offsets vary. Compare parsed
+            // instants instead of ordering timestamp text in SQLite.
+            if event_sequence <= sequence {
+                let created = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                    .map_err(|error| DaemonError::Store(error.to_string()))?;
+                if !armed_at.is_some_and(|at| created > at) {
+                    continue;
+                }
+            }
+            let operator = metadata
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|value| value["source"] == rsi_common::types::OPERATOR_EVENT_SOURCE);
+            if operator || !rsi_common::daemon_message::is_daemon_message(&content) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Store half of the check, run under the tip's spawn guard. The session
@@ -207,6 +335,11 @@ impl Store {
         }
         if let Some(observed) = fence.observed_restart_cut.as_ref()
             && self.restart_cut_fence(fence.tip)?.as_ref() != Some(observed)
+        {
+            return Err(refused(CONTINUATION_TURN_CHANGED));
+        }
+        if let Some(sequence) = fence.self_wake_event_sequence
+            && self.self_wake_has_newer_operator_input(fence.tip, sequence, None, None, None)?
         {
             return Err(refused(CONTINUATION_TURN_CHANGED));
         }

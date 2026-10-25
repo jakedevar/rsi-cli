@@ -6,18 +6,21 @@
 //! `portfolio:<id>`), never on a session, so it outlives every seat rotation.
 //! Authority: the operator writes any scope. A manager seat writes only to a
 //! scope strictly below its own (`Store::tier_ancestors` contains the caller's
-//! node) and must name provenance; it cannot write its own scope and no author
+//! node) and must name provenance, or write its own manager-authored ruling
+//! (#3736: provenance "manager:<its node>[ note]", never operator words); it cannot write its own scope and no author
 //! is read from request JSON. A manager clears a directive of a scope below it
-//! only when a manager (not the operator) wrote it. Rows are never deleted:
+//! only when a manager (not the operator) wrote it; a manager-authored ruling
+//! only the manager scope that wrote it clears. Rows are never deleted:
 //! `cleared_at` and `expires_at` end delivery and keep the audit trail.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rsi_common::manager_tier_routing::{MANAGER_TIER_TARGET_UNKNOWN, ManagerNodeRefV1};
 use rsi_common::standing_directives::{
     STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT, STANDING_DIRECTIVE_LIMIT,
-    STANDING_DIRECTIVE_MAX_ACTIVE_PER_SCOPE, STANDING_DIRECTIVE_NOT_AUTHORIZED,
-    STANDING_DIRECTIVE_NOT_FOUND, STANDING_DIRECTIVE_OPERATOR, STANDING_DIRECTIVE_SESSION_PREFIX,
-    StandingDirectiveV1,
+    STANDING_DIRECTIVE_MANAGER_PROVENANCE_PREFIX, STANDING_DIRECTIVE_MAX_ACTIVE_PER_SCOPE,
+    STANDING_DIRECTIVE_NOT_AUTHORIZED, STANDING_DIRECTIVE_NOT_FOUND, STANDING_DIRECTIVE_OPERATOR,
+    STANDING_DIRECTIVE_SESSION_PREFIX, StandingDirectiveKindV1, StandingDirectiveSourceV1,
+    StandingDirectiveV1, manager_provenance, parse_manager_provenance,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -84,6 +87,7 @@ impl RawDirective {
             id: parse_uuid(&self.id)?,
             scope: self.scope,
             text: self.body,
+            source: StandingDirectiveSourceV1::classify(&self.author, self.provenance.as_deref()),
             author: self.author,
             provenance: self.provenance,
             created_at: parse_time(&self.created_at)?,
@@ -121,7 +125,10 @@ impl StandingDirectiveActor {
 pub struct StandingDirectiveSetInput<'a> {
     pub scope: ManagerNodeRefV1,
     pub text: &'a str,
+    /// The operator relay's provenance, or a manager ruling's optional note.
     pub provenance: Option<&'a str>,
+    /// Whose words this is. A manager ruling needs a manager seat as actor.
+    pub kind: StandingDirectiveKindV1,
     pub expires_in_secs: Option<u64>,
     pub idempotency_key: &'a str,
 }
@@ -222,28 +229,60 @@ impl Store {
         {
             return Err(refused(STANDING_DIRECTIVE_INVALID_REQUEST));
         }
-        if let StandingDirectiveActor::Seat { node, .. } = actor {
-            if input.provenance.is_none() {
+        // The reserved prefix marks a manager ruling and only the daemon writes
+        // it, so an operator relay can never pose as one (or the reverse).
+        if input.provenance.is_some_and(|p| {
+            p.trim_start()
+                .to_ascii_lowercase()
+                .starts_with(STANDING_DIRECTIVE_MANAGER_PROVENANCE_PREFIX)
+        }) {
+            return Err(refused(STANDING_DIRECTIVE_INVALID_REQUEST));
+        }
+        let manager_ruling = input.kind == StandingDirectiveKindV1::Manager;
+        match actor {
+            StandingDirectiveActor::Seat { node, .. } => {
+                if input.provenance.is_none() && !manager_ruling {
+                    return Err(refused(STANDING_DIRECTIVE_INVALID_REQUEST));
+                }
+                if !self.standing_directive_covers(*node, input.scope)? {
+                    return Err(refused(STANDING_DIRECTIVE_NOT_AUTHORIZED));
+                }
+            }
+            // The operator speaks for itself; a manager ruling is never its.
+            StandingDirectiveActor::Operator if manager_ruling => {
                 return Err(refused(STANDING_DIRECTIVE_INVALID_REQUEST));
             }
-            if !self.standing_directive_covers(*node, input.scope)? {
-                return Err(refused(STANDING_DIRECTIVE_NOT_AUTHORIZED));
+            StandingDirectiveActor::Operator => {}
+        }
+        let stored_provenance: Option<String> = match actor {
+            StandingDirectiveActor::Seat { node, .. } if manager_ruling => {
+                Some(manager_provenance(node, input.provenance))
             }
+            _ => input.provenance.map(str::to_string),
+        };
+        if stored_provenance
+            .as_deref()
+            .is_some_and(|p| p.len() > STANDING_DIRECTIVE_MAX_PROVENANCE_BYTES)
+        {
+            return Err(refused(STANDING_DIRECTIVE_INVALID_REQUEST));
         }
         if !self.standing_directive_scope_exists(input.scope)? {
             return Err(refused(MANAGER_TIER_TARGET_UNKNOWN));
         }
         let scope = input.scope.as_ref_text();
         let author = actor.author();
-        let digest = format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(&serde_json::json!({
-                "scope": scope,
-                "text": input.text,
-                "provenance": input.provenance,
-                "expires_in_secs": input.expires_in_secs,
-            }))?)
-        );
+        // The digest of an operator relay is unchanged; a manager ruling adds its
+        // kind so a replay under the same key cannot change whose words it is.
+        let mut request = serde_json::json!({
+            "scope": scope,
+            "text": input.text,
+            "provenance": input.provenance,
+            "expires_in_secs": input.expires_in_secs,
+        });
+        if manager_ruling {
+            request["kind"] = serde_json::json!("manager");
+        }
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&request)?));
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing: Option<RawDirective> = tx
             .query_row(
@@ -286,7 +325,7 @@ impl Store {
                 scope,
                 input.text,
                 author,
-                input.provenance,
+                stored_provenance,
                 input.idempotency_key,
                 digest,
                 stamp(now),
@@ -336,6 +375,15 @@ impl Store {
                 return Err(refused(STANDING_DIRECTIVE_NOT_FOUND));
             }
             if row.author == STANDING_DIRECTIVE_OPERATOR {
+                return Err(refused(STANDING_DIRECTIVE_NOT_AUTHORIZED));
+            }
+            // A manager's own ruling is cleared by the manager scope that wrote
+            // it (any seat of it, so a rotation keeps the right), not by a
+            // sibling scope or another manager above.
+            if let Some((author_node, _)) =
+                row.provenance.as_deref().and_then(parse_manager_provenance)
+                && author_node != *node
+            {
                 return Err(refused(STANDING_DIRECTIVE_NOT_AUTHORIZED));
             }
         }

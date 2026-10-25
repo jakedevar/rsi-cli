@@ -22,6 +22,7 @@
 //! - `main` and `master` are refused even when the caller allowlists them.
 //! - Only worktrees minted by this engine can be discarded by it.
 
+mod cargo_lock;
 mod engine;
 mod git;
 mod guard;
@@ -44,7 +45,10 @@ pub use engine::{
 // integration path can bypass continuous custody.
 pub(crate) use engine::publish;
 pub use guard::scrubbed as guard_withholds_env;
-pub use guard::{GuardCommand, GuardCommandReport, GuardReport, GuardSpec, GuardStatus, run_guard};
+pub use guard::{
+    GuardCommand, GuardCommandReport, GuardReport, GuardSpec, GuardStatus, run_guard,
+    run_guard_with_env,
+};
 pub use test_timings::{TEST_TIMINGS_ENV, TEST_TIMINGS_HEADER, append_test_timings};
 
 /// RME-S2A-002: Resolve a Git ref to its commit OID using the hardened

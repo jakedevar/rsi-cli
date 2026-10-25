@@ -339,8 +339,12 @@ fn register_rsi_control_tools(
             description: "Read a bounded page of a session's conversation events (tail, or \
                  forward from after_sequence) plus its final assistant message and terminal \
                  reason. Set final_message_full to return up to 32768 characters of the final \
-                 message. Scope: your own child, a child of an Epic you lead, or a session in \
-                 your manager scope."
+                 message; set full_fields to raise the per-event content, tool_input and \
+                 metadata clip from 2000 to 262144 characters. Scope: your own child, a child of an Epic you lead, or a session in \
+                 your manager scope, or (Issue-bound worker, live binding) a same-project \
+                 non-manager session that created your bound Issue or is cited by full lowercase UUID in its \
+                 body, launch brief or newest 64 handoffs authored outside your continuation lineage. \
+                 Manager seats, including former seats and their continuations, are excluded."
                 .to_string(),
             parameters: AgentControlVerbV1::ReadSessionEvents
                 .descriptor()
@@ -568,7 +572,7 @@ fn register_rsi_control_tools(
                 match kind {
                     rsi_control::IssueControlToolKind::List => {
                         let params = rsi_control::agent_list_issues_from_args(&args)
-                            .map_err(agent_issue_invalid_request)?;
+                            .map_err(crate::error::agent_issue_list_invalid_request)?;
                         serialize_agent_issue_tool_result(
                             control.agent_list_issues(caller, params).await,
                         )
@@ -693,7 +697,7 @@ pub fn register_builtin_tools(
 pub fn register_codegraph_tools(
     registry: &mut ToolRegistry,
     handle: crate::codegraph::IndexHandle,
-    store: Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     session_id: uuid::Uuid,
     binding: crate::codegraph::NativeCodegraphBinding,
 ) {
@@ -771,7 +775,7 @@ mod tests {
         use crate::session::spawn_coordinator::SpawnCoordinator;
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -922,25 +926,11 @@ mod tests {
         assert_eq!(
             rpc_only,
             std::collections::BTreeSet::from([
-                "AgentContinueChild",
                 "AgentArchiveChild",
-                "AgentCancelWake",
-                "AgentManagerDelegateNode",
-                "AgentManagerEscalate",
-                "AgentManagerListEscalations",
-                "AgentManagerResolveEscalation",
-                "AgentEnqueueLandingSource",
-                "AgentGetProviderStatus",
-                "AgentSubmitJob",
-                "AgentGetJob",
-                "AgentListJobs",
-                "AgentCancelJob",
-                "AgentSendSatelliteMessage",
                 "AgentReportToHub",
-                "AgentGetDaemonInfo",
-                "AgentRequestDeploy",
                 "AgentPushSatelliteManagerPolicy",
                 "AgentReseatSatelliteManager",
+                "AgentSwitchHostPreset",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
@@ -951,7 +941,9 @@ mod tests {
             let Some(native) = descriptor.native_tool else {
                 continue;
             };
-            if native == NativeAgentControlToolV1::ScheduleWake {
+            // `schedule_wake` and the #3774 gateway-only tools are not served by
+            // this in-process registry.
+            if native == NativeAgentControlToolV1::ScheduleWake || native.mcp_gateway_only() {
                 assert!(specs.iter().all(|spec| spec.name != native.name()));
                 continue;
             }
@@ -976,7 +968,7 @@ mod tests {
         use crate::session::spawn_coordinator::SpawnCoordinator;
 
         let caller = uuid::Uuid::new_v4();
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         store
@@ -1063,7 +1055,7 @@ mod tests {
         let expected_len = rsi_common::agent_control_schema::agent_control_catalog_v1()
             .iter()
             .filter_map(|descriptor| descriptor.native_tool)
-            .filter(|native| native.name() != "schedule_wake")
+            .filter(|native| native.name() != "schedule_wake" && !native.mcp_gateway_only())
             .count()
             + 1;
         assert_eq!(registry.len(), expected_len);

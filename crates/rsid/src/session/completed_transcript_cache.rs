@@ -165,7 +165,7 @@ impl CompletedTranscriptCache {
 
     pub(super) async fn get_or_load(
         &self,
-        store: &Arc<AsyncMutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: Uuid,
         cap: &AtomicU64,
     ) -> Result<Vec<ConversationEvent>> {

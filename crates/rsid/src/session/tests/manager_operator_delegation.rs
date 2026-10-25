@@ -1930,6 +1930,384 @@ async fn storage_control_runs_status_preview_and_real_reclaim_and_journals_each(
     }
 }
 
+/// #434: replay both a queued disk hold and the observed already-running
+/// launch claim. Reclaim must finish without first settling that launch.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn storage_reclaim_finishes_while_same_manager_launch_is_disk_held() {
+    for running in [false, true] {
+        let p = grant_pilot(&[ManagerCapabilityV2::StorageControl]).await;
+        let launch = control(
+            &p,
+            "disk-held-launch",
+            ManagerActionV2::CreateSession {
+                parent_id: p.epic,
+                kind: SessionKind::Task,
+                query: "worker waiting for disk".into(),
+                launch: p.default_launch(),
+                sandbox_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Claim before the floor closes, as in the reported running action.
+        // Retain the claim without executing it to model its stalled launch.
+        let held_claim = if running { Some(p.claim().await) } else { None };
+        let disk_hold = crate::host_pressure::PressureHold::DiskPressure {
+            free_gb: 26.6,
+            min_gb: 30,
+            reserve_gb: 0,
+        };
+        p.manager
+            .host_load()
+            .set_pressure_source(std::sync::Arc::new(move || Some(disk_hold)));
+        if !running {
+            p.manager.reconcile_manager_actions_once().await.unwrap();
+        }
+
+        let reclaim = control(
+            &p,
+            "disk-freeing-reclaim",
+            call(
+                "RunSandboxBuildCacheReclaim",
+                json!({"dry_run": false}),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            if running {
+                // This fixture retains the running launch claim itself.
+                // A new reconcile pass would correctly recover it as
+                // abandoned; exercise its concurrent claim/executor path
+                // directly instead. The full-pool test drives the live
+                // coordinator with real in-flight launch futures.
+                let claim = p.claim().await;
+                assert_eq!(claim.id(), reclaim.operation_id);
+                p.manager.run_claimed_manager_action(claim).await.unwrap();
+            } else {
+                p.manager.reconcile_manager_actions_once().await.unwrap();
+            }
+        })
+        .await
+        .expect("reclaim must not wait for disk-held launch");
+        let receipt = p.receipt(reclaim.operation_id).await;
+        assert_eq!(receipt.state, ManagerActionStateV2::Succeeded);
+        let Some(OperatorCallResultV1::Scalar { method, result }) =
+            receipt.operator_result.map(|r| *r)
+        else {
+            panic!("completed reclaim report");
+        };
+        assert_eq!(method, "RunSandboxBuildCacheReclaim");
+        let report = result.get("report").unwrap_or(&result);
+        assert_eq!(report["dry_run"], false);
+        assert_eq!(actor(&p, reclaim.operation_id), Some(p.owner.to_string()));
+        assert_eq!(p.manager.host_load().pressure_now(), Some(disk_hold));
+        assert_eq!(
+            p.receipt(launch.operation_id).await.state,
+            if running {
+                ManagerActionStateV2::Running
+            } else {
+                ManagerActionStateV2::Queued
+            }
+        );
+        if let Some(claim) = held_claim {
+            p.manager
+                .store
+                .lock()
+                .await
+                .manager_action_runtime_gate(&claim, false)
+                .unwrap();
+        } else {
+            let view = p
+                .manager
+                .agent_control()
+                .agent_manager_get_action_view(
+                    p.owner,
+                    AgentManagerGetActionRequestV2 {
+                        project_id: None,
+                        operation_id: launch.operation_id,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(view.held.unwrap().reason, "disk_pressure");
+        }
+    }
+}
+
+/// Fill every ordinary executor slot with a real launch paused by the test
+/// seam, then close the disk floor. Reclaim uses its reserved slot while all
+/// launches remain parked, including after the ordinary batch budget is spent.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_reclaim_has_executor_capacity_when_all_launch_slots_are_held() {
+    let p = pilot().await;
+    let mut policy = p.policy.clone();
+    policy
+        .capabilities
+        .push(ManagerCapabilityV2::StorageControl);
+    policy.max_active_sessions = 12;
+    reconfigure(&p, 1, policy);
+    p.manager
+        .runtime_config
+        .host_load_admission_threshold
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let mut parents = vec![p.epic];
+    for i in 1..3 {
+        let parent = control(
+            &p,
+            &format!("parent-{i}"),
+            ManagerActionV2::CreateContainer {
+                parent_id: Some(p.group),
+                kind: SessionKind::Epic,
+                name: format!("Launch parent {i}"),
+                tags: vec!["manager".into()],
+            },
+        )
+        .await
+        .unwrap();
+        p.execute().await.unwrap();
+        parents.push(parent.target_session_id.unwrap());
+    }
+    let mut launches = Vec::new();
+    let mut reached = Vec::new();
+    let mut releases = Vec::new();
+    let mut processes = Vec::new();
+    for (i, parent_id) in parents.into_iter().enumerate() {
+        let receipt = control(
+            &p,
+            &format!("full-pool-launch-{i}"),
+            ManagerActionV2::CreateSession {
+                parent_id,
+                kind: SessionKind::Task,
+                query: "held launch".into(),
+                launch: p.default_launch(),
+                sandbox_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        let child = receipt.target_session_id.unwrap();
+        processes.push(crate::session::launch::install_controller_candidate_test_process(child));
+        let (parked, release) = crate::session::launch::install_controller_candidate_test_pause(
+            child,
+            crate::session::launch::ControllerCandidateTestPhase::ManagerActionAfterProviderStart,
+        );
+        launches.push(receipt.operation_id);
+        reached.push(parked);
+        releases.push(release);
+    }
+    let pass = p.manager.reconcile_manager_actions_once();
+    tokio::pin!(pass);
+    tokio::select! {
+        result = &mut pass => panic!("launches must remain parked: {result:?}"),
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), futures::future::try_join_all(reached)) => {
+            result.expect("all ordinary slots reached their launch pause").unwrap();
+        }
+    }
+    let disk_hold = crate::host_pressure::PressureHold::DiskPressure {
+        free_gb: 26.6,
+        min_gb: 30,
+        reserve_gb: 0,
+    };
+    p.manager
+        .host_load()
+        .set_pressure_source(std::sync::Arc::new(move || Some(disk_hold)));
+    // More than BATCH successful reclaims ensures the reserved lane stays
+    // available even after the pass's ordinary completion budget is spent.
+    for i in 0..5 {
+        let receipt = control(
+            &p,
+            &format!("full-pool-reclaim-{i}"),
+            call(
+                "RunSandboxBuildCacheReclaim",
+                json!({"dry_run": false}),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        let settled = async {
+            loop {
+                let receipt = p.receipt(receipt.operation_id).await;
+                if receipt.state == ManagerActionStateV2::Succeeded {
+                    break;
+                }
+                assert!(
+                    matches!(
+                        receipt.state,
+                        ManagerActionStateV2::Queued | ManagerActionStateV2::Running
+                    ),
+                    "{receipt:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut pass => panic!("reclaim completed the parked launches: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(15), settled) => {
+                result.expect("reclaim finishes while the executor's launch slots remain occupied");
+            }
+        }
+        assert_eq!(p.manager.host_load().pressure_now(), Some(disk_hold));
+        for launch in &launches {
+            assert_eq!(
+                p.receipt(*launch).await.state,
+                ManagerActionStateV2::Running
+            );
+        }
+    }
+    p.manager
+        .host_load()
+        .set_pressure_source(std::sync::Arc::new(|| None));
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(15), pass)
+        .await
+        .expect("released launches finish")
+        .unwrap();
+    for launch in launches {
+        assert_eq!(
+            p.receipt(launch).await.state,
+            ManagerActionStateV2::Succeeded
+        );
+    }
+    for process in processes {
+        assert_eq!(
+            process
+                .productive_start_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+}
+
+/// Only reclaim bypasses creates: status/other actions keep their fence, and
+/// two reclaims never run together even through the reserved-slot entry.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn storage_reclaim_bypass_preserves_other_action_ordering() {
+    let p = grant_pilot(&[ManagerCapabilityV2::StorageControl]).await;
+    let launch = control(
+        &p,
+        "launch",
+        ManagerActionV2::CreateSession {
+            parent_id: p.epic,
+            kind: SessionKind::Task,
+            query: "slow worker".into(),
+            launch: p.default_launch(),
+            sandbox_source: None,
+        },
+    )
+    .await
+    .unwrap();
+    let launch_claim = p.claim().await;
+    assert_eq!(launch_claim.id(), launch.operation_id);
+    let status = control(
+        &p,
+        "status",
+        call("GetSandboxStorageStatus", json!({}), None),
+    )
+    .await
+    .unwrap();
+    let first = control(
+        &p,
+        "reclaim-1",
+        call(
+            "RunSandboxBuildCacheReclaim",
+            json!({"dry_run": false}),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let second = control(
+        &p,
+        "reclaim-2",
+        call(
+            "RunSandboxBuildCacheReclaim",
+            json!({"dry_run": false}),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), first.operation_id);
+    {
+        let store = p.manager.store.lock().await;
+        assert!(
+            store
+                .claim_manager_build_cache_reclaim(p.manager.program_run_boot_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_manager_action(p.manager.program_run_boot_id)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .finish_manager_action(&claim, ManagerActionStateV2::Succeeded, "test_reclaimed")
+            .unwrap();
+    }
+    let claim = p.claim().await;
+    assert_eq!(claim.id(), second.operation_id);
+    {
+        let store = p.manager.store.lock().await;
+        store
+            .finish_manager_action(&claim, ManagerActionStateV2::Succeeded, "test_reclaimed")
+            .unwrap();
+        store
+            .finish_manager_action(
+                &launch_claim,
+                ManagerActionStateV2::Succeeded,
+                "test_launched",
+            )
+            .unwrap();
+    }
+    let status_claim = p.claim().await;
+    assert_eq!(status_claim.id(), status.operation_id);
+    let third = control(
+        &p,
+        "reclaim-3",
+        call(
+            "RunSandboxBuildCacheReclaim",
+            json!({"dry_run": false}),
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+    let store = p.manager.store.lock().await;
+    assert!(
+        store
+            .claim_manager_build_cache_reclaim(p.manager.program_run_boot_id)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .finish_manager_action(
+            &status_claim,
+            ManagerActionStateV2::Succeeded,
+            "test_status",
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_manager_build_cache_reclaim(p.manager.program_run_boot_id)
+            .unwrap()
+            .unwrap()
+            .id(),
+        third.operation_id
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[tokio::test]
 async fn storage_control_keeps_the_execute_and_pause_gates() {
@@ -2172,6 +2550,8 @@ async fn host_load_and_batch_size_apply_inside_default_bounds() {
         ("governor_min_free_disk_gb", "floor-low", 29),
         ("governor_min_free_disk_gb", "floor-high", 101),
         ("rolling_queue_full_qa_interval_mins", "qa-low", 29),
+        ("rolling_queue_gate_timeout_mins", "gate-timeout-low", 44),
+        ("rolling_queue_gate_timeout_mins", "gate-timeout-high", 181),
     ] {
         refused_with(
             &p,
@@ -2947,7 +3327,7 @@ async fn satellite_deploy_forwards_interrupt_workers_and_refuses_an_older_satell
         assert_eq!(seen[0].interrupt_workers, Some(true));
         assert_eq!(seen[0].max_wait_secs, Some(3000));
         assert!(seen[0].as_local_request().interrupts_workers());
-        assert_eq!(seen[1].interrupt_workers, None);
+        assert_eq!(seen[1].interrupt_workers, Some(true));
     }
 
     sat.legacy_no_interrupt
@@ -2963,8 +3343,8 @@ async fn satellite_deploy_forwards_interrupt_workers_and_refuses_an_older_satell
         "{error}"
     );
     assert_eq!(sat.deploys.lock().unwrap().len(), 2, "nothing was sent");
-    // The old request shape still works against the older satellite.
-    request_satellite_deploy(
+    // Omission now also requires the interrupt capability.
+    let error = request_satellite_deploy(
         &p,
         p.owner,
         &dirs,
@@ -2972,8 +3352,13 @@ async fn satellite_deploy_forwards_interrupt_workers_and_refuses_an_older_satell
         satellite_deploy_request(&dirs, sat.peer, "sat-legacy-plain"),
     )
     .await
-    .unwrap();
-    assert_eq!(sat.deploys.lock().unwrap().len(), 3);
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("satellite_deploy_interrupt_unsupported"),
+        "{error}"
+    );
+    assert_eq!(sat.deploys.lock().unwrap().len(), 2);
     // An explicit `interrupt_workers:false` asks for nothing: it is sent with
     // no field, so the older satellite is not refused (#2605).
     let mut ask = satellite_deploy_request(&dirs, sat.peer, "sat-legacy-false");
@@ -2983,9 +3368,9 @@ async fn satellite_deploy_forwards_interrupt_workers_and_refuses_an_older_satell
         .unwrap();
     {
         let seen = sat.deploys.lock().unwrap();
-        assert_eq!(seen.len(), 4);
-        assert_eq!(seen[3].interrupt_workers, None);
-        let body = serde_json::to_string(&seen[3]).unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[2].interrupt_workers, None);
+        let body = serde_json::to_string(&seen[2]).unwrap();
         assert!(!body.contains("interrupt_workers"), "{body}");
     }
 }
@@ -3257,7 +3642,7 @@ async fn deploy_is_advertised_only_to_a_manager_holding_the_capability() {
 /// A fake satellite: answers `GetSatelliteIdentity` (with health) and
 /// `RequestHubDeploy`, and records every deploy request it receives.
 struct FakeSatellite {
-    policy_store: std::sync::Arc<tokio::sync::Mutex<Store>>,
+    policy_store: std::sync::Arc<rsid_core::store_lock::Mutex<Store>>,
     policy_received: std::sync::Arc<tokio::sync::Notify>,
     _temp: tempfile::TempDir,
     root: std::path::PathBuf,
@@ -3272,6 +3657,10 @@ struct FakeSatellite {
     reseats: std::sync::Arc<
         std::sync::Mutex<Vec<rsi_common::manager_reseat::SatelliteManagerReseatRequestV1>>,
     >,
+    /// #3291: how long the satellite takes to answer an admitted reseat, and
+    /// whether it closes the connection instead of answering.
+    reseat_delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    reseat_drop_reply: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// An older satellite build: its identity does not advertise `deploy_interrupt`.
     legacy_no_interrupt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -3346,12 +3735,16 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
             ..Default::default()
         })
         .unwrap();
-    let policy_store = Arc::new(tokio::sync::Mutex::new(policy_store));
+    let policy_store = Arc::new(rsid_core::store_lock::Mutex::new(policy_store));
     let remote_policy_store = Arc::clone(&policy_store);
     let policy_received = Arc::new(tokio::sync::Notify::new());
     let remote_policy_received = Arc::clone(&policy_received);
     let reseats = Arc::new(Mutex::new(Vec::new()));
     let remote_reseats = Arc::clone(&reseats);
+    let reseat_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reseat_drop_reply = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let remote_reseat_delay_ms = Arc::clone(&reseat_delay_ms);
+    let remote_reseat_drop_reply = Arc::clone(&reseat_drop_reply);
     let (c, d, r, b, legacy) = (
         Arc::clone(&calls),
         Arc::clone(&deploys),
@@ -3374,6 +3767,8 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
             let policy_store = Arc::clone(&remote_policy_store);
             let policy_received = Arc::clone(&remote_policy_received);
             let reseats = Arc::clone(&remote_reseats);
+            let reseat_delay_ms = Arc::clone(&remote_reseat_delay_ms);
+            let reseat_drop_reply = Arc::clone(&remote_reseat_drop_reply);
             tokio::spawn(async move {
                 let mut stream = tokio::io::BufReader::new(stream);
                 let mut line = String::new();
@@ -3390,6 +3785,9 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                             let mut identity =
                                 crate::satellite::identity(installation, incarnation);
                             identity.capabilities.deploy_interrupt = !legacy.load(Ordering::SeqCst);
+                            // Keep the fake identity independent of policy
+                            // writes: the pending-link test holds this store
+                            // lock until a policy request reaches the socket.
                             identity.health = Some(SatelliteHealthV1 {
                                 platform: None,
                                 daemon_version: "1.0.0".into(),
@@ -3397,6 +3795,8 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                 uptime_seconds: 42,
                                 schema_version: Some(146),
                                 sessions_running: 0,
+                                workers_parked: None,
+                                open_jobs: None,
                                 sessions_waiting_approval: 0,
                                 disk_free_bytes: None,
                                 load_avg_1m_milli: None,
@@ -3412,11 +3812,14 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                     finished_at: None,
                                 }),
                                 missing_provider_clis: Vec::new(),
+                                manager_policies: Some(Vec::new()),
                                 manager_launches: Vec::new(),
+                                governor_disk: None,
                                 qa_admission: None,
                                 provider_logins: Vec::new(),
                                 provider_faults: Vec::new(),
                                 store_probe_elapsed_ms: None,
+                                usage: Vec::new(),
                                 latest_watchdog_trip: None,
                             });
                             rsi_common::rpc::RpcResponse::success(
@@ -3437,7 +3840,12 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                     rsi_common::RpcError {
                                         code: -32000,
                                         message: error.to_string(),
-                                        data: None,
+                                        data: match &error {
+                                            DaemonError::StructuredRpc { data, .. } => {
+                                                Some(data.clone())
+                                            }
+                                            _ => None,
+                                        },
                                     },
                                 ),
                             }
@@ -3473,6 +3881,14 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                             result,
                                         };
                                     reseats.lock().unwrap().push(wire);
+                                    let delay = reseat_delay_ms.load(Ordering::SeqCst);
+                                    if delay > 0 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(delay))
+                                            .await;
+                                    }
+                                    if reseat_drop_reply.load(Ordering::SeqCst) {
+                                        return;
+                                    }
                                     rsi_common::rpc::RpcResponse::success(
                                         id,
                                         serde_json::to_value(receipt).unwrap(),
@@ -3520,6 +3936,11 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
                                         ),
                                         interrupt_workers: false,
                                         interrupted_workers: Vec::new(),
+                                        expected_interrupted_workers: Vec::new(),
+                                        expected_requeued_jobs: Vec::new(),
+                                        requeued_jobs: Vec::new(),
+                                        expected_surviving_jobs: Vec::new(),
+                                        surviving_jobs: Vec::new(),
                                         job_grace_secs: None,
                                         cancelled_jobs: Vec::new(),
                                         blockers: Vec::new(),
@@ -3600,6 +4021,8 @@ async fn fake_satellite(p: &Pilot, dispatch: bool, scoped: bool) -> FakeSatellit
         refuse,
         build_sha,
         reseats,
+        reseat_delay_ms,
+        reseat_drop_reply,
         legacy_no_interrupt,
     }
 }
@@ -3632,6 +4055,30 @@ async fn request_satellite_deploy(
             &sat.root,
         )
         .await
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_deploy_refuses_non_absolute_paths_before_contacting_the_peer() {
+    let dirs = deploy_dirs(false, DEPLOY_SHA, 999);
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+    // An unavailable socket proves the refusal precedes the round trip.
+    std::fs::remove_file(sat.root.join("peer.sock")).unwrap();
+    for path in ["relative/bin", "~/.rsi/staging/bin-test", ""] {
+        let mut request = satellite_deploy_request(&dirs, sat.peer, "relative");
+        request.binaries_dir = Some(path.into());
+        let error = request_satellite_deploy(&p, p.owner, &dirs, &sat, request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid parameter: {}",
+                rsi_common::agent_deploy::DEPLOY_BINARIES_DIR_NOT_ABSOLUTE
+            )
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
@@ -3922,6 +4369,7 @@ async fn daemon_info_lists_satellites_read_over_the_link_for_the_manager_only() 
     assert_eq!(row.build_sha.as_deref(), Some("b".repeat(40).as_str()));
     assert_eq!(row.supervisor_mode.as_deref(), Some("rsid-supervisor.sh"));
     assert_eq!(row.schema_version, Some(146));
+    assert_eq!(row.manager_policies, Some(Vec::new()));
     assert_eq!(
         row.last_deploy.as_ref().map(|deploy| deploy.state),
         Some(rsi_common::agent_deploy::DeployState::Succeeded)
@@ -3980,6 +4428,7 @@ fn satellite_policy_request(
         policy: SatelliteManagerPolicyPatchV1 {
             allowed_launches: p.policy.allowed_launches.clone(),
             max_created_sessions: 3,
+            created_sessions_window_hours: None,
             max_active_sessions: 2,
             provider_limits: Vec::new(),
         },
@@ -4174,6 +4623,51 @@ async fn satellite_reseat_bounds_check_the_model_and_effort_against_the_grant() 
     assert!(
         !reseat_against_grant(vec![entry(Some("high"))], Some("other-model"), Some("high")).await
     );
+}
+
+/// #3291: a reseat launches a session on the satellite, so its reply can take
+/// longer than the 3 s read deadline. The hub waits for it and returns the
+/// successor instead of reporting the completed reseat as unreachable.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_reseat_waits_for_a_reply_slower_than_the_read_deadline() {
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+    sat.reseat_delay_ms
+        .store(4_000, std::sync::atomic::Ordering::SeqCst);
+    let receipt = p
+        .manager
+        .agent_control()
+        .reseat_satellite_manager_via(p.owner, satellite_reseat_request(&p, &sat), &sat.root)
+        .await
+        .expect("a slow reply is still the satellite's receipt");
+    assert_eq!(receipt.result.predecessor_session_id, p.owner);
+    assert_eq!(sat.reseats.lock().unwrap().len(), 1);
+}
+
+/// #3291: when the reply is lost after the satellite admitted the request, the
+/// caller is told the outcome is uncertain, never that the satellite was
+/// unreachable.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn satellite_reseat_with_a_lost_reply_is_uncertain_not_unreachable() {
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+    sat.reseat_drop_reply
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let error = p
+        .manager
+        .agent_control()
+        .reseat_satellite_manager_via(p.owner, satellite_reseat_request(&p, &sat), &sat.root)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("satellite_reseat_uncertain reason=reply_lost"),
+        "{text}"
+    );
+    assert!(!text.contains("satellite_reseat_unreachable"), "{text}");
+    assert_eq!(sat.reseats.lock().unwrap().len(), 1);
 }
 
 /// #2750: the satellite refuses a reseat from a hub it does not allowlist,
@@ -4502,6 +4996,51 @@ async fn satellite_policy_link_applies_records_replays_and_preserves_operator_sa
         serde_json::from_str::<Value>(&stored).unwrap()["deduplicated"],
         false
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn stale_satellite_policy_push_preserves_actual_versions_counts_and_seat_over_the_link() {
+    use rsi_common::satellite_manager_policy::POLICY_STALE;
+    let p = grant_pilot(&[ManagerCapabilityV2::Deploy]).await;
+    let sat = fake_satellite(&p, true, true).await;
+    let control = p.manager.agent_control();
+    let request = satellite_policy_request(&p, &sat);
+    // Both scope and policy are stale; the satellite still reports both actuals.
+    let mut stale = request.clone();
+    for (key, scope, policy, launches) in [("stale-scope", 2, 0, 0), ("stale-policy", 1, 1, 1)] {
+        stale.idempotency_key = key.into();
+        stale.expected_scope_version = scope;
+        stale.expected_policy_version = policy;
+        let error = control
+            .push_satellite_manager_policy_via(p.owner, stale.clone(), &sat.root)
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("stale refusal must carry typed data: {text}")
+        };
+        assert_eq!(data["code"], POLICY_STALE);
+        assert_eq!(data["actual_scope_version"], 1);
+        assert_eq!(data["actual_policy_version"], launches + 1);
+        assert_eq!(data["allowed_launches"], launches);
+        assert_eq!(data["manager_session_id"], p.owner.to_string());
+        for field in [
+            "actual_scope_version=1",
+            &format!("actual_policy_version={}", launches + 1),
+            &format!("allowed_launches={launches}"),
+            &format!("manager_session_id={}", p.owner),
+        ] {
+            assert!(text.contains(field), "{text}");
+        }
+        if launches == 0 {
+            // A valid push changes only the policy version and saved list.
+            control
+                .push_satellite_manager_policy_via(p.owner, request.clone(), &sat.root)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]

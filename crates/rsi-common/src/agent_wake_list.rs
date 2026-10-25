@@ -50,10 +50,15 @@ pub struct AgentWakeV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<WakePredicate>,
     pub next_fire_at: DateTime<Utc>,
-    /// When a `when` wake fires with `timed_out: true` if still pending.
+    /// Predicate timeout or busy-target recovery deadline, whichever is earlier.
+    /// A pending predicate fires with `timed_out: true`; a still-busy target
+    /// settles as `wake_recoverable` after its result has a durable owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<DateTime<Utc>>,
     pub enabled: bool,
+    /// Why the wake was disabled, when recorded (for example `disabled_by_halt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     /// Daemon-owned (program guard, manager watch, background process): not
     /// cancellable by the owner.

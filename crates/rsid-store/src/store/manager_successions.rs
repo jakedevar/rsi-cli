@@ -130,6 +130,40 @@ impl ManagerRootSuccession {
     }
 }
 
+/// One published predecessor of a seat lineage (#185), as recorded at admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagerHandoffLineageHop {
+    pub session_id: Uuid,
+    pub working_dir: Option<PathBuf>,
+    pub source_commit: Option<String>,
+    pub sandboxless: bool,
+    pub protected: bool,
+}
+
+/// Maximum lineage work while one store lock is held.
+pub const MANAGER_HANDOFF_LINEAGE_BATCH: usize = 256;
+
+/// In-memory catch-up cursor over immutable published rows. Retaining the
+/// project and visited seats across pages preserves the lineage/cycle fences.
+/// A restart can safely start over; no schema or persisted progress is needed.
+pub struct ManagerHandoffLineageCursor {
+    current: Uuid,
+    project: Option<String>,
+    seen: std::collections::HashSet<Uuid>,
+    finished: bool,
+}
+
+impl ManagerHandoffLineageCursor {
+    pub fn new(live: Uuid) -> Self {
+        Self {
+            current: live,
+            project: None,
+            seen: std::collections::HashSet::from([live]),
+            finished: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManagerSuccessionClaim {
     pub action: ManagerActionClaimV2,
@@ -231,6 +265,12 @@ pub struct ManagerRootResourceOrigin {
 /// `manager_succession_predecessor_changed` (a settled predecessor that keeps
 /// being resumed is not handing the seat over).
 const MANAGER_SUCCESSION_MAX_INTERVENING_TURNS: i64 = 4;
+
+/// hub #3778: the queued `succeed_manager` receipt tells the predecessor what
+/// settlement needs. Settlement accepts a later commit only while the handoff blob
+/// is unchanged at HEAD, so the safe instruction is to add no commit at all.
+const AWAITING_SETTLEMENT_NOTICE: &str =
+    "succession queued: commit nothing after this; end your turn so the daemon settles the handoff";
 
 fn settled_status(status: SessionStatus) -> bool {
     matches!(
@@ -583,6 +623,7 @@ impl Store {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: Some(AWAITING_SETTLEMENT_NOTICE.into()),
         };
         let stamp = now();
         self.conn.execute("INSERT INTO harness_manager_v2_operations(id,project_id,manager_session_id,scope_version,policy_version,actor_session_id,idempotency_key,fingerprint,kind,payload_json,state,row_version,target_session_id,outcome_json,not_before,created_at,updated_at)
@@ -605,6 +646,7 @@ impl Store {
                 session_id: caller,
                 working_dir: current.working_dir.clone(),
                 sandbox_root: current.sandbox_root.clone(),
+                parent_working_dir: None,
                 commit: handoff.source_commit.clone(),
                 custody_generation: expected.custody_generation,
                 historical_commit: false,
@@ -740,6 +782,7 @@ impl Store {
         receipt.state = ManagerActionStateV2::Queued;
         receipt.row_version += 1;
         receipt.outcome = Some("awaiting_predecessor_settlement".into());
+        receipt.outcome_detail = Some(AWAITING_SETTLEMENT_NOTICE.into());
         receipt.refresh_action_metadata(&operation.context.request.operation);
         let stamp = now();
         let changed = self.conn.execute(
@@ -1303,6 +1346,88 @@ impl Store {
                     .ok_or_else(|| refused("manager_succession_unavailable"))
             })
             .collect()
+    }
+
+    /// #185: the published seat lineage behind `live`, newest predecessor
+    /// first, as the store recorded each hop when it was admitted: the
+    /// predecessor's session id, the working directory its handoff was read in,
+    /// the handoff commit and whether it held no custody (only such a seat
+    /// anchors its handoff at its private ref). Follows committed (published)
+    /// successions only, inside one project, for at most `max_hops` hops,
+    /// capped at [`MANAGER_HANDOFF_LINEAGE_BATCH`]. Use the cursor API below
+    /// to continue beyond one batch.
+    pub fn manager_handoff_lineage(
+        &self,
+        live: Uuid,
+        max_hops: usize,
+    ) -> Result<Vec<ManagerHandoffLineageHop>> {
+        self.manager_handoff_lineage_page(&mut ManagerHandoffLineageCursor::new(live), max_hops)
+    }
+
+    /// Read at most one bounded page, resuming from its oldest predecessor on
+    /// the next call. Callers release the store lock between pages and do Git
+    /// work outside it. Protected seats are still walked, never pruned.
+    pub fn manager_handoff_lineage_page(
+        &self,
+        cursor: &mut ManagerHandoffLineageCursor,
+        max_hops: usize,
+    ) -> Result<Vec<ManagerHandoffLineageHop>> {
+        const HOP_SQL: &str = "SELECT predecessor_session_id,project_id,
+            json_extract(frozen_json,'$.predecessor.working_dir'),
+            json_extract(frozen_json,'$.handoff.source_commit'),
+            json_extract(frozen_json,'$.predecessor_custody') IS NULL,
+            EXISTS(SELECT 1 FROM manager_root_successions AS pending
+                      WHERE pending.state IN ('reserved','executing','established','cleanup_required')
+                        AND (pending.predecessor_session_id=hop.predecessor_session_id
+                             OR pending.candidate_session_id=hop.predecessor_session_id))
+            FROM manager_root_successions AS hop
+            WHERE candidate_session_id=?1 AND state='committed' AND published_epoch IS NOT NULL";
+        let mut hops = Vec::new();
+        while !cursor.finished && hops.len() < max_hops.min(MANAGER_HANDOFF_LINEAGE_BATCH) {
+            let row = self
+                .conn
+                .query_row(HOP_SQL, [cursor.current.to_string()], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, bool>(4)?,
+                        r.get::<_, bool>(5)?,
+                    ))
+                })
+                .optional()?;
+            let Some((
+                predecessor,
+                row_project,
+                working_dir,
+                source_commit,
+                sandboxless,
+                protected,
+            )) = row
+            else {
+                cursor.finished = true;
+                break;
+            };
+            if cursor.project.get_or_insert_with(|| row_project.clone()) != &row_project {
+                cursor.finished = true;
+                break;
+            }
+            let session_id = parse_id(&predecessor)?;
+            if !cursor.seen.insert(session_id) {
+                cursor.finished = true;
+                break;
+            }
+            hops.push(ManagerHandoffLineageHop {
+                session_id,
+                working_dir: working_dir.map(PathBuf::from),
+                source_commit,
+                sandboxless,
+                protected,
+            });
+            cursor.current = session_id;
+        }
+        Ok(hops)
     }
 
     /// Monotonic measured lower-bound update; never upgrades unknown original

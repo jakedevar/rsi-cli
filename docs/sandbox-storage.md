@@ -83,13 +83,13 @@ whose sources differ from that commit.
   hashes `rustc -vV` (the commit's toolchain), `CARGO_INCREMENTAL`, every
   `CARGO_PROFILE_*` variable and the rustc flag variables.
 - **No clobbering, by construction.** Library outputs (`.rlib`, `.rmeta`)
-  are hard links; rustc replaces them by rename. Executables, `.dwo` and `.so`
-  are written in place by the linker, so they are hard links only behind
+  are hard links; rustc replaces them by rename. Executables, `.dwo`, `.so` and (on macOS, where rustc keeps
+  a unit's object files) `.o` are written in place by the linker, so they are hard links only behind
   `rsi-build-rustc` (`RUSTC_WRAPPER`), which unlinks a unit's shared or
   read-only outputs before compiling; the pool marks them read-only, so a build
   without the wrapper stops (`not writeable` / `IO failure on output stream`)
   instead of writing into another sandbox's file. Fingerprints, dep-info and
-  build-script output are copied. `scripts/tests/test_target_pool.py` builds
+  build-script output are copied. `crates/rsid/tests/target_pool_cargo.rs` builds
   two sandboxes on different commits from one pool concurrently and checks the
   pool's bytes are unchanged.
 - **Relocation.** Cargo does not rebuild a unit when `CARGO_MANIFEST_DIR`
@@ -143,7 +143,9 @@ whose sources differ from that commit.
   the built rsid embeds this checkout's commit (`rsid --build-info`), and
   `--link-only` refuses binaries this worktree did not build from its current
   sources: HEAD plus a git tree fingerprint of uncommitted edits and new files
-  (#2179; `--allow-foreign-build` overrides). Before any cleanup it repoints
+  (#2179; `--allow-foreign-build` overrides, and `--build-receipt FILE` takes a
+  `build` job's result JSON instead, #157: it links only a clean-tree job whose
+  `source_head` is this HEAD and whose rsid embeds it; the receipt's `target_dir` must resolve to the release target or the caller's cargo target, or `--target-dir` names it, #3513). Before any cleanup it repoints
   installed links that resolve into `release/` (`~/.local/bin`, each worktree's
   `target/release`) at kept copies in `~/.rsi/install-kept` (pruned once no
   installed or recorded link resolves to them, #2188), and `--tui-only`
@@ -322,8 +324,14 @@ Eligibility is not immediate, and a kept `target/` is not a lifecycle failure:
 - **Idle TTL.** Outside pressure a candidate must be idle for the reclaim TTL
   (default 6 hours). Inside the TTL it is still reclaimed when the worktree's
   `HEAD` is already an ancestor of `refs/remotes/origin/rolling`, or the
-  session's newest merge-queue entry is `published` (#1684); otherwise the
-  attempt reports `idle_below_ttl`. Under disk pressure the TTL is bypassed,
+  session's newest merge-queue entry is `published` (#1684), or the session's
+  latest turn ended with a final `PIPELINE HANDOFF` and its `HEAD` is
+  contained in any `refs/remotes/origin/*` branch it pushed (a satellite
+  worker lands through the hub queue, hub #3026). The probes read the local
+  remote-tracking refs and never fetch, so a stale ref only delays the
+  reclaim. Otherwise the attempt reports `idle_below_ttl`. Without pressure
+  the fair walk visits a finished row once per cycle, so a worker that lands
+  after its visit waits for the next cycle. Under disk pressure the TTL is bypassed,
   but an unparseable timestamp and every check below still refuse.
 - **Live consumers** keep the target: `running_job` (a `queued` or `running`
   daemon job owned by the session or running inside its sandbox),

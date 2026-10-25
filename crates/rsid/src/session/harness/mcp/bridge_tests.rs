@@ -147,11 +147,11 @@ pub(in crate::session::harness) fn definition(
 
 async fn world() -> (
     TempDir,
-    Arc<tokio::sync::Mutex<Store>>,
+    Arc<rsid_core::store_lock::Mutex<Store>>,
     crate::vault::VaultHandle,
 ) {
     let temp = TempDir::new().expect("temp dir");
-    let store = Arc::new(tokio::sync::Mutex::new(
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(
         Store::open_in_memory().expect("store"),
     ));
     let vault = VaultHandleBuilder::new(Arc::new(VaultSettings::default()))
@@ -162,7 +162,7 @@ async fn world() -> (
 }
 
 pub(in crate::session::harness) async fn configure(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     definition: &McpServerDefinition,
 ) {
     let store = store.lock().await;
@@ -173,7 +173,7 @@ pub(in crate::session::harness) async fn configure(
 }
 
 async fn built_bridge(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     vault: &crate::vault::VaultHandle,
 ) -> McpBridge {
     McpBridge::build(store, vault).await
@@ -195,7 +195,7 @@ fn pid(temp: &TempDir, id: &str) -> i32 {
 }
 
 fn process_alive(pid: i32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    crate::test_support::process_is_running(pid)
 }
 
 struct StubTool(String);

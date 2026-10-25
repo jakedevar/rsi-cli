@@ -16,6 +16,8 @@ use std::sync::Mutex as StdMutex;
 #[derive(Default)]
 pub(crate) struct RecordingLauncher {
     deliveries: StdMutex<Vec<(Uuid, String)>>,
+    /// Exercise the real durable continuation fence in seat-transfer tests.
+    fence_store: Option<Arc<rsid_core::store_lock::Mutex<Store>>>,
     /// #2204: the daemon has decided to restart (scheduler paused).
     restart_draining: std::sync::atomic::AtomicBool,
     /// #2204: a waiting deploy holds this target's resume.
@@ -30,6 +32,13 @@ pub(crate) struct RecordingLauncher {
 }
 
 impl RecordingLauncher {
+    pub(crate) fn with_fence_store(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> Self {
+        Self {
+            fence_store: Some(store),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn deliveries(&self) -> Vec<(Uuid, String)> {
         self.deliveries.lock().unwrap().clone()
     }
@@ -54,10 +63,17 @@ impl SessionLauncher for RecordingLauncher {
         &self,
         target: Uuid,
         message: String,
-        _: Vec<Uuid>,
+        job_ids: Vec<Uuid>,
     ) -> crate::error::Result<Uuid> {
         use std::sync::atomic::Ordering;
         self.resume_attempts.fetch_add(1, Ordering::SeqCst);
+        if let Some(store) = &self.fence_store {
+            let store = store.lock().await;
+            let fence = store
+                .capture_scheduled_continuation_fence(target, &job_ids)?
+                .expect("delivery target");
+            store.check_continuation_fence_durable(&fence)?;
+        }
         let refused = self
             .drain_refusals
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
@@ -93,7 +109,7 @@ impl SessionLauncher for RecordingLauncher {
 }
 
 struct World {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     launcher: Arc<RecordingLauncher>,
     owner: Uuid,
@@ -106,7 +122,7 @@ impl World {
 
     fn with_store(store: Store) -> Self {
         Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             bus: Arc::new(EventBus::new(64)),
             launcher: Arc::new(RecordingLauncher::default()),
             owner: Uuid::new_v4(),
@@ -131,6 +147,7 @@ fn new_job(owner: Uuid, name: &str, wake: JobWake) -> NewAgentJob {
         project_id: None,
         name: Some(name.into()),
         params: JobParams::Build(BuildJobParams {
+            release_members: Vec::new(),
             command: BuildCommand::Check,
             package: None,
             workspace: true,
@@ -139,6 +156,7 @@ fn new_job(owner: Uuid, name: &str, wake: JobWake) -> NewAgentJob {
             no_default_features: false,
             features: Vec::new(),
             shards: Vec::new(),
+            bins: Vec::new(),
             cpu_quota_percent: None,
             sha: None,
         }),
@@ -200,11 +218,13 @@ pub(crate) fn jobs_terminal(ids: &[Uuid]) -> WakePredicate {
     WakePredicate {
         jobs_terminal: Some(ids.to_vec()),
         sha_on_rolling: None,
+        shas_on_rolling: None,
         issue_closed: None,
         todo_closed: None,
         topology_execution_settled: None,
         health_anomaly: None,
         settlement_run_settled: None,
+        fire: None,
     }
 }
 
@@ -216,6 +236,106 @@ async fn make_due(world: &World, id: Uuid) {
         .await
         .defer_wake_when(id, Utc::now() - chrono::Duration::seconds(1))
         .expect("defer");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn scheduler_tick_logs_only_delivered_when_wakes_at_info() {
+    use std::collections::BTreeMap;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Default)]
+    struct Fields(BTreeMap<String, String>);
+
+    impl tracing::field::Visit for Fields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct InfoCapture(Arc<StdMutex<Vec<Fields>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for InfoCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().level() == &tracing::Level::INFO
+                && event.metadata().target().starts_with("rsid::scheduler")
+            {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    for outcome in ["satisfied", "timed_out", "unsatisfiable"] {
+        let world = World::new();
+        let (pending, delivered) = {
+            let store = world.store.lock().await;
+            let pending_id = insert_job(&store, world.owner, "still running");
+            let delivered_id = insert_job(&store, world.owner, "awaited job");
+            let pending = arm(&store, world.owner, jobs_terminal(&[pending_id]), None).unwrap();
+            let delivered = arm(&store, world.owner, jobs_terminal(&[delivered_id]), None).unwrap();
+            match outcome {
+                "satisfied" => finish(&store, delivered_id, JobState::Succeeded, 0, None),
+                "timed_out" | "unsatisfiable" => {
+                    let mut state = store.wake_when_state(delivered.id).unwrap().unwrap();
+                    if outcome == "timed_out" {
+                        state.deadline = Some(Utc::now() - chrono::Duration::seconds(1));
+                    } else {
+                        state.predicate = jobs_terminal(&[Uuid::new_v4()]);
+                    }
+                    store
+                        .set_wake_when_state_for_test(delivered.id, &state)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            (pending, delivered)
+        };
+        let capture = InfoCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        async {
+            // Exercise the real fast-lane tick with both pending and settled rows.
+            world.pass().await;
+            make_due(&world, pending.id).await;
+            make_due(&world, delivered.id).await;
+            world.pass().await;
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        {
+            let events = capture.0.lock().unwrap();
+            assert_eq!(events.len(), 1, "one INFO for the {outcome} delivery");
+            let fields = &events[0].0;
+            assert_eq!(fields["job_id"], delivered.id.to_string());
+            assert_eq!(fields["job_name"], delivered.name);
+            assert_eq!(fields["mode"], "when");
+            assert_eq!(fields["outcome"], outcome);
+        }
+        assert_eq!(world.launcher.deliveries().len(), 1);
+        assert_eq!(world.launcher.deliveries()[0].0, world.owner);
+        assert!(
+            world
+                .store
+                .lock()
+                .await
+                .get_scheduled_job(&pending.id)
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -433,6 +553,7 @@ fn a_vanished_job_settles_with_a_typed_reason_and_satisfied_beats_timeout() {
         armed_at: now,
         deadline: Some(now - chrono::Duration::seconds(5)),
         repo_dir: None,
+        delivered_shas: Vec::new(),
     };
     let missing = vec![(id, None)];
     let verdict = decide_jobs(&missing, &state, now, false);
@@ -454,6 +575,135 @@ fn a_vanished_job_settles_with_a_typed_reason_and_satisfied_beats_timeout() {
     assert_eq!(decide_jobs(&snaps, &state, now, false), Verdict::Satisfied);
 }
 
+/// A launchd backend whose service state the test drives: `launchctl print`
+/// reads "not running" between `bootstrap` and the `kickstart` taking effect,
+/// then "running", then the service exits after the wrapper's status write.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[derive(Default)]
+struct MidStartLaunchd {
+    active: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+impl crate::agent_jobs::JobRuntime for MidStartLaunchd {
+    fn launch(&self, _: &crate::agent_jobs::LaunchSpec) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
+    fn unit_active(&self, _: &str) -> bool {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// #170: a `jobs_terminal` wake armed while its launchd job is mid-start stays
+/// pending through every launch-window reading of the service (inactive with
+/// no status, active, active with the status already written). It fires once,
+/// only after the jobs loop has settled the stored row, and reports that row's
+/// state and exit code. The settled row never goes back to running.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_launchd_job_mid_start_keeps_its_jobs_terminal_wake_pending_until_the_stored_row_settles()
+{
+    use std::sync::atomic::Ordering;
+    let world = World::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut new = new_job(world.owner, "169-exact", JobWake::None);
+    new.unit_name = format!("gui/501/rsi-job-{}", new.id);
+    new.log_path = dir
+        .path()
+        .join(format!("{}.log", new.id))
+        .display()
+        .to_string();
+    new.status_path = dir
+        .path()
+        .join(format!("{}.status", new.id))
+        .display()
+        .to_string();
+    let id = new.id;
+    // What the observed job's log held while it was mid-start.
+    std::fs::write(
+        &new.log_path,
+        format!(
+            "rsi-phase 1792449207 unit-launch: requesting service {}\n",
+            new.unit_name
+        ),
+    )
+    .expect("log");
+    let wake = {
+        let store = world.store.lock().await;
+        store
+            .insert_agent_job(&new, Utc::now())
+            .expect("insert job");
+        arm(&store, world.owner, jobs_terminal(&[id]), None).expect("arm")
+    };
+    let launchd = Arc::new(MidStartLaunchd::default());
+    let runtime: Arc<dyn crate::agent_jobs::JobRuntime> = launchd.clone();
+    let stored = |world: &World| {
+        let store = world.store.try_lock().expect("store free");
+        store.get_agent_job(id).unwrap().unwrap().job
+    };
+
+    // Inactive with no status, active with no status, active with the status
+    // written: the jobs loop leaves the row running and the wake delivers nothing.
+    for (active, status) in [(false, false), (true, false), (true, true)] {
+        launchd.active.store(active, Ordering::SeqCst);
+        if status {
+            std::fs::write(&new.status_path, "101\n").expect("status");
+        }
+        crate::agent_jobs::poll_once(&world.store, &runtime, Utc::now())
+            .await
+            .expect("poll");
+        make_due(&world, wake.id).await;
+        world.pass().await;
+        let job = stored(&world);
+        assert_eq!(
+            job.state,
+            JobState::Running,
+            "active={active} status={status}"
+        );
+        assert_eq!(job.exit_code, None);
+        assert!(
+            world.launcher.deliveries().is_empty(),
+            "active={active} status={status}: {:?}",
+            world.launcher.deliveries()
+        );
+    }
+
+    // The service exits: the loop settles the row, and only then the wake fires.
+    launchd.active.store(false, Ordering::SeqCst);
+    let settled = crate::agent_jobs::poll_once(&world.store, &runtime, Utc::now())
+        .await
+        .expect("poll");
+    assert_eq!(settled, 1);
+    let job = stored(&world);
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.exit_code, Some(101));
+    make_due(&world, wake.id).await;
+    world.pass().await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    let line = format!("- job {id} name=169-exact state=failed exit_code=101");
+    assert!(deliveries[0].1.contains(&line), "{}", deliveries[0].1);
+
+    // Terminal is final: no path returns the row to queued or running.
+    {
+        let store = world.store.lock().await;
+        assert!(!store.start_queued_agent_job(id, Utc::now()).unwrap());
+        assert!(
+            !store
+                .requeue_agent_job_for_deploy(id, Uuid::new_v4())
+                .unwrap()
+        );
+    }
+    crate::agent_jobs::poll_once(&world.store, &runtime, Utc::now())
+        .await
+        .expect("poll");
+    assert_eq!(stored(&world).state, JobState::Failed);
+    make_due(&world, wake.id).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 1);
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[test]
 fn the_wake_message_is_bounded_however_many_jobs_and_refusals() {
@@ -472,6 +722,7 @@ fn the_wake_message_is_bounded_however_many_jobs_and_refusals() {
         armed_at: Utc::now(),
         deadline: None,
         repo_dir: None,
+        delivered_shas: Vec::new(),
     };
     let message = compose_message("go", &state, &Verdict::Satisfied, &snaps, &[], None);
     assert!(
@@ -481,6 +732,49 @@ fn the_wake_message_is_bounded_however_many_jobs_and_refusals() {
     );
     assert!(message.contains("more jobs omitted"), "{message}");
     assert!(!message.contains(&long));
+}
+
+/// #3916: a scoped-test receipt and its log detail stay available on demand;
+/// their size must not become input to a parked worker's next model turn.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn jobs_terminal_wake_size_is_independent_of_receipt_and_log_size() {
+    let store = Store::open_in_memory().unwrap();
+    let id = insert_job(&store, Uuid::new_v4(), "scoped-test");
+    finish(&store, id, JobState::Succeeded, 0, None);
+    let mut job = store.get_agent_job(id).unwrap().unwrap().job;
+    let state = WakeWhenState {
+        predicate: jobs_terminal(&[id]),
+        armed_at: Utc::now(),
+        deadline: None,
+        repo_dir: None,
+        delivered_shas: Vec::new(),
+    };
+    let compact = compose_message(
+        "read the receipt",
+        &state,
+        &Verdict::Satisfied,
+        &[(id, Some(job.clone()))],
+        &[],
+        None,
+    );
+    let large = "diagnostic output\n".repeat(100_000);
+    let result = job.result.as_mut().unwrap();
+    result.detail = Some(large.clone());
+    result.receipt = Some(serde_json::json!({"ok":true,"packages":[{
+        "diagnostic":large, "log_path":"/tmp/scoped-test.log"
+    }]}));
+    let message = compose_message(
+        "read the receipt",
+        &state,
+        &Verdict::Satisfied,
+        &[(id, Some(job))],
+        &[],
+        None,
+    );
+    assert_eq!(message, compact);
+    assert!(message.len() < 512, "{} bytes", message.len());
+    assert!(message.contains("state=succeeded exit_code=0"));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -568,11 +862,13 @@ async fn sha_on_rolling_fires_when_the_commit_reaches_origin_rolling() {
         predicate: WakePredicate {
             jobs_terminal: None,
             sha_on_rolling: Some(fix.clone()),
+            shas_on_rolling: None,
             issue_closed: None,
             todo_closed: None,
             topology_execution_settled: None,
             health_anomaly: None,
             settlement_run_settled: None,
+            fire: None,
         },
         timeout_seconds: None,
         working_dir: repo.path().to_path_buf(),
@@ -647,11 +943,13 @@ async fn sha_on_rolling_fires_when_rolling_advances_on_the_remote_without_a_loca
         predicate: WakePredicate {
             jobs_terminal: None,
             sha_on_rolling: Some(fix.clone()),
+            shas_on_rolling: None,
             issue_closed: None,
             todo_closed: None,
             topology_execution_settled: None,
             health_anomaly: None,
             settlement_run_settled: None,
+            fire: None,
         },
         timeout_seconds: None,
         working_dir: repo.path().to_path_buf(),
@@ -692,6 +990,358 @@ async fn sha_on_rolling_fires_when_rolling_advances_on_the_remote_without_a_loca
             .1
             .contains(&format!("sha_on_rolling {fix}: satisfied"))
     );
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn shas_on_rolling_waits_for_all_commits_and_reports_each_state() {
+    let remote = tempfile::tempdir().expect("remote");
+    git(remote.path(), &["init", "-q", "--bare", "-b", "rolling"]);
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "work"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    git(
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "first"],
+    );
+    let first = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    let second = git(repo.path(), &["rev-parse", "HEAD"]);
+    // Publish only the first commit. The second is known locally but not landed.
+    git(
+        repo.path(),
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{first}:refs/heads/rolling"),
+        ],
+    );
+
+    let world = World::new();
+    let (job, state) = build_wake_when_job(WakeWhenRequest {
+        message: "batch landed?".into(),
+        name: None,
+        predicate: WakePredicate {
+            shas_on_rolling: Some(vec![first.clone(), second.clone()]),
+            ..WakePredicate::default()
+        },
+        timeout_seconds: None,
+        working_dir: repo.path().to_path_buf(),
+        provider: None,
+        model: None,
+        project_id: None,
+        origin_session_id: world.owner,
+    })
+    .unwrap();
+    world
+        .store
+        .lock()
+        .await
+        .insert_wake_when(&job, &state, false)
+        .unwrap();
+    assert_eq!(
+        world.store.lock().await.wake_when_state(job.id).unwrap(),
+        Some(state.clone())
+    );
+    world.pass().await;
+    assert!(
+        world.launcher.deliveries().is_empty(),
+        "one commit is still pending"
+    );
+    assert!(
+        world
+            .store
+            .lock()
+            .await
+            .get_scheduled_job(&job.id)
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+
+    // A deadline must still report which commits landed and which are pending.
+    let mut timeout_job = job.clone();
+    timeout_job.id = Uuid::new_v4();
+    timeout_job.name = "batch timeout".into();
+    let mut timeout_state = state;
+    timeout_state.deadline = Some(Utc::now() - chrono::Duration::seconds(1));
+    world
+        .store
+        .lock()
+        .await
+        .insert_wake_when(&timeout_job, &timeout_state, false)
+        .unwrap();
+    world.pass().await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert!(deliveries[0].1.contains("timed_out: true"));
+    assert!(
+        deliveries[0]
+            .1
+            .contains(&format!("sha={first} state=on_rolling"))
+    );
+    assert!(
+        deliveries[0]
+            .1
+            .contains(&format!("sha={second} state=pending"))
+    );
+
+    // The probe fetches rolling's remote advance and fires the original once.
+    git(
+        repo.path(),
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("{second}:refs/heads/rolling"),
+        ],
+    );
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/rolling", &first],
+    );
+    make_due(&world, job.id).await;
+    world.pass().await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 2);
+    assert!(
+        deliveries[1]
+            .1
+            .contains("shas_on_rolling (2 commits): satisfied")
+    );
+    assert!(
+        deliveries[1]
+            .1
+            .contains(&format!("sha={first} state=on_rolling"))
+    );
+    assert!(
+        deliveries[1]
+            .1
+            .contains(&format!("sha={second} state=on_rolling"))
+    );
+    make_due(&world, job.id).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 2, "each wake fires once");
+}
+
+/// #217: a local repository with `base -> first -> second -> third` on a work
+/// branch and `origin/rolling` at `base` (no remote, so the probe's fetch is a
+/// fast no-op and `update-ref` alone lands a commit), plus one armed
+/// `shas_on_rolling` wake over the three commits with the given firing mode.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+async fn three_commit_rolling_wake(
+    fire: Option<rsi_common::wake_predicate::WakeFire>,
+) -> (tempfile::TempDir, World, ScheduledJob, [String; 3]) {
+    let repo = tempfile::tempdir().expect("repo");
+    git(repo.path(), &["init", "-q", "-b", "work"]);
+    git(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "base"],
+    );
+    let base = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(
+        repo.path(),
+        &["update-ref", "refs/remotes/origin/rolling", &base],
+    );
+    let mut shas = Vec::new();
+    for name in ["first", "second", "third"] {
+        git(repo.path(), &["commit", "-q", "--allow-empty", "-m", name]);
+        shas.push(git(repo.path(), &["rev-parse", "HEAD"]));
+    }
+    let world = World::new();
+    let (job, state) = build_wake_when_job(WakeWhenRequest {
+        message: "sources landed?".into(),
+        name: None,
+        predicate: WakePredicate {
+            shas_on_rolling: Some(shas.clone()),
+            fire,
+            ..WakePredicate::default()
+        },
+        timeout_seconds: None,
+        working_dir: repo.path().to_path_buf(),
+        provider: None,
+        model: None,
+        project_id: None,
+        origin_session_id: world.owner,
+    })
+    .unwrap();
+    world
+        .store
+        .lock()
+        .await
+        .insert_wake_when(&job, &state, false)
+        .unwrap();
+    let shas: [String; 3] = shas.try_into().expect("three commits");
+    (repo, world, job, shas)
+}
+
+/// #217: land `sha` (move `origin/rolling` to it), make the wake due and run
+/// one scheduler pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+async fn land_and_pass(repo: &std::path::Path, world: &World, job: Uuid, sha: &str) {
+    git(repo, &["update-ref", "refs/remotes/origin/rolling", sha]);
+    make_due(world, job).await;
+    world.pass().await;
+}
+
+/// #217 (1): one `fire: "each"` wake resumes its owner on the first landing,
+/// stays armed, is quiet while nothing new lands, and resumes again on the
+/// second landing, each time naming only the newly landed commit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn shas_on_rolling_fire_each_resumes_on_the_first_landing_and_again_on_the_second() {
+    use rsi_common::wake_predicate::WakeFire;
+    let (repo, world, job, [first, second, third]) =
+        three_commit_rolling_wake(Some(WakeFire::Each)).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 0, "nothing has landed");
+    assert!(wake_row(&world, job.id).await.enabled);
+
+    land_and_pass(repo.path(), &world, job.id, &first).await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 1, "the first landing resumes the owner");
+    let report = &deliveries[0].1;
+    assert!(report.contains("sources landed?"));
+    assert!(report.contains("[wake_when] shas_on_rolling (3 commits, fire=each): landed"));
+    assert!(report.contains(&format!("landed_since_last_firing: {first}\n")));
+    assert!(report.contains(&format!("sha={first} state=on_rolling new=true\n")));
+    assert!(report.contains(&format!("sha={second} state=pending\n")));
+    assert!(report.contains(&format!("sha={third} state=pending\n")));
+    assert!(report.contains("remaining: 2 pending"));
+    let row = wake_row(&world, job.id).await;
+    assert!(row.enabled, "the wake stays armed for the pending commits");
+    assert!(row.last_fired_at.is_some());
+    assert!(
+        row.next_fire_at > Utc::now(),
+        "re-armed at the poll interval"
+    );
+    let state = world
+        .store
+        .lock()
+        .await
+        .wake_when_state(job.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.delivered_shas, vec![first.clone()]);
+    assert_eq!(
+        world.store.lock().await.delivery_claim(job.id).unwrap(),
+        None,
+        "the delivery claim is settled"
+    );
+
+    // Nothing new on rolling: no second turn for the same landing.
+    make_due(&world, job.id).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 1);
+
+    land_and_pass(repo.path(), &world, job.id, &second).await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 2, "the second landing resumes again");
+    let report = &deliveries[1].1;
+    assert!(report.contains("(3 commits, fire=each): landed"));
+    assert!(report.contains(&format!("landed_since_last_firing: {second}\n")));
+    assert!(report.contains(&format!("sha={first} state=on_rolling\n")));
+    assert!(report.contains(&format!("sha={second} state=on_rolling new=true\n")));
+    assert!(report.contains(&format!("sha={third} state=pending\n")));
+    assert!(report.contains("remaining: 1 pending"));
+    assert!(wake_row(&world, job.id).await.enabled);
+    let state = world
+        .store
+        .lock()
+        .await
+        .wake_when_state(job.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.delivered_shas, vec![first, second]);
+}
+
+/// #217 (2): the firing that finds the last listed commit on rolling settles
+/// the wake as satisfied and retires it; nothing fires after that.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn shas_on_rolling_fire_each_retires_after_the_last_listed_commit_lands() {
+    use rsi_common::wake_predicate::WakeFire;
+    let (repo, world, job, [first, second, third]) =
+        three_commit_rolling_wake(Some(WakeFire::Each)).await;
+    land_and_pass(repo.path(), &world, job.id, &first).await;
+    assert_eq!(world.launcher.deliveries().len(), 1);
+
+    // The last two land between evaluations: one firing names both.
+    land_and_pass(repo.path(), &world, job.id, &third).await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 2);
+    let report = &deliveries[1].1;
+    assert!(report.contains("[wake_when] shas_on_rolling (3 commits, fire=each): satisfied"));
+    assert!(report.contains(&format!("landed_since_last_firing: {second} {third}\n")));
+    assert!(report.contains(&format!("sha={first} state=on_rolling\n")));
+    assert!(report.contains(&format!("sha={second} state=on_rolling new=true\n")));
+    assert!(report.contains(&format!("sha={third} state=on_rolling new=true")));
+    assert!(
+        !wake_row(&world, job.id).await.enabled,
+        "the last landing retires the wake"
+    );
+
+    make_due(&world, job.id).await;
+    world.pass().await;
+    assert_eq!(
+        world.launcher.deliveries().len(),
+        2,
+        "retired: fires no more"
+    );
+}
+
+/// #217 (3): without `fire`, and with an explicit `fire: "all"`, a batch wake
+/// behaves exactly as before: no firing per landing, one satisfied report once
+/// every listed commit is on rolling, then retired.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn shas_on_rolling_default_fires_once_after_every_commit_lands() {
+    use rsi_common::wake_predicate::WakeFire;
+    for fire in [None, Some(WakeFire::All)] {
+        let (repo, world, job, [first, second, third]) = three_commit_rolling_wake(fire).await;
+        land_and_pass(repo.path(), &world, job.id, &first).await;
+        land_and_pass(repo.path(), &world, job.id, &second).await;
+        assert_eq!(
+            world.launcher.deliveries().len(),
+            0,
+            "{fire:?}: waits for all"
+        );
+        assert!(wake_row(&world, job.id).await.enabled);
+
+        land_and_pass(repo.path(), &world, job.id, &third).await;
+        let deliveries = world.launcher.deliveries();
+        assert_eq!(deliveries.len(), 1, "{fire:?}");
+        let expected = format!(
+            "sources landed?\n\n[wake_when] shas_on_rolling (3 commits): satisfied\n\
+             timed_out: false\nsha={first} state=on_rolling\nsha={second} state=on_rolling\n\
+             sha={third} state=on_rolling"
+        );
+        assert_eq!(
+            deliveries[0].1,
+            rsi_common::daemon_message::wrap("scheduled-wake", &expected),
+            "{fire:?}: the report is byte-identical to the pre-#217 one"
+        );
+        assert!(!wake_row(&world, job.id).await.enabled, "{fire:?}");
+        let state = world
+            .store
+            .lock()
+            .await
+            .wake_when_state(job.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.delivered_shas, Vec::<String>::new(), "{fire:?}");
+    }
 }
 
 fn issue_closed(number: u32) -> WakePredicate {
@@ -1400,7 +2050,11 @@ impl HostGuard {
             cell.set(Some(HostReading {
                 disk_used_pct: Some(disk_used_pct),
                 cpu_c: Some(cpu_c),
+                mem_available_gb: None,
+                swap_used_pct: None,
+                mem_floor_gb: 0,
                 build_cache_reclaim_unsupported: false,
+                disk_free_gb: None,
             }));
         });
         Self
@@ -1482,7 +2136,7 @@ async fn health_anomaly_with_nothing_abnormal_takes_no_model_turn() {
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn an_injected_host_condition_wakes_the_owner_exactly_once_naming_it() {
-    let _host = HostGuard::set(98.0, 50.0);
+    let _host = HostGuard::set(91.0, 50.0);
     let world = World::new();
     let messages = health_run(&world, HealthAnomalySpec::default(), 5).await;
     assert_eq!(
@@ -1491,27 +2145,266 @@ async fn an_injected_host_condition_wakes_the_owner_exactly_once_naming_it() {
         "one wake, however many evaluations: {messages:?}"
     );
     let message = &messages[0];
+    assert_eq!(
+        message,
+        &rsi_common::daemon_message::wrap(
+            "scheduled-wake",
+            &format!(
+                "batch done?\n\n[wake_when] health_anomaly: satisfied\ntimed_out: false\n\
+                 - condition=hub_disk_high subject=/ ignore_key=hub_disk_high:/ \
+                 detail=\"used=91.0% threshold={}% severity=warm \
+                 critical_at=97%_or_free<20GiB\"\n\
+                 Handle each condition, then re-arm health_anomaly; add its \
+                 key (the ignore_key= field, verbatim) to ignore to accept one that will persist.",
+                rsid_core::health_thresholds::current().disk_used_pct,
+            ),
+        )
+    );
+}
+
+/// Arm the daemon's manager idle backstop (#3765) for `owner`: a plain
+/// `health_anomaly` wake under the backstop's name, as `guard_idle_manager`
+/// re-arms it after every turn end.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+async fn arm_idle_backstop(world: &World) -> Uuid {
+    let (job, state) = build_wake_when_job(WakeWhenRequest {
+        message: "[rsid-manager-idle] backstop".into(),
+        name: Some(format!(
+            "{}{}",
+            crate::session::manager_idle::IDLE_BACKSTOP_NAME_PREFIX,
+            world.owner
+        )),
+        predicate: health(HealthAnomalySpec::default()),
+        timeout_seconds: None,
+        working_dir: "/tmp/sandbox".into(),
+        provider: None,
+        model: None,
+        project_id: None,
+        origin_session_id: world.owner,
+    })
+    .expect("builds");
+    world
+        .store
+        .lock()
+        .await
+        .insert_wake_when(&job, &state, true)
+        .expect("arm");
+    make_due(world, job.id).await;
+    job.id
+}
+
+/// #4020: a seat that finishes under a persistent anomaly re-arms its idle
+/// backstop at every turn end; the re-armed wake must not resume the seat
+/// again for the set it already reported, but must fire for a changed set.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_rearmed_idle_backstop_fires_once_per_anomaly_set_4020() {
+    let _host = HostGuard::set(91.0, 50.0);
+    let world = World::new();
+
+    // First arm: the unchanged-from-nothing set fires once.
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 1, "the first set fires");
+
+    // The seat finishes under the same anomaly and the backstop is re-armed,
+    // again and again (the storm): not one more resume.
+    for _ in 0..5 {
+        let wake = arm_idle_backstop(&world).await;
+        world.pass().await;
+        make_due(&world, wake).await;
+        world.pass().await;
+    }
+    assert_eq!(
+        world.launcher.deliveries().len(),
+        1,
+        "an unchanged anomaly set never re-fires a re-armed backstop"
+    );
+
+    // A changed set (a new condition) fires the next re-arm once.
+    std::mem::forget(HostGuard::set(99.0, 50.0));
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    let deliveries = world.launcher.deliveries();
+    assert_eq!(deliveries.len(), 2, "a new condition fires: {deliveries:?}");
     assert!(
-        message.contains("[wake_when] health_anomaly: satisfied"),
-        "{message}"
+        deliveries[1].1.contains("condition=hub_disk_critical"),
+        "the delivery names the new condition: {}",
+        deliveries[1].1
     );
     assert!(
-        message.contains(&format!("ignore_key={KIND_HUB_DISK_HIGH}:/ ")),
+        !deliveries[1].1.contains("condition=hub_disk_high"),
+        "the already-reported condition is not repeated: {}",
+        deliveries[1].1
+    );
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 2, "and then stays quiet");
+
+    // A condition that cleared and returned is news again.
+    std::mem::forget(HostGuard::set(41.0, 48.0));
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    assert_eq!(
+        world.launcher.deliveries().len(),
+        2,
+        "a quiet daemon is quiet"
+    );
+    std::mem::forget(HostGuard::set(91.0, 50.0));
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    assert_eq!(
+        world.launcher.deliveries().len(),
+        3,
+        "a returned condition fires again"
+    );
+}
+
+/// The latch is the backstop's own: a seat's plain `health_anomaly` wake keeps
+/// its documented behaviour (the owner dedupes with `ignore`).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_plain_health_wake_is_not_latched_by_the_idle_backstop_4020() {
+    let _host = HostGuard::set(91.0, 50.0);
+    let world = World::new();
+    arm_idle_backstop(&world).await;
+    world.pass().await;
+    assert_eq!(world.launcher.deliveries().len(), 1);
+    let messages = health_run(&world, HealthAnomalySpec::default(), 1).await;
+    assert_eq!(
+        messages.len(),
+        2,
+        "a seat's own wake still fires: {messages:?}"
+    );
+}
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn hub_pull_health_rearm_stays_pending_until_a_distinct_outage() {
+    use super::wake_when::{Gate, gate_at};
+    use rsi_common::health_anomaly::{HUB_PULL_STALE_SECS, KIND_HUB_NOT_PULLING};
+    use rsi_common::satellite::SatelliteUuidV1;
+    use rsi_common::satellite_dispatch::SatelliteInboundPolicyV1;
+
+    let _host = HostGuard::set(41.0, 48.0);
+    let world = World::new();
+    let hub = Uuid::new_v4();
+    let project = {
+        let store = world.store.lock().await;
+        let project = crate::health_anomaly::tests::project_row(&store);
+        crate::health_anomaly::tests::portfolio_seat(&store, "global", world.owner, &[project]);
+        store
+            .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                allowed_hub_installations: vec![SatelliteUuidV1(hub)],
+                scope_projects: vec![SatelliteUuidV1(project)],
+                ..Default::default()
+            })
+            .unwrap();
+        store.take_hub_reports(hub, &[], &[]).unwrap();
+        project
+    };
+    let stale_at = Utc::now() + chrono::Duration::seconds(HUB_PULL_STALE_SECS + 10);
+    let wake = arm(
+        &*world.store.lock().await,
+        world.owner,
+        health(HealthAnomalySpec::default()),
+        None,
+    )
+    .unwrap();
+    let launcher = world.dyn_launcher();
+    let Gate::Deliver(message, "satisfied", _) =
+        gate_at(&world.store, &launcher, &wake, false, stale_at).await
+    else {
+        panic!("first outage must satisfy the wake");
+    };
+    assert!(message.contains(&format!("ignore_key={KIND_HUB_NOT_PULLING}:{hub}")));
+    assert!(
+        message.contains(
+            "hub_not_pulling is latched for this outage: re-arm with your usual spec; \
+             do not add its key to ignore, a later outage after a successful pull fires again."
+        ),
         "{message}"
     );
-    assert!(message.contains("used=98.0%"), "{message}");
+    // A new row armed with {} has no ignore key, but the same outage is latched.
+    let rearmed = arm(
+        &*world.store.lock().await,
+        world.owner,
+        health(HealthAnomalySpec::default()),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        gate_at(&world.store, &launcher, &rearmed, false, stale_at).await,
+        Gate::Pending
+    ));
+    world
+        .store
+        .lock()
+        .await
+        .take_hub_reports(hub, &[], &[])
+        .unwrap();
+    assert!(matches!(
+        gate_at(&world.store, &launcher, &rearmed, false, Utc::now()).await,
+        Gate::Pending
+    ));
+    let second_outage = Utc::now() + chrono::Duration::seconds(HUB_PULL_STALE_SECS + 20);
+    assert!(matches!(
+        gate_at(&world.store, &launcher, &rearmed, false, second_outage).await,
+        Gate::Deliver(_, "satisfied", _)
+    ));
+    let again = arm(
+        &*world.store.lock().await,
+        world.owner,
+        health(HealthAnomalySpec::default()),
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        gate_at(&world.store, &launcher, &again, false, second_outage).await,
+        Gate::Pending
+    ));
+    // Link diagnostics leave the observer's existing local scope intact.
+    assert_eq!(
+        world
+            .store
+            .lock()
+            .await
+            .portfolio_seat_grant(world.owner)
+            .unwrap()
+            .unwrap()
+            .project_ids,
+        vec![project]
+    );
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
 #[tokio::test]
 async fn an_accepted_condition_in_ignore_does_not_wake() {
-    let _host = HostGuard::set(98.0, 50.0);
+    let _host = HostGuard::set(91.0, 50.0);
     let world = World::new();
     let spec = HealthAnomalySpec {
         ignore: vec![format!("{KIND_HUB_DISK_HIGH}:/")],
         ..HealthAnomalySpec::default()
     };
     assert!(health_run(&world, spec, 3).await.is_empty());
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_warm_ignore_does_not_hide_a_later_critical_disk() {
+    let _host = HostGuard::set(99.0, 50.0);
+    let world = World::new();
+    let spec = HealthAnomalySpec {
+        ignore: vec![format!("{KIND_HUB_DISK_HIGH}:/")],
+        ..HealthAnomalySpec::default()
+    };
+    let messages = health_run(&world, spec, 3).await;
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(
+        messages[0].contains("ignore_key=hub_disk_critical:/ "),
+        "{}",
+        messages[0]
+    );
+    assert!(messages[0].contains("severity=critical"), "{}", messages[0]);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -1533,6 +2426,8 @@ async fn injected_live_conditions_each_wake_once_with_their_subject() {
             label: "laptop".into(),
             disk_free_bytes: Some(1 << 30),
             disk_floor_bytes: Some(30 << 30),
+            disk_wait_seconds: None,
+            manager_policies: Vec::new(),
             provider_faults: vec![rsi_common::satellite::SatelliteProviderFaultV1 {
                 provider: "Codex".into(),
                 kind: rsi_common::satellite::SATELLITE_FAULT_AUTH.into(),
@@ -1878,6 +2773,7 @@ fn settlement_run(finished: bool) -> rsi_common::cohort_settlement::SourceWorktr
             after_observation: None,
         }],
         retained_roots: Vec::new(),
+        unproven_survivors: Vec::new(),
         created_at: timestamp.clone(),
         updated_at: timestamp.clone(),
         finished_at: finished.then_some(timestamp),
@@ -1898,6 +2794,7 @@ fn settlement_run_settled_waits_for_the_run_to_finish_2789() {
         armed_at: Utc::now(),
         deadline,
         repo_dir: None,
+        delivered_shas: Vec::new(),
     };
     let now = Utc::now();
     assert_eq!(
@@ -1976,5 +2873,361 @@ async fn an_unknown_settlement_run_is_refused_at_arming_and_a_vanished_one_wakes
     assert!(
         message.contains("reason: settlement_run_missing"),
         "{message}"
+    );
+}
+
+/// #482: publish a real seat transfer after the successor's plain bootstrap
+/// prompt was persisted. The launcher checks the production durable fence.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+async fn carried_job_wait(rotation: bool, backed_off: bool) -> (World, Uuid, Uuid, ScheduledJob) {
+    use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+    use rsi_common::types::{ConversationEvent, EventType, Project, Role, SessionStatus};
+    let store = Store::open_in_memory().unwrap();
+    let project = Uuid::new_v4();
+    let now = Utc::now();
+    store
+        .insert_project(&Project {
+            id: project,
+            name: "carried wait".into(),
+            path: None,
+            description: None,
+            color: Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .unwrap();
+    let mut predecessor = rsid_store::test_support::make_test_session();
+    predecessor.project_id = Some(project);
+    predecessor.parent_id = None;
+    predecessor.status = SessionStatus::Completed;
+    store.insert_session(&predecessor).unwrap();
+    let config = store
+        .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+            project_id: project,
+            session_id: predecessor.id,
+            epic_ids: None,
+            group_ids: vec![],
+            expected_row_version: 0,
+        })
+        .unwrap();
+    let job = insert_job(&store, predecessor.id, "carried build");
+    let wake = arm(&store, predecessor.id, jobs_terminal(&[job]), None).unwrap();
+    let foreign = insert_job(&store, Uuid::new_v4(), "foreign build");
+    assert!(
+        arm(&store, predecessor.id, jobs_terminal(&[foreign]), None)
+            .unwrap_err()
+            .to_string()
+            .contains("wake_when_job_not_found")
+    );
+    if backed_off {
+        // A refusal belonged to A's delivery epoch, not B's predicate poll.
+        store
+            .record_continuation_retry(
+                wake.id,
+                "continuation_turn_changed",
+                Some(predecessor.id),
+                now,
+                true,
+            )
+            .unwrap();
+        store
+            .defer_wake_when(wake.id, now + chrono::Duration::minutes(10))
+            .unwrap();
+    }
+    let mut successor = predecessor.clone();
+    successor.id = Uuid::new_v4();
+    if rotation {
+        successor.continued_from = Some(predecessor.id);
+        successor.rotation_depth += 1;
+    }
+    store.insert_session(&successor).unwrap();
+    store
+        .insert_event(&ConversationEvent {
+            id: 0,
+            session_id: successor.id,
+            sequence: 1,
+            event_type: EventType::Message,
+            role: Some(Role::User),
+            content: "Resume the manager seat and receive the outstanding build result".into(),
+            created_at: Utc::now(),
+            tool_name: None,
+            tool_input: None,
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        })
+        .unwrap();
+    if rotation {
+        store
+            .update_session_status(predecessor.id, SessionStatus::Archived)
+            .unwrap();
+        assert!(
+            store
+                .record_harness_manager_rotation(predecessor.id, successor.id)
+                .unwrap()
+        );
+    } else {
+        store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: project,
+                session_id: successor.id,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: config.row_version,
+            })
+            .unwrap();
+    }
+    let carried = store.get_scheduled_job(&wake.id).unwrap().unwrap();
+    assert_eq!(carried.wake_session_id, Some(successor.id));
+    assert_eq!(
+        store
+            .get_agent_job(job)
+            .unwrap()
+            .unwrap()
+            .job
+            .owner_session_id,
+        successor.id
+    );
+    assert_eq!(store.continuation_retry(wake.id).unwrap(), None);
+    assert!(carried.next_fire_at <= Utc::now());
+    // Later daemon mail and terminal notices advance the transcript across
+    // idle turns without becoming operator input (the observed PM history).
+    for sequence in 2..=11 {
+        store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: successor.id,
+                sequence,
+                event_type: EventType::Message,
+                role: Some(Role::User),
+                content: rsi_common::daemon_message::wrap(
+                    if sequence % 2 == 0 {
+                        "agent-message"
+                    } else {
+                        "terminal-watch"
+                    },
+                    "daemon notification after the seat transfer",
+                ),
+                created_at: Utc::now(),
+                tool_name: None,
+                tool_input: None,
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .unwrap();
+    }
+    let mut world = World::with_store(store);
+    world.owner = successor.id;
+    world.launcher = Arc::new(RecordingLauncher {
+        fence_store: Some(world.store.clone()),
+        ..RecordingLauncher::default()
+    });
+    (world, predecessor.id, job, carried)
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+async fn assert_carried_job_wait_fires(keep_predecessor_owner: bool, backed_off: bool) {
+    for rotation in [false, true] {
+        let (world, predecessor, job, wake) = carried_job_wait(rotation, backed_off).await;
+        if keep_predecessor_owner {
+            // Exercise a legacy carried wait whose live job was not moved.
+            // Evaluation is by the IDs authorized at arm time, not current owner.
+            world
+                .store
+                .lock()
+                .await
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET owner_session_id=?2 WHERE id=?1",
+                    rusqlite::params![job.to_string(), predecessor.to_string()],
+                )
+                .unwrap();
+        }
+        if !backed_off {
+            world.pass().await;
+            assert!(world.launcher.deliveries().is_empty());
+            let pending = wake_row(&world, wake.id).await;
+            assert!(pending.next_fire_at <= Utc::now() + chrono::Duration::seconds(5));
+        }
+        {
+            let store = world.store.lock().await;
+            finish(&store, job, JobState::Succeeded, 0, None);
+        }
+        if !backed_off {
+            make_due(&world, wake.id).await; // the next short polling interval
+        }
+        world.pass().await;
+        world.pass().await;
+        let deliveries = world.launcher.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].0, world.owner);
+        assert!(deliveries[0].1.contains("satisfied"));
+        assert!(deliveries[0].1.contains("exit_code=0"));
+        let settled = wake_row(&world, wake.id).await;
+        assert!(!settled.enabled);
+        assert!(settled.last_fired_at.is_some());
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn carried_jobs_terminal_wake_fires_once_with_job_owned_by_successor() {
+    assert_carried_job_wait_fires(false, false).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn carried_jobs_terminal_wake_fires_once_with_job_still_owned_by_predecessor() {
+    assert_carried_job_wait_fires(true, false).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn carried_satisfied_jobs_terminal_wake_fires_without_predecessor_backoff() {
+    assert_carried_job_wait_fires(false, true).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn carried_jobs_terminal_wake_keeps_new_operator_input_fenced() {
+    use crate::store::manager_actions::fence::CONTINUATION_TURN_CHANGED;
+    for after_capture in [false, true] {
+        let (world, _, _, wake) = carried_job_wait(false, false).await;
+        let store = world.store.lock().await;
+        let fence = store
+            .capture_scheduled_continuation_fence(world.owner, &[wake.id])
+            .unwrap()
+            .unwrap();
+        // An operator-attributed envelope is still input after the transfer.
+        store.conn.execute(
+            "INSERT INTO conversation_events(session_id,sequence,event_type,role,content,metadata,created_at)
+             VALUES(?1,12,'Message','User',?2,'{\"source\":\"operator\"}',?3)",
+            rusqlite::params![world.owner.to_string(),
+                rsi_common::daemon_message::wrap("agent-message", "new instruction"),
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+        ).unwrap();
+        let error = if after_capture {
+            store.check_continuation_fence_durable(&fence).unwrap_err()
+        } else {
+            store
+                .capture_scheduled_continuation_fence(world.owner, &[wake.id])
+                .unwrap_err()
+        };
+        assert!(error.to_string().contains(CONTINUATION_TURN_CHANGED));
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn provider_window_warning_survives_refusal_and_dedupes_after_rearm() {
+    use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
+    let _host = HostGuard::set(40.0, 45.0);
+    let world = World::new();
+    let now = Utc::now();
+    // Exact hour boundary: a one-second drift must not split the episode.
+    let reset = ((now + chrono::Duration::days(4)).timestamp() / 3600) * 3600;
+    {
+        let store = world.store.lock().await;
+        let project = crate::health_anomaly::tests::project_row(&store);
+        crate::health_anomaly::tests::portfolio_seat(&store, "global", world.owner, &[project]);
+        store
+            .upsert_provider_rate_limit_snapshot(
+                &ProviderRateLimitSnapshot {
+                    provider: rsi_common::types::SessionProvider::Claude,
+                    observed_at: now,
+                    status: None,
+                    rate_limit_type: None,
+                    overage_status: None,
+                    is_using_overage: false,
+                    stale_reason: None,
+                    windows: vec![ProviderRateLimitWindow {
+                        window_key: "seven_day".into(),
+                        utilization: 0.83,
+                        resets_at_epoch: Some(reset),
+                    }],
+                },
+                None,
+            )
+            .unwrap();
+    }
+    // Exercise the same deploy-drain refusal existing wake tests inject.
+    world
+        .launcher
+        .drain_refusals
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let wake = arm(
+        &*world.store.lock().await,
+        world.owner,
+        health(HealthAnomalySpec::default()),
+        None,
+    )
+    .unwrap();
+    make_due(&world, wake.id).await;
+    world.pass().await;
+    assert!(world.launcher.deliveries().is_empty());
+    make_due(&world, wake.id).await;
+    world.pass().await;
+    let delivered = world.launcher.deliveries();
+    assert_eq!(delivered.len(), 1);
+    assert!(
+        delivered[0]
+            .1
+            .contains("condition=provider_window_projected_exhaustion")
+    );
+    assert!(
+        delivered[0]
+            .1
+            .contains("provider=Claude window=seven_day utilization=83.0%")
+    );
+    // Simulate losing every daemon-local sample/acknowledgment on restart.
+    crate::health_anomaly::provider_windows::trackers()
+        .lock()
+        .unwrap()
+        .remove(&world.owner);
+    let durable = world
+        .store
+        .lock()
+        .await
+        .provider_window_warning_subjects(world.owner, now)
+        .unwrap();
+    assert_eq!(durable, vec![format!("Claude:seven_day:{reset}")]);
+    {
+        let store = world.store.lock().await;
+        let mut snapshot = store
+            .load_provider_rate_limit_snapshots()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.provider == rsi_common::types::SessionProvider::Claude)
+            .unwrap();
+        snapshot.windows[0].resets_at_epoch = Some(reset - 1);
+        store
+            .upsert_provider_rate_limit_snapshot(&snapshot, None)
+            .unwrap();
+    }
+    let rearmed = arm(
+        &*world.store.lock().await,
+        world.owner,
+        health(HealthAnomalySpec::default()),
+        None,
+    )
+    .unwrap();
+    make_due(&world, rearmed.id).await;
+    world.pass().await;
+    assert_eq!(
+        world.launcher.deliveries().len(),
+        1,
+        "same manager re-arm keeps the episode acknowledgment"
+    );
+    assert!(
+        world
+            .store
+            .lock()
+            .await
+            .get_scheduled_job(&rearmed.id)
+            .unwrap()
+            .unwrap()
+            .enabled
     );
 }

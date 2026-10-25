@@ -133,13 +133,26 @@ export function halfPage(rows: number): number {
 }
 
 /**
- * One keydown inside the focused terminal. Insert mode: `Ctrl-\` hides, Esc
+ * One keydown inside the focused terminal. With Vim keys off there is no modal
+ * layer (hub #229): Esc and every letter go to the shell in any state, `Ctrl-\`
+ * hides, Shift-PageUp / Shift-PageDown scroll a page (the wheel scrolls by
+ * itself) and a leftover normal mode is ignored. With Vim keys on: insert mode: `Ctrl-\` hides, Esc
  * enters normal mode, everything else goes to the shell (Ctrl-C is the
  * shell's interrupt). Normal mode: `i` / `a` back to insert, `j` / `k` (and
  * the arrows) a line, `Ctrl-d` / `Ctrl-u` half a page, `g` top, `G` bottom.
  */
-export function routeTerminalKey(mode: TermMode, ev: KeyEventLike, platform: Platform, rows: number): TermKey {
+export function routeTerminalKey(mode: TermMode, ev: KeyEventLike, platform: Platform, rows: number, vim = true): TermKey {
   if (isToggleChord(ev, platform)) return { kind: 'toggle' };
+  if (!vim) {
+    if (ev.isComposing) return { kind: 'pty' };
+    if (platform === 'mac' && ev.metaKey && !ev.ctrlKey && MAC_NATIVE.has(ev.key.toLowerCase())) return { kind: 'native' };
+    if (ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      const page = Math.max(1, rows - 1);
+      if (ev.key === 'PageUp') return { kind: 'scroll', scroll: { by: 'lines', n: -page } };
+      if (ev.key === 'PageDown') return { kind: 'scroll', scroll: { by: 'lines', n: page } };
+    }
+    return { kind: 'pty' };
+  }
   if (ev.isComposing) return mode === 'insert' ? { kind: 'pty' } : { kind: 'swallow' };
   const plain = !ev.ctrlKey && !ev.altKey && !ev.metaKey;
   if (platform === 'mac' && ev.metaKey && !ev.ctrlKey && MAC_NATIVE.has(ev.key.toLowerCase())) return { kind: 'native' };
@@ -163,9 +176,13 @@ export function routeTerminalKey(mode: TermMode, ev: KeyEventLike, platform: Pla
   }
 }
 
-/** The overlay's status-line mode label, as the TUI shows it. */
-export function modeLabel(mode: TermMode): string {
-  return mode === 'insert' ? 'INSERT' : 'NORMAL';
+/**
+ * The overlay's status-line mode label. With Vim keys on it is the TUI's, and
+ * normal mode names the way back; with them off there is no mode, so no label.
+ */
+export function modeLabel(mode: TermMode, vim = true): string {
+  if (!vim) return '';
+  return mode === 'insert' ? 'INSERT' : 'NORMAL · i to type';
 }
 
 /** The overlay's title: the directory, then why the shell is not running. */

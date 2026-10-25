@@ -1,4 +1,5 @@
 use super::*;
+mod layout;
 mod presets;
 use crate::{
     app::app_test_helpers::{baseline_session, with_focused_kind},
@@ -93,7 +94,7 @@ async fn connect(
     app: &mut App,
     cases: Vec<Case>,
 ) -> (tempfile::TempDir, tokio::task::JoinHandle<Vec<Value>>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let path = dir.path().join("m.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let task = tokio::spawn(async move {
@@ -138,6 +139,12 @@ fn board_state(app: &App) -> &board::BoardState {
         _ => panic!(),
     }
 }
+/// Screen text with every run of whitespace collapsed to one space, so
+/// assertions do not depend on the label column width.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn screen(app: &mut App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(140, 42)).unwrap();
     terminal
@@ -186,6 +193,7 @@ async fn operator_policy_edits_every_field_and_saves_current_fences() {
         for (field, value) in [
             (Containers, "8"),
             (Sessions, "16"),
+            (SessionsWindow, "12"),
             (Concurrency, "3"),
             (Retries, "2"),
             (RetryDelay, "120"),
@@ -193,6 +201,9 @@ async fn operator_policy_edits_every_field_and_saves_current_fences() {
             (Spend, "12.50"),
             (ProviderLimit(1), "2"),
             (SettingBound(0), "4096-32768"),
+            // #3417: the provider spend grant (OpenRouter).
+            (GrantBudget(3), "100"),
+            (GrantExpiry(3), "2026-12-01"),
         ] {
             s.apply_text(field, value).unwrap();
         }
@@ -258,7 +269,7 @@ async fn operator_policy_grants_topology_automation_capability() {
         let row = s
             .rows()
             .into_iter()
-            .find(|row| row.label == "Grant Automation")
+            .find(|row| row.label == "Automation")
             .expect("Automation capability row");
         assert_eq!(
             row.description,
@@ -1757,8 +1768,30 @@ fn loaded_usage() -> policy::usage::CreationUsage {
         created: 152,
         created_limit: Some(1024),
         created_remaining: Some(872),
+        window_hours: None,
+        next_free_at: None,
+        lifetime_total: None,
         active: 3,
+        grants: vec![],
+        bench_enabled: None,
     }
+}
+
+/// #3416: the usage header says what the quota means: a rolling window, the
+/// next time a slot frees, and the informational lifetime total.
+#[test]
+fn policy_usage_header_names_the_window_and_the_next_free_time() {
+    let usage = policy::usage::CreationUsage {
+        window_hours: Some(24),
+        next_free_at: Some("2026-10-21T04:12:00.000000000Z".into()),
+        lifetime_total: Some(183),
+        ..loaded_usage()
+    };
+    let line = policy::usage::UsageView::Loaded(usage).render(Some(256), 4, false);
+    assert_eq!(
+        line,
+        "Usage: sessions 152 of 256 created in the last 24 h; next slot frees at 2026-10-21 04:12 UTC · 104 left · 183 ever · active 3/4"
+    );
 }
 
 fn focus_field(app: &mut App, field: policy::Field) {
@@ -1782,25 +1815,25 @@ async fn policy_editor_renders_titled_sections_usage_header_and_row_help() {
         .unwrap();
     finish(task).await;
     policy_mut(&mut app).apply_usage(Ok(Ok(loaded_usage())));
-    let top = screen(&mut app);
+    let top = flat(&screen(&mut app));
     for text in [
-        "── Authority · presets ──",
-        "── Budgets ──",
-        "── Launches ──",
-        "Usage: sessions 152/1024 created · 872 left · active 3/4",
+        "── Presets · each replaces mode and grants ──",
+        "── Budgets and limits ──",
+        "── Allowed models ──",
+        "Usage: sessions 152/1024 created (lifetime) · 872 left · active 3/4",
         // #2502: the PM's own policy says what it governs.
         "governs this PM's own launches only; caps above bind too (gm > b)",
-        "Created session quota: 0",
-        "Active session limit: 4",
+        "Created session quota 0",
+        "Active session limit 4",
         "Enter runs · Replace mode and grants with this preset; explicit limits are kept",
     ] {
         assert!(top.contains(text), "{text}\n{top}");
     }
     focus_field(&mut app, policy::Field::Retries);
-    let recovery = screen(&mut app);
+    let recovery = flat(&screen(&mut app));
     for text in [
         "── Recovery ──",
-        "Recovery attempt limit: 0",
+        "Recovery attempt limit 0",
         "Enter edits · range 0–32 · Automatic recovery attempts per Epic; 0 disables automatic recovery",
     ] {
         assert!(recovery.contains(text), "{text}\n{recovery}");
@@ -1835,6 +1868,19 @@ async fn policy_every_accepted_field_is_a_top_level_editable_row() {
     finish(task).await;
     let s = policy_mut(&mut app);
     assert!(!s.advanced_open);
+    // Collapsed, no provider has a limit: only the expander row is listed.
+    let collapsed = s.rows();
+    assert!(
+        collapsed
+            .iter()
+            .any(|r| r.field == ProviderLimits && r.value.starts_with("none set"))
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|r| matches!(r.field, ProviderLimit(_)))
+    );
+    s.activate(ProviderLimits);
     let rows = s.rows();
     let kind = |field: policy::Field| {
         rows.iter()
@@ -1850,6 +1896,7 @@ async fn policy_every_accepted_field_is_a_top_level_editable_row() {
         AddGroup,
         CreateGroups,
         Sessions,
+        SessionsWindow,
         Containers,
         Concurrency,
         Spend,
@@ -1859,6 +1906,7 @@ async fn policy_every_accepted_field_is_a_top_level_editable_row() {
         AddLaunch,
     ];
     editable.extend((0..10).map(Capability));
+    editable.push(ProviderLimits);
     editable.extend((0..policy::PROVIDERS.len()).map(ProviderLimit));
     for field in editable {
         assert!(
@@ -1896,7 +1944,7 @@ async fn created_session_quota_edits_above_256_marks_unsaved_and_save_states_gra
     policy::open(&mut app, config, "Coordination desk".into())
         .await
         .unwrap();
-    assert!(screen(&mut app).contains("Created session quota: 160"));
+    assert!(flat(&screen(&mut app)).contains("Created session quota 160"));
     focus_field(&mut app, policy::Field::Sessions);
     key(&mut app, KeyCode::Enter).await;
     assert!(
@@ -1920,12 +1968,12 @@ async fn created_session_quota_edits_above_256_marks_unsaved_and_save_states_gra
     let lines = screen_lines(&mut app);
     let line = lines
         .lines()
-        .find(|l| l.contains("Created session quota: 512"))
+        .find(|l| flat(l).contains("Created session quota 512"))
         .unwrap_or_else(|| panic!("{lines}"));
     // Draft-versus-saved marker and the saved value on the edited row.
     assert!(line.contains("› *"), "{line}");
     assert!(
-        line.contains("Created session quota: 512 (saved 160)"),
+        flat(line).contains("Created session quota 512 (saved 160)"),
         "{line}"
     );
     key(&mut app, KeyCode::Char('s')).await;
@@ -1937,7 +1985,7 @@ async fn created_session_quota_edits_above_256_marks_unsaved_and_save_states_gra
         text.contains("mode Execute · grants WorkPlan, SessionCreate"),
         "{text}"
     );
-    assert!(text.contains("Created session quota: 512"), "{text}");
+    assert!(flat(&text).contains("Created session quota 512"), "{text}");
 }
 
 #[tokio::test]
@@ -1973,15 +2021,16 @@ async fn policy_out_of_range_entry_and_invalid_draft_show_the_field_error_inline
     let s = policy_mut(&mut app);
     let selected = s.rows()[s.selected].field;
     assert_eq!(selected, policy::Field::CreateGroups);
-    let text = screen(&mut app);
+    let text = flat(&screen(&mut app));
     assert!(
         text.contains("Policy not saved: Allow root Group creation needs Grant Topology."),
         "{text}"
     );
     assert!(
-        text.contains("Allow root Group creation: true (saved false)  ✗ needs Grant Topology"),
+        text.contains("[x] Allow root Group creation (saved off) "),
         "{text}"
     );
+    assert!(text.contains("✗ needs Grant Topology"), "{text}");
 }
 
 #[test]
@@ -1992,6 +2041,7 @@ fn policy_field_bounds_match_daemon_validation() {
         let small = u16::try_from(value).unwrap_or(u16::MAX);
         match field {
             Field::Sessions => p.max_created_sessions = small,
+            Field::SessionsWindow => p.created_sessions_window_hours = small,
             Field::Containers => p.max_created_containers = small,
             Field::Concurrency => p.max_active_sessions = small,
             Field::ProviderLimit(_) => p.provider_limits.push(ManagerProviderLimitV2 {
@@ -2007,6 +2057,7 @@ fn policy_field_bounds_match_daemon_validation() {
     };
     for field in [
         Field::Sessions,
+        Field::SessionsWindow,
         Field::Containers,
         Field::Concurrency,
         Field::ProviderLimit(0),
@@ -2027,7 +2078,7 @@ fn policy_field_bounds_match_daemon_validation() {
 #[tokio::test]
 async fn policy_usage_request_reads_created_sessions_from_inspect_resources() {
     let (_, config) = fixture();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let path = dir.path().join("usage.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let reply = page(
@@ -2101,7 +2152,12 @@ fn usage_under_160() -> policy::usage::CreationUsage {
         created: 152,
         created_limit: Some(160),
         created_remaining: Some(8),
+        window_hours: None,
+        next_free_at: None,
+        lifetime_total: None,
         active: 3,
+        grants: vec![],
+        bench_enabled: None,
     }
 }
 
@@ -2127,7 +2183,7 @@ async fn policy_save_renders_usage_against_the_saved_quota_immediately() {
     policy_mut(&mut app).apply_usage(Ok(Ok(usage_under_160())));
     let before = screen(&mut app);
     assert!(
-        before.contains("Usage: sessions 152/160 created · 8 left · active 3/4"),
+        before.contains("Usage: sessions 152/160 created (lifetime) · 8 left · active 3/4"),
         "{before}"
     );
     policy_mut(&mut app)
@@ -2137,7 +2193,7 @@ async fn policy_save_renders_usage_against_the_saved_quota_immediately() {
     finish(task).await;
     let after = screen(&mut app);
     assert!(
-        after.contains("Usage: sessions 152/512 created · 360 left · active 3/4"),
+        after.contains("Usage: sessions 152/512 created (lifetime) · 360 left · active 3/4"),
         "{after}"
     );
 }
@@ -2169,7 +2225,7 @@ async fn policy_reload_keeps_same_scope_usage_and_marks_changed_scope_usage_stal
     key(&mut app, KeyCode::Char('r')).await;
     let same = screen(&mut app);
     assert!(
-        same.contains("Usage: sessions 152/160 created · 8 left · active 3/4"),
+        same.contains("Usage: sessions 152/160 created (lifetime) · 8 left · active 3/4"),
         "{same}"
     );
     key(&mut app, KeyCode::Char('r')).await;
@@ -2217,7 +2273,7 @@ async fn policy_ninth_provider_limit_is_refused_and_flagged_on_its_row() {
     finish(task).await;
     let s = policy_mut(&mut app);
     assert_eq!(s.rows()[s.selected].field, ProviderLimit(last));
-    let text = screen(&mut app);
+    let text = flat(&screen(&mut app));
     assert!(
         text.contains(
             "Policy not saved: Harness active limit at most 8 provider limits; blank one."
@@ -2226,7 +2282,7 @@ async fn policy_ninth_provider_limit_is_refused_and_flagged_on_its_row() {
     );
     assert!(
         text.contains(
-            "Harness active limit: 1 (saved inherit)  ✗ at most 8 provider limits; blank one"
+            "Harness active limit 1 (saved inherit) ✗ at most 8 provider limits; blank one"
         ),
         "{text}"
     );
@@ -2238,7 +2294,12 @@ fn usage_after_512() -> policy::usage::CreationUsage {
         created: 153,
         created_limit: Some(512),
         created_remaining: Some(359),
+        window_hours: None,
+        next_free_at: None,
+        lifetime_total: None,
         active: 3,
+        grants: vec![],
+        bench_enabled: None,
     }
 }
 
@@ -2274,7 +2335,9 @@ async fn policy_usage_request_started_before_save_is_dropped_and_the_later_snaps
     policy_mut(&mut app).apply_usage(Ok(Ok(usage_under_160())));
     let raced = screen(&mut app);
     assert!(
-        raced.contains("Usage: sessions 152/512 created · 360 left · active 3/4 · refreshing"),
+        raced.contains(
+            "Usage: sessions 152/512 created (lifetime) · 360 left · active 3/4 · refreshing"
+        ),
         "{raced}"
     );
     let s = policy_mut(&mut app);
@@ -2286,7 +2349,7 @@ async fn policy_usage_request_started_before_save_is_dropped_and_the_later_snaps
     s.apply_usage(Ok(Ok(usage_after_512())));
     let fresh = screen(&mut app);
     assert!(
-        fresh.contains("Usage: sessions 153/512 created · 359 left · active 3/4"),
+        fresh.contains("Usage: sessions 153/512 created (lifetime) · 359 left · active 3/4"),
         "{fresh}"
     );
 }
@@ -2324,13 +2387,15 @@ async fn policy_usage_request_retained_across_same_scope_reload_is_dropped_and_t
     policy_mut(&mut app).apply_usage(Ok(Ok(usage_under_160())));
     let raced = screen(&mut app);
     assert!(
-        raced.contains("Usage: sessions 152/512 created · 360 left · active 3/4 · refreshing"),
+        raced.contains(
+            "Usage: sessions 152/512 created (lifetime) · 360 left · active 3/4 · refreshing"
+        ),
         "{raced}"
     );
     policy_mut(&mut app).apply_usage(Ok(Ok(usage_after_512())));
     let fresh = screen(&mut app);
     assert!(
-        fresh.contains("Usage: sessions 153/512 created · 359 left · active 3/4"),
+        fresh.contains("Usage: sessions 153/512 created (lifetime) · 359 left · active 3/4"),
         "{fresh}"
     );
 }

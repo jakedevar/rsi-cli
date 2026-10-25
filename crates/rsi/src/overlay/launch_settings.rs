@@ -17,20 +17,23 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rsi_common::grant_narrowing::{intersect_launches, portfolio_effective_launches};
 use rsi_common::harness_manager::{ConfigureHarnessManagerRequestV1, HarnessManagerScopeModeV1};
 use rsi_common::harness_manager_presets::{
     ManagerPolicyOrigin, ManagerPolicyPreset, ManagerPresetContext, apply_manager_policy_preset,
     classify_manager_policy,
 };
-use rsi_common::harness_manager_v2::{ConfigureHarnessManagerWithPolicyRequestV2, ManagerPolicyV2};
+use rsi_common::harness_manager_v2::{
+    ConfigureHarnessManagerWithPolicyRequestV2, ManagerLaunchChoiceV2, ManagerPolicyV2,
+};
 use rsi_common::types::{Session, SessionKind, SessionStatus};
 use uuid::Uuid;
 
 use crate::app::App;
 use crate::overlay::grant_editor::{GrantEditor, GrantKey};
 use crate::types::{
-    ManagerAppointment, ManagerLaunchPlan, ManagerLaunchScope, OverlayState, PopupMode,
-    PromptLaunchSettings, PromptPurpose,
+    GrantContextState, ManagerAppointment, ManagerGrantContext, ManagerLaunchPlan,
+    ManagerLaunchScope, OverlayState, PopupMode, PromptLaunchSettings, PromptPurpose,
 };
 
 /// Policy presets offered at launch, in cycle order. `Custom` policies stay
@@ -514,10 +517,17 @@ fn toggle_manager(app: &mut App, slot: PromptSlot) {
         if launch.manager.is_none() {
             launch.grant = None;
             launch.grant_open = false;
+            launch.preset_chosen = false;
+            launch.grant_context = GrantContextState::Loading;
         }
         let rows = setting_rows(purpose, launch).len();
         launch.selected = launch.selected.min(rows.saturating_sub(1));
     }
+    // Ask the event loop for what the project already has granted (#3270).
+    app.manager_grant_context_request = match (planned, project_id) {
+        (false, Some(project_id)) => Some(project_id),
+        _ => None,
+    };
 }
 
 const fn wrapped(index: usize, len: usize, forward: bool) -> usize {
@@ -562,41 +572,214 @@ fn step_preset(app: &mut App, slot: PromptSlot, forward: bool) {
     {
         editor.apply_preset(preset);
     }
+    if let Some(OverlayState::Prompt { launch, .. }) = slot.get_mut(app) {
+        launch.preset_chosen = true;
+    }
     set_plan(app, slot, ManagerLaunchPlan { preset, ..plan });
 }
 
-/// Show (`open`) or hide the grant page. The editor is created from the
-/// planned preset the first time it opens, so an operator who never opens the
-/// page grants exactly the preset.
+/// The grant editor for a planned appointment. It starts from the project's
+/// saved grant when one exists and the operator did not pick a preset, else
+/// from the planned preset; the ancestor grants' launches mark what is not
+/// covered (#3270).
+fn grant_editor_for(
+    plan: &ManagerLaunchPlan,
+    preset_chosen: bool,
+    context: &ManagerGrantContext,
+) -> GrantEditor {
+    let saved = context.saved.clone().filter(|_| !preset_chosen);
+    let mut editor = GrantEditor::for_manager(
+        saved.unwrap_or_else(|| plan.policy()),
+        plan.scope_mode(),
+        crate::overlay::global_manager_command::default_allowed_launches(),
+    );
+    editor.set_ancestor_launches(context.ancestor_launches.clone());
+    editor
+}
+
+/// Deliver the read state to every prompt planning a manager for this project.
+/// An unopened or waiting page gets an editor only after a successful read.
+pub(crate) fn apply_grant_context(app: &mut App, project_id: Uuid, state: &GrantContextState) {
+    let apply = |overlay: &mut OverlayState| {
+        let OverlayState::Prompt { launch, .. } = overlay else {
+            return;
+        };
+        let Some(plan) = launch.manager.filter(|plan| plan.project_id == project_id) else {
+            return;
+        };
+        let pristine = match (&launch.grant, &launch.grant_context) {
+            (Some(editor), GrantContextState::Loaded(previous)) => {
+                *editor == grant_editor_for(&plan, launch.preset_chosen, previous)
+            }
+            _ => true,
+        };
+        launch.grant_context = state.clone();
+        match state {
+            GrantContextState::Loaded(context) => {
+                if pristine && (launch.grant_open || launch.grant.is_some()) {
+                    launch.grant = Some(grant_editor_for(&plan, launch.preset_chosen, context));
+                } else if let Some(editor) = launch.grant.as_mut() {
+                    editor.set_ancestor_launches(context.ancestor_launches.clone());
+                }
+            }
+            GrantContextState::Loading | GrantContextState::Failed { .. } => launch.grant = None,
+        }
+    };
+    apply(&mut app.overlay);
+    for overlay in &mut app.input_overlays {
+        apply(overlay);
+    }
+    app.mark_dirty();
+}
+
+/// Deliver a finished read, including task failure, then start a requested read.
+#[allow(clippy::future_not_send)] // App is owned by the single-threaded event loop.
+pub(crate) async fn tick_grant_context(app: &mut App) {
+    if app
+        .manager_grant_context_task
+        .as_ref()
+        .is_some_and(|(_, handle)| handle.is_finished())
+        && let Some((project_id, handle)) = app.manager_grant_context_task.take()
+    {
+        let state = handle
+            .await
+            .unwrap_or_else(|error| GrantContextState::Failed {
+                reason: format!("grant read task failed: {error}"),
+            });
+        apply_grant_context(app, project_id, &state);
+    }
+    if app.manager_grant_context_task.is_some() {
+        return;
+    }
+    let Some(project_id) = app.manager_grant_context_request.take() else {
+        return;
+    };
+    apply_grant_context(app, project_id, &GrantContextState::Loading);
+    let socket_path = app.client.socket_path().to_path_buf();
+    app.manager_grant_context_task = Some((
+        project_id,
+        tokio::spawn(read_grant_context(socket_path, project_id)),
+    ));
+}
+
+async fn read_grant_context(socket_path: PathBuf, project_id: Uuid) -> GrantContextState {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        fetch_grant_context(socket_path, project_id),
+    )
+    .await
+    {
+        Ok(Ok(context)) => GrantContextState::Loaded(context),
+        Ok(Err(reason)) => GrantContextState::Failed { reason },
+        Err(_) => GrantContextState::Failed {
+            reason: "grant read timed out".into(),
+        },
+    }
+}
+
+/// Read the saved grant and ancestor launches. A successful `saved: None`
+/// means the project has no saved grant; transport/RPC failures are errors.
+pub(crate) async fn fetch_grant_context(
+    socket_path: PathBuf,
+    project_id: Uuid,
+) -> Result<ManagerGrantContext, String> {
+    let mut client = crate::client::DaemonClient::new(socket_path);
+    client
+        .connect()
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let saved = client
+        .get_harness_manager_policy(project_id)
+        .await
+        .map_err(|error| format!("saved grant read failed: {error}"))?
+        .map(|config| config.policy);
+    let nodes = client
+        .list_portfolio_nodes(false)
+        .await
+        .map_err(|error| format!("ancestor grants read failed: {error}"))?;
+    Ok(ManagerGrantContext {
+        saved,
+        ancestor_launches: ancestor_launches_of(&nodes, project_id),
+    })
+}
+
+/// Block every launch placement while a planned manager's grant is unknown.
+pub(super) fn block_unloaded_grant(app: &mut App, slot: PromptSlot) -> bool {
+    let message = match slot.get(app) {
+        Some(OverlayState::Prompt { launch, .. }) if launch.manager.is_some() => {
+            launch.grant_context.status_message()
+        }
+        _ => None,
+    };
+    if let Some(message) = message {
+        app.notify(message);
+        true
+    } else {
+        false
+    }
+}
+
+/// The launches every live portfolio node covering `project_id` admits,
+/// intersected the way the daemon resolves a manager's effective launches
+/// (`manager_effective_launches`); `None` when no node covers the project.
+#[must_use]
+pub(crate) fn ancestor_launches_of(
+    nodes: &[rsi_common::portfolio_nodes::PortfolioNodeV1],
+    project_id: Uuid,
+) -> Option<Vec<ManagerLaunchChoiceV2>> {
+    let mut launches: Option<Vec<ManagerLaunchChoiceV2>> = None;
+    for node in nodes
+        .iter()
+        .filter(|node| node.state == "active" && node.grant.project_ids.contains(&project_id))
+    {
+        let effective =
+            portfolio_effective_launches(&node.grant.allowed_launches, &node.grant.project_policy);
+        launches = Some(match launches {
+            Some(current) => intersect_launches(&current, &effective),
+            None => effective,
+        });
+    }
+    launches
+}
+
+/// Show (`open`) or hide the grant page. The editor is created the first time
+/// it opens, from the saved grant or the planned preset, so an operator who
+/// never opens the page grants exactly what the settings row says.
 fn open_grant_page(app: &mut App, slot: PromptSlot, open: bool) {
     let Some(plan) = planned_manager(app, slot) else {
         return;
     };
+    let mut retry = false;
     if let Some(OverlayState::Prompt { launch, .. }) = slot.get_mut(app) {
         if open && launch.grant.is_none() {
-            launch.grant = Some(GrantEditor::for_manager(
-                plan.policy(),
-                plan.scope_mode(),
-                crate::overlay::global_manager_command::default_allowed_launches(),
-            ));
+            match &launch.grant_context {
+                GrantContextState::Loaded(context) => {
+                    launch.grant = Some(grant_editor_for(&plan, launch.preset_chosen, context));
+                }
+                GrantContextState::Failed { .. } => retry = true,
+                GrantContextState::Loading => {}
+            }
         }
         launch.grant_open = open;
     }
+    // One bounded read per reopening after failure; ticks do not retry forever.
+    if retry {
+        app.manager_grant_context_request = Some(plan.project_id);
+    }
 }
 
-/// Keys while the grant page shows: the editor takes them; `Esc` (or `p`)
-/// returns to the launch rows.
+/// Waiting pages consume editing keys and allow the existing Esc/p return.
 fn handle_grant_page_key(app: &mut App, slot: PromptSlot, key: KeyEvent) {
     let outcome = match slot.get_mut(app) {
         Some(OverlayState::Prompt { launch, .. }) => launch
             .grant
             .as_mut()
-            .map_or(GrantKey::Leave, |editor| editor.handle_key(key)),
+            .map_or(GrantKey::Ignored, |editor| editor.handle_key(key)),
         _ => return,
     };
     let back = outcome == GrantKey::Leave
         || (outcome == GrantKey::Ignored
-            && key.code == KeyCode::Char('p')
+            && matches!(key.code, KeyCode::Esc | KeyCode::Char('p'))
             && key.modifiers.is_empty());
     if back {
         open_grant_page(app, slot, false);
@@ -631,7 +814,11 @@ pub(crate) async fn appoint_launched_manager(
     session_id: Uuid,
     appointment: ManagerAppointment,
 ) -> Result<String, String> {
-    let ManagerAppointment { plan, grant } = appointment;
+    let ManagerAppointment {
+        plan,
+        grant,
+        preset_chosen,
+    } = appointment;
     let not_appointed = |error: String| {
         format!(
             "Session launched but not appointed manager: {error}. Retry with :manager appoint on it."
@@ -657,7 +844,15 @@ pub(crate) async fn appoint_launched_manager(
         .get_harness_manager_policy(plan.project_id)
         .await
         .map_err(|error| not_appointed(error.to_string()))?;
-    let policy = grant.unwrap_or_else(|| plan.policy());
+    // #3270: an appointment nobody edited re-grants the project's saved grant
+    // (the operator's last values), not the preset's defaults; the preset
+    // applies only when it was picked or the project has no saved grant.
+    let saved = stored
+        .as_ref()
+        .map(|config| config.policy.clone())
+        .filter(|_| grant.is_none() && !preset_chosen);
+    let regrants_saved = saved.is_some();
+    let policy = grant.or(saved).unwrap_or_else(|| plan.policy());
     let label = if policy == plan.policy() {
         plan.preset.label()
     } else {
@@ -668,7 +863,7 @@ pub(crate) async fn appoint_launched_manager(
     let result = client
         .configure_harness_manager_with_policy(ConfigureHarnessManagerWithPolicyRequestV2 {
             scope: plan.scope_request(session_id, previous.as_ref().map_or(0, |c| c.row_version)),
-            expected_policy_version: stored.map_or(0, |policy| policy.row_version),
+            expected_policy_version: stored.as_ref().map_or(0, |policy| policy.row_version),
             idempotency_key: Uuid::new_v4().to_string(),
             policy,
         })
@@ -684,8 +879,13 @@ pub(crate) async fn appoint_launched_manager(
             config.explicit_epic_ids().len()
         )
     };
+    let granted = if regrants_saved {
+        format!("re-granting the saved grant ({label})")
+    } else {
+        format!("with the {label} policy")
+    };
     Ok(format!(
-        "Manager appointed for {scope} with the {label} policy{}",
+        "Manager appointed for {scope} {granted}{}",
         if replaced {
             "; it replaces the previous manager"
         } else {

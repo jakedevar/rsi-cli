@@ -12,6 +12,17 @@ pub const PROVIDER_AUTH_INVALID_DETAIL: &str = "auth_invalid";
 
 /// Error code for an unknown `provider` filter.
 pub const PROVIDER_STATUS_UNKNOWN_PROVIDER: &str = "provider_status_unknown_provider";
+/// Error code for a `models` list on anything but `provider:"openrouter"`.
+pub const PROVIDER_STATUS_MODELS_NEED_OPENROUTER: &str = "provider_status_models_need_openrouter";
+/// Error code for a `models` list that is too long or names an invalid id.
+pub const PROVIDER_STATUS_MODELS_INVALID: &str = "provider_status_models_invalid";
+/// Error code for `run_budget_usd` / `run_sessions` on anything but
+/// `provider:"openrouter"`, or `run_sessions` without a `run_budget_usd`.
+pub const PROVIDER_STATUS_RUN_BUDGET_NEEDS_OPENROUTER: &str =
+    "provider_status_run_budget_needs_openrouter";
+/// Error code for a `run_budget_usd` that is not a positive finite number, or a
+/// `run_sessions` list that is too long.
+pub const PROVIDER_STATUS_RUN_BUDGET_INVALID: &str = "provider_status_run_budget_invalid";
 
 /// Closed set of provider names the verb reports. Session providers use their
 /// snake_case name; `anthropic` and `openai` are the Harness API credential
@@ -46,11 +57,26 @@ pub const PROVIDER_AUTH_LOGIN_RECHECK_MIN_SECS: i64 = 5 * 60;
 pub const PROVIDER_STATUS_CACHE_TTL_SECS: u64 = 60;
 
 /// Strict request; omit `provider` for every provider.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGetProviderStatusRequestV1 {
     #[serde(default)]
     pub provider: Option<String>,
+    /// OpenRouter model ids whose current prices (from the daemon's own model
+    /// discovery, per million tokens, with the fetch time) the `openrouter`
+    /// entry returns in `model_prices` (#3154). Needs `provider:"openrouter"`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// A benchmark run's USD budget (#3154). The `openrouter` entry returns
+    /// `run_budget`: whether the run may launch its next task, judged from the
+    /// spend of `run_sessions` against this budget and the cap's remainder.
+    /// Needs `provider:"openrouter"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_budget_usd: Option<f64>,
+    /// The sessions the run launched so far; their invocation spend is the
+    /// run's spend. Empty for a run about to start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_sessions: Vec<uuid::Uuid>,
 }
 
 impl AgentGetProviderStatusRequestV1 {
@@ -59,10 +85,36 @@ impl AgentGetProviderStatusRequestV1 {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self.provider.as_deref() {
             Some(name) if !PROVIDER_STATUS_NAMES.contains(&name) => {
-                Err(PROVIDER_STATUS_UNKNOWN_PROVIDER)
+                return Err(PROVIDER_STATUS_UNKNOWN_PROVIDER);
             }
-            _ => Ok(()),
+            _ => {}
         }
+        if self.run_budget_usd.is_some() || !self.run_sessions.is_empty() {
+            if self.provider.as_deref() != Some("openrouter") || self.run_budget_usd.is_none() {
+                return Err(PROVIDER_STATUS_RUN_BUDGET_NEEDS_OPENROUTER);
+            }
+            if self
+                .run_budget_usd
+                .is_some_and(|budget| !budget.is_finite() || budget <= 0.0)
+                || self.run_sessions.len() > crate::openrouter_spend::RUN_SESSIONS_MAX
+            {
+                return Err(PROVIDER_STATUS_RUN_BUDGET_INVALID);
+            }
+        }
+        if self.models.is_empty() {
+            return Ok(());
+        }
+        if self.provider.as_deref() != Some("openrouter") {
+            return Err(PROVIDER_STATUS_MODELS_NEED_OPENROUTER);
+        }
+        if self.models.len() > crate::openrouter_spend::MODEL_PRICES_MAX
+            || self.models.iter().any(|model| {
+                model.trim().is_empty() || model.len() > crate::openrouter_spend::MODEL_ID_MAX_LEN
+            })
+        {
+            return Err(PROVIDER_STATUS_MODELS_INVALID);
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +328,24 @@ pub struct ProviderStatusEntryV1 {
     /// every other provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<crate::provider_contract::ProviderContractV1>,
+    /// The operator's OpenRouter spend cap (#3154), on the `openrouter` entry:
+    /// cap, baseline, spend since arming, remainder and state, so a lead or the
+    /// benchmark runner can check it before every run. Absent on every other
+    /// provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spend_cap: Option<crate::openrouter_spend::OpenRouterSpendCapV1>,
+    /// Prices (per million tokens) of the models the request named, from the
+    /// daemon's own OpenRouter model discovery (#3154). A model the catalog
+    /// does not list is absent here and named in `model_prices_unknown`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_prices: Vec<crate::openrouter_spend::OpenRouterModelPriceV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_prices_unknown: Vec<String>,
+    /// The per-run budget verdict for the request's `run_budget_usd` (#3154),
+    /// on the `openrouter` entry: `admitted`, the typed refusal and the run's
+    /// spend. Absent when the request named no run budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_budget: Option<crate::openrouter_spend::RunBudgetReportV1>,
 }
 
 impl ProviderStatusEntryV1 {
@@ -416,6 +486,38 @@ impl AgentGetProviderStatusResultV1 {
         }
     }
 
+    /// Attach the OpenRouter spend ceiling (#3154) and the discovered prices of
+    /// the models the request named to the `openrouter` entry, if the report
+    /// has one. An armed cap that cannot be judged (stale probe) or that is
+    /// reached reads `launch_admission: refused` with the typed code as
+    /// `refusal_detail`, unless something already refuses it, so a lead that
+    /// only reads `launch_admission` stops too.
+    pub fn apply_openrouter_spend(
+        &mut self,
+        cap: crate::openrouter_spend::OpenRouterSpendCapV1,
+        prices: Vec<crate::openrouter_spend::OpenRouterModelPriceV1>,
+        unknown: Vec<String>,
+        run_budget: Option<crate::openrouter_spend::RunBudgetReportV1>,
+    ) {
+        let Some(entry) = self
+            .providers
+            .iter_mut()
+            .find(|entry| entry.provider == "openrouter")
+        else {
+            return;
+        };
+        if entry.launch_admission == "open"
+            && let Err(refusal) = crate::openrouter_spend::launch_verdict(&cap)
+        {
+            entry.launch_admission = "refused".to_string();
+            entry.refusal_detail = Some(refusal.code.to_string());
+        }
+        entry.spend_cap = Some(cap);
+        entry.model_prices = prices;
+        entry.model_prices_unknown = unknown;
+        entry.run_budget = run_budget;
+    }
+
     /// Record `profile` and mark every provider it refuses as refused up
     /// front. `all` changes nothing.
     pub fn apply_provider_profile(&mut self, profile: crate::provider_profile::ProviderProfile) {
@@ -458,6 +560,10 @@ mod tests {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         };
         let mut report = AgentGetProviderStatusResultV1 {
             generated_at: Utc::now(),
@@ -509,6 +615,10 @@ mod tests {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         };
         let mut report = AgentGetProviderStatusResultV1 {
             generated_at: Utc::now(),
@@ -565,6 +675,10 @@ mod tests {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         };
         let mut report = AgentGetProviderStatusResultV1 {
             generated_at: Utc::now(),
@@ -630,6 +744,10 @@ mod tests {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         };
         let report = || AgentGetProviderStatusResultV1 {
             generated_at: Utc::now(),
@@ -707,11 +825,66 @@ mod tests {
         assert_eq!(ok.validate(), Ok(()));
         let bad = AgentGetProviderStatusRequestV1 {
             provider: Some("nope".into()),
+            ..Default::default()
         };
         assert_eq!(bad.validate(), Err(PROVIDER_STATUS_UNKNOWN_PROVIDER));
+        // #3154: a price read names models and needs the openrouter provider.
+        let priced =
+            |provider: Option<&str>, models: Vec<String>| AgentGetProviderStatusRequestV1 {
+                provider: provider.map(str::to_string),
+                models,
+                ..Default::default()
+            };
+        let one = vec!["deepseek/deepseek-v4.1-flash".to_string()];
+        assert_eq!(priced(Some("openrouter"), one.clone()).validate(), Ok(()));
+        assert_eq!(
+            priced(None, one.clone()).validate(),
+            Err(PROVIDER_STATUS_MODELS_NEED_OPENROUTER)
+        );
+        assert_eq!(
+            priced(Some("claude"), one).validate(),
+            Err(PROVIDER_STATUS_MODELS_NEED_OPENROUTER)
+        );
+        assert_eq!(
+            priced(Some("openrouter"), vec![String::new()]).validate(),
+            Err(PROVIDER_STATUS_MODELS_INVALID)
+        );
+        assert_eq!(
+            priced(Some("openrouter"), vec!["m".to_string(); 33]).validate(),
+            Err(PROVIDER_STATUS_MODELS_INVALID)
+        );
         assert_eq!(
             AgentGetProviderStatusRequestV1::default().validate(),
             Ok(())
+        );
+        // #3154: a run budget needs the openrouter provider and a positive,
+        // finite figure; sessions need a budget.
+        let run = |provider: Option<&str>, budget: Option<f64>, sessions: usize| {
+            AgentGetProviderStatusRequestV1 {
+                provider: provider.map(str::to_string),
+                run_budget_usd: budget,
+                run_sessions: vec![uuid::Uuid::nil(); sessions],
+                ..Default::default()
+            }
+        };
+        assert_eq!(run(Some("openrouter"), Some(2.5), 3).validate(), Ok(()));
+        assert_eq!(
+            run(None, Some(2.5), 0).validate(),
+            Err(PROVIDER_STATUS_RUN_BUDGET_NEEDS_OPENROUTER)
+        );
+        assert_eq!(
+            run(Some("openrouter"), None, 1).validate(),
+            Err(PROVIDER_STATUS_RUN_BUDGET_NEEDS_OPENROUTER)
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                run(Some("openrouter"), Some(bad), 0).validate(),
+                Err(PROVIDER_STATUS_RUN_BUDGET_INVALID)
+            );
+        }
+        assert_eq!(
+            run(Some("openrouter"), Some(1.0), 257).validate(),
+            Err(PROVIDER_STATUS_RUN_BUDGET_INVALID)
         );
     }
     fn auth_entry(episode: Option<ProviderAuthEpisodeV1>) -> ProviderStatusEntryV1 {
@@ -735,6 +908,10 @@ mod tests {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         }
     }
 

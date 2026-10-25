@@ -4,6 +4,7 @@ pub(crate) mod delivery;
 pub(crate) mod deploy_link;
 pub(crate) mod diagnostics;
 pub(crate) mod dispatch;
+pub(crate) mod enqueue_intake;
 pub(crate) mod hub;
 pub(crate) mod link;
 pub(crate) mod poll;
@@ -166,7 +167,8 @@ pub(crate) fn last_deploy_status(
     if row.state == rsi_common::agent_deploy::DeployState::Staged
         && let Some(owner) = row.owner_session_id
     {
-        blockers = store.deploy_quiet_blocker_details_with(owner, true)?;
+        let surviving = crate::agent_jobs::deploy_surviving_jobs_or_none(store, &row);
+        blockers = store.deploy_quiet_blocker_details_surviving(owner, true, &surviving)?;
         blockers.truncate(rsi_common::satellite::SATELLITE_MAX_DEPLOY_BLOCKERS);
         waiting_since = store
             .agent_deploy_created_at(row.id)?
@@ -186,8 +188,7 @@ pub(crate) fn last_deploy_status(
 
 pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
     let probe_started = Instant::now();
-    let (sessions_running, sessions_waiting_approval, schema_version) =
-        store.satellite_health_counts()?;
+    let counts = store.satellite_health_counts()?;
     Ok(SatelliteHealthV1 {
         store_probe_elapsed_ms: Some(crate::satellite::diagnostics::elapsed_ms(probe_started)),
         platform: Some(rsi_common::satellite::SatellitePlatformV1 {
@@ -197,9 +198,11 @@ pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
         daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
         binary_sha256: binary_digest(),
         uptime_seconds: PROCESS_START.elapsed().as_secs(),
-        schema_version: Some(schema_version),
-        sessions_running,
-        sessions_waiting_approval,
+        schema_version: Some(counts.schema_version),
+        sessions_running: counts.sessions_running,
+        sessions_waiting_approval: counts.sessions_waiting_approval,
+        workers_parked: Some(counts.workers_parked),
+        open_jobs: Some(counts.open_jobs),
         disk_free_bytes: disk_free_bytes(&rsi_common::identity::data_dir()),
         load_avg_1m_milli: load_avg_1m_milli(),
         build_sha: Some(crate::daemon_info::BUILD_SHA.to_owned()),
@@ -207,6 +210,7 @@ pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
         supervisor_mode: crate::daemon_info::supervisor_mode(),
         missing_provider_clis: crate::provider_cli::missing_provider_clis(),
         manager_launches: store.satellite_manager_launches().unwrap_or_default(),
+        manager_policies: Some(store.satellite_manager_policies()?),
         last_deploy: last_deploy_status(store)?,
         latest_watchdog_trip: store
             .latest_daemon_restart_record()?
@@ -214,11 +218,16 @@ pub(crate) fn health(store: &crate::store::Store) -> Result<SatelliteHealthV1> {
             .transpose()
             .map_err(|error| DaemonError::Store(error.to_string()))?,
         // #2120: the RPC identity handler fills this from the live governor.
+        governor_disk: None,
         qa_admission: None,
         // #2753: this host's own CLI login probes (cached; never probes here).
         provider_logins: crate::provider_login::ProviderLoginService::global().health_reports(),
         // #2747: the hub's `when.health_anomaly` reads these.
         provider_faults: crate::health_anomaly::health_provider_faults(store, chrono::Utc::now())
+            .unwrap_or_default(),
+        // #4008: this host's invocations and tokens by provider, 1h and 24h.
+        usage: store
+            .provider_usage_rollup(chrono::Utc::now())
             .unwrap_or_default(),
     })
 }
@@ -333,6 +342,92 @@ impl SatelliteSessionSnapshots {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn declared_project_manager_policy_enters_health_and_the_hub_anomaly_reading() {
+        use rsi_common::harness_manager::ConfigureHarnessManagerRequestV1;
+        use rsi_common::harness_manager_v2::{
+            ConfigureHarnessManagerPolicyRequestV2, ManagerLaunchChoiceV2, ManagerPolicyV2,
+        };
+        use rsi_common::satellite::{SatelliteHealthV1, SatelliteUuidV1};
+        use rsi_common::satellite_dispatch::SatelliteInboundPolicyV1;
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let session = rsid_store::test_support::make_test_session();
+        let project = session.project_id.unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .put_satellite_inbound_policy(&SatelliteInboundPolicyV1 {
+                scope_projects: vec![SatelliteUuidV1(project)],
+                ..Default::default()
+            })
+            .unwrap();
+        let vacant = super::health(&store)
+            .unwrap()
+            .manager_policies
+            .unwrap()
+            .remove(0);
+        assert_eq!(vacant.project_id, project);
+        assert_eq!(vacant.manager_session_id, None);
+        let scope = store
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: project,
+                session_id: session.id,
+                epic_ids: None,
+                group_ids: Vec::new(),
+                expected_row_version: 0,
+            })
+            .unwrap();
+        // A declared seat with no saved policy must still be visible.
+        let missing = super::health(&store)
+            .unwrap()
+            .manager_policies
+            .unwrap()
+            .remove(0);
+        assert_eq!(missing.manager_session_id, Some(session.id));
+        assert_eq!(missing.policy_version, Some(0));
+        assert_eq!(missing.allowed_launches, Some(0));
+        for (expected, launches) in [
+            vec![],
+            vec![ManagerLaunchChoiceV2 {
+                provider: rsi_common::SessionProvider::Codex,
+                model: "model".into(),
+                effort: None,
+            }],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let saved = store
+                .configure_harness_manager_policy(&ConfigureHarnessManagerPolicyRequestV2 {
+                    project_id: project,
+                    expected_scope_version: scope.row_version,
+                    expected_policy_version: expected as i64,
+                    idempotency_key: format!("health-{expected}"),
+                    policy: ManagerPolicyV2 {
+                        allowed_launches: launches,
+                        ..Default::default()
+                    },
+                })
+                .unwrap();
+            let health = super::health(&store).unwrap();
+            let row = &health.manager_policies.as_ref().unwrap()[0];
+            assert_eq!(row.project_id, project);
+            assert_eq!(row.manager_session_id, Some(session.id));
+            assert_eq!(row.scope_version, Some(scope.row_version));
+            assert_eq!(row.policy_version, Some(saved.row_version));
+            assert_eq!(row.allowed_launches, Some(expected as u32));
+            assert_eq!(row.launches, expected as u32);
+            let received: SatelliteHealthV1 =
+                serde_json::from_value(serde_json::to_value(health).unwrap()).unwrap();
+            let reading = crate::health_anomaly::SatelliteReading::from_health(
+                uuid::Uuid::new_v4(),
+                "laptop",
+                &received,
+            );
+            assert_eq!(reading.manager_policies, received.manager_policies.unwrap());
+        }
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
     fn imported_watchdog_trip_survives_reopen_and_enters_satellite_health() {

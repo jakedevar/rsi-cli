@@ -115,6 +115,11 @@ else
     if [[ "$mode" == full ]]; then profile=ci-full; else profile=rsid-fast; fi
 fi
 
+# The shard inventory and runtime identity checks are the Rust `rsid-test-shards` guard
+# (#362, #448); `scripts/repo-guard` builds or reuses it, failing closed.
+shard_guard_cmd=(scripts/repo-guard rsid-test-shards)
+shard_guard() { "${shard_guard_cmd[@]}" "$@"; }
+
 # `list` always ignores the default-filter: the runtime identity check needs every
 # shard test listed as matching. A run ignores it only on the slow tier.
 list_tier_args=(--ignore-default-filter)
@@ -122,9 +127,9 @@ run_tier_args=()
 if (( slow_tier )); then run_tier_args=(--ignore-default-filter); fi
 
 if (( dry_run )); then
-    shard_output="$(python3 scripts/check-rsid-test-shards.py --list-shards)"
+    shard_output="$(shard_guard --list-shards)"
 else
-    shard_output="$(python3 scripts/check-rsid-test-shards.py --require-gates --list-shards)"
+    shard_output="$(shard_guard --require-gates --list-shards)"
 fi
 # Portable to bash 3.2 (macOS /bin/bash): no `mapfile`, no associative arrays.
 shards=()
@@ -139,7 +144,7 @@ while read -r shard_name shard_packages; do
     flags=""
     for package_name in $shard_packages; do flags+="-p $package_name "; done
     shard_package_map+="${shard_name}"$'\t'"${flags% }"$'\n'
-done < <(python3 scripts/check-rsid-test-shards.py --list-shard-packages)
+done < <(shard_guard --list-shard-packages)
 shard_flags() {
     local wanted="$1" name flags
     while IFS=$'\t' read -r name flags; do
@@ -173,7 +178,7 @@ if (( dry_run )); then
         read -r -a package_flags <<<"$(shard_flags "$shard")"
         print_command cargo nextest list --profile "$profile" "${package_flags[@]}" --lib --no-default-features --features "test-shard-$shard" "${list_tier_args[@]}" --message-format json
     done
-    runtime_check=(python3 scripts/check-rsid-test-shards.py --require-gates --runtime-dir '<evidence>/lists')
+    runtime_check=("${shard_guard_cmd[@]}" --require-gates --runtime-dir '<evidence>/lists')
     if [[ "$mode" == shard ]]; then runtime_check+=(--runtime-shard "$requested_shard"); fi
     print_command "${runtime_check[@]}"
     if [[ "$mode" == warmup ]]; then
@@ -216,7 +221,7 @@ fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}" CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0
 # Cargo resolves environment, workspace and global target-dir settings for us.
 # Keep this lock outside the package artifacts removed by `cargo clean -p`.
-target_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+target_dir="$(cargo metadata --no-deps --format-version 1 | shard_guard --target-directory)"
 mkdir -p "$target_dir"
 exec {artifact_lock_fd}>"$target_dir/.rsid-test-shards.lock"
 flock --shared "$artifact_lock_fd"
@@ -299,7 +304,7 @@ for shard in "${shards[@]}"; do
     cat "$evidence_dir/logs/$label.stderr"
     (( status == 0 )) || exit "$status"
 done
-runtime_check=(python3 scripts/check-rsid-test-shards.py --require-gates --runtime-dir "$evidence_dir/lists")
+runtime_check=("${shard_guard_cmd[@]}" --require-gates --runtime-dir "$evidence_dir/lists")
 if [[ "$mode" == shard ]]; then runtime_check+=(--runtime-shard "$requested_shard"); fi
 run_logged runtime-union "${runtime_check[@]}"
 if [[ "$mode" == list ]]; then exit 0; fi

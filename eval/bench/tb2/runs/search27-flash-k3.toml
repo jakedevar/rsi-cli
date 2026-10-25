@@ -1,0 +1,17 @@
+# Run config (#3135, #3685): batch 3 of the published-numbers plan. Same 27 oracle-solvable search
+# tasks, model and per-task cap as search27-flash.toml (batch 2: 17/27 at k=1, $1.05), at k=3
+# for pass@1 as a mean over three attempts with its spread. Concurrency 3 (four trials need more
+# laptop memory than is free). Expected cost about $3.2; submit with budget_usd 8.
+schema_version = 1
+name = "search27-flash-k3"
+description = "RSI harness, deepseek-v4.1-flash, 27 search tasks (oracle-solvable), k=3"
+host = "ssh://arch-laptop"
+tasks = ["break-filter-js-from-html", "code-from-image", "constraints-scheduling", "db-wal-recovery", "dna-assembly", "extract-elf", "extract-moves-from-video", "feal-differential-cryptanalysis", "financial-document-processor", "fix-git", "git-leak-recovery", "git-multibranch", "headless-terminal", "hf-model-inference", "merge-diff-arc-agi-task", "multi-source-data-merger", "openssl-selfsigned-cert", "password-recovery", "path-tracing-reverse", "polyglot-rust-c", "pytorch-model-recovery", "raman-fitting", "regex-chess", "sparql-university", "sqlite-with-gcov", "torch-pipeline-parallelism", "winning-avg-corewars"]
+k = 3
+concurrency = 3
+
+[agent]
+kind = "rsi"
+model = "deepseek/deepseek-v4.1-flash"
+effort = "high"
+per_task_cap_usd = 0.40

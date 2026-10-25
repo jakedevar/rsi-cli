@@ -10,7 +10,10 @@ import {
 import {
   actions, adminDialog, button, errorLine, inField, listBox, note, rowEl, show, showError, textField,
 } from './admin-dom.js';
+import { emptyText } from './empty-states.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { syncListbox } from './listbox-a11y.js';
+import { loadView } from './view-load.js';
 
 interface BrowserState {
   jobs: ScheduledJob[];
@@ -23,27 +26,34 @@ interface BrowserState {
 
 let st: BrowserState = { jobs: [], holds: [], includeHistory: false, nextCursor: null, at: 0, armed: null };
 
-async function load(more = false): Promise<void> {
-  const page = await invoke<JobPage>('list_scheduled_jobs', {
-    includeHistory: st.includeHistory, cursor: more ? st.nextCursor : null,
-  });
-  const holds = await invoke<JobHold[]>('list_scheduled_job_holds').catch(() => [] as JobHold[]);
+/** The browser state after one read of the jobs and the holds; the two reads run together. Changes nothing until the caller assigns it. */
+async function fetchState(more = false): Promise<BrowserState> {
+  const [page, holds] = await Promise.all([
+    invoke<JobPage>('list_scheduled_jobs', { includeHistory: st.includeHistory, cursor: more ? st.nextCursor : null }),
+    invoke<JobHold[]>('list_scheduled_job_holds').catch(() => [] as JobHold[]),
+  ]);
   const jobs = more ? [...st.jobs, ...page.jobs] : page.jobs;
-  st = { ...st, jobs, holds, nextCursor: page.next_cursor ?? null, at: Math.min(st.at, Math.max(0, jobs.length - 1)), armed: null };
+  return { ...st, jobs, holds, nextCursor: page.next_cursor ?? null, at: Math.min(st.at, Math.max(0, jobs.length - 1)), armed: null };
 }
 
-export async function openSchedules(): Promise<void> {
-  try {
-    await load();
-  } catch (e) {
-    toast(`Failed to load scheduled jobs: ${String(e)}`);
-    return;
-  }
+async function load(more = false): Promise<void> {
+  st = await fetchState(more);
+}
+
+export function openSchedules(): Promise<void> {
+  return loadView({
+    key: 'admin-schedules', title: 'Scheduled jobs', failed: 'Failed to load scheduled jobs',
+    read: () => fetchState(),
+    open: (next) => { st = next; buildSchedules(); },
+  });
+}
+
+function buildSchedules(): void {
   const dlg = adminDialog('admin-schedules-dialog', 'admin-schedules');
   const box = el('div', 'launch-form');
   const title = el('h2');
   const ul = listBox('Scheduled jobs');
-  const empty = note('No scheduled jobs. Press n to create one.');
+  const empty = note(emptyText('admin-schedules'));
   const info = note();
   const err = errorLine();
   const newBtn = button('New (n)');
@@ -57,7 +67,7 @@ export async function openSchedules(): Promise<void> {
   const closeBtn = button('Close');
   box.append(title, ul, empty, info, err,
     actions(closeBtn, refreshBtn, histBtn, moreBtn, newBtn, editBtn, toggleBtn, runBtn, delBtn),
-    note('j/k move, n new, Enter/e edit, Space enable or disable, t run now, dd delete, r refresh, H history, m more, q/Esc close.'));
+    note('j/k move, n new, Enter/e edit, Space enable or disable, t run now, dd delete, r refresh, H history, m more, q/Esc close, ? help.'));
 
   const selectedJob = (): ScheduledJob | undefined => st.jobs[st.at];
   const draw = (): void => {
@@ -73,6 +83,7 @@ export async function openSchedules(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     const job = selectedJob();
     info.textContent = st.armed && st.armed === job?.id ? `Press d again to delete "${job.name}".` : job ? job.message : '';
     for (const b2 of [editBtn, toggleBtn, runBtn, delBtn]) b2.disabled = !job;
@@ -140,6 +151,8 @@ export async function openSchedules(): Promise<void> {
     else if (k === 'H') hit(() => { st = { ...st, includeHistory: !st.includeHistory, at: 0 }; void run('Refresh', async () => {}); });
     else if (k === 'm') hit(() => void loadMore());
     else if (k === 'q' || k === 'Escape') hit(() => dlg.close());
+    // `?` is contextual help, as in the TUI (#321); Ctrl-Alt-G reaches the same table.
+    else if (k === '?') hit(() => void import('./keyhelp.js').then((h) => import('./commands.js').then((c) => h.openKeyHelp(c.snapshot()))));
   };
   draw();
   show(dlg, box);

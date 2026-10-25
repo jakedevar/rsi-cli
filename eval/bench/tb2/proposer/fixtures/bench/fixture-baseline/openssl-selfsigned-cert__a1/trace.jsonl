@@ -1,0 +1,8 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Create a self-signed certificate and put the files where the task says.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"pwd && ls -la / /app 2>&1 | head -20"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"/app\n/app:\ncerts","success":true},"seq":2}
+{"args":{"command":"mkdir -p /app/certs && openssl req -x509 -newkey rsa:2048 -nodes -keyout /app/certs/key.pem -out /app/certs/cert.pem -days 365 -subj /CN=localhost"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"ok","success":true},"seq":4}
+{"args":{"command":"openssl x509 -in /app/certs/cert.pem -noout -subject"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"subject=CN = localhost","success":true},"seq":6}
+{"kind":"model_response","response":{"content":"Wrote the files to the directory the task names and verified the subject.","stop_reason":"stop","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":7}

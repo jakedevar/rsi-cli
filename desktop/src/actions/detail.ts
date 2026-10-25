@@ -4,9 +4,9 @@
 // detail-model.ts (pure, tested) and the registry entries in detail-spec.ts;
 // commands.ts calls runDetail / detailSnapshot / noteAction from its single
 // dispatch path. Daemon text is set with textContent only.
-import { api, invoke } from '../api.js';
+import { type Session, api, invoke } from '../api.js';
 import { type Invocation, type SliceRuntime, copyText, dispatch } from '../commands.js';
-import { renderEvents } from '../conversation.js';
+import { renderEvents, scrollToLatest } from '../conversation.js';
 import {
   type DiscoveredModels, type Focus, type PendingSwitch, type SwitchOptions, type SwitchState, type Visibility,
   MAX_TITLE_CHARS, SCROLL_LINES, buildSwitch, checkFollowUp, checkTitle, chosen, focusAfter, foldTargets,
@@ -14,7 +14,8 @@ import {
   routeDetailKey, sessionRating, moveModel, overlayChord, stepEffort, stepEvent, stepRating, stepUserMessage, switchDecision,
   tupleLabel, visibleSeqs, yankTarget,
 } from '../detail-model.js';
-import { $, el, toast } from '../dom.js';
+import { $, el, renderMessage, toast } from '../dom.js';
+import { focusList } from '../focus-return.js';
 import { deliver } from '../operator-messages.js';
 import { isTypingTarget } from '../keyengine.js';
 import { sessionLabel } from '../model.js';
@@ -22,6 +23,10 @@ import { refreshSessions, renderSessionList, select, visibleRows } from '../sess
 import { currentSessions, selected, state } from '../state.js';
 import { type DetailActionId, type DetailSnapshot, SLICE } from './detail-spec.js';
 import { focusOwnsKey } from '../modal-gate.js';
+import { loadView } from '../view-load.js';
+import { sendChord } from '../keylabel.js';
+import { currentPlatform } from '../vimkeys.js';
+import { syncListbox } from '../listbox-a11y.js';
 
 // ---------- state ----------
 
@@ -48,7 +53,8 @@ function sync(): void {
   d.cursor = keepCursor(state.events, d.cursor);
 }
 
-function vis(): Visibility {
+/** What the transcript hides now (the find bar skips hidden events). */
+export function vis(): Visibility {
   return { hideTools: state.hideTools, hideSystem: d.hideSystem, hideThinking: d.hideThinking };
 }
 
@@ -90,15 +96,20 @@ export function noteAction(id: string): void {
   d.focus = focusAfter(id, d.focus);
 }
 
-/** `gg` / `G` while the transcript has the keys: select the first / last shown event (jump_to_top / bottom). */
+/**
+ * `gg` / `G` / Home / End while the transcript has the keys: select the first loaded / last shown event
+ * (jump_to_top / bottom). "Loaded" means rendered: events behind "Show earlier" stay hidden (local #306),
+ * so a jump never rebuilds thousands of nodes. `G` and End also clear the "Jump to latest" count.
+ */
 export function jumpTranscript(end: 'first' | 'last'): void {
   sync();
-  const seqs = visibleSeqs(state.events, vis());
+  const first = state.renderedFirstSeq;
+  const seqs = visibleSeqs(state.events, vis()).filter((s) => first === undefined || s >= first);
   const seq = end === 'first' ? seqs[0] : seqs[seqs.length - 1];
   if (seq === undefined) return;
   setCursor(seq);
   if (end === 'first') $('events').scrollTop = 0;
-  else $('events').scrollTop = $('events').scrollHeight;
+  else scrollToLatest();
 }
 
 // ---------- transcript cursor ----------
@@ -283,7 +294,7 @@ export function errorLine(): HTMLElement {
 }
 
 export function showError(line: HTMLElement, msg: string): void {
-  line.textContent = msg;
+  renderMessage(line, msg);
   line.hidden = false;
 }
 
@@ -408,27 +419,32 @@ function normalizeDiscovered(raw: unknown): DiscoveredModels | null {
   return null;
 }
 
-async function openSwitch(): Promise<void> {
+function openSwitch(): Promise<void> {
   const s = selected();
-  if (!s) return;
-  let options: SwitchOptions;
-  try {
-    options = await invoke<SwitchOptions>('get_session_model_switch_options', { sessionId: s.id });
-  } catch (e) {
-    toast(`Model switch unavailable: ${String(e)}`);
-    return;
-  }
+  if (!s) return Promise.resolve();
+  return loadView({
+    key: 'switch-model', title: 'Switch model or effort', failed: 'Model switch unavailable',
+    read: async () => {
+      const options = await invoke<SwitchOptions>('get_session_model_switch_options', { sessionId: s.id });
+      if (!options.switchable) return { options, discovered: null };
+      let discovered: DiscoveredModels | null = null;
+      try {
+        discovered = normalizeDiscovered(await invoke<unknown>('discover_models', { provider: options.provider }));
+      } catch {
+        discovered = null; // the current model is still offered
+      }
+      return { options, discovered };
+    },
+    open: ({ options, discovered }) => showSwitch(s, options, discovered),
+  });
+}
+
+function showSwitch(s: Session, options: SwitchOptions, discovered: DiscoveredModels | null): void {
   pendings.set(s.id, options.pending ?? null);
   decorateHeader();
   if (!options.switchable) {
     toast(options.unavailable_reason ?? 'Model switch unavailable for this session');
     return;
-  }
-  let discovered: DiscoveredModels | null = null;
-  try {
-    discovered = normalizeDiscovered(await invoke<unknown>('discover_models', { provider: options.provider }));
-  } catch {
-    discovered = null; // the current model is still offered
   }
   let st = buildSwitch(options, discovered);
   if (!st) { toast('No models are available to switch to for this session'); return; }
@@ -450,6 +466,7 @@ async function openSwitch(): Promise<void> {
       return li;
     }));
     list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(list, dlg);
     const less = button('◀', 'btn');
     const more = button('▶', 'btn');
     less.setAttribute('aria-label', 'Lower effort');
@@ -592,7 +609,7 @@ export function openContinue(): void {
   form.append(
     el('h2', undefined, `Continue: ${sessionLabel(s)}`),
     label,
-    el('div', 'dialog-note', 'Ctrl+Enter (Cmd+Enter on macOS) sends. Esc closes without sending; the draft is kept.'),
+    el('div', 'dialog-note', `${sendChord(currentPlatform())} sends. Esc closes without sending; the draft is kept.`),
     err, actions,
   );
   const send = (): void => {
@@ -665,6 +682,7 @@ export function initDetail(): void {
     setCursor(seq);
   });
   $('session-list').addEventListener('click', () => { d.focus = 'list'; });
+  $('session-list').addEventListener('focus', () => { d.focus = 'list'; });
 
   document.addEventListener('keydown', (ev) => {
     if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
@@ -679,7 +697,7 @@ export function initDetail(): void {
     });
     if (route.kind === 'pass') return;
     ev.preventDefault();
-    if (route.kind === 'blur-composer') { composer.blur(); return; }
+    if (route.kind === 'blur-composer') { composer.blur(); focusList(); return; }
     dispatch(route.action, { source: 'key' });
   });
 }

@@ -8,6 +8,7 @@
 // src/actions/*.ts module, collected by the generated actions/runtime.generated.ts):
 // no slice edits this file to register. The direct imports below are core
 // actions that open a slice's dialog (bare :continue, <Space>gq, refresh).
+import { findSlash } from './actions/find-run.js';
 import { interrupt } from './actions.js';
 import { openContinue } from './actions/detail.js';
 import { openQuestionModal } from './actions/lifecycle.js';
@@ -26,7 +27,8 @@ import { closePalette, isPaletteOpen, openPalette } from './palette.js';
 import {
   type ActionId, type ActionSource, Deduper, type SliceSpec, type UiSnapshot, isActionId, tooltipText, unavailable,
 } from './registry.js';
-import { refreshHealth, refreshProjects, refreshSessions, renderSessionList, select, setView, visibleRows } from './sessions.js';
+import { hardPauseNeedsConfirm } from './session-head-model.js';
+import { refreshHealth, refreshProjects, refreshSessions, renderSessionList, select, setShowFinished, setView, visibleRows } from './sessions.js';
 import { isReadOnly, selected, state, uiChanged } from './state.js';
 import { currentPlatform, isVimKeysOn, openCommandLine, setVimKeys } from './vimkeys.js';
 
@@ -253,7 +255,10 @@ function run(id: ActionId, inv: Invocation): void {
       if (next) { moveCursor(next); select(next); }
       return;
     }
-    case 'focus-search': $('search').focus(); return;
+    case 'focus-search':
+      // With the keys in the transcript the TUI's / searches the conversation, not the session list (local #307).
+      if (!findSlash()) $('search').focus();
+      return;
     case 'refresh':
       void Promise.all([refreshHealth(), refreshProjects(), refreshLabels(), refreshSessions()]).then(() => toast('Refreshed', true));
       return;
@@ -262,9 +267,7 @@ function run(id: ActionId, inv: Invocation): void {
     case 'view-active': void setView('active'); return;
     case 'view-archived': void setView('archived'); return;
     case 'toggle-finished': {
-      const box = $<HTMLInputElement>('show-finished');
-      box.checked = !box.checked;
-      renderSessionList();
+      setShowFinished(!$<HTMLInputElement>('show-finished').checked);
       return;
     }
     case 'toggle-tools': setHideTools(!state.hideTools); return;
@@ -273,7 +276,7 @@ function run(id: ActionId, inv: Invocation): void {
     case 'help': openPalette(); return;
     case 'command-line': openCommandLine(); return;
     case 'soft-interrupt': void interrupt(); return;
-    case 'hard-pause': void hardPause(); return;
+    case 'hard-pause': void hardPause(hardPauseNeedsConfirm(inv.source)); return;
     case 'clear-pause': void clearPause(); return;
     case 'archive': void archive(); return;
     case 'quick-continue': void send('continue'); return;

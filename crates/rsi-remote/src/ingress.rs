@@ -321,13 +321,16 @@ pub fn read_method(path: &str) -> Option<&'static str> {
     }
 }
 
-/// The closed v2 GET route table (#2962): the exposed projects' manager seats
-/// and one seat's conversation. No request-supplied method name is forwarded.
+/// The closed v2 GET route table (#2962): the exposed projects' manager seats,
+/// one seat's conversation, the dashboard (hub #3287) and the providers (hub #3796). No request-supplied
+/// method name is forwarded.
 #[must_use]
 pub fn v2_read_method(path: &str) -> Option<&'static str> {
     let parts: Vec<_> = path.split('/').collect();
     match parts.as_slice() {
         ["", "api", "v2", "projects"] => Some("RemoteListManagerSeatsV2"),
+        ["", "api", "v2", "dashboard"] => Some("RemoteGetDashboardV2"),
+        ["", "api", "v2", "providers"] => Some("RemoteGetProvidersV2"),
         [
             "",
             "api",
@@ -831,7 +834,21 @@ mod tests {
             Some((P.to_string(), SEAT.to_string()))
         );
         assert_eq!(v2_read_method(&message), None, "a write is not a read");
+        let dashboard = parse_request(&get("/api/v2/dashboard"), HOST).unwrap();
+        assert_eq!(
+            v2_read_method(&dashboard.path),
+            Some("RemoteGetDashboardV2")
+        );
+        let providers = parse_request(&get("/api/v2/providers"), HOST).unwrap();
+        assert_eq!(
+            v2_read_method(&providers.path),
+            Some("RemoteGetProvidersV2")
+        );
         for path in [
+            "/api/v2/dashboard/x".to_string(),
+            "/api/v2/providers/x".to_string(),
+            format!("/api/v2/projects/{P}/providers"),
+            format!("/api/v2/projects/{P}/dashboard"),
             "/api/v2/projects/nope/managers/x/conversation".to_string(),
             format!("/api/v2/projects/{P}/managers/{SEAT}"),
             format!("/api/v2/projects/{P}/managers/{SEAT}/conversation/x"),

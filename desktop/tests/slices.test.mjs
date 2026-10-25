@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ACTIONS, sliceProblems } from '../dist/registry.js';
 import { SLICES } from '../dist/actions/index.generated.js';
@@ -51,6 +52,100 @@ test('sliceProblems names a clashing registration', () => {
   assert.ok(found.some((p) => /:command quit of g overrides the core binding \(quit\)/.test(p)), found.join('\n'));
   const sameKey = spec('h', 8, [], {}, { zq: { action: 'x-one' } });
   assert.deepEqual(problems([a, sameKey]), [], 'two slices may bind one key to the same action');
+});
+
+test('sliceProblems names a key two slices route in raw listeners', () => {
+  const ok = () => null;
+  const act = (id, extraKeys) => ({ id, title: id, group: 'go', ...(extraKeys ? { extraKeys } : {}) });
+  const spec = (name, order, rawKeys, actions = [], rules = {}, keys) => ({ name, order, actions, rules, keys, rawKeys });
+  const base = spec('base', 0, undefined, [], { 'answer-question': ok, 'focus-composer': ok });
+  const problems = (slices) => sliceProblems([base, ...slices]);
+  // The Issue's case: two sweeps both raw-route Ctrl-H.
+  const g1 = spec('g1', 1, ['C-h', 'C-l']);
+  const g2 = spec('g2', 2, ['C-h', 'C-d']);
+  assert.deepEqual(problems([g1]), []);
+  assert.ok(problems([g1, g2]).some((p) => /raw key C-h is routed by both g1 and g2/.test(p)), problems([g1, g2]).join('\n'));
+  assert.equal(problems([g1, g2]).filter((p) => /raw key/.test(p)).length, 1, 'only the shared token clashes');
+  // A raw token another slice binds in the registry (`keys`; extraKeys are display hints and may repeat across panes), whichever order they are listed in.
+  const binder = spec('binder', 3, undefined, [act('x-one', ['C-h'])], { 'x-one': ok }, { 'C-l': { action: 'x-one' }, 'C-d': { action: 'x-one' } });
+  for (const order of [[g1, binder], [binder, g1]]) {
+    assert.ok(problems(order).some((p) => /raw key C-l of g1 is also bound in the registry by binder/.test(p)), problems(order).join('\n'));
+  }
+  assert.ok(problems([g2, binder]).some((p) => /raw key C-d of g2 is also bound in the registry by binder/.test(p)));
+  const hintOnly = spec('hints', 5, undefined, [act('x-three', ['C-h'])], { 'x-three': ok });
+  assert.deepEqual(problems([g1, hintOnly]).filter((p) => /raw key/.test(p)), [], 'a display hint is no binding');
+  // A slice may bind in the registry what it routes itself, and repeating a token in one slice is no clash.
+  const own = spec('own', 4, ['C-l', 'C-l'], [act('x-two', ['C-l'])], { 'x-two': ok }, { 'C-l': { action: 'x-two' } });
+  assert.deepEqual(problems([own]), []);
+});
+
+// Every raw global keydown/keyup listener must be accounted for (parallel sweeps once routed the same keys in two
+// listeners and no check saw it). A listener in src/actions belongs to its slice, which must declare rawKeys; one
+// elsewhere needs an entry here with the reason it cannot collide. Listeners on a dialog, form or field
+// (dlg.onkeydown, el.addEventListener) only see keys while that element has focus, so they are not global.
+const GLOBAL_KEY_LISTENER = /\b(?:window|document|win)\s*\.\s*(?:addEventListener\(\s*['"]key(?:down|up|press)['"]|onkey(?:down|up|press)\s*=)/;
+const RAW_LISTENER_ALLOWLIST = {
+  'assist.ts': 'Ctrl/Cmd-Alt-A and Ctrl/Cmd-Shift-A inside a draft only; the assist chords bind no registry key',
+  'dag.ts': 'pane keys, only while the DAG pane is open (paneKeyAllowed, no dialog, no typing target)',
+  'dashboard.ts': 'pane keys, only while the Global Dashboard (gd) is open',
+  'esp.ts': 'pane keys, only while the ESP overlay is open',
+  'files.ts': 'pane keys, only while the explorer or viewer has focus',
+  'graphs.ts': 'pane keys, only while the graph pane is open',
+  'issues.ts': 'pane keys, only while the Issues workspace is active',
+  'managers.ts': 'pane keys, only while a manager view is open',
+  'menus.ts': 'Cmd-N / Ctrl-N only (isNewSessionChord), the File menu New session chord with Vim keys off (#305)',
+  'modal-gate.ts': 'the activation guard and dialog key gate: they stop keys, they route none',
+  'palette.ts': 'Ctrl-K / Cmd-K only (isPaletteChord), the core palette chord',
+  'prompt-creator.ts': 'keys inside the prompt-creator dialog only (window capture so it beats the vim-field handler)',
+  'prompts.ts': 'keys inside the launch and prompt dialogs only (window capture so it beats the vim-field handler)',
+  'settings.ts': 'pane keys, only while the settings pane is open',
+  'todo.ts': 'Esc only, and only while the to-do panel is an open drawer (a narrow window); it routes no other key (local #291)',
+  'vimkeys.ts': 'the vim key engine: it routes by the registry and the core keymap, not by raw tokens',
+};
+
+test('every raw global key listener is declared by its slice or allowlisted with a reason', () => {
+  const src = here('../src');
+  const walk = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : [join(d, e.name)]));
+  const files = walk(src).filter((f) => f.endsWith('.ts') && !f.endsWith('.generated.ts'));
+  const listeners = files.filter((f) => GLOBAL_KEY_LISTENER.test(readFileSync(f, 'utf8')));
+  assert.ok(listeners.length >= 10, 'the scan finds the known listeners');
+  const rel = (f) => f.slice(src.length + 1);
+  // The slice file a src/actions module belongs to: itself when it has the SLICE, else the one its RUNTIME imports.
+  const specOf = (f) => {
+    const text = readFileSync(f, 'utf8');
+    if (/^export const SLICE\b/m.test(text)) return f;
+    const m = /import \{[^}]*\bSLICE\b[^}]*\} from '\.\/([\w-]+)\.js'/.exec(text);
+    return m ? join(f, '..', `${m[1]}.ts`) : null;
+  };
+  const byName = new Map(SLICES.map((s) => [s.name, s]));
+  const nameOf = (specFile) => /^  name: '([^']+)'/m.exec(readFileSync(specFile, 'utf8').slice(readFileSync(specFile, 'utf8').indexOf('export const SLICE')))?.[1];
+  const used = new Set();
+  const failures = [];
+  for (const f of listeners) {
+    const r = rel(f);
+    if (r.startsWith('actions/')) {
+      const spec = specOf(f);
+      const slice = spec && byName.get(nameOf(spec));
+      if (!slice) failures.push(`${r}: has a raw key listener but is not part of a slice; declare it in a slice or add it to RAW_LISTENER_ALLOWLIST with a reason`);
+      else if (!(slice.rawKeys?.length > 0)) failures.push(`${r}: slice "${slice.name}" has a raw key listener but declares no rawKeys`);
+      continue;
+    }
+    if (RAW_LISTENER_ALLOWLIST[r]) used.add(r);
+    else failures.push(`${r}: has a raw key listener; declare rawKeys in its slice (src/actions) or add it to RAW_LISTENER_ALLOWLIST with a reason`);
+  }
+  assert.deepEqual(failures, []);
+  assert.deepEqual(Object.keys(RAW_LISTENER_ALLOWLIST).filter((k) => !used.has(k)), [], 'allowlist entries that no longer have a listener');
+  for (const [k, why] of Object.entries(RAW_LISTENER_ALLOWLIST)) assert.ok(why.length > 10, `${k} needs a reason`);
+});
+
+test('the raw key scan sees window, document and win listeners but not element-local ones', () => {
+  assert.ok(GLOBAL_KEY_LISTENER.test("window.addEventListener('keydown', (ev) => {"));
+  assert.ok(GLOBAL_KEY_LISTENER.test('document.addEventListener("keyup", f)'));
+  assert.ok(GLOBAL_KEY_LISTENER.test("win.addEventListener('keydown', f, true)"));
+  assert.ok(GLOBAL_KEY_LISTENER.test('document.onkeydown = f'));
+  assert.ok(!GLOBAL_KEY_LISTENER.test("dlg.addEventListener('keydown', f)"));
+  assert.ok(!GLOBAL_KEY_LISTENER.test('dlg.onkeydown = f'));
+  assert.ok(!GLOBAL_KEY_LISTENER.test("window.addEventListener('resize', f)"));
 });
 
 test('every slice with actions has exactly one RUNTIME that runs it', () => {

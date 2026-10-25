@@ -192,6 +192,7 @@ fn issue_editor(title: &str) -> crate::types::IssueEditorState {
         retry_key: "k".to_string(),
         error: None,
         submitted: false,
+        text: Default::default(),
     }
 }
 
@@ -244,11 +245,16 @@ async fn issue_editor_ctrl_c_copies_a_selection_instead_of_quitting() {
 }
 
 #[tokio::test]
-async fn issue_editor_stays_append_only_in_vim_mode() {
+async fn issue_editor_edits_in_place_with_vim_keys_in_vim_mode() {
     let mut app = issues_app("vim");
+    // A field opens in insert mode at the end; Left moves the cursor (#3421).
     press(&mut app, KeyCode::Left, KeyModifiers::NONE).await;
     type_text(&mut app, "!").await;
-    assert_eq!(editor_title(&app), "Draft!", "Vim mode appends, as before");
+    assert_eq!(editor_title(&app), "Draf!t");
+    // Esc leaves insert mode, `0x` deletes the first character in place.
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+    type_text(&mut app, "0x").await;
+    assert_eq!(editor_title(&app), "raf!t");
 }
 
 // ---- model-dropdown filter ----

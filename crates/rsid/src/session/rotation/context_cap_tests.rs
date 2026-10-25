@@ -676,6 +676,152 @@ async fn global_grant_moves_with_the_successors_publication() -> anyhow::Result<
     Ok(())
 }
 
+/// Hub #3315: the daemon's context-cap rotation of a seat in the home project
+/// publishes its successor in the home project, at `$HOME`, with no sandbox,
+/// and moves the global grant to it; the home repository is untouched.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_home_seat_cap_rotation_publishes_its_successor_in_home_3315() -> anyhow::Result<()> {
+    let (manager, dir) = rotation_manager_with_context_rotation(true);
+    let (mut seat, grant) = global_cap_fixture(&manager, &dir).await;
+    let home_dir = tempfile::tempdir()?;
+    let home = home_dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&home)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@rsi.local",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "home",
+    ]);
+    let observe = || {
+        (
+            git(&["rev-parse", "HEAD"]),
+            git(&["symbolic-ref", "HEAD"]),
+            git(&["for-each-ref"]),
+            git(&["worktree", "list", "--porcelain"]),
+            git(&["status", "--porcelain", "--untracked-files=all"]),
+            std::fs::read(home.join(".git/index")).ok(),
+        )
+    };
+    let before = observe();
+    {
+        let store = manager.store.lock().await;
+        store.ensure_home_project(&home)?;
+        store.conn.execute(
+            "UPDATE sessions SET project_id=?2, working_dir=?3 WHERE id=?1",
+            rusqlite::params![
+                seat.id.to_string(),
+                Project::HOME_ID.to_string(),
+                home.to_string_lossy()
+            ],
+        )?;
+    }
+    seat.project_id = Some(Project::HOME_ID);
+    seat.working_dir = home.clone();
+    manager
+        .completed
+        .write()
+        .await
+        .insert(seat.id, CompletedSession::for_test(seat.clone()));
+    let successor = Uuid::new_v4();
+    install_rotation_child_id_for_test(seat.id, successor);
+    install_controller_candidate_test_process(successor);
+
+    assert_eq!(manager.rotate_capped_coordinators().await?, 1);
+    wait_until("the grant to move with the publication", || async {
+        manager
+            .store
+            .lock()
+            .await
+            .active_global_grant()
+            .ok()
+            .flatten()
+            .is_some_and(|grant| grant.seat_session_id == successor)
+    })
+    .await;
+    assert_grant_moved(&manager, successor, &grant).await;
+    let published = manager
+        .store
+        .lock()
+        .await
+        .get_session(successor)?
+        .expect("successor");
+    assert_eq!(published.continued_from, Some(seat.id));
+    assert_eq!(published.project_id, Some(Project::HOME_ID));
+    assert_eq!(published.working_dir, home);
+    assert!(published.sandbox_root.is_none() && published.sandbox_branch.is_none());
+    assert_eq!(observe(), before, "the home repository is untouched");
+
+    // Hub #3315, #186: the handoff is the daemon's typed state in one DB
+    // write, never a git object or ref, and the successor holds no custody.
+    let start = published
+        .query
+        .find("---\ndate:")
+        .expect("handoff document");
+    assert!(
+        published.query.contains("source=\"context-cap-handoff\""),
+        "the successor starts from the daemon-written handoff"
+    );
+    let end = published
+        .query
+        .rfind("\n</rsid-daemon-message>")
+        .expect("envelope end");
+    let handoff = parse_strict(&published.query[start..end])
+        .map_err(|error| anyhow::anyhow!("handoff does not validate strict: {error}"))?;
+    assert_eq!(handoff.predecessor_session_id, seat.id);
+    assert_eq!(handoff.seat, CoordinatorSeatV1::GlobalManager);
+    {
+        let store = manager.store.lock().await;
+        let custody_roots: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM sandbox_custody_roots WHERE owner_session_id=?1",
+            rusqlite::params![successor.to_string()],
+            |row| row.get(0),
+        )?;
+        let custody_id: Option<String> = store.conn.query_row(
+            "SELECT sandbox_custody_id FROM sessions WHERE id=?1",
+            rusqlite::params![successor.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(custody_roots, 0, "the successor owns no custody root");
+        assert!(custody_id.is_none(), "the successor row names no custody");
+    }
+
+    // The settlement pass records the rotation and moves nothing further:
+    // the grant stays on the successor and the home repository stays as it was.
+    assert_eq!(
+        run_cap_passes(&manager, process_boot_id(), seat.id, 2).await,
+        CapState::Rotated
+    );
+    assert_grant_moved(&manager, successor, &grant).await;
+    assert_eq!(manager.rotate_capped_coordinators().await?, 0);
+    assert_eq!(
+        observe(),
+        before,
+        "the home repository is untouched after the rotation settles"
+    );
+    assert!(
+        git(&["for-each-ref", "refs/rsi/"]).is_empty(),
+        "no handoff ref was written into the home repository"
+    );
+    drop_controller_candidate_test_stream(successor);
+    Ok(())
+}
+
 /// #1142 R2/R3: the daemon died after the global seat's successor finished its
 /// first turn and before publication. The next boot publishes that exact
 /// candidate; the grant moves with that publication, once, in its scope.
@@ -2086,5 +2232,167 @@ async fn cap_custody_return_refuses_live_effects_and_changed_reservations() -> a
             (Some(parent), Some(parent))
         );
     }
+    Ok(())
+}
+
+/// #498 / hub #3223: a parked lead's result wait survives cap publication and
+/// uses the same durable input fence as a manager seat's inherited wait.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capped_lead_jobs_terminal_wake_resumes_only_successor_once() -> anyhow::Result<()> {
+    use crate::scheduler::wake_when_tests::{
+        RecordingLauncher, arm, finish, insert_job, jobs_terminal,
+    };
+    use crate::store_support::schedule_wake_job::{ScheduleWakeRequest, build_agent_scheduled_job};
+    use rsi_common::agent_jobs::JobState;
+    use rsi_common::types::{ConversationEvent, EventType, Role};
+
+    let (manager, dir) = rotation_manager_with_context_rotation(true);
+    let fx = lead_cap_fixture(&manager, &dir).await;
+    let (job, wake, backstop, untouched) = {
+        let store = manager.store.lock().await;
+        let job = insert_job(&store, fx.lead.id, "lead build");
+        let wake = arm(&store, fx.lead.id, jobs_terminal(&[job]), None)?;
+        let scheduled = |owner, mode: &str, watched| {
+            let row = build_agent_scheduled_job(ScheduleWakeRequest {
+                message: "Continue the Epic".into(),
+                in_seconds: (mode != "program_guard").then_some(600),
+                at: None,
+                name: None,
+                every_seconds: None,
+                mode: Some(mode.into()),
+                working_dir: dir.path().into(),
+                provider: None,
+                model: None,
+                project_id: fx.lead.project_id,
+                origin_session_id: Some(owner),
+                watch_session_id: watched,
+            })
+            .expect("scheduled wake");
+            store.insert_scheduled_job(&row).expect("insert wake");
+            row
+        };
+        let backstop = scheduled(fx.lead.id, "resume", None);
+        let guard = scheduled(fx.lead.id, "program_guard", None);
+        let other_watch = scheduled(fx.epic.id, "on_terminal", Some(fx.lead.id));
+        let own_watch = scheduled(fx.lead.id, "on_terminal", Some(fx.epic.id));
+        store.record_continuation_retry(
+            wake.id,
+            "continuation_turn_changed",
+            Some(fx.lead.id),
+            chrono::Utc::now(),
+            true,
+        )?;
+        store.defer_wake_when(wake.id, chrono::Utc::now() + chrono::Duration::minutes(10))?;
+        (job, wake, backstop, vec![guard, other_watch, own_watch])
+    };
+    let successor = Uuid::new_v4();
+    install_rotation_child_id_for_test(fx.lead.id, successor);
+    install_controller_candidate_test_process(successor);
+    assert_eq!(manager.rotate_capped_coordinators().await?, 1);
+    wait_until("the successor to hold the lead", || async {
+        epic_lead(&manager, fx.epic.id).await == Some(successor)
+    })
+    .await;
+    {
+        let store = manager.store.lock().await;
+        let carried = store.get_scheduled_job(&wake.id)?.expect("carried wait");
+        assert!(carried.enabled);
+        assert_eq!(carried.wake_session_id, Some(successor));
+        assert!(carried.next_fire_at <= chrono::Utc::now());
+        assert_eq!(store.continuation_retry(wake.id)?, None);
+        assert_eq!(
+            store.get_agent_job(job)?.expect("job").job.owner_session_id,
+            successor
+        );
+        assert_eq!(
+            store
+                .get_scheduled_job(&backstop.id)?
+                .expect("backstop")
+                .wake_session_id,
+            Some(successor)
+        );
+        for row in &untouched {
+            assert_eq!(
+                serde_json::to_value(store.get_scheduled_job(&row.id)?.expect("retained wake"))?,
+                serde_json::to_value(row)?
+            );
+        }
+        let row = store.get_session(successor)?.expect("successor");
+        let start = row.query.find("---\ndate:").expect("handoff start");
+        let end = row
+            .query
+            .rfind("\n</rsid-daemon-message>")
+            .expect("handoff end");
+        let handoff = parse_strict(&row.query[start..end]).map_err(|e| anyhow::anyhow!(e))?;
+        let armed: Vec<_> = handoff.armed_wakes.iter().map(|w| w.job_id).collect();
+        assert!(armed.contains(&wake.id));
+        assert!(armed.contains(&backstop.id));
+        for row in [&untouched[0], &untouched[2]] {
+            assert!(handoff.not_carried_wakes.iter().any(|w| w.job_id == row.id));
+        }
+    }
+    let launcher = Arc::new(RecordingLauncher::with_fence_store(manager.store.clone()));
+    let dyn_launcher: Arc<dyn crate::issue_tracker::poller::SessionLauncher> = launcher.clone();
+    crate::scheduler::process_due_wake_when(&manager.store, &manager.event_bus, &dyn_launcher)
+        .await;
+    assert_eq!(launcher.deliveries().len(), 0);
+    {
+        let store = manager.store.lock().await;
+        finish(&store, job, JobState::Succeeded, 0, None);
+        store.defer_wake_when(wake.id, chrono::Utc::now() - chrono::Duration::seconds(1))?;
+    }
+    for _ in 0..2 {
+        crate::scheduler::process_due_wake_when(&manager.store, &manager.event_bus, &dyn_launcher)
+            .await;
+    }
+    let deliveries = launcher.deliveries();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].0, successor);
+    assert!(deliveries[0].1.contains("exit_code=0"));
+    {
+        let store = manager.store.lock().await;
+        let settled = store.get_scheduled_job(&wake.id)?.expect("settled wake");
+        assert_eq!(
+            (settled.enabled, settled.last_fired_at.is_some()),
+            (false, true)
+        );
+        // Reuse the carried row to exercise input arriving after capture.
+        store.conn.execute(
+            "UPDATE scheduled_jobs SET enabled=1 WHERE id=?1",
+            [wake.id.to_string()],
+        )?;
+        let fence = store
+            .capture_scheduled_continuation_fence(successor, &[wake.id])?
+            .expect("fence");
+        store.insert_event(&ConversationEvent {
+            id: 0,
+            session_id: successor,
+            sequence: 1000,
+            event_type: EventType::Message,
+            role: Some(Role::User),
+            content: "new operator instruction".into(),
+            created_at: chrono::Utc::now(),
+            tool_name: None,
+            tool_input: None,
+            offload_id: None,
+            tool_use_id: None,
+            metadata: None,
+        })?;
+        for result in [
+            store.check_continuation_fence_durable(&fence),
+            store
+                .capture_scheduled_continuation_fence(successor, &[wake.id])
+                .map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .expect_err("later input stays fenced")
+                    .to_string()
+                    .contains("continuation_turn_changed")
+            );
+        }
+    }
+    drop_controller_candidate_test_stream(successor);
     Ok(())
 }

@@ -283,6 +283,138 @@ class ReleasedMigrationRefreshTest(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
         self.assertIn("pin deferred to the lander", checked.stdout)
 
+    def commit_provisional(self, version, declared=True):
+        path = f"{GUARD.MIGRATION_DIR}/v{version:03d}.rs"
+        source = SplitLayoutTest.step(version)
+        self.write(path, source)
+        if declared:
+            self.write(f"{GUARD.DECLARATIONS_DIR}/issue-531-v{version}.json", json.dumps({
+                "schema_version": 1,
+                "version": version,
+                "files": [{
+                    "path": path,
+                    "path_template": f"{GUARD.MIGRATION_DIR}/v${{VERSION}}.rs",
+                    "source_blob": GUARD.digest(source),
+                    "sites": [{
+                        "anchor": f"if version < {version} {{",
+                        "replacement": "if version < ${VERSION} {",
+                        "scope": "unit",
+                    }],
+                }],
+            }))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", f"provisional V{version}, no pin edit")
+        return path
+
+    def test_stacked_base_with_declared_provisional_block_passes(self):
+        before = self.read_manifest()
+        self.commit_provisional(2)
+        base = self.git("rev-parse", "HEAD")
+        self.write("README.md", "stacked worker changes no migrations\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "stacked worker")
+        checked = self.check(base)
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertIn("V0-V2 immutable, head V2", checked.stdout)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_undeclared_extra_base_block_still_fails(self):
+        self.commit_provisional(2)
+        self.commit_provisional(3, declared=False)
+        checked = self.check("HEAD", "HEAD")
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("base migration manifest does not match its source", checked.stderr)
+
+    def test_391e970d6_zero_diff_reproduction_as_fixture(self):
+        # #531: 391e970d6 has a released V188 pin and #519's declared,
+        # unpublished V189. Recreate that inventory without a live git ref.
+        files = SplitLayoutTest().files(188)
+        self.write(GUARD.MIGRATION_PATH, "")
+        for path, source in files.items():
+            self.write(path, source)
+        self.write(GUARD.MANIFEST_PATH, json.dumps(GUARD.inventory(files)))
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "published V188 fixture")
+        before = self.read_manifest()
+        self.commit_provisional(189)
+        checked = self.check("HEAD", "HEAD")
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertIn("V0-V189 immutable, head V189", checked.stdout)
+        self.assertEqual(self.read_manifest(), before)
+
+    def test_base_declaration_does_not_allow_changed_released_history(self):
+        self.commit_provisional(2)
+        for path, old, new in (
+            (GUARD.MIGRATION_PATH, "migrate_v1", "changed_v1"),
+            ("crates/rsid/src/store/alpha.rs", "apply_alpha", "changed_alpha"),
+        ):
+            with self.subTest(path=path):
+                original = (self.repo / path).read_text()
+                self.write(path, original.replace(old, new))
+                self.git("add", path)
+                self.git("commit", "-q", "-m", "change released history")
+                base = self.git("rev-parse", "HEAD")
+                self.write(path, original)
+                self.git("add", path)
+                self.git("commit", "-q", "-m", "restore released history in head")
+                checked = self.check(base)
+                self.assertEqual(checked.returncode, 1)
+                self.assertIn("changed " + ("migration blocks V1" if old == "migrate_v1"
+                                           else "protected sections alpha-catalog"), checked.stderr)
+
+    def test_declaration_added_only_in_head_cannot_cover_base(self):
+        self.commit_provisional(2, declared=False)
+        base = self.git("rev-parse", "HEAD")
+        self.commit_provisional(2)
+        checked = self.check(base)
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("base migration manifest does not match its source", checked.stderr)
+
+    def test_base_provisional_declaration_shape_is_validated(self):
+        self.commit_provisional(2)
+        path = f"{GUARD.DECLARATIONS_DIR}/issue-531-v2.json"
+        declaration = json.loads((self.repo / path).read_text())
+        del declaration["files"][0]["path_template"]
+        self.write(path, json.dumps(declaration))
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "malformed provisional declaration")
+        checked = self.check("HEAD", "HEAD")
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("missing key `path_template`", checked.stderr)
+
+    def test_provisional_base_block_is_immutable_in_the_stacked_head(self):
+        path = self.commit_provisional(2)
+        base = self.git("rev-parse", "HEAD")
+        self.write(path, (self.repo / path).read_text().replace("migrate();", "changed();"))
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "change provisional base block")
+        checked = self.check(base)
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("released migration block V2 changed relative to base", checked.stderr)
+
+    def test_a_bare_check_after_merging_rolling_names_the_real_base(self):
+        # #151: a source with an unpinned migration merges origin/rolling (no
+        # rebase); the bare guard's default base HEAD^ is then its own commit.
+        self.git("checkout", "-q", "-b", "source")
+        self.commit_v2_without_a_pin()
+        self.git("checkout", "-q", "rolling")
+        self.write("README.md", "rolling advanced\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "rolling advances")
+        self.git("update-ref", "refs/remotes/origin/rolling", "HEAD")
+        self.git("checkout", "-q", "source")
+        self.git("merge", "-q", "--no-edit", "--no-ff", "origin/rolling")
+        bare = subprocess.run(
+            [sys.executable, str(ROOT / "tools/check-released-migrations.py")],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(bare.returncode, 1, bare.stderr + bare.stdout)
+        self.assertIn("Rerun against the real base: "
+                          "`python3 tools/check-released-migrations.py origin/rolling HEAD`", bare.stderr)
+        checked = self.check()
+        self.assertEqual(checked.returncode, 0, checked.stderr + checked.stdout)
+        self.assertIn("pin deferred to the lander", checked.stdout)
+
     def test_the_derived_pin_passes_the_strict_guard(self):
         # What the lander commits (`--refresh` against the tip) is exactly the
         # pin the guard defers: the committed result validates without deferral.

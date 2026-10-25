@@ -9,8 +9,8 @@ import { desktopKeymap } from '../dist/keybindings.js';
 import { KeyEngine } from '../dist/keyengine.js';
 import { SESSIONOPS_ACTIONS, SESSIONOPS_COMMANDS, SESSIONOPS_KEYS, SESSIONOPS_RULES } from '../dist/actions/sessionops.js';
 import {
-  CI_COMMIT, LAND_CONFIRM_MS, LAND_WATCH_MAX, TOGGLES, commitBlock, confirmsLand, landBlocker, landKey, landPrompt,
-  landSummary, retryBadge, retryCancelled, retryMessage, rotateBlock, rowMarks, settle, settledMessage, statusLine,
+  CI_COMMIT, LAND_WATCH_MAX, TOGGLES, commitBlock, landKey,
+  retryBadge, retryCancelled, retryMessage, rotateBlock, rowMarks, settle, settledMessage,
   testingBlock, toggleFailure, toggleMessage, toggledAt, watchIds,
 } from '../dist/sessionops-model.js';
 
@@ -133,34 +133,16 @@ test('row markers lead with the pin and keep the TUI glyphs', () => {
 const src = (over = {}) => ({ session_id: 's1', branch: 'rsi/x', commit: 'c'.repeat(40), ahead: 2, on_rolling: false, dirty: false, title: null, ...over });
 const entry = (state, outcome = null) => ({ id: 'e1', sequence: 7, source_commit: 'a'.repeat(40), state, outcome });
 
-test('the land summary and prompt match the TUI', () => {
-  assert.equal(landSummary(src()), 'rsi/x @ ccccccccc: unmerged, 2 commits ahead of rolling');
-  assert.equal(landSummary(src({ ahead: 1 })), 'rsi/x @ ccccccccc: unmerged, 1 commit ahead of rolling');
-  assert.equal(landSummary(src({ ahead: null, dirty: true })), 'rsi/x @ ccccccccc: unmerged, sandbox has uncommitted changes the landing omits');
-  assert.equal(landSummary(src({ branch: null, title: 'T' })), 'T @ ccccccccc: unmerged, 2 commits ahead of rolling');
-  assert.equal(landSummary(src({ on_rolling: true })), 'rsi/x @ ccccccccc: already on rolling');
-  assert.equal(landBlocker(src({ on_rolling: true })), 'already on rolling; nothing to land');
-  assert.equal(landBlocker(src()), null);
-  assert.equal(landPrompt(src()), 'Land rsi/x @ ccccccccc: unmerged, 2 commits ahead of rolling? Press <Space>gl (or :land) again within 30s to queue it.');
+test('the replay key of a confirmed landing keeps the TUI shape', () => {
   assert.equal(landKey('u'), 'operator-land-u');
-});
-
-test('an arming confirms only the same session inside the window', () => {
-  const armed = { sessionId: 's1', commit: 'c', at: 1000 };
-  assert.equal(confirmsLand(armed, 's1', 1000), true);
-  assert.equal(confirmsLand(armed, 's2', 1000), false);
-  assert.equal(confirmsLand(armed, 's1', 1000 + LAND_CONFIRM_MS), false);
-  assert.equal(confirmsLand(null, 's1', 1000), false);
 });
 
 test('settled entries are announced with their outcome and dropped from the watch', () => {
   const done = { ...entry('published', { landed_sha: 'b'.repeat(40) }), id: 'd' };
   const refused = { ...entry('refused', { refusal: 'queue_x' }), id: 'r' };
   const running = { ...entry('gating'), id: 'g' };
-  assert.equal(statusLine(done), 'queue #7 aaaaaaaaa: published (landed bbbbbbbbb)');
-  assert.equal(statusLine(running), 'queue #7 aaaaaaaaa: gating');
-  assert.equal(settledMessage('rsi/x @ aaaaaaaaa', done), 'landed: rsi/x @ aaaaaaaaa - queue #7 aaaaaaaaa: published (landed bbbbbbbbb)');
-  assert.match(settledMessage('rsi/x', refused), /^NOT landed: rsi\/x - .*\(queue_x\)$/);
+  assert.match(settledMessage('T', done), /^Landed “T”\./);
+  assert.match(settledMessage('T', refused), /^Not landed: “T”\. queue_x$/);
   const watching = [{ entryId: 'd', label: 'done' }, { entryId: 'g', label: 'running' }, { entryId: 'r', label: 'refused' }, { entryId: 'gone', label: 'x' }];
   const { settled, rest } = settle(watching, [done, running, refused]);
   assert.deepEqual(settled.map((s) => s.label), ['done', 'refused']);

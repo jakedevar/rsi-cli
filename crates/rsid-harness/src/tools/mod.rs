@@ -31,13 +31,19 @@ pub enum ToolExecutionMode {
 }
 
 /// Shared limits passed to tools. Later session policy can narrow these limits.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ToolPolicy {
     pub max_output_bytes: usize,
     /// Network egress policy (#774). A network-capable tool reads it from its
     /// `ToolContext` and never from an ambient global; the default is the
     /// fail-closed `deny_private` mode.
     pub egress: rsi_common::egress_policy::EgressPolicy,
+    /// Where the file tools may reach (#3172). Contained to the working
+    /// directory unless the session policy opts into the task environment.
+    pub file_paths: rsi_common::harness_tool_policy::FilePathScope,
+    /// Extra environment names a host `shell` / `exec_command` launch passes
+    /// through (#3169); credential-looking names are dropped at launch too.
+    pub env_passthrough: std::sync::Arc<[String]>,
 }
 
 impl Default for ToolPolicy {
@@ -45,6 +51,8 @@ impl Default for ToolPolicy {
         Self {
             max_output_bytes: 1024 * 1024,
             egress: rsi_common::egress_policy::EgressPolicy::default(),
+            file_paths: rsi_common::harness_tool_policy::FilePathScope::default(),
+            env_passthrough: std::sync::Arc::from([]),
         }
     }
 }

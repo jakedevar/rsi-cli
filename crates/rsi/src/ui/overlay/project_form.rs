@@ -10,6 +10,12 @@ use ratatui::widgets::{Clear, Padding, Paragraph};
 
 use super::fixed_centered_rect;
 
+/// The popup is this wide; its inner width (borders and padding off) sets how
+/// far a long name or path runs before it wraps.
+const POPUP_WIDTH: u16 = 55;
+const NAME_MAX_ROWS: u16 = 3;
+const PATH_MAX_ROWS: u16 = 4;
+
 /// Render the project form popup (create/edit).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_project_form(
@@ -18,16 +24,52 @@ pub(super) fn render_project_form(
     focused_field: usize,
     name: &str,
     path: &str,
+    text: &crate::form_text::FormText,
     color_index: usize,
     is_editing: bool,
     workflow_status: Option<&serde_json::Value>,
 ) {
+    use crate::ui::form_field::{Field, field_rows, mode_pill, render_field};
+
     // Expand popup height by 1 if we have a workflow status to show
     let has_workflow = workflow_status
         .map(|s| s.get("exists").and_then(|v| v.as_bool()).unwrap_or(false))
         .unwrap_or(false);
-    let popup_height: u16 = if has_workflow { 13 } else { 12 };
-    let popup_area = fixed_centered_rect(area, 55, popup_height);
+    let inner_width = POPUP_WIDTH.saturating_sub(4);
+    let label_style = |focused: bool| {
+        if focused {
+            Style::default()
+                .fg(theme::mauve())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::overlay_hint())
+        }
+    };
+    let fields = [
+        Field {
+            label: format!("{:>6}: ", "Name"),
+            label_style: label_style(focused_field == 0),
+            value: name,
+            surface: (focused_field == 0).then(|| text.surface_for(0)).flatten(),
+            min_rows: 1,
+            max_rows: NAME_MAX_ROWS,
+        },
+        Field {
+            label: format!("{:>6}: ", "Path"),
+            label_style: label_style(focused_field == 1),
+            value: path,
+            surface: (focused_field == 1).then(|| text.surface_for(1)).flatten(),
+            min_rows: 1,
+            max_rows: PATH_MAX_ROWS,
+        },
+    ];
+    let name_rows = field_rows(&fields[0], inner_width);
+    let path_rows = field_rows(&fields[1], inner_width);
+    // Name, path, color, an optional workflow line, a spacer and the hint bar,
+    // inside the two border rows.
+    let wanted = 2 + name_rows + path_rows + 1 + u16::from(has_workflow) + 1 + 1;
+    let popup_height: u16 = wanted.max(if has_workflow { 13 } else { 12 });
+    let popup_area = fixed_centered_rect(area, POPUP_WIDTH, popup_height);
 
     frame.render_widget(Clear, popup_area);
 
@@ -37,13 +79,18 @@ pub(super) fn render_project_form(
         " New Project "
     };
 
+    let mut title_spans = vec![Span::styled(
+        title,
+        Style::default()
+            .fg(theme::overlay_title())
+            .add_modifier(Modifier::BOLD),
+    )];
+    if focused_field < 2 && text.surface_for(focused_field).is_some() {
+        title_spans.push(mode_pill(text.mode_label()));
+        title_spans.push(Span::raw(" "));
+    }
     let block = theme::overlay_block()
-        .title(Line::from(vec![Span::styled(
-            title,
-            Style::default()
-                .fg(theme::overlay_title())
-                .add_modifier(Modifier::BOLD),
-        )]))
+        .title(Line::from(title_spans))
         .padding(Padding::horizontal(1));
 
     let inner = block.inner(popup_area);
@@ -53,34 +100,20 @@ pub(super) fn render_project_form(
         return;
     }
 
-    let fields = [("Name", name), ("Path", path)];
-
-    for (i, (label, value)) in fields.iter().enumerate() {
-        let row_y = inner.y + i as u16;
-        let is_focused = i == focused_field;
-
-        let label_style = if is_focused {
-            Style::default()
-                .fg(theme::mauve())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::overlay_hint())
-        };
-
-        let value_style = Style::default().fg(theme::text());
-        let mut spans = vec![Span::styled(format!("{:>6}: ", label), label_style)];
-        if is_focused {
-            spans.extend(crate::field_edit::draw(&value.to_string(), value_style));
-        } else {
-            spans.push(Span::styled(value.to_string(), value_style));
-        }
-        let line = Line::from(spans);
-        let row_area = Rect::new(inner.x, row_y, inner.width, 1);
-        frame.render_widget(Paragraph::new(line), row_area);
-    }
+    let background = theme::overlay_bg();
+    let name_area = Rect::new(inner.x, inner.y, inner.width, name_rows.min(inner.height));
+    render_field(frame, name_area, &fields[0], background);
+    let path_y = inner.y + name_rows;
+    let path_area = Rect::new(
+        inner.x,
+        path_y,
+        inner.width,
+        path_rows.min(inner.height.saturating_sub(name_rows)),
+    );
+    render_field(frame, path_area, &fields[1], background);
 
     // Color field (row 2)
-    let color_y = inner.y + 2;
+    let color_y = inner.y + name_rows + path_rows;
     let is_color_focused = focused_field == 2;
     let color_label_style = if is_color_focused {
         Style::default()
@@ -123,7 +156,7 @@ pub(super) fn render_project_form(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            let rsi_y = inner.y + 3;
+            let rsi_y = color_y + 1;
             let rsi_area = Rect::new(inner.x, rsi_y, inner.width, 1);
 
             let rsi_line = if healthy {
@@ -162,7 +195,7 @@ pub(super) fn render_project_form(
     let _ = hint_offset; // used via popup_height calculation above
     let hint_area = Rect::new(inner.x, hint_y, inner.width, 1);
     let hint = Line::from(vec![Span::styled(
-        "Tab: next field  Enter: save  Esc: cancel",
+        "Tab: next  Enter: save  Esc: normal, then cancel",
         Style::default().fg(theme::overlay_hint()),
     )]);
     frame.render_widget(Paragraph::new(hint), hint_area);

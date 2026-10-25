@@ -34,7 +34,7 @@
     "key:<Space>gl": {
       "status": "done",
       "location": "src/actions/sessionops.ts, src/actions/sessionops-run.ts, src/sessionops-model.ts, src-tauri/src/sessionops.rs",
-      "note": "EnqueueRollingQueueSource dry run shows the commit and where it stands; the same key (or :land) on the same session within 30 s queues exactly that commit under an operator-land-<uuid> key; queued entries are watched through GetRollingQueue {entry_ids} every 5 s and announced when they settle (land.rs)"
+      "note": "EnqueueRollingQueueSource dry run, then a plain-words confirm dialog (Land / Cancel; Enter, or the same chord, confirms) from every path including the key and :land; Land queues exactly the shown commit under an operator-land-<uuid> key; queued entries are watched through GetRollingQueue {entry_ids} every 5 s and announced when they settle (land.rs)"
     },
     "cmd:rotate": {
       "status": "done",

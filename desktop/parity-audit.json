@@ -400,7 +400,7 @@
     },
     "issue-inspector": {
       "class": "ui-adaptation",
-      "what": "The inspector shows body, metadata, dependencies, events, handoffs and the associated-session selection. In place of the TUI's fold cursor, handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole.",
+      "what": "The inspector shows body, metadata, dependencies, events, handoffs and the associated-session selection. In place of the TUI's fold cursor, handoffs fold as disclosure rows (click or Enter on the summary) and the body is shown whole. Body and handoffs are Markdown, rendered by the transcript's sanitizing renderer, with a View raw button (#293).",
       "tui": [
         "crates/rsi/src/ui/issue_detail.rs"
       ],
@@ -415,6 +415,10 @@
         {
           "file": "tests/issues-tracker.test.mjs",
           "anchor": "associated sessions are the ones launched for the Issue, by UUID"
+        },
+        {
+          "file": "tests/issue-markdown.test.mjs",
+          "anchor": "a body with a heading, a list, inline code and a fenced block is rendered by the transcript renderer"
         }
       ]
     },
@@ -499,7 +503,7 @@
       "confirmation": "none: the TUI runs on one r and links the session with no prompt. The desktop's key r, the Run (r) header button and the palette entry \"Graph: run workflow\" all call the same runDraft, so each also runs and links with no prompt.",
       "refusal": "The run is refused before the daemon when the draft fails the rsi_graph preflight (the TUI's blocker toast) or a UUID is malformed (graphs.rs bind_session_workflow_params). The TUI drops a daemon refusal of UpdateSessionWorkflow (`let _ =`) and keeps its local link; the desktop keeps the local link too and shows the refusal as a toast, which is more than the TUI says.",
       "interaction": "dom-e2e",
-      "gap": "The isolated run drives the run-and-link path (<Space>v, o, Enter, r) with CDP key events and reads the session's workflow_id and the execution back from rsid (scripts/smoke-e2e-sections.mjs, extra graph-run). Not driven there: the info dashboard (Tab / l, which needs a bridged recursive graph and the gv_info_dashboard capability), the refusal of UpdateSessionWorkflow (the TUI drops it; the desktop toasts it, model-tested), and a run that succeeds: the workflow's one node is pinned to the unconfigured local provider so the run ends failed at rsid's admission before any model call.",
+      "gap": "The isolated run drives the run-and-link path (<Space>v, o, Enter, r) with CDP key events and reads the session's workflow_id and the execution back from rsid (scripts/smoke-e2e-sections.mjs, extra graph-run). Not driven there: the info dashboard (Tab / l, which needs a bridged recursive graph and the gv_info_dashboard capability), the refusal of UpdateSessionWorkflow (the TUI drops it; the desktop toasts it, model-tested). A successful run is covered by step 2 of the same extra (local #150): rsi-e2e-seed writes a finished, succeeded two-node run through the store, the saved picker opens its workflow, the run view shows it succeeded with each node succeeded on attempt 1, and that is checked against rsid's GetWorkflowExecution; step 1's driven run still ends failed at rsid's admission (its one node is pinned to the unconfigured local provider), so no successful run is driven end to end by the desktop.",
       "evidence": [
         {
           "file": "tests/graphs.test.mjs",
@@ -550,7 +554,6 @@
     "overlay:prompt-overlay-new-session-continue-session": "launch-dialog",
     "module:ui/overlay/prompt.rs": "launch-dialog",
     "overlay-ref:new-session-prompt": "launch-dialog",
-    "overlay-ref:new-session-settings": "launch-dialog",
     "global:backspace/quick-launch-continue-input-line": "launch-line",
     "global:char/quick-launch-continue-input-line": "launch-line",
     "global:enter/quick-launch-continue-input-line": "launch-line",

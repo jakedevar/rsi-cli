@@ -26,7 +26,7 @@ use uuid::Uuid;
 struct Runtime {
     active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     tokens: Arc<RwLock<AgentTokenRegistry>>,
     bus: Arc<EventBus>,
     custody: CustodyExecutionRuntime,
@@ -100,10 +100,20 @@ impl AgentControlHandle {
                 "manager_succession::enqueue_root_manager_succession",
             )
             .await;
+            // Hub #3315: a home seat is a portfolio seat with no project
+            // manager configuration; it hands its seat on with
+            // `AgentManagerAppointChild` on its own node, and no git ever runs
+            // in `$HOME` for it. Say so instead of `manager_not_configured`.
+            let caller_session = store.get_session(caller)?;
+            if caller_session
+                .as_ref()
+                .and_then(|session| session.project_id)
+                .is_some_and(rsi_common::types::Project::is_home_id)
+            {
+                return Err(refused(rsi_common::types::Project::HOME_SUCCESSION_REFUSED));
+            }
             store.manager_succession_observation(caller)?;
-            store
-                .get_session(caller)?
-                .ok_or_else(|| refused("manager_session_unavailable"))?
+            caller_session.ok_or_else(|| refused("manager_session_unavailable"))?
         };
         let ManagerActionV2::SucceedManager { handoff, .. } = &request.operation else {
             return Err(refused("manager_succession_action_required"));
@@ -394,6 +404,20 @@ impl ManagerSuccessionLaunchContext {
         if let Some(tx) = self.confirmation.lock().await.take() {
             let _ = tx.send(Ok(receipt));
         }
+        // #185: the successor is published and its handoff was verified at
+        // the source gate above; prune the lineage's aged-out handoff refs off
+        // this path, so publication never waits on that git.
+        let store = self.runtime.store.clone();
+        let live = self.candidate;
+        tokio::spawn(async move {
+            match prune_manager_handoff_refs(&store, live).await {
+                Ok(pruned) if !pruned.is_empty() => {
+                    tracing::info!(%live, ?pruned, "pruned aged-out manager handoff refs")
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%live, %error, "manager handoff ref prune failed"),
+            }
+        });
         Ok(())
     }
 
@@ -675,6 +699,9 @@ fn launch_config(root: &ManagerRootSuccession, content: String) -> Result<Launch
         topology_iteration: source.topology_iteration,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     })
 }
 
@@ -703,4 +730,88 @@ async fn ensure_successor_effort_ladders(launch: &ManagerLaunchChoiceV2) {
         return;
     };
     Box::pin(client.ensure_effort_ladders_for(launch.effort.as_deref())).await;
+}
+
+/// #185: how many published predecessors of a seat lineage keep their private
+/// handoff ref (`refs/rsi/manager-handoff/<id>`, #172). Two: the handoff the
+/// live seat was just admitted from (it, a reviewer or a recovery may re-read
+/// it) and the one before it, for one hop of audit; older handoffs stay in the
+/// transcripts the predecessor-seat read serves (#118), so their refs go.
+pub(crate) const MANAGER_HANDOFF_REFS_KEPT: usize = 2;
+
+/// #185: after `live` was published, delete the handoff refs of its lineage's
+/// predecessors older than [`MANAGER_HANDOFF_REFS_KEPT`]. Only a sandboxless
+/// hop (the one kind whose handoff the daemon read at the ref) is considered,
+/// matched by its session id and recorded commit from the store; the ref is
+/// deleted only while it still names that commit, in the hop's own recorded
+/// working directory, never in `$HOME` or the home project. Best effort:
+/// a repository that cannot be read keeps its refs. Returns the pruned ids.
+pub(crate) async fn prune_manager_handoff_refs(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    live: Uuid,
+) -> Result<Vec<Uuid>> {
+    let mut cursor = ManagerHandoffLineageCursor::new(live);
+    let mut kept = MANAGER_HANDOFF_REFS_KEPT;
+    let mut pruned = Vec::new();
+    let user_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    loop {
+        // #505: continue behind the oldest hop of each batch. Bound each lock
+        // hold to 256 hops, then release it before Git and the next batch.
+        let (lineage, home) = {
+            let store =
+                crate::store_lock::lock(store, "manager_succession::prune_handoff_refs").await;
+            let lineage =
+                store.manager_handoff_lineage_page(&mut cursor, MANAGER_HANDOFF_LINEAGE_BATCH)?;
+            let home = store
+                .get_project(rsi_common::types::Project::HOME_ID)?
+                .and_then(|home| home.path);
+            (lineage, home)
+        };
+        if lineage.is_empty() {
+            return Ok(pruned);
+        }
+        let skip = kept.min(lineage.len());
+        kept -= skip;
+        let mut by_repo: HashMap<std::path::PathBuf, Vec<(Uuid, String)>> = HashMap::new();
+        for hop in lineage.into_iter().skip(skip) {
+            let (Some(dir), Some(commit), true, false) = (
+                hop.working_dir,
+                hop.source_commit,
+                hop.sandboxless,
+                hop.protected,
+            ) else {
+                continue;
+            };
+            if !dir.is_absolute() || home.as_ref() == Some(&dir) || user_home.as_ref() == Some(&dir)
+            {
+                continue;
+            }
+            by_repo
+                .entry(dir)
+                .or_default()
+                .push((hop.session_id, commit));
+        }
+        if !by_repo.is_empty() {
+            let batch = tokio::task::spawn_blocking(move || {
+                let mut pruned = Vec::new();
+                for (dir, recorded) in by_repo {
+                    match crate::sandbox::git_worktree::prune_manager_handoff_refs(&dir, &recorded)
+                    {
+                        Ok(ids) => pruned.extend(ids),
+                        Err(error) => {
+                            tracing::warn!(dir=%dir.display(), %error, "manager handoff refs kept")
+                        }
+                    }
+                }
+                pruned
+            })
+            .await
+            .map_err(|error| {
+                crate::error::DaemonError::Process(format!("handoff ref prune: {error}"))
+            })?;
+            pruned.extend(batch);
+        }
+        // Even a page with no eligible refs yields before reacquiring Store.
+        tokio::task::yield_now().await;
+    }
 }

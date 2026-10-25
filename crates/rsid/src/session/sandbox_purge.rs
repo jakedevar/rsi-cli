@@ -355,7 +355,7 @@ impl super::SessionManager {
 // would scatter the fences that must stay in this order.
 #[allow(clippy::too_many_lines)]
 fn process_candidate(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     active: &Arc<tokio::sync::RwLock<HashMap<Uuid, super::types::TrackedSession>>>,
     sandbox_base: &Path,
     candidate: &ArchivedSandboxPurgeCandidate,

@@ -11,7 +11,10 @@ mod seeder {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
 
-    use rsi_common::types::{EventType, SessionStatus};
+    use rsi_common::types::{
+        EventType, GraphExecutionUpdate, SessionStatus, WorkflowExecutionStatus,
+        WorkflowNodeExecutionState,
+    };
     use rsid::store::Store;
     use serde_json::json;
     use uuid::Uuid;
@@ -241,6 +244,183 @@ mod seeder {
         extra["session"]["status"] = json!("Running");
         std::fs::write(&path, extra.to_string()).expect("spec");
         assert_eq!(run_seeder(state.path(), &path).status.code(), Some(2));
+    }
+
+    /// Local #150: a two-node, session-only workflow (plan -> build) and its finished run.
+    fn graph_run(workflow_id: Uuid, execution_id: Uuid) -> serde_json::Value {
+        json!({
+            "workflow_id": workflow_id,
+            "title": "E2E seeded run",
+            "project_id": null,
+            "execution_id": execution_id,
+            "repo_root": "/tmp",
+            "base_commit": "0123456789abcdef0123456789abcdef01234567",
+            "definition": {
+                "version": "1.0", "name": "E2E seeded run", "description": "",
+                "nodes": [
+                    { "id": "plan", "name": "Plan the fix", "type": "action", "instructions": "Plan the fix." },
+                    { "id": "build", "name": "Apply the fix", "type": "action", "instructions": "Apply the fix." },
+                ],
+                "edges": [{ "source": "plan", "target": "build" }],
+                "metadata": { "topology_steps": "{\"plan\":{\"kind\":\"session\"},\"build\":{\"kind\":\"session\"}}" },
+            },
+            "node_results": { "plan": "plan ready", "build": "built ok" },
+        })
+    }
+
+    #[test]
+    fn the_seeder_writes_a_succeeded_graph_run_with_each_node_result() {
+        let state = marked_state_dir();
+        let (workflow_id, execution_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut full = spec(Uuid::new_v4());
+        full["graph_run"] = graph_run(workflow_id, execution_id);
+        let path = state.path().join("spec.json");
+        std::fs::write(&path, full.to_string()).expect("spec");
+        let out = run_seeder(state.path(), &path);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let store = Store::open(&state.path().join("rsi.db")).expect("open seeded store");
+        let document = store
+            .get_workflow_definition(workflow_id)
+            .expect("read workflow")
+            .expect("the seeded workflow exists");
+        assert_eq!(document.workflow.title, "E2E seeded run");
+        let (status, finished, workflow): (String, Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT status,finished_at,workflow_id FROM topology_executions WHERE id=?1",
+                [execution_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("the seeded execution exists");
+        assert_eq!(status, "succeeded");
+        assert!(finished.is_some(), "a finished run has finished_at");
+        assert_eq!(workflow, workflow_id.to_string());
+
+        let mut attempts = store
+            .conn
+            .prepare("SELECT node_id,status,iteration,attempt_no,output_json FROM topology_node_attempts WHERE execution_id=?1 ORDER BY created_at")
+            .expect("prepare");
+        let attempts = attempts
+            .query_map([execution_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .expect("attempts")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|a| (a.0.as_str(), a.1.as_str(), a.2, a.3))
+                .collect::<Vec<_>>(),
+            vec![("plan", "succeeded", 0, 1), ("build", "succeeded", 0, 1)]
+        );
+        assert!(attempts[0].4.contains("plan ready"));
+        assert!(attempts[1].4.contains("built ok"));
+
+        // The event stream the daemon projects: each node reserved, running and settled succeeded with its
+        // result preview, then exactly one `finished` update, the run's `succeeded`.
+        let mut events = store
+            .conn
+            .prepare("SELECT kind,payload_json FROM topology_events WHERE execution_id=?1 ORDER BY execution_seq")
+            .expect("prepare");
+        let events = events
+            .query_map([execution_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("events")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(
+            events.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(),
+            vec![
+                "accepted",
+                "running",
+                "node_reserved",
+                "node_running",
+                "node_settled",
+                "node_reserved",
+                "node_running",
+                "node_settled",
+                "succeeded",
+            ]
+        );
+        let updates = events
+            .iter()
+            .map(|(_, payload)| {
+                let payload: serde_json::Value = serde_json::from_str(payload).expect("payload");
+                serde_json::from_value::<GraphExecutionUpdate>(payload["update"].clone())
+                    .expect("a GraphExecutionUpdate")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates.iter().map(|u| u.sequence).collect::<Vec<_>>(),
+            (1..=9).collect::<Vec<_>>()
+        );
+        let settled = updates
+            .iter()
+            .filter(|u| u.node_state == Some(WorkflowNodeExecutionState::Succeeded))
+            .map(|u| {
+                (
+                    u.node_id.clone().unwrap_or_default(),
+                    u.output_preview.clone().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 2);
+        assert!(settled[0].0 == "plan" && settled[0].1.contains("plan ready"));
+        assert!(settled[1].0 == "build" && settled[1].1.contains("built ok"));
+        let last = updates.last().expect("events");
+        assert_eq!(last.status, WorkflowExecutionStatus::Succeeded);
+        assert!(last.finished);
+        assert_eq!(updates.iter().filter(|u| u.finished).count(), 1);
+    }
+
+    #[test]
+    fn a_graph_run_the_seeder_cannot_record_as_one_clean_pass_is_refused_and_writes_nothing() {
+        let cases: [(&str, fn(&mut serde_json::Value)); 4] = [
+            ("cycle", |run| {
+                run["definition"]["edges"] = json!([{ "source": "plan", "target": "build" }, { "source": "build", "target": "plan" }]);
+            }),
+            ("not a node", |run| {
+                run["node_results"]["ghost"] = json!("x")
+            }),
+            ("not a session node", |run| {
+                run["definition"]["metadata"]["topology_steps"] =
+                    json!("{\"plan\":{\"kind\":\"command\"}}");
+            }),
+            ("40-hex", |run| run["base_commit"] = json!("main")),
+        ];
+        for (why, break_it) in cases {
+            let state = marked_state_dir();
+            let mut bad = spec(Uuid::new_v4());
+            let mut run = graph_run(Uuid::new_v4(), Uuid::new_v4());
+            break_it(&mut run);
+            bad["graph_run"] = run;
+            let path = state.path().join("spec.json");
+            std::fs::write(&path, bad.to_string()).expect("spec");
+            let out = run_seeder(state.path(), &path);
+            assert_eq!(out.status.code(), Some(2), "{why}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(why),
+                "{why}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !state.path().join("rsi.db").exists(),
+                "{why}: a refused graph run must not create a database"
+            );
+        }
     }
 }
 

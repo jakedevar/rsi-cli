@@ -134,13 +134,33 @@ test('positive state: any honest gap is partial with an owner, not substitute', 
   assert.ok(audit().groups['graph-review-dashboard'].rsid.includes('UpdateSessionWorkflow'));
   // Settings > Skills e/d run over SetSkillEnabled / DeleteSkill (#97).
   for (const id of ['overlay:settings-pane-space-or-set', 'module:ui/settings.rs', 'cmd:skills']) assert.equal(byId.get(id).status, 'done', id);
+  // The Global Dashboard (gd, :dashboard) is a desktop view over GetGlobalDashboard (#3366, slice D of #3314).
+  for (const id of [
+    'key:gd', 'cmd:dashboard', 'overlay:global-dashboard-gd-dashboard', 'overlay-ref:global-dashboard',
+    'module:ui/overlay/global_dashboard.rs', 'module:ui/overlay/global_dashboard_tests.rs',
+  ]) {
+    assert.equal(byId.get(id).status, 'done', id);
+    assert.match(byId.get(id).location, /src\/dashboard\.ts/, id);
+  }
   const counts = countByStatus(real());
-  assert.equal(counts.missing, 0);
-  assert.equal(counts.partial, partial.length);
+  // The new TUI hold-clear action (#3568) has an explicit desktop follow-up.
+  for (const id of ['cmd:provider-clear-hold', 'key:<Space>hu']) {
+    assert.equal(byId.get(id).status, 'missing', id);
+    assert.deepEqual(byId.get(id).owner, ['#3636'], id);
+  }
+  // The TUI `:intake` command (#3787) has an explicit desktop follow-up too.
+  assert.equal(byId.get('cmd:intake').status, 'missing');
+  assert.deepEqual(byId.get('cmd:intake').owner, ['#3787']);
+  // The external-report import view (#3789) is TUI-only until the desktop follows.
+  assert.equal(byId.get('cmd:external-reports').status, 'missing');
+  assert.deepEqual(byId.get('cmd:external-reports').owner, ['#3789']);
+  // Host tuning has two owned desktop gaps (#3932).
+  assert.equal(counts.missing, 6);
+  assert.equal(counts.partial + counts.missing, partial.length);
 });
 
 test('the rendered PARITY.md shows the editor rows as done', () => {
-  const md = readFileSync(join(desktop, 'PARITY.md'), 'utf8');
+  const md = generate({ root: repo, sidecarDir: join(desktop, 'parity-status.d') }).text;
   assert.match(md, /\| `overlay-ref:file-viewer` \|.*\| done \|/);
   assert.match(md, /\| `cmd:skills` \|.*\| done \|/);
 });
@@ -162,7 +182,7 @@ test('inventory guard: an unedited copy of the TUI sources passes', () => {
   try {
     const r = check(root);
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /PARITY\.md is current, 514 rows/);
+    assert.match(r.stdout, /PARITY\.md is current, \d+ rows/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -172,7 +192,7 @@ test('inventory guard: a new Normal-mode keybinding the TUI documents but PARITY
     edit(root, 'docs/keybindings.md', (t) => t.replace('| `j` | Move selection or scroll down |', '| `Ctrl-Alt-Z` | Brand new action | Does a brand new thing. |\n| `j` | Move selection or scroll down |'));
     const r = check(root);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /PARITY\.md is stale \(515 rows \(missing 1,/);
+    assert.match(r.stderr, /1 row\(s\) have no entry in parity-status\.d\/\*\.json.*: key:/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -182,7 +202,7 @@ test('inventory guard: a new : command the TUI documents but PARITY lacks fails 
     edit(root, 'docs/keybindings.md', (t) => t.replace('| `:commands` |  | All commands |', '| `:brandnew` |  | Brand new | Does a brand new thing. |\n| `:commands` |  | All commands |'));
     const r = check(root);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /PARITY\.md is stale \(515 rows/);
+    assert.match(r.stderr, /1 row\(s\) have no entry in parity-status\.d\/\*\.json.*: cmd:brandnew/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -192,7 +212,7 @@ test('inventory guard: a new overlay heading the TUI documents but PARITY lacks 
     edit(root, 'docs/keybindings.md', (t) => t.replace('## Overlay Key Reference (generated)', '## Overlay Key Reference (generated)\n\n### Brand New Overlay\n\n| Keys | Action | What it does |\n| --- | --- | --- |\n| `x` | Do | Does a thing. |'));
     const r = check(root);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /stale/);
+    assert.match(r.stderr, /have no entry in parity-status\.d\/\*\.json.*overlay-ref:brand-new-overlay/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -203,7 +223,7 @@ test('inventory guard: a new TUI view module (crates/rsi/src/ui) that PARITY lac
     writeFileSync(join(root, 'crates/rsi/src/ui/overlay/brand_new_overlay.rs'), '//! A brand new overlay.\n');
     const r = check(root);
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /PARITY\.md is stale \(516 rows/);
+    assert.match(r.stderr, /2 row\(s\) have no entry in parity-status\.d\/\*\.json.*module:ui\/brand_new_view\.rs/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -242,7 +262,8 @@ test('inventory guard: a substitute added without an audit entry fails the same 
 
 test('the inventory guard runs in npm test and in the hub desktop lane', () => {
   const pkg = JSON.parse(readFileSync(join(desktop, 'package.json'), 'utf8'));
-  assert.match(pkg.scripts.test, /node scripts\/parity\.mjs --check/);
+  // PARITY.md is a build product (#60): npm test writes it, and the write fails on the same guard.
+  assert.match(pkg.scripts.test, /node scripts\/parity\.mjs( |&|$)/);
   const gate = readFileSync(join(repo, 'scripts/desktop-test-gate.py'), 'utf8');
   assert.match(gate, /docs\/keybindings\.md/);
   assert.match(gate, /crates\/rsi\/src/);

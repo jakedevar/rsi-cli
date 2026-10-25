@@ -11,18 +11,24 @@
 
 mod cursor;
 mod cursor_pages;
+mod dashboard;
 mod decisions_cursor;
 mod detail;
 mod history;
 mod pending;
 mod projection;
 mod projects;
+mod providers;
 mod responses;
 mod selected_session;
 mod sessions;
 mod source;
 
 pub use cursor::RemoteCursorSigner;
+pub use dashboard::{
+    DASHBOARD_AGENT_ROWS_SQL, DASHBOARD_SATELLITES_SQL, DashboardSatelliteReport, DashboardSource,
+    dashboard_response, dashboard_source,
+};
 pub use decisions_cursor::DecisionsPositionV1;
 pub use detail::{SessionDetailSource, session_detail_source};
 pub use history::{
@@ -60,6 +66,10 @@ pub use projection::{
     selected_saved_pending_sources, session_attention, session_detail, session_summary,
 };
 pub use projects::{ProjectRow, list_projects};
+pub use providers::{
+    PROVIDER_WINDOWS_SQL, ProviderSpendRow, ProviderSpendView, ProvidersSource, providers_response,
+    providers_source,
+};
 pub use responses::{
     SessionsResponseSources, info_response, observed_history_response, projects_response,
     selected_session_response, sessions_response,

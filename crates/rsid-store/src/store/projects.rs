@@ -35,7 +35,20 @@ impl Store {
     }
 
     /// Update an existing project.
+    ///
+    /// # Errors
+    /// `home_project_repath_refused` when `project` is the built-in home
+    /// project with a path other than its stored one (hub #3315), or a
+    /// persistence error.
     pub fn update_project(&self, project: &Project) -> Result<()> {
+        if Project::is_home_id(project.id)
+            && let Some(stored) = self.get_project(project.id)?
+            && stored.path != project.path
+        {
+            return Err(DaemonError::InvalidParam(
+                Project::HOME_REPATH_REFUSED.into(),
+            ));
+        }
         let context_files_json = project
             .context_files
             .as_ref()
@@ -58,7 +71,16 @@ impl Store {
 
     /// Delete a project by ID.
     /// Clears project_id from sessions referencing this project, then deletes the project.
+    ///
+    /// # Errors
+    /// `home_project_delete_refused` for the built-in home project (hub
+    /// #3315), the manager-authority refusal or a persistence error.
     pub fn delete_project(&self, id: Uuid) -> Result<()> {
+        if Project::is_home_id(id) {
+            return Err(DaemonError::InvalidParam(
+                Project::HOME_DELETE_REFUSED.into(),
+            ));
+        }
         let id_str = id.to_string();
         let tx = self.conn.unchecked_transaction()?;
         // V111 seeds every project at 1, including projects with older manager
@@ -98,6 +120,57 @@ impl Store {
         tx.execute("DELETE FROM projects WHERE id = ?1", params![&id_str])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Hub #3315: register the built-in home project ([`Project::HOME_ID`])
+    /// at `home`, the daemon's `$HOME`. Idempotent: a store that already has
+    /// it keeps that one row (its path follows `home` if the daemon's home
+    /// moved; this is the only writer of that path). The name is
+    /// [`Project::HOME_NAME`], or the first free `"<name> (n)"` when an
+    /// operator project already uses it.
+    ///
+    /// # Errors
+    /// A persistence error.
+    pub fn ensure_home_project(&self, home: &std::path::Path) -> Result<Project> {
+        if let Some(existing) = self.get_project(Project::HOME_ID)? {
+            if existing.path.as_deref() == Some(home) {
+                return Ok(existing);
+            }
+            let now = chrono::Utc::now();
+            self.conn.execute(
+                "UPDATE projects SET path = ?1, updated_at = ?2 WHERE id = ?3",
+                params![
+                    home.to_string_lossy().to_string(),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    Project::HOME_ID.to_string(),
+                ],
+            )?;
+            return self
+                .get_project(Project::HOME_ID)?
+                .ok_or_else(|| DaemonError::Store("home project vanished".into()));
+        }
+        let mut name = Project::HOME_NAME.to_string();
+        let mut suffix = 2;
+        while self.get_project_by_name(&name)?.is_some() {
+            name = format!("{} ({suffix})", Project::HOME_NAME);
+            suffix += 1;
+        }
+        let now = chrono::Utc::now();
+        let project = Project {
+            id: Project::HOME_ID,
+            name,
+            path: Some(home.to_path_buf()),
+            description: Some(
+                "Built-in RSI home: global and portfolio manager seats run here, without a sandbox."
+                    .into(),
+            ),
+            color: Project::DEFAULT_COLOR.to_string(),
+            context_files: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.insert_project(&project)?;
+        Ok(project)
     }
 
     /// Get a project by ID.
@@ -188,7 +261,9 @@ impl Store {
         let mut best_match: Option<Project> = None;
         let mut longest_prefix_len = 0;
 
-        for project in projects {
+        // Hub #3315: the home project is never matched by path, or it would
+        // claim every unregistered directory under `$HOME`.
+        for project in projects.into_iter().filter(|p| !Project::is_home_id(p.id)) {
             if let Some(ref project_path) = project.path {
                 let project_path_str = project_path.to_string_lossy();
                 if working_dir_str.starts_with(project_path_str.as_ref())

@@ -15,7 +15,7 @@ use super::daemon_settings::{
 use super::row_mappers::parse_timestamp;
 use crate::error::{
     DaemonError, Result, agent_issue_bound_field_not_allowed, agent_issue_error,
-    agent_issue_invalid_request, issue_workspace_error,
+    agent_issue_invalid_failure_signature, agent_issue_list_invalid_request, issue_workspace_error,
 };
 use chrono::{SecondsFormat, Utc};
 use rsi_common::issue_workspace::{
@@ -454,6 +454,36 @@ pub(crate) struct AgentIssueAuthority {
     pub caller_session_id: Uuid,
     pub project_id: Uuid,
     pub(super) actor: AgentIssueActor,
+}
+
+/// #3595: refuse a published body whose added or changed
+/// `rsi-failure-signature` block cannot parse, with the exact diagnostic.
+/// Blocks already in `prior` are not rechecked, so editing an Issue with a
+/// legacy malformed block still works.
+fn check_published_signature_blocks(
+    prior: &str,
+    body: &str,
+    display_number: Option<i64>,
+) -> Result<()> {
+    let issue = display_number.and_then(|number| u64::try_from(number).ok());
+    rsi_common::failure_signature::validate_published_blocks(prior, body, issue)
+        .map_err(|diagnostic| agent_issue_invalid_failure_signature(&diagnostic))
+}
+
+/// #3052: bytes of the current body's end that a lead or manager body update
+/// must keep unless it sets `replace_body`.
+const BODY_TAIL_GUARD_BYTES: usize = 64;
+
+/// #3052: whether `next` still holds the end of `prior` (its last
+/// [`BODY_TAIL_GUARD_BYTES`] bytes, snapped forward to a character boundary,
+/// trailing whitespace ignored). An empty prior has no tail to drop.
+fn body_keeps_tail(prior: &str, next: &str) -> bool {
+    let prior = prior.trim_end();
+    let mut start = prior.len().saturating_sub(BODY_TAIL_GUARD_BYTES);
+    while !prior.is_char_boundary(start) {
+        start += 1;
+    }
+    next.contains(&prior[start..])
 }
 
 /// #2391: whether `text` holds the token `#<number>`: a `#` not glued to a
@@ -2134,6 +2164,12 @@ impl Store {
                 "Issue project_id must not be nil".to_string(),
             ));
         }
+        // Hub #3315: the built-in home project holds no Issues.
+        if rsi_common::types::Project::is_home_id(new.project_id) {
+            return Err(DaemonError::InvalidParam(
+                rsi_common::types::Project::HOME_ISSUE_REFUSED.into(),
+            ));
+        }
         let project_exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
             params![new.project_id.to_string()],
@@ -2644,6 +2680,7 @@ impl Store {
             tx.commit()?;
             return Ok(outcome);
         }
+        check_published_signature_blocks("", &new.body, None)?;
         let outcome = Self::idempotent_issue_in_tx(
             &tx,
             id,
@@ -2947,7 +2984,7 @@ impl Store {
     /// punctuation and spacing are ignored. One finding becomes one Issue: the
     /// review reporter that files a finding the topology also files finds the
     /// existing number instead of a second Issue.
-    fn find_open_issue_with_equivalent_title(
+    pub(super) fn find_open_issue_with_equivalent_title(
         conn: &rusqlite::Connection,
         project_id: Uuid,
         title: &str,
@@ -5288,12 +5325,11 @@ impl Store {
         caller_session_id: Uuid,
         request: &AgentListIssuesRequestV1,
     ) -> Result<AgentIssuePageV1> {
-        let limit = request.validated_limit().map_err(|_| {
-            agent_issue_error(
-                rsi_common::rpc::AgentIssueErrorCodeV1::InvalidRequest,
-                None,
-                None,
-            )
+        let limit = request.validate().map_err(|(field, _)| {
+            agent_issue_list_invalid_request(rsi_common::rpc::AgentIssueValidationV1 {
+                class: rsi_common::rpc::AgentIssueValidationClassV1::InvalidField,
+                field: Some(field),
+            })
         })?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let (project_id, summary) = match Self::resolve_agent_issue_authority(
@@ -5342,14 +5378,19 @@ impl Store {
                         None,
                     ));
                 }
+                // #184: a worker's search needs at least one narrowing filter,
+                // title_contains, labels or status; the last two alone are a
+                // read-only summary search over its bound project.
                 if request
                     .title_contains
                     .as_ref()
                     .is_none_or(|title| title.trim().is_empty())
+                    && request.labels.is_empty()
+                    && request.status.is_none()
                 {
                     // #2425: name the missing field; a bare invalid_request
                     // left callers guessing which parameter to correct.
-                    return Err(agent_issue_invalid_request(
+                    return Err(agent_issue_list_invalid_request(
                         rsi_common::rpc::AgentIssueValidationV1 {
                             class: rsi_common::rpc::AgentIssueValidationClassV1::MissingField,
                             field: Some(
@@ -5461,6 +5502,7 @@ impl Store {
                     .map(|issue| AgentIssueSummaryV1 {
                         display_number: issue.display_number,
                         id: issue.id,
+                        row_version: issue.row_version,
                         title: issue.title,
                         labels: issue.labels,
                         status: issue.status,
@@ -5839,33 +5881,56 @@ impl Store {
         request.validate().map_err(|_| invalid())?;
         let handoff = request.handoff.as_deref().ok_or_else(invalid)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let Some((project_id, issue_id, _operation)) =
-            Self::live_issue_binding_for_worker_on(&tx, caller_session_id)?
-        else {
-            let code = if Self::bound_issue_for_worker_on(&tx, caller_session_id)?.is_some() {
-                Code::BoundIssueBindingNotLive
-            } else {
-                Code::AuthorityDenied
-            };
-            return Err(agent_issue_error(code, None, None));
-        };
-        let wrong_issue = || agent_issue_error(Code::BoundIssueWrongIssue, None, None);
-        if request
-            .project_id
-            .is_some_and(|project| project != project_id)
-        {
-            return Err(wrong_issue());
-        }
-        let target = Self::resolve_agent_issue_target_tx(
+        // #3052: a lead or manager appends a note to any Issue it governs; a
+        // caller with no such authority falls back to the bound worker's own
+        // Issue (#1750).
+        let (project_id, issue_id) = match Self::resolve_agent_issue_authority(
             &tx,
-            project_id,
-            request.issue_id,
-            request.display_number,
-        )
-        .map_err(|_| wrong_issue())?;
-        if target != issue_id {
-            return Err(wrong_issue());
-        }
+            caller_session_id,
+            request.project_id,
+            true,
+        ) {
+            Ok(authority) => (
+                authority.project_id,
+                Self::resolve_agent_issue_target_tx(
+                    &tx,
+                    authority.project_id,
+                    request.issue_id,
+                    request.display_number,
+                )?,
+            ),
+            Err(error) => {
+                let Some((project_id, issue_id, _operation)) =
+                    Self::live_issue_binding_for_worker_on(&tx, caller_session_id)?
+                else {
+                    let code = if Self::bound_issue_for_worker_on(&tx, caller_session_id)?.is_some()
+                    {
+                        Code::BoundIssueBindingNotLive
+                    } else {
+                        return Err(error);
+                    };
+                    return Err(agent_issue_error(code, None, None));
+                };
+                let wrong_issue = || agent_issue_error(Code::BoundIssueWrongIssue, None, None);
+                if request
+                    .project_id
+                    .is_some_and(|project| project != project_id)
+                {
+                    return Err(wrong_issue());
+                }
+                let target = Self::resolve_agent_issue_target_tx(
+                    &tx,
+                    project_id,
+                    request.issue_id,
+                    request.display_number,
+                )
+                .map_err(|_| wrong_issue())?;
+                if target != issue_id {
+                    return Err(wrong_issue());
+                }
+                (project_id, issue_id)
+            }
+        };
         let issue = Self::get_issue_in_project_tx(&tx, project_id, issue_id)?
             .ok_or_else(|| agent_issue_error(Code::NotFoundInScope, None, None))?;
         let receipt =
@@ -6032,6 +6097,23 @@ impl Store {
         }
         let title = request.title.clone().unwrap_or_else(|| prior.title.clone());
         let body = request.body.clone().unwrap_or_else(|| prior.body.clone());
+        if request.body.is_some() {
+            check_published_signature_blocks(&prior.body, &body, Some(prior.display_number))?;
+        }
+        // #3052: a lead or manager body rebuilt from a read cut short drops the
+        // current body's tail without noticing; replacing it is explicit. A
+        // bound worker is held to the stricter append-only rule instead.
+        if !bound_worker
+            && request.body.is_some()
+            && !request.replace_body
+            && !body_keeps_tail(&prior.body, &body)
+        {
+            return Err(agent_issue_error(
+                rsi_common::rpc::AgentIssueErrorCodeV1::BodyWouldDropTail,
+                None,
+                None,
+            ));
+        }
         let labels = request
             .labels
             .clone()

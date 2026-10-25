@@ -192,3 +192,18 @@ pub fn make_test_session() -> Session {
         terminal_reason: None,
     }
 }
+
+/// Disk-backed sandbox fixture, independent of a job's tmpfs `TMPDIR`.
+/// Kept in the leaf crate so allocator tests need no daemon dependency.
+pub fn disk_backed_tempdir(label: &str) -> tempfile::TempDir {
+    let base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(rsi_common::manifest_dir!()).join("../../target"))
+        .join("rsid-test-fixtures");
+    std::fs::create_dir_all(&base).expect("create disk-backed test fixture root");
+    let base = std::fs::canonicalize(&base).expect("canonicalize disk-backed test fixture root");
+    tempfile::Builder::new()
+        .prefix(label)
+        .tempdir_in(base)
+        .expect("create disk-backed test fixture")
+}

@@ -54,8 +54,39 @@ pub fn record_reported_health(peer_id: Uuid, health: Option<&SatelliteHealthV1>)
     }
 }
 
+impl ReportedHealth {
+    /// The daemon build the satellite reported, if it reports one.
+    #[must_use]
+    pub fn build_sha(&self) -> Option<&str> {
+        self.health.build_sha.as_deref()
+    }
+
+    /// Running plus waiting-approval sessions the satellite reported.
+    #[must_use]
+    pub fn running_agents(&self) -> u32 {
+        self.health
+            .sessions_running
+            .saturating_add(self.health.sessions_waiting_approval)
+    }
+}
+
 pub fn reported_health(peer_id: Uuid) -> Option<ReportedHealth> {
     REPORTED_HEALTH.lock().ok()?.get(&peer_id).cloned()
+}
+
+/// Current manager identities from the existing hub poll, including declared
+/// projects beyond the legacy eight-row summary. No satellite request.
+pub fn reported_manager_policies(
+    peer_id: Uuid,
+) -> Vec<rsi_common::satellite_manager_policy::SatelliteManagerLaunchesV1> {
+    reported_health(peer_id)
+        .map(|reported| {
+            reported
+                .health
+                .manager_policies
+                .unwrap_or(reported.health.manager_launches)
+        })
+        .unwrap_or_default()
 }
 
 static REACHABILITY: LazyLock<

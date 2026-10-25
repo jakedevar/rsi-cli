@@ -3,12 +3,12 @@
 //! lost execution ownership becomes uncertain rather than being replayed.
 
 use super::Store;
-use super::harness_manager_v2::{ManagerAuthorityV2, fingerprint, now, refused};
+use super::harness_manager_v2::{ManagerAuthorityV2, fingerprint, now, refused, session_changed};
 use super::sessions::historical_session_restore_blocked_on;
 use crate::error::{DaemonError, Result};
 use chrono::Utc;
 use rsi_common::harness_manager_v2::*;
-use rsi_common::manager_budget::{BudgetNodeKindV1, CreationCapRefusalV1};
+use rsi_common::manager_budget::{BudgetNodeKindV1, CreationCapRefusalV1, CreationCapUsageV1};
 use rsi_common::manager_operator_delegation::DelegatedOperatorCallV1;
 use rsi_common::types::{SandboxCleanupState, SandboxKind, Session, SessionKind, SessionStatus};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -34,6 +34,96 @@ pub(crate) fn head_created_count(
         .count() as i64
 }
 
+/// #3416: a session creation count over a rolling window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreationWindowUsage {
+    /// Creations inside the window.
+    pub used: i64,
+    /// Every charged creation, window or not (informational).
+    pub lifetime: i64,
+    pub window_hours: u16,
+    /// RFC3339: when the next creation leaves the window and a slot frees.
+    pub next_free_at: Option<String>,
+}
+
+/// The `created_at` floor of the window ending at `now`.
+pub(crate) fn window_floor(now: chrono::DateTime<Utc>, window_hours: u16) -> String {
+    (now - chrono::Duration::hours(i64::from(window_hours)))
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// [`CreationWindowUsage`] over `times` (RFC3339, ascending, all charged
+/// creations of one counter).
+pub(crate) fn window_usage(
+    times: &[String],
+    window_hours: u16,
+    limit: i64,
+    now: chrono::DateTime<Utc>,
+) -> CreationWindowUsage {
+    let floor = window_floor(now, window_hours);
+    let first = times.partition_point(|t| t.as_str() < floor.as_str());
+    let inside = &times[first..];
+    let used = inside.len() as i64;
+    // At or over the limit, admission resumes when enough of the oldest have
+    // left to put the count back under it; under it, the count next drops
+    // when the oldest leaves.
+    let index = if used >= limit {
+        usize::try_from(used.saturating_sub(limit)).unwrap_or(0)
+    } else {
+        0
+    };
+    let next_free_at = inside.get(index).and_then(|t| {
+        chrono::DateTime::parse_from_rfc3339(t).ok().map(|t| {
+            (t.with_timezone(&Utc) + chrono::Duration::hours(i64::from(window_hours)))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
+    });
+    CreationWindowUsage {
+        used,
+        lifetime: times.len() as i64,
+        window_hours,
+        next_free_at,
+    }
+}
+
+/// The `limit` [`window_usage`] takes so that `next_free_at` is when `needed`
+/// creations (of which `counted` are already charged) fit under `cap`: the
+/// count is at or over it exactly when `used - counted + needed > cap`.
+pub(crate) fn creation_free_limit(cap: u16, needed: i64, counted: i64) -> i64 {
+    i64::from(cap)
+        .saturating_sub(needed)
+        .saturating_add(counted)
+        .saturating_add(1)
+}
+
+/// [`head_created_count`] as the ascending `created_at` of each charge, for
+/// the rolling creation window (#3416).
+pub(crate) fn head_created_times(
+    charges: &[(String, Option<Vec<Uuid>>)],
+    head: &super::harness_manager_v2::PortfolioHead,
+) -> Vec<String> {
+    let mut times: Vec<String> = charges
+        .iter()
+        .filter(|(created, lineage)| {
+            created.as_str() >= head.started.as_str()
+                && lineage
+                    .as_ref()
+                    .is_none_or(|lineage| lineage.contains(&head.node_id))
+        })
+        .map(|(created, _)| created.clone())
+        .collect();
+    times.sort();
+    times
+}
+
+/// One of the caller's own creation counts with its #3416 window facts.
+struct OwnCreationUsage {
+    used: i64,
+    lifetime: Option<i64>,
+    window_hours: Option<u16>,
+    next_free_at: Option<String>,
+}
+
 /// The policy field a creation budget charges (#2502).
 fn creation_cap_field(container: bool) -> &'static str {
     if container {
@@ -43,19 +133,23 @@ fn creation_cap_field(container: bool) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod eligibility_tests;
 pub mod fence;
 mod issue_worker;
 pub mod issue_worker_capacity;
 mod issue_worker_evidence;
+mod issue_worker_jobs;
 mod operator_delegation;
+mod queued_create;
 mod recovery;
 mod sandbox_source;
 mod superseded_wakes;
 
 pub(crate) const ACTION_KIND: &str = "lifecycle_action";
 /// #1118: independent `create_session` launches in one project may be
-/// `running` at once up to this many; every other action keeps the
-/// one-active-command-per-project fence.
+/// `running` at once up to this many. Build-cache reclaim may bypass running
+/// creates (#434); every other action keeps the one-active-command fence.
 pub const MANAGER_CREATE_PARALLELISM: i64 = 3;
 /// #1143: receipt outcome (state `uncertain`) of a launch whose deadline
 /// could not prove the candidate's process and task exited.
@@ -130,6 +224,18 @@ pub(super) const REVIEW_ALLOCATION_KEY_PREFIX: &str = "manager-review-allocation
 /// burn `max_created_sessions`.
 const CREATION_CHARGED: &str = "NOT (o.state IN ('blocked','revoked') AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=o.target_session_id))";
 
+/// #3495: the instant a charged operation `o` counts from in the rolling
+/// creation window, as a SQL expression: the `now` parameter (for example
+/// `?7`) goes between [`CREATION_AT_HEAD`] and [`CREATION_AT_TAIL`]. A queued
+/// or running operation has created nothing yet: its reservation stays charged as of `now`, however long it was held
+/// back, until it settles. Once created, the charge starts at the actual
+/// creation, once: the bound entity (`create_session`, lead replacement), or
+/// a succession's candidate session. Any other settled operation counts from
+/// the moment it settled.
+const CREATION_AT_HEAD: &str = "(CASE WHEN o.state IN ('queued','running') THEN ";
+/// See [`CREATION_AT_HEAD`].
+const CREATION_AT_TAIL: &str = " ELSE COALESCE((SELECT e.created_at FROM harness_manager_v2_entities e WHERE e.operation_id=o.id),(SELECT cs.created_at FROM manager_root_successions r JOIN sessions cs ON cs.id=r.candidate_session_id WHERE r.operation_id=o.id),o.updated_at) END)";
+
 /// Which caller runs [`Store::recovery_owner_gate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryOwnerMode {
@@ -184,6 +290,48 @@ pub(super) const UNCERTAINTY_CURRENT_AUTHORITY: &str = "(
        (e.lead_session_id IS json_extract(a.payload_json,'$.request.operation.expected.lead_session_id')
         AND g.generation=json_extract(a.payload_json,'$.request.operation.expected.lead_generation')))))";
 
+// #554: materialize only active lifecycle operations through the state-leading
+// due index. Each correlated fence then reads this set instead of project history.
+const CLAIM_ELIGIBLE_SQL: &str = "WITH active AS MATERIALIZED (
+             SELECT * FROM harness_manager_v2_operations
+              WHERE kind=?1 AND state IN ('running','uncertain')
+             ), eligible AS (
+             SELECT o.id,o.project_id,o.not_before,
+                    json_extract(o.payload_json,'$.origin.origin') AS origin,
+                    json_extract(o.payload_json,'$.request.operation.action') AS action
+               FROM harness_manager_v2_operations o WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
+             AND (?6=0 OR (json_extract(o.payload_json,'$.request.operation.action')='operator_call' AND json_extract(o.payload_json,'$.request.operation.call.method')='RunSandboxBuildCacheReclaim'))
+             AND (?3=0 OR json_extract(o.payload_json,'$.request.operation.action') NOT IN ('create_session','replace_lead','retry_lead','resume_lead'))
+             AND (?5=0 OR json_extract(o.payload_json,'$.request.operation.action')<>'create_session'
+                  OR json_extract(o.payload_json,'$.issue_binding.continue_from') IS NOT NULL)
+             AND NOT EXISTS(SELECT 1 FROM active a WHERE a.project_id=o.project_id AND a.kind=?1
+                AND a.id IS NOT json_extract(o.payload_json,'$.request.operation.operation_id') AND ((a.state='running' AND NOT (((json_extract(o.payload_json,'$.request.operation.action')='operator_call' AND json_extract(o.payload_json,'$.request.operation.call.method')='RunSandboxBuildCacheReclaim') OR (json_extract(o.payload_json,'$.request.operation.action')='create_session' AND json_extract(a.payload_json,'$.request.operation.parent_id') IS NOT json_extract(o.payload_json,'$.request.operation.parent_id'))) AND json_extract(a.payload_json,'$.request.operation.action')='create_session')) OR (a.state='uncertain' AND (a.target_session_id=o.target_session_id OR (json_extract(a.payload_json,'$.request.operation.epic_id')=json_extract(o.payload_json,'$.request.operation.epic_id') AND (
+    json_extract(a.payload_json,'$.request.operation.epic_id') IS NULL OR
+    EXISTS(SELECT 1 FROM sessions e JOIN epic_lead_generations g ON g.epic_id=e.id
+      WHERE e.id=json_extract(a.payload_json,'$.request.operation.epic_id') AND
+      (e.lead_session_id=a.target_session_id OR
+       (e.lead_session_id IS json_extract(a.payload_json,'$.request.operation.expected.lead_session_id')
+        AND g.generation=json_extract(a.payload_json,'$.request.operation.expected.lead_generation'))))))))))
+             AND (json_extract(o.payload_json,'$.request.operation.action')<>'create_session' OR (
+                  (SELECT COUNT(*) FROM active a WHERE a.project_id=o.project_id AND a.kind=?1 AND a.state='running')<?4
+              AND (NOT EXISTS(SELECT 1 FROM active a WHERE a.project_id=o.project_id AND a.kind=?1 AND a.state='running')
+                   OR NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations q WHERE q.project_id=o.project_id AND q.kind=?1 AND q.state='queued'
+                        AND json_extract(q.payload_json,'$.request.operation.action')<>'create_session' AND (q.not_before,q.id)<(o.not_before,o.id)))))
+             AND NOT EXISTS(SELECT 1 FROM manager_root_successions r JOIN sessions p ON p.id=r.predecessor_session_id
+                WHERE r.operation_id=o.id AND r.state='reserved'
+                  AND (p.status IN ('Starting','Running','WaitingApproval')
+                       OR EXISTS(SELECT 1 FROM daemon_settings d WHERE d.key='manager_operator_pause:'||p.id AND d.value<>'false'))
+                  AND r.authority_epoch=(SELECT epoch FROM manager_authority_epochs WHERE project_id=r.project_id)
+                  AND EXISTS(SELECT 1 FROM harness_manager_scopes h WHERE h.project_id=r.project_id AND h.row_version=r.scope_version))
+             ), oldest AS (SELECT * FROM eligible ORDER BY not_before,id LIMIT 1)
+             SELECT e.id,e.not_before FROM eligible e CROSS JOIN oldest first
+              WHERE e.id=first.id OR (
+                    first.origin='operating_intent'
+                AND first.action IN ('resume_lead','retry_lead','replace_lead')
+                AND e.project_id=first.project_id
+                AND e.origin='agent' AND e.action='create_session')
+              ORDER BY CASE WHEN e.id=first.id THEN 1 ELSE 0 END,e.not_before,e.id LIMIT 1";
+
 /// Coordinator-owned holds are persisted through the shared record helpers.
 /// Keys are disjoint so releasing resources cannot clear a human decision.
 pub const MANAGER_ACTION_HOLD_KIND: &str = "lifecycle_hold";
@@ -223,6 +371,10 @@ pub struct ManagerActionSourceV2 {
     pub session_id: Uuid,
     pub working_dir: PathBuf,
     pub sandbox_root: Option<PathBuf>,
+    /// #617: a container's original directory is still a lifecycle fence,
+    /// even when its registered project supplies the actual fork repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_working_dir: Option<PathBuf>,
     pub commit: String,
     pub custody_generation: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -297,6 +449,10 @@ pub struct ManagerIssueBindingV1 {
     /// reuses the original brief.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_of: Option<i64>,
+    /// Review default inferred from the latest handoff, frozen for exact replay.
+    /// The caller's operation keeps its original sandbox_source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_source_commit: Option<String>,
     /// #218: the same-project Issues the manager attached as read-only context
     /// (`related`). Their texts are copied into the brief as a snapshot; the
     /// worker may also read each live. Old bindings default to none.
@@ -527,6 +683,33 @@ impl Store {
     }
 }
 
+/// #3540: the `manager_v2_container_out_of_scope` refusal of `create_container`
+/// keeps its code (receipts classify on it) and says which rule refused, so a
+/// manager with no Group in scope reads the remedy instead of guessing. An Epic
+/// is only legal under a Group; a top-level Group needs the operator's
+/// `allow_create_groups` grant.
+fn create_container_refusal(
+    kind: SessionKind,
+    parent: Option<SessionKind>,
+    allow_create_groups: bool,
+) -> String {
+    const CODE: &str = "manager_v2_container_out_of_scope";
+    match (kind, parent) {
+        (SessionKind::Epic, None) => format!(
+            "{CODE}: an Epic is created under a Group; set parent_id to a Group in your scope{}",
+            if allow_create_groups {
+                ", or create a top-level Group first"
+            } else {
+                " (none is in scope and allow_create_groups is off: create_container for a top-level Group is refused until the operator or the global manager adds a Group to your scope or grants allow_create_groups)"
+            }
+        ),
+        (SessionKind::Group, None) if !allow_create_groups => format!(
+            "{CODE}: a top-level Group needs allow_create_groups, which your policy does not grant; ask the operator or the global manager to grant it or to add a Group to your scope"
+        ),
+        _ => CODE.to_string(),
+    }
+}
+
 fn state_name(state: ManagerActionStateV2) -> &'static str {
     match state {
         ManagerActionStateV2::Queued => "queued",
@@ -732,14 +915,11 @@ impl Store {
 
     fn manager_action_check_fence(&self, epic: Uuid, expected: &ManagerLeadFenceV2) -> Result<()> {
         let current = self.manager_action_lead_fence(epic)?;
-        if expected.lead_generation <= 0
-            || expected.event_sequence < 0
-            || current.lead_session_id != expected.lead_session_id
-            || current.lead_generation != expected.lead_generation
-            || current.event_sequence != expected.event_sequence
-            || current.custody_generation != expected.custody_generation
-        {
-            return Err(refused("manager_v2_lead_changed"));
+        let mismatched = lead_fence_mismatch(expected, &current);
+        if !mismatched.is_empty() {
+            return Err(refused(&format!(
+                "manager_v2_lead_changed: {mismatched}; read the current fence from AgentManagerInspect (lead_control row, `expected`)"
+            )));
         }
         Ok(())
     }
@@ -751,6 +931,19 @@ impl Store {
         check_version: bool,
     ) -> Result<Option<Session>> {
         use ManagerActionV2::*;
+        if let WithdrawQueuedCreate {
+            operation_id,
+            expected_row_version,
+        } = action
+        {
+            self.manager_withdraw_create_target(
+                authority,
+                *operation_id,
+                *expected_row_version,
+                check_version,
+            )?;
+            return Ok(None);
+        }
         if let SettleUncertainAction {
             operation_id,
             expected_row_version,
@@ -813,10 +1006,11 @@ impl Store {
                         || !rsi_common::is_leaf_kind(lead.session_kind)
                         || !rsi_common::legal_children(Some(SessionKind::Epic))
                             .contains(&lead.session_kind)
-                        || matches!(
-                            lead.status,
-                            SessionStatus::Archived | SessionStatus::Deleted
-                        )
+                        || (!matches!(action, ReplaceLead { .. })
+                            && matches!(
+                                lead.status,
+                                SessionStatus::Archived | SessionStatus::Deleted
+                            ))
                     {
                         return Err(refused("manager_v2_lead_out_of_scope"));
                     }
@@ -845,7 +1039,11 @@ impl Store {
                         && (!authority.grant.policy.allow_create_groups
                             || *kind != SessionKind::Group))
                 {
-                    return Err(refused("manager_v2_container_out_of_scope"));
+                    return Err(refused(&create_container_refusal(
+                        *kind,
+                        parent.as_ref().map(|s| s.session_kind),
+                        authority.grant.policy.allow_create_groups,
+                    )));
                 }
                 Ok(parent)
             }
@@ -936,7 +1134,7 @@ impl Store {
                         return Err(refused("manager_v2_policy_paused"));
                     }
                     if session.updated_at != *expected_updated_at {
-                        return Err(refused("manager_v2_session_changed"));
+                        return Err(session_changed(session.updated_at));
                     }
                     match action {
                         ArchiveSession { .. } => {
@@ -1552,38 +1750,151 @@ impl Store {
         )
     }
 
-    /// Lifetime-within-scope creation usage charged against
-    /// `max_created_{containers,sessions}` (#674). Reservations count as well
-    /// as committed creations, and policy edits do not reset it. DB-native
-    /// review launches are not charged, and a blocked or revoked operation
-    /// that never created its target is free.
+    /// Creation usage charged against `max_created_{containers,sessions}`
+    /// (#674). Reservations count as well as committed creations, and policy
+    /// edits do not reset it. DB-native review launches are not charged, and
+    /// a blocked or revoked operation that never created its target is free.
+    ///
+    /// #3416: the session count is the creations of the last
+    /// `created_sessions_window_hours` of the governing policy (24 when none
+    /// resolves), so it refills as the oldest creations leave the window. The
+    /// container count stays a lifetime-within-scope count. Use
+    /// [`Self::manager_v2_created_lifetime`] for the informational total.
     pub fn manager_v2_created_usage(
         &self,
         config: &rsi_common::harness_manager::HarnessManagerConfigV1,
         container: bool,
     ) -> Result<i64> {
-        let count: i64 = self.conn.query_row(&format!("SELECT count(*) FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.manager_session_id=?2 AND o.scope_version=?3 AND o.kind=?4 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?5)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED}"), params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,ACTION_KIND,if container { "[\"create_container\"]" } else { "[\"create_session\",\"replace_lead\",\"retry_lead\",\"succeed_manager\"]" }], |r|r.get(0))?;
         if container {
-            return Ok(count);
+            return self.manager_v2_created_lifetime(config, true);
         }
+        let hours = self.manager_creation_window_hours(config);
+        Ok(self
+            .manager_v2_created_window_usage_at(config, hours, i64::MAX, Utc::now())?
+            .used)
+    }
+
+    /// The rolling window (hours) of the policy that governs `config`
+    /// (#3416), or the default when none resolves.
+    pub fn manager_creation_window_hours(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    ) -> u16 {
+        self.manager_policy_for_config(config)
+            .ok()
+            .flatten()
+            .map_or(DEFAULT_CREATED_SESSIONS_WINDOW_HOURS, |grant| {
+                grant.policy.created_sessions_window_hours
+            })
+    }
+
+    /// Every charged creation of the seat lineage over the whole scope, with
+    /// no window (#3416: shown beside the windowed count, never compared with
+    /// the cap).
+    pub fn manager_v2_created_lifetime(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+    ) -> Result<i64> {
+        if container {
+            return self.manager_v2_created_container_count(config);
+        }
+        Ok(self
+            .manager_v2_created_session_times(config, "", Utc::now())?
+            .len() as i64)
+    }
+
+    fn manager_v2_created_container_count(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    ) -> Result<i64> {
+        Ok(self.conn.query_row(&format!("SELECT count(*) FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.manager_session_id=?2 AND o.scope_version=?3 AND o.kind=?4 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?5)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED}"), params![config.project_id.to_string(),config.manager_session_id.to_string(),config.row_version,ACTION_KIND,"[\"create_container\"]"], |r|r.get(0))?)
+    }
+
+    /// The `created_at` of each charged session creation at or after `since`
+    /// (`""`: all), oldest first. #3416: the one source both the windowed
+    /// count and the lifetime total read.
+    fn manager_v2_created_session_times(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        since: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        // #3495: a reservation that has not created its session yet is
+        // charged as of `now`; see [`CREATION_AT_HEAD`].
+        let now_stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let mut times: Vec<String> = {
+            let mut statement = self.conn.prepare(&format!("SELECT {CREATION_AT_HEAD}?7{CREATION_AT_TAIL} FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.manager_session_id=?2 AND o.scope_version=?3 AND o.kind=?4 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?5)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED} AND {CREATION_AT_HEAD}?7{CREATION_AT_TAIL}>=?6"))?; // sql-dynamic-ok: static CREATION_CHARGED clause
+            statement
+                .query_map(
+                    params![
+                        config.project_id.to_string(),
+                        config.manager_session_id.to_string(),
+                        config.row_version,
+                        ACTION_KIND,
+                        "[\"create_session\",\"replace_lead\",\"retry_lead\",\"succeed_manager\"]",
+                        since,
+                        now_stamp
+                    ],
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         // Root occurrences retain their creation charge across scope/appointment
         // changes. They are not a recovery and are counted exactly once. A
         // blocked or revoked occurrence never created its candidate and is
         // free, as its operation is (#1390).
-        let retained: i64 = self.conn.query_row(
-            "SELECT count(*) FROM manager_root_successions r WHERE r.project_id=?1 AND NOT (r.manager_session_id=?2 AND r.scope_version=?3) AND NOT (r.state IN ('blocked','revoked') AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=r.candidate_session_id))",
-            params![config.project_id.to_string(), config.manager_session_id.to_string(), config.row_version],
-            |r| r.get(0),
+        // #3495: a reserved or executing occurrence is charged as of `now`;
+        // a created one counts from its candidate session's creation.
+        let mut retained = self.conn.prepare(
+            concat!(
+                "SELECT (CASE WHEN r.state IN ('reserved','executing') THEN ?5 ELSE COALESCE((SELECT cs.created_at FROM sessions cs WHERE cs.id=r.candidate_session_id),r.updated_at) END) AS charged_at FROM manager_root_successions r WHERE r.project_id=?1 AND NOT (r.manager_session_id=?2 AND r.scope_version=?3) AND NOT (r.state IN ('blocked','revoked') AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.id=r.candidate_session_id)) AND charged_at>=?4",
+            ),
         )?;
+        times.extend(
+            retained
+                .query_map(
+                    params![
+                        config.project_id.to_string(),
+                        config.manager_session_id.to_string(),
+                        config.row_version,
+                        since,
+                        now_stamp
+                    ],
+                    |r| r.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
         // #633: sessions launched by topology executions this manager
         // requested in the current scope are charged to the same quota.
-        let topology = crate::store_support::topology_usage::topology_created_usage(
-            &self.conn,
-            config.project_id,
-            config.manager_session_id,
-            config.row_version,
-        )?;
-        Ok(count + retained + topology)
+        times.extend(
+            crate::store_support::topology_usage::topology_created_times(
+                &self.conn,
+                config.project_id,
+                config.manager_session_id,
+                config.row_version,
+                since,
+                now,
+            )?,
+        );
+        times.sort();
+        Ok(times)
+    }
+
+    /// #3416: the session creations of `config` inside the `window_hours`
+    /// before `now`, the lifetime total, and when a slot next frees against
+    /// `limit` (a count at or over it frees one when enough of the oldest
+    /// creations have left the window; under it, when the oldest leaves).
+    /// `now` is a parameter so a test injects the clock.
+    pub fn manager_v2_created_window_usage_at(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        window_hours: u16,
+        limit: i64,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<CreationWindowUsage> {
+        let all = self.manager_v2_created_session_times(config, "", now)?;
+        Ok(window_usage(&all, window_hours, limit, now))
     }
 
     /// Test fixture: journal a lifecycle operation in an exact state for the
@@ -1652,6 +1963,7 @@ impl Store {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let request = AgentManagerControlRequestV2::new(
             ManagerFenceV2 {
@@ -1693,14 +2005,33 @@ impl Store {
         container: bool,
         epic: bool,
     ) -> Result<()> {
-        let count = self.manager_v2_created_usage(&authority.config, container)?;
+        self.manager_action_creation_budget_at(authority, container, epic, Utc::now())
+    }
+
+    /// [`Self::manager_action_creation_budget`] at `now` (#3416: the rolling
+    /// window is judged against an injectable clock).
+    pub(super) fn manager_action_creation_budget_at(
+        &self,
+        authority: &ManagerAuthorityV2,
+        container: bool,
+        epic: bool,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
         let cap = if container {
             authority.grant.policy.max_created_containers
         } else {
             authority.grant.policy.max_created_sessions
         };
-        if count >= i64::from(cap) {
-            return Err(self.own_creation_refusal(&authority.config, container, count, cap)?);
+        // #3416: sessions count over the policy's rolling window.
+        let window = (!container).then_some(authority.grant.policy.created_sessions_window_hours);
+        let usage = self.own_creation_usage(&authority.config, container, window, cap, now)?;
+        if usage.used >= i64::from(cap) {
+            return Err(self.own_creation_refusal_with(
+                &authority.config,
+                container,
+                &usage,
+                cap,
+            )?);
         }
         self.manager_ancestor_creation_budget(authority, container)?;
         if epic && !authority.config.has_dynamic_scope() {
@@ -1716,6 +2047,7 @@ impl Store {
     /// spent. The refusal names the principal's node (its portfolio node,
     /// its project, or the delegate seat), the cap, used/limit and the TUI
     /// path that raises it. The count runs over the current scope.
+    #[cfg(test)]
     pub(super) fn own_creation_refusal(
         &self,
         config: &rsi_common::harness_manager::HarnessManagerConfigV1,
@@ -1723,6 +2055,147 @@ impl Store {
         used: i64,
         cap: u16,
     ) -> Result<DaemonError> {
+        let window = (!container).then(|| self.manager_creation_window_hours(config));
+        let mut usage = self.own_creation_usage(config, container, window, cap, Utc::now())?;
+        usage.used = used;
+        self.own_creation_refusal_with(config, container, &usage, cap)
+    }
+
+    /// [`Self::own_creation_refusal`] over a usage already read (#3416: the
+    /// refusal names the window, the count and when a slot frees).
+    fn own_creation_refusal_with(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        usage: &OwnCreationUsage,
+        cap: u16,
+    ) -> Result<DaemonError> {
+        self.own_creation_refusal_for(config, container, usage, cap, 1, 0)
+    }
+
+    /// [`Self::own_creation_refusal_with`] for `needed` creations of which
+    /// `counted` are already charged (#3497: a topology launch asks for one
+    /// per session node).
+    fn own_creation_refusal_for(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        usage: &OwnCreationUsage,
+        cap: u16,
+        needed: i64,
+        counted: i64,
+    ) -> Result<DaemonError> {
+        let cap_field = creation_cap_field(container);
+        let (node_kind, node_id, window_start, raise_in) =
+            self.own_creation_raise(config, cap_field, usage.used, cap)?;
+        Ok(DaemonError::InvalidParam(
+            CreationCapRefusalV1 {
+                code: rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT.to_string(),
+                node_kind,
+                node_id,
+                project_id: config.project_id,
+                cap_field: cap_field.to_string(),
+                used: usage.used,
+                limit: i64::from(cap),
+                needed,
+                counted,
+                window_start,
+                raise_in,
+                window_hours: usage.window_hours,
+                next_free_at: usage.next_free_at.clone(),
+            }
+            .message(),
+        ))
+    }
+
+    /// The caller's own usage against one creation cap: the rolling window
+    /// for sessions (`window` hours), the scope lifetime for containers
+    /// (#3416).
+    fn own_creation_usage(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        window: Option<u16>,
+        cap: u16,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<OwnCreationUsage> {
+        match window {
+            Some(hours) if !container => {
+                let usage =
+                    self.manager_v2_created_window_usage_at(config, hours, i64::from(cap), now)?;
+                Ok(OwnCreationUsage {
+                    used: usage.used,
+                    lifetime: Some(usage.lifetime),
+                    window_hours: Some(hours),
+                    next_free_at: usage.next_free_at,
+                })
+            }
+            _ => Ok(OwnCreationUsage {
+                used: self.manager_v2_created_usage(config, container)?,
+                lifetime: None,
+                window_hours: None,
+                next_free_at: None,
+            }),
+        }
+    }
+
+    /// #206: the caller's own creation caps (sessions, then containers),
+    /// each counted ([`Self::manager_v2_created_usage`]) and limited (the
+    /// policy that governs `config`) exactly as
+    /// [`Self::manager_action_creation_budget`] refuses on, with the raise
+    /// path that refusal prints. Empty when no live policy governs `config`
+    /// (absent, revoked, or an area node authority that no longer resolves),
+    /// so a read of it never fails the snapshot it is part of.
+    ///
+    /// # Errors
+    /// A persistence error.
+    pub fn manager_own_creation_caps(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+    ) -> Result<Vec<CreationCapUsageV1>> {
+        let grant = match self.manager_policy_for_config(config) {
+            Ok(grant) => grant,
+            Err(DaemonError::InvalidParam(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let Some(grant) = grant.filter(|grant| !grant.revoked) else {
+            return Ok(Vec::new());
+        };
+        let mut caps = Vec::with_capacity(2);
+        for container in [false, true] {
+            let cap = if container {
+                grant.policy.max_created_containers
+            } else {
+                grant.policy.max_created_sessions
+            };
+            let window = (!container).then_some(grant.policy.created_sessions_window_hours);
+            let usage = self.own_creation_usage(config, container, window, cap, Utc::now())?;
+            let cap_field = creation_cap_field(container);
+            let (_, _, _, raise_in) =
+                self.own_creation_raise(config, cap_field, usage.used, cap)?;
+            caps.push(CreationCapUsageV1 {
+                cap_field: cap_field.to_string(),
+                used: usage.used,
+                limit: i64::from(cap),
+                raise_in,
+                window_hours: usage.window_hours,
+                next_free_at: usage.next_free_at,
+                lifetime_total: usage.lifetime,
+            });
+        }
+        Ok(caps)
+    }
+
+    /// The node a caller's own creation cap belongs to, its counting window
+    /// and the exact path that raises it (#2502, #3028), shared by the
+    /// refusal and the #206 early warning so the two never disagree.
+    fn own_creation_raise(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        cap_field: &str,
+        used: i64,
+        cap: u16,
+    ) -> Result<(BudgetNodeKindV1, Uuid, Option<String>, String)> {
         let (_, own) = self.portfolio_ancestors_of(config)?;
         let (node_kind, node_id, window_start) = match own {
             Some(head) => (
@@ -1738,7 +2211,6 @@ impl Store {
             }
             None => (BudgetNodeKindV1::Delegate, config.manager_session_id, None),
         };
-        let cap_field = creation_cap_field(container);
         let mut raise_in = CreationCapRefusalV1::raise_path(node_kind, node_id, cap_field);
         // #3028: a satellite seat whose policy a hub pushed is raised by the
         // hub's PM, not the operator; the operator path stays as the fallback.
@@ -1749,22 +2221,44 @@ impl Store {
             raise_in =
                 CreationCapRefusalV1::hub_report_path(cap_field, used, i64::from(cap), &raise_in);
         }
-        Ok(DaemonError::InvalidParam(
-            CreationCapRefusalV1 {
-                code: rsi_common::manager_budget::MANAGER_V2_CREATION_LIMIT.to_string(),
-                node_kind,
-                node_id,
-                project_id: config.project_id,
-                cap_field: cap_field.to_string(),
-                used,
-                limit: i64::from(cap),
-                needed: 1,
-                counted: 0,
-                window_start,
-                raise_in,
-            }
-            .message(),
-        ))
+        Ok((node_kind, node_id, window_start, raise_in))
+    }
+
+    /// #3497: whether a topology launch of `needed` session creations (of
+    /// which `counted` are already charged, a relaunch) fits the caller's own
+    /// rolling-window allowance (`cap` creations per `window_hours`) and then
+    /// every ancestor's, judged at `now`. A refusal is the shared typed
+    /// [`CreationCapRefusalV1`] message the lifecycle creation path returns:
+    /// the governing window, used/limit, the slots this launch needs and when
+    /// enough of the oldest creations have left the window to admit it.
+    ///
+    /// # Errors
+    /// The creation refusal, or a persistence error.
+    pub fn manager_topology_creation_allowance_at(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        cap: u16,
+        window_hours: u16,
+        needed: i64,
+        counted: i64,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        let usage = self.manager_v2_created_window_usage_at(
+            config,
+            window_hours,
+            creation_free_limit(cap, needed, counted),
+            now,
+        )?;
+        if (usage.used - counted).saturating_add(needed) > i64::from(cap) {
+            let own = OwnCreationUsage {
+                used: usage.used,
+                lifetime: Some(usage.lifetime),
+                window_hours: Some(window_hours),
+                next_free_at: usage.next_free_at,
+            };
+            return Err(self.own_creation_refusal_for(config, false, &own, cap, needed, counted)?);
+        }
+        self.manager_ancestor_creation_allowance_at(config, false, needed, counted, now)
     }
 
     /// #1235 rule (d), budgets are charged up the chain: an admission in a
@@ -1798,6 +2292,19 @@ impl Store {
         needed: i64,
         counted: i64,
     ) -> Result<()> {
+        self.manager_ancestor_creation_allowance_at(config, container, needed, counted, Utc::now())
+    }
+
+    /// [`Self::manager_ancestor_creation_allowance`] judged at `now` (#3497:
+    /// the rolling window reads an injectable clock).
+    pub fn manager_ancestor_creation_allowance_at(
+        &self,
+        config: &rsi_common::harness_manager::HarnessManagerConfigV1,
+        container: bool,
+        needed: i64,
+        counted: i64,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<()> {
         let (ancestors, own) = self.portfolio_ancestors_of(config)?;
         let charged: Vec<_> = ancestors
             .iter()
@@ -1807,7 +2314,7 @@ impl Store {
         let Some(since) = charged.iter().map(|(head, _)| head.started.as_str()).min() else {
             return Ok(());
         };
-        let charges = self.portfolio_creation_charges(config.project_id, container, since)?;
+        let charges = self.portfolio_creation_charges(config.project_id, container, since, now)?;
         for (head, is_own) in charged {
             let policy = &head.record.grant.project_policy;
             let cap = if container {
@@ -1815,7 +2322,19 @@ impl Store {
             } else {
                 policy.max_created_sessions
             };
-            let count = head_created_count(&charges, head);
+            // #3416: sessions count over the head's rolling window.
+            let (count, window_hours, next_free_at) = if container {
+                (head_created_count(&charges, head), None, None)
+            } else {
+                let hours = policy.created_sessions_window_hours;
+                let usage = window_usage(
+                    &head_created_times(&charges, head),
+                    hours,
+                    creation_free_limit(cap, needed, counted),
+                    now,
+                );
+                (usage.used, Some(hours), usage.next_free_at)
+            };
             if (count - counted).saturating_add(needed) > i64::from(cap) {
                 // #2502: name the node, the cap, used/limit and where to
                 // raise it, whether it is the caller's own node or above it.
@@ -1842,6 +2361,8 @@ impl Store {
                             head.node_id,
                             cap_field,
                         ),
+                        window_hours,
+                        next_free_at,
                     }
                     .message(),
                 ));
@@ -1861,23 +2382,30 @@ impl Store {
         project: Uuid,
         container: bool,
         since: &str,
+        now: chrono::DateTime<Utc>,
     ) -> Result<Vec<(String, Option<Vec<Uuid>>)>> {
         let actions = if container {
             "[\"create_container\"]"
         } else {
             "[\"create_session\",\"replace_lead\",\"retry_lead\",\"succeed_manager\"]"
         };
-        let mut statement = self.conn.prepare(&format!("SELECT o.created_at,o.manager_session_id,o.scope_version FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.kind=?2 AND o.created_at>=?3 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?4)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED}"))?; // sql-dynamic-ok: static CREATION_CHARGED clause
+        let mut statement = self.conn.prepare(&format!("SELECT {CREATION_AT_HEAD}?5{CREATION_AT_TAIL},o.manager_session_id,o.scope_version FROM harness_manager_v2_operations o WHERE o.project_id=?1 AND o.kind=?2 AND {CREATION_AT_HEAD}?5{CREATION_AT_TAIL}>=?3 AND json_extract(o.payload_json,'$.request.operation.action') IN (SELECT value FROM json_each(?4)) AND NOT EXISTS(SELECT 1 FROM manager_review_assignments r WHERE r.action_operation_id=o.id) AND {CREATION_CHARGED}"))?; // sql-dynamic-ok: static CREATION_CHARGED clause
         let mut rows: Vec<(String, Option<String>, Option<i64>)> = statement
             .query_map(
-                params![project.to_string(), ACTION_KIND, since, actions],
+                params![
+                    project.to_string(),
+                    ACTION_KIND,
+                    since,
+                    actions,
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if !container {
             rows.extend(
                 crate::store_support::topology_usage::topology_created_charges_since(
-                    &self.conn, project, since,
+                    &self.conn, project, since, now,
                 )?,
             );
         }
@@ -1977,6 +2505,7 @@ impl Store {
             session_id: source.id,
             working_dir: source.working_dir.clone(),
             sandbox_root: source.sandbox_root.clone(),
+            parent_working_dir: None,
             commit,
             custody_generation: self.manager_action_custody_generation(source.id)?,
             historical_commit: false,
@@ -2003,6 +2532,7 @@ impl Store {
                 session_id: source.id,
                 working_dir: reclaimed.repository,
                 sandbox_root: None,
+                parent_working_dir: None,
                 commit: expected_commit.to_string(),
                 custody_generation: Some(reclaimed.generation as i64),
                 historical_commit: true,
@@ -2026,6 +2556,7 @@ impl Store {
             session_id: source.id,
             working_dir: source.working_dir.clone(),
             sandbox_root: source.sandbox_root.clone(),
+            parent_working_dir: None,
             commit: expected_commit.to_string(),
             custody_generation: self
                 .manager_action_custody_generation(source.id)
@@ -2106,29 +2637,29 @@ impl Store {
                 source = Some(if let Some(source) = review_source {
                     source.clone()
                 } else {
-                    let source_session = target.as_ref().ok_or_else(|| {
-                        // `replace_lead` forks from the current lead. An Epic
-                        // with no lead needs `create_session` + `assign_lead`;
-                        // say so instead of a generic source refusal.
-                        if matches!(request.operation, ReplaceLead { .. }) {
-                            refused("manager_v2_replace_lead_requires_lead_use_create_session")
-                        } else {
-                            refused("manager_v2_source_unavailable")
-                        }
-                    })?;
                     match &request.operation {
                         // #1195: a new worker branches from published rolling
                         // (or the named commit/worktree), never from whatever
                         // the shared checkout happens to have checked out.
                         CreateSession { sandbox_source, .. } => self
-                            .manager_action_selected_source(
-                                source_session,
+                            .manager_action_selected_project_source(
+                                target
+                                    .as_ref()
+                                    .ok_or_else(|| refused("manager_v2_source_unavailable"))?,
                                 sandbox_source.as_ref(),
                             )?,
-                        _ => {
-                            let epic = action_epic(&request.operation).expect("replace epic");
-                            self.manager_lead_handover_source(authority, source_session, epic)?
-                        }
+                        ReplaceLead { epic_id, .. } => match target.as_ref() {
+                            Some(lead) => {
+                                self.manager_lead_handover_source(authority, lead, *epic_id)?
+                            }
+                            None => {
+                                let epic = self.manager_v2_require_epic(authority, *epic_id)?;
+                                self.manager_action_selected_source(&epic, None).map_err(|_| refused(
+                                    "manager_v2_replace_lead_source_unavailable: restore the Epic repository and published origin/rolling, then retry replace_lead"
+                                ))?
+                            }
+                        },
+                        _ => unreachable!("create or replace"),
                     }
                 });
                 launch = Some(choice.clone());
@@ -2333,7 +2864,7 @@ impl Store {
             let epic = action_epic(&request.operation).expect("lead action");
             self.manager_v2_inherit_lead_pause(&authority.config, epic)?;
         }
-        let admission = self.manager_action_admission(
+        let mut admission = self.manager_action_admission(
             &authority,
             &origin,
             &request,
@@ -2341,6 +2872,30 @@ impl Store {
             true,
             review_source,
         )?;
+        // A review_of default changes only the frozen fork, not the caller's
+        // operation or the ordinary worker admission/capacity policy.
+        if let Some(commit) =
+            issue_binding.and_then(|binding| binding.review_source_commit.as_ref())
+            && matches!(
+                &request.operation,
+                CreateSession {
+                    sandbox_source: None,
+                    ..
+                }
+            )
+        {
+            let source = admission
+                .source
+                .as_ref()
+                .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            let session = self
+                .get_session(source.session_id)?
+                .ok_or_else(|| refused("manager_v2_source_unavailable"))?;
+            admission.source = Some(self.manager_action_selected_project_source(
+                &session,
+                Some(&ManagerSandboxSourceV1::Commit(commit.clone())),
+            )?);
+        }
         let id = admission.target_session_id;
         let operation_id = Uuid::new_v4();
         let receipt = ManagerActionReceiptV2 {
@@ -2359,6 +2914,7 @@ impl Store {
                 .as_ref()
                 .and_then(sandbox_source::sandbox_source_receipt),
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let stamp = now();
         let due = (Utc::now() + chrono::Duration::seconds(i64::from(admission.delay_seconds)))
@@ -2593,7 +3149,13 @@ impl Store {
         hold_worker_starts: bool,
         hold_creates: bool,
     ) -> Result<Option<ManagerActionClaimV2>> {
-        self.claim_manager_action_with_admission(boot_id, hold_worker_starts, hold_creates, None)
+        self.claim_manager_action_with_admission(
+            boot_id,
+            hold_worker_starts,
+            hold_creates,
+            None,
+            false,
+        )
     }
 
     /// Consult admission only for the oldest eligible new create. The callback
@@ -2605,7 +3167,23 @@ impl Store {
         hold_worker_starts: bool,
         admit: &dyn Fn(Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>) -> bool,
     ) -> Result<Option<ManagerActionClaimV2>> {
-        self.claim_manager_action_with_admission(boot_id, hold_worker_starts, false, Some(admit))
+        self.claim_manager_action_with_admission(
+            boot_id,
+            hold_worker_starts,
+            false,
+            Some(admit),
+            false,
+        )
+    }
+
+    /// #434: the coordinator reserves an extra slot for disk-freeing work when
+    /// its ordinary slots (or batch budget) are occupied by slow launches.
+    /// This uses the same claim and authority fences, restricted to reclaim.
+    pub fn claim_manager_build_cache_reclaim(
+        &self,
+        boot_id: Uuid,
+    ) -> Result<Option<ManagerActionClaimV2>> {
+        self.claim_manager_action_with_admission(boot_id, false, false, None, true)
     }
 
     fn claim_manager_action_with_admission(
@@ -2614,6 +3192,7 @@ impl Store {
         hold_worker_starts: bool,
         hold_creates: bool,
         admit: Option<&dyn Fn(Uuid, chrono::DateTime<chrono::Utc>, Option<Uuid>) -> bool>,
+        reclaim_only: bool,
     ) -> Result<Option<ManagerActionClaimV2>> {
         // Avoid an immediate write transaction and the full conflict/admission
         // query on idle ticks. The due index excludes settled history and
@@ -2662,7 +3241,8 @@ impl Store {
             }
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        // One active command per project, even across independent daemon handles.
+        // One active command per project except independent creates and
+        // reclaim bypassing creates, even across independent daemon handles.
         // An uncertain command fences only conflicting targets, not all future work.
         // Preserve the oldest eligible claim except when that claim is
         // automatic lead recovery and a due agent-created child in the same
@@ -2672,38 +3252,24 @@ impl Store {
         // same-parent (or unreadable-parent: `IS NOT` fails closed) running
         // create fences the candidate; the runtime keeps a matching
         // per-parent guard (`manager_create_parent_guard_key`).
-        const CREATE_PAIR: &str =
-            "json_extract(o.payload_json,'$.request.operation.action')='create_session'";
-        let selected:Option<(String,String)>=self.conn.query_row(
-            &format!("WITH eligible AS (
-             SELECT o.id,o.project_id,o.not_before,
-                    json_extract(o.payload_json,'$.origin.origin') AS origin,
-                    json_extract(o.payload_json,'$.request.operation.action') AS action
-               FROM harness_manager_v2_operations o WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
-             AND (?3=0 OR json_extract(o.payload_json,'$.request.operation.action') NOT IN ('create_session','replace_lead','retry_lead','resume_lead'))
-             AND (?5=0 OR json_extract(o.payload_json,'$.request.operation.action')<>'create_session'
-                  OR json_extract(o.payload_json,'$.issue_binding.continue_from') IS NOT NULL)
-             AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations a WHERE a.project_id=o.project_id AND a.kind=?1
-                AND a.id IS NOT json_extract(o.payload_json,'$.request.operation.operation_id') AND ((a.state='running' AND NOT ({CREATE_PAIR} AND json_extract(a.payload_json,'$.request.operation.action')='create_session' AND json_extract(a.payload_json,'$.request.operation.parent_id') IS NOT json_extract(o.payload_json,'$.request.operation.parent_id'))) OR (a.state='uncertain' AND (a.target_session_id=o.target_session_id OR (json_extract(a.payload_json,'$.request.operation.epic_id')=json_extract(o.payload_json,'$.request.operation.epic_id') AND {UNCERTAINTY_CURRENT_AUTHORITY})))))
-             AND (json_extract(o.payload_json,'$.request.operation.action')<>'create_session' OR (
-                  (SELECT COUNT(*) FROM harness_manager_v2_operations a WHERE a.project_id=o.project_id AND a.kind=?1 AND a.state='running')<?4
-              AND (NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations a WHERE a.project_id=o.project_id AND a.kind=?1 AND a.state='running')
-                   OR NOT EXISTS(SELECT 1 FROM harness_manager_v2_operations q WHERE q.project_id=o.project_id AND q.kind=?1 AND q.state='queued'
-                        AND json_extract(q.payload_json,'$.request.operation.action')<>'create_session' AND (q.not_before,q.id)<(o.not_before,o.id)))))
-             AND NOT EXISTS(SELECT 1 FROM manager_root_successions r JOIN sessions p ON p.id=r.predecessor_session_id
-                WHERE r.operation_id=o.id AND r.state='reserved'
-                  AND (p.status IN ('Starting','Running','WaitingApproval')
-                       OR EXISTS(SELECT 1 FROM daemon_settings d WHERE d.key='manager_operator_pause:'||p.id AND d.value<>'false'))
-                  AND r.authority_epoch=(SELECT epoch FROM manager_authority_epochs WHERE project_id=r.project_id)
-                  AND EXISTS(SELECT 1 FROM harness_manager_scopes h WHERE h.project_id=r.project_id AND h.row_version=r.scope_version))
-             ), oldest AS (SELECT * FROM eligible ORDER BY not_before,id LIMIT 1)
-             SELECT e.id,e.not_before FROM eligible e CROSS JOIN oldest first
-              WHERE e.id=first.id OR (
-                    first.origin='operating_intent'
-                AND first.action IN ('resume_lead','retry_lead','replace_lead')
-                AND e.project_id=first.project_id
-                AND e.origin='agent' AND e.action='create_session')
-              ORDER BY CASE WHEN e.id=first.id THEN 1 ELSE 0 END,e.not_before,e.id LIMIT 1"),params![ACTION_KIND,now(),i64::from(hold_worker_starts),MANAGER_CREATE_PARALLELISM,i64::from(hold_creates)],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        // Only reclaim may pass a running create. Reclaims still serialize
+        // with each other and all other actions, and creates never pass a
+        // running reclaim. Custody checks remain in the reclaim worker.
+        let selected: Option<(String, String)> = self
+            .conn
+            .query_row(
+                CLAIM_ELIGIBLE_SQL,
+                params![
+                    ACTION_KIND,
+                    now(),
+                    i64::from(hold_worker_starts),
+                    MANAGER_CREATE_PARALLELISM,
+                    i64::from(hold_creates),
+                    i64::from(reclaim_only)
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         let Some((id, not_before)) = selected else {
             return Ok(None);
         };
@@ -2806,6 +3372,49 @@ impl Store {
         Ok(true)
     }
 
+    /// #495: only a pre-effect create whose allocator cleaned up may retry.
+    /// Keep the charged attempt count across restarts and other admission holds.
+    pub fn requeue_sandbox_git_timeout(&self, claim: &ManagerActionClaimV2) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let op = self.manager_action_assert_claim(claim)?;
+        let attempts: i64 = self.conn.query_row(
+            "SELECT attempts FROM harness_manager_v2_operations WHERE id=?1",
+            [claim.id().to_string()],
+            |row| row.get(0),
+        )?;
+        if op.effect_started || !op.is_new_worker_create() || attempts >= 3 {
+            return Ok(false);
+        }
+        let mut receipt = op.receipt;
+        receipt.state = ManagerActionStateV2::Queued;
+        receipt.outcome = Some("sandbox_git_timeout".into());
+        receipt.row_version += 1;
+        receipt.refresh_action_metadata(&op.context.request.operation);
+        let retry_at = (chrono::Utc::now() + chrono::Duration::seconds(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.conn.execute(
+            "UPDATE harness_manager_v2_operations SET state='queued',row_version=?2,outcome_json=?3,claim_boot_id=NULL,not_before=?4,updated_at=?5 WHERE id=?1",
+            params![claim.id().to_string(), receipt.row_version, serde_json::to_string(&receipt)?, retry_at, now()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Durable cooldown, also available after a daemon restart. Once due, the
+    /// ordinary host/deploy admission view explains any remaining hold.
+    pub fn sandbox_git_timeout_retry_at(&self, id: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT not_before FROM harness_manager_v2_operations
+             WHERE id=?1 AND state='queued' AND not_before>?2
+             AND json_extract(outcome_json,'$.outcome')='sandbox_git_timeout'",
+                params![id.to_string(), now()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn recover_manager_actions_startup(&self, boot_id: Uuid) -> Result<usize> {
         self.recover_manager_action_claims(Some(boot_id))
     }
@@ -2905,6 +3514,7 @@ impl Store {
         // #967: a DB review launch whose assignment already ended must not
         // start (or continue toward) a reviewer provider turn.
         self.require_manager_review_launch_live(&op)?;
+        self.require_issue_worker_launch_live(&op)?;
         let authority =
             self.manager_stored_action_authority(&op.context.origin, &op.context.request)?;
         // An appointment rotation cannot make a stored daemon intent act under a
@@ -2917,7 +3527,17 @@ impl Store {
         }
         let mut action = op.context.request.operation.clone();
         let review_evidence_action = self.manager_review_evidence_action(&op)?;
-        if let Some(settled) = op.settled_fence {
+        if let Some(mut settled) = op.settled_fence {
+            // A lost-lead replacement publishes its candidate before dispatch.
+            // Its own first turn may append events; only the lead identity,
+            // generation and custody remain assignment fences in this phase.
+            if matches!(action, ManagerActionV2::ReplaceLead { .. })
+                && settled.lead_session_id == op.context.target_session_id
+            {
+                settled.event_sequence = self
+                    .manager_action_lead_fence(action_epic(&action).expect("replacement epic"))?
+                    .event_sequence;
+            }
             match &mut action {
                 ManagerActionV2::PauseLead { expected, .. }
                 | ManagerActionV2::ReplaceLead { expected, .. }
@@ -3155,6 +3775,66 @@ impl Store {
         Ok(())
     }
 
+    /// Seat a lost lead's replacement after durable custody admission, before
+    /// token mint or provider dispatch. A failed launch retains this recoverable
+    /// lead; it never restores an archived predecessor or overwrites a new lead.
+    pub fn publish_manager_lost_lead_replacement(
+        &self,
+        claim: &ManagerActionClaimV2,
+    ) -> Result<bool> {
+        let ManagerActionV2::ReplaceLead {
+            epic_id, expected, ..
+        } = claim.action()
+        else {
+            return Ok(false);
+        };
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let authority = self.manager_action_runtime_gate_on(claim)?;
+        if let Some(old) = expected.lead_session_id {
+            let old = self
+                .get_session(old)?
+                .ok_or_else(|| refused("manager_v2_lead_unavailable"))?;
+            if !matches!(old.status, SessionStatus::Archived | SessionStatus::Deleted) {
+                return Ok(false);
+            }
+        }
+        let target = claim
+            .operation
+            .context
+            .target_session_id
+            .expect("replacement candidate");
+        let candidate = self
+            .get_session(target)?
+            .ok_or_else(|| refused("manager_v2_candidate_unavailable"))?;
+        if candidate.status != SessionStatus::Starting
+            || candidate.parent_id != Some(*epic_id)
+            || candidate.project_id != Some(claim.operation.project_id)
+            || !rsi_common::is_leaf_kind(candidate.session_kind)
+            || self.is_non_lead_worker_session(target)?
+            || self.session_model_invocation_id(target)?.is_none()
+        {
+            return Err(refused("manager_v2_candidate_changed"));
+        }
+        self.set_lead_session(*epic_id, Some(target))?;
+        let key = claim.id().to_string();
+        let prior = self.manager_v2_record(&authority.config, EXECUTION_KIND, &key)?;
+        let mut payload = prior
+            .as_ref()
+            .map(|r| r.payload.clone())
+            .unwrap_or(json!({}));
+        payload["settled_fence"] = serde_json::to_value(self.manager_action_lead_fence(*epic_id)?)?;
+        self.manager_v2_put_record(
+            &authority.config,
+            EXECUTION_KIND,
+            &key,
+            Some(*epic_id),
+            prior.map_or(0, |r| r.row_version),
+            &payload,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// A manager continuation publishes its admitted invocation before the
     /// backend effect, rather than relying on the generic asynchronous mirror.
     pub fn bind_manager_resume_invocation(
@@ -3187,8 +3867,20 @@ impl Store {
         state: ManagerActionStateV2,
         outcome: &str,
     ) -> Result<ManagerActionReceiptV2> {
+        self.finish_manager_action_detailed(claim, state, outcome, None)
+    }
+
+    /// `finish_manager_action` plus the bounded `outcome_detail` (#3640): the
+    /// redacted error behind a catch-all outcome, kept on the receipt.
+    pub fn finish_manager_action_detailed(
+        &self,
+        claim: &ManagerActionClaimV2,
+        state: ManagerActionStateV2,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<ManagerActionReceiptV2> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let receipt = self.finish_manager_action_on(claim, state, outcome)?;
+        let receipt = self.finish_manager_action_result_on(claim, state, outcome, None, detail)?;
         tx.commit()?;
         // #1553: a launch that ends without its worker tells its Issue. Best
         // effort: the receipt is already durable and is the record.
@@ -3227,7 +3919,7 @@ impl Store {
         state: ManagerActionStateV2,
         outcome: &str,
     ) -> Result<ManagerActionReceiptV2> {
-        self.finish_manager_action_result_on(claim, state, outcome, None)
+        self.finish_manager_action_result_on(claim, state, outcome, None, None)
     }
 
     /// `finish_manager_action_on` plus the bounded K14 `operator_result`.
@@ -3237,6 +3929,7 @@ impl Store {
         state: ManagerActionStateV2,
         outcome: &str,
         operator_result: Option<rsi_common::manager_operator_delegation::OperatorCallResultV1>,
+        detail: Option<&str>,
     ) -> Result<ManagerActionReceiptV2> {
         if let Some(result) = &operator_result {
             result.validate().map_err(refused)?;
@@ -3250,10 +3943,11 @@ impl Store {
         text(outcome, 256).map_err(refused)?;
         let op = self.manager_action_assert_claim(claim)?;
         let state = self.finish_manager_succession_on(claim.id(), state)?;
-        let mut receipt = op.receipt;
+        let mut receipt = op.receipt.clone();
         receipt.state = state;
         receipt.row_version += 1;
         receipt.outcome = Some(outcome.into());
+        receipt.outcome_detail = detail.map(bounded_outcome_detail);
         receipt.refresh_action_metadata(&op.context.request.operation);
         receipt.operator_result = operator_result.map(Box::new);
         // #2652: a succeeded `succeed_manager` names the wakes its publication
@@ -3268,6 +3962,24 @@ impl Store {
         let changed=self.conn.execute("UPDATE harness_manager_v2_operations SET state=?2,row_version=?3,outcome_json=?4,updated_at=?5 WHERE id=?1 AND state='running' AND row_version=?6 AND claim_boot_id=?7",params![claim.id().to_string(),state_name(state),receipt.row_version,serde_json::to_string(&receipt)?,now(),claim.operation.receipt.row_version,claim.boot_id.to_string()])?;
         if changed != 1 {
             return Err(refused("manager_v2_claim_changed"));
+        }
+        if state == ManagerActionStateV2::Succeeded
+            && op
+                .context
+                .issue_binding
+                .as_ref()
+                .is_some_and(|b| b.continue_from.is_some())
+            && let Some(successor) = op.context.target_session_id
+        {
+            self.carry_worker_job_wakes_on(successor)?;
+        }
+        if matches!(
+            state,
+            ManagerActionStateV2::Failed
+                | ManagerActionStateV2::Blocked
+                | ManagerActionStateV2::Revoked
+        ) {
+            self.retire_unstarted_issue_worker_watch_on(&op)?;
         }
         // #2455: a failure that finishes after its scope changed is retired
         // by the queue trigger; hand it to the current owner in this commit.
@@ -3670,11 +4382,19 @@ impl Store {
                 return Err(refused("manager_v2_candidate_changed"));
             }
         }
+        let op = self.manager_action_assert_claim(claim)?;
+        let preassigned = matches!(claim.action(), ManagerActionV2::ReplaceLead { .. })
+            && op
+                .settled_fence
+                .as_ref()
+                .is_some_and(|f| f.lead_session_id == target);
         let expected = action_fence(claim.action()).expect("lead fence");
         self.reject_nonterminal_agent_successor_epic_lead_mutation(epic)?;
-        let changed=self.conn.execute("UPDATE sessions SET lead_session_id=?2,updated_at=?3 WHERE id=?1 AND lead_session_id IS ?4 AND EXISTS(SELECT 1 FROM epic_lead_generations WHERE epic_id=?1 AND generation=?5)",params![epic.to_string(),target.map(|v|v.to_string()),now(),expected.lead_session_id.map(|v|v.to_string()),expected.lead_generation])?;
-        if changed != 1 {
-            return Err(refused("manager_v2_lead_changed"));
+        if !preassigned {
+            let changed=self.conn.execute("UPDATE sessions SET lead_session_id=?2,updated_at=?3 WHERE id=?1 AND lead_session_id IS ?4 AND EXISTS(SELECT 1 FROM epic_lead_generations WHERE epic_id=?1 AND generation=?5)",params![epic.to_string(),target.map(|v|v.to_string()),now(),expected.lead_session_id.map(|v|v.to_string()),expected.lead_generation])?;
+            if changed != 1 {
+                return Err(refused("manager_v2_lead_changed"));
+            }
         }
         let jobs = match (expected.lead_session_id, target) {
             (Some(old), Some(new)) if old != new => {
@@ -3730,6 +4450,81 @@ impl Store {
     }
 }
 
+/// #4011: the fields of `expected` that differ from the `current` fence, each as
+/// `field expected X, current Y` (the values are not secret to the authorized
+/// manager); empty when the fence holds. An out-of-range `expected` is named too.
+fn lead_fence_mismatch(expected: &ManagerLeadFenceV2, current: &ManagerLeadFenceV2) -> String {
+    fn show<T: std::fmt::Display>(value: Option<T>) -> String {
+        value.map_or_else(|| "null".into(), |v| v.to_string())
+    }
+    let mut fields = Vec::new();
+    if current.lead_session_id != expected.lead_session_id {
+        fields.push(format!(
+            "lead_session_id expected {}, current {}",
+            show(expected.lead_session_id),
+            show(current.lead_session_id)
+        ));
+    }
+    if current.lead_generation != expected.lead_generation || expected.lead_generation <= 0 {
+        fields.push(format!(
+            "lead_generation expected {}, current {}",
+            expected.lead_generation, current.lead_generation
+        ));
+    }
+    if current.event_sequence != expected.event_sequence || expected.event_sequence < 0 {
+        fields.push(format!(
+            "event_sequence expected {}, current {}",
+            expected.event_sequence, current.event_sequence
+        ));
+    }
+    if current.custody_generation != expected.custody_generation {
+        fields.push(format!(
+            "custody_generation expected {}, current {}",
+            show(expected.custody_generation),
+            show(current.custody_generation)
+        ));
+    }
+    fields.join("; ")
+}
+
 fn parse_id(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value).map_err(|_| refused("manager_v2_invalid_stored_identity"))
+}
+
+#[cfg(test)]
+mod create_container_refusal_tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn create_container_refusal_names_the_remedy_and_keeps_the_code() {
+        use super::{SessionKind, create_container_refusal};
+        let off = create_container_refusal(SessionKind::Epic, None, false);
+        assert!(
+            off.starts_with("manager_v2_container_out_of_scope: "),
+            "{off}"
+        );
+        assert!(off.contains("under a Group"), "{off}");
+        assert!(off.contains("allow_create_groups"), "{off}");
+        let on = create_container_refusal(SessionKind::Epic, None, true);
+        assert!(on.contains("create a top-level Group first"), "{on}");
+        let group = create_container_refusal(SessionKind::Group, None, false);
+        assert!(group.contains("needs allow_create_groups"), "{group}");
+        assert_eq!(
+            create_container_refusal(SessionKind::Epic, Some(SessionKind::Group), true),
+            "manager_v2_container_out_of_scope"
+        );
+    }
+}
+
+/// Longest `outcome_detail` a receipt keeps, in characters (#3640).
+pub const OUTCOME_DETAIL_MAX_CHARS: usize = 300;
+
+/// Bound a receipt's `outcome_detail`: control characters become spaces and the
+/// text is cut at [`OUTCOME_DETAIL_MAX_CHARS`] on a character boundary. The
+/// caller redacts secrets; this keeps the stored text one short line.
+fn bounded_outcome_detail(detail: &str) -> String {
+    detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(OUTCOME_DETAIL_MAX_CHARS)
+        .collect()
 }

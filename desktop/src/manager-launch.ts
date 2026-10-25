@@ -12,10 +12,12 @@ import { toast } from './dom.js';
 import { withCapConfirm } from './manager-cmds.js';
 import { managersApi } from './managers-api.js';
 import {
-  CAPABILITIES, type LaunchChoice, type LaunchPlan, type LaunchRole, MODES, PRESETS, defaultLaunchPrompt, launchCatalog,
-  launchHost, launchScope, launchText, launchedSessionId, validateLaunch,
+  CAPABILITIES, type LaunchChoice, type LaunchPlan, type LaunchRole, MODES, NOT_GRANTED_HINT, NOT_GRANTED_MARK, PRESETS,
+  ancestorLaunches, defaultLaunchPrompt, launchCatalog, launchHost, launchScope, launchText, launchedSessionId, uncoveredLaunchTexts,
+  validateLaunch,
 } from './managers-model.js';
 import { formDialog } from './mgr-form.js';
+import { ownProjects } from './project-model.js';
 import { state } from './state.js';
 
 type Json = Record<string, unknown>;
@@ -26,16 +28,34 @@ const short = (id: string): string => id.slice(0, 8);
 // ---------- the grant editor ----------
 
 /**
+ * The launches the live global or portfolio grants above `projectId` admit, or null when none covers the project or
+ * rsid would not answer (the appointment still refuses what is not covered; this only feeds the marks on the editor).
+ */
+export async function launchCoverage(projectId: string): Promise<LaunchChoice[] | null> {
+  try { return ancestorLaunches((await managersApi.portfolioNodes(false)).nodes, projectId); } catch { return null; }
+}
+
+/** The marks for a launch checklist: each catalog launch `ancestors` do not cover gets the warning, and the list gets the fix. */
+export function launchMarks(catalog: readonly LaunchChoice[], ancestors: readonly LaunchChoice[] | null): { marks: ReadonlyMap<string, string>; note: string | undefined } {
+  const marks = new Map<string, string>();
+  for (const text of uncoveredLaunchTexts(catalog, ancestors)) marks.set(text, NOT_GRANTED_MARK);
+  return { marks, note: marks.size ? NOT_GRANTED_HINT : undefined };
+}
+
+/**
  * Edit a manager policy and, for the global grant, its launch list. A preset
  * applies and reopens the editor on the result; the rest is checked by
- * ManagerPolicyV2::validate (manager_ops.rs) before it is returned.
+ * ManagerPolicyV2::validate (manager_ops.rs) before it is returned. For a
+ * project manager, `ancestors` (the launches the global grant admits, from
+ * `launchCoverage`) marks each launch outside them, as the TUI does (#3270).
  */
-export async function grantEditor(title: string, start: Json, startLaunches: LaunchChoice[] | null, catalog: readonly LaunchChoice[]): Promise<{ policy: Json; launches: LaunchChoice[] } | null> {
+export async function grantEditor(title: string, start: Json, startLaunches: LaunchChoice[] | null, catalog: readonly LaunchChoice[], ancestors: readonly LaunchChoice[] | null = null): Promise<{ policy: Json; launches: LaunchChoice[] } | null> {
   let policy = start;
   for (;;) {
     const inPolicy = startLaunches === null;
     const launches = inPolicy ? ((policy.allowed_launches as LaunchChoice[] | undefined) ?? []) : startLaunches;
     const offered = launchCatalog(catalog, launches);
+    const { marks, note } = inPolicy ? launchMarks(offered, ancestors) : { marks: new Map<string, string>(), note: undefined };
     const got = await formDialog({
       title,
       lines: [inPolicy ? 'The policy this project manager receives. No launch checked means any valid choice.' : 'The launches the global seat may start project managers from, and the policy body they receive. At least one launch.'],
@@ -49,7 +69,7 @@ export async function grantEditor(title: string, start: Json, startLaunches: Lau
       ],
       lists: [
         { key: 'caps', title: 'Capabilities', items: CAPABILITIES.map((c) => ({ value: c, label: c, on: ((policy.capabilities as string[] | undefined) ?? []).includes(c) })) },
-        { key: 'launches', title: 'Launches', items: offered.map((l) => ({ value: launchText(l), label: launchText(l), on: launches.some((x) => launchText({ ...x, effort: x.effort ?? null }) === launchText(l)) })) },
+        { key: 'launches', title: 'Launches', note, items: offered.map((l) => ({ value: launchText(l), label: launchText(l), on: launches.some((x) => launchText({ ...x, effort: x.effort ?? null }) === launchText(l)), mark: marks.get(launchText(l)) })) },
       ],
       ok: 'Check and use',
     });
@@ -124,7 +144,7 @@ export async function launchAndAppoint(role: LaunchRole, activeProject: string |
     }
   }
   const projects = state.projects;
-  if (!projects.length) throw new Error('No projects exist yet; create one before appointing a manager');
+  if (!ownProjects(projects).length) throw new Error('No projects exist yet; create one before appointing a manager');
   const current = role.kind === 'global' ? await managersApi.globalGrant() : null;
   const active = current?.state === 'active' ? current : null;
   const defaults = await managersApi.defaultGrant();
@@ -159,7 +179,7 @@ export async function launchAndAppoint(role: LaunchRole, activeProject: string |
       grant = await grantEditor('Global grant', (active?.project_policy as Json | undefined) ?? defaults.policy, active ? grantLaunches : (defaults.launches as unknown as LaunchChoice[]), catalog);
     } else {
       const saved = await managersApi.policy(role.projectId);
-      grant = await grantEditor(`Policy of ${role.name}’s manager`, saved?.policy ?? defaults.policy, null, catalog);
+      grant = await grantEditor(`Policy of ${role.name}’s manager`, saved?.policy ?? defaults.policy, null, catalog, await launchCoverage(role.projectId));
     }
     if (!grant) return null;
   }

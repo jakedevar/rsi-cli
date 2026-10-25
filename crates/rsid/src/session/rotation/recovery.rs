@@ -650,7 +650,7 @@ async fn bind_recovered_own_handoff(
     predecessor: &Session,
     start_head: Option<&str>,
     entered_at: &str,
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
 ) -> Option<String> {
     let root = predecessor
         .sandbox_root

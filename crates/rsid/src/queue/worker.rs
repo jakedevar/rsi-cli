@@ -6,7 +6,7 @@ use crate::bus::EventBus;
 use crate::error::{DaemonError, Result};
 use crate::store::Store;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 const QUEUE_CHANNEL_CAPACITY: usize = 128;
@@ -85,7 +85,7 @@ impl QueueHandle {
 /// Background queue worker. Runs as a tokio task.
 pub struct QueueWorker {
     rx: mpsc::Receiver<QueueCommand>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     #[allow(dead_code)]
     bus: Arc<EventBus>,
     config: QueueConfig,
@@ -95,7 +95,7 @@ pub struct QueueWorker {
 impl QueueWorker {
     pub fn new(
         rx: mpsc::Receiver<QueueCommand>,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         bus: Arc<EventBus>,
         config: QueueConfig,
         processor: Box<dyn TaskProcessor>,
@@ -354,7 +354,7 @@ impl QueueWorker {
 
 /// Spawn the queue worker and return a cloneable handle.
 pub fn spawn_queue_worker(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     config: QueueConfig,
     processor: Box<dyn TaskProcessor>,
@@ -375,11 +375,11 @@ mod tests {
 
     /// Returns the `TempDir` guard alongside the store so the temporary
     /// directory is removed when the test ends rather than orphaned in `/tmp`.
-    fn open_test_store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
+    fn open_test_store() -> (tempfile::TempDir, Arc<rsid_core::store_lock::Mutex<Store>>) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let store = Store::open_test_fixture(&db_path).unwrap();
-        (dir, Arc::new(Mutex::new(store)))
+        (dir, Arc::new(rsid_core::store_lock::Mutex::new(store)))
     }
 
     fn test_bus() -> Arc<EventBus> {

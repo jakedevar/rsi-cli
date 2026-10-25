@@ -467,7 +467,7 @@ pub const RUNAWAY_DISK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// `None` when no sandbox directory holds a `target/` or the Store is busy.
 pub fn pass(
     runtime: &tokio::runtime::Runtime,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     base: &Path,
     trigger: &'static str,
     params: &StrayParams,
@@ -568,7 +568,7 @@ fn rsid_test_binary_sets(target: &Path) -> usize {
 /// the previous start). Returns each session told and where the record went.
 pub fn runaway_disk_pass(
     runtime: &tokio::runtime::Runtime,
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     base: &Path,
     last_run: &std::sync::Mutex<Option<Instant>>,
     min_interval: Duration,
@@ -836,7 +836,7 @@ mod tests {
         status: rsi_common::types::SessionStatus,
         cleanup: rsi_common::types::SandboxCleanupState,
         id: u128,
-    ) -> (Arc<tokio::sync::Mutex<Store>>, Uuid) {
+    ) -> (Arc<rsid_core::store_lock::Mutex<Store>>, Uuid) {
         use rsi_common::types::SandboxKind;
         let store = Store::open_in_memory().unwrap();
         let mut session = rsid_store::test_support::make_test_session();
@@ -847,7 +847,10 @@ mod tests {
         session.sandbox_branch = Some("rsi/stray-test".into());
         session.sandbox_cleanup_state = Some(cleanup);
         store.insert_session(&session).unwrap();
-        (Arc::new(tokio::sync::Mutex::new(store)), session.id)
+        (
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
+            session.id,
+        )
     }
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -989,7 +992,7 @@ mod tests {
         fs::write(dir.join(name), vec![1u8; blocks * 4096]).unwrap();
     }
 
-    fn start_scoped_test_job(store: &Arc<tokio::sync::Mutex<Store>>, owner: Uuid) {
+    fn start_scoped_test_job(store: &Arc<rsid_core::store_lock::Mutex<Store>>, owner: Uuid) {
         use crate::store::agent_jobs::NewAgentJob;
         use rsi_common::agent_jobs::JobWake;
         let id = Uuid::new_v4();

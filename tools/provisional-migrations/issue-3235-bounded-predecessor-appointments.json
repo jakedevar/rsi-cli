@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "version": 184,
+  "files": [
+    {
+      "path": "crates/rsid-store/src/store/migrations/v184.rs",
+      "source_blob": "sha256:a260f88ac685bd878c6bd246ba65cac4c08e15b464fe27e10f9f735d84de5582",
+      "sites": [
+        {
+          "anchor": "fn migrate_v184(&self, version: i32) -> Result<()> {",
+          "replacement": "fn migrate_v${VERSION}(&self, version: i32) -> Result<()> {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if version < 184 {",
+          "replacement": "if version < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": "tx.pragma_update(None, \"user_version\", 184)?;",
+          "replacement": "tx.pragma_update(None, \"user_version\", ${VERSION})?;",
+          "scope": "unit"
+        }
+      ],
+      "path_template": "crates/rsid-store/src/store/migrations/v${VERSION}.rs"
+    },
+    {
+      "path": "crates/rsid-store/src/store/tests.rs",
+      "source_blob": "sha256:b676a87a507109a2a09c3e31b88e189593ca0bf65160c1f9dd6da9454f29f4ba",
+      "sites": [
+        {
+          "anchor": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = 184;",
+          "replacement": "const REWIND_TEARDOWN_COVERED_THROUGH: i32 = ${VERSION};",
+          "scope": "head"
+        },
+        {
+          "anchor": "if active >= 184 && target < 184 {",
+          "replacement": "if active >= ${VERSION} && target < ${VERSION} {",
+          "scope": "unit"
+        },
+        {
+          "anchor": ".pragma_update(None, \"user_version\", 184 - 1)",
+          "replacement": ".pragma_update(None, \"user_version\", ${VERSION} - 1)",
+          "scope": "unit"
+        },
+        {
+          "anchor": "if target_version >= 184 { 5 } else { 0 },",
+          "replacement": "if target_version >= ${VERSION} { 5 } else { 0 },",
+          "scope": "unit"
+        },
+        {
+          "anchor": "\"V184 retired appointments replayed\"",
+          "replacement": "\"V${VERSION} retired appointments replayed\"",
+          "scope": "unit"
+        }
+      ]
+    }
+  ]
+}

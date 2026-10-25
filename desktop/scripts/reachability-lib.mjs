@@ -52,8 +52,8 @@ export function reachability(reg, src) {
   for (const p of PLATFORMS) {
     for (const s of snaps) {
       for (const m of reg.appMenuModel(p, s)) {
-        for (const n of m.items) {
-          if (n.kind !== 'item') continue;
+        // Nested submenus count (#305): View > Files > Save file is in the menu bar.
+        for (const n of reg.menuItems(m.items)) {
           const mm = /^act:([a-z-]+)$/.exec(n.id);
           if (mm) menuBar.set(mm[1], true);
         }
@@ -238,4 +238,58 @@ export function renderSectionTable(sections) {
     out.push(`| ${s.section} | ${s.rows} | ${s.binding} | ${s.module} | ${s.none} | ${e}${m} |`);
   }
   return out.join('\n');
+}
+
+/**
+ * Form completion inside an overlay (hub #3280): a modal editor a click opens must also be finished and
+ * cancelled by click. Each entry names the opener function, the labels of its native buttons (the submit
+ * label may depend on the row, e.g. Save for an immediate write and Stage for a staged value) and the
+ * headless smoke steps that click them: `smoke` in scripts/smoke.mjs (fake daemon) and `e2e` in
+ * scripts/smoke-e2e-sections.mjs (isolated rsid, write and readback).
+ */
+export const FORM_COMPLETION = [
+  {
+    id: 'settings-text-editor', file: 'src/settings.ts', fn: 'editText',
+    what: 'Settings text rows (Daemon Text Setting editor and staged text rows, e.g. Benchmark docker hosts)',
+    submit: ['Save', 'Stage'], cancel: 'Cancel', smoke: 'settings-text-mouse', e2e: 'settings-text-mouse',
+  },
+];
+
+/** The body of top-level `function name(` in `source` (to the first column-0 closing brace), or null. */
+export function functionBody(source, name) {
+  const at = source.search(new RegExp(`^(?:export )?(?:async )?function ${name}\\(`, 'm'));
+  if (at < 0) return null;
+  const end = source.indexOf('\n}\n', at);
+  return source.slice(at, end < 0 ? source.length : end + 2);
+}
+
+/** The step ids (`id: '<x>'`) a smoke script declares. */
+export function smokeStepIds(source) {
+  return new Set([...source.matchAll(/\bid: '([a-z0-9-]+)'/g)].map((m) => m[1]));
+}
+
+/**
+ * @param {object[]} entries  FORM_COMPLETION
+ * @param {(file: string) => string} readSource  a desktop/ file's text
+ * @param {{ smoke: Set<string>, e2e: Set<string> }} steps  smokeStepIds of smoke.mjs and smoke-e2e-sections.mjs
+ * @returns {{ rows: object[], problems: string[] }}
+ */
+export function formCompletion(entries, readSource, steps) {
+  const problems = [];
+  const rows = entries.map((f) => {
+    const body = functionBody(readSource(f.file), f.fn);
+    const miss = [];
+    if (!body) miss.push(`no function ${f.fn} in ${f.file}`);
+    else {
+      for (const label of [...f.submit, f.cancel]) if (!body.includes(`'${label}'`)) miss.push(`no '${label}' button label`);
+      if (!/el\('button'/.test(body)) miss.push('no native <button>');
+      if (!/\.type = 'submit'/.test(body)) miss.push('no submit button (a click must run the same path as Enter)');
+      if (!/\.type = 'button'/.test(body) || !/addEventListener\('click'/.test(body)) miss.push('no click-wired Cancel button');
+    }
+    if (!steps.smoke.has(f.smoke)) miss.push(`smoke step ${f.smoke} is missing from scripts/smoke.mjs`);
+    if (!steps.e2e.has(f.e2e)) miss.push(`e2e step ${f.e2e} is missing from scripts/smoke-e2e-sections.mjs`);
+    for (const m of miss) problems.push(`form ${f.id}: ${m}`);
+    return { id: f.id, what: f.what, buttons: [...f.submit, f.cancel], smoke: f.smoke, e2e: f.e2e, ok: miss.length === 0 };
+  });
+  return { rows, problems };
 }

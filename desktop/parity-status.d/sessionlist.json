@@ -6,6 +6,12 @@
       "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
       "note": "opens the label picker for the open session (also :groups)"
     },
+    "cmd:intake": {
+      "status": "missing",
+      "location": "",
+      "note": "Call LaunchIntakeSession with the active project and the request text, then toast that the intake agent is filing it (the TUI :intake does the same).",
+      "owner": ["#3787"]
+    },
     "cmd:project": {
       "status": "substitute",
       "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
@@ -133,8 +139,8 @@
     },
     "key:N": {
       "status": "done",
-      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
-      "note": "the previous event, or with no session open the previous matching session (G2)"
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts, src/actions/find-run.ts",
+      "note": "the previous match of the conversation find bar, or with no find the previous session the list filter matches (G2)"
     },
     "key:[g": {
       "status": "done",
@@ -158,8 +164,8 @@
     },
     "key:n": {
       "status": "done",
-      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts",
-      "note": "with a session open, the next conversation event that contains the filter text (the TUI detail search); with none open, the next session the filter matches (G2)"
+      "location": "src/actions/sessionlist.ts, src/actions/sessionlist-run.ts, src/actions/find-run.ts",
+      "note": "the next match of the conversation find bar (the TUI detail search), also after Esc closed the bar; with no find and a list filter, the next session the filter matches (G2)"
     },
     "module:ui/overlay/label_form.rs": {
       "status": "done",

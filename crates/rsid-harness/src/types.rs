@@ -154,6 +154,15 @@ pub struct ChatMessage {
     pub is_error: bool,
     /// Tool calls requested by the assistant (populated when role == Assistant).
     pub tool_calls: Vec<ToolCall>,
+    /// The thinking text the model returned with this assistant turn (#3170).
+    /// A route that wants it back (OpenRouter) replays it on later requests of
+    /// the same tool-call chain; it never reaches a route that does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Structured `reasoning_details` blocks the route returned, kept verbatim
+    /// so they can be passed back unmodified (#3170).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 impl ChatMessage {
@@ -164,6 +173,8 @@ impl ChatMessage {
             tool_call_id: None,
             is_error: false,
             tool_calls: Vec::new(),
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -174,6 +185,8 @@ impl ChatMessage {
             tool_call_id: None,
             is_error: false,
             tool_calls: Vec::new(),
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -184,6 +197,8 @@ impl ChatMessage {
             tool_call_id: None,
             is_error: false,
             tool_calls: Vec::new(),
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -194,6 +209,8 @@ impl ChatMessage {
             tool_call_id: Some(call_id.into()),
             is_error: false,
             tool_calls: Vec::new(),
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -204,6 +221,8 @@ impl ChatMessage {
             tool_call_id: Some(call_id.into()),
             is_error: true,
             tool_calls: Vec::new(),
+            reasoning: None,
+            reasoning_details: None,
         }
     }
 
@@ -239,9 +258,17 @@ impl ChatMessage {
         image_event_metadata(&self.tool_blocks())
     }
 
-    /// Approximate token count using the 4-chars-per-token heuristic.
+    /// Approximate token count using the 4-chars-per-token heuristic. Counts
+    /// the content and the assistant's tool calls (name and arguments): an
+    /// edit-heavy session keeps its `apply_patch`/`write_file` bodies there,
+    /// not in `content` (#3166).
     pub fn estimated_tokens(&self) -> u64 {
-        self.content.len().div_ceil(4) as u64
+        let call_bytes: usize = self
+            .tool_calls
+            .iter()
+            .map(|call| call.name.len() + call.arguments.len())
+            .sum();
+        (self.content.len() + call_bytes).div_ceil(4) as u64
     }
 }
 
@@ -258,6 +285,16 @@ pub struct ToolCall {
     /// Exact provider result payload for a hosted tool, keyed by the same id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hosted_result: Option<serde_json::Value>,
+}
+
+/// Approximate tokens the tool specs add to every request (#3166): the
+/// serialized spec JSON at the same 4-bytes-per-token heuristic.
+pub fn estimated_tool_specs_tokens(specs: &[HarnessToolSpec]) -> u64 {
+    specs
+        .iter()
+        .map(|spec| serde_json::to_string(spec).map_or(0, |json| json.len()))
+        .sum::<usize>()
+        .div_ceil(4) as u64
 }
 
 /// Specification for a tool the LLM can call.
@@ -328,6 +365,8 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub reasoning_content: Option<String>,
+    /// Structured `reasoning_details` the route returned, verbatim (#3170).
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
     pub stop_reason: Option<String>,
 }
 
@@ -467,6 +506,38 @@ mod tests {
 
         let empty = ChatMessage::user("");
         assert_eq!(empty.estimated_tokens(), 0); // (0+3)/4 = 0 (integer division)
+    }
+
+    #[test]
+    fn estimated_tokens_counts_tool_call_names_and_arguments() {
+        let mut msg = ChatMessage::assistant("");
+        msg.tool_calls.push(ToolCall {
+            id: "call-1".into(),
+            name: "apply_patch".into(),
+            arguments: "x".repeat(4_000),
+            hosted: false,
+            hosted_result: None,
+        });
+        // 11 name bytes + 4000 argument bytes.
+        assert_eq!(msg.estimated_tokens(), 1_003);
+    }
+
+    #[test]
+    fn tool_specs_tokens_count_the_spec_json() {
+        let spec = HarnessToolSpec {
+            name: "read_file".into(),
+            description: "d".repeat(2_000),
+            parameters_json: "{}".into(),
+            freeform: None,
+            kind: HarnessToolSpecKind::Function,
+        };
+        let json_len = serde_json::to_string(&spec).unwrap().len();
+        assert!(json_len > 2_000);
+        assert_eq!(
+            estimated_tool_specs_tokens(&[spec]),
+            json_len.div_ceil(4) as u64
+        );
+        assert_eq!(estimated_tool_specs_tokens(&[]), 0);
     }
 
     #[test]

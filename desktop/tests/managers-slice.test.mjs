@@ -32,6 +32,7 @@ test('every manager : command resolves, aliases included', () => {
     'manager inspect': 'mgr-inspect', 'manager policy': 'mgr-policy', 'manager scope': 'mgr-scope', 'manager appoint': 'mgr-appoint',
     'manager clear': 'mgr-clear', 'manager tree': 'mgr-tree', 'global-manager': 'mgr-global', gm: 'mgr-global',
     'manager workspace': 'mgr-global', 'manager global': 'mgr-global-grant', 'manager global revoke': 'mgr-global-revoke',
+    dashboard: 'mgr-dashboard', gd: 'mgr-dashboard',
     fleet: 'mgr-fleet', 'manager portfolio': 'mgr-portfolio', 'manager escalations all': 'mgr-escalations',
     'manager friction 48': 'mgr-friction',
   };
@@ -43,6 +44,7 @@ test('every manager : command resolves, aliases included', () => {
 test('key hints name the TUI bindings', () => {
   assert.deepEqual(keyHints('mgr-board'), ['<Space>gb', ':manager', ':manager board']);
   assert.deepEqual(keyHints('mgr-global'), ['gm', ':global-manager']);
+  assert.deepEqual(keyHints('mgr-dashboard'), ['gd', ':dashboard']);
   assert.deepEqual(keyHints('mgr-tree'), [':manager tree']);
 });
 

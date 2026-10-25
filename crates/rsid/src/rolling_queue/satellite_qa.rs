@@ -26,7 +26,7 @@
 //! #2176: the run is a guest that must not block deploys or starve this
 //! satellite's workers. No run is taken while a deploy is staged or
 //! restarting here, and a staged deploy stops a running hub run at once
-//! (`agent_jobs::cancel_test_jobs_for_deploy`, `interrupted_by_deploy`, which
+//! (`agent_jobs::stop_hub_qa_for_deploy`, `interrupted_by_deploy`, which
 //! the hub defers as `deploy_preempted`). The governor floor is what the
 //! workers need, so free space must also hold the run's own target: the size
 //! measured for the last completed run, else
@@ -35,7 +35,7 @@
 //! QA target's build output (recording its size first) and the run's
 //! snapshot, so the disk returns to its pre-run level.
 
-use super::bounded_qa::{RECIPE, SNAPSHOTS, full_library_params, snapshot};
+use super::bounded_qa::{QaLogReadError, RECIPE, SNAPSHOTS, full_library_params, snapshot};
 use super::{fetch_rolling, head_commit, source_commit_exists, with_store};
 use crate::agent_jobs::SubmitContext;
 use crate::error::{DaemonError, Result};
@@ -50,8 +50,10 @@ use rsi_common::satellite_qa::{
     SATELLITE_QA_SHA_UNAVAILABLE, SatelliteQaAdmissionV1, SatelliteQaRunReceiptV1,
     SatelliteQaRunRequestV1, is_full_sha,
 };
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// The job name carries the pinned SHA, so a replay reports it durably.
@@ -115,10 +117,202 @@ fn after_failed_submit(store: &Store, key: &str, error: &DaemonError) -> Result<
     }
 }
 
-fn receipt(run_id: Uuid, job: &AgentJobV1, replayed: bool) -> Result<SatelliteQaRunReceiptV1> {
+type PanicExcerpts = BTreeMap<String, String>;
+type CachedExcerpts = tokio::sync::watch::Receiver<Option<MiningOutcome>>;
+
+#[derive(Clone)]
+enum MiningOutcome {
+    Success(Arc<PanicExcerpts>),
+    ReadFailed { retry_at: Instant },
+}
+
+const PANIC_READ_RETRY: Duration = Duration::from_secs(60);
+
+/// Successful reads, even empty evidence, live for this daemon's lifetime.
+/// Any I/O failure returns empty evidence and permits one shared retry on a
+/// later poll, 60 monotonic seconds after completion. No background retry.
+/// A watch channel shares in-flight work independently of waiter cancellation.
+struct PanicCache {
+    jobs: Mutex<HashMap<Uuid, CachedExcerpts>>,
+    now: Arc<dyn Fn() -> Instant + Send + Sync>,
+    warn_read: Arc<dyn Fn(Uuid, QaLogReadError) + Send + Sync>,
+    #[cfg(test)]
+    mining_runs: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for PanicCache {
+    fn default() -> Self {
+        Self {
+            jobs: Mutex::new(HashMap::new()),
+            now: Arc::new(Instant::now),
+            warn_read: Arc::new(|job, failure| {
+                tracing::warn!(job_id = %job, operation = ?failure.operation, kind = ?failure.kind,
+                    "hub QA panic log read failed; empty evidence until a later poll retries");
+            }),
+            #[cfg(test)]
+            mining_runs: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl PanicCache {
+    async fn get(
+        &self,
+        job: Uuid,
+        mine: impl FnOnce() -> std::result::Result<PanicExcerpts, QaLogReadError> + Send + 'static,
+    ) -> PanicExcerpts {
+        let mut receiver = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+            let now = (self.now)();
+            let expired = jobs.get(&job).is_some_and(|cached| {
+                matches!(&*cached.borrow(), Some(MiningOutcome::ReadFailed { retry_at }) if now >= *retry_at)
+            });
+            if expired {
+                jobs.remove(&job);
+            }
+            jobs.entry(job)
+                .or_insert_with(|| {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    #[cfg(test)]
+                    self.mining_runs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let now = self.now.clone();
+                    let warn_read = self.warn_read.clone();
+                    // The blocking task owns the sender: cancelling the RPC waiter
+                    // cannot cancel or duplicate mining. A panic closes the channel
+                    // and later polls retain the empty-evidence fallback.
+                    tokio::task::spawn_blocking(move || {
+                        let outcome = match mine() {
+                            Ok(excerpts) => MiningOutcome::Success(Arc::new(excerpts)),
+                            Err(failure) => {
+                                let retry_at = now() + PANIC_READ_RETRY;
+                                // The shared attempt owner warns exactly once, even
+                                // if every RPC waiter was cancelled.
+                                warn_read(job, failure);
+                                MiningOutcome::ReadFailed { retry_at }
+                            }
+                        };
+                        let _ = sender.send(Some(outcome));
+                    });
+                    receiver
+                })
+                .clone()
+        };
+        loop {
+            if let Some(outcome) = receiver.borrow().clone() {
+                return match outcome {
+                    MiningOutcome::Success(excerpts) => (*excerpts).clone(),
+                    MiningOutcome::ReadFailed { .. } => PanicExcerpts::new(),
+                };
+            }
+            if receiver.changed().await.is_err() {
+                let mut jobs = self.jobs.lock().unwrap_or_else(|error| error.into_inner());
+                let cached = jobs.get_mut(&job).expect("polled job stays cached");
+                if cached.borrow().is_none() {
+                    tracing::warn!(job_id = %job, "hub QA panic mining ended without evidence");
+                    // Publish the fallback under the cache lock so concurrent and
+                    // later polls share it and only this first observer warns.
+                    *cached = tokio::sync::watch::channel(Some(MiningOutcome::Success(Arc::new(
+                        PanicExcerpts::new(),
+                    ))))
+                    .1;
+                }
+                return PanicExcerpts::new();
+            }
+        }
+    }
+}
+
+static PANIC_CACHE: LazyLock<PanicCache> = LazyLock::new(PanicCache::default);
+/// Four transport payloads of raw text, always ending at a complete line
+/// before running either redactor. An overlong single line is discarded.
+const MAX_RAW_PANIC_BYTES: usize = 4 * rsi_common::satellite_qa::SATELLITE_QA_MAX_PANIC_BYTES;
+
+/// One sequential pass indexes only reported tests. All subsequent searches
+/// and regex work operate on at most MAX_RAW_PANIC_BYTES per indexed test.
+/// The observer records actual scan/raw-input bytes for deterministic tests.
+fn mine_panic_excerpts(
+    log: &str,
+    reported: &[String],
+    mut observe: impl FnMut(usize, usize),
+) -> PanicExcerpts {
+    let tests = rsi_common::rolling_queue::failing_test_paths(reported);
+    let wanted: HashSet<&str> = tests.iter().map(String::as_str).collect();
+    let mut sections = HashMap::new();
+    let mut current: Option<(&str, usize, bool)> = None;
+    let mut offset = 0;
+    for line in log.split_inclusive('\n') {
+        observe(line.len(), 0);
+        let trimmed = line.trim();
+        let header = trimmed
+            .strip_prefix("---- ")
+            .and_then(|s| s.strip_suffix(" stdout ----"));
+        let thread = trimmed
+            .strip_prefix("thread '")
+            .and_then(|s| s.split_once('\'').map(|(name, _)| name));
+        // A libtest stdout section can contain its own or a helper thread's
+        // panic. Bare nextest threads delimit each other, with no headers.
+        let boundary = header.is_some()
+            || thread.is_some_and(|name| {
+                !current.is_some_and(|(owner, _, header)| {
+                    header && (owner == name || !wanted.contains(name))
+                })
+            });
+        if boundary {
+            if let Some((test, start, _)) = current.take() {
+                sections.entry(test).or_insert((start, offset));
+            }
+            if let Some(test) = header.or(thread).filter(|test| wanted.contains(test)) {
+                current = Some((test, offset, header.is_some()));
+            }
+        }
+        offset += line.len();
+    }
+    if let Some((test, start, _)) = current {
+        sections.entry(test).or_insert((start, log.len()));
+    }
+    tests
+        .iter()
+        .filter_map(|test| {
+            let &(start, section_end) = sections.get(test.as_str())?;
+            let section = &log[start..section_end];
+            let end = if section.len() > MAX_RAW_PANIC_BYTES {
+                // Search backwards only inside the fixed raw budget. This also
+                // cuts UTF-8 safely because a newline is an ASCII boundary.
+                section.as_bytes()[..MAX_RAW_PANIC_BYTES]
+                    .iter()
+                    .rposition(|b| *b == b'\n')
+                    .map_or(0, |i| i + 1)
+            } else {
+                section.len()
+            };
+            observe(0, end);
+            let excerpt = rsi_common::failure_signature::panic_excerpt_for(&section[..end], test)?;
+            Some((
+                test.clone(),
+                rsi_common::satellite_qa::sanitize_panic_excerpt(&excerpt),
+            ))
+        })
+        .collect()
+}
+
+async fn receipt(
+    run_id: Uuid,
+    job: &AgentJobV1,
+    replayed: bool,
+) -> Result<SatelliteQaRunReceiptV1> {
+    receipt_with_cache(run_id, job, replayed, &PANIC_CACHE).await
+}
+
+async fn receipt_with_cache(
+    run_id: Uuid,
+    job: &AgentJobV1,
+    replayed: bool,
+    cache: &PanicCache,
+) -> Result<SatelliteQaRunReceiptV1> {
     let sha = run_sha(job).ok_or_else(|| refused(SATELLITE_QA_NOT_FOUND))?;
     let result = job.result.clone().unwrap_or_default();
-    Ok(SatelliteQaRunReceiptV1 {
+    let mut receipt = SatelliteQaRunReceiptV1 {
         run_id,
         sha,
         job_id: job.id,
@@ -127,10 +321,24 @@ fn receipt(run_id: Uuid, job: &AgentJobV1, replayed: bool) -> Result<SatelliteQa
         refusal: result.refusal,
         failing_tests: result.failing_tests,
         failing_tests_omitted: result.failing_tests_omitted,
+        panic_excerpts: Default::default(),
         log_path: job.log_path.clone(),
         replayed,
     }
-    .bounded())
+    .bounded();
+    if job.state.is_terminal() && !receipt.failing_tests.is_empty() {
+        let mut evidence = receipt.clone();
+        let log_path = job.log_path.clone();
+        receipt.panic_excerpts = cache
+            .get(job.id, move || {
+                let log = super::bounded_qa::read_qa_log(&log_path)?;
+                evidence.panic_excerpts =
+                    mine_panic_excerpts(&log, &evidence.failing_tests, |_, _| {});
+                Ok(evidence.bounded().panic_excerpts)
+            })
+            .await;
+    }
+    Ok(receipt)
 }
 
 /// What the build governor would do with a new build now: its disk gate (the
@@ -145,6 +353,8 @@ pub(crate) struct BuildGate {
     pub(crate) disk_floor_gib: u64,
     /// Another governor gate would hold a new build.
     pub(crate) other_closed: bool,
+    /// Continuous disk wait of the oldest live governor waiter, if held now.
+    pub(crate) disk_wait_seconds: Option<u64>,
 }
 
 impl BuildGate {
@@ -163,9 +373,16 @@ impl BuildGate {
                 .queue
                 .iter()
                 .any(|waiter| waiter.class == crate::governor::AdmissionClass::Build);
+        let now = chrono::Utc::now();
         Self {
             disk_free_bytes,
             disk_floor_gib: snapshot.policy.min_free_disk_gb,
+            disk_wait_seconds: snapshot
+                .queue
+                .iter()
+                .filter_map(|waiter| waiter.disk_wait_started_at)
+                .map(|since| (now - since).num_seconds().max(0) as u64)
+                .max(),
             other_closed,
         }
     }
@@ -274,7 +491,7 @@ fn refusal(store: &Store, host: &QaHost) -> Result<Option<&'static str>> {
         .build
         .disk_free_bytes
         .is_none_or(|free| free.saturating_add(host.reclaimable_bytes) < need);
-    if data_low || build_low {
+    if data_low || build_low || host.build.disk_wait_seconds.is_some() {
         return Ok(Some(SATELLITE_QA_DISK_LOW));
     }
     if host.load_hold || host.build.other_closed || library_qa_active(store)? {
@@ -368,7 +585,7 @@ fn prepare(repo: &Path, sha: &str, jobs: &Path, run_id: Uuid) -> Result<(PathBuf
 /// run), `satellite_qa_owner_required`, `satellite_qa_busy`,
 /// `satellite_qa_disk_low`, `satellite_qa_sha_unavailable`, or a launch error.
 pub(crate) async fn request_hub_qa_run<F>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     host: QaHost,
     request: SatelliteQaRunRequestV1,
     submit: F,
@@ -390,7 +607,7 @@ where
 /// The reclaim seam lets fixtures exercise the real pool script with an isolated
 /// pool root and controlled disk readings, without touching the installed pool.
 async fn request_hub_qa_run_with_reclaim<F, R>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     mut host: QaHost,
     request: SatelliteQaRunRequestV1,
     submit: F,
@@ -406,7 +623,7 @@ where
     let run_id = request.run_id;
     let lookup = request.clone();
     if let Some(row) = with_store(store, move |s| recorded(s, &lookup)).await? {
-        return receipt(run_id, &row.job, true);
+        return receipt(run_id, &row.job, true).await;
     }
     if !request.start {
         return Err(refused(SATELLITE_QA_NOT_FOUND));
@@ -423,7 +640,7 @@ where
         (existing, admitted)
     };
     if let Some(row) = existing {
-        return receipt(run_id, &row.job, true);
+        return receipt(run_id, &row.job, true).await;
     }
     let admitted = admitted.ok_or_else(|| refused(SATELLITE_QA_INVALID))?;
     let need = host.build.floor_bytes().saturating_add(host.target_bytes);
@@ -469,7 +686,7 @@ where
     })
     .await?;
     tracing::info!(%run_id, job_id = %row.job.id, sha = %pinned, "hub full-library QA run started");
-    receipt(run_id, &row.job, false)
+    receipt(run_id, &row.job, false).await
 }
 
 /// What one [`reclaim_settled_runs`] pass returned.
@@ -518,7 +735,7 @@ fn completed(job: &AgentJobV1) -> bool {
 /// succeeds. `target` resolves the shared target (production: the registered
 /// allocation the runs build in, `agent_jobs::library_qa_target`).
 pub(crate) async fn reclaim_settled_runs<T>(
-    store: &Arc<tokio::sync::Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     jobs: &Path,
     target: T,
 ) -> Result<Option<Reclaimed>>
@@ -602,7 +819,7 @@ mod tests {
 
     struct Rig {
         _temp: tempfile::TempDir,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         hub: Uuid,
         jobs: PathBuf,
         sha: String,
@@ -648,7 +865,7 @@ mod tests {
         Rig {
             jobs: temp.path().join("jobs"),
             _temp: temp,
-            store: Arc::new(tokio::sync::Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             hub,
             sha,
             seat: seat.id,
@@ -661,6 +878,7 @@ mod tests {
         BuildGate {
             disk_free_bytes: Some(free * GIB_BYTES),
             disk_floor_gib: floor,
+            disk_wait_seconds: None,
             other_closed: false,
         }
     }
@@ -721,6 +939,431 @@ mod tests {
             DaemonError::PolicyDenied(code) | DaemonError::InvalidParam(code) => code,
             other => panic!("unexpected error {other}"),
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn terminal_receipt_carries_only_each_failed_tests_redacted_panic() {
+        let _test_start = TEST_START.lock().await;
+        let rig = rig();
+        let run = Uuid::new_v4();
+        let started = request_hub_qa_run(&rig.store, host(&rig), request(&rig, run, true), record)
+            .await
+            .unwrap();
+        let mut job = rig
+            .store
+            .lock()
+            .await
+            .get_agent_job(started.job_id)
+            .unwrap()
+            .unwrap()
+            .job;
+        let log = rig.jobs.join("evidence.log");
+        std::fs::write(&log, concat!(
+            "test a::first ... FAILED\ntest b::second ... FAILED\n",
+            "---- a::first stdout ----\nthread 'a::first' panicked at src/a.rs:1:1:\nassertion failed: first inbox ready\n/home/fixture/private\nnote: run with `RUST_BACKTRACE=1`\n",
+            "---- b::second stdout ----\nthread 'b::second' panicked at src/b.rs:1:1:\nassertion failed: second worker ready\napi_key=short\nnote: run with `RUST_BACKTRACE=1`\n",
+            "---- c::missing stdout ----\nno panic output\n",
+            "---- d::unreported stdout ----\nthread 'd::unreported' panicked at src/d.rs:1:1:\nunreported panic\n",
+        )).unwrap();
+        job.log_path = log.display().to_string();
+        job.result = Some(rsi_common::agent_jobs::AgentJobResultV1 {
+            failing_tests: vec![
+                "FAIL rsid a::first".into(),
+                "FAIL rsid b::second".into(),
+                "TIMEOUT rsid c::missing".into(),
+            ],
+            ..Default::default()
+        });
+        // Running receipts do not read a partial log.
+        assert!(
+            receipt(run, &job, false)
+                .await
+                .unwrap()
+                .panic_excerpts
+                .is_empty()
+        );
+        job.state = JobState::Failed;
+        let got = receipt(run, &job, true).await.unwrap();
+        assert_eq!(
+            got.panic_excerpts,
+            [
+                (
+                    "a::first".into(),
+                    "assertion failed: first inbox ready\n[REDACTED]".into()
+                ),
+                (
+                    "b::second".into(),
+                    "assertion failed: second worker ready\n[REDACTED]".into()
+                ),
+            ]
+            .into()
+        );
+        assert_eq!(got.validate(run), Ok(()));
+        assert!(got.replayed);
+        // Later polls reuse evidence even if the local log has been reclaimed.
+        std::fs::remove_file(&log).unwrap();
+        assert_eq!(
+            receipt(run, &job, true).await.unwrap().panic_excerpts,
+            got.panic_excerpts
+        );
+        job.id = Uuid::new_v4();
+        job.log_path = rig.jobs.join("missing.log").display().to_string();
+        assert!(
+            receipt(run, &job, true)
+                .await
+                .unwrap()
+                .panic_excerpts
+                .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn read_failures_warn_once_per_shared_attempt_and_retry_only_after_backoff() {
+        use super::super::bounded_qa::QaLogOperation;
+        use std::io::ErrorKind;
+
+        for failure in [
+            QaLogReadError {
+                operation: QaLogOperation::Open,
+                kind: ErrorKind::NotFound,
+            },
+            QaLogReadError {
+                operation: QaLogOperation::Read,
+                kind: ErrorKind::PermissionDenied,
+            },
+            QaLogReadError {
+                operation: QaLogOperation::Seek,
+                kind: ErrorKind::Other,
+            },
+        ] {
+            let start = Instant::now();
+            let clock = Arc::new(Mutex::new(start));
+            let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let cache = PanicCache {
+                now: {
+                    let clock = clock.clone();
+                    Arc::new(move || *clock.lock().unwrap())
+                },
+                warn_read: {
+                    let diagnostics = diagnostics.clone();
+                    Arc::new(move |job, failure| diagnostics.lock().unwrap().push((job, failure)))
+                },
+                ..Default::default()
+            };
+            let job = Uuid::new_v4();
+            let (entered, entered_rx) = tokio::sync::oneshot::channel();
+            let (release, release_rx) = tokio::sync::oneshot::channel();
+            let (first, concurrent, ()) = tokio::join!(
+                biased;
+                cache.get(job, move || {
+                    entered.send(()).unwrap();
+                    release_rx.blocking_recv().unwrap();
+                    Err(failure)
+                }),
+                cache.get(job, || panic!("shared attempt was replaced")),
+                async {
+                    entered_rx.await.unwrap();
+                    release.send(()).unwrap();
+                },
+            );
+            assert_eq!(first, PanicExcerpts::new());
+            assert_eq!(concurrent, first);
+            assert_eq!(*diagnostics.lock().unwrap(), vec![(job, failure)]);
+
+            *clock.lock().unwrap() = start + PANIC_READ_RETRY - Duration::from_nanos(1);
+            assert_eq!(
+                cache.get(job, || panic!("poll retried too early")).await,
+                PanicExcerpts::new()
+            );
+            *clock.lock().unwrap() = start + PANIC_READ_RETRY;
+            let (retry, concurrent) = tokio::join!(
+                biased;
+                cache.get(job, move || Err(failure)),
+                cache.get(job, || panic!("shared retry was replaced")),
+            );
+            assert_eq!(retry, PanicExcerpts::new());
+            assert_eq!(concurrent, retry);
+            assert_eq!(*diagnostics.lock().unwrap(), vec![(job, failure); 2]);
+            assert_eq!(
+                cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+                2
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn restored_log_retries_but_successful_empty_and_reclaimed_logs_stay_cached() {
+        let _test_start = TEST_START.lock().await;
+        let rig = rig();
+        let run = Uuid::new_v4();
+        let started = request_hub_qa_run(&rig.store, host(&rig), request(&rig, run, true), record)
+            .await
+            .unwrap();
+        let mut job = rig
+            .store
+            .lock()
+            .await
+            .get_agent_job(started.job_id)
+            .unwrap()
+            .unwrap()
+            .job;
+        let log = rig.jobs.join("restored.log");
+        job.log_path = log.display().to_string();
+        job.state = JobState::Failed;
+        job.result = Some(rsi_common::agent_jobs::AgentJobResultV1 {
+            failing_tests: vec!["FAIL rsid a::red".into()],
+            ..Default::default()
+        });
+        let start = Instant::now();
+        let clock = Arc::new(Mutex::new(start));
+        let cache = PanicCache {
+            now: {
+                let clock = clock.clone();
+                Arc::new(move || *clock.lock().unwrap())
+            },
+            ..Default::default()
+        };
+        let poll = || receipt_with_cache(run, &job, true, &cache);
+        assert_eq!(poll().await.unwrap().panic_excerpts, PanicExcerpts::new());
+        std::fs::write(&log, "thread 'a::red' panicked at src/a.rs:1:1:\nassertion failed: inbox is ready\nnote: run with `RUST_BACKTRACE=1`\n").unwrap();
+        assert_eq!(poll().await.unwrap().panic_excerpts, PanicExcerpts::new());
+        *clock.lock().unwrap() = start + PANIC_READ_RETRY;
+        let (first, concurrent) = tokio::join!(poll(), poll());
+        let evidence = first.unwrap().panic_excerpts;
+        assert_eq!(
+            evidence,
+            [("a::red".into(), "assertion failed: inbox is ready".into())].into()
+        );
+        assert_eq!(concurrent.unwrap().panic_excerpts, evidence);
+        std::fs::remove_file(&log).unwrap();
+        *clock.lock().unwrap() = start + 3 * PANIC_READ_RETRY;
+        assert_eq!(poll().await.unwrap().panic_excerpts, evidence);
+        assert_eq!(
+            cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        // A readable log with no matching panic is a permanent success, even
+        // when the file later changes and then is reclaimed.
+        job.id = Uuid::new_v4();
+        std::fs::write(&log, "ordinary output\n").unwrap();
+        assert_eq!(
+            receipt_with_cache(run, &job, true, &cache)
+                .await
+                .unwrap()
+                .panic_excerpts,
+            PanicExcerpts::new()
+        );
+        std::fs::write(
+            &log,
+            "thread 'a::red' panicked at src/a.rs:1:1:\nnew detail\n",
+        )
+        .unwrap();
+        *clock.lock().unwrap() = start + 4 * PANIC_READ_RETRY;
+        assert_eq!(
+            receipt_with_cache(run, &job, true, &cache)
+                .await
+                .unwrap()
+                .panic_excerpts,
+            PanicExcerpts::new()
+        );
+        std::fs::remove_file(&log).unwrap();
+        assert_eq!(
+            receipt_with_cache(run, &job, true, &cache)
+                .await
+                .unwrap()
+                .panic_excerpts,
+            PanicExcerpts::new()
+        );
+        assert_eq!(
+            cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn cancelling_a_poll_preserves_inflight_and_empty_cached_evidence() {
+        use super::super::bounded_qa::QaLogOperation;
+
+        let start = Instant::now();
+        let clock = Arc::new(Mutex::new(start));
+        let cache = Arc::new(PanicCache {
+            now: {
+                let clock = clock.clone();
+                Arc::new(move || *clock.lock().unwrap())
+            },
+            ..Default::default()
+        });
+        let job = Uuid::new_v4();
+        // Exercise cancellation of the retry owner as well as successful
+        // empty caching. Advancing time cannot steal an in-flight attempt.
+        assert_eq!(
+            cache
+                .get(job, || Err(QaLogReadError {
+                    operation: QaLogOperation::Open,
+                    kind: std::io::ErrorKind::NotFound,
+                }))
+                .await,
+            PanicExcerpts::new()
+        );
+        *clock.lock().unwrap() = start + PANIC_READ_RETRY;
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let first_cache = cache.clone();
+        let first = tokio::spawn(async move {
+            first_cache
+                .get(job, move || {
+                    entered.send(()).unwrap();
+                    release_rx.blocking_recv().unwrap();
+                    Ok(PanicExcerpts::new())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        *clock.lock().unwrap() = start + 3 * PANIC_READ_RETRY;
+        let (evidence, ()) = tokio::join!(
+            biased;
+            cache.get(job, || panic!("inflight work was replaced")),
+            async {
+                release.send(()).unwrap();
+            },
+        );
+        assert_eq!(evidence, PanicExcerpts::new());
+        assert_eq!(
+            cache
+                .get(job, || panic!("empty evidence was mined again"))
+                .await,
+            PanicExcerpts::new()
+        );
+        assert_eq!(
+            cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn mining_panic_returns_and_caches_empty_evidence() {
+        let cache = PanicCache::default();
+        let job = Uuid::new_v4();
+        let (first, concurrent) = tokio::join!(
+            cache.get(job, || panic!("mining failed")),
+            cache.get(job, || panic!("concurrent poll restarted mining")),
+        );
+        assert_eq!(first, PanicExcerpts::new());
+        assert_eq!(concurrent, PanicExcerpts::new());
+        assert_eq!(
+            cache
+                .get(job, || panic!("later poll restarted mining"))
+                .await,
+            PanicExcerpts::new()
+        );
+        assert_eq!(
+            cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let jobs = cache.jobs.lock().unwrap();
+        assert!(
+            matches!(&*jobs[&job].borrow(), Some(MiningOutcome::Success(excerpts)) if excerpts.is_empty())
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn mass_failure_log_is_mined_once_with_bounded_raw_work() {
+        let _test_start = TEST_START.lock().await;
+        let rig = rig();
+        let run = Uuid::new_v4();
+        let started = request_hub_qa_run(&rig.store, host(&rig), request(&rig, run, true), record)
+            .await
+            .unwrap();
+        let mut job = rig
+            .store
+            .lock()
+            .await
+            .get_agent_job(started.job_id)
+            .unwrap()
+            .unwrap()
+            .job;
+        let reported: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    "{} rsid mass::test_{i:03}",
+                    if i < 150 { "FAIL" } else { "TIMEOUT" }
+                )
+            })
+            .collect();
+        let mut log = "ordinary build output\n".repeat(100_000);
+        for i in 0..150 {
+            if i < 100 {
+                // Nextest-style sections have thread anchors, no stdout headers
+                // and no backtrace note separating one failure from the next.
+                log.push_str(&format!(
+                    "thread 'mass::test_{i:03}' panicked at src/test.rs:1:1:\npanic marker {i:03}\n"
+                ));
+                log.push_str(&format!("{}\n", "bounded detail ".repeat(40)).repeat(30));
+            } else {
+                log.push_str(&format!(
+                    "thread 'mass::test_{i:03}' started\nno panic output\n"
+                ));
+            }
+        }
+        // A very long line is discarded whole before redaction, even though
+        // its first bytes would fit within the raw budget.
+        log.push_str("thread 'mass::test_150' panicked at src/test.rs:1:1:\n");
+        log.push_str(&"x".repeat(1024 * 1024));
+        log.push('\n');
+        assert!(log.len() > 4 * 1024 * 1024);
+        let mut scanned = 0;
+        let mut raw = 0;
+        let mut largest_raw = 0;
+        let excerpts = mine_panic_excerpts(&log, &reported, |scan, input| {
+            scanned += scan;
+            raw += input;
+            largest_raw = largest_raw.max(input);
+        });
+        assert_eq!(scanned, log.len(), "exactly one indexing pass");
+        assert!(largest_raw <= MAX_RAW_PANIC_BYTES);
+        assert!(raw <= 200 * MAX_RAW_PANIC_BYTES);
+        assert_eq!(excerpts.len(), 100);
+        for i in 0..100 {
+            let excerpt = &excerpts[&format!("mass::test_{i:03}")];
+            assert!(excerpt.starts_with(&format!("panic marker {i:03}\n")));
+            assert!(excerpt.len() <= rsi_common::satellite_qa::SATELLITE_QA_MAX_PANIC_BYTES);
+        }
+        let path = rig.jobs.join("mass-failure.log");
+        std::fs::write(&path, &log).unwrap();
+        job.log_path = path.display().to_string();
+        job.state = JobState::Failed;
+        job.result = Some(rsi_common::agent_jobs::AgentJobResultV1 {
+            failing_tests: reported,
+            ..Default::default()
+        });
+        let cache = PanicCache::default();
+        // Concurrent first polls share the same blocking task.
+        let (first, concurrent) = tokio::join!(
+            receipt_with_cache(run, &job, true, &cache),
+            receipt_with_cache(run, &job, true, &cache),
+        );
+        let first = first.unwrap();
+        assert_eq!(concurrent.unwrap(), first);
+        assert!(!first.panic_excerpts.is_empty());
+        assert_eq!(first.validate(run), Ok(()));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            receipt_with_cache(run, &job, true, &cache).await.unwrap(),
+            first
+        );
+        assert_eq!(
+            cache.mining_runs.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     /// The run is pinned under the shared QA snapshot directory (so the job
@@ -839,6 +1482,28 @@ mod tests {
                 .list_running_agent_jobs()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
+    async fn a_disk_wait_refuses_qa_even_with_reclaimable_space() {
+        let _test_start = TEST_START.lock().await;
+        let rig = rig();
+        let mut held = host_with(&rig, gate(27, 30));
+        held.reclaimable_bytes = 100 * GIB_BYTES;
+        held.build.disk_wait_seconds = Some(2400);
+        assert_eq!(
+            admission(&*rig.store.lock().await, &held)
+                .unwrap()
+                .refusal
+                .as_deref(),
+            Some(SATELLITE_QA_DISK_LOW)
+        );
+        let start = request(&rig, Uuid::new_v4(), true);
+        assert_eq!(
+            code(request_hub_qa_run(&rig.store, held, start, record).await),
+            SATELLITE_QA_DISK_LOW
         );
     }
 
@@ -1193,11 +1858,31 @@ mod tests {
         any(not(feature = "test-shard-mode"), feature = "test-shard-other-01")
     ))]
     fn pool_report(root: &Path, action: &str) -> serde_json::Value {
-        let output = std::process::Command::new("python3")
-            .arg(Path::new(rsi_common::manifest_dir!()).join("../../scripts/target-pool"))
+        // The Rust pool tool (#453) through the repository's shim. `scripts/repo-guard --bin`
+        // builds `rsi-repo-guard` with the caller's own Cargo setup (once per binary) and
+        // prints its path; the tool is not linked into this crate because its `serde_json`
+        // feature set would change the topology starters' canonical digests here.
+        static GUARD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let scripts = Path::new(rsi_common::manifest_dir!()).join("../../scripts");
+        let guard = GUARD.get_or_init(|| {
+            let output = std::process::Command::new("sh")
+                .arg(scripts.join("repo-guard"))
+                .arg("--bin")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        });
+        let output = std::process::Command::new("sh")
+            .arg(scripts.join("target-pool"))
             .arg(action)
             .arg("--filesystem")
             .arg(root)
+            .env("RSI_REPO_GUARD_BIN", guard)
             .env("RSI_TARGET_POOL_ROOT", root)
             .env_remove("RSI_SESSION_TOKEN")
             .output()

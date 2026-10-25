@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
         clean(error)
     } else if state.sorting {
         if state.focus_groups {
-            "Sort: 1 group · 2 active · 3 tokens · 4 cost · 5 errors".into()
+            "Sort: 1 group · 2 active · 3 tokens · 4 metered · 5 errors".into()
         } else {
             "Sort: 1 project · 2 provider · 3 model · 4 status · 5 context".into()
         }
@@ -116,7 +116,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
         .map(|s| {
             let u = &s.totals[state.window];
             format!(
-                "Fleet total  {:.0} tok/min   ${:.2}/hr   {} invocations   {:.1}% errors{}",
+                "Fleet total  {:.0} tok/min   ${:.2}/hr metered   {} invocations   {:.1}% errors{}",
                 u.tokens_per_minute(FLEET_WINDOWS[state.window]),
                 u.cost_per_hour(FLEET_WINDOWS[state.window]),
                 u.invocations,
@@ -148,9 +148,17 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
             u.input.to_string(),
             u.output.to_string(),
             format!("{}/{}", u.cache_read, u.cache_write),
-            format!("${:.3}", u.cost),
+            if u.cost == 0.0 {
+                "—".into()
+            } else {
+                format!("${:.3}", u.cost)
+            },
             format!("{:.0}", u.tokens_per_minute(seconds)),
-            format!("${:.2}", u.cost_per_hour(seconds)),
+            if u.cost == 0.0 {
+                "—".into()
+            } else {
+                format!("${:.2}", u.cost_per_hour(seconds))
+            },
             u.invocations.to_string(),
             format!(
                 "{:.1}%{}",
@@ -181,7 +189,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
         "INPUT",
         "OUTPUT",
         "CACHE R/W",
-        "EST COST",
+        "METERED $",
         "TOK/MIN",
         "$/HR",
         "CALLS",
@@ -282,7 +290,46 @@ pub fn render(frame: &mut Frame, area: Rect, state: &FleetState) {
             let mut lines = vec![format!("{} · {} active", clean(&g.label), g.active)];
             let i = state.window;
             let u = &g.windows[i];
-            lines.push(format!("{}: {} calls · {:.1}% errors\n{} in / {} out / {} cache read / {} cache write\n${:.3} · {:.0} tok/min · ${:.2}/hr · {} unknown usage",["5 min","1 hour","24 hours"][i],u.invocations,u.error_pct(),u.input,u.output,u.cache_read,u.cache_write,u.cost,u.tokens_per_minute(FLEET_WINDOWS[i]),u.cost_per_hour(FLEET_WINDOWS[i]),u.unknown_usage));
+            lines.push(format!("{}: {} calls · {:.1}% errors\n{} in / {} out / {} cache read / {} cache write\n{:.0} tok/min · {} unknown usage",["5 min","1 hour","24 hours"][i],u.invocations,u.error_pct(),u.input,u.output,u.cache_read,u.cache_write,u.tokens_per_minute(FLEET_WINDOWS[i]),u.unknown_usage));
+            if u.cost > 0.0 {
+                lines.push(format!(
+                    "${:.3} metered · ${:.2}/hr",
+                    u.cost,
+                    u.cost_per_hour(FLEET_WINDOWS[i])
+                ));
+            }
+            if let Some(snapshot) = &state.snapshot {
+                for plan in &snapshot.plan_windows {
+                    if g.dimension == "provider" && g.key != format!("{:?}", plan.provider) {
+                        continue;
+                    }
+                    for window in &plan.windows {
+                        lines.push(format!(
+                            "{:?} {} plan: {:.0}% used",
+                            plan.provider,
+                            window.window_key,
+                            window.utilization * 100.0
+                        ));
+                    }
+                }
+                for role in snapshot
+                    .plan_usage_by_role
+                    .iter()
+                    .filter(|r| g.dimension != "provider" || g.key == r.provider)
+                    .take(8)
+                {
+                    lines.push(format!(
+                        "{} {} {} ({}): {} in / {} out{}",
+                        role.provider,
+                        role.window_key,
+                        role.role,
+                        role.origin,
+                        role.input,
+                        role.output,
+                        if role.incomplete { " · partial" } else { "" }
+                    ));
+                }
+            }
             lines.join("\n")
         } else {
             "No usage groups match the filter.".into()

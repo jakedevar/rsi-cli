@@ -5,7 +5,7 @@
 //! - No ledger admission: no Work binding, seal, hot-file claim or migration
 //!   reservation is required. Fast-forward-only publication serializes
 //!   landings; a conflicting tip fails the merge in seconds.
-//! - Released migrations stay immutable (`tools/check-released-migrations.py`).
+//! - Released migrations stay immutable (`released-migrations` in `rsi-repo-guards`).
 //! - A candidate that raises `LATEST_SCHEMA_VERSION` must append a contiguous
 //!   run of migrations starting at exactly the rolling tip's version + 1, each
 //!   version carrying its `if version < N` block. The refusal names the number
@@ -16,8 +16,8 @@
 use super::git_output;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const STORE: &str = "crates/rsid-store/src/store/mod.rs";
 /// Each schema version is one `vNNN.rs` here; the head is the highest number.
@@ -376,8 +376,13 @@ pub(super) fn derive_released_pin(
     target: &str,
     candidate: &str,
 ) -> Result<Option<String>, String> {
-    let script = repo.join("tools/check-released-migrations.py");
-    if !script.is_file() {
+    // A tree that predates the pin tooling has nothing to derive on.
+    if super::git_text(
+        repo,
+        &["cat-file", "-e", &format!("{target}:{RELEASED_MANIFEST}")],
+    )
+    .is_err()
+    {
         return Ok(None);
     }
     let paths = changed_paths(repo, target, candidate)?;
@@ -410,20 +415,17 @@ pub(super) fn derive_released_pin(
     {
         return Err("pin derivation needs a clean worktree at the candidate".into());
     }
-    let refreshed = Command::new("python3")
-        .arg(&script)
-        .arg("--refresh")
-        .arg(target)
-        .current_dir(worktree)
-        .output()
-        .map_err(|error| format!("cannot start released-migration refresh: {error}"))?;
-    if !refreshed.status.success() {
+    let refreshed = run_repo_guard(
+        repo,
+        target,
+        worktree,
+        "released-migrations",
+        &["--refresh", target],
+    );
+    if !refreshed.success() {
         // `--refresh` writes only after every check passed, so the worktree is
         // untouched; the guard that follows refuses with the reason.
-        println!(
-            "released_pin_derive=skipped reason={}",
-            String::from_utf8_lossy(&refreshed.stderr).trim()
-        );
+        println!("released_pin_derive=skipped reason={}", refreshed.reason());
         return Ok(None);
     }
     super::git_ok(worktree, &["add", "--", RELEASED_MANIFEST])?;
@@ -433,15 +435,12 @@ pub(super) fn derive_released_pin(
     {
         return Ok(None);
     }
-    let name = format!("user.name={PIN_COMMIT_NAME}");
-    let email = format!("user.email={PIN_COMMIT_EMAIL}");
-    super::git_ok(
+    // The identity goes in the child environment, not `-c user.*`: an exported
+    // GIT_AUTHOR_*/GIT_COMMITTER_* (the cloud sweep sets them, #4012) would
+    // override `-c` and [`pin_commit_parent`] would not recognise the commit (#4018).
+    let commit = super::git_output_with_env(
         worktree,
         &[
-            "-c",
-            &name,
-            "-c",
-            &email,
             "commit",
             "--no-verify",
             "--no-gpg-sign",
@@ -449,7 +448,19 @@ pub(super) fn derive_released_pin(
             "-m",
             PIN_COMMIT_SUBJECT,
         ],
+        &[
+            ("GIT_AUTHOR_NAME", PIN_COMMIT_NAME),
+            ("GIT_AUTHOR_EMAIL", PIN_COMMIT_EMAIL),
+            ("GIT_COMMITTER_NAME", PIN_COMMIT_NAME),
+            ("GIT_COMMITTER_EMAIL", PIN_COMMIT_EMAIL),
+        ],
     )?;
+    if !commit.status.success() {
+        return Err(format!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
+    }
     if !super::git_text(worktree, &["status", "--porcelain=v1"])?.is_empty() {
         return Err("pin derivation left the candidate worktree dirty".into());
     }
@@ -470,27 +481,142 @@ pub(super) fn pin_commit_parent(repo: &Path, oid: &str) -> Result<Option<String>
     Ok(Some(parent))
 }
 
+/// The longest one repository-guard child may run.
+const GUARD_TIMEOUT: Duration = Duration::from_secs(900);
+
+#[cfg(test)]
+static GUARD_EXE_OVERRIDE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: run every repository guard with `exe` until the returned guard
+/// drops (the real `rsi-repo-guard` is a separate executable). Process-wide, not
+/// per thread: the lander runs guards from blocking threads too, and the tests
+/// that install it hold the environment lock.
+#[cfg(test)]
+pub(super) fn use_guard_exe(exe: &Path) -> impl Drop {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *GUARD_EXE_OVERRIDE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = self.0.take();
+        }
+    }
+    Restore(
+        GUARD_EXE_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(exe.to_path_buf()),
+    )
+}
+
+/// The test-installed guard, if any (always `None` outside tests).
+fn override_exe() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        GUARD_EXE_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// The trusted `rsi-repo-guard` for work on `repo` judged against `target`, if
+/// one is installed and authenticated for it: the single answer every lander
+/// guard call uses (#361). `None` fails a guard closed; the landing guard alone
+/// still has its committed legacy script until that script is deleted (#363).
+pub(super) fn trusted_guard_exe(repo: &Path, target: &str) -> Option<PathBuf> {
+    override_exe().or_else(|| rsid::repo_guard_call::trusted_tool(repo, target))
+}
+
+/// Whether any native guard is installed, authenticated for a target or not.
+/// Only then is the legacy landing-guard script not needed.
+pub(super) fn native_guard_installed() -> bool {
+    override_exe().is_some() || rsid::repo_guard_call::installed_tool().is_some()
+}
+
+/// Run one repository guard as a bounded child of the lander (#361): the
+/// executable installed beside the lander, never a file of `repo` or of a
+/// candidate, with the lander's scrubbed environment minus `GIT_*`, `RSI_*` and `PYTHON*`.
+pub(super) fn run_repo_guard(
+    repo: &Path,
+    target: &str,
+    cwd: &Path,
+    guard: &str,
+    args: &[&str],
+) -> rsid::repo_guard_call::GuardRun {
+    use rsid::repo_guard_call::{GUARD_BIN, GuardRun, run_guard};
+    let Some(exe) = trusted_guard_exe(repo, target) else {
+        return GuardRun::Failed(format!(
+            "no trusted {GUARD_BIN} is installed beside the lander"
+        ));
+    };
+    run_guard(
+        &exe,
+        guard,
+        args,
+        cwd,
+        crate::lander_env::vars_os().into_iter().filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            !(key.starts_with("GIT_") || key.starts_with("RSI_") || key.starts_with("PYTHON"))
+        }),
+        GUARD_TIMEOUT,
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASED_GUARD_STUB: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: answer [`check_released_migrations`] with a fixed exit code on
+/// this thread until the returned guard drops. The native guard has its own
+/// fixture suite in `rsi-repo-guards`; a landing-policy test that isolates one
+/// rule (the migration number, the fence a refusal carries) installs this.
+#[cfg(test)]
+pub(super) fn stub_released_guard(exit: i32) -> impl Drop {
+    struct Restore(Option<i32>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RELEASED_GUARD_STUB.with(|stub| stub.set(self.0));
+        }
+    }
+    Restore(RELEASED_GUARD_STUB.with(|stub| stub.replace(Some(exit))))
+}
+
+/// The released-migration guard on `target..candidate`, run in process from
+/// the lander's own build (#361). `_source_repo` is the former script location;
+/// no committed script is consulted any more.
 pub(super) fn check_released_migrations(
     repo: &Path,
-    source_repo: &Path,
+    _source_repo: &Path,
     target: &str,
     candidate: &str,
 ) -> Result<(), String> {
-    let script = source_repo.join("tools/check-released-migrations.py");
-    if !script.is_file() {
-        return Err("released-migration guard script is missing".into());
+    #[cfg(test)]
+    if let Some(exit) = RELEASED_GUARD_STUB.with(std::cell::Cell::get) {
+        return if exit == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "released-migration guard refused landing: stubbed exit {exit}"
+            ))
+        };
     }
-    let output = Command::new("python3")
-        .arg(script)
-        .arg(target)
-        .arg(candidate)
-        .current_dir(repo)
-        .output()
-        .map_err(|error| format!("cannot start released-migration guard: {error}"))?;
-    if !output.status.success() {
+    let run = run_repo_guard(
+        repo,
+        target,
+        repo,
+        "released-migrations",
+        &[target, candidate],
+    );
+    if !run.success() {
         return Err(format!(
             "released-migration guard refused landing: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            run.reason()
         ));
     }
     Ok(())

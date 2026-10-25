@@ -14,11 +14,26 @@ const AGENT_LIMIT: usize = 2048;
 const USAGE_LIMIT: usize = 50000;
 const ACTIVE_SQL: &str = "SELECT id FROM sessions WHERE status IN ('Starting','Running','WaitingApproval')
     AND updated_at <= ?1 AND COALESCE(session_kind,'Standard') NOT IN ('Group','Epic') ORDER BY updated_at DESC, id LIMIT ?2";
-const USAGE_SQL: &str = "SELECT COALESCE(i.project_id,''), COALESCE(p.name,'Unassigned'),
+/// The cost column is each invocation's OWN cost (#3534): a session
+/// launch/resume row stores the session's cumulative figure
+/// (`model_control::cost`, #2593), so the raw column summed a long session once
+/// per turn. The increment table is scoped to the sessions with a row in the
+/// window; a row with no session keeps its recorded cost.
+const USAGE_SQL: &str = concat!(
+    "WITH ids(id) AS (SELECT DISTINCT session_id FROM model_invocations
+        WHERE created_at >= ?1 AND created_at <= ?2 AND session_id IS NOT NULL)
+    SELECT COALESCE(i.project_id,''), COALESCE(p.name,'Unassigned'),
     COALESCE(i.provider,'Unknown'), COALESCE(i.model,'Unknown'), i.created_at, i.status,
-    i.input_tokens, i.output_tokens, i.cache_read_tokens, i.cache_creation_tokens, i.estimated_cost_usd, i.session_id
-    FROM (SELECT project_id,provider,model,created_at,status,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,estimated_cost_usd,session_id FROM model_invocations WHERE created_at >= ?1 AND created_at <= ?2
-          ORDER BY created_at DESC, id LIMIT ?3) i LEFT JOIN projects p ON p.id=i.project_id";
+    i.input_tokens, i.output_tokens, i.cache_read_tokens, i.cache_creation_tokens,
+    ",
+    "CASE WHEN rsi_billing_mode(i.provider,i.model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))='subscription' THEN 0.0 ELSE CASE WHEN i.session_id IS NULL THEN i.estimated_cost_usd ELSE ci.cost_increment_usd END END",
+    ", i.session_id
+    FROM (SELECT id,project_id,provider,model,created_at,status,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,estimated_cost_usd,session_id FROM model_invocations WHERE created_at >= ?1 AND created_at <= ?2
+          ORDER BY created_at DESC, id LIMIT ?3) i LEFT JOIN projects p ON p.id=i.project_id
+    LEFT JOIN (",
+    crate::model_control::cost::cost_increment_for_ids_sql!(),
+    ") ci ON ci.invocation_id = i.id"
+);
 fn timestamp(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
@@ -52,7 +67,7 @@ pub enum FleetScope {
 }
 
 impl FleetScope {
-    fn admits(&self, project: Option<Uuid>, session: Option<Uuid>) -> bool {
+    pub(crate) fn admits(&self, project: Option<Uuid>, session: Option<Uuid>) -> bool {
         match self {
             Self::All => true,
             Self::Projects(projects) => project.is_some_and(|id| projects.contains(&id)),
@@ -76,6 +91,8 @@ impl Store {
     ) -> Result<FleetOverview> {
         let mut snapshot = FleetOverview {
             as_of: now,
+            plan_windows: self.load_provider_rate_limit_snapshots()?,
+            plan_usage_by_role: self.plan_usage_by_role(now, scope)?,
             agents: vec![],
             groups: vec![],
             totals: Default::default(),
@@ -97,7 +114,10 @@ impl Store {
                 break;
             }
             scanned += 1;
-            let session = row?.into_session()?;
+            let mut session = row?.into_session()?;
+            if !self.session_billing_mode(&session)?.is_metered() {
+                session.cost_usd = None;
+            }
             if !scope.admits(session.project_id, Some(session.id)) {
                 continue;
             }
@@ -203,6 +223,19 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Dollar-accounting fixtures use API logins. Subscription coverage lives
+    // in provider_billing::tests and never treats CLI list prices as bills.
+    fn metered_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
+        store
+            .set_daemon_setting("codex_billing_mode", "metered_api")
+            .unwrap();
+        store
+    }
+
     use rsi_common::types::{Project, SessionStatus};
     use uuid::Uuid;
     fn invocation(
@@ -220,7 +253,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn fleet_aggregates_projects_providers_models_and_exact_windows() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let now = Utc::now();
         let projects = [Uuid::new_v4(), Uuid::new_v4()];
         for (i, id) in projects.iter().enumerate() {
@@ -340,10 +373,62 @@ mod tests {
             4
         );
     }
+    /// #3534: a session's launch/resume rows each store the session's
+    /// CUMULATIVE cost; the fleet cost is each row's own increment, with the
+    /// predecessor read from before a window opens.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn fleet_cost_counts_each_session_row_once_not_its_running_total() {
+        let store = metered_store();
+        let now = Utc::now();
+        let project = Uuid::new_v4();
+        store
+            .insert_project(&Project {
+                id: project,
+                name: "Cum".into(),
+                path: None,
+                description: None,
+                color: Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        let mut s = crate::test_support::test_session(Uuid::new_v4(), "/tmp/fleet".into());
+        s.project_id = Some(project);
+        s.status = SessionStatus::Completed;
+        store.insert_session(&s).unwrap();
+        for (age, cost) in [
+            (Duration::hours(3), 1.0),
+            (Duration::hours(2), 2.5),
+            (Duration::minutes(30), 4.0),
+            (Duration::minutes(2), 4.5),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO model_invocations (id,session_id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,trigger_source,project_id,provider,model,created_at,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,estimated_cost_usd)
+                     VALUES (?1,?2,'session.continue.resume','cli','foreground','paid','admitted','completed','test',?3,'Claude','m-cum',?4,1,1,1,1,?5)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        s.id.to_string(),
+                        project.to_string(),
+                        timestamp(now - age),
+                        cost
+                    ],
+                )
+                .unwrap();
+        }
+        let result = store.fleet_overview(now).unwrap();
+        let cost: Vec<f64> = result.totals.iter().map(|u| u.cost).collect();
+        // Last 5 min: 0.5 (4.5 over the 4.0 before it); last hour: 1.5 + 0.5;
+        // last day: the session's 4.5, not the 12.0 of the raw rows.
+        assert_eq!(cost, vec![0.5, 2.0, 4.5]);
+    }
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
     #[test]
     fn fleet_queries_use_range_indexes_and_report_limits() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let now = Utc::now();
         for (sql, values, expected) in [
             (
@@ -394,7 +479,7 @@ mod tests {
     #[test]
     fn fleet_active_snapshot_keeps_old_agents_and_excludes_containers() {
         use rsi_common::types::SessionKind;
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let now = Utc::now();
         let mut epic = crate::test_support::test_session(Uuid::new_v4(), "/tmp/fleet".into());
         epic.session_kind = SessionKind::Epic;

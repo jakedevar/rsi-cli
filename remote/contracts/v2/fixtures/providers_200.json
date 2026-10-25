@@ -1,0 +1,92 @@
+{
+  "name": "providers_200",
+  "request": {
+    "body": null,
+    "headers": {
+      "cookie": "__Host-rsi_remote=<session cookie>",
+      "origin": "https://<canonical_host>"
+    },
+    "method": "GET",
+    "path": "/api/v2/providers"
+  },
+  "response": {
+    "body": {
+      "observed_at": "2026-10-22T12:00:00.000000000Z",
+      "providers": [
+        {
+          "binding_window": "five_hour",
+          "is_using_overage": false,
+          "models": [
+            {
+              "cost_1h_usd": 1.0,
+              "cost_24h_usd": 8.0,
+              "model": "claude-opus"
+            },
+            {
+              "cost_1h_usd": 0.25,
+              "cost_24h_usd": 1.5,
+              "model": "claude-haiku"
+            }
+          ],
+          "models_truncated": false,
+          "observed_at": "2026-10-22T12:00:00.000000000Z",
+          "overage_status": "rejected",
+          "provider": "Claude",
+          "spend": {
+            "cost_1h_usd": 1.25,
+            "cost_24h_usd": 9.5
+          },
+          "spend_reason": null,
+          "stale_reason": null,
+          "status": "allowed",
+          "windows": [
+            {
+              "key": "five_hour",
+              "resets_at": "2026-10-22T15:00:00.000000000Z",
+              "resets_at_epoch": 1792681200,
+              "utilization": 0.42
+            },
+            {
+              "key": "seven_day",
+              "resets_at": null,
+              "resets_at_epoch": null,
+              "utilization": 0.1
+            }
+          ],
+          "windows_reason": null,
+          "windows_truncated": false
+        },
+        {
+          "binding_window": "weekly",
+          "is_using_overage": false,
+          "models": [],
+          "models_truncated": false,
+          "observed_at": "2026-10-22T11:58:00.000000000Z",
+          "overage_status": null,
+          "provider": "Codex",
+          "spend": {
+            "cost_1h_usd": 0.0,
+            "cost_24h_usd": 0.0
+          },
+          "spend_reason": null,
+          "stale_reason": "probe_timeout",
+          "status": "allowed_warning",
+          "windows": [
+            {
+              "key": "weekly",
+              "resets_at": "2026-10-25T00:00:00.000000000Z",
+              "resets_at_epoch": 1792886400,
+              "utilization": 0.97
+            }
+          ],
+          "windows_reason": null,
+          "windows_truncated": false
+        }
+      ],
+      "providers_truncated": false,
+      "windows_incomplete": false
+    },
+    "retry_after": null,
+    "status": 200
+  }
+}

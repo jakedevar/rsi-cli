@@ -214,7 +214,11 @@ fn published_examples_use_canonical_names_only() {
 #[test]
 fn deprecated_aliases_decode_to_the_same_request_as_the_canonical_name() {
     for (verb, alias, canonical) in DEPRECATED_PARAMETER_ALIASES {
-        let new = verb.example();
+        let mut new = verb.example();
+        if *verb == AgentControlVerbV1::SubmitJob {
+            // A source session is only accepted for landing and cloud_gate jobs.
+            new = json!({"kind": "landing", "params": {"accepted": "a".repeat(40)}});
+        }
         let mut with_alias = new.clone();
         let object = with_alias.as_object_mut().unwrap();
         let value = object.remove(*canonical);

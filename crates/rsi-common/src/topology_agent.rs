@@ -470,8 +470,22 @@ impl AgentTopologyExecuteRequestV1 {
     }
 }
 
+/// A live landing already linked to the execution's input Issue. Advisory:
+/// execution is still accepted, so a manager can deliberately rerun work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyQueuedLandingWarningV1 {
+    pub code: String,
+    pub issue: i64,
+    pub entry_id: Uuid,
+    pub entry_sequence: i64,
+    pub state: crate::rolling_queue::RollingQueueEntryState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTopologyExecuteResultV1 {
+    /// Live queued/admitted/gating landings for inputs.issue (at most 32).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<TopologyQueuedLandingWarningV1>,
     pub execution_id: Uuid,
     pub accepted_at: DateTime<Utc>,
     pub base_commit: String,

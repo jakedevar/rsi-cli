@@ -59,8 +59,8 @@ pub fn take_marker_env() -> Option<PathBuf> {
     let path = std::env::var_os(SHUTDOWN_MARKER_ENV).map(PathBuf::from);
     if path.is_some() {
         // SAFETY: called from `main` before any thread exists (see
-        // `capture_marker_path`); the unit test that calls it is the only
-        // reader or writer of this variable in its process.
+        // `capture_marker_path`); the unit test that calls it holds the
+        // process-wide `temp_env` lock (#190).
         unsafe { std::env::remove_var(SHUTDOWN_MARKER_ENV) };
     }
     path
@@ -98,21 +98,74 @@ pub fn scrub_supervisor_env() {
 /// and a no-op without a supervisor (or when [`capture_marker_path`] never saw
 /// a path). Never fails the shutdown it reports.
 pub fn mark_shutdown_begun(reason: &str) {
+    mark_shutdown_begun_from(reason, None);
+}
+
+/// [`mark_shutdown_begun`] for a shutdown a signal started: the marker also
+/// names the signal's sender (`sender_pid=<pid>`, #3433), which the supervisor
+/// echoes when it restarts the daemon after an unannounced stop.
+pub fn mark_shutdown_begun_from(reason: &str, sender_pid: Option<i32>) {
     let Some(path) = MARKER_PATH.get().and_then(Option::as_deref) else {
         return;
     };
     if MARKED.swap(true, Ordering::AcqRel) {
         return;
     }
-    if let Err(error) = write_marker(path, reason, std::process::id()) {
+    if let Err(error) = write_marker(path, reason, std::process::id(), sender_pid) {
         tracing::warn!(%error, path = %path.display(), "shutdown marker not written");
+    }
+}
+
+/// #3433: the friction event for a shutdown signal. Signature
+/// `forced_shutdown:signal:<sigint|sigterm>` (the existing shutdown kind, so no
+/// new variant of a type half the daemon matches on), evidence `sender:<pid>` (`sender:unknown`
+/// when the platform or the kernel gave no sender).
+#[must_use]
+pub fn shutdown_signal_event(
+    signal: &str,
+    sender: Option<&crate::signal_sender::SignalSender>,
+) -> NewFrictionEventV1 {
+    let evidence = sender.map_or_else(|| "unknown".to_string(), |sender| sender.pid.to_string());
+    NewFrictionEventV1::new(
+        FrictionKind::ForcedShutdown,
+        &["signal", &signal.to_ascii_lowercase()],
+    )
+    .evidence("sender", evidence)
+}
+
+/// #3433: the `daemon.log` line naming who sent the shutdown signal.
+pub fn log_shutdown_signal(signal: &str, sender: Option<&crate::signal_sender::SignalSender>) {
+    tracing::warn!(
+        "Shutdown signal received: {}",
+        crate::signal_sender::describe(signal, sender)
+    );
+}
+
+/// #3433: record the shutdown signal as a friction event, so the next
+/// unexplained stop names its sender in the friction rollup (the `daemon.log`
+/// line comes from [`log_shutdown_signal`]). Bounded: a busy store never delays
+/// the shutdown by more than two seconds.
+pub async fn record_shutdown_signal(
+    store: &rsid_core::store_lock::Mutex<Store>,
+    signal: &str,
+    sender: Option<&crate::signal_sender::SignalSender>,
+) {
+    let event = shutdown_signal_event(signal, sender);
+    match tokio::time::timeout(std::time::Duration::from_secs(2), store.lock()).await {
+        Ok(store) => crate::friction::note_locked(&store, &event),
+        Err(_) => tracing::warn!("shutdown signal friction event skipped: store busy"),
     }
 }
 
 /// The marker names its writer, `pid=<pid> reason=<reason>`: the supervisor
 /// starts its grace clock only for its own child's pid and removes any other
 /// (#2594).
-fn write_marker(path: &Path, reason: &str, pid: u32) -> std::io::Result<()> {
+fn write_marker(
+    path: &Path,
+    reason: &str,
+    pid: u32,
+    sender_pid: Option<i32>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -123,7 +176,10 @@ fn write_marker(path: &Path, reason: &str, pid: u32) -> std::io::Result<()> {
     };
     // Atomic, so the supervisor never reads a half-written marker.
     let staged = path.with_extension("tmp");
-    std::fs::write(&staged, format!("pid={pid} reason={reason}\n"))?;
+    let sender = sender_pid
+        .filter(|sender| *sender > 0)
+        .map_or_else(String::new, |sender| format!(" sender_pid={sender}"));
+    std::fs::write(&staged, format!("pid={pid} reason={reason}{sender}\n"))?;
     std::fs::rename(&staged, path)
 }
 
@@ -133,7 +189,10 @@ pub struct ForcedShutdown {
     /// RFC3339 time of the forced end.
     pub forced_at: String,
     /// `daemon_shutdown` (the daemon began it) or `supervisor_stop` (the
-    /// supervisor was told to stop).
+    /// supervisor was told to stop); #3433: `unannounced_signal` (a SIGINT or
+    /// SIGTERM no intended-stop path announced ended the daemon, which the
+    /// supervisor restarted) or `restart_budget_exhausted` (#3492: the shared
+    /// restart budget was spent, so it waited before restarting).
     pub trigger: String,
     /// The grace period that elapsed.
     pub grace_seconds: u64,
@@ -153,13 +212,27 @@ impl ForcedShutdown {
         format!("{stamp}-{}", self.pid)
     }
 
+    /// What the supervisor did about this incident.
+    fn action(&self) -> &'static str {
+        match self.trigger.as_str() {
+            // #3433: a SIGINT/SIGTERM nobody announced ended the daemon.
+            "unannounced_signal" => {
+                "daemon stopped by a signal no intended-stop path announced; restarted (sender in daemon.log)"
+            }
+            "restart_budget_exhausted" => {
+                "the supervisor's restart budget (deploys, watchdog exits and signal stops share it) was spent; it waited the budget out (capped) and restarted the daemon instead of exiting; deploys are refused until the window frees"
+            }
+            _ => "SIGTERM then SIGKILL to the daemon process group, then restart",
+        }
+    }
+
     fn json(&self) -> serde_json::Value {
         serde_json::json!({
             "forced_at": self.forced_at,
             "trigger": self.trigger,
             "grace_seconds": self.grace_seconds,
             "pid": self.pid,
-            "action": "SIGTERM then SIGKILL to the daemon process group, then restart",
+            "action": self.action(),
         })
     }
 }
@@ -288,25 +361,71 @@ pub fn spawn_supervisor_parent_watch() {
 mod tests {
     use super::*;
 
-    /// Serialises the tests that mutate the supervisor environment variables.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn the_marker_names_its_writer_and_is_written_where_told() {
         let dir = std::env::temp_dir().join(format!("rsid-marker-{}", std::process::id()));
         let marker = dir.join("nested").join("shutdown-begun");
-        write_marker(&marker, "sigterm", 4242).unwrap();
+        write_marker(&marker, "sigterm", 4242, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
             "pid=4242 reason=sigterm\n"
         );
-        write_marker(&marker, "not a friction code!", 7).unwrap();
+        write_marker(&marker, "not a friction code!", 7, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
             "pid=7 reason=unclassified\n"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433: a signal-driven shutdown names its sender in the marker, and the
+    /// supervisor's `pid=` match still reads only the daemon's own pid.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn a_signal_shutdown_marker_names_the_sender() {
+        let dir = std::env::temp_dir().join(format!("rsid-marker-sender-{}", std::process::id()));
+        let marker = dir.join("shutdown-begun");
+        write_marker(&marker, "ctrl_c", 4242, Some(777)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "pid=4242 reason=ctrl_c sender_pid=777\n"
+        );
+        write_marker(&marker, "sigterm", 4242, Some(0)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "pid=4242 reason=sigterm\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[test]
+    fn an_unannounced_signal_incident_says_it_was_restarted_not_force_killed() {
+        let incidents = parse_incidents(
+            "forced_at=2026-10-21T01:54:59Z trigger=unannounced_signal grace_seconds=0 pid=2799079 signal=INT\n\
+             forced_at=2026-10-21T02:00:00Z trigger=restart_budget_exhausted grace_seconds=0 pid=5 signal=TERM\n\
+             forced_at=2026-10-21T02:10:00Z trigger=daemon_shutdown grace_seconds=120 pid=6 signal=KILL\n",
+        );
+        assert_eq!(incidents.len(), 3);
+        assert!(
+            incidents[0].json()["action"]
+                .as_str()
+                .unwrap()
+                .contains("restarted")
+        );
+        assert!(
+            incidents[1].json()["action"]
+                .as_str()
+                .unwrap()
+                .contains("waited the budget out")
+        );
+        assert!(
+            incidents[2].json()["action"]
+                .as_str()
+                .unwrap()
+                .contains("SIGKILL")
+        );
     }
 
     /// #2594: the daemon reads the supervisor's marker path once and removes it
@@ -315,26 +434,31 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn the_marker_variable_is_removed_so_no_child_inherits_it() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: this is the only test that reads or writes the variable.
-        unsafe { std::env::set_var(SHUTDOWN_MARKER_ENV, "/nonexistent/shutdown-begun") };
-        assert_eq!(
-            take_marker_env(),
-            Some(PathBuf::from("/nonexistent/shutdown-begun"))
+        // `temp_env` holds the one process-wide environment lock and restores
+        // the variable afterwards (#190).
+        temp_env::with_var(
+            SHUTDOWN_MARKER_ENV,
+            Some("/nonexistent/shutdown-begun"),
+            || {
+                assert_eq!(
+                    take_marker_env(),
+                    Some(PathBuf::from("/nonexistent/shutdown-begun"))
+                );
+                assert!(std::env::var_os(SHUTDOWN_MARKER_ENV).is_none());
+                // The child probe needs the Unix `env` executable; the in-process
+                // assertion above holds on every OS (a child inherits the process
+                // environment, so its absence there is what a child would see).
+                #[cfg(unix)]
+                {
+                    let output = std::process::Command::new("env").output().unwrap();
+                    assert!(
+                        !String::from_utf8_lossy(&output.stdout).contains(SHUTDOWN_MARKER_ENV),
+                        "a spawned child must not see the marker variable"
+                    );
+                }
+                assert_eq!(take_marker_env(), None);
+            },
         );
-        assert!(std::env::var_os(SHUTDOWN_MARKER_ENV).is_none());
-        // The child probe needs the Unix `env` executable; the in-process
-        // assertion above holds on every OS (a child inherits the process
-        // environment, so its absence there is what a child would see).
-        #[cfg(unix)]
-        {
-            let output = std::process::Command::new("env").output().unwrap();
-            assert!(
-                !String::from_utf8_lossy(&output.stdout).contains(SHUTDOWN_MARKER_ENV),
-                "a spawned child must not see the marker variable"
-            );
-        }
-        assert_eq!(take_marker_env(), None);
     }
 
     /// #2601: every supervisor-internal variable is gone from a child spawned
@@ -354,55 +478,57 @@ mod tests {
             "RSID_SUPERVISOR_FUTURE_KNOB",
             SHUTDOWN_MARKER_ENV,
         ];
-        // SAFETY: this test and the marker test are the only users of these
-        // names; the marker test serialises on the same lock.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        for name in names {
-            unsafe { std::env::set_var(name, "/nonexistent/supervisor") };
-        }
-        unsafe { std::env::set_var("RSI_SCRUB_TEST_KEEP", "1") };
-        scrub_supervisor_env();
-        // Portable, in-process: nothing supervisor-internal is left in the
-        // environment any spawn path would inherit, and an unrelated variable
-        // is untouched.
-        for name in names {
-            assert!(
-                std::env::var_os(name).is_none(),
-                "{name} survived the scrub"
-            );
-        }
-        assert!(
-            std::env::vars_os().all(|(key, _)| {
-                let key = key.to_string_lossy();
-                let name: &str = &key;
-                !name.starts_with(SUPERVISOR_INTERNAL_ENV_PREFIX)
-                    && !SUPERVISOR_INTERNAL_ENV.contains(&name)
-            }),
-            "a supervisor-internal variable survived the scrub"
-        );
-        assert_eq!(
-            std::env::var_os("RSI_SCRUB_TEST_KEEP"),
-            Some(std::ffi::OsString::from("1")),
-            "unrelated env kept"
-        );
-        // Child probes need the Unix `env` and `sh` executables: the direct
-        // and shell spawn paths both see the scrubbed environment.
-        #[cfg(unix)]
-        {
-            let std_out = std::process::Command::new("env").output().unwrap();
-            let shell_out = std::process::Command::new("sh")
-                .args(["-c", "env"])
-                .output()
-                .unwrap();
-            for out in [std_out, shell_out] {
-                let text = String::from_utf8_lossy(&out.stdout);
-                for name in names {
-                    assert!(!text.contains(name), "a child inherited {name}");
-                }
-                assert!(text.contains("RSI_SCRUB_TEST_KEEP=1"), "unrelated env kept");
+        // The scrub reads the whole process environment, so it runs under the
+        // one process-wide environment lock (`temp_env`), which also restores
+        // every name afterwards (#190).
+        let vars: Vec<(&str, Option<&str>)> = names
+            .iter()
+            .map(|name| (*name, Some("/nonexistent/supervisor")))
+            .chain([("RSI_SCRUB_TEST_KEEP", Some("1"))])
+            .collect();
+        temp_env::with_vars(vars, || {
+            scrub_supervisor_env();
+            // Portable, in-process: nothing supervisor-internal is left in the
+            // environment any spawn path would inherit, and an unrelated variable
+            // is untouched.
+            for name in names {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} survived the scrub"
+                );
             }
-        }
-        unsafe { std::env::remove_var("RSI_SCRUB_TEST_KEEP") };
+            assert!(
+                std::env::vars_os().all(|(key, _)| {
+                    let key = key.to_string_lossy();
+                    let name: &str = &key;
+                    !name.starts_with(SUPERVISOR_INTERNAL_ENV_PREFIX)
+                        && !SUPERVISOR_INTERNAL_ENV.contains(&name)
+                }),
+                "a supervisor-internal variable survived the scrub"
+            );
+            assert_eq!(
+                std::env::var_os("RSI_SCRUB_TEST_KEEP"),
+                Some(std::ffi::OsString::from("1")),
+                "unrelated env kept"
+            );
+            // Child probes need the Unix `env` and `sh` executables: the direct
+            // and shell spawn paths both see the scrubbed environment.
+            #[cfg(unix)]
+            {
+                let std_out = std::process::Command::new("env").output().unwrap();
+                let shell_out = std::process::Command::new("sh")
+                    .args(["-c", "env"])
+                    .output()
+                    .unwrap();
+                for out in [std_out, shell_out] {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for name in names {
+                        assert!(!text.contains(name), "a child inherited {name}");
+                    }
+                    assert!(text.contains("RSI_SCRUB_TEST_KEEP=1"), "unrelated env kept");
+                }
+            }
+        });
     }
 
     /// Without a captured path (every unit test, any non-supervised start) a
@@ -456,6 +582,43 @@ mod tests {
         assert_eq!(take_incidents(&path).unwrap().len(), 1);
         assert!(!path.exists());
         assert!(take_incidents(&path).unwrap().is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
+    #[tokio::test]
+    async fn a_shutdown_signal_is_recorded_with_its_sender() {
+        let store = rsid_core::store_lock::Mutex::new(Store::open_in_memory().unwrap());
+        let sender = crate::signal_sender::SignalSender {
+            pid: 31337,
+            uid: 1000,
+            comm: Some("kill".into()),
+            cgroup: None,
+        };
+        record_shutdown_signal(&store, "SIGINT", Some(&sender)).await;
+        let rollup = store
+            .lock()
+            .await
+            .friction_rollup(
+                &rsi_common::friction::ListFrictionRollupRequestV1::default(),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let row = rollup
+            .rows
+            .iter()
+            .find(|row| row.signature == "forced_shutdown:signal:sigint")
+            .unwrap_or_else(|| panic!("{rollup:?}"));
+        assert!(
+            row.evidence_refs
+                .iter()
+                .any(|reference| reference == "sender:31337")
+        );
+        assert_eq!(
+            shutdown_signal_event("SIGTERM", None)
+                .evidence_ref
+                .as_deref(),
+            Some("sender:unknown")
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]

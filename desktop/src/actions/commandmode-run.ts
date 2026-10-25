@@ -4,6 +4,7 @@
 // command. `:manual` opens the generated manual in an in-app reader. Daemon
 // text is set with textContent only; the manual's HTML comes from the Rust
 // sanitizer that renders transcripts.
+import { launchedToast } from '../launch-model.js';
 import { api, invoke } from '../api.js';
 import { type Invocation, type SliceRuntime, dispatch, snapshot } from '../commands.js';
 import {
@@ -20,6 +21,7 @@ import { injectCss } from '../sweep-css.js';
 import { type CommandModeActionId, type CommandModeSnapshot, SLICE } from './commandmode.js';
 import { detailSnapshot } from './detail.js';
 import { focusOwnsKey } from '../modal-gate.js';
+import { loadView } from '../view-load.js';
 
 type Json = Record<string, unknown>;
 
@@ -118,16 +120,19 @@ function confirmMove(): Promise<boolean> {
 async function coldArchive(inv: Invocation): Promise<void> {
   const cmd = parseColdArchive(inv.arg);
   if ('error' in cmd) { toast(cmd.error); return; }
+  if (cmd.kind === 'status') {
+    await loadView({
+      key: 'cm-cold-archive', title: 'Cold storage', failed: 'Cold storage: the status read failed',
+      read: () => invoke<Json>('cold_archive_status'),
+      open: (status) => toast(`Cold storage: ${coldStatusLine(status)} — last pass: ${coldLastRunLine(status)}`, !coldHasProblems(status)),
+    });
+    return;
+  }
   try {
-    if (cmd.kind === 'run') {
-      if (cmd.mode === 'move' && !(await confirmMove())) return;
-      toast(coldStartedMessage(await invoke<Json>('cold_archive_run', { mode: cmd.mode })), true);
-    }
-    const status = await invoke<Json>('cold_archive_status');
-    const line = `Cold storage: ${coldStatusLine(status)} — last pass: ${coldLastRunLine(status)}`;
-    if (cmd.kind === 'status') toast(line, !coldHasProblems(status));
+    if (cmd.mode === 'move' && !(await confirmMove())) return;
+    toast(coldStartedMessage(await invoke<Json>('cold_archive_run', { mode: cmd.mode })), true);
   } catch (e) {
-    toast(cmd.kind === 'run' ? `Cold-storage ${cmd.mode} pass: ${errText(e)}` : `Cold storage: the status read failed: ${errText(e)}`);
+    toast(`Cold-storage ${cmd.mode} pass: ${errText(e)}`);
   }
 }
 
@@ -153,8 +158,8 @@ async function launchBlank(text: string): Promise<void> {
   const pid = $<HTMLSelectElement>('project-filter').value;
   const project = state.projects.find((p) => p.id === pid) ?? null;
   try {
-    await api.launch(blankLaunch(text, defaults, project) as unknown as Parameters<typeof api.launch>[0]);
-    toast('Session launched', true);
+    const result = await api.launch(blankLaunch(text, defaults, project) as unknown as Parameters<typeof api.launch>[0]);
+    toast(launchedToast(result, text, false), true);
     window.setTimeout(() => void refreshSessions(), 500);
   } catch (e) {
     toast(`Launch failed: ${errText(e)}`);

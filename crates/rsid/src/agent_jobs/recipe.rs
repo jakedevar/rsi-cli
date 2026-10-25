@@ -5,33 +5,33 @@
 use super::{JOB_TIMEOUT_UNIT_GRACE_SECS, JobCommand, JobTools, MIB, s};
 use crate::error::{DaemonError, Result};
 use rsi_common::agent_jobs::{
-    JOB_INVALID_PARAMS, JOB_MAX_TOKEN_BYTES, JOB_RECIPE_INVALID, JOB_RECIPE_NOT_ALLOWED,
-    JOB_RECIPE_USE_SCOPED_TEST, JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMEOUT_MIN_MINS,
-    TestJobParams,
+    JOB_MAX_TOKEN_BYTES, JOB_RECIPE_INVALID, JOB_RECIPE_NOT_ALLOWED, JOB_RECIPE_USE_SCOPED_TEST,
+    JOB_TEST_TIMEOUT_MAX_MINS, JOB_TEST_TIMEOUT_MIN_MINS, JobRefusal, TestJobParams,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::io::Read;
 use std::path::Path;
 
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_RECIPES: usize = 64;
 const MAX_CPU_QUOTA_PERCENT: u64 = 1600;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
+pub(super) struct Manifest {
     version: u32,
-    recipes: BTreeMap<String, Recipe>,
+    pub(super) recipes: BTreeMap<String, Recipe>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Recipe {
-    runner: Runner,
-    target: String,
-    timeout_minutes: u32,
-    cpu_quota_percent: u64,
+pub struct Recipe {
+    pub runner: Runner,
+    pub target: String,
+    pub timeout_minutes: u32,
+    pub cpu_quota_percent: u64,
 }
 
 /// The environment variable `scripts/scoped-test` reads its focused filters from.
@@ -40,9 +40,9 @@ struct Recipe {
 /// takes no filters refuses them itself (`make check-touched-shards`).
 pub(super) const RECIPE_FILTERS_ENV: &str = "RSI_SCOPED_TEST_FILTERS";
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Runner {
+pub enum Runner {
     Just,
     Make,
 }
@@ -51,7 +51,7 @@ fn invalid() -> DaemonError {
     DaemonError::InvalidParam(JOB_RECIPE_INVALID.into())
 }
 
-fn target_token(value: &str) -> bool {
+pub(super) fn target_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= JOB_MAX_TOKEN_BYTES
         && !value.starts_with('-')
@@ -60,7 +60,8 @@ fn target_token(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-fn load(cwd: &Path) -> Result<Manifest> {
+#[cfg(test)]
+pub(super) fn load(cwd: &Path) -> Result<Manifest> {
     let root = cwd.canonicalize().map_err(|_| invalid())?;
     let path = root.join(".rsi/jobs.toml");
     let path = path.canonicalize().map_err(|error| {
@@ -80,10 +81,12 @@ fn load(cwd: &Path) -> Result<Manifest> {
     if text.len() as u64 > MAX_MANIFEST_BYTES {
         return Err(invalid());
     }
-    let manifest: Manifest = toml::from_str(&text).map_err(|_| invalid())?;
-    if manifest.version != 1
-        || manifest.recipes.len() > MAX_RECIPES
-        || manifest.recipes.iter().any(|(name, recipe)| {
+    parse_manifest(&text)
+}
+
+pub(super) fn validate_recipes(recipes: &BTreeMap<String, Recipe>) -> Result<()> {
+    if recipes.len() > MAX_RECIPES
+        || recipes.iter().any(|(name, recipe)| {
             !target_token(name)
                 || !target_token(&recipe.target)
                 || !(JOB_TEST_TIMEOUT_MIN_MINS..=JOB_TEST_TIMEOUT_MAX_MINS)
@@ -93,6 +96,18 @@ fn load(cwd: &Path) -> Result<Manifest> {
     {
         return Err(invalid());
     }
+    Ok(())
+}
+
+pub(super) fn parse_manifest(text: &str) -> Result<Manifest> {
+    if text.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(invalid());
+    }
+    let manifest: Manifest = toml::from_str(text).map_err(|_| invalid())?;
+    if manifest.version != 1 {
+        return Err(invalid());
+    }
+    validate_recipes(&manifest.recipes)?;
     Ok(manifest)
 }
 
@@ -103,9 +118,23 @@ fn declared_recipe(cwd: &Path, name: &str) -> Result<Recipe> {
     if retired(name) {
         return Err(DaemonError::InvalidParam(JOB_RECIPE_USE_SCOPED_TEST.into()));
     }
-    let recipe = load(cwd)?
+    let profile = super::project_profile::resolve(cwd).map_err(|_| invalid())?;
+    let recipe = profile
         .recipes
-        .remove(name)
+        .get(name)
+        .cloned()
+        .or_else(|| {
+            let super::project_profile::Verification::Available(commands) = &profile.verification
+            else {
+                return None;
+            };
+            commands.iter().find_map(|command| match command {
+                super::project_profile::ProjectCommand::Recipe(recipe) if recipe.target == name => {
+                    Some(recipe.clone())
+                }
+                _ => None,
+            })
+        })
         .ok_or_else(|| DaemonError::InvalidParam(JOB_RECIPE_NOT_ALLOWED.into()))?;
     if retired(&recipe.target) {
         return Err(DaemonError::InvalidParam(JOB_RECIPE_USE_SCOPED_TEST.into()));
@@ -143,7 +172,10 @@ pub(super) fn command(tools: &JobTools, test: &TestJobParams, cwd: &Path) -> Res
     let recipe = declared_recipe(cwd, name)?;
     let timeout_minutes = test.timeout_minutes.unwrap_or(recipe.timeout_minutes);
     if timeout_minutes > recipe.timeout_minutes {
-        return Err(DaemonError::InvalidParam(JOB_INVALID_PARAMS.into()));
+        return Err(super::job_refusal(JobRefusal::timeout_over_recipe(
+            timeout_minutes,
+            recipe.timeout_minutes,
+        )));
     }
     // Explicit local recipe files prevent just/make from discovering a file
     // in an ancestor directory. Neither the request nor the manifest supplies
@@ -183,6 +215,7 @@ pub(super) fn command(tools: &JobTools, test: &TestJobParams, cwd: &Path) -> Res
         cpu_quota_percent: recipe.cpu_quota_percent,
         background: false,
         admission_max_secs: None,
+        scoped_tool: None,
     })
 }
 
@@ -256,9 +289,10 @@ mod tests {
             assert_eq!(result.memory_max_gib, 24);
             let mut too_long = test_params();
             too_long.timeout_minutes = Some(21);
-            assert_eq!(
-                refusal(command(&tools, &too_long, dir.path()).unwrap_err()),
-                JOB_INVALID_PARAMS
+            let text = refusal(command(&tools, &too_long, dir.path()).unwrap_err());
+            assert!(
+                text.starts_with("job_invalid_params: params.timeout_minutes: 21 exceeds"),
+                "{text}"
             );
         }
     }
@@ -381,6 +415,42 @@ mod tests {
                 .argv
                 .iter()
                 .any(|a| a.starts_with(RECIPE_FILTERS_ENV))
+        );
+    }
+
+    /// #3239, #3453: the repository's own manifest declares `watchdog-pressure`,
+    /// which runs its make target with the declared budget, and only that fixed
+    /// target: a request cannot name another path, argument or environment.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn the_repository_declares_the_watchdog_pressure_recipe() {
+        let root = Path::new(rsi_common::manifest_dir!()).join("../..");
+        let tools = JobTools {
+            cargo_slot: "slot".into(),
+            lander: "lander".into(),
+        };
+        let mut test = test_params();
+        test.recipe = Some("watchdog-pressure".into());
+        test.timeout_minutes = None;
+        let result = command(&tools, &test, &root).unwrap();
+        assert_eq!(
+            result.argv.last().map(String::as_str),
+            Some("watchdog-pressure")
+        );
+        assert_eq!(result.argv[result.argv.len() - 2], "--");
+        assert!(result.cpu_quota_percent >= 200);
+        assert!(result.runtime_max_secs >= 20 * 60);
+        let makefile = std::fs::read_to_string(root.join("Makefile")).unwrap();
+        assert!(
+            makefile.contains("watchdog-pressure:\n\tpython3 scripts/watchdog-compile-pressure.py")
+        );
+        assert!(root.join("scripts/watchdog-compile-pressure.py").is_file());
+        // An unlisted name, such as another target of the same Makefile, is
+        // still refused with the typed code.
+        test.recipe = Some("watchdog-pressure-arbitrary".into());
+        assert_eq!(
+            refusal(command(&tools, &test, &root).unwrap_err()),
+            JOB_RECIPE_NOT_ALLOWED
         );
     }
 

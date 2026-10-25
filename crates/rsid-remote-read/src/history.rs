@@ -51,7 +51,9 @@ pub struct HistoryObservedPage {
 /// Check one complete tool ID against at most 65 exact-key index entries in
 /// the caller's history transaction. The released Store index is on the full
 /// `tool_use_id`; a 256-byte display prefix never enters this lookup. If the
-/// capped seek cannot prove uniqueness, refuse the exact-pairing claim.
+/// capped seek cannot prove the key is used by no more than one call row and
+/// its one result row, refuse the exact-pairing claim. That normal pair is not
+/// ambiguous; any other multi-row use of the key in the session is (hub #3832).
 pub fn tool_pair_ambiguous(
     conn: &Connection,
     session: Uuid,
@@ -62,20 +64,22 @@ pub fn tool_pair_ambiguous(
         return Err(ReadError::InvalidSource);
     }
     let mut statement = conn.prepare_cached(
-        "SELECT id,session_id=?2 FROM conversation_events INDEXED BY idx_events_tool_use_id
+        "SELECT id,session_id=?2,event_type FROM conversation_events
+         INDEXED BY idx_events_tool_use_id
          WHERE tool_use_id=?1 ORDER BY id LIMIT 65",
     )?;
     let rows = statement
         .query_map(params![full_key, session.to_string()], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let target_seen = rows
         .iter()
-        .any(|(id, same_session)| *id == event_id && *same_session);
-    let duplicate_seen = rows
-        .iter()
-        .any(|(id, same_session)| *id != event_id && *same_session);
+        .any(|(id, same_session, _)| *id == event_id && *same_session);
     if !target_seen {
         return Err(if rows.len() == 65 {
             ReadError::SourceUnavailable
@@ -83,13 +87,29 @@ pub fn tool_pair_ambiguous(
             ReadError::InvalidSource
         });
     }
-    if duplicate_seen {
+    let session_rows = rows
+        .iter()
+        .filter(|(_, same_session, _)| *same_session)
+        .map(|(_, _, event_type)| event_type.as_deref().unwrap_or(""))
+        .collect::<Vec<_>>();
+    if session_rows.len() > 1 && !is_one_call_and_result(&session_rows) {
         return Ok(true);
     }
     if rows.len() == 65 {
         return Err(ReadError::SourceUnavailable);
     }
     Ok(false)
+}
+
+/// A normal pair is exactly one call row and its one result row sharing the
+/// call ID. Any other multi-row use of a key (a reused ID) is ambiguous.
+fn is_one_call_and_result(event_types: &[&str]) -> bool {
+    let [first, second] = event_types else {
+        return false;
+    };
+    let is_call = |kind: &str| kind.eq_ignore_ascii_case("ToolUse");
+    let is_result = |kind: &str| kind.eq_ignore_ascii_case("ToolResult");
+    (is_call(first) && is_result(second)) || (is_result(first) && is_call(second))
 }
 
 pub fn observed_history_page(
@@ -378,19 +398,20 @@ mod tests {
     fn tool_pair_check_uses_complete_key_and_refuses_capped_uncertainty() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,tool_use_id TEXT);
+            "CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,event_type TEXT,tool_use_id TEXT);
              CREATE INDEX idx_events_tool_use_id ON conversation_events(tool_use_id);",
         )
         .unwrap();
         let session = Uuid::new_v4();
         let foreign = Uuid::new_v4();
-        let insert = |id: i64, owner: Uuid, key: &str| {
+        let insert_typed = |id: i64, owner: Uuid, kind: &str, key: &str| {
             conn.execute(
-                "INSERT INTO conversation_events(id,session_id,tool_use_id) VALUES(?1,?2,?3)",
-                params![id, owner.to_string(), key],
+                "INSERT INTO conversation_events(id,session_id,event_type,tool_use_id) VALUES(?1,?2,?3,?4)",
+                params![id, owner.to_string(), kind, key],
             )
             .unwrap();
         };
+        let insert = |id: i64, owner: Uuid, key: &str| insert_typed(id, owner, "ToolUse", key);
         insert(1, session, "short");
         insert(2, foreign, "short");
         let prefix = "x".repeat(255);
@@ -416,11 +437,102 @@ mod tests {
             Err(ReadError::InvalidSource)
         ));
         conn.execute(
-            "INSERT INTO conversation_events(id,session_id,tool_use_id) VALUES(3,?1,'short')",
+            "INSERT INTO conversation_events(id,session_id,event_type,tool_use_id) VALUES(3,?1,'ToolUse','short')",
             [session.to_string()],
         )
         .unwrap();
         assert!(tool_pair_ambiguous(&conn, session, 1, "short").unwrap());
         conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// hub #3832: a call row plus its one result row is the normal pair and is
+    /// not ambiguous; a key reused beyond that single pair still is.
+    #[test]
+    fn normal_call_and_result_pair_is_not_ambiguous_but_reuse_is() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,event_type TEXT,tool_use_id TEXT);
+             CREATE INDEX idx_events_tool_use_id ON conversation_events(tool_use_id);",
+        )
+        .unwrap();
+        let session = Uuid::new_v4();
+        let rows: [(i64, &str, &str); 12] = [
+            (1, "ToolUse", "pair"),
+            (2, "ToolResult", "pair"),
+            (3, "ToolUse", "twice-use"),
+            (4, "ToolUse", "twice-use"),
+            (5, "ToolResult", "twice-result"),
+            (6, "ToolResult", "twice-result"),
+            (7, "ToolUse", "three"),
+            (8, "ToolResult", "three"),
+            (9, "ToolResult", "three"),
+            (10, "ToolUse", "lone"),
+            (11, "ToolResult", "resultfirst"),
+            (12, "ToolUse", "resultfirst"),
+        ];
+        for (id, kind, key) in rows {
+            conn.execute(
+                "INSERT INTO conversation_events(id,session_id,event_type,tool_use_id) VALUES(?1,?2,?3,?4)",
+                params![id, session.to_string(), kind, key],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("BEGIN").unwrap();
+        let ask = |id: i64, key: &str| tool_pair_ambiguous(&conn, session, id, key).unwrap();
+        assert!(!ask(1, "pair"));
+        assert!(!ask(2, "pair"));
+        assert!(ask(3, "twice-use"));
+        assert!(ask(4, "twice-use"));
+        assert!(ask(5, "twice-result"));
+        assert!(ask(7, "three"));
+        assert!(ask(8, "three"));
+        assert!(ask(9, "three"));
+        assert!(!ask(10, "lone"));
+        assert!(!ask(11, "resultfirst"));
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// #3797 gap 2: the session-history projection already carries the call
+    /// id, so a result pairs with its call without a client-side guess.
+    #[test]
+    fn tool_use_and_result_rows_share_one_exact_call_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY,project_id TEXT,status TEXT,is_eval INTEGER);
+             CREATE TABLE conversation_events(id INTEGER PRIMARY KEY,session_id TEXT,sequence INTEGER,
+               event_type TEXT,role TEXT,created_at TEXT,content TEXT,tool_name TEXT,tool_use_id TEXT);
+             CREATE INDEX idx_events_tool_use_id ON conversation_events(tool_use_id);
+             CREATE TABLE offloaded_content(session_id TEXT,event_sequence INTEGER);",
+        )
+        .unwrap();
+        let project = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO sessions(id,project_id,status,is_eval) VALUES(?1,?2,'Running',0)",
+            params![session.to_string(), project.to_string()],
+        )
+        .unwrap();
+        for (id, kind, tool_name, content) in [
+            (1_i64, "ToolUse", Some("Bash"), "cargo check"),
+            (2, "ToolResult", None, "Finished"),
+        ] {
+            conn.execute(
+                "INSERT INTO conversation_events(id,session_id,sequence,event_type,created_at,content,tool_name,tool_use_id)
+                 VALUES(?1,?2,?1,?3,'2026-09-27T00:00:00.000000000Z',?4,?5,'toolu_01ABC')",
+                params![id, session.to_string(), kind, content, tool_name],
+            )
+            .unwrap();
+        }
+        let page = history_page(&conn, project, session, HistoryRange::Latest, 10).unwrap();
+        let call = &page.items[0];
+        let result = &page.items[1];
+        assert_eq!(call.event_type, "ToolUse");
+        assert_eq!(result.event_type, "ToolResult");
+        assert_eq!(call.tool_pair_key.as_deref(), Some("toolu_01ABC"));
+        assert_eq!(call.tool_pair_key, result.tool_pair_key);
+        assert_eq!(
+            result.tool_id_display.as_ref().map(|id| id.text.as_str()),
+            Some("toolu_01ABC")
+        );
     }
 }

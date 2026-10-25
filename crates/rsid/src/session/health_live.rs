@@ -55,10 +55,15 @@ impl SessionManager {
                 .filter_map(|text| Uuid::parse_str(&text).ok())
                 .filter(|project| scope.allows(*project))
                 .filter_map(|project| {
-                    let seat = store
-                        .get_harness_manager_notice_config(project)
-                        .ok()??
-                        .current_session_id?;
+                    let seat = match scope.area_seat() {
+                        Some(seat) => seat,
+                        None => {
+                            store
+                                .get_harness_manager_notice_config(project)
+                                .ok()??
+                                .current_session_id?
+                        }
+                    };
                     let queued = store
                         .session_has_unresolved_manager_succession(seat)
                         .unwrap_or(false);

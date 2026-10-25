@@ -1,0 +1,8 @@
+{"kind":"model_request","request":{"messages":[{"content":"fixture bench prompt","role":"system"},{"content":"Recover the rows from the write-ahead log of the database.","role":"user"}],"model":"fixture-model","tools":[{},{}]},"seq":0}
+{"args":{"command":"ls -la /app && which sqlite3 rustc"},"kind":"tool_call","name":"shell","seq":1}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"/app:\nmain.db\nmain.db-wal\n/usr/bin/sqlite3\n/usr/bin/rustc","success":true},"seq":2}
+{"args":{"command":"sqlite3 main.db 'select count(*) from items'"},"kind":"tool_call","name":"shell","seq":3}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"3","success":true},"seq":4}
+{"args":{"command":"cp main.db main.db-wal /tmp/ && sqlite3 /tmp/main.db 'pragma wal_checkpoint(full); select count(*) from items'"},"kind":"tool_call","name":"shell","seq":5}
+{"kind":"tool_result","name":"shell","result":{"error_msg":null,"output":"0|2|2\n5","success":true},"seq":6}
+{"kind":"model_response","response":{"content":"Replayed the log into a copy of the database and counted the rows.","stop_reason":"stop","tool_calls":[],"usage":{"completion_tokens":40,"cost_usd":0.004,"prompt_tokens":900}},"seq":7}

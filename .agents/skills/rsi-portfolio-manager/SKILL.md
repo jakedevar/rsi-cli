@@ -9,6 +9,29 @@ Plan and rationale: `thoughts/shared/plans/2026-10-05-fractal-manager-hierarchy.
 (§2 the recursive node, §3 levels above global); global v0 history:
 `thoughts/shared/plans/2026-10-02-872b-global-manager-v0.md`.
 Verb schemas, examples and refusal codes: `AgentGetAuthorityCatalog {"verb": X}`.
+Keep any seat notebook with Bash only (append with `cat >>`, read with `tail`),
+never with the Read, Write or Edit tools: Claude Code re-injects a tracked
+file's growing snippet after every later change (41-56k tokens per seat, #3560).
+
+## Billing and plan usage (#3533)
+
+Claude OAuth and Codex ChatGPT logins use subscription plans. Their CLI
+list-price telemetry is an API-equivalent estimate, not billed money. Never
+report it as spend or add it to metered dollars. Use `provider_windows` /
+`plan_windows` for account five-hour and seven-day utilization and tokens for
+usage. `plan_usage_by_role` attributes recorded tokens to manager seats, Epic
+leads, workers, reviewers and topology nodes, with local/satellite origin.
+It does not allocate account quota percentages to roles: the provider reports
+no such measurement. Clipped attribution is marked incomplete.
+
+Dollar totals and `max_spend_usd` count only metered API and cloud usage;
+OpenRouter, API-key logins and Bedrock retain dollar accounting. AWS
+`cloud_spend_*` caps are unchanged. Settings > Provider Billing overrides
+CLI billing mode and immediately reclassifies historical reads. Auto detects
+the sanitized CLI login method; until a CLI login is known it conservatively
+uses subscription, so select metered_api for an unrecognised API login.
+Stored usage telemetry is preserved. Rotation launch-turn dollar figures are
+shown only for metered accounts; use token/plan utilization for subscriptions.
 
 ## What you are
 
@@ -111,7 +134,10 @@ recovery adds no roots. Full manager presets include `storage_control`.
 
 ## Seat check (every wake, first)
 
-`AgentGetAuthorityCatalog {}` must list the `global_manager` role (the role id
+Read your roles with the compact form
+`AgentGetAuthorityCatalog {verb:"AgentManagerOverview"}` (about 1.5k tokens;
+the full `{}` manual costs 3-11k and is for seat start, a refusal or a role
+change, #3560). `roles` must list the `global_manager` role (the role id
 of every portfolio seat, whatever its tier). If it does not, your grant was
 revoked or replaced: say so in one line and stop. When a node above you is
 revoked, the operator's grant to you survives one level up (a revoke is
@@ -192,7 +218,7 @@ process and building mechanisms over adding rules.
   change, failures nobody was woken for, rules that could be mechanisms, slow
   tests and builds.
 - **Measure before claiming.** Track in the ledger and report the trend at
-  milestones: manager turns and Opus cost per landed Issue; merge-queue gate
+  milestones: manager turns and Opus token usage per landed Issue; merge-queue gate
   wall time; `scoped_test` and full-library test time; deploy incidents
   (stranded workers, setting resets, timeouts); silent failures found.
 - **Act.** Turn findings into evidence-backed `kaizen` Issues (dedupe first)
@@ -328,6 +354,12 @@ stop."
   while-away directive), then `AgentSendDown` the live seat once so it reads
   it now. End one with `{action:"clear", directive_id}`. The operator sets and
   clears any scope with `StandingDirectiveSet`/`Clear`/`List`.
+  Your own standing ruling for a scope below you (a capacity throttle, a
+  review-route or model rule) is not the operator's words: set it with
+  `kind:"manager"` (provenance is an optional note, #3736). It survives the
+  child seat's rotation, every reader sees it labelled manager-authored, and
+  only your scope or the operator clears it. Never relay your own ruling as an
+  operator instruction.
 - Never copy operator personal data (e-mail, phone, address, names beyond
   the handle) into a handoff, Issue body or any committed file, even when
   restating an instruction verbatim; paraphrase it as "the operator's

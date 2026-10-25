@@ -66,6 +66,9 @@ fn hub_effective_grant(
         }
     } else {
         launches = store.manager_effective_launches(&config, &launches)?;
+        // #3417: a provider grant's any-model entry is charged against the
+        // hub's own spend; a satellite policy carries exact tuples only.
+        launches.retain(|launch| !launch.is_provider_wide());
         caps = store
             .project_effective_resource_caps(config.project_id)?
             .ok_or_else(denied)?;

@@ -4,6 +4,7 @@ mod agent_projects;
 pub(crate) mod attention;
 pub(crate) mod bootstrap;
 mod cache;
+pub mod daemon_recovery;
 mod graph;
 mod handoff;
 mod hierarchy_effect;
@@ -269,6 +270,7 @@ pub struct ConversationPollResult {
         Result<Vec<(Uuid, Option<i32>, Vec<rsi_common::types::ConversationEvent>)>, String>,
     pub batch_unsupported: bool,
     pub connection_lost: bool,
+    pub timed_out: bool,
 }
 
 /// Completion from an owned, bounded `/resume_handoff` launch dispatch.
@@ -484,6 +486,14 @@ pub struct App {
     pub needs_redraw: bool,
     /// When true, the main loop should kick off background model discovery.
     pub needs_model_refresh: bool,
+    /// The launch dialog planned a manager for this project: the event loop
+    /// should read what the project already has granted (#3270).
+    pub manager_grant_context_request: Option<Uuid>,
+    /// The in-flight read for `manager_grant_context_request`.
+    pub(crate) manager_grant_context_task: Option<(
+        Uuid,
+        tokio::task::JoinHandle<crate::types::GrantContextState>,
+    )>,
     /// Model/effort switches the operator queued from session detail that the
     /// daemon has not applied yet (Issue #681). The status line shows the
     /// queued tuple until the session's effective model and effort match it.
@@ -660,6 +670,10 @@ pub struct App {
     /// session browser's live-activity pane.
     pub(crate) daemon_resources: Option<crate::daemon_resources::DaemonResourceView>,
     pub(crate) local_build_warning: Option<String>,
+    pub(crate) daemon_build_sha: Option<String>,
+    /// #3433: a running TUI starts the daemon (or shows how) when its socket
+    /// stays unreachable.
+    pub daemon_recovery: daemon_recovery::DaemonRecovery,
     /// #2055: the operator landing flow (armed confirmation, watched entries).
     pub(crate) land: crate::land::LandState,
     /// #2384: which archived sessions have their rows in cold storage (the
@@ -979,9 +993,12 @@ pub struct App {
     /// on every `cached_claude_settings_rows()` call after the cache is
     /// (re)populated; `&[HookRow]` is returned to the renderer.
     pub cached_hook_rows: Vec<crate::claude_config::HookRow>,
-    /// Cached `~/.claude/skills/` listing for the Settings -> Skills category.
-    /// Read from this host's skills directory.
+    /// The daemon user's `~/.claude/skills/` listing (`ListSkills`, local
+    /// #91) for the Settings -> Skills category; fetched on first read.
     pub cached_user_skills: Option<Vec<crate::claude_config::SkillEntry>>,
+    /// A `ListSkills` was asked for since the cache was last cleared, so
+    /// render does not queue one per frame (also after a failed fetch).
+    pub claude_skills_requested: bool,
 
     /// Cached lifetime usage aggregate for the Settings -> Stats category
     /// (T8). Populated on first entry to the category; refreshed on each
@@ -1340,6 +1357,8 @@ impl App {
             quit: false,
             needs_redraw: true, // Draw on first frame
             needs_model_refresh: false,
+            manager_grant_context_request: None,
+            manager_grant_context_task: None,
             pending_model_switches: HashMap::new(),
             model_refresh_provider: None,
             model_discovery_rx: None,
@@ -1396,6 +1415,8 @@ impl App {
             worker_pressure_next_refresh_at: std::time::Instant::now(),
             daemon_resources: None,
             local_build_warning: None,
+            daemon_build_sha: None,
+            daemon_recovery: daemon_recovery::DaemonRecovery::default(),
             land: crate::land::LandState::default(),
             cold_storage: crate::cold_storage::ColdStorageState::default(),
             available_models: models_for_provider(selected_provider),
@@ -1486,6 +1507,7 @@ impl App {
             claude_hooks_requested: false,
             cached_hook_rows: Vec::new(),
             cached_user_skills: None,
+            claude_skills_requested: false,
             cached_usage_stats: None,
             cached_efficiency_metrics: None,
             cached_model_control_status: None,
@@ -1595,15 +1617,22 @@ impl App {
         self.mark_dirty();
     }
 
-    /// Lazy-load + cache the `~/.claude/skills/` listing.
+    /// The daemon's `~/.claude/skills/` listing (`ListSkills`). Asks the
+    /// daemon on first use (render never blocks on it) and returns an empty
+    /// slice until it arrives.
     pub fn cached_user_skills(&mut self) -> &[crate::claude_config::SkillEntry] {
-        if self.cached_user_skills.is_none() {
-            match crate::claude_config::list_user_skills() {
-                Ok(list) => self.cached_user_skills = Some(list),
-                Err(_) => self.cached_user_skills = Some(Vec::new()),
-            }
+        if self.cached_user_skills.is_none() && !self.claude_skills_requested {
+            self.claude_skills_requested = true;
+            self.pending_lc_actions
+                .push(crate::modalkit_types::LcAction::RefreshClaudeSkills);
         }
         self.cached_user_skills.as_deref().unwrap_or(&[])
+    }
+
+    /// Store a skills listing the daemon returned.
+    pub fn set_user_skills(&mut self, listing: &rsi_common::input_assets::ListSkillsResponseV1) {
+        self.cached_user_skills = Some(crate::claude_config::skill_entries(listing));
+        self.mark_dirty();
     }
 
     /// Drop the cached hooks view so the next read asks the daemon again.
@@ -1613,9 +1642,10 @@ impl App {
         self.cached_hook_rows.clear();
     }
 
-    /// Invalidate the cached skills listing.
+    /// Invalidate the cached skills listing; the next read asks the daemon.
     pub fn invalidate_claude_skills_cache(&mut self) {
         self.cached_user_skills = None;
+        self.claude_skills_requested = false;
     }
 
     pub fn push_current_overlay(&mut self) {
@@ -2063,11 +2093,13 @@ impl App {
             OverlayState::PromptPreview { .. } => "PromptPreview",
             OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
             OverlayState::LegacyScratch(..) => "LegacyScratch",
+            OverlayState::HostTuning(..) => "HostTuning",
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
             OverlayState::Remote(..) => "Remote",
             OverlayState::ManagerTree(..) => "ManagerTree",
             OverlayState::Fleet(..) => "Fleet",
             OverlayState::GlobalManagerWorkspace(..) => "GlobalManagerWorkspace",
+            OverlayState::GlobalDashboard(..) => "GlobalDashboard",
             OverlayState::HarnessManagerV2(..) => "HarnessManagerV2",
             OverlayState::HarnessManagerScope(..) => "HarnessManagerScope",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",

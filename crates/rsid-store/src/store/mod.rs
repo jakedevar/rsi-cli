@@ -17,6 +17,7 @@ pub mod closure_kernel;
 pub mod cohort_settlement;
 pub mod cold_archive; // #2384 cold-storage archive of old session data.
 mod compiled_prompts;
+pub mod context_settings;
 // The file stays at its released path: tools/released-migrations.json pins the
 // v128 sections of `daemon_restart_persistence.rs` by path.
 #[path = "../daemon_restart_persistence.rs"]
@@ -24,6 +25,7 @@ pub mod daemon_restart_persistence;
 pub mod daemon_settings; // V48 — RSI-026 key-value table for daemon-owned settings.
 pub(crate) mod efficiency_metrics;
 pub mod efficiency_publications;
+pub mod error_disposition;
 mod esp_games;
 mod events;
 pub mod graph_cache;
@@ -35,6 +37,7 @@ mod manager_decision_history;
 mod manager_decision_rulings;
 pub mod manager_decisions;
 mod manager_obligations; // #2471: durable result/predicate carry across seat changes
+pub mod operator_settings;
 pub mod pending_approvals;
 pub mod session_retention;
 pub mod source_worktree_v120;
@@ -42,7 +45,14 @@ pub(crate) mod terminal_custody_shape;
 pub use ideas::IdeaControllerReconciliationCursor;
 #[cfg(any(test, feature = "test-seam"))]
 pub use ideas::{IdeaControllerWriteFault, inject_d03_idea_controller_write_fault};
+pub use manager_decision_rulings::{
+    PENDING_MANAGER_DECISION, PENDING_OPERATOR_DECISION, PendingDecisionSummary,
+    decision_block_reason,
+};
 pub mod agent_deploys;
+// #648: test-only COPY_COLUMNS is frozen inside a released migration region.
+// Scope its non-test dead_code allowance here without changing the pinned bytes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub mod agent_deploys_operator;
 pub mod agent_jobs;
 pub mod agent_projects;
@@ -53,16 +63,21 @@ pub mod codegraph_failure_notice; // #2454 first-failure notice to the workspace
 pub mod codegraph_health;
 pub mod custody_lock_order;
 pub mod daemon_info;
+pub mod disk_hold_notice; // #644 persisting disk-floor hold notice to the job owner and manager.
+pub mod external_reports;
 mod failure_signatures;
 mod fleet;
 pub mod friction;
+pub mod global_dashboard;
 pub mod gone_wake_escalation;
+pub mod intake_notice; // hub #3787: operator intake agent P1 notice to the manager.
 pub mod issue_result_landed; // hub #2911: landed-RESULT notice to the manager.
 pub mod operator_todos;
 pub mod settlement_notice;
 pub mod standing_directives;
 pub mod unsettled_model_invocations; // #2528 bounded-shutdown record.
 pub use fleet::FleetScope;
+pub use provider_spend::{PROVIDER_SPEND_ROW_LIMIT, ProviderModelSpend, ProviderSpend};
 pub mod global_manager;
 mod issues;
 mod labels;
@@ -90,6 +105,7 @@ pub mod migration_backup;
 mod model_control;
 mod observations;
 mod offload;
+mod openrouter_spend; // #3154 spend reads for the OpenRouter ceiling.
 pub(crate) mod operator_messages;
 pub mod origin_authority;
 pub mod pending_questions;
@@ -98,6 +114,10 @@ pub mod portfolio_nodes;
 pub mod program_runs;
 mod projects;
 pub mod provider_exhaustion;
+mod provider_grants; // #3417 operator provider spend grants.
+#[cfg(test)]
+mod provider_grants_tests;
+mod provider_spend;
 pub mod provider_status;
 pub mod provider_turn_custody;
 pub mod queue;
@@ -108,12 +128,22 @@ pub mod restart_intents;
 pub mod rolling_queue;
 pub mod rotation_abandon;
 mod rotation_events;
+mod seat_digest; // #3386 rotation successor launch-turn cost and project-state digest
 mod session_activity;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod stripe_liveness_support;
+pub use operator_messages::{
+    PasteReferenceMarks, PasteReferenceSource, PasteReferenceStep, PasteReferenceStream,
+};
 pub use rotation_events::{BlockedRotation, COMPLETED_TRIGGER_PHASE, RotationRequestSuccessor};
+pub mod bench;
+#[allow(clippy::redundant_pub_crate)]
+pub mod bench_route_audit;
+#[cfg(test)]
+mod home_project_tests; // hub #3315
 pub mod manager_question_stall;
 pub mod portable_bundle; // #1406 clean export/import of durable state.
+pub mod provider_billing;
 pub mod row_mappers;
 pub mod runaway_process; // #1337 CPU-time andon notice to the owning manager.
 pub mod sandbox_custody;
@@ -121,7 +151,7 @@ pub mod sandbox_custody;
 pub mod sandbox_reclaim;
 pub mod sandbox_stray; // #2682 stray sandbox target owner and runaway-disk notice.
 pub mod satellite_dispatch;
-#[allow(clippy::redundant_pub_crate)]
+pub mod satellite_enqueue_intakes;
 pub mod satellite_identity;
 pub mod satellite_inbound_attempts;
 pub mod satellite_registry;
@@ -133,7 +163,9 @@ pub mod scheduled_jobs;
 mod scheduled_jobs_list_tests; // #954 B paging tests
 pub(crate) mod session_completion_gates;
 mod session_diagnostics;
+pub mod session_exec_target;
 mod session_model_updates;
+pub mod session_start_preamble;
 pub mod session_tool_policy;
 pub mod session_transient_heal;
 mod session_write_order;
@@ -187,6 +219,8 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 include!("migrations/support.rs");
+// #648/#653: keep the frozen test fingerprint referenced outside immutable bytes.
+const _: &str = V113_CONVERGED_FULL_CATALOG_FINGERPRINT;
 include!("migrations/altered_objects.rs");
 include!(concat!(env!("OUT_DIR"), "/store_migrations.rs"));
 
@@ -1555,6 +1589,43 @@ impl Store {
     /// Returns a store error when SQLite refuses the function registration.
     pub fn register_sql_functions(conn: &Connection) -> Result<()> {
         use rusqlite::functions::FunctionFlags;
+
+        // All inputs, including the settings snapshot, are explicit SQL
+        // arguments. Cache only decoding; a live settings change invalidates it.
+        let mut billing_settings = (
+            String::new(),
+            std::collections::BTreeMap::<String, String>::new(),
+        );
+        conn.create_scalar_function(
+            "rsi_billing_mode",
+            3,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let provider: Option<String> = ctx.get(0)?;
+                let model: Option<String> = ctx.get(1)?;
+                let settings: String = ctx.get(2)?;
+                if settings != billing_settings.0 {
+                    let decoded = serde_json::from_str(&settings)
+                        .map_err(|e| rusqlite::Error::UserFunctionError(Box::new(e)))?;
+                    billing_settings = (settings, decoded);
+                }
+                let provider = provider.as_deref().unwrap_or("Unknown");
+                Ok(provider_billing::resolve_settings(
+                    provider,
+                    model.as_deref(),
+                    &billing_settings.1,
+                )
+                .as_str()
+                .to_string())
+            },
+        )?;
+
+        conn.create_aggregate_function(
+            "rsi_billed_usage",
+            4,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            provider_billing::BilledUsage,
+        )?;
 
         // RSI-RELEASED-MIGRATION-BEGIN: v120-source-worktree-session-relevance-function
         conn.create_scalar_function(

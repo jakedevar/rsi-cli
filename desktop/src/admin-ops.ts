@@ -6,16 +6,20 @@ import { invoke } from './api.js';
 import { el, toast } from './dom.js';
 import {
   type AdoptResult, type Cohort, type CohortAudit, type LinkFormState, type PeerFormState, type RemoteStatus, type SatProbe,
-  type SatRegistry, type SatSessionPage, type SatTab, type ScratchList, type SettlementRunSummary,
-  LINK_DIRECTIONS, adoptAll, adoptOne, adoptSummary, applyBlock, countsLine, formatBytes, formatScope, linkForm, linkRequest,
-  linkRow, moveCursor, nextSatTab, pageCursor, parseIdList, parseScope, peerForm, peerRequest, peerRow, remoteDeviceEdit,
-  remoteProjectEdit, remoteSummary, satSessionRow, scratchVerdict, settlementApply, settlementKey, toggleLinkEdit, togglePeerEdit,
+  type SatRegistry, type SatSessionPage, type SatTab, type ScratchList, type SettlementReceipt, type SettlementRunSummary,
+  LINK_DIRECTIONS, adoptAll, adoptOne, adoptSummary, applyBlock, auditItemViews, countsLine, formatBytes, formatScope, linkForm, linkRequest,
+  linkRow, moveCursor, nextSatTab, pageCursor, parseIdList, parseScope, peerForm, peerRequest, peerRow, activitySummary, remoteDeviceEdit,
+  receiptMismatch, receiptView, remoteProjectEdit, remoteSummary, satSessionRow, scratchVerdict, settlementApply, settlementKey, toggleLinkEdit, togglePeerEdit,
 } from './admin-model.js';
 import {
   actions, adminDialog, button, checkField, errorLine, inField, listBox, note, rowEl, show, showError, textField,
 } from './admin-dom.js';
 import { overlayKey } from './actions/detail.js';
-import { focusOwnsKey } from './modal-gate.js';
+import { emptyText } from './empty-states.js';
+import { focusOwnsKey, paneKeyName, tabIsNative } from './modal-gate.js';
+import { loadView } from './view-load.js';
+import { isVimKeysOn } from './vimkeys.js';
+import { syncListbox } from './listbox-a11y.js';
 
 const newId = (): string => crypto.randomUUID();
 
@@ -33,16 +37,23 @@ interface SatState {
 }
 let sat: SatState | null = null;
 
-async function loadSatellites(): Promise<void> {
-  const registry = await invoke<SatRegistry>('list_satellite_peers');
-  const scope = await invoke<SatState['scope']>('get_satellite_scope_status').catch(() => null);
+/** The registry and the inbound scope, read together; changes nothing until the caller assigns it. */
+async function fetchSatellites(): Promise<SatState> {
+  const [registry, scope] = await Promise.all([
+    invoke<SatRegistry>('list_satellite_peers'),
+    invoke<SatState['scope']>('get_satellite_scope_status').catch(() => null),
+  ]);
   const prevId = sat?.registry.peers[sat.peer]?.config.peer_id;
   const peer = Math.max(0, registry.peers.findIndex((p) => p.config.peer_id === prevId));
   const links = registry.peers[peer]?.links.length ?? 0;
-  sat = {
+  return {
     registry, scope, tab: sat?.tab ?? 'peers', peer, link: Math.min(sat?.link ?? 0, Math.max(0, links - 1)),
     session: 0, sessions: null, probe: sat?.probe ?? null,
   };
+}
+
+async function loadSatellites(): Promise<void> {
+  sat = await fetchSatellites();
 }
 
 async function loadSatSessions(offset: number): Promise<void> {
@@ -52,8 +63,15 @@ async function loadSatSessions(offset: number): Promise<void> {
   if (sat.registry.peers[sat.peer]?.config.peer_id === p.config.peer_id) sat = { ...sat, sessions: page, session: 0 };
 }
 
-export async function openSatellites(): Promise<void> {
-  try { await loadSatellites(); } catch (e) { toast(`Satellite registry load failed: ${String(e)}`); return; }
+export function openSatellites(): Promise<void> {
+  return loadView({
+    key: 'admin-satellites', title: 'Satellite registry', failed: 'Satellite registry load failed',
+    read: fetchSatellites,
+    open: (next) => { sat = next; buildSatellites(); },
+  });
+}
+
+function buildSatellites(): void {
   const dlg = adminDialog('admin-sat-dialog', 'admin-satellites');
   const box = el('div', 'launch-form');
   const head = note();
@@ -88,7 +106,7 @@ export async function openSatellites(): Promise<void> {
     if (st.tab === 'peers') { rows = st.registry.peers.map((p) => ({ ...peerRow(p), off: !p.config.enabled })); at = st.peer; }
     else if (st.tab === 'links') { rows = (peer()?.links ?? []).map((l) => ({ ...linkRow(l), off: !l.enabled })); at = st.link; }
     else { rows = (st.sessions?.sessions ?? []).map((x) => satSessionRow(x, now)); at = st.session; }
-    empty.textContent = st.tab === 'peers' ? 'No peers. Press a to add one.' : st.tab === 'links' ? (peer() ? 'No links. Press a to add one.' : 'Add a peer first.') : 'No cached sessions for this peer.';
+    empty.textContent = emptyText(st.tab === 'peers' ? 'admin-peers' : st.tab === 'links' ? (peer() ? 'admin-links' : 'admin-links-no-peer') : 'admin-sessions');
     empty.hidden = rows.length > 0;
     ul.hidden = rows.length === 0;
     ul.replaceChildren(...rows.map((r, i) => {
@@ -97,11 +115,13 @@ export async function openSatellites(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     const p = peer();
     const lines: string[] = [];
     if (st.tab === 'peers' && p) {
       lines.push(`peer ${p.config.peer_id}`, `expected installation ${p.config.expected_installation_id ?? '— (unpaired)'}`);
       if (p.dispatch_scope?.length || p.dispatch_project_scope?.length) lines.push(`dispatch scope ${formatScope(p.dispatch_scope ?? [], p.dispatch_project_scope ?? [])}`);
+      lines.push(activitySummary(p.observation));
       if (p.observation) lines.push(`installation ${p.observation.installation_id ?? '—'} · incarnation ${p.observation.incarnation_id ?? '—'}`);
     }
     if (st.tab === 'sessions' && st.sessions) lines.push(`offset ${st.sessions.offset}${st.sessions.next_offset !== null ? ` · more from ${st.sessions.next_offset} (n)` : ''} · cached remote sessions have no local actions`);
@@ -194,7 +214,8 @@ export async function openSatellites(): Promise<void> {
   dlg.onkeydown = (ev) => {
     if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
     if (inField(ev) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
-    if (ev.key === 'Tab') { ev.preventDefault(); cycleTab(); return; }
+    if (tabIsNative(isVimKeysOn(), ev)) return; // Vim keys off: Tab is the browser's focus order (local #248)
+    if (paneKeyName(ev) === 'Tab') { ev.preventDefault(); cycleTab(); return; }
     const moved = moveCursor(cur(), len(), ev.key);
     if (moved !== null) { ev.preventDefault(); void select(moved); return; }
     const hit = (fn: () => void): void => { ev.preventDefault(); fn(); };
@@ -307,9 +328,16 @@ function openInboundForm(hubsText: string, rootsText: string): void {
 
 // ---------- remote settings ----------
 
-export async function openRemote(): Promise<void> {
-  let status: RemoteStatus;
-  try { status = await invoke<RemoteStatus>('remote_get_status'); } catch (e) { toast(`Remote status failed: ${String(e)}`); return; }
+export function openRemote(): Promise<void> {
+  return loadView({
+    key: 'admin-remote', title: 'Remote access', failed: 'Remote status failed',
+    read: () => invoke<RemoteStatus>('remote_get_status'),
+    open: buildRemote,
+  });
+}
+
+function buildRemote(first: RemoteStatus): void {
+  let status = first;
   let tab: 'devices' | 'projects' = 'devices';
   let at = 0;
   const dlg = adminDialog('admin-remote-dialog', 'admin-remote');
@@ -349,6 +377,7 @@ export async function openRemote(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     enableBtn.textContent = status.enabled ? 'Disable (e)' : 'Enable (e)';
     answersBtn.textContent = `Answers: ${status.allow_answers ? 'on' : 'off'} (n)`;
     messagesBtn.textContent = `Messages: ${status.allow_messages ? 'on' : 'off'} (m)`;
@@ -385,7 +414,8 @@ export async function openRemote(): Promise<void> {
   dlg.onkeydown = (ev) => {
     if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
     if (inField(ev) || ev.ctrlKey || ev.metaKey || ev.altKey) return;
-    if (ev.key === 'Tab') { ev.preventDefault(); setTab(tab === 'devices' ? 'projects' : 'devices'); return; }
+    if (tabIsNative(isVimKeysOn(), ev)) return; // Vim keys off: Tab is the browser's focus order (local #248)
+    if (paneKeyName(ev) === 'Tab') { ev.preventDefault(); setTab(tab === 'devices' ? 'projects' : 'devices'); return; }
     const len = tab === 'devices' ? status.peers.length : status.projects.length;
     const moved = moveCursor(at, len, ev.key);
     if (moved !== null) { ev.preventDefault(); at = moved; draw(); return; }
@@ -406,9 +436,16 @@ export async function openRemote(): Promise<void> {
 
 // ---------- legacy scratch adoption ----------
 
-export async function openScratch(): Promise<void> {
-  let list: ScratchList;
-  try { list = await invoke<ScratchList>('list_legacy_scratch'); } catch (e) { toast(`Legacy scratch list failed: ${String(e)}`); return; }
+export function openScratch(): Promise<void> {
+  return loadView({
+    key: 'admin-scratch', title: 'Legacy scratch adoption', failed: 'Legacy scratch list failed',
+    read: () => invoke<ScratchList>('list_legacy_scratch'),
+    open: buildScratch,
+  });
+}
+
+function buildScratch(first: ScratchList): void {
+  let list = first;
   let at = 0;
   let confirm: string[] | null = null;
   const dlg = adminDialog('admin-scratch-dialog', 'admin-scratch');
@@ -440,6 +477,7 @@ export async function openScratch(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     confirmBox.replaceChildren();
     if (confirm) {
       const listEl = listBox('Directories to adopt');
@@ -499,20 +537,30 @@ export async function openScratch(): Promise<void> {
 
 // ---------- source-worktree settlement ----------
 
-export async function openSettlement(): Promise<void> {
-  let cohorts: Cohort[];
-  let runs: SettlementRunSummary[] = [];
-  try {
-    cohorts = await invoke<Cohort[]>('list_source_worktree_cohorts');
-    runs = await invoke<SettlementRunSummary[]>('list_source_worktree_settlement_runs').catch(() => []);
-  } catch (e) {
-    toast(`Source-worktree cohorts failed: ${String(e)}`);
-    return;
-  }
+export function openSettlement(): Promise<void> {
+  return loadView({
+    key: 'admin-settlement', title: 'Source-worktree settlement', failed: 'Source-worktree cohorts failed',
+    read: async () => {
+      const [cohorts, runs] = await Promise.all([
+        invoke<Cohort[]>('list_source_worktree_cohorts'),
+        invoke<SettlementRunSummary[]>('list_source_worktree_settlement_runs').catch(() => [] as SettlementRunSummary[]),
+      ]);
+      return { cohorts, runs };
+    },
+    open: ({ cohorts, runs }) => buildSettlement(cohorts, runs),
+  });
+}
+
+function buildSettlement(firstCohorts: Cohort[], firstRuns: SettlementRunSummary[]): void {
+  let cohorts = firstCohorts;
+  let runs = firstRuns;
   let at = 0;
   let audit: CohortAudit | null = null;
   let authorizing = false;
   let key: string | null = null;
+  // The full receipt of the shown run: its roots and unproven survivors (#149, #276), or why it could not be read.
+  let full: SettlementReceipt | null = null;
+  let fullError: { run: string; msg: string } | null = null;
   const dlg = adminDialog('admin-settle-dialog', 'admin-settlement');
   const box = el('div', 'launch-form');
   const ul = listBox('Source-worktree cohorts');
@@ -528,6 +576,7 @@ export async function openSettlement(): Promise<void> {
   phraseWrap.append(phrase);
   authBox.append(phraseWrap);
   const receipt = note();
+  const detail = el('div', 'admin-receipt');
   const err = errorLine();
   const auditBtn = button('Audit (Enter)');
   const authBtn = button('Begin authorization (A)', 'btn danger');
@@ -535,7 +584,7 @@ export async function openSettlement(): Promise<void> {
   const leaveBtn = button('Leave authorization (Esc)');
   const refreshBtn = button('Refresh receipt (r)');
   const closeBtn = button('Close');
-  box.append(el('h2', undefined, 'Source-worktree settlement'), ul, empty, auditBox, authBox, receipt, err,
+  box.append(el('h2', undefined, 'Source-worktree settlement'), ul, empty, auditBox, authBox, receipt, detail, err,
     actions(closeBtn, refreshBtn, auditBtn, authBtn, leaveBtn, applyBtn),
     note('j/k (J/K page) select; Enter audits (read-only); A begins authorization after a fresh applyable audit; r refreshes the receipt; Esc / q close; Space N new session, Space ; palette.'));
   const sel = (): Cohort | undefined => cohorts[at];
@@ -548,6 +597,7 @@ export async function openSettlement(): Promise<void> {
       return li;
     }));
     ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+    syncListbox(ul, dlg);
     auditBox.replaceChildren();
     if (audit) {
       const rows: [string, string][] = [
@@ -556,17 +606,71 @@ export async function openSettlement(): Promise<void> {
       ];
       if (audit.refusal) rows.push(['refusal', audit.refusal]);
       auditBox.append(grid(rows));
+      const roots = auditItemViews(audit);
+      if (roots.length) {
+        auditBox.append(el('h3', undefined, 'Roots in this check'));
+        for (const r of roots) {
+          const row = el('div', `admin-item ${r.tone}`);
+          row.append(el('div', 'admin-item-title', r.title), el('div', undefined, r.verdict));
+          if (r.detail) row.append(el('div', 'admin-detail', r.detail));
+          auditBox.append(row);
+        }
+      }
       if (audit.authorization_phrase) {
         const ph = el('div', 'admin-phrase', audit.authorization_phrase);
         auditBox.append(note('Authorization phrase:'), ph);
       }
     }
     const last = runs.find((r) => r.repository_identity === sel()?.repository_identity) ?? runs[0];
-    receipt.textContent = last ? `latest run ${last.run_id} (${last.repository_identity}): ${last.state} · ${countsLine(last.counts)} · ${last.created_at}` : 'No settlement run yet.';
+    const shown = !!last && full?.run_id === last.run_id;
+    // The one-line summary stands in until the full receipt has loaded (or if it cannot).
+    receipt.hidden = shown;
+    receipt.textContent = last ? `Latest run ${last.run_id} (${last.repository_identity}): ${last.state} · ${countsLine(last.counts)} · ${last.created_at}` : 'No settlement run yet.';
+    const failed = last && fullError?.run === last.run_id ? fullError.msg : null;
+    detail.replaceChildren(...(shown && full ? receiptBlock(last.run_id, full) : failed ? [note(failed)] : []));
+    if (last && !shown && !failed) loadReceipt(last.run_id);
     authBox.hidden = !authorizing;
     auditBtn.hidden = authBtn.hidden = authorizing;
     applyBtn.hidden = leaveBtn.hidden = !authorizing;
     auditBtn.disabled = !sel();
+  };
+  /** The receipt block: the run, each root with its reason, then the programs settlement left running. */
+  const receiptBlock = (runId: string, r: SettlementReceipt): HTMLElement[] => {
+    const v = receiptView(r);
+    const out: HTMLElement[] = [el('h3', undefined, `Latest run ${runId}`), grid(v.facts)];
+    if (v.error) out.push(el('div', 'admin-warn', v.error));
+    out.push(el('h3', undefined, 'Roots'));
+    if (v.itemsEmpty) out.push(note(v.itemsEmpty));
+    for (const i of v.items) {
+      const row = el('div', `admin-item ${i.tone}`);
+      row.append(el('div', 'admin-item-title', i.title), el('div', undefined, i.status));
+      if (i.reason) row.append(el('div', 'admin-warn', `Reason: ${i.reason}`));
+      if (i.detail) row.append(el('div', 'admin-detail', i.detail));
+      if (i.hint) row.append(note(i.hint));
+      out.push(row);
+    }
+    if (v.survivors.length) {
+      out.push(el('h3', undefined, v.survivorsTitle), note(v.survivorsNote), ...v.survivorMeanings.map((m) => note(`What this means: ${m}`)),
+        ...v.survivors.map((line) => el('div', 'admin-warn', line)));
+    }
+    return out;
+  };
+  let loading: string | null = null;
+  const loadReceipt = (runId: string): void => {
+    if (loading === runId) return;
+    loading = runId;
+    invoke<SettlementReceipt>('get_source_worktree_settlement_run', { runId }).then((r) => {
+      if (loading !== runId) return;
+      const c = sel();
+      const bad = c ? receiptMismatch(r, runId, c.repository_identity, c.canonical_repo_dir) : null;
+      if (bad) fullError = { run: runId, msg: `Run details not shown: ${bad}` };
+      else full = r;
+      draw();
+    }, (e: unknown) => {
+      if (loading !== runId) return;
+      fullError = { run: runId, msg: `Run details could not be read: ${String(e)}` };
+      draw();
+    });
   };
   const move = (i: number): void => {
     if (i !== at) { audit = null; authorizing = false; phrase.value = ''; key = null; }
@@ -620,7 +724,7 @@ export async function openSettlement(): Promise<void> {
     });
   };
   const refresh = (): void => {
-    invoke<SettlementRunSummary[]>('list_source_worktree_settlement_runs').then((r) => { runs = r; err.hidden = true; draw(); },
+    invoke<SettlementRunSummary[]>('list_source_worktree_settlement_runs').then((r) => { runs = r; err.hidden = true; full = null; fullError = null; loading = null; draw(); },
       (e: unknown) => showError(err, `Receipt refresh failed: ${String(e)}`));
   };
   auditBtn.addEventListener('click', runAudit);

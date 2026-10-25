@@ -30,7 +30,8 @@
 //! hub #2919: a `SessionStart` event claims the preamble the session's launch
 //! deferred to the hook ([`crate::session_start_preamble`]); the reply carries it
 //! as `additional_context`, which the hook prints as the provider's
-//! `additionalContext`, and the row records the delivery. Nothing deferred (a
+//! `additionalContext`. Only provider transcript evidence for every part
+//! records delivery. Nothing deferred (a
 //! resumed turn, the default setting) writes no row and replies `skipped`.
 
 use std::collections::HashMap;
@@ -42,7 +43,7 @@ use rsi_common::provider_lifecycle_hooks::{
 };
 use rsi_common::types::{ConversationEvent, EventType, PROVIDER_HEALTH_METADATA_KEY, Session};
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::types::TrackedSession;
@@ -52,7 +53,8 @@ use crate::store::Store;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordProviderLifecycleEventResponse {
     /// `queued` (the live monitor writes it), `written`, `dropped`, or
-    /// `skipped` (a `SessionStart` with no preamble owed: no row).
+    /// `served` (SessionStart awaits transcript evidence), or `skipped`
+    /// (a `SessionStart` with no preamble owed: no row).
     pub outcome: &'static str,
     /// #2898: the handoff a `PreCompact` drove, when one applies.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -205,7 +207,7 @@ fn deferred_seat(reason: &'static str) -> CompactionHandoff {
 /// The compacting session's live facts: the tracked copy when a monitor
 /// runs, else the stored row with no live measurement.
 async fn compaction_subject(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     session_id: Uuid,
 ) -> crate::error::Result<Option<CompactionSubject>> {
@@ -235,7 +237,7 @@ async fn compaction_subject(
 /// [`request_compaction_handoff`] for a `PreCompact`; any failure is logged
 /// and yields no handoff (never an error to the hook).
 async fn compaction_handoff(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     runtime_config: &crate::config::RuntimeConfig,
     session_id: Uuid,
@@ -294,7 +296,7 @@ pub(crate) fn lifecycle_row(
 
 /// Record one lifecycle event for `session_id` (the token-resolved caller).
 pub(crate) async fn record_provider_lifecycle_event(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     runtime_config: &crate::config::RuntimeConfig,
@@ -321,22 +323,141 @@ pub(crate) async fn record_provider_lifecycle_event(
     }
 }
 
-/// hub #2919: deliver the preamble the session's launch deferred to its
-/// `SessionStart` hook, with one visible row naming the delivery.
+/// Serve the deferred preamble. A reply proves neither printing nor provider
+/// acceptance; only the transcript watcher may record the delivery row.
 async fn session_start(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     session_id: Uuid,
     params: &RecordProviderLifecycleEventParams,
 ) -> RecordProviderLifecycleEventResponse {
-    let source = params.source.as_deref().unwrap_or("other");
-    let Some(preamble) = crate::session_start_preamble::claim_for_hook(session_id, source) else {
+    if params.session_start_fallback {
+        for (claim, earlier, mut cursor) in
+            crate::session_start_preamble::pending_evidence_with_store(store, session_id).await
+        {
+            check_session_start_evidence(
+                store,
+                active,
+                event_bus,
+                session_id,
+                &earlier,
+                &claim,
+                &mut cursor,
+            )
+            .await;
+        }
+    }
+    // Snapshot before returning context so a fast provider cannot append its
+    // evidence before our cursor. Old compact/clear evidence is excluded.
+    let cursor = super::boundary_mail::verified_transcript_path(
+        params.provider_session_id.as_deref(),
+        params.provider_session_id.as_deref(),
+        params.transcript_path.as_deref(),
+    )
+    .and_then(|path| std::fs::metadata(path).ok())
+    .map_or(0, |meta| meta.len());
+    let Some(claim) =
+        crate::session_start_preamble::claim_for_lifecycle(store, session_id, params, cursor).await
+    else {
         return RecordProviderLifecycleEventResponse {
             outcome: "skipped",
             handoff: None,
             additional_context: None,
         };
+    };
+    let text = claim.text.clone();
+    let (store, active, event_bus, params) = (
+        Arc::clone(store),
+        Arc::clone(active),
+        Arc::clone(event_bus),
+        params.clone(),
+    );
+    if params.provider_session_id.is_some() && params.transcript_path.is_some() {
+        tokio::spawn(async move {
+            let deadline =
+                tokio::time::Instant::now() + super::boundary_mail::BOUNDARY_MAIL_CONFIRM_DEADLINE;
+            let mut cursor = cursor;
+            loop {
+                if check_session_start_evidence(
+                    &store,
+                    &active,
+                    &event_bus,
+                    session_id,
+                    &params,
+                    &claim,
+                    &mut cursor,
+                )
+                .await
+                    || tokio::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+    }
+    RecordProviderLifecycleEventResponse {
+        outcome: "served",
+        handoff: None,
+        additional_context: Some(text),
+    }
+}
+
+/// One bounded scan using the same locator and tail rules as boundary mail.
+/// SessionStart can precede the provider init event, so wait for the monitor's
+/// recorded provider identity before trusting the hook's locator.
+async fn check_session_start_evidence(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
+    event_bus: &Arc<crate::bus::EventBus>,
+    session_id: Uuid,
+    params: &RecordProviderLifecycleEventParams,
+    claim: &crate::session_start_preamble::HookClaim,
+    cursor: &mut u64,
+) -> bool {
+    let mut recorded = active
+        .read()
+        .await
+        .get(&session_id)
+        .and_then(|tracked| tracked.session.claude_session_id.clone());
+    if recorded.is_none() {
+        recorded = store
+            .lock()
+            .await
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .and_then(|session| session.claude_session_id);
+    }
+    let Some(path) = super::boundary_mail::verified_transcript_path(
+        recorded.as_deref(),
+        params.provider_session_id.as_deref(),
+        params.transcript_path.as_deref(),
+    ) else {
+        return false;
+    };
+    let Some((lines, next)) = super::boundary_mail::read_transcript_tail(&path, *cursor) else {
+        return false;
+    };
+    *cursor = next;
+    if !lines.iter().any(|line| {
+        rsi_common::boundary_mail_hook::transcript_line_accepts_hook_block(
+            line,
+            &claim.text,
+            if claim.fallback {
+                "UserPromptSubmit"
+            } else {
+                "SessionStart"
+            },
+        )
+    }) {
+        return false;
+    }
+    let Some((chars, parts)) =
+        crate::session_start_preamble::confirm_part_with_store(store, session_id, claim).await
+    else {
+        return true;
     };
     let mut row = lifecycle_row(session_id, params);
     if let Some(health) = row
@@ -345,21 +466,22 @@ async fn session_start(
         .and_then(|metadata| metadata.get_mut(PROVIDER_HEALTH_METADATA_KEY))
         .and_then(serde_json::Value::as_object_mut)
     {
-        health.insert(
-            "preamble_chars".to_string(),
-            serde_json::json!(preamble.chars().count()),
-        );
+        if claim.fallback {
+            health.insert(
+                "hook_event".to_string(),
+                serde_json::json!("UserPromptSubmit"),
+            );
+        }
+        health.insert("preamble_chars".to_string(), serde_json::json!(chars));
+        health.insert("preamble_parts".to_string(), serde_json::json!(parts));
     }
-    tracing::info!(%session_id, source, chars = preamble.chars().count(), "SessionStart hook delivers the preamble");
-    RecordProviderLifecycleEventResponse {
-        outcome: record_row(store, active, event_bus, session_id, row).await,
-        handoff: None,
-        additional_context: Some(preamble),
-    }
+    tracing::info!(%session_id, chars, parts, "SessionStart preamble confirmed by provider transcript");
+    record_row(store, active, event_bus, session_id, row).await;
+    true
 }
 
 async fn record_row(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     session_id: Uuid,
@@ -384,8 +506,8 @@ async fn record_row(
 /// Monitor side: write each queued lifecycle row with the monitor's own
 /// sequence counter. A row that cannot be written keeps its number free.
 pub(crate) async fn drain_lifecycle_rows(
-    rows: Vec<ConversationEvent>,
-    store: &Arc<Mutex<Store>>,
+    rows: Vec<super::boundary_mail::LifecycleTranscriptRow>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     active: &Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     event_bus: &Arc<crate::bus::EventBus>,
     session_id: Uuid,
@@ -396,18 +518,24 @@ pub(crate) async fn drain_lifecycle_rows(
             tracing::error!(%session_id, "transcript sequence exhausted; lifecycle row dropped");
             return;
         };
-        let Some(event) = write_row(store, event_bus, row, next).await else {
+        let Some(event) = write_row(store, event_bus, row.event, next).await else {
+            if let Some(receipt) = row.receipt {
+                let _ = receipt.send(false);
+            }
             continue;
         };
         *sequence = next;
         if let Some(tracked) = active.write().await.get_mut(&session_id) {
             tracked.events.push(event);
         }
+        if let Some(receipt) = row.receipt {
+            let _ = receipt.send(true);
+        }
     }
 }
 
 async fn write_row(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<crate::bus::EventBus>,
     mut row: ConversationEvent,
     sequence: i32,
@@ -452,7 +580,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     struct Fixture {
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         bus: Arc<crate::bus::EventBus>,
         session: Uuid,
@@ -463,14 +591,15 @@ mod tests {
     fn fixture(live: bool) -> Fixture {
         let store = Store::open_in_memory().expect("store");
         let session = Uuid::new_v4();
-        let row = test_session(session, std::path::PathBuf::from("/tmp"));
+        let mut row = test_session(session, std::path::PathBuf::from("/tmp"));
+        row.claude_session_id = None;
         store.insert_session(&row).expect("session");
         let mut map = HashMap::new();
         if live {
             map.insert(session, tracked(row));
         }
         Fixture {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             active: Arc::new(RwLock::new(map)),
             bus: Arc::new(crate::bus::EventBus::new(16)),
             session,
@@ -547,14 +676,12 @@ mod tests {
 
     /// hub #2919: a `SessionStart` claims the preamble the launch deferred:
     /// the reply carries it, the hook prints it as the provider's
-    /// `additionalContext`, and one visible row records the delivery. A later
+    /// `additionalContext`; without transcript evidence no row is recorded. A later
     /// resume, and a session nothing was deferred for, get nothing and no row.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     #[tokio::test]
     async fn a_session_start_delivers_the_deferred_preamble_as_hook_context() {
-        use rsi_common::provider_lifecycle_hooks::{
-            KIND_SESSION_START_CONTEXT, render_session_start_output,
-        };
+        use rsi_common::provider_lifecycle_hooks::render_session_start_output;
         let fixture = fixture(false);
         let config = runtime();
         let start = |source: &str| params("SessionStart", serde_json::json!({"source": source}));
@@ -581,7 +708,7 @@ mod tests {
             start("startup"),
         )
         .await;
-        assert_eq!(reply.outcome, "written");
+        assert_eq!(reply.outcome, "served");
         assert_eq!(
             reply.additional_context.as_deref(),
             Some("ROUTER\n\nPREAMBLE")
@@ -600,17 +727,10 @@ mod tests {
                 "additionalContext": "ROUTER\n\nPREAMBLE",
             })
         );
-        let events = fixture
-            .store
-            .lock()
-            .await
-            .load_events(fixture.session)
-            .unwrap();
-        let health = &events[0].metadata.as_ref().unwrap()[PROVIDER_HEALTH_METADATA_KEY];
-        assert_eq!(health["kind"], KIND_SESSION_START_CONTEXT);
-        assert_eq!(health["session_source"], "startup");
-        assert_eq!(health["preamble_chars"], 16);
-        assert!(events[0].is_provider_health_notice());
+        assert!(
+            stored_kinds(&fixture).await.is_empty(),
+            "serving context is not evidence"
+        );
 
         let resumed = record_provider_lifecycle_event(
             &fixture.store,
@@ -623,8 +743,392 @@ mod tests {
         .await;
         assert_eq!(resumed.outcome, "skipped");
         assert_eq!(resumed.additional_context, None);
-        assert_eq!(stored_kinds(&fixture).await.len(), 1);
+        assert!(stored_kinds(&fixture).await.is_empty());
         crate::session_start_preamble::forget(fixture.session);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    fn accepted_context(codex: bool, text: &str) -> String {
+        if codex {
+            serde_json::json!({"type": "response_item", "payload": {
+                "type": "message", "role": "developer",
+                "content": [{"type": "input_text", "text": text}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["hooks.additional_context"]}
+            }})
+            .to_string()
+        } else {
+            serde_json::json!({"type": "attachment", "attachment": {
+                "type": "hook_additional_context", "hookEvent": "SessionStart",
+                "content": [text]
+            }})
+            .to_string()
+        }
+    }
+
+    /// A single prompt with no tool calls recovers at UserPromptSubmit even
+    /// when SessionStart never called the daemon, or only some replies made it
+    /// into the transcript. The synchronous scan wins over watcher scheduling.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(start_paused = true)]
+    async fn single_turn_prompt_submit_recovers_missing_and_partial_startup_context() {
+        use crate::session_start_preamble::{defer_parts, forget, split_parts};
+        for codex in [false, true] {
+            for accepted in 0..=2 {
+                let fixture = fixture(false);
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("thread.jsonl");
+                std::fs::write(&path, "").unwrap();
+                fixture
+                    .store
+                    .lock()
+                    .await
+                    .update_claude_session_id(fixture.session, "thread")
+                    .unwrap();
+                let parts = vec!["A".repeat(6000), "B".repeat(6000)];
+                let chunks = split_parts(&parts).unwrap();
+                assert!(defer_parts(fixture.session, &parts));
+                let mut evidence = String::new();
+                for part in 1..=accepted {
+                    let mut request = params(
+                        "SessionStart",
+                        serde_json::json!({
+                            "source":"startup", "session_id":"thread", "transcript_path":path
+                        }),
+                    );
+                    request.session_start_part = Some(part);
+                    let reply = record_provider_lifecycle_event(
+                        &fixture.store,
+                        &fixture.active,
+                        &fixture.bus,
+                        &runtime(),
+                        fixture.session,
+                        request,
+                    )
+                    .await;
+                    assert_eq!(
+                        reply.additional_context.as_deref(),
+                        Some(chunks[part - 1].as_str())
+                    );
+                    evidence.push_str(&format!("{}\n", accepted_context(codex, &chunks[part - 1])));
+                }
+                std::fs::write(&path, &evidence).unwrap();
+                for part in 1..=2 {
+                    let mut request = params(
+                        "SessionStart",
+                        serde_json::json!({
+                            "session_id":"thread", "transcript_path":path
+                        }),
+                    );
+                    request.session_start_fallback = true;
+                    request.session_start_part = Some(part);
+                    let reply = record_provider_lifecycle_event(
+                        &fixture.store,
+                        &fixture.active,
+                        &fixture.bus,
+                        &runtime(),
+                        fixture.session,
+                        request,
+                    )
+                    .await;
+                    if part > accepted {
+                        assert_eq!(reply.outcome, "served");
+                        assert_eq!(
+                            reply.additional_context.as_deref(),
+                            Some(chunks[part - 1].as_str())
+                        );
+                        let line = accepted_context(codex, &chunks[part - 1]).replace(
+                            "\"hookEvent\":\"SessionStart\"",
+                            "\"hookEvent\":\"UserPromptSubmit\"",
+                        );
+                        evidence.push_str(&format!("{line}\n"));
+                        std::fs::write(&path, &evidence).unwrap();
+                    } else {
+                        assert_eq!(reply.outcome, "skipped");
+                    }
+                }
+                // Reconcile the final reply without advancing time or starting
+                // another launch. A repeat handler has nothing left to serve.
+                let mut request = params(
+                    "SessionStart",
+                    serde_json::json!({
+                        "session_id":"thread", "transcript_path":path
+                    }),
+                );
+                request.session_start_fallback = true;
+                request.session_start_part = Some(1);
+                let reply = record_provider_lifecycle_event(
+                    &fixture.store,
+                    &fixture.active,
+                    &fixture.bus,
+                    &runtime(),
+                    fixture.session,
+                    request,
+                )
+                .await;
+                assert_eq!(reply.outcome, "skipped");
+                let events = fixture
+                    .store
+                    .lock()
+                    .await
+                    .load_events(fixture.session)
+                    .unwrap();
+                assert_eq!(events.len(), 1, "codex={codex} accepted={accepted}");
+                let health = &events[0].metadata.as_ref().unwrap()[PROVIDER_HEALTH_METADATA_KEY];
+                assert_eq!(health["preamble_chars"], 12002);
+                assert_eq!(health["preamble_parts"], 2);
+                assert_eq!(
+                    health["hook_event"],
+                    if accepted == 2 {
+                        "SessionStart"
+                    } else {
+                        "UserPromptSubmit"
+                    }
+                );
+                forget(fixture.session);
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn multipart_preamble_requires_full_transcript_evidence_for_both_providers() {
+        use rsi_common::provider_lifecycle_hooks::KIND_SESSION_START_CONTEXT;
+        for codex in [false, true] {
+            for accepted in [0, 1, 2] {
+                let fixture = fixture(false);
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join(if codex {
+                    "rollout-test-provider-thread.jsonl"
+                } else {
+                    "provider-thread.jsonl"
+                });
+                std::fs::write(&path, "").unwrap();
+                fixture
+                    .store
+                    .lock()
+                    .await
+                    .update_claude_session_id(fixture.session, "provider-thread")
+                    .unwrap();
+                let parts = vec!["A".repeat(6000), "B".repeat(6000)];
+                assert!(crate::session_start_preamble::defer_parts(
+                    fixture.session,
+                    &parts
+                ));
+                let request = params(
+                    "SessionStart",
+                    serde_json::json!({
+                        "source": "startup", "session_id": "provider-thread", "transcript_path": path,
+                    }),
+                );
+                // Both hooks were served, out of order. That alone writes no row.
+                let claims: Vec<_> = [2, 1]
+                    .into_iter()
+                    .map(|part| {
+                        crate::session_start_preamble::claim_part_for_hook(
+                            fixture.session,
+                            "startup",
+                            Some(part),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                assert!(stored_kinds(&fixture).await.is_empty());
+                let evidence: String = claims
+                    .iter()
+                    .take(accepted)
+                    .map(|claim| format!("{}\n", accepted_context(codex, &claim.text)))
+                    .collect();
+                std::fs::write(&path, evidence).unwrap();
+                for claim in &claims {
+                    let mut cursor = 0;
+                    check_session_start_evidence(
+                        &fixture.store,
+                        &fixture.active,
+                        &fixture.bus,
+                        fixture.session,
+                        &request,
+                        claim,
+                        &mut cursor,
+                    )
+                    .await;
+                }
+                let events = fixture
+                    .store
+                    .lock()
+                    .await
+                    .load_events(fixture.session)
+                    .unwrap();
+                assert_eq!(
+                    events.len(),
+                    usize::from(accepted == 2),
+                    "codex={codex} evidence={accepted}"
+                );
+                if accepted == 2 {
+                    let health =
+                        &events[0].metadata.as_ref().unwrap()[PROVIDER_HEALTH_METADATA_KEY];
+                    assert_eq!(health["kind"], KIND_SESSION_START_CONTEXT);
+                    assert_eq!(health["preamble_parts"], 2);
+                    assert_eq!(health["preamble_chars"], 12002);
+                    assert_eq!(
+                        crate::session_start_preamble::take_undelivered(fixture.session),
+                        None
+                    );
+                    // Re-reading accepted evidence cannot record a second delivery.
+                    for claim in &claims {
+                        check_session_start_evidence(
+                            &fixture.store,
+                            &fixture.active,
+                            &fixture.bus,
+                            fixture.session,
+                            &request,
+                            claim,
+                            &mut 0,
+                        )
+                        .await;
+                    }
+                    assert_eq!(stored_kinds(&fixture).await.len(), 1);
+                } else {
+                    assert_eq!(
+                        crate::session_start_preamble::take_undelivered(fixture.session),
+                        Some(parts.join("\n\n"))
+                    );
+                }
+                crate::session_start_preamble::forget(fixture.session);
+            }
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(start_paused = true)]
+    async fn session_start_watches_after_serving_and_waits_for_provider_identity() {
+        for codex in [false, true] {
+            let fixture = fixture(true);
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("provider-thread.jsonl");
+            // An old accepted copy (e.g. before compact) cannot confirm this batch.
+            std::fs::write(&path, format!("{}\n", accepted_context(codex, "PREAMBLE"))).unwrap();
+            crate::session_start_preamble::defer(fixture.session, "PREAMBLE".into());
+            let request = params(
+                "SessionStart",
+                serde_json::json!({
+                    "source": "startup", "session_id": "provider-thread", "transcript_path": path,
+                }),
+            );
+            let reply = record_provider_lifecycle_event(
+                &fixture.store,
+                &fixture.active,
+                &fixture.bus,
+                &runtime(),
+                fixture.session,
+                request,
+            )
+            .await;
+            assert_eq!(reply.outcome, "served");
+            assert_eq!(reply.additional_context.as_deref(), Some("PREAMBLE"));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            fixture
+                .active
+                .write()
+                .await
+                .get_mut(&fixture.session)
+                .unwrap()
+                .session
+                .claude_session_id = Some("provider-thread".into());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let inbox = fixture
+                .active
+                .read()
+                .await
+                .get(&fixture.session)
+                .unwrap()
+                .operator_inbox
+                .clone();
+            let mut sequence = 0;
+            super::super::boundary_mail::drain_operator_transcript_inbox(
+                &inbox,
+                &fixture.store,
+                &fixture.active,
+                &fixture.bus,
+                fixture.session,
+                &mut sequence,
+            )
+            .await;
+            assert_eq!(sequence, 0, "old evidence does not confirm this batch");
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let line = accepted_context(codex, "PREAMBLE");
+            // A partial JSONL write must stay pending until its newline arrives.
+            write!(file, "{line}").unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            super::super::boundary_mail::drain_operator_transcript_inbox(
+                &inbox,
+                &fixture.store,
+                &fixture.active,
+                &fixture.bus,
+                fixture.session,
+                &mut sequence,
+            )
+            .await;
+            assert_eq!(sequence, 0, "a partial JSONL line is not evidence");
+            writeln!(file).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            super::super::boundary_mail::drain_operator_transcript_inbox(
+                &inbox,
+                &fixture.store,
+                &fixture.active,
+                &fixture.bus,
+                fixture.session,
+                &mut sequence,
+            )
+            .await;
+            assert_eq!(sequence, 1, "new evidence records exactly one delivery");
+            assert_eq!(
+                crate::session_start_preamble::take_undelivered(fixture.session),
+                None
+            );
+            crate::session_start_preamble::forget(fixture.session);
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test(start_paused = true)]
+    async fn session_start_with_a_foreign_transcript_cannot_confirm_delivery() {
+        let fixture = fixture(false);
+        fixture
+            .store
+            .lock()
+            .await
+            .update_claude_session_id(fixture.session, "actual-thread")
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("other-thread.jsonl");
+        std::fs::write(&path, "").unwrap();
+        crate::session_start_preamble::defer(fixture.session, "PREAMBLE".into());
+        let reply = record_provider_lifecycle_event(
+            &fixture.store,
+            &fixture.active,
+            &fixture.bus,
+            &runtime(),
+            fixture.session,
+            params(
+                "SessionStart",
+                serde_json::json!({"source": "startup",
+                "session_id": "other-thread", "transcript_path": path}),
+            ),
+        )
+        .await;
+        assert_eq!(reply.outcome, "served");
+        std::fs::write(&path, format!("{}\n", accepted_context(false, "PREAMBLE"))).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert!(stored_kinds(&fixture).await.is_empty());
+        assert_eq!(
+            crate::session_start_preamble::take_undelivered(fixture.session).as_deref(),
+            Some("PREAMBLE")
+        );
     }
 
     /// With no live monitor the row is written at once after the stored rows.
@@ -696,7 +1200,7 @@ mod tests {
     /// child the lead launched; both tracked live (rotation on).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
     struct EpicFixture {
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         bus: Arc<crate::bus::EventBus>,
         lead: Uuid,
@@ -741,7 +1245,7 @@ mod tests {
             map.insert(session.id, live);
         }
         EpicFixture {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             active: Arc::new(RwLock::new(map)),
             bus: Arc::new(crate::bus::EventBus::new(16)),
             lead: lead.id,

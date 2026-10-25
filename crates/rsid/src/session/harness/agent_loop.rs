@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use rsid_harness::agent_loop::{
     COMPACTION_STREAM_EVENT, COMPLETION_GATE_STREAM_EVENT, FINAL_ANSWER_RETRY_STREAM_EVENT,
-    REPEAT_FAILURE_STREAM_EVENT, STREAM_SUPERSEDED_STREAM_EVENT,
+    LENGTH_ACT_RETRY_STREAM_EVENT, REPEAT_FAILURE_STREAM_EVENT, STREAM_SUPERSEDED_STREAM_EVENT,
 };
 
 #[cfg(test)]
@@ -34,7 +34,7 @@ pub async fn run_harness_loop(
     event_tx: mpsc::Sender<StreamEvent>,
     cancel: CancellationToken,
     model_call_control: Arc<dyn ModelCallControl>,
-    max_iterations: u32,                            // default 25
+    max_iterations: u32,                            // per-turn cap (default 150)
     token_limit: u64,                               // context window size for this model
     conversation_history: Option<Vec<ChatMessage>>, // for continue/rotation
 ) -> Result<(), DaemonError> {
@@ -53,6 +53,7 @@ pub async fn run_harness_loop(
         token_limit,
         conversation_history,
         None,
+        Default::default(),
         None,
         None,
         true,
@@ -78,14 +79,17 @@ pub async fn run_harness_loop_with_compact_budget(
     token_limit: u64,
     conversation_history: Option<Vec<ChatMessage>>,
     compact_budget: Option<u64>,
+    compaction: rsid_harness::compaction::CompactionPolicy,
     agent_mail_boundary: Option<Arc<dyn HarnessMailBoundary>>,
     completion_gates: Option<CompletionGates>,
     completion_gates_enabled: bool,
 ) -> Result<(), DaemonError> {
-    let port = DaemonModelPort::new(provider, model_call_control);
+    // #3178: a bench session's live trace rides on its tool registry.
+    let trace = tools.trace_sink();
+    let port = DaemonModelPort::new(provider, model_call_control, trace.clone());
     run_loop(
         &port,
-        Arc::new(DaemonTools(tools)),
+        Arc::new(DaemonTools(tools, trace)),
         LoopParams {
             system_prompt,
             user_query,
@@ -96,6 +100,7 @@ pub async fn run_harness_loop_with_compact_budget(
             token_limit,
             conversation_history,
             compact_budget,
+            compaction,
             completion_gates,
             completion_gates_enabled,
         },
@@ -367,6 +372,7 @@ pub(in crate::session::harness) mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
                 reasoning_content: None,
+                reasoning_details: None,
                 stop_reason: None,
             })
         }
@@ -457,6 +463,7 @@ pub(in crate::session::harness) mod tests {
                     cost_usd: None,
                 },
                 reasoning_content: None,
+                reasoning_details: None,
                 stop_reason: None,
             })
         }
@@ -557,6 +564,7 @@ pub(in crate::session::harness) mod tests {
                     cost_usd: None,
                 },
                 reasoning_content: None,
+                reasoning_details: None,
                 stop_reason: None,
             })
         }
@@ -620,14 +628,14 @@ pub(in crate::session::harness) mod tests {
     }
 
     pub(in crate::session::harness) async fn root_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
     ) -> crate::model_control::AdmissionPermit {
         root_permit_keyed(store, session_id, "root").await
     }
 
     pub(in crate::session::harness) async fn root_permit_keyed(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
         key_prefix: &str,
     ) -> crate::model_control::AdmissionPermit {
@@ -671,7 +679,7 @@ pub(in crate::session::harness) mod tests {
     }
 
     pub(in crate::session::harness) fn controller(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
         permit: crate::model_control::AdmissionPermit,
     ) -> Arc<dyn ModelCallControl> {
@@ -737,6 +745,7 @@ pub(in crate::session::harness) mod tests {
                 tool_calls: vec![tool_call("mail-boundary", "unknown_tool")],
                 usage: TokenUsage::default(),
                 reasoning_content: None,
+                reasoning_details: None,
                 stop_reason: None,
             },
             ChatResponse {
@@ -744,6 +753,7 @@ pub(in crate::session::harness) mod tests {
                 tool_calls: Vec::new(),
                 usage: TokenUsage::default(),
                 reasoning_content: None,
+                reasoning_details: None,
                 stop_reason: None,
             },
         ])))
@@ -770,6 +780,7 @@ pub(in crate::session::harness) mod tests {
             tool_calls,
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: Some("end_turn".into()),
         }
     }
@@ -778,7 +789,9 @@ pub(in crate::session::harness) mod tests {
         policy: rsi_common::harness_tool_policy::HarnessToolPolicy,
         responses: Vec<ChatResponse>,
     ) -> (Vec<ChatRequest>, Vec<StreamEvent>) {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -926,7 +939,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn hosted_tool_call_emits_pair_and_preserves_result() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -949,6 +964,7 @@ pub(in crate::session::harness) mod tests {
                     }],
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: Some("tool_use".into()),
                 }),
                 Ok(ChatResponse {
@@ -956,6 +972,7 @@ pub(in crate::session::harness) mod tests {
                     tool_calls: Vec::new(),
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: Some("end_turn".into()),
                 }),
             ])),
@@ -1029,7 +1046,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn hosted_tool_rejection_records_failure_and_continues() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1049,6 +1068,7 @@ pub(in crate::session::harness) mod tests {
                     tool_calls: Vec::new(),
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: Some("end_turn".into()),
                 }),
             ])),
@@ -1108,7 +1128,9 @@ pub(in crate::session::harness) mod tests {
         use crate::session::harness::tools::web_fetch::WebFetchTool;
         use crate::session::harness::types::HarnessToolSpecKind;
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1128,6 +1150,7 @@ pub(in crate::session::harness) mod tests {
                     tool_calls: Vec::new(),
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: Some("end_turn".into()),
                 }),
             ])),
@@ -1185,7 +1208,9 @@ pub(in crate::session::harness) mod tests {
     }
 
     async fn captured_harness_request_effort(reasoning_effort: Option<String>) -> Option<String> {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let control = controller(&store, session_id, permit);
@@ -1236,7 +1261,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn resumed_orphan_call_is_repaired_before_provider_request() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1290,7 +1317,9 @@ pub(in crate::session::harness) mod tests {
     #[allow(clippy::expect_used, clippy::too_many_lines)]
     async fn compaction_is_persisted_and_continuation_rebuilds_summary_and_tail() {
         use rsi_common::types::{ConversationEvent, EventType, Role};
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1328,7 +1357,7 @@ pub(in crate::session::harness) mod tests {
             Some(rsi_common::model_control::ModelInvocationPurpose::SessionHarnessCompaction),
             crate::model_control::registry::RuntimeExecutionRoute::SessionHarnessOpenAiHttp,
         ));
-        let prior: Vec<ChatMessage> = (0..155)
+        let prior: Vec<ChatMessage> = (0..185)
             .map(|n| ChatMessage::user(format!("prior {n}")))
             .collect();
 
@@ -1362,7 +1391,7 @@ pub(in crate::session::harness) mod tests {
         // Persist the transcript as the daemon does: user turns, the
         // compaction boundary, then the assistant reply.
         let mut sequence = 0;
-        let mut persisted: Vec<ConversationEvent> = (0..155)
+        let mut persisted: Vec<ConversationEvent> = (0..185)
             .map(|n| format!("prior {n}"))
             .chain(std::iter::once("resume".to_string()))
             .map(|content| {
@@ -1413,20 +1442,22 @@ pub(in crate::session::harness) mod tests {
             "the provider request still carries the original task verbatim"
         );
         assert_eq!(rebuilt[0].content, "prior 0");
-        assert_eq!(rebuilt[1].content, "prior 135");
+        assert_eq!(rebuilt[1].content, "prior 165");
         assert_eq!(rebuilt[2].content, "[Conversation summary: done]");
         assert_eq!(rebuilt.len(), 23);
     }
 
     /// #974 acceptance 3: the default paid controller denies the compaction
-    /// summary call in Normal mode, so a 156-message history falls back to local
+    /// summary call in Normal mode, so a 186-message history falls back to local
     /// truncation, the turn completes, and the emitted compaction event carries
     /// the fallback.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn policy_denied_compaction_truncates_and_the_turn_completes() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let control = controller(&store, session_id, permit);
@@ -1437,7 +1468,7 @@ pub(in crate::session::harness) mod tests {
             responses: None,
         };
         let (event_tx, mut event_rx) = mpsc::channel(64);
-        let prior: Vec<ChatMessage> = (0..155)
+        let prior: Vec<ChatMessage> = (0..185)
             .map(|n| ChatMessage::user(format!("prior {n}")))
             .collect();
 
@@ -1475,7 +1506,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn resumed_late_tool_result_is_relocated_before_provider_request() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1523,7 +1556,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn failing_tool_result_is_flagged_in_the_next_provider_request() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1536,6 +1571,7 @@ pub(in crate::session::harness) mod tests {
                     tool_calls: vec![tool_call("failure", "unknown_tool")],
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -1543,6 +1579,7 @@ pub(in crate::session::harness) mod tests {
                     tool_calls: Vec::new(),
                     usage: TokenUsage::default(),
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
             ])))),
@@ -1584,7 +1621,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn continued_harness_session_gets_fresh_model_invocation_keys() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         for (run, prefix) in ["launch", "continue-1", "continue-2"]
             .into_iter()
@@ -1635,7 +1674,9 @@ pub(in crate::session::harness) mod tests {
     async fn second_harness_turn_admits_distinct_child_keys_and_a_replayed_key_dedups() {
         use rsi_common::model_control::ModelInvocationPurpose;
 
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let mut roots = Vec::new();
         for (turn, prefix) in ["turn-1", "turn-2"].into_iter().enumerate() {
@@ -1653,6 +1694,7 @@ pub(in crate::session::harness) mod tests {
                         tool_calls: Vec::new(),
                         usage: TokenUsage::default(),
                         reasoning_content: None,
+                        reasoning_details: None,
                         stop_reason: None,
                     },
                 ])))),
@@ -1785,6 +1827,7 @@ pub(in crate::session::harness) mod tests {
             tool_calls: vec![tool_call(id, "unknown_tool")],
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: None,
         }
     }
@@ -1807,7 +1850,9 @@ pub(in crate::session::harness) mod tests {
         responses: Vec<ChatResponse>,
         max_iterations: u32,
     ) -> (Vec<Vec<ChatMessage>>, Vec<StreamEvent>, Vec<Option<String>>) {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1903,7 +1948,9 @@ pub(in crate::session::harness) mod tests {
         max_iterations: u32,
         mutate_on_calls: &[usize],
     ) -> (Vec<Vec<ChatMessage>>, Vec<StreamEvent>) {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1930,6 +1977,7 @@ pub(in crate::session::harness) mod tests {
             100_000,
             None,
             None,
+            Default::default(),
             None,
             Some(gates),
             completion_gates_enabled,
@@ -2272,6 +2320,7 @@ pub(in crate::session::harness) mod tests {
                 ChatResponse {
                     content: String::new(),
                     reasoning_content: Some("the answer is 42".to_string()),
+                    reasoning_details: None,
                     stop_reason: Some("stop".to_string()),
                     ..plain_response()
                 },
@@ -2292,13 +2341,15 @@ pub(in crate::session::harness) mod tests {
         ChatResponse {
             content: String::new(),
             reasoning_content: Some("long analysis".to_string()),
+            reasoning_details: None,
             stop_reason: Some(stop_reason.to_string()),
             ..plain_response()
         }
     }
 
-    /// #1061: an empty final response cut off by the output limit is retried
-    /// once, in the same turn, with a final-answer nudge and a lower effort.
+    /// #1061, #4028: an empty final response cut off by the output limit is first
+    /// recovered by the act retries; once those are spent it is retried once, in
+    /// the same turn, with a final-answer nudge and a lower effort.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn empty_length_final_response_is_retried_once_with_a_nudge() {
@@ -2306,27 +2357,29 @@ pub(in crate::session::harness) mod tests {
             vec![
                 tool_only_response("a"),
                 empty_response_with("length"),
+                empty_response_with("length"),
+                empty_response_with("length"),
                 ChatResponse {
                     content: "the review".to_string(),
                     stop_reason: Some("stop".to_string()),
                     ..plain_response()
                 },
             ],
-            5,
+            6,
         )
         .await;
-        assert_eq!(requests.len(), 3);
-        let nudge = requests[2].last().expect("retry nudge");
+        assert_eq!(requests.len(), 5);
+        let nudge = requests[4].last().expect("retry nudge");
         assert_eq!(nudge.role, MessageRole::User);
         assert_eq!(nudge.content, FINAL_ANSWER_RETRY_PROMPT);
         // The retry still carries the tool result from earlier in the turn.
         assert!(
-            requests[2]
+            requests[4]
                 .iter()
                 .any(|message| message.role == MessageRole::Tool)
         );
         assert_eq!(
-            efforts[2].as_deref(),
+            efforts[4].as_deref(),
             Some(FINAL_ANSWER_RETRY_EFFORT),
             "retry lowers the reasoning effort"
         );
@@ -2353,11 +2406,13 @@ pub(in crate::session::harness) mod tests {
                 tool_only_response("a"),
                 empty_response_with("length"),
                 empty_response_with("length"),
+                empty_response_with("length"),
+                empty_response_with("length"),
             ],
-            5,
+            6,
         )
         .await;
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 5);
         let texts = assistant_texts(&events);
         assert_eq!(texts.len(), 1);
         assert!(texts[0].contains("empty final response"));
@@ -2410,7 +2465,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn harness_mail_is_not_claimed_on_the_initial_model_request() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -2438,6 +2495,7 @@ pub(in crate::session::harness) mod tests {
             100_000,
             None,
             None,
+            Default::default(),
             Some(Arc::new(boundary)),
             None,
             true,
@@ -2453,7 +2511,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn harness_mail_reaches_the_next_model_request_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -2481,6 +2541,7 @@ pub(in crate::session::harness) mod tests {
             100_000,
             None,
             None,
+            Default::default(),
             Some(Arc::new(boundary)),
             None,
             true,
@@ -2510,7 +2571,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn harness_mail_cancelled_before_dispatch_is_undone_and_rejected() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -2539,6 +2602,7 @@ pub(in crate::session::harness) mod tests {
             100_000,
             None,
             None,
+            Default::default(),
             Some(Arc::new(boundary)),
             None,
             true,
@@ -2559,7 +2623,9 @@ pub(in crate::session::harness) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_records_three_attempts_in_non_streaming_mode() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let control = controller(&store, session_id, permit);
@@ -2578,6 +2644,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -2593,6 +2660,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -2608,6 +2676,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
             ])),
@@ -2658,7 +2727,9 @@ pub(in crate::session::harness) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_records_three_attempts_in_streaming_mode() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let control = controller(&store, session_id, permit);
@@ -2677,6 +2748,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -2692,6 +2764,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -2707,6 +2780,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
             ])),
@@ -2757,7 +2831,9 @@ pub(in crate::session::harness) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_stream_fallback_requires_a_second_admission() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let root_invocation_id = permit.invocation_id();
@@ -2849,7 +2925,9 @@ pub(in crate::session::harness) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn cancellation_during_compaction_prevents_the_followup_turn_send() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let root_invocation_id = permit.invocation_id();
@@ -2886,7 +2964,7 @@ pub(in crate::session::harness) mod tests {
             cancel: cancel.clone(),
         };
         let mut history = vec![ChatMessage::system("system")];
-        for idx in 0..160 {
+        for idx in 0..185 {
             history.push(ChatMessage::user(format!(
                 "message {idx} {}",
                 "x".repeat(64)
@@ -2942,7 +3020,9 @@ pub(in crate::session::harness) mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
     #[tokio::test]
     async fn harness_loop_denies_third_backend_call_before_execution() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         {
             let guard = store.lock().await;
@@ -2976,6 +3056,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -2991,6 +3072,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
                 ChatResponse {
@@ -3006,6 +3088,7 @@ pub(in crate::session::harness) mod tests {
                         cost_usd: None,
                     },
                     reasoning_content: None,
+                    reasoning_details: None,
                     stop_reason: None,
                 },
             ])),
@@ -3099,6 +3182,7 @@ pub(in crate::session::harness) mod tests {
             }],
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: None,
         }
     }
@@ -3110,6 +3194,7 @@ pub(in crate::session::harness) mod tests {
             tool_calls: Vec::new(),
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: None,
         }
     }
@@ -3130,6 +3215,7 @@ pub(in crate::session::harness) mod tests {
                 .collect(),
             usage: TokenUsage::default(),
             reasoning_content: None,
+            reasoning_details: None,
             stop_reason: None,
         }
     }
@@ -3146,7 +3232,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn parallel_reads_overlap_and_results_stay_in_call_order() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let active = Arc::new(AtomicUsize::new(0));
@@ -3230,7 +3318,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn sequential_tool_never_overlaps_a_parallel_batch() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let active = Arc::new(AtomicUsize::new(0));
@@ -3323,7 +3413,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn sequential_tool_invalidates_parallel_result_cache() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let active = Arc::new(AtomicUsize::new(0));
@@ -3397,7 +3489,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn repeated_sequential_tool_calls_execute_every_time() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let active = Arc::new(AtomicUsize::new(0));
@@ -3455,7 +3549,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn cancellation_mid_batch_settles_every_call_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let active = Arc::new(AtomicUsize::new(0));
@@ -3541,7 +3637,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn repaired_arguments_dispatch_with_coercion_and_are_flagged() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -3600,7 +3698,9 @@ pub(in crate::session::harness) mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn unrepairable_arguments_surface_invalid_tool_arguments() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let seen = Arc::new(Mutex::new(Vec::new()));

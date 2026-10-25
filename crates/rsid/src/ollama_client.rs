@@ -4,20 +4,11 @@
 //! duplicate `generate_ollama` helpers in title / summarizer / extractor and
 //! powers the streaming CompilePrompt pipeline.
 
+use crate::memory::helper_breaker::{Guarded, HelperCall, HelperEndpointBreaker, Outcome};
 use futures::StreamExt;
 use std::time::Duration;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-
-/// Process-wide mutex used by tests that need to set `RSI_OLLAMA_URL`
-/// without racing against other parallel tests that read it. Acquire this lock
-/// before calling `std::env::set_var` and hold it for the entire test body.
-///
-/// Lives at module scope (not inside `#[cfg(test)] mod tests`) so it is
-/// reachable as `crate::ollama_client::TEST_OLLAMA_URL_LOCK` from any lib-test
-/// module in this crate.
-#[cfg(test)]
-pub(crate) static TEST_OLLAMA_URL_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Base endpoint for Ollama's `/api/generate`. Read from `RSI_OLLAMA_URL`
 /// (legacy `MOTHERSHIP_OLLAMA_URL` / `FLYWHEEL_OLLAMA_URL`) on each call
@@ -72,6 +63,37 @@ pub enum OllamaError {
     Cancelled,
     #[error("Rejected non-loopback native Ollama URL: {0}")]
     NonLoopback(String),
+    /// The endpoint's circuit breaker is open (#261): nothing was sent.
+    #[error("{0}")]
+    EndpointUnreachable(String),
+}
+
+/// Run one Ollama request behind the endpoint's circuit breaker (#261).
+async fn behind_breaker<T>(
+    url: &str,
+    call: &HelperCall<'_>,
+    attempt: impl std::future::Future<Output = (Result<T, OllamaError>, Outcome)>,
+) -> Result<T, OllamaError> {
+    let Some(endpoint) = crate::memory::helper_breaker::loopback_endpoint_key(url) else {
+        return attempt.await.0;
+    };
+    match HelperEndpointBreaker::global()
+        .guarded(&endpoint, call, attempt)
+        .await
+    {
+        Guarded::Rejected(message) => Err(OllamaError::EndpointUnreachable(message)),
+        Guarded::Ran { value } => value,
+    }
+}
+
+/// What a failed send says about the endpoint: a connect failure means
+/// nothing listens there.
+fn send_outcome(error: &reqwest::Error) -> Outcome {
+    if error.is_connect() {
+        Outcome::Unreachable
+    } else {
+        Outcome::Unknown
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +157,7 @@ pub(crate) fn build_body(
 /// Callers that previously did `.trim()` should continue to do so.
 pub async fn generate(
     http: &reqwest::Client,
-    model: &str,
+    call: &HelperCall<'_>,
     system: Option<&str>,
     prompt: &str,
     opts: GenerateOptions,
@@ -146,29 +168,33 @@ pub async fn generate(
         response: String,
     }
 
-    let body = build_body(model, system, prompt, &opts, false);
+    // The breaker key; the request below binds `ollama_url()` itself, the
+    // shape the model-control validator proves loopback.
+    let url = ollama_url()?;
+    let body = build_body(call.model, system, prompt, &opts, false);
+    let request = http.post(ollama_url()?).timeout(timeout).json(&body);
 
-    let resp = http
-        .post(ollama_url()?)
-        .timeout(timeout)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| OllamaError::Request(e.to_string()))?;
+    behind_breaker(&url, call, async {
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => return (Err(OllamaError::Request(e.to_string())), send_outcome(&e)),
+        };
 
-    if !resp.status().is_success() {
-        return Err(OllamaError::Status(resp.status()));
-    }
+        if !resp.status().is_success() {
+            return (Err(OllamaError::Status(resp.status())), Outcome::Reachable);
+        }
 
-    let parsed: Resp = resp
-        .json()
-        .await
-        .map_err(|e| OllamaError::Parse(e.to_string()))?;
+        let parsed: Resp = match resp.json().await {
+            Ok(parsed) => parsed,
+            Err(e) => return (Err(OllamaError::Parse(e.to_string())), Outcome::Reachable),
+        };
 
-    if parsed.response.is_empty() {
-        return Err(OllamaError::Empty);
-    }
-    Ok(parsed.response)
+        if parsed.response.is_empty() {
+            return (Err(OllamaError::Empty), Outcome::Reachable);
+        }
+        (Ok(parsed.response), Outcome::Reachable)
+    })
+    .await
 }
 
 /// Streaming generate. Invokes `on_token` for each non-empty delta as NDJSON
@@ -177,7 +203,7 @@ pub async fn generate(
 /// Honors `cancel` — if triggered, returns `OllamaError::Cancelled` promptly.
 pub async fn generate_stream<F>(
     http: &reqwest::Client,
-    model: &str,
+    call: &HelperCall<'_>,
     system: Option<&str>,
     prompt: &str,
     opts: GenerateOptions,
@@ -195,15 +221,20 @@ where
         done: bool,
     }
 
-    let body = build_body(model, system, prompt, &opts, true);
+    let url = ollama_url()?;
+    let body = build_body(call.model, system, prompt, &opts, true);
 
     let request = http.post(ollama_url()?).json(&body);
-    let resp = tokio::select! {
-        r = request.send() => {
-            r.map_err(|e| OllamaError::Request(e.to_string()))?
+    let resp = behind_breaker(&url, call, async {
+        tokio::select! {
+            r = request.send() => match r {
+                Ok(resp) => (Ok(resp), Outcome::Reachable),
+                Err(e) => (Err(OllamaError::Request(e.to_string())), send_outcome(&e)),
+            },
+            _ = cancel.cancelled() => (Err(OllamaError::Cancelled), Outcome::Unknown),
         }
-        _ = cancel.cancelled() => return Err(OllamaError::Cancelled),
-    };
+    })
+    .await?;
 
     if !resp.status().is_success() {
         return Err(OllamaError::Status(resp.status()));
@@ -267,19 +298,29 @@ pub async fn warmup(http: &reqwest::Client, model: &str) -> Result<(), OllamaErr
         think: false,
         keep_alive: Some("60m".to_string()),
     };
+    let call = HelperCall {
+        purpose: rsi_common::model_control::ModelInvocationPurpose::PromptCompile.as_str(),
+        setting_key: "prompt_compile_model_local",
+        model,
+        gate: true,
+    };
+    let url = ollama_url()?;
     let body = build_body(model, None, "", &opts, false);
-    let resp = http
+    let request = http
         .post(ollama_url()?)
         .timeout(Duration::from_secs(30))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| OllamaError::Request(e.to_string()))?;
-
-    if !resp.status().is_success() {
-        return Err(OllamaError::Status(resp.status()));
-    }
-    Ok(())
+        .json(&body);
+    behind_breaker(&url, &call, async {
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => return (Err(OllamaError::Request(e.to_string())), send_outcome(&e)),
+        };
+        if !resp.status().is_success() {
+            return (Err(OllamaError::Status(resp.status())), Outcome::Reachable);
+        }
+        (Ok(()), Outcome::Reachable)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -288,27 +329,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    struct OllamaUrlRestore(Option<std::ffi::OsString>);
-
-    impl OllamaUrlRestore {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var_os("RSI_OLLAMA_URL");
-            // SAFETY: callers hold TEST_OLLAMA_URL_LOCK for the full lifetime
-            // of this guard, including any awaited request.
-            unsafe { std::env::set_var("RSI_OLLAMA_URL", value) };
-            Self(previous)
-        }
-    }
-
-    impl Drop for OllamaUrlRestore {
-        fn drop(&mut self) {
-            // SAFETY: the owning test still holds TEST_OLLAMA_URL_LOCK.
-            unsafe {
-                match self.0.take() {
-                    Some(value) => std::env::set_var("RSI_OLLAMA_URL", value),
-                    None => std::env::remove_var("RSI_OLLAMA_URL"),
-                }
-            }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    fn test_call(model: &str) -> HelperCall<'_> {
+        HelperCall {
+            purpose: "session.summary",
+            setting_key: "memory_model_local",
+            model,
+            gate: true,
         }
     }
 
@@ -421,30 +448,33 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn remote_native_ollama_generate_is_rejected_before_transport() {
-        let _lock = TEST_OLLAMA_URL_LOCK.lock();
-        let _restore = OllamaUrlRestore::set("https://example.com/api/generate");
-        let error = generate(
-            &reqwest::Client::new(),
-            "model",
-            None,
-            "prompt",
-            GenerateOptions::default(),
-            Duration::from_millis(100),
+        temp_env::async_with_vars(
+            [("RSI_OLLAMA_URL", Some("https://example.com/api/generate"))],
+            async move {
+                let error = generate(
+                    &reqwest::Client::new(),
+                    &test_call("model"),
+                    None,
+                    "prompt",
+                    GenerateOptions::default(),
+                    Duration::from_millis(100),
+                )
+                .await
+                .expect_err("remote native URL");
+                assert!(matches!(error, OllamaError::NonLoopback(_)));
+            },
         )
-        .await
-        .expect_err("remote native URL");
-        assert!(matches!(error, OllamaError::NonLoopback(_)));
+        .await;
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test(flavor = "current_thread")]
     async fn loopback_native_ollama_generate_remains_operational() {
-        let _lock = TEST_OLLAMA_URL_LOCK.lock();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback listener");
         let address = listener.local_addr().expect("listener address");
-        let _restore = OllamaUrlRestore::set(&format!("http://{address}/api/generate"));
+        temp_env::async_with_vars([("RSI_OLLAMA_URL", Some(format!("http://{address}/api/generate")))], async move {
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("request connection");
             let mut request = [0_u8; 8192];
@@ -467,7 +497,7 @@ mod tests {
 
         let response = generate(
             &reqwest::Client::new(),
-            "model",
+            &test_call("model"),
             None,
             "prompt",
             GenerateOptions::default(),
@@ -477,5 +507,99 @@ mod tests {
         .expect("loopback generate");
         assert_eq!(response, "ok");
         server.await.expect("loopback server");
+        })
+    .await;
+    }
+
+    /// #261: a port nothing listens on opens the endpoint's breaker on the
+    /// first refused connect; the next gated call is refused without any
+    /// request, naming the setting and the fix; an answer from the endpoint
+    /// (here an operator's ungated call) closes it again without a restart.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_endpoint_opens_the_breaker_and_an_answer_closes_it() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener");
+        let address = listener.local_addr().expect("listener address");
+        drop(listener);
+        let url = format!("http://{address}/api/generate");
+        let endpoint = format!("localhost:{}", address.port());
+        temp_env::async_with_vars([("RSI_OLLAMA_URL", Some(url))], async move {
+            let http = reqwest::Client::new();
+            let first = generate(
+                &http,
+                &test_call("gemma4:e4b"),
+                None,
+                "prompt",
+                GenerateOptions::default(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("nothing listens");
+            assert!(matches!(first, OllamaError::Request(_)), "{first:?}");
+            let open = HelperEndpointBreaker::global().outages(std::time::Instant::now());
+            assert!(
+                open.iter().any(|outage| outage.endpoint == endpoint
+                    && outage.setting_key == "memory_model_local"),
+                "{open:?}"
+            );
+
+            let second = generate(
+                &http,
+                &test_call("gemma4:e4b"),
+                None,
+                "prompt",
+                GenerateOptions::default(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("the breaker refuses");
+            let OllamaError::EndpointUnreachable(message) = second else {
+                panic!("expected a breaker refusal, got {second:?}");
+            };
+            assert!(message.contains("memory_model_local=gemma4:e4b"), "{message}");
+            assert!(message.contains("ollama pull gemma4:e4b"), "{message}");
+
+            // The endpoint comes back: an ungated call reaches it and closes
+            // the breaker.
+            let listener = TcpListener::bind(address).await.expect("rebind the port");
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.expect("request connection");
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.expect("request bytes");
+                let body = r#"{"response":"ok"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("HTTP response");
+            });
+            let operator = HelperCall {
+                gate: false,
+                ..test_call("gemma4:e4b")
+            };
+            let reply = generate(
+                &http,
+                &operator,
+                None,
+                "prompt",
+                GenerateOptions::default(),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the endpoint answers");
+            assert_eq!(reply, "ok");
+            server.await.expect("loopback server");
+            let open = HelperEndpointBreaker::global().outages(std::time::Instant::now());
+            assert!(
+                open.iter().all(|outage| outage.endpoint != endpoint),
+                "{open:?}"
+            );
+        })
+        .await;
     }
 }

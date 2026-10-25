@@ -5,10 +5,12 @@
 //! observations and transport lifetime guards. No function here exposes an agent
 //! control method.
 
+mod dashboard;
 mod decision_targets;
 mod manager_v2;
 mod owner;
 mod permit;
+mod providers;
 mod rpc_owner;
 mod store_budget;
 

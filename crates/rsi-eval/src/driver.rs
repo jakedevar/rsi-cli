@@ -84,6 +84,7 @@ pub async fn replay_ticket(
 async fn launch(socket: &Path, ticket: &CorpusTicket, working_dir: PathBuf) -> Result<Uuid> {
     let params = LaunchSessionParams {
         completion_gates: None,
+        agent_role: None,
         query: ticket.prompt.clone(),
         title: None,
         working_dir: Some(working_dir),

@@ -1,0 +1,470 @@
+[
+  {
+    "name": "identity-assignments-and-ascii-predecessors",
+    "exit": 1,
+    "stdout": "sample.rs:2: asserts an entity's own identity is absent: 'Orchid'\n    !screen.contains(\"Orchid\"); !other.contains(\"Orchid\")\nsample.rs:2: asserts an entity's own identity is absent: 'Orchid'\n    !screen.contains(\"Orchid\"); !other.contains(\"Orchid\")\nsample.rs:6: asserts an entity's own identity is absent: 'Orchid'\n    é!screen.contains(\"Orchid\")\n\ncheck-identity-assertions: 3 finding(s).\nA test must not require an entity's own name to be invisible.\nAssert the positive end state instead (what the user SHOULD see).\nIf the omission is genuinely correct, assert the specific\nreplacement is present and name the test so the rationale is explicit.\n",
+    "stderr": ""
+  },
+  {
+    "name": "identity-late-assignment-and-crlf",
+    "exit": 1,
+    "stdout": "sample.rs:1: asserts an entity's own identity is absent: \"Petal's\"\n    !out.contains(\"Petal's\")\n\ncheck-identity-assertions: 1 finding(s).\nA test must not require an entity's own name to be invisible.\nAssert the positive end state instead (what the user SHOULD see).\nIf the omission is genuinely correct, assert the specific\nreplacement is present and name the test so the rationale is explicit.\n",
+    "stderr": ""
+  },
+  {
+    "name": "identity-escapes",
+    "exit": 1,
+    "stdout": "sample.rs:2: asserts an entity's own identity is absent: 'A\\\\\"B'\n    !out.contains(\"A\\\"B\")\n\ncheck-identity-assertions: 1 finding(s).\nA test must not require an entity's own name to be invisible.\nAssert the positive end state instead (what the user SHOULD see).\nIf the omission is genuinely correct, assert the specific\nreplacement is present and name the test so the rationale is explicit.\n",
+    "stderr": ""
+  },
+  {
+    "name": "identity-default-and-order",
+    "exit": 1,
+    "stdout": "crates/a.rs:2: asserts an entity's own identity is absent: 'Aster'\n    !out.contains(\"Aster\")\ncrates/z.rs:2: asserts an entity's own identity is absent: 'Zinnia'\n    !out.contains(\"Zinnia\")\n\ncheck-identity-assertions: 2 finding(s).\nA test must not require an entity's own name to be invisible.\nAssert the positive end state instead (what the user SHOULD see).\nIf the omission is genuinely correct, assert the specific\nreplacement is present and name the test so the rationale is explicit.\n",
+    "stderr": ""
+  },
+  {
+    "name": "identity-missing-and-clean",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "personal-default-skips",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "personal-public-and-leading-zeros",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:93,184,216,34>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "personal-fixture-exemption",
+    "exit": 1,
+    "stdout": "egress_policy.rs:1: public IP literal <ipv4:93,184,216,34>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "personal-missing",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "operator-staged-private-output",
+    "exit": 1,
+    "stdout": "thoughts/contact.md:2: operator identifier #1 from the local identifiers list\nthoughts/contact.md:2: operator identifier #2 from the local identifiers list\n\ncheck-operator-identifiers: 2 finding(s).\nDo not commit operator personal data. Refer to it as \"the operator's\n<purpose> contact (local config)\" and keep the value out of git, Issue\nbodies and handoffs. Edit the list at identifiers\n",
+    "stderr": ""
+  },
+  {
+    "name": "operator-clean",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "operator-no-list",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "operator-empty-list",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "operator-unreadable-range",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-0",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-16777215",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-16777216",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:1,0,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-167772160",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-184549375",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-167772159",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:9,255,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-184549376",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:11,0,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-1681915904",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-1686110207",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-1681915903",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:100,63,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-1686110208",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:100,128,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2130706432",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2147483647",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2130706431",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:126,255,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2147483648",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:128,0,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2851995648",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2852061183",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2851995647",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:169,253,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2852061184",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:169,255,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2886729728",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2887778303",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2886729727",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:172,15,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-2887778304",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:172,32,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225472",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225727",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225471",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:191,255,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225728",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,0,1,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225642",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225643",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225641",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225644",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225984",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221226239",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221225983",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,0,1,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3221226240",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,0,3,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3232235520",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3232301055",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3232235519",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,167,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3232301056",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,169,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3323068416",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3323199487",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3323068415",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:198,17,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3323199488",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:198,20,0,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3325256704",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3325256959",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3325256703",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:198,51,99,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3325256960",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:198,51,101,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3405803776",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3405804031",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3405803775",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:203,0,112,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3405804032",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:203,0,114,0>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3758096384",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-4026531839",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-3758096383",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:223,255,255,255>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-4026531840",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-4026531840",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-4294967295",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "ipv4-4026531839",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "special-3221225480",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "special-3221225481",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,0,0,9>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "special-3221225482",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:192,0,0,10>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  },
+  {
+    "name": "special-3221225483",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "special-134744072",
+    "exit": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "name": "special-134743044",
+    "exit": 1,
+    "stdout": "sample.txt:1: public IP literal <ipv4:8,8,4,4>\n\ncheck-personal-paths: 1 finding(s).\nUse $HOME, ~/, <repo>-relative paths, or a placeholder host such as\nremote.example.net / <ipv4:203,0,113,10>. Historical records belong under thoughts/.\n",
+    "stderr": ""
+  }
+]

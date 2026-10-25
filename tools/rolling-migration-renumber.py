@@ -44,6 +44,9 @@ SPEC.loader.exec_module(guard)
 STORE = guard.MIGRATION_PATH
 MIGRATION_DIR = guard.MIGRATION_DIR
 MANIFEST = "tools/released-migrations.json"
+# The store test module holds one rewind-teardown block per migration (#3343).
+STORE_TESTS = "crates/rsid-store/src/store/tests.rs"
+TEARDOWN_HEAD_RE = re.compile(rb"^    if active >= (\d+) && target < (\d+) \{\n\Z")
 DECLARATIONS = "tools/provisional-migrations/"
 TOKEN = "${VERSION}"
 OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -86,9 +89,10 @@ def run(repo: Path, *args: str, data: bytes | None = None,
     return result.stdout
 
 
-def oid(value: str) -> str:
+def oid(value: str, argument: str = "commit") -> str:
     if not OID_RE.fullmatch(value):
-        raise Refusal("noncanonical commit ID")
+        raise Refusal(f"noncanonical commit ID for {argument}: "
+                      "pass a full 40-hex SHA (git rev-parse <ref>)")
     return value
 
 
@@ -200,10 +204,92 @@ def revision_inventory(repo: Path, revision: str, base: str | None = None) -> di
         raise Refusal(f"invalid migration inventory at {revision}: {error}") from error
 
 
+def check_declaration_bytes(raw: bytes) -> None:
+    if len(raw) > MAX_DECLARATION_BYTES:
+        raise ValueError(f"declaration is {len(raw)} bytes, over the {MAX_DECLARATION_BYTES} byte limit")
+
+
+def check_declared_file_count(files: list) -> None:
+    if len(files) > MAX_DECLARED_FILES:
+        raise ValueError(f"`files` has {len(files)} entries, over the {MAX_DECLARED_FILES} limit")
+
+
+def check_declared_file_unique(file: dict, destination: str, paths: set[str],
+                               destinations: set[str]) -> None:
+    """Refuse a repeated source path or destination; records both on success."""
+    if file["path"] in paths:
+        raise ValueError(f"duplicate `path` {file['path']}")
+    if destination in destinations:
+        raise ValueError(f"duplicate destination {destination} from `path_template` of {file['path']}")
+    paths.add(file["path"])
+    destinations.add(destination)
+
+
+def check_declared_site_count(file: dict) -> None:
+    if len(file["sites"]) > MAX_SITES:
+        raise ValueError(f"`sites` of {file['path']} has {len(file['sites'])} entries, over the {MAX_SITES} limit")
+
+
+def validate_declaration_limits(raw: bytes, declaration: dict, new: int) -> None:
+    """Enforce the size, count and uniqueness limits of a declaration (#3329).
+
+    `inspect` applies the same `check_*` helpers inline on the renumber path;
+    this runs them up front for the no-renumber path. Runs after the shape
+    check, so `files` and `sites` are lists of objects. The destination is
+    where the file lands at `new`.
+    """
+    check_declaration_bytes(raw)
+    check_declared_file_count(declaration["files"])
+    paths: set[str] = set()
+    destinations: set[str] = set()
+    for file in declaration["files"]:
+        check_declared_file_unique(file, file["path_template"].replace(TOKEN, str(new)), paths, destinations)
+        check_declared_site_count(file)
+
+
+def validate_source_declarations(repo: Path, base: str, source: str, target: str, old: int,
+                                 new: int | None = None) -> None:
+    """Check the shape of every declaration the source carries (#3304).
+
+    The no-renumber path (source already at rolling head + 1) returns before any
+    file entry is read, so a malformed declaration would land and then fail the
+    next provisional source in the batch with an error naming the wrong source.
+    A declaration byte-identical on the target already landed and is skipped.
+    """
+    for name in sorted(changed(repo, base, source)):
+        if not (name.startswith(DECLARATIONS) and name.endswith(".json")):
+            continue
+        raw = show(repo, source, name)
+        if raw is None or raw == show(repo, target, name):
+            continue
+        try:
+            declaration = json.loads(raw)
+            guard.validate_declaration_shape(declaration, name, old)
+            validate_declaration_limits(raw, declaration, old if new is None else new)
+            # A stacked source can carry a declaration that already landed through
+            # another commit and edit the declared files past their original blob;
+            # only a declaration new to the target pins blobs and anchors.
+            if show(repo, target, name) is None:
+                for file in declaration["files"]:
+                    original = show(repo, source, file["path"])
+                    if original is None or sha(original) != file["source_blob"]:
+                        raise ValueError(f"`source_blob` of {file['path']} does not match the source file")
+                    if file["path_template"].replace(TOKEN, str(old)) != file["path"]:
+                        raise ValueError(f"`path_template` of {file['path']} does not match its path")
+                    for site in file["sites"]:
+                        if original.count(site["anchor"].encode()) != 1:
+                            raise ValueError(
+                                f"anchor in {file['path']} is missing or duplicated: {site['anchor']!r}")
+        except (TypeError, ValueError) as error:
+            raise Refusal(f"invalid provisional site declaration {name}: {error}") from error
+        except guard.GuardError as error:
+            raise Refusal(f"invalid provisional file declaration: {error}") from error
+
+
 def inspect(repo: Path, base: str, source: str, target: str,
             allow_noop: bool = False) -> dict | None:
-    for item in (base, source, target):
-        oid(item)
+    for argument, item in (("--base", base), ("--source", source), ("--target", target)):
+        oid(item, argument)
         run(repo, "cat-file", "-e", f"{item}^{{commit}}")
     if subprocess.run(git_argv(repo, "merge-base", "--is-ancestor", base, source),
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -242,6 +328,8 @@ def inspect(repo: Path, base: str, source: str, target: str,
         raise Refusal("target schema head is behind the accepted base")
     if target_manifest["latest_schema_version"] >= 2_147_483_647:
         raise Refusal("no representable next i32 schema version")
+    validate_source_declarations(repo, base, source, target, old,
+                                 target_manifest["latest_schema_version"] + 1)
     if allow_noop and target_manifest["latest_schema_version"] + 1 == old:
         # Already rolling head + 1: nothing to renumber, so nothing to inventory.
         return {"base": base, "source": source, "target": target,
@@ -254,17 +342,24 @@ def inspect(repo: Path, base: str, source: str, target: str,
     if show(repo, base, declaration_path) is not None:
         raise Refusal("provisional site declaration must be newly added")
     raw = show(repo, source, declaration_path)
-    if raw is None or len(raw) > MAX_DECLARATION_BYTES:
-        raise Refusal("provisional site declaration is missing or too large")
+    if raw is None:
+        raise Refusal("provisional site declaration is missing")
+    try:
+        check_declaration_bytes(raw)
+    except ValueError as error:
+        raise Refusal(f"provisional site declaration is too large: {error}") from error
     try:
         declaration = json.loads(raw)
     except (TypeError, ValueError) as error:
         raise Refusal("invalid provisional site declaration") from error
     if (set(declaration) - {"pending_predecessors"} != {"schema_version", "version", "files"} or
             declaration["schema_version"] != 1 or declaration["version"] != old or
-            not isinstance(declaration["files"], list) or not declaration["files"] or
-            len(declaration["files"]) > MAX_DECLARED_FILES):
+            not isinstance(declaration["files"], list) or not declaration["files"]):
         raise Refusal("invalid provisional declaration shape or version")
+    try:
+        check_declared_file_count(declaration["files"])
+    except ValueError as error:
+        raise Refusal(f"invalid provisional declaration shape or version: {error}") from error
     if (allow_noop and layout_of(source_manifest) == "dir" and
             show(repo, target, declaration_path) is not None and
             str(old) in target_manifest["blocks"]):
@@ -300,23 +395,29 @@ def inspect(repo: Path, base: str, source: str, target: str,
         if version_pattern.search(source_path.encode()) and TOKEN not in file["path_template"]:
             raise Refusal(f"undeclared version-bearing filename: {source_path}")
         destination = path(file["path_template"].replace(TOKEN, str(target_manifest["latest_schema_version"] + 1)))
-        if source_path in declared_paths or destination in destinations or source_path not in all_changed:
+        try:
+            check_declared_file_unique(file, destination, declared_paths, destinations)
+        except ValueError as error:
+            raise Refusal(f"duplicate, unchanged, or colliding provisional file: {error}") from error
+        if source_path not in all_changed:
             raise Refusal("duplicate, unchanged, or colliding provisional file")
         if (source_path.startswith(tuple(f"{root}/" for root in guard.STORE_ROOTS)) and
                 source_path not in guard.MIGRATION_PATHS and
                 not is_migration_unit_file(source_path) and
                 source_path not in guard.tracked_source_paths(source_manifest)):
             raise Refusal(f"migration helper or rewind source is not pinned: {source_path}")
-        declared_paths.add(source_path)
-        destinations.add(destination)
         original = show(repo, source, source_path)
         if (original is None or len(original) > MAX_SOURCE_BLOB_BYTES or
                 sha(original) != file["source_blob"] or b"\0" in original):
             raise Refusal(f"source blob digest mismatch or binary file: {source_path}")
-        if (not isinstance(file["sites"], list) or len(file["sites"]) > MAX_SITES or
+        if (not isinstance(file["sites"], list) or
                 any(set(site) != {"anchor", "replacement", "scope"} or
                     site["scope"] not in ("unit", "head") for site in file["sites"])):
             raise Refusal("invalid provisional site list")
+        try:
+            check_declared_site_count(file)
+        except ValueError as error:
+            raise Refusal(f"invalid provisional site list: {error}") from error
         covered = bytearray(len(original))
         converted = original
         introduced = introduced_ranges(repo, base, source, source_path, original)
@@ -358,10 +459,11 @@ def inspect(repo: Path, base: str, source: str, target: str,
             continue
         content = show(repo, source, filename) or b""
         introduced = introduced_ranges(repo, base, source, filename, content)
-        if (version_pattern.search(filename.encode()) or
-                any(in_ranges(introduced, m.start(), m.end())
-                    for m in version_pattern.finditer(content))):
+        if version_pattern.search(filename.encode()):
             raise Refusal(f"undeclared version-bearing file or site: {filename}")
+        for match in version_pattern.finditer(content):
+            if in_ranges(introduced, match.start(), match.end()):
+                raise Refusal(f"undeclared version-bearing file or site: {filename}:{match.start()}")
     if layout_of(source_manifest) == "dir":
         unit_file = f"{MIGRATION_DIR}/v{old:03d}.rs"
         if unit_file not in declared_paths:
@@ -482,6 +584,196 @@ def transform(repo: Path, unit: dict) -> dict:
             "transformed_manifest": manifest, "transformed_tree": tree}
 
 
+def attribute_lines_start(data: bytes, start: int) -> int:
+    """Start of the ``#[...]`` attribute lines directly above the item at ``start``.
+
+    A declared item keeps the attributes written on the lines above it (for
+    example a ``cfg`` shard gate); they belong to the declared site (#3343).
+    """
+    line_start = data.rfind(b"\n", 0, start) + 1
+    if data[line_start:start].strip():
+        return start
+    while line_start > 0:
+        previous = data.rfind(b"\n", 0, line_start - 1) + 1
+        if not data[previous:line_start].lstrip().startswith(b"#["):
+            break
+        line_start = previous
+    return line_start
+
+
+def teardown_blocks(data: bytes) -> dict[int, tuple[int, int]]:
+    """Byte spans of each ``if active >= N && target < N { ... }`` rewind-teardown block.
+
+    A block starts at its header line and ends at the next line that is exactly the
+    closing brace at the header's indentation; the header must name one version twice.
+    """
+    blocks: dict[int, tuple[int, int]] = {}
+    offset = 0
+    lines = data.splitlines(keepends=True)
+    index = 0
+    while index < len(lines):
+        match = TEARDOWN_HEAD_RE.match(lines[index])
+        if match is None:
+            offset += len(lines[index])
+            index += 1
+            continue
+        if match.group(1) != match.group(2):
+            raise Refusal("rewind teardown header names two versions")
+        end = index + 1
+        while end < len(lines) and lines[end] != b"    }\n":
+            end += 1
+        if end == len(lines):
+            raise Refusal("rewind teardown block is not closed")
+        size = sum(len(line) for line in lines[index:end + 1])
+        version = int(match.group(1))
+        if version in blocks:
+            raise Refusal(f"duplicate rewind teardown block V{version}")
+        blocks[version] = (offset, offset + size)
+        offset += size
+        index = end + 1
+    return blocks
+
+
+def mask_teardown_block(mask: bytearray, data: bytes, version: int, *, required: bool) -> None:
+    span = teardown_blocks(data).get(version)
+    if span is None:
+        if required:
+            raise Refusal(f"rewind teardown block V{version} is missing")
+        return
+    mask[span[0]:span[1]] = b"\1" * (span[1] - span[0])
+
+
+def ordered_teardown_insertions(ours: list[bytes], theirs: list[bytes]) -> list[bytes] | None:
+    """Merge two insertions of whole teardown blocks, newest version first.
+
+    The rewind chain tears down from the newest migration, so the renumbered
+    (higher) block precedes the older one. Returns None when either side is
+    anything but whole blocks.
+    """
+    parsed = []
+    for side in (ours, theirs):
+        data = b"".join(side)
+        spans = teardown_blocks(data) if data else {}
+        if not spans or sum(end - start for start, end in spans.values()) != len(data):
+            return None
+        parsed.extend((version, data[start:end]) for version, (start, end) in spans.items())
+    if len({version for version, _ in parsed}) != len(parsed):
+        return None
+    return [text for _, text in sorted(parsed, key=lambda item: -item[0])]
+
+
+def whole_statements(data: bytes) -> bool:
+    """True when ``data`` is complete top-level statements of a 4-space indented body."""
+    if not data.startswith(b"    ") or data.startswith(b"     ") or not data.endswith(b"\n"):
+        return False
+    last = data.rstrip().splitlines()[-1].rstrip()
+    if not last.endswith((b";", b"}")):
+        return False
+    depth = 0
+    quoted = False
+    index = 0
+    while index < len(data):
+        byte = data[index:index + 1]
+        if quoted:
+            if byte == b"\\":
+                index += 1
+            elif byte == b'"':
+                quoted = False
+        elif byte == b'"':
+            quoted = True
+        elif byte in b"([{":
+            depth += 1
+        elif byte in b")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        index += 1
+    return depth == 0 and not quoted
+
+
+FIXTURE_LET_RE = re.compile(
+    rb"\A\s*let\s+(?P<identifier>[a-z_][a-z0-9_]*)(?:\s*:\s*[A-Za-z0-9_<>]+)?\s*=\s*"
+    rb"connection\s*\.query_row\(\s*\"\s*SELECT\b[^\"\\]*\"\s*,\s*\[\]\s*,\s*"
+    rb"\|row\|\s*row\.get(?:::<[^<>;]*>)?\(0\)\s*,?\s*\)\s*"
+    rb"(?:\.optional\(\)\s*)?\.unwrap\(\)\s*\Z")
+FIXTURE_ASSERT_RE = re.compile(
+    rb"\A\s*assert_eq!\(\s*(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)(?:\.contains\(\"[^\"\\]*\"\))?\s*,\s*"
+    rb"(?:target_version\s*>=\s*(?P<direct_version>\d+)|"
+    rb"if\s+target_version\s*>=\s*(?P<conditional_version>\d+)\s*\{\s*\d+\s*\}\s*else\s*\{\s*\d+\s*\})\s*,\s*"
+    rb"\"fixture V\{target_version\}: [^\"\\]*\"\s*,?\s*\)\s*\Z")
+
+
+def top_level_statements(data: bytes) -> list[bytes] | None:
+    """Split ``data`` at depth-0 ``;`` (outside string literals); None when not whole."""
+    statements = []
+    depth = 0
+    quoted = False
+    begin = 0
+    index = 0
+    while index < len(data):
+        byte = data[index:index + 1]
+        if quoted:
+            if byte == b"\\":
+                index += 1
+            elif byte == b'"':
+                quoted = False
+        elif byte == b'"':
+            quoted = True
+        elif byte in b"([{":
+            depth += 1
+        elif byte in b")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif byte == b";" and depth == 0:
+            statements.append(data[begin:index])
+            begin = index + 1
+        index += 1
+    if depth or quoted or data[begin:].strip():
+        return None
+    return statements
+
+
+def fixture_insertion_declared(side: list[bytes], versions: range | list[int]) -> bool:
+    """A pure insertion of whole fixture-assertion runs gated on the unit's version.
+
+    ``assert_fixture_matches_claimed_version`` gains one run of statements per
+    migration: ``let x = connection.query_row("SELECT ..", [], |row| row.get(0))
+    .unwrap();`` probes, each consumed by ``assert_eq!(x, target_version >= N,
+    "fixture V{target_version}: ..")``. Two concurrent migrations insert their
+    runs at the same place. The run is the migration's own declared unit only when
+    each probe is followed by an assertion consuming the same identifier and every
+    gate names one of the unit's versions; any unpaired statement is refused.
+    """
+    data = b"".join(side)
+    if not data or not whole_statements(data):
+        return False
+    statements = top_level_statements(data)
+    if not statements:
+        return False
+    allowed = set(versions)
+    pending: bytes | None = None
+    for statement in statements:
+        match = FIXTURE_LET_RE.match(statement)
+        if match is not None:
+            if pending is not None:
+                return False
+            pending = match.group("identifier")
+            continue
+        match = FIXTURE_ASSERT_RE.match(statement)
+        if (match is None or pending is None or match.group("identifier") != pending or
+                int(match.group("direct_version") or match.group("conditional_version")) not in allowed):
+            return False
+        pending = None
+    return pending is None
+
+
+def target_tail(unit: dict) -> range:
+    """Schema versions the target added past the accepted base."""
+    prior = unit.get("base_latest", unit["source_manifest"]["latest_schema_version"] - 1)
+    return range(prior + 1, unit["target_manifest"]["latest_schema_version"] + 1)
+
+
 def allowed_mask(repo: Path, unit: dict, filename: str, transformed: bytes) -> bytearray:
     mask = bytearray(len(transformed))
     for site in unit["sites"]:
@@ -494,6 +786,7 @@ def allowed_mask(repo: Path, unit: dict, filename: str, transformed: bytes) -> b
         end = start + len(value)
         if transformed[end:end + 1] == b"\n":
             end += 1
+        start = attribute_lines_start(transformed, start)
         mask[start:end] = b"\1" * (end - start)
     if is_migration_unit_file(filename):
         # The whole per-version file is the declared unit.
@@ -505,7 +798,17 @@ def allowed_mask(repo: Path, unit: dict, filename: str, transformed: bytes) -> b
             raise Refusal("transformed migration gate is missing or ambiguous")
         start = transformed.index(block.encode())
         mask[start:start + len(block)] = b"\1" * len(block)
+    if filename == STORE_TESTS:
+        # The unit's rewind teardown is a declared region as a whole (#3343).
+        mask_teardown_block(mask, transformed, unit["new_version"], required=False)
     return mask
+
+
+def prior_refusal(source: str, error: Refusal, declarations: list[str] | None = None) -> Refusal:
+    """Name the earlier source that owns a failing provisional declaration (#3304)."""
+    where = f" ({', '.join(declarations)})" if declarations else ""
+    return Refusal(f"prior provisional source {source}{where} is the owner of this "
+                   f"refusal, not the source being landed: {error}")
 
 
 def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) -> bytearray:
@@ -537,6 +840,10 @@ def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) 
             if target[end:end + 1] == b"\n":
                 end += 1
             mask[start:end] = b"\1" * (end - start)
+    if filename == STORE_TESTS:
+        # Each rewind teardown the target added past the accepted base (#3343).
+        for number in range(prior + 1, latest + 1):
+            mask_teardown_block(mask, target, number, required=False)
     prior_units = unit.get("prior_units", [])
     if not isinstance(prior_units, list) or len(prior_units) > 64:
         raise Refusal("invalid prior provisional proof list")
@@ -549,10 +856,13 @@ def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) 
     for prior_unit in prior_units.values():
         if set(prior_unit) != {"base", "source", "target", "unit_candidate"}:
             raise Refusal("invalid prior provisional proof binding")
-        previous = inspect(repo, prior_unit["base"], prior_unit["source"], prior_unit["target"])
-        if previous is None:
-            raise Refusal("prior provisional source is not a migration")
-        proof = prove(repo, previous, prior_unit["unit_candidate"], unit["target"])
+        try:
+            previous = inspect(repo, prior_unit["base"], prior_unit["source"], prior_unit["target"])
+            if previous is None:
+                raise Refusal("prior provisional source is not a migration")
+            proof = prove(repo, previous, prior_unit["unit_candidate"], unit["target"])
+        except Refusal as error:
+            raise prior_refusal(prior_unit["source"], error) from error
         for site in proof["sites"]:
             if site["target_path"] != filename:
                 continue
@@ -563,8 +873,29 @@ def target_migration_mask(repo: Path, unit: dict, filename: str, target: bytes) 
             end = start + len(after)
             if target[end:end + 1] == b"\n":
                 end += 1
+            # A landed declared item owns its preceding attributes just as a
+            # transformed source item does. Otherwise a shard-gated schema
+            # constant beside the head site is refused on the attribute line.
+            start = attribute_lines_start(target, start)
             mask[start:end] = b"\1" * (end - start)
     return mask
+
+
+def malformed_declaration(repo: Path, source: str, declarations: list[str]) -> str | None:
+    """Return why a landed declaration fails the structural shape check, else None."""
+    for name in declarations:
+        raw = show(repo, source, name)
+        if raw is None:
+            continue
+        try:
+            declaration = json.loads(raw)
+            guard.validate_declaration_shape(declaration, name)
+        except (TypeError, KeyError, AttributeError, ValueError, guard.GuardError) as error:
+            return str(error)
+    return None
+
+
+UNDECLARED_SITE_PREFIX = "undeclared version-bearing"
 
 
 def discover_target_provisional_units(repo: Path, base: str, target: str) -> list[dict]:
@@ -584,12 +915,40 @@ def discover_target_provisional_units(repo: Path, base: str, target: str) -> lis
         source_base = run(repo, "merge-base", parent, source).decode().strip()
         declarations = [name for name in changed(repo, source_base, source)
                         if name.startswith(DECLARATIONS) and name.endswith(".json")]
+        # A declaration already present, byte-identical, in the first parent was
+        # landed by an earlier unit; this landing only inherits it (#3388).
+        inherited = [name for name in declarations
+                     if (blob := show(repo, parent, name)) is not None
+                     and blob == show(repo, source, name)]
+        for name in inherited:
+            print(f"skipping inherited landed declaration {name} from {source}",
+                  file=sys.stderr)
+        declarations = [name for name in declarations if name not in inherited]
         if not declarations:
             continue
-        previous = inspect(repo, source_base, source, parent)
-        if previous is None:
-            raise Refusal("target provisional declaration has no appended migration")
-        prove(repo, previous, candidate, target)
+        malformed =malformed_declaration(repo, source, declarations)
+        if malformed:
+            # An already-landed declaration that fails structural validation cannot
+            # be renumbered or proved, so it masks nothing; refusing every later
+            # source for it would only blame an unrelated source (#3344).
+            print(f"skipping malformed landed declaration from {source}: {malformed}",
+                  file=sys.stderr)
+            continue
+        try:
+            previous = inspect(repo, source_base, source, parent)
+            if previous is None:
+                raise Refusal("target provisional declaration has no appended migration")
+            prove(repo, previous, candidate, target)
+        except Refusal as error:
+            if str(error).startswith(UNDECLARED_SITE_PREFIX):
+                # A landed unit that landed without a renumber never had its
+                # undeclared version sites checked. It cannot be re-proved, so it
+                # masks nothing; a later source whose conflict needs its transform
+                # still refuses on the unmasked conflict (#3400).
+                print(f"skipping unprovable landed declaration from {source}: {error}",
+                      file=sys.stderr)
+                continue
+            raise prior_refusal(source, error, declarations) from error
         units.append({"base": source_base, "source": source,
                       "target": parent, "unit_candidate": candidate})
         if len(units) > 64:
@@ -649,13 +1008,23 @@ def resolve_diff3(repo: Path, unit: dict, filename: str, contents: bytes) -> byt
         theirs: list[bytes] = []
         while index < len(lines) and not lines[index].startswith(b">>>>>>> "):
             theirs.append(lines[index]); index += 1
-        if (index == len(lines) or
-                not changed_lines_are_declared(base, theirs, transformed, mask) or
-                not changed_lines_are_declared(base, ours, target, target_mask)):
+        if index == len(lines):
+            raise Refusal(f"unproved migration conflict: {filename}")
+        fixture = filename == STORE_TESTS and not base
+        if not (changed_lines_are_declared(base, theirs, transformed, mask) or
+                (fixture and fixture_insertion_declared(theirs, [unit["new_version"]]))):
+            raise Refusal(f"unproved migration conflict: {filename}")
+        if not (changed_lines_are_declared(base, ours, target, target_mask) or
+                (fixture and fixture_insertion_declared(ours, target_tail(unit)))):
             raise Refusal(f"unproved migration conflict: {filename}")
         index += 1
         if not base:
-            output.extend(ours if ours == theirs else ours + theirs)
+            if ours == theirs:
+                output.extend(ours)
+            else:
+                ordered = (ordered_teardown_insertions(ours, theirs)
+                           if filename == STORE_TESTS else None)
+                output.extend(ordered if ordered is not None else ours + theirs)
             continue
         if len(base) != 1 or not ours or not theirs:
             raise Refusal(f"semantic replacement conflict: {filename}")

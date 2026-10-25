@@ -17,7 +17,7 @@ use rsi_common::mcp::{
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-pub const MCP_SERVER_SETTING_PREFIX: &str = "mcp.server.";
+use crate::store::operator_settings::MCP_SERVER_SETTING_PREFIX;
 pub const OPERATOR_ONLY_REFUSAL: &str = "mcp_config_operator_only";
 
 #[must_use]
@@ -71,10 +71,6 @@ fn invalid_secret_params(method: &str) -> DaemonError {
     ))
 }
 
-fn setting_key(id: &str) -> String {
-    format!("{MCP_SERVER_SETTING_PREFIX}{id}")
-}
-
 fn parse_definition(id: &str, raw: &str) -> Result<McpServerDefinition> {
     let definition: McpServerDefinition = serde_json::from_str(raw).map_err(|_| {
         DaemonError::Store(format!(
@@ -93,7 +89,7 @@ fn parse_definition(id: &str, raw: &str) -> Result<McpServerDefinition> {
 
 fn load_definitions(store: &Store) -> Result<BTreeMap<String, McpServerDefinition>> {
     let mut definitions = BTreeMap::new();
-    for (key, raw) in store.list_daemon_settings_with_prefix(MCP_SERVER_SETTING_PREFIX)? {
+    for (key, raw) in store.list_mcp_server_definition_rows()? {
         let Some(id) = key.strip_prefix(MCP_SERVER_SETTING_PREFIX) else {
             continue;
         };
@@ -110,7 +106,7 @@ pub(crate) fn load_enabled_definitions_lossy(
 ) -> (BTreeMap<String, McpServerDefinition>, Vec<String>) {
     let mut definitions = BTreeMap::new();
     let mut unavailable = Vec::new();
-    let Ok(rows) = store.list_daemon_settings_with_prefix(MCP_SERVER_SETTING_PREFIX) else {
+    let Ok(rows) = store.list_mcp_server_definition_rows() else {
         return (definitions, unavailable);
     };
     for (key, raw) in rows {
@@ -167,9 +163,7 @@ fn upsert(
             "the mcp server limit is already full; disable an existing server first".into(),
         ));
     }
-    let key = setting_key(&request.server.id);
-    let raw = serde_json::to_string(&request.server).map_err(DaemonError::from)?;
-    store.set_daemon_setting(&key, &raw)?;
+    store.set_mcp_server_definition(&request.server)?;
     Ok(McpServerSummary {
         credential: vault.mcp_metadata(&request.server.id),
         definition: request.server,
@@ -183,14 +177,12 @@ fn set_enabled(
 ) -> Result<McpServerSummary> {
     validate_mcp_server_id(&request.id)
         .map_err(|reason| DaemonError::InvalidParam(reason.into()))?;
-    let key = setting_key(&request.id);
     let raw = store
-        .get_daemon_setting(&key)?
+        .get_mcp_server_definition_raw(&request.id)?
         .ok_or_else(|| DaemonError::InvalidParam("mcp server is not configured".into()))?;
     let mut definition = parse_definition(&request.id, &raw)?;
     definition.enabled = request.enabled;
-    let raw = serde_json::to_string(&definition).map_err(DaemonError::from)?;
-    store.set_daemon_setting(&key, &raw)?;
+    store.set_mcp_server_definition(&definition)?;
     Ok(McpServerSummary {
         credential: vault.mcp_metadata(&request.id),
         definition,
@@ -204,7 +196,7 @@ fn validate_id(id: &str) -> Result<()> {
 
 fn require_configured_server(store: &Store, id: &str) -> Result<()> {
     store
-        .get_daemon_setting(&setting_key(id))?
+        .get_mcp_server_definition_raw(id)?
         .ok_or_else(|| DaemonError::InvalidParam("mcp server is not configured".into()))
         .map(|_| ())
 }

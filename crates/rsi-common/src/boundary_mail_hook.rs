@@ -82,7 +82,14 @@ pub fn render_mail_block(sender_role: &str, text: &str) -> String {
 /// provider timed out or rejected leaves no such line.
 #[must_use]
 pub fn transcript_line_accepts_block(line: &str, block: &str) -> bool {
-    if !line.contains("additional_context") {
+    transcript_line_accepts_hook_block(line, block, "PostToolUse")
+}
+
+/// Accepted context for a specific hook event. Codex tags hook context without
+/// an event name; Claude attachments must name the requested event.
+#[must_use]
+pub fn transcript_line_accepts_hook_block(line: &str, block: &str, hook_event: &str) -> bool {
+    if block.is_empty() || !line.contains("additional_context") {
         return false;
     }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -112,7 +119,7 @@ pub fn transcript_line_accepts_block(line: &str, block: &str) -> bool {
         Some("attachment") => {
             let attachment = &value["attachment"];
             if attachment["type"] != "hook_additional_context"
-                || attachment["hookEvent"] != "PostToolUse"
+                || attachment["hookEvent"] != hook_event
             {
                 return false;
             }
@@ -249,7 +256,8 @@ fn render_ask_user_question_denial(event: &Value) -> Option<String> {
     )
 }
 
-/// Deny broad process signals (#1227) and unscoped library tests (#1339).
+/// Deny broad process signals (#1227), Python (#654) and unscoped
+/// library tests (#1339).
 fn render_shell_denial(event: &Value, full_suite: bool) -> Option<String> {
     if event.get("tool_name").and_then(Value::as_str) != Some("Bash") {
         return None;
@@ -260,6 +268,7 @@ fn render_shell_denial(event: &Value, full_suite: bool) -> Option<String> {
         .and_then(Value::as_str)?;
     let reason = crate::kill_guard::broad_kill_refusal(command)
         .map(str::to_owned)
+        .or_else(|| crate::python_guard::python_refusal(command).map(str::to_owned))
         .or_else(|| test_guard::refusal(command, full_suite).map(str::to_owned))
         .or_else(|| {
             let cwd = event_cwd(event)?;
@@ -305,15 +314,26 @@ pub fn sandbox_base() -> std::path::PathBuf {
 /// a repository elsewhere, is not ours to guard. `Some(reason)` denies the call
 /// before it runs.
 fn custody_refusal(command: &str, cwd: &Path, base: &Path) -> Option<String> {
-    if base.as_os_str().is_empty() {
+    if !command_in_custody_scope(command, cwd, base) {
         return None;
     }
     let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    if !cwd.starts_with(&base) && !command_names_path_under(command, &cwd, &base) {
-        return None;
-    }
     crate::custody_scan::check_command_sync_in(command, &cwd, &base)
+}
+
+/// Whether `command`, run from `cwd`, is inside RSI's git custody (#3165): it
+/// starts inside the sandbox `base` or names a path under it. This is the one
+/// location predicate of the sandbox branch custody; the CLI hook and the
+/// Harness `shell`, `exec_command` and `git` tools share it, so a scratch
+/// repository elsewhere is not guarded by either. An empty `base` guards nothing.
+pub fn command_in_custody_scope(command: &str, cwd: &Path, base: &Path) -> bool {
+    if base.as_os_str().is_empty() {
+        return false;
+    }
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    cwd.starts_with(&base) || command_names_path_under(command, &cwd, &base)
 }
 
 /// Whether any word of `command` names a path under `base`, resolved the way
@@ -414,8 +434,76 @@ where
         .and_then(|exe| exe.to_str().map(str::to_string))
         .unwrap_or_else(|| "rsi-rpc".to_string());
     let cfg = spill_config_for_args(args, crate::spill::SpillConfig::from_env());
+    run_hook_with_input_and_args(args, &input, &cfg, &wrapper, stdout, dispatch)
+}
+
+/// Route the installed handler's part number through the hook-only lifecycle
+/// request. It comes from RSI's argv, never from the provider hook input.
+fn run_hook_with_input_and_args<F>(
+    args: &[String],
+    input: &str,
+    cfg: &crate::spill::SpillConfig,
+    wrapper: &str,
+    stdout: &mut impl Write,
+    mut dispatch: F,
+) -> u8
+where
+    F: FnMut(&Path, &str, Value, Duration) -> std::io::Result<RpcResponse>,
+{
     let dialect = crate::provider_lifecycle_hooks::HookOutputDialect::from_hook_args(args);
-    run_hook_with_input_for(&input, &cfg, &wrapper, dialect, stdout, dispatch)
+    let part = args.iter().find_map(|arg| {
+        arg.strip_prefix("--session-start-part=")?
+            .parse::<usize>()
+            .ok()
+    });
+    if args.iter().any(|arg| arg == "--session-start-fallback") {
+        // This handler has a single purpose. Never forward the user's prompt
+        // or fall through to the mail/spill path.
+        let Ok(mut event) = serde_json::from_str::<Value>(input) else {
+            return 0;
+        };
+        if event["hook_event_name"] != "UserPromptSubmit" {
+            return 0;
+        }
+        event["hook_event_name"] = serde_json::json!("SessionStart");
+        let Some(mut params) =
+            crate::provider_lifecycle_hooks::RecordProviderLifecycleEventParams::from_hook_input(
+                &event,
+            )
+        else {
+            return 0;
+        };
+        params.session_start_fallback = true;
+        params.session_start_part = part;
+        let socket = crate::agent_rpc_client::resolve_socket_path();
+        if let Ok(reply) = dispatch(
+            &socket,
+            crate::provider_lifecycle_hooks::RECORD_METHOD,
+            serde_json::to_value(params).expect("serializable hook params"),
+            crate::provider_lifecycle_hooks::RECORD_TIMEOUT,
+        ) && let Some(output) =
+            crate::provider_lifecycle_hooks::render_start_context_output(&reply, "UserPromptSubmit")
+        {
+            let _ = writeln!(stdout, "{output}").and_then(|()| stdout.flush());
+        }
+        return 0;
+    }
+    run_hook_with_input_for(
+        input,
+        cfg,
+        wrapper,
+        dialect,
+        stdout,
+        |socket, method, mut params, timeout| {
+            if method == crate::provider_lifecycle_hooks::RECORD_METHOD
+                && params.get("event").and_then(Value::as_str) == Some("SessionStart")
+                && let Some(part) = part
+            {
+                params["session_start_part"] = serde_json::json!(part);
+            }
+            dispatch(socket, method, params, timeout)
+        },
+    )
 }
 
 /// The spill configuration for one hook run: [`MAIL_ONLY_FLAG`] disables it.
@@ -577,6 +665,46 @@ mod tests {
     }
 
     #[test]
+    fn prompt_submit_fallback_transports_only_locator_and_renders_capped_context() {
+        for mail_only in [false, true] {
+            let mut args = vec![
+                "--session-start-fallback".into(),
+                "--session-start-part=2".into(),
+            ];
+            if mail_only {
+                args.push(MAIL_ONLY_FLAG.into());
+            }
+            let mut output = Vec::new();
+            let code = run_hook_with_input_and_args(
+                &args,
+                r#"{"hook_event_name":"UserPromptSubmit","session_id":"thread","transcript_path":"/thread.jsonl","prompt":"private query"}"#,
+                &crate::spill::SpillConfig::from_env(),
+                "rsi-rpc",
+                &mut output,
+                |_, method, params, _| {
+                    assert_eq!(method, crate::provider_lifecycle_hooks::RECORD_METHOD);
+                    assert_eq!(
+                        params,
+                        json!({"event":"SessionStart", "source":"other",
+                        "session_start_fallback":true,"session_start_part":2,
+                        "provider_session_id":"thread","transcript_path":"/thread.jsonl"})
+                    );
+                    Ok(RpcResponse::success(
+                        Some(json!(1)),
+                        json!({"outcome":"served", "additional_context":"PART TWO"}),
+                    ))
+                },
+            );
+            assert_eq!(code, 0);
+            let output: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                output,
+                json!({"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"PART TWO"}})
+            );
+        }
+    }
+
+    #[test]
     fn output_carries_sender_labelled_additional_context() {
         let out = render_hook_output(&reply(json!({"messages": [
             {"message_id": "m1", "sender_role": "manager", "text": "watch your context"},
@@ -716,6 +844,52 @@ mod tests {
     }
 
     #[test]
+    fn session_start_evidence_requires_exact_accepted_context() {
+        let block = "[RSI preamble part 1/2]\n\nPREAMBLE";
+        let claude = json!({"type": "attachment", "attachment": {
+            "type": "hook_additional_context", "hookEvent": "SessionStart", "content": [block]
+        }});
+        let codex = json!({"type": "response_item", "payload": {
+            "type": "message", "role": "developer", "content": [{"type": "input_text", "text": block}],
+            "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["hooks.additional_context"]}
+        }});
+        for value in [&claude, &codex] {
+            assert!(transcript_line_accepts_hook_block(
+                &value.to_string(),
+                block,
+                "SessionStart"
+            ));
+            assert!(!transcript_line_accepts_hook_block(
+                &value.to_string(),
+                "MISSING PART",
+                "SessionStart"
+            ));
+        }
+        assert!(!transcript_line_accepts_block(&claude.to_string(), block));
+        let mut wrong_hook = claude.clone();
+        wrong_hook["attachment"]["hookEvent"] = json!("PostToolUse");
+        assert!(!transcript_line_accepts_hook_block(
+            &wrong_hook.to_string(),
+            block,
+            "SessionStart"
+        ));
+        let mut truncated = claude;
+        truncated["attachment"]["content"] = json!(["[RSI preamble part 1/2]"]);
+        assert!(!transcript_line_accepts_hook_block(
+            &truncated.to_string(),
+            block,
+            "SessionStart"
+        ));
+        let mut quoted = codex;
+        quoted["payload"]["role"] = json!("assistant");
+        assert!(!transcript_line_accepts_hook_block(
+            &quoted.to_string(),
+            block,
+            "SessionStart"
+        ));
+    }
+
+    #[test]
     fn confirm_params_reject_unknown_fields() {
         let ok: ConfirmBoundaryMailParams =
             serde_json::from_value(json!({"message_ids": [uuid::Uuid::nil()]})).unwrap();
@@ -725,6 +899,39 @@ mod tests {
                 json!({"message_ids": [], "session_id": "x"})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_numbered_handler_selects_its_session_start_part_through_the_rpc() {
+        let mut calls = Vec::new();
+        let mut out = Vec::new();
+        let code = run_hook_with_input_and_args(
+            &["--session-start-part=2".into()],
+            r#"{"hook_event_name":"SessionStart","source":"startup","session_start_part":99}"#,
+            &crate::spill::SpillConfig::from_lookup(&|_| None),
+            "rsi-rpc",
+            &mut out,
+            |_, method, params, _| {
+                calls.push((method.to_string(), params));
+                Ok(RpcResponse::success(
+                    Some(json!(1)),
+                    json!({"outcome":"partial", "additional_context":"[RSI preamble part 2/3]\n\nBODY"}),
+                ))
+            },
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            calls,
+            vec![(
+                crate::provider_lifecycle_hooks::RECORD_METHOD.to_string(),
+                json!({"event":"SessionStart", "source":"startup", "session_start_part":2})
+            )]
+        );
+        let output: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["additionalContext"],
+            "[RSI preamble part 2/3]\n\nBODY"
         );
     }
 
@@ -885,7 +1092,7 @@ mod tests {
     #[test]
     fn pre_tool_use_rewrites_a_heavy_bash_command_without_a_permission_decision() {
         let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
-            "tool_input": {"command": "cargo test -p rsid", "description": "t"}});
+            "tool_input": {"command": "cargo build -p rsid", "description": "t"}});
         let mut out = Vec::new();
         let tmp = tempfile::tempdir().unwrap();
         let code = run_hook_with_input(
@@ -902,7 +1109,7 @@ mod tests {
         assert!(specific.get("permissionDecision").is_none());
         assert_eq!(
             specific["updatedInput"]["command"],
-            "'/x/rsi-rpc' spill --shell 'cargo test -p rsid'"
+            "'/x/rsi-rpc' spill --shell 'cargo build -p rsid'"
         );
         assert_eq!(specific["updatedInput"]["description"], "t");
     }
@@ -933,6 +1140,57 @@ mod tests {
             specific["permissionDecisionReason"],
             crate::kill_guard::BROAD_KILL_REFUSAL
         );
+    }
+
+    /// #654: Claude and Codex deny every interpreter invocation at PreToolUse,
+    /// including repository scripts. Mentioning Python as data stays allowed.
+    #[test]
+    fn pre_tool_use_denies_python_for_claude_and_codex_and_allows_mentions() {
+        let run = |command: &str, args: &[String]| {
+            let event = json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": command}});
+            let mut out = Vec::new();
+            let tmp = tempfile::tempdir().unwrap();
+            let cfg = spill_config_for_args(args, spill_cfg(tmp.path()));
+            let code = run_hook_with_input_and_args(
+                args,
+                &event.to_string(),
+                &cfg,
+                "rsi-rpc",
+                &mut out,
+                |_, _, _, _| panic!("PreToolUse must not call the daemon"),
+            );
+            assert_eq!(code, 0);
+            out
+        };
+        // Codex installs the same Bash matcher with --mail-only; its disabled
+        // spill configuration must still enforce the shell guards.
+        for args in [vec![], vec![MAIL_ONLY_FLAG.to_string()]] {
+            for command in [
+                "python",
+                "python3",
+                "python3 -",
+                "python3 --version",
+                "cd crates && python3 --version; ls",
+                "python3 -c 'print(1)'",
+                "python3 -m unittest -v scripts/tests/test_rsi_stash.py",
+                "python3 -I scripts/rsid-sample-stacks --pid 1",
+                "pip install x",
+            ] {
+                let value: Value = serde_json::from_slice(&run(command, &args)).unwrap();
+                let specific = &value["hookSpecificOutput"];
+                assert_eq!(specific["hookEventName"], "PreToolUse", "{command}");
+                assert_eq!(specific["permissionDecision"], "deny", "{command}");
+                assert_eq!(
+                    specific["permissionDecisionReason"],
+                    crate::python_guard::PYTHON_REFUSAL,
+                    "{command}"
+                );
+            }
+            for command in ["ls ~/python-notes", "echo python", "git log --grep python"] {
+                assert_eq!(run(command, &args), Vec::<u8>::new(), "{command}");
+            }
+        }
     }
 
     fn git(dir: &Path, args: &[&str]) {

@@ -38,8 +38,9 @@ const feed = (keys) => {
 
 test('every TUI Normal-mode key now runs a desktop action', () => {
   const unbound = NORMAL_KEYS.filter((r) => !KEY_BINDINGS[r.keys]).map((r) => r.keys);
-  // The last one, <Space>gP, is the prompt creator over the hub #3040 prompt-file RPCs (local #88).
-  assert.deepEqual(unbound, []);
+  // The only gap is the declared <Space>hu (ClearProviderUsageHold, #3568; owner #3636 in parity-status.d/lifecycle.json);
+  // binding it must drop it from this list.
+  assert.deepEqual(unbound, ['<Space>hu']);
 });
 
 test('the navigation actions are registered with their TUI keys and commands', () => {

@@ -77,7 +77,7 @@ impl ManagerAllowanceField {
     fn suggested(self) -> u16 {
         match self {
             Self::CreatedContainers => 8,
-            Self::CreatedSessions => 32,
+            Self::CreatedSessions => crate::harness_manager_v2::DEFAULT_MAX_CREATED_SESSIONS,
             Self::RecoveryAttempts => 3,
         }
     }
@@ -164,6 +164,12 @@ fn grants(preset: ManagerPolicyPreset) -> &'static [ManagerCapabilityV2] {
         ManagerPolicyPreset::Execute => EXECUTE,
         _ => &[],
     }
+}
+/// The grants a preset applies (empty for Observe and Custom); the TUI prints
+/// them so each preset line says what it changes.
+#[must_use]
+pub fn manager_preset_grants(preset: ManagerPolicyPreset) -> &'static [ManagerCapabilityV2] {
+    grants(preset)
 }
 fn same_grants(actual: &[ManagerCapabilityV2], expected: &[ManagerCapabilityV2]) -> bool {
     actual.len() == expected.len() && expected.iter().all(|c| actual.contains(c))

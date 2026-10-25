@@ -30,15 +30,30 @@ pub(super) struct ChargedUsage {
     pub provider_active: u64,
     pub known_spend_usd: Option<f64>,
     pub unknown_spend_observations: u64,
+    /// #235: the sessions `active` counts (the replaced slot left out) and
+    /// the live sessions of the principal's own seat lineage it does not.
+    pub counted: Vec<Uuid>,
+    pub seat_active: Vec<Uuid>,
+    /// The caller (`existing_session`) is of the principal's own seat lineage.
+    pub existing_holds_seat: bool,
 }
 
 /// The live members and scoped spend one [`ChargeScope`] pays for.
 pub(super) struct ChargedMembers {
-    pub active: BTreeMap<Uuid, SessionProvider>,
+    /// The live members, split into what the cap counts and the principal's
+    /// own manager-seat sessions (#235).
+    pub split: super::seat::SeatSplit,
     /// How many ledgers were counted: `config`'s own plus those below it.
     pub ledgers: usize,
     pub known_spend: f64,
     pub unknown_spend: i64,
+}
+
+impl ChargedMembers {
+    /// Every live member, counted or not.
+    pub(super) fn live(&self) -> usize {
+        self.split.counted.len() + self.split.seat_active.len()
+    }
 }
 
 /// SQL: whether the V2 ledger principal (`manager`, `version`) acts for a
@@ -212,11 +227,12 @@ impl Store {
         existing_session: Option<Uuid>,
     ) -> Result<ChargedUsage> {
         let members = self.manager_v2_charged_members(config, charge, true, None)?;
-        let active = members.active;
+        let active = &members.split.counted;
         let mut count = active.len() as u64;
         let mut provider_active = active.values().filter(|p| **p == provider).count() as u64;
         // A continuation replaces one live slot rather than consuming two.
-        if let Some(existing) = existing_session.and_then(|id| active.get(&id)) {
+        let replaced = existing_session.filter(|id| active.contains_key(id));
+        if let Some(existing) = replaced.and_then(|id| active.get(&id)) {
             count = count.saturating_sub(1);
             if *existing == provider {
                 provider_active = provider_active.saturating_sub(1);
@@ -227,6 +243,13 @@ impl Store {
             provider_active,
             known_spend_usd: valid_cost(Some(members.known_spend)),
             unknown_spend_observations: u64::try_from(members.unknown_spend).unwrap_or(u64::MAX),
+            counted: active
+                .keys()
+                .copied()
+                .filter(|id| Some(*id) != replaced)
+                .collect(),
+            seat_active: members.split.seat_active.keys().copied().collect(),
+            existing_holds_seat: members.split.holds_seat(existing_session),
         })
     }
 
@@ -247,6 +270,7 @@ impl Store {
         own_cohort: Option<&[ManagerCohortMemberV2]>,
     ) -> Result<ChargedMembers> {
         let mut active = BTreeMap::new();
+        let mut reservations = std::collections::BTreeSet::new();
         let mut ledgers = Vec::new();
         for (index, scope) in std::iter::once(config)
             .chain(charge.below.iter())
@@ -261,6 +285,7 @@ impl Store {
                 }
             };
             let rotation = self.manager_v2_resource_reservations(scope, cohort)?;
+            reservations.extend(rotation.keys().copied());
             for (id, member_provider) in self.manager_v2_active_members(cohort, &rotation)? {
                 active.entry(id).or_insert(member_provider);
             }
@@ -275,10 +300,13 @@ impl Store {
                 active.remove(&id);
             }
         }
+        // #235: only `config`'s own seat lineage is excluded; a seat a node
+        // below appointed still fills this principal's caps (#1314, #1330).
+        let split = self.manager_v2_split_seat(config, active, &reservations)?;
         let (known_spend, unknown_spend) =
             self.manager_v2_scoped_spend(config, &ledgers, &charge.foreign)?;
         Ok(ChargedMembers {
-            active,
+            split,
             ledgers: ledgers.len(),
             known_spend,
             unknown_spend,

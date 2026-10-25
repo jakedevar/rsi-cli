@@ -22,7 +22,6 @@ use rsi_common::types::{
 };
 use rsi_graph::format::WorkflowDefinition;
 use rsi_graph::generate::templates::build_starter_workflow;
-use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -40,11 +39,11 @@ pub const MASTER_IMPROVE_DEFAULT_CAP: u32 = 10;
 ///
 /// `store` is wrapped in a `tokio::sync::Mutex` because the underlying
 /// `Store` (rusqlite Connection + statement cache) is `!Sync`. This matches
-/// the `SessionManager`'s `Arc<Mutex<Store>>` ownership model so the same
+/// the `SessionManager`'s `Arc<rsid_core::store_lock::Mutex<Store>>` ownership model so the same
 /// handle can be shared with the driver task and held across await points.
 pub fn spawn_chain_driver(
     session_manager: Arc<SessionManager>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: Arc<EventBus>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -113,7 +112,7 @@ pub fn spawn_chain_driver(
 async fn process_execution_finished(
     update: &GraphExecutionUpdate,
     session_manager: &Arc<SessionManager>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) -> Result<()> {
     // Phase 1 — short, sync DB lookup under lock.
     let chain_lookup = {
@@ -305,7 +304,7 @@ async fn apply_verdict(
     chain_id: Uuid,
     iteration_index: u32,
     session_manager: &Arc<SessionManager>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) -> Result<()> {
     match verdict {
         BudgetVerdict::ProceedDone => {
@@ -419,7 +418,7 @@ async fn apply_verdict(
 /// workflow execution fails to launch, or persisting the iteration row fails.
 pub async fn register_chain(
     session_manager: Arc<SessionManager>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     initial_goal: String,
     cap: u32,
     workflow_id: Uuid,
@@ -480,7 +479,7 @@ async fn respawn_iteration(
     refined_goal: String,
     cap: u32,
     session_manager: &Arc<SessionManager>,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
 ) -> Result<Uuid> {
     let workflow_def = build_starter_workflow("master_improve")
         .ok_or_else(|| anyhow!("master_improve template not registered"))?;

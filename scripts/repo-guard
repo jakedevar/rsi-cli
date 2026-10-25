@@ -1,0 +1,148 @@
+#!/bin/sh
+# Run one Rust repository static guard (#360, umbrella #358: no Python).
+#
+#   scripts/repo-guard <guard> [args...]   run a guard in the current directory
+#   scripts/repo-guard --bin [guard]       resolve a binary capable of the requested guard
+#   scripts/repo-guard --list              list the guards and their source files
+#
+# The guards live in crates/rsi-repo-guards, one subcommand per guard (see its
+# README.md). The crate is built from the checkout that holds this script, with the
+# caller's own Cargo setup: an rsi sandbox's stamped CARGO_TARGET_DIR and
+# RUSTC_WRAPPER (sccache), or the checkout's default target/ elsewhere. This script
+# never chooses a target of its own. It builds the release profile: the guards scan
+# the whole tree, where an unoptimised regex engine is about 7x slower, and a
+# release build never waits on a test job's debug-profile Cargo lock. A binary
+# newer than the crate sources, Cargo.toml and Cargo.lock is reused without
+# starting Cargo at all, so a hook stays fast, but only when it also passes a capability
+# probe (#3872): file times alone cannot tell a binary built from another commit, or seeded
+# from a target pool, from this tree's. The probe asks the binary itself (`--list`): it must
+# list the guard being run and as many guards as this tree's GUARDS table declares, else it
+# is rebuilt. A binary that still fails the probe after the build is refused (fail closed).
+#
+# Fail closed: when Cargo is missing or the build fails, this prints why and exits
+# 2. A guard that cannot run is never read as a pass.
+# RSI_REPO_GUARD_NO_BUILD=1 requires a content-matching, capable prebuilt binary
+# instead. It is inherited by every hook invocation; no guard is skipped and
+# Cargo is never started in that mode, even for --bin or --list.
+set -u
+
+script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P) || exit 2
+root=$(dirname "$script_dir")
+crate="$root/crates/rsi-repo-guards"
+no_build=${RSI_REPO_GUARD_NO_BUILD-0}
+
+fail() {
+  if [ "$no_build" = 0 ]; then
+    echo "repo-guard: $*; refusing to run the guard (fail closed). Fix the build first: (cd '$root' && cargo build --release -p rsi-repo-guards)" >&2
+  else
+    echo "repo-guard: $*; refusing to run the guard (fail closed). No-build mode requires an authorized, platform-compatible prebuild matching this checkout; no Cargo fallback." >&2
+  fi
+  exit 2
+}
+
+case $no_build in
+  0|1) ;;
+  *) fail "RSI_REPO_GUARD_NO_BUILD must be 0 or 1" ;;
+esac
+
+[ -d "$crate" ] || fail "$crate is missing"
+
+target=${CARGO_TARGET_DIR:-$root/target}
+case $target in
+  /*) ;;
+  *) target="$root/$target" ;;
+esac
+
+# The guard this run needs, including an optional command after --bin.
+wanted=
+case ${1:-} in
+  --bin) wanted=${2:-} ;;
+  -*|'') ;;
+  *) wanted=$1 ;;
+esac
+
+# probe_bin <binary>: 0 when it knows the guard being run and every guard this tree declares.
+# The reason for a refusal is left in probe_reason.
+probe_reason=
+probe_bin() {
+  listing=$("$1" --list 2>/dev/null </dev/null) || { probe_reason="--list failed"; return 1; }
+  if [ -n "$wanted" ]; then
+    printf '%s\n' "$listing" | cut -f1 | grep -qx -- "$wanted" || { probe_reason="it does not list the guard '$wanted'"; return 1; }
+  fi
+  # One source-path literal per GUARDS entry; an unreadable table skips only the count.
+  declared=$(awk '/^pub const GUARDS/{on=1} on{print} on&&/^\];/{exit}' "$crate/src/lib.rs" 2>/dev/null | grep -o '"crates/rsi-repo-guards/src/[^"]*"' | wc -l | tr -d ' ')
+  listed=$(printf '%s\n' "$listing" | grep -c .)
+  if [ "${declared:-0}" -gt 0 ] && [ "$listed" -lt "$declared" ]; then
+    probe_reason="it lists $listed guards, this tree declares $declared"
+    return 1
+  fi
+  return 0
+}
+
+# The already built binary when nothing it is built from changed since and it passes the probe.
+fresh_bin() {
+  for candidate in "$target/release/rsi-repo-guard" "$target/release/rsi-repo-guard.exe"; do
+    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    newer=$(find "$crate" "$root/Cargo.lock" "$root/Cargo.toml" -newer "$candidate" -print 2>/dev/null | head -n 1)
+    [ -z "$newer" ] || return 1
+    if ! probe_bin "$candidate"; then
+      echo "repo-guard: $candidate is stale ($probe_reason); rebuilding" >&2
+      return 1
+    fi
+    echo "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Build with Cargo and print the binary path Cargo reports.
+build_bin() {
+  command -v cargo >/dev/null 2>&1 || fail "cargo is not on PATH"
+  built=$(cd "$root" && cargo build --release --quiet --locked --message-format=json-render-diagnostics \
+    -p rsi-repo-guards --bin rsi-repo-guard) || fail "cargo build -p rsi-repo-guards failed (see above)"
+  exe=$(printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1 | sed 's/\\\\/\\/g')
+  [ -n "$exe" ] && [ -f "$exe" ] || fail "cargo build did not report the rsi-repo-guard binary"
+  # Cargo leaves a still-fresh binary untouched; mark it current for fresh_bin.
+  touch "$exe" 2>/dev/null
+  probe_bin "$exe" || fail "the freshly built $exe fails its capability probe ($probe_reason)"
+  echo "$exe"
+}
+
+prebuilt_bin() {
+  # Admission bootstrap (#423): cargo-slot cannot compile its own client
+  # before acquiring a slot. The deployment/build job prepares this binary.
+  for candidate in "$target/release/rsi-repo-guard" "$target/debug/rsi-repo-guard" "$target/release/rsi-repo-guard.exe" "$target/debug/rsi-repo-guard.exe"; do
+    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    "$candidate" cargo-slot verify-build "$root" >/dev/null 2>&1 || continue
+    if [ "$no_build" = 1 ] && ! probe_bin "$candidate"; then
+      echo "repo-guard: $candidate fails its capability probe ($probe_reason)" >&2
+      continue
+    fi
+    echo "$candidate"
+    return 0
+  done
+  return 1
+}
+
+if [ "${1:-}" = --existing-bin ]; then
+  prebuilt_bin || fail "a current prebuilt rsi-repo-guard is required for admission bootstrap"
+  exit 0
+fi
+
+if [ "$no_build" = 1 ]; then
+  bin=$(prebuilt_bin) || fail "a content-matching, capable prebuilt rsi-repo-guard is required"
+else
+  bin=$(fresh_bin) || bin=$(build_bin) || exit 2
+fi
+
+case ${1:-} in
+  --bin)
+    echo "$bin"
+    exit 0
+    ;;
+  '')
+    echo "usage: scripts/repo-guard <guard> [args...] | --bin [guard] | --list" >&2
+    exit 2
+    ;;
+esac
+exec "$bin" "$@"

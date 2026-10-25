@@ -6,7 +6,12 @@
 // textContent only, and credential-like fields are never shown.
 import type { ManagersActionId, ManagersSnapshot } from './actions/managers.js';
 import { type Invocation, copyText } from './commands.js';
-import { el, toast } from './dom.js';
+import { el, errorBlock, errorDetails, renderMessage, toast } from './dom.js';
+import { rememberOpener, returnFocus } from './focus-return.js';
+import { nextStep } from './key-hints.js';
+import {
+  type BarAction, MANAGER_EXPLAINER, NO_PORTFOLIO_NODES, appointProjectCopy, barFor, barLabel, clearScopeCopy, revokeGlobalCopy, revokeProjectCopy,
+} from './manager-actions-model.js';
 import { runManagerCommand } from './manager-cmds.js';
 import { type TreeContext, appointAbove, appointSeat, cancelMove, editArea, editGrant, moveUnder, pendingMove } from './manager-tree-ops.js';
 import { FORM_CSS } from './mgr-form.js';
@@ -29,10 +34,14 @@ import {
 } from './managers-model.js';
 import { select as openSessionRow } from './sessions.js';
 import { selected, state, uiChanged } from './state.js';
+import { ownProjects } from './project-model.js';
 import { api, type ConversationEvent } from './api.js';
-import { launchAndAppoint } from './manager-launch.js';
-import { focusOwnsKey, paneKeyAllowed } from './modal-gate.js';
-import { isVimKeysOn } from './vimkeys.js';
+import { launchAndAppoint, launchCoverage, launchMarks } from './manager-launch.js';
+import { initDashboard, openDashboard } from './dashboard.js';
+import { focusOwnsKey, paneKeyAllowed, paneKeyName } from './modal-gate.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
+import { syncListbox } from './listbox-a11y.js';
+import { moreActionsHint } from './empty-states.js';
 
 /** Conversation events the console shows beside a seat. */
 const CONVERSATION_TAIL = 40;
@@ -50,7 +59,7 @@ interface Item {
 
 const VIEW_TITLES: Readonly<Record<ManagerView, string>> = {
   tree: 'Manager tree', board: 'Harness manager', scope: 'Manager scope', workspace: 'Global manager workspace',
-  budget: 'Above all projects / Budget', fleet: 'Fleet', lists: 'Managers',
+  budget: 'Budget: every manager’s limits', fleet: 'Fleet', lists: 'Managers',
 };
 
 const mv = {
@@ -100,19 +109,22 @@ export function seatCandidate(): { id: string; project_id?: string | null; archi
 
 export function managersSnapshot(): ManagersSnapshot {
   const c = seatCandidate();
-  return { view: mv.view, hasProject: state.projects.length > 0, seatCandidate: !!c && !c.archived && c.leaf };
+  return { view: mv.view, hasProject: ownProjects(state.projects).length > 0, seatCandidate: !!c && !c.archived && c.leaf };
 }
 
 // ---------- open / close ----------
 
 export function chooseProject(): string | null {
-  const known = (id: string | null | undefined) => (id && state.projects.some((p) => p.id === id) ? id : null);
+  // A project manager belongs to a project the person made: RSI home (portfolio seats only) is never chosen.
+  const own = ownProjects(state.projects);
+  const known = (id: string | null | undefined) => (id && own.some((p) => p.id === id) ? id : null);
   const filter = document.querySelector<HTMLSelectElement>('#project-filter')?.value;
-  return known(mv.projectId) ?? known(selected()?.project_id) ?? known(filter) ?? state.projects[0]?.id ?? null;
+  return known(mv.projectId) ?? known(selected()?.project_id) ?? known(filter) ?? own[0]?.id ?? null;
 }
 
 function show(view: ManagerView): void {
   const o = overlay();
+  if (mv.view === null) rememberOpener('managers');
   if (mv.view !== view) mv.cursor = 0;
   mv.view = view;
   mv.epoch++;
@@ -128,6 +140,7 @@ function close(): void {
   mv.view = null;
   mv.epoch++;
   if (root) root.hidden = true;
+  returnFocus('managers');
   uiChanged();
 }
 
@@ -383,28 +396,39 @@ function items(): Item[] {
 
 // ---------- render ----------
 
+/** The h / l keys moved the decision option (not the row): the focused list announces that option until the cursor moves (local #330). */
+let optionMoved = false;
+let optionCursor = -1;
+
 function render(): void {
   if (!root || !mv.view) return;
   const list = items();
   mv.cursor = clampIndex(mv.cursor, list.length);
+  if (mv.cursor !== optionCursor) { optionCursor = mv.cursor; optionMoved = false; }
   part('mgr-title').textContent = mv.view === 'lists' ? mv.lists.title
     : mv.view === 'workspace' && mv.node.target ? `Manager console · ${mv.node.data?.label ?? nodeRefId(mv.node.target).slice(0, 8)}` : VIEW_TITLES[mv.view];
   renderHeader();
   const status = part('mgr-status');
-  status.textContent = mv.error ?? mv.notice ?? (mv.loading ? 'Loading…' : '');
+  if (mv.error) renderMessage(status, mv.error); else status.textContent = mv.notice ?? (mv.loading ? 'Loading…' : '');
   status.className = `mgr-status${mv.error ? ' err' : ''}`;
   const ul = part('mgr-list');
   ul.replaceChildren(...list.map((it, i) => {
     const li = el('li', `mgr-item${i === mv.cursor ? ' sel' : ''}${it.tone ? ` ${it.tone}` : ''}`);
     li.dataset.index = String(i);
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(i === mv.cursor));
     li.style.paddingLeft = `${8 + (it.indent ?? 0) * 14}px`;
     for (const c of it.cells) li.append(el('span', 'mgr-cell', c));
     return li;
   }));
   if (!list.length && !mv.loading) ul.append(el('li', 'mgr-empty', mv.error ? '' : 'Nothing here'));
   ul.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+  // The list holds focus and moves a visual cursor: name it and point aria-activedescendant at the current row (local #330).
+  ul.setAttribute('aria-label', part('mgr-title').textContent || 'Manager list');
+  syncListbox(ul, ul);
   renderDetail();
-  part('mgr-hints').textContent = hints();
+  renderActions();
+  part('mgr-hints').textContent = `${hints()} · ${moreActionsHint(currentPlatform())}`;
 }
 
 function renderHeader(): void {
@@ -412,7 +436,7 @@ function renderHeader(): void {
   const scoped = mv.view === 'board' || mv.view === 'scope';
   proj.hidden = !scoped;
   if (scoped) {
-    proj.replaceChildren(...state.projects.map((p) => { const o = el('option', undefined, p.name); o.value = p.id; return o; }));
+    proj.replaceChildren(...ownProjects(state.projects).map((p) => { const o = el('option', undefined, p.name); o.value = p.id; return o; }));
     if (mv.projectId) proj.value = mv.projectId;
   }
   const tabs = part('mgr-tabs');
@@ -426,6 +450,7 @@ function renderHeader(): void {
     }
     if (mv.board.section === 'inspect') tabs.append(el('span', 'mgr-sub', `[ ${mv.board.sub} ]`));
   }
+  part('mgr-about').hidden = !(mv.view === 'tree' || mv.view === 'board');
   const meta = part('mgr-meta');
   meta.textContent = headerMeta();
   const kpi = part('mgr-kpi');
@@ -443,19 +468,19 @@ function headerMeta(): string {
       const b = mv.board;
       if (b.section === 'policy') {
         const p = mv.policy;
-        const saved = p.saved ? `saved v${p.saved.row_version}${p.saved.revoked ? ' (REVOKED: s regrants this draft)' : ''}` : 'no saved policy (Status defaults)';
-        const dirty = JSON.stringify(p.saved?.policy ?? defaultPolicy()) !== JSON.stringify(p.draft) ? ' · draft changed (s saves, r discards)' : '';
-        return `${p.config ? `scope v${p.config.row_version}` : 'no manager'} · ${saved}${dirty}`;
+        const saved = p.saved ? `policy saved (revision ${p.saved.row_version})${p.saved.revoked ? ', revoked: Save policy grants this draft again' : ''}` : 'no saved policy yet (the defaults apply)';
+        const dirty = policyDirty() ? ' · unsaved changes: Save policy keeps them, Discard changes drops them' : '';
+        return `${p.config ? 'a manager is appointed' : 'no manager appointed'} · ${saved}${dirty}`;
       }
       const page = b.section === 'board' ? b.bands.overview : b.page;
       if (!page) return '';
       const pol = page.policy ? `${String(page.policy.policy.mode ?? '?')} v${page.policy.row_version}${page.policy.revoked ? ' (revoked)' : ''}` : 'no policy';
-      return `scope v${page.scope_version} · policy ${pol} · observed ${page.observed_at}${page.complete ? '' : ' · incomplete'}${b.section !== 'board' ? ` · page ${b.cursors.length + 1}${page.next_cursor ? ' (n next)' : ''}` : ''}`;
+      return `scope revision ${page.scope_version} · policy ${pol} · observed ${page.observed_at}${page.complete ? '' : ' · incomplete'}${b.section !== 'board' ? ` · page ${b.cursors.length + 1}${page.next_cursor ? ' (n next)' : ''}` : ''}`;
     }
     case 'scope': {
       const s = mv.scope;
-      const seat = s.seatId ? `seat ${s.seatId.slice(0, 8)}` : 'no seat';
-      return `${seat} · ${scopeSummary(s.draft)} · ${s.cands.length} candidate(s)${s.complete ? '' : '+'}${s.filter ? ` · filter “${s.filter}”` : ''}`;
+      const seat = s.seatId ? `manager session ${s.seatId.slice(0, 8)}` : 'no manager appointed';
+      return `${seat} · ${scopeSummary(s.draft)} · ${s.cands.length}${s.complete ? '' : '+'} Group(s) and Epic(s) to choose from${s.filter ? ` · filter “${s.filter}”` : ''}`;
     }
     case 'workspace': {
       if (mv.node.target) return mv.node.data ? nodeHeader(mv.node.data) : '';
@@ -529,11 +554,18 @@ function renderDetail(): void {
           const ol = el('ol', 'mgr-options');
           for (const [n, o] of options.entries()) {
             const li = el('li', n === mv.board.option ? 'sel' : '', `${o.label}${o.text ? `: ${o.text}` : ''}${n === recommended ? '  (recommended)' : ''}`);
+            li.dataset.option = String(n);
+            li.setAttribute('role', 'option');
+            li.setAttribute('aria-selected', String(n === mv.board.option));
             ol.append(li);
           }
+          ol.setAttribute('aria-label', 'Answer options');
+          const optionId = syncListbox(ol, ol);
+          // h / l move this pointer while the row list holds focus, so the focused list names the option until j / k move the row.
+          if (optionMoved && optionId) part('mgr-list').setAttribute('aria-activedescendant', optionId);
           pane.append(ol);
         }
-        pane.append(el('p', 'mgr-note', block ?? 'h/l highlight · Enter answers · y accepts the recommendation · a writes an answer'));
+        pane.append(block ? el('p', 'mgr-note', block) : keyTip(el('p', 'mgr-note', DECISION_NOTE)));
       }
       pane.append(kv(recordDetail(sel.row)));
       return;
@@ -541,18 +573,18 @@ function renderDetail(): void {
     case 'scope': {
       const c = scopeRows()[i];
       if (c) pane.append(el('h3', undefined, c.title), kv([['Kind', c.kind], ['Group', c.group_title ?? '—'], ['ID', c.id], ['Mark', scopeMark(mv.scope.draft, c)]]));
-      pane.append(el('p', 'mgr-note', '[x] explicit · [+] inherited. Space toggles, a selects the whole project, Enter saves; an empty explicit selection revokes supervision.'));
+      pane.append(keyTip(el('p', 'mgr-note', scopeNote())));
       return;
     }
     case 'workspace': {
       const r = wsRows()[i];
       if (!r) return;
       pane.append(el('h3', undefined, r.title), kv([['Seat', r.health], ['Signals', r.detail], ['Session', r.sessionId ?? '—']]));
-      if (r.kind === 'child') { pane.append(el('p', 'mgr-note', 'Enter opens this node’s console; Backspace there returns here.')); return; }
+      if (r.kind === 'child') { pane.append(keyTip(el('p', 'mgr-note', `${nextStep({ click: 'Open', key: 'Enter', to: 'open this node’s console' })}; there, ${nextStep({ click: 'Up a level', key: 'Backspace', to: 'come back here' }).replace(/^C/, 'c')}.`))); return; }
       if (!r.sessionId) return;
       if (mv.conv.sessionId !== r.sessionId) { void loadConversation(r.sessionId); return; }
-      pane.append(el('h4', undefined, `Conversation (last ${CONVERSATION_TAIL} events) · Tab focuses, i types`));
-      if (mv.conv.error) pane.append(el('p', 'mgr-err', mv.conv.error));
+      pane.append(keyTip(el('h4', undefined, `Conversation (last ${CONVERSATION_TAIL} events) · ${nextStep({ click: 'Conversation', key: 'Tab', to: 'scroll it' })} · ${nextStep({ click: 'Type to this seat…', key: 'i', to: 'write to it' })}`)));
+      if (mv.conv.error) pane.append(errorBlock('p', 'mgr-err', mv.conv.error));
       for (const ev of mv.conv.events) {
         if (!ev.content) continue;
         const who = ev.role ?? ev.event_type;
@@ -569,7 +601,7 @@ function renderDetail(): void {
         ['Kind', r.node.kind], ['Project', r.project], ['Used / limit', `${describeCap(r.cap.field, r.cap.used)} / ${describeCap(r.cap.field, r.cap.limit)}`],
         ['Binding', r.cap.binding ? 'yes: the lowest headroom on this chain' : 'no'], ['Counted since', r.node.counted_since ?? '—'],
         ['Fence', `v${r.node.version} · epoch ${r.node.epoch}`],
-      ]), el('p', 'mgr-note', budgetEditBlock(r) ?? `+ raises one step (${CAP_META[r.cap.field].step}); Enter types a new limit.`));
+      ]), keyTip(el('p', 'mgr-note', budgetEditBlock(r) ?? `${nextStep({ click: 'Raise one step', key: '+', to: `raise it by ${CAP_META[r.cap.field].step}` })}; ${nextStep({ click: 'Set a limit…', key: 'Enter', to: 'type a new one' }).replace(/^C/, 'c')}.`)));
       return;
     }
     case 'fleet': {
@@ -597,8 +629,151 @@ function renderDetail(): void {
   }
 }
 
+/** Mark prose that names keys so the key-hints pass drops the Vim-only ones with the switch off. */
+function keyTip<T extends HTMLElement>(n: T): T {
+  n.dataset.keyTip = '';
+  return n;
+}
+
+/** The decisions' side note: the buttons first, their keys secondary (local #223). */
+const DECISION_NOTE = [
+  'Click an option to highlight it',
+  nextStep({ click: 'Send highlighted option', key: 'Enter' }),
+  nextStep({ click: 'Accept recommendation', key: 'y' }),
+  nextStep({ click: 'Answer…', key: 'a', to: 'write your own answer' }),
+].join(' · ');
+
+function scopeNote(): string {
+  return `[x] chosen · [+] covered through its Group. ${nextStep({ click: 'Toggle', key: 'Space', to: 'choose a row' })}, ${nextStep({ click: 'Whole project', key: 'a', to: 'cover everything' }).replace(/^C/, 'c')}, then ${nextStep({ click: 'Save', key: 'Enter' }).replace(/^C/, 'c')}. Saving with nothing chosen stops this manager supervising the project.`;
+}
+
+function policyDirty(): boolean {
+  const p = mv.policy;
+  return JSON.stringify(p.saved?.policy ?? defaultPolicy()) !== JSON.stringify(p.draft);
+}
+
+// ---------- action bar (local #223): every view key that is not a standard key, as a button ----------
+
+/** Why a bar button cannot act now (it renders disabled with this as its tooltip), or null. */
+function barBlock(action: string): string | null {
+  const i = mv.cursor;
+  switch (mv.view) {
+    case 'tree': {
+      const r = treeRow();
+      const cand = seatCandidate();
+      switch (action) {
+        case 'mgr-enter': case 'mgr-preview': return r ? null : 'Select a row first';
+        case 'mgr-toggle-fold': return r && parentKeys(mv.tree.rows).has(r.key) ? null : 'This row has nothing under it to fold';
+        case 'mgr-fold-all': case 'mgr-unfold-all': return mv.tree.rows.length ? null : 'The tree is empty';
+        case 'mgr-appoint': return treeActionBlock(r, 'appoint', cand);
+        case 'mgr-above': return treeActionBlock(r, 'above', cand);
+        case 'mgr-edit': return treeActionBlock(r, 'edit', null);
+        case 'mgr-revoke': return treeActionBlock(r, 'revoke', null);
+        case 'mgr-move': return treeActionBlock(r, 'move', cand);
+        case 'mgr-open-project': return r?.project_id ? null : 'This row has no project';
+        case 'mgr-next-page': return mv.tree.next ? null : 'This is the whole tree';
+        default: return null;
+      }
+    }
+    case 'board': {
+      const b = mv.board;
+      if (b.section === 'policy') {
+        const p = mv.policy;
+        if (action === 'mgr-space') return POLICY_FIELDS[i] ? null : 'Select a field first';
+        if (action === 'mgr-refresh') return policyDirty() ? null : 'No unsaved changes';
+        if (action === 'mgr-save') {
+          if (!p.config) return 'No manager is appointed in this project';
+          const problems = policyProblems(p.draft);
+          if (problems.length) return problems[0]!;
+          return policyDirty() || !p.saved || p.saved.revoked ? null : 'No unsaved changes';
+        }
+        return null;
+      }
+      const sel = selectedBoardRow();
+      const isDecision = b.section === 'decisions' || !!items()[i]?.id.startsWith('decisions:');
+      switch (action) {
+        case 'mgr-enter':
+          if (b.section === 'decisions') return decisionBlock(sel?.row ?? null, sel?.page ?? null);
+          return items()[i] ? null : 'Select a row first';
+        case 'mgr-answer': case 'mgr-accept-recommended': {
+          if (!isDecision) return 'Select a pending decision.';
+          const block = decisionBlock(sel?.row ?? null, sel?.page ?? null);
+          if (block) return block;
+          return action === 'mgr-accept-recommended' && decisionOptions(sel!.row).recommended === null ? 'This decision names no recommendation' : null;
+        }
+        case 'mgr-archive-stale': return null;
+        case 'mgr-open-session': return sel && rowSession(sel.row) ? null : 'This row has no session to open';
+        case 'mgr-next-page': return b.page?.next_cursor ? null : 'This is the last page';
+        case 'mgr-prev-page': return b.cursors.length ? null : 'This is the first page';
+        default: return null;
+      }
+    }
+    case 'scope':
+      if (action === 'mgr-toggle') return scopeRows()[i] ? null : 'Select a Group or Epic first';
+      if (action === 'mgr-whole-project') return mv.scope.draft.whole ? 'The whole project is already chosen' : null;
+      if (action === 'mgr-save') return mv.scope.seatId ?? mv.scope.config?.manager_session_id ? null : 'No manager to scope: appoint one first';
+      return null;
+    case 'workspace': {
+      const r = wsRows()[i] ?? null;
+      switch (action) {
+        case 'mgr-enter': return r ? null : 'Nothing to open';
+        case 'mgr-type': return seatActionBlock(r, 'type');
+        case 'mgr-talk': return seatActionBlock(wsRows()[0] ?? null, 'type');
+        case 'mgr-status': return seatActionBlock(r, 'status');
+        case 'mgr-halt': case 'mgr-halt-now': return seatActionBlock(r, 'halt');
+        case 'mgr-archive-seat': return seatActionBlock(r, 'archive');
+        case 'mgr-launch': return mv.node.target && !(r?.level === 'project' && r.projectId) ? 'Here Launch and appoint starts a project manager: select a project row' : null;
+        case 'mgr-conversation': return r?.sessionId && r.kind !== 'child' ? null : 'This row has no conversation';
+        case 'mgr-parent': return mv.node.data?.parent ? null : 'This console has no manager above it here';
+        case 'mgr-open-project': return r?.projectId ? null : 'This row has no project';
+        default: return null;
+      }
+    }
+    case 'budget': return budgetEditBlock(budgetList()[i] ?? null);
+    case 'fleet':
+      if (action === 'mgr-enter') return items()[i] ? null : 'Nothing to open';
+      if (action === 'mgr-copy') return !mv.fleet.groups && items()[i] ? null : 'Select an agent row to copy its session ID';
+      return null;
+    case 'lists': { const row = mv.lists.rows[i]; return row && rowSession(row) ? null : 'This row has no session to open'; }
+    default: return null;
+  }
+}
+
+/** The fleet's sort columns as buttons, after Sort… (the TUI's s then 1-5; the digit only works after s, so the label names none). */
+function sortChoices(): BarAction[] {
+  return (mv.fleet.groups ? GROUP_SORTS : AGENT_SORTS).map((c, n) => ({ action: `mgr-sort-${n + 1}`, label: `Sort by ${c}`, key: String(n + 1), shown: '' }));
+}
+
+function renderActions(): void {
+  const bar = part('mgr-actions');
+  const spec = mv.view ? barFor(mv.view, mv.board.section) : [];
+  const list = mv.view === 'fleet' && sortPending ? [...spec, ...sortChoices()] : spec;
+  bar.replaceChildren(...list.map((b) => {
+    const btn = el('button', 'btn small', barLabel(b));
+    btn.type = 'button';
+    btn.dataset.mgrAct = b.action;
+    const block = barBlock(b.action);
+    btn.disabled = block !== null;
+    if (block) btn.title = block;
+    return btn;
+  }));
+  bar.hidden = list.length === 0;
+}
+
+/** A bar button: the same action as its key, except where a key needs a second press. */
+function barRun(action: string): void {
+  part('mgr-list').focus();
+  if (mv.view === 'fleet' && action === 'mgr-copy') {
+    const id = mv.fleet.groups ? null : items()[mv.cursor]?.id;
+    if (id) void copyText(id, 'session UUID');
+    return;
+  }
+  if (mv.view === 'workspace' && action === 'mgr-halt-now') { void haltSeat(wsRows()[mv.cursor] ?? null, true, true); return; }
+  viewKey(action);
+}
+
 const POLICY_HELP: Readonly<Record<string, string>> = {
-  preset: 'Enter applies Observe, Execute or Full project control to the draft (kept until s saves). Any other edit makes it Custom.',
+  preset: 'Enter applies Observe, Execute or Full project control to the draft (kept until Save policy saves it). Any other edit makes it Custom.',
   suggest: 'Enter raises only the named zero allowances the matched preset needs.',
   advanced: 'Enter edits every field of the policy as JSON; the draft changes only when the daemon’s validator accepts it.',
   json: 'Enter edits this list as JSON (ids, or the daemon’s objects); the whole policy is checked before it reaches the draft.',
@@ -625,9 +800,12 @@ function hints(): string {
 
 export interface AskSpec {
   title: string;
-  lines?: string[];
+  lines?: readonly string[];
+  /** Technical detail (the RPC and the versions it expects), under a collapsed Details. */
+  details?: string;
   input?: { value: string; placeholder?: string; multiline?: boolean };
-  checks?: { options: readonly string[]; on: readonly string[] };
+  /** `marks` (option text → warning) shows next to a checked option; `note` explains them while any marked option is checked (#324). */
+  checks?: { options: readonly string[]; on: readonly string[]; marks?: ReadonlyMap<string, string>; note?: string };
   ok: string;
   destructive?: boolean;
 }
@@ -640,6 +818,7 @@ export function ask(spec: AskSpec): Promise<{ text: string; checked: string[] } 
     form.method = 'dialog';
     form.append(el('h2', undefined, spec.title));
     for (const l of spec.lines ?? []) form.append(el('p', 'mgr-note', l));
+    if (spec.details) form.append(errorDetails(spec.details));
     let input: HTMLInputElement | HTMLTextAreaElement | null = null;
     if (spec.input) {
       input = spec.input.multiline ? el('textarea') : el('input');
@@ -652,6 +831,13 @@ export function ask(spec: AskSpec): Promise<{ text: string; checked: string[] } 
     const boxes: HTMLInputElement[] = [];
     if (spec.checks) {
       const wrap = el('div', 'mgr-checks');
+      const marked: Array<[HTMLInputElement, HTMLElement]> = [];
+      const note = spec.checks.note ? el('p', 'mgr-note mgr-mark-note', spec.checks.note) : null;
+      if (note) note.setAttribute('role', 'note');
+      const showMarks = () => {
+        for (const [cb, mark] of marked) mark.hidden = !cb.checked;
+        if (note) note.hidden = !marked.some(([cb]) => cb.checked);
+      };
       for (const o of spec.checks.options) {
         const lab = el('label');
         const cb = el('input');
@@ -660,9 +846,18 @@ export function ask(spec: AskSpec): Promise<{ text: string; checked: string[] } 
         cb.checked = spec.checks.on.includes(o);
         boxes.push(cb);
         lab.append(cb, document.createTextNode(` ${o}`));
+        const warn = spec.checks.marks?.get(o);
+        if (warn) {
+          const mark = el('small', 'mgr-mark', warn);
+          lab.append(mark);
+          marked.push([cb, mark]);
+          cb.addEventListener('change', showMarks);
+        }
         wrap.append(lab);
       }
       form.append(wrap);
+      if (note) form.append(note);
+      showMarks();
     }
     const actions = el('div', 'pick-actions');
     const cancel = el('button', 'btn', 'Cancel');
@@ -755,8 +950,7 @@ async function treeAppoint(r: TreeRow): Promise<void> {
   try { live = await managersApi.config(pid); } catch (e) { toast(`Manager: ${errText(e)}`); return; }
   const req = appointRequest(pid, cand.id, live);
   const ok = await ask({
-    title: r.focus_session_id ? `Replace the manager seat of ${r.label}` : `Appoint a manager for ${r.label}`,
-    lines: [`Seat: ${r.focus_session_id?.slice(0, 8) ?? 'none'} → ${cand.id.slice(0, 8)}.`, `Scope: ${'epic_ids' in req ? 'kept selection' : 'whole project'}.`, `ConfigureHarnessManager (expects row v${String(req.expected_row_version)})`],
+    ...appointProjectCopy(r.label, r.focus_session_id, cand.id, !('epic_ids' in req), Number(req.expected_row_version)),
     ok: r.focus_session_id ? 'Replace' : 'Appoint', destructive: !!r.focus_session_id,
   });
   if (ok) await write(`Manager seat of ${r.label} saved`, () => managersApi.configureScope(req), () => void loadTree(false));
@@ -770,7 +964,7 @@ async function treeRevoke(r: TreeRow): Promise<void> {
     if (r.kind === 'project') {
       const c = await managersApi.config(r.project_id!);
       if (!c) { toast('No manager to revoke'); return; }
-      if (await ask({ title: `Revoke the manager of ${r.label}`, lines: [impact, 'Clears the scope (ConfigureHarnessManager with an empty selection).'], ok: 'Revoke', destructive: true })) {
+      if (await ask({ ...revokeProjectCopy(r.label, impact, c.row_version), ok: 'Revoke', destructive: true })) {
         await write(`Manager of ${r.label} revoked`, () => managersApi.configureScope(scopeClearRequest(c)), () => void loadTree(false));
       }
     } else if (r.kind === 'portfolio' && r.node_id) {
@@ -783,7 +977,7 @@ async function treeRevoke(r: TreeRow): Promise<void> {
     } else if (r.kind === 'global') {
       const v = mv.tree.globalVersion;
       if (!v) { toast('No active global grant version'); return; }
-      if (await ask({ title: 'Revoke the global manager', lines: [impact, `RevokeGlobalManager (expects grant v${v})`], ok: 'Revoke', destructive: true })) {
+      if (await ask({ ...revokeGlobalCopy(v, r.seat?.session_id ?? null, impact), ok: 'Revoke', destructive: true })) {
         await write('Global manager revoked', () => managersApi.revokeGlobal(v, mint()), () => void loadTree(false));
       }
     } else if (r.kind === 'area' && r.node_id && r.project_id) {
@@ -971,10 +1165,12 @@ async function editLaunches(): Promise<void> {
   // The global grant's launch list is the ceiling every PM below it inherits.
   try { granted = ((await managersApi.globalGrant()) as { allowed_launches?: LaunchChoice[] } | null)?.allowed_launches ?? []; } catch { /* none */ }
   const catalog = launchCatalog(current, granted, defaults);
+  const projectId = p.config?.project_id ?? p.saved?.project_id ?? null;
+  const { marks, note } = launchMarks(catalog, projectId ? await launchCoverage(projectId) : null);
   const got = await ask({
     title: 'Allowed launches',
     lines: ['Checked choices are allowed; none checked means any valid choice, including future models. Type more as Provider/model[/effort].'],
-    checks: { options: catalog.map(launchText), on: current.map((l) => launchText({ ...l, effort: l.effort ?? null })) },
+    checks: { options: catalog.map(launchText), on: current.map((l) => launchText({ ...l, effort: l.effort ?? null })), marks, note },
     input: { value: '', placeholder: 'Codex/gpt-6-astra/high Claude/claude-opus-5-5' },
     ok: 'Apply',
   });
@@ -1078,8 +1274,8 @@ function boardKey(action: string): void {
       b.sub = cycle(INSPECT_SUBSECTIONS, b.sub, action === 'mgr-sub-next' ? 1 : -1);
       setSection('inspect');
       return;
-    case 'mgr-option-prev': b.option = Math.max(0, b.option - 1); break;
-    case 'mgr-option-next': b.option += 1; { const s = selectedBoardRow(); if (s) b.option = clampIndex(b.option, decisionOptions(s.row).options.length); } break;
+    case 'mgr-option-prev': b.option = Math.max(0, b.option - 1); optionMoved = true; break;
+    case 'mgr-option-next': b.option += 1; optionMoved = true; { const s = selectedBoardRow(); if (s) b.option = clampIndex(b.option, decisionOptions(s.row).options.length); } break;
     case 'mgr-enter': {
       if (b.section === 'policy') { void editPolicyField(); return; }
       if (b.section === 'board') {
@@ -1248,14 +1444,17 @@ async function typeToSeat(r: WorkspaceRow | null): Promise<void> {
   }
 }
 
-async function haltSeat(r: WorkspaceRow | null, hard: boolean): Promise<void> {
+async function haltSeat(r: WorkspaceRow | null, hard: boolean, confirmDialog = false): Promise<void> {
   const block = seatActionBlock(r, 'halt');
   if (block) { toast(block); return; }
   const s = await seatSession(r!);
   if (!s) return;
   if (!HALTABLE.includes(s.status)) { toast(`${r!.title} ${r!.sessionId!.slice(0, 8)} is ${s.status}; only a starting, running or waiting session can be halted`); return; }
   const id = r!.sessionId!;
-  if (hard) {
+  if (hard && confirmDialog) {
+    // The button asks in a dialog instead of the key's press-twice arming.
+    if (!(await ask({ title: `Interrupt ${r!.title} now?`, lines: ['This cancels the turn it is working on right now.'], ok: 'Interrupt now', destructive: true }))) return;
+  } else if (hard) {
     const armed = mv.haltArmed;
     if (!armed || armed.id !== id || Date.now() - armed.at > 5000) {
       mv.haltArmed = { id, at: Date.now() };
@@ -1308,7 +1507,7 @@ async function launchSeat(r: WorkspaceRow | null): Promise<void> {
 function focusConversation(): void {
   const pane = part('mgr-detail');
   pane.focus();
-  mv.notice = 'Conversation: j/k, Ctrl-D/U scroll, g/G ends; Tab or Esc returns to the seats';
+  mv.notice = 'Conversation: j/k, Ctrl-D/U scroll, g/G ends; ' + (isVimKeysOn() ? 'Tab' : 'F6') + ' or Esc returns to the seats';
   render();
 }
 
@@ -1467,7 +1666,8 @@ async function clearScope(): Promise<void> {
   try {
     const c = await managersApi.config(pid);
     if (!c) { toast('No manager is appointed in this project'); return; }
-    if (await ask({ title: 'Clear the manager scope?', lines: ['Revokes supervision (ConfigureHarnessManager with an empty selection).'], ok: 'Clear', destructive: true })) {
+    const name = state.projects.find((p) => p.id === pid)?.name ?? 'this project';
+    if (await ask({ ...clearScopeCopy(name, c.row_version), ok: 'Stop supervising', destructive: true })) {
       await write('Manager scope cleared', () => managersApi.configureScope(scopeClearRequest(c)), () => render());
     }
   } catch (e) { toast(`Manager: ${errText(e)}`); }
@@ -1477,7 +1677,7 @@ async function revokeGlobal(): Promise<void> {
   try {
     const g = await managersApi.globalGrant();
     if (!g || g.state !== 'active') { toast('There is no active global manager grant'); return; }
-    if (await ask({ title: 'Revoke the global manager?', lines: [`Grant v${g.grant_version}, seat ${g.seat_session_id.slice(0, 8)}: the seat keeps its session but loses its authority.`], ok: 'Revoke', destructive: true })) {
+    if (await ask({ ...revokeGlobalCopy(g.grant_version, g.seat_session_id), ok: 'Revoke', destructive: true })) {
       await write('Global manager revoked', () => managersApi.revokeGlobal(g.grant_version, mint()), () => { if (mv.view === 'workspace') void loadWorkspace(); });
     }
   } catch (e) { toast(`Global manager: ${errText(e)}`); }
@@ -1503,6 +1703,11 @@ export function runManagers(id: ManagersActionId, inv: Invocation): void {
     }
     case 'mgr-clear': void clearScope(); return;
     case 'mgr-global': void openWorkspace(); return;
+    case 'mgr-dashboard':
+      // The dashboard opens above everything; the managers view closes so its keys stay quiet (gm reopens it).
+      if (mv.view) close();
+      void openDashboard();
+      return;
     case 'mgr-global-grant':
       if (inv.arg) { void runManagerCommand('global', inv.arg); return; }
       void openWorkspace();
@@ -1516,10 +1721,25 @@ export function runManagers(id: ManagersActionId, inv: Invocation): void {
       void openList('Portfolio nodes', async () => {
         const all = state.projects.map((p) => ({ id: p.id, name: p.name }));
         const nodes = (await managersApi.portfolioNodes(false)).nodes;
-        if (!nodes.length) return [{ title: 'No portfolio nodes. Focus a session and run :manager portfolio appoint <label> [projects...].', state: '' }];
+        if (!nodes.length) return [{ title: NO_PORTFOLIO_NODES, state: '' }];
         return nodes.map((n) => ({ ...n, title: portfolioSummary(n as never, all) }) as unknown as Json);
       });
       return;
+    case 'mgr-portfolio-appoint': {
+      // The same flow as `:manager portfolio appoint <label> [projects...]`; the palette asks for the label first.
+      if (inv.arg?.trim()) { void runManagerCommand('portfolio', `appoint ${inv.arg.trim()}`); return; }
+      void (async () => {
+        const got = await ask({
+          title: 'Appoint a portfolio manager',
+          lines: ['The selected session becomes a manager over your projects that no other portfolio manager has. Give the node a short name, such as its team or area.'],
+          input: { value: '', placeholder: 'Name of the portfolio node' },
+          ok: 'Choose',
+        });
+        const label = got?.text.trim().split(/\s+/)[0];
+        if (label) void runManagerCommand('portfolio', `appoint ${label}`);
+      })();
+      return;
+    }
     case 'mgr-escalations': void runManagerCommand('escalations', inv.arg); return;
     case 'mgr-node': void runManagerCommand('node', inv.arg); return;
     case 'mgr-restart': void runManagerCommand('restart', inv.arg); return;
@@ -1582,11 +1802,12 @@ const CSS = `
 .mgr-list { list-style: none; margin: 0; padding: 0; overflow: auto; outline: none; border-right: 1px solid var(--surface1); }
 .mgr-item { display: grid; grid-template-columns: minmax(180px, 2fr) repeat(auto-fit, minmax(80px, 1fr)); gap: 10px; padding: 3px 8px; font-size: 12px; font-family: var(--mono); cursor: pointer; white-space: nowrap; }
 .mgr-item .mgr-cell { overflow: hidden; text-overflow: ellipsis; }
-.mgr-item.sel { background: var(--surface0); }
+.mgr-item.sel { background: var(--surface0); box-shadow: inset 3px 0 var(--blue); }
+.mgr-list:focus .mgr-item.sel { outline: 2px solid var(--blue); outline-offset: -2px; }
 .mgr-item.attn .mgr-cell:first-child { color: var(--yellow); }
 .mgr-item.head { color: var(--blue); font-weight: 600; }
-.mgr-item.more, .mgr-item.dim { color: var(--overlay0); }
-.mgr-empty { padding: 12px; color: var(--overlay0); }
+.mgr-item.more, .mgr-item.dim { color: var(--muted); }
+.mgr-empty { padding: 12px; color: var(--muted); }
 .mgr-detail { overflow: auto; padding: 10px 14px; font-size: 13px; }
 .mgr-detail h3 { margin: 0 0 8px; font-size: 14px; color: var(--blue); }
 .mgr-note { color: var(--subtext); font-size: 12px; }
@@ -1596,10 +1817,17 @@ const CSS = `
 .mgr-conv { margin: 6px 0; font-size: 12px; }
 .mgr-conv pre { white-space: pre-wrap; margin: 2px 0 0; font-family: var(--mono); }
 .mgr-conv.user b { color: var(--blue); }
-.mgr-hints { padding: 4px 12px; font-size: 11px; color: var(--overlay0); border-top: 1px solid var(--surface1); }
+.mgr-hints { padding: 4px 12px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--surface1); }
+.mgr-mark { display: block; color: var(--peach); }
 .mgr-checks { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; margin: 6px 0 10px; font-size: 13px; }
 .mgr-dialog textarea { width: 100%; box-sizing: border-box; background: var(--base); color: var(--text); border: 1px solid var(--surface1); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
-.btn.danger { background: var(--red); color: var(--crust); }
+.btn.danger { background: var(--red); color: var(--on-red); }
+.mgr-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 12px; border-bottom: 1px solid var(--surface1); }
+.mgr-actions[hidden] { display: none; }
+.mgr-about { flex: 1 1 100%; font-size: 12px; color: var(--subtext); }
+.mgr-about[hidden] { display: none; }
+.mgr-about summary { cursor: pointer; color: var(--blue); }
+.mgr-options li { cursor: pointer; }
 `;
 
 function overlay(): HTMLElement {
@@ -1619,14 +1847,20 @@ function overlay(): HTMLElement {
   closeBtn.dataset.mgr = 'mgr-close';
   const kpi = el('div', 'mgr-kpi');
   kpi.hidden = true;
-  head.append(el('span', 'mgr-title'), proj, el('span', 'mgr-tabs'), refresh, closeBtn, el('div', 'mgr-meta'), kpi);
+  const about = el('details', 'mgr-about');
+  about.append(el('summary', undefined, 'What is a manager?'), el('span', undefined, MANAGER_EXPLAINER));
+  about.hidden = true;
+  head.append(el('span', 'mgr-title'), proj, el('span', 'mgr-tabs'), refresh, closeBtn, el('div', 'mgr-meta'), kpi, about);
   const list = el('ul', 'mgr-list');
   list.tabIndex = 0;
   const body = el('div', 'mgr-body');
   const detail = el('div', 'mgr-detail');
   detail.tabIndex = -1;
   body.append(list, detail);
-  o.append(head, el('div', 'mgr-status'), body, el('div', 'mgr-hints'));
+  const actions = el('div', 'mgr-actions');
+  actions.setAttribute('role', 'toolbar');
+  actions.setAttribute('aria-label', 'Actions');
+  o.append(head, actions, el('div', 'mgr-status'), body, el('div', 'mgr-hints'));
   document.body.append(o);
   root = o;
   proj.addEventListener('change', () => {
@@ -1641,11 +1875,24 @@ function overlay(): HTMLElement {
     if (t?.dataset.section) setSection(t.dataset.section as BoardSection);
     else if (t?.dataset.mgr) viewKey(t.dataset.mgr);
   });
+  actions.addEventListener('click', (ev) => {
+    const t = (ev.target as HTMLElement).closest<HTMLButtonElement>('button');
+    if (t?.dataset.mgrAct && !t.disabled) barRun(t.dataset.mgrAct);
+  });
+  // A click on a decision option highlights it (the arrows' job with the keyboard).
+  detail.addEventListener('click', (ev) => {
+    const li = (ev.target as HTMLElement).closest<HTMLElement>('.mgr-options li');
+    if (!li?.dataset.option) return;
+    mv.board.option = Number(li.dataset.option);
+    optionMoved = true;
+    render();
+  });
   list.addEventListener('click', (ev) => {
     const li = (ev.target as HTMLElement).closest<HTMLElement>('.mgr-item');
     if (!li?.dataset.index) return;
     mv.cursor = Number(li.dataset.index);
     mv.board.option = 0;
+    optionMoved = false;
     render();
   });
   list.addEventListener('dblclick', () => viewKey(mv.view === 'scope' ? 'mgr-toggle' : 'mgr-enter'));
@@ -1661,6 +1908,8 @@ export function initManagers(): void {
   style.textContent = CSS + FORM_CSS;
   window.setInterval(() => { if (mv.view === 'workspace' && !mv.loading && !document.querySelector('dialog[open]')) void loadWorkspace(); }, AUTO_REFRESH_MS);
   document.head.append(style);
+  // Registered first, so the open dashboard (it sits above this view) takes its keys first.
+  initDashboard();
   // Capture phase: an open manager view takes its keys before the global key engine.
   window.addEventListener('keydown', (ev) => {
     if (focusOwnsKey(ev.key, ev.target as Element | null)) return;
@@ -1674,7 +1923,7 @@ export function initManagers(): void {
       else if (ev.key in scroll && !ev.ctrlKey) pane.scrollBy(0, scroll[ev.key]!);
       else if (ev.key === 'g') pane.scrollTop = 0;
       else if (ev.key === 'G') pane.scrollTop = pane.scrollHeight;
-      else if (ev.key === 'Tab' || ev.key === 'Escape') { part('mgr-list').focus(); mv.notice = null; render(); }
+      else if (paneKeyName(ev) === 'Tab' || ev.key === 'Escape') { part('mgr-list').focus(); mv.notice = null; render(); }
       else return;
       ev.preventDefault();
       ev.stopImmediatePropagation();
@@ -1682,7 +1931,8 @@ export function initManagers(): void {
     }
     if (!mv.view || ev.isComposing || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     if (document.querySelector('dialog[open]') || isTyping(document.activeElement as HTMLElement | null)) return;
-    const name = ev.key === 'Tab' && ev.shiftKey ? 'S-Tab' : ev.key;
+    const key = paneKeyName(ev);
+    const name = key === 'Tab' && ev.shiftKey ? 'S-Tab' : key;
     const action = VIEW_KEYS[mv.view][name];
     if (!action) return;
     if (ev.key === 'Enter' && (document.activeElement as HTMLElement | null)?.closest('button')) return;

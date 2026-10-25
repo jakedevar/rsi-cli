@@ -294,6 +294,8 @@ pub(crate) mod tests {
             agents,
             groups,
             totals: [usage.clone(), usage.clone(), usage],
+            plan_windows: Vec::new(),
+            plan_usage_by_role: Vec::new(),
             agents_truncated: false,
             usage_truncated: false,
         }

@@ -13,7 +13,6 @@ use crate::config::RuntimeConfig;
 use crate::error::{DaemonError, Result};
 use crate::memory::session_text::extract_session_text;
 use crate::store::Store;
-use tokio::sync::Mutex;
 
 /// Build the extraction prompt from session text and query.
 pub(crate) fn build_extraction_prompt(session_text: &str, query: &str) -> String {
@@ -125,7 +124,7 @@ pub(crate) fn parse_observations_response(raw: &str) -> Vec<String> {
 /// - No extractable text in events
 /// - LLM returns no parseable observations
 pub async fn extract_observations(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     project_id: Option<Uuid>,
@@ -206,7 +205,7 @@ pub async fn extract_observations(
 }
 
 async fn call_llm(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     project_id: Option<Uuid>,
@@ -247,7 +246,7 @@ async fn local_then_fallback<F: std::future::Future<Output = Result<String>>>(
 }
 
 async fn call_fallback(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &Arc<EventBus>,
     session_id: Uuid,
     project_id: Option<Uuid>,
@@ -331,7 +330,13 @@ async fn generate_ollama(http: &reqwest::Client, prompt: &str, model: &str) -> R
     };
     let raw = crate::ollama_client::generate(
         http,
-        model,
+        &crate::memory::helper_breaker::HelperCall {
+            purpose: rsi_common::model_control::ModelInvocationPurpose::MemoryObservationExtract
+                .as_str(),
+            setting_key: "memory_model_local",
+            model,
+            gate: true,
+        },
         None,
         prompt,
         opts,
@@ -576,7 +581,9 @@ Hope that helps!"#;
     async fn test_extract_below_min_events_returns_empty() {
         let events = vec![make_event(1, EventType::Message, Some(Role::User), "hello")];
         let rt_cfg = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let result = extract_observations(
             &store,
             &Arc::new(crate::bus::EventBus::new(8)),
@@ -597,7 +604,9 @@ Hope that helps!"#;
     #[tokio::test]
     async fn test_extract_empty_events_returns_empty() {
         let rt_cfg = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let result = extract_observations(
             &store,
             &Arc::new(crate::bus::EventBus::new(8)),
@@ -624,7 +633,9 @@ Hope that helps!"#;
             make_event(4, EventType::Thinking, None, "thinking"),
         ];
         let rt_cfg = crate::config::RuntimeConfig::from_config(&crate::config::Config::from_env());
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let result = extract_observations(
             &store,
             &Arc::new(crate::bus::EventBus::new(8)),
@@ -685,13 +696,11 @@ mod http_tests {
     /// this file. A regression in the `GenerateOptions` construction here would
     /// NOT be caught by the `build_body` unit tests in `ollama_client.rs`.
     //
-    // `TEST_OLLAMA_URL_LOCK` is intentionally held across awaits — it exists to
-    // serialise env-var mutation across this binary's HTTP tests.
-    #[allow(clippy::await_holding_lock)]
+    // `temp_env` holds the one process-wide environment lock for the block and
+    // restores `RSI_OLLAMA_URL` after it (#190).
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[tokio::test]
     async fn extractor_generate_ollama_posts_expected_body_shape() {
-        let _lock = crate::ollama_client::TEST_OLLAMA_URL_LOCK.lock();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/api/generate$"))
@@ -701,31 +710,36 @@ mod http_tests {
             )
             .mount(&server)
             .await;
-        // SAFETY: TEST_OLLAMA_URL_LOCK is held above.
-        unsafe {
-            std::env::set_var("RSI_OLLAMA_URL", format!("{}/api/generate", server.uri()));
-        }
-        let http = reqwest::Client::new();
-        super::generate_ollama(&http, "EXTRACT PROMPT", "qwen3:14b")
-            .await
-            .expect("generate_ollama should succeed");
-        let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1, "expected exactly one request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
-        assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
-        assert_eq!(body["prompt"], serde_json::json!("EXTRACT PROMPT"));
-        assert_eq!(body["stream"], serde_json::json!(false));
-        assert_eq!(body["think"], serde_json::json!(false));
-        assert_eq!(body["options"]["num_predict"], serde_json::json!(1024));
-        let t = body["options"]["temperature"]
-            .as_f64()
-            .expect("temperature is f64");
-        assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
-        assert!(body.get("system").is_none(), "system key must be absent");
-        assert!(
-            body.get("keep_alive").is_none(),
-            "keep_alive key must be absent"
-        );
+        temp_env::async_with_vars(
+            [(
+                "RSI_OLLAMA_URL",
+                Some(format!("{}/api/generate", server.uri())),
+            )],
+            async move {
+                let http = reqwest::Client::new();
+                super::generate_ollama(&http, "EXTRACT PROMPT", "qwen3:14b")
+                    .await
+                    .expect("generate_ollama should succeed");
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1, "expected exactly one request");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests[0].body).expect("body is valid JSON");
+                assert_eq!(body["model"], serde_json::json!("qwen3:14b"));
+                assert_eq!(body["prompt"], serde_json::json!("EXTRACT PROMPT"));
+                assert_eq!(body["stream"], serde_json::json!(false));
+                assert_eq!(body["think"], serde_json::json!(false));
+                assert_eq!(body["options"]["num_predict"], serde_json::json!(1024));
+                let t = body["options"]["temperature"]
+                    .as_f64()
+                    .expect("temperature is f64");
+                assert!((t - 0.3).abs() < 1e-6, "temperature {t} not ≈ 0.3");
+                assert!(body.get("system").is_none(), "system key must be absent");
+                assert!(
+                    body.get("keep_alive").is_none(),
+                    "keep_alive key must be absent"
+                );
+            },
+        )
+        .await;
     }
 }

@@ -58,8 +58,10 @@ impl AgentControlHandle {
             .await
     }
 
-    /// #2052: `AgentManagerOverview` as the agent sees it: the workspace with
-    /// the fleet rollup cut to the requested detail (default `summary`).
+    /// #2052, #3531: `AgentManagerOverview` as the agent sees it: the
+    /// workspace with the fleet rollup cut to the requested detail (default
+    /// `summary`) and the repeated per-seat data compacted (default
+    /// `detail: compact`).
     ///
     /// # Errors
     /// As [`Self::agent_manager_overview`], or a serialization error.
@@ -68,9 +70,8 @@ impl AgentControlHandle {
         caller: Uuid,
         request: AgentManagerOverviewRequestV1,
     ) -> Result<serde_json::Value> {
-        let fleet = request.fleet;
-        let workspace = self.agent_manager_overview(caller, request).await?;
-        Ok(workspace.into_overview_value(fleet)?)
+        let workspace = self.agent_manager_overview(caller, request.clone()).await?;
+        Ok(workspace.into_overview_value(&request)?)
     }
 
     /// One snapshot of `node`; `with_fleet: false` skips the fleet rollup

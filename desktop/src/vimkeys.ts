@@ -7,13 +7,13 @@ import { dispatch } from './commands.js';
 import { $, el, toast } from './dom.js';
 import {
   CONFIRM_MS, KeyEngine, MAX_COMPLETIONS, type Outcome, type Platform, SEQUENCE_TIMEOUT_MS, detectPlatform, isTypingTarget,
-  readVimKeys, routeKey, writeVimKeys,
+  VIM_FIRST_RUN_NOTE, answerVimKeysFirstRun, routeKey, vimKeysFirstRun, writeVimKeys,
 } from './keyengine.js';
 import { type DesktopAction, desktopKeymap } from './keybindings.js';
 import { uiChanged } from './state.js';
 import { bindDialogGate } from './dialog-gate.js';
 import { installKeyHints } from './key-hints.js';
-import { focusOwnsKey } from './modal-gate.js';
+import { bindCommandLineOpen, focusOwnsKey } from './modal-gate.js';
 
 let engine: KeyEngine<DesktopAction>;
 let platform: Platform = 'other';
@@ -79,14 +79,73 @@ export function isVimKeysOn(): boolean {
   return engine?.isEnabled() ?? true;
 }
 
+/** A chord, count or `:` line is half typed: its next key (Enter, arrows) belongs to the engine. */
+export function vimKeysBusy(): boolean {
+  return engine?.busy() ?? false;
+}
+
 /** The "Vim keys" setting: engine, top-bar checkbox and local storage together. */
 export function setVimKeys(on: boolean): void {
   engine.setEnabled(on);
   $<HTMLInputElement>('vim-keys').checked = on;
+  // Changing the switch anywhere (top bar, Settings, palette) answers a first-run question still open.
+  if (firstRunCard) { answerVimKeysFirstRun(storage(), on); closeFirstRun(); }
   writeVimKeys(storage(), on);
   refreshKeyHints();
   render();
+  if (typeof window.dispatchEvent === 'function') window.dispatchEvent(new Event('rsi:vim-keys')); // the terminal overlay drops its modes
 }
+
+// ---------- first-run question (local #208) ----------
+
+let firstRunCard: HTMLElement | null = null;
+
+function closeFirstRun(): void {
+  firstRunCard?.remove();
+  firstRunCard = null;
+}
+
+/**
+ * "Use Vim-style keys?" once, on a new install: No is the default (already applied and focused),
+ * Esc answers No. A card, not a modal dialog, so nothing else waits on it. Settings › Workspace › Editing Mode
+ * (Vim keys in this window) and the top-bar switch change the answer later.
+ */
+function askVimKeys(): void {
+  const card = el('section', 'first-run-card');
+  card.id = 'vim-first-run';
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-label', 'Use Vim-style keys?');
+  const no = el('button', 'btn primary', 'No');
+  const yes = el('button', 'btn', 'Yes');
+  no.type = 'button';
+  yes.type = 'button';
+  const answer = (on: boolean): void => {
+    answerVimKeysFirstRun(storage(), on);
+    closeFirstRun();
+    if (on !== isVimKeysOn()) setVimKeys(on);
+    uiChanged();
+  };
+  no.addEventListener('click', () => answer(false));
+  yes.addEventListener('click', () => answer(true));
+  card.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Escape') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    answer(false);
+  });
+  const actions = el('div', 'actions');
+  actions.append(no, yes);
+  card.append(
+    el('h2', undefined, 'Use Vim-style keys?'),
+    el('p', undefined, 'Vim-style keys let you drive the app with the rsi TUI\u2019s single-letter keys (j and k move, : runs a command). Everything also works with the mouse and the menus.'),
+    el('p', 'first-run-note', VIM_FIRST_RUN_NOTE),
+    actions,
+  );
+  firstRunCard = card;
+  document.body.append(card);
+  no.focus();
+}
+
 
 /** Run one `:` line typed elsewhere (the palette); works with Vim keys off. */
 export function runCommandLine(line: string): void {
@@ -117,12 +176,15 @@ export function initVimKeys(): void {
   engine = new KeyEngine(desktopKeymap());
   platform = detectPlatform(platformString());
   const toggle = $<HTMLInputElement>('vim-keys');
-  toggle.checked = readVimKeys(storage());
+  const first = vimKeysFirstRun(storage());
+  toggle.checked = first.on;
   engine.setEnabled(toggle.checked);
   bindDialogGate(isVimKeysOn);
+  bindCommandLineOpen(() => engine.commandLineOpen());
   // Hint lines and "(x)" button labels follow the switch (local #129); also data-vim-keys on <html>.
   refreshKeyHints = installKeyHints(document.body, isVimKeysOn);
   refreshKeyHints();
+  if (first.ask) askVimKeys();
   toggle.addEventListener('change', () => {
     setVimKeys(toggle.checked);
     toggle.blur();

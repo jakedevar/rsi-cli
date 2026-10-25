@@ -140,6 +140,18 @@ pub const MANAGER_ADJUSTABLE_DAEMON_SETTINGS: &[AdjustableDaemonSetting] = &[
         excluded_between: None,
         default_bounds: Some((30, 240)),
     },
+    // hub #3846: the wall-clock budget of one merge-queue lander run. The hard
+    // range is the daemon's own (30..=1440); the built-in manager bound sits
+    // inside it around the 60-minute default so a manager can give a slow gate
+    // room or tighten a stuck one, but cannot park the queue for a day.
+    AdjustableDaemonSetting {
+        key: "rolling_queue_gate_timeout_mins",
+        label: "Merge queue gate timeout (min)",
+        hard_min: crate::rolling_queue::ROLLING_QUEUE_MIN_GATE_TIMEOUT_MINS,
+        hard_max: crate::rolling_queue::ROLLING_QUEUE_MAX_GATE_TIMEOUT_MINS,
+        excluded_between: None,
+        default_bounds: Some((45, 180)),
+    },
     // #2119: hub build CPU budget (percent of logical CPUs). Lower-only by
     // default: the built-in max is the registry default; an explicit operator
     // bound may widen it.
@@ -180,7 +192,6 @@ pub fn adjustable_daemon_setting(key: &str) -> Option<&'static AdjustableDaemonS
 
 /// Operator-set bounds for one allowlisted key, stored in the manager policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ManagerDaemonSettingBoundV2 {
     pub key: String,
     pub min: u64,
@@ -437,6 +448,7 @@ mod tests {
             ("governor_lander_slots", [1, 5], [0, 6]),
             ("governor_min_free_disk_gb", [30, 100], [29, 101]),
             ("rolling_queue_full_qa_interval_mins", [30, 240], [29, 241]),
+            ("rolling_queue_gate_timeout_mins", [45, 180], [44, 181]),
         ] {
             for v in ok {
                 assert_eq!(

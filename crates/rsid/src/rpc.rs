@@ -102,7 +102,9 @@ mod agent_verbs;
 mod codegraph;
 mod cold_archive; // #2384: cold-storage archive status and run-now
 mod common;
+mod external_reports; // #3789: operator-only external report sync status
 mod fleet;
+mod host_tuning;
 mod input_assets; // hub #3044: operator-only paste upload and slash-command listing
 mod issues;
 mod manager;
@@ -155,6 +157,7 @@ pub use self::topology::*;
 // an `Agent*` verb that internally enforces its own self/lead scoping.
 mod failure_signatures; // #1016: AgentQueryFailureSignatures handler
 mod friction; // #1333: ListFrictionRollup and the agent-refusal andon point
+mod git_push_consent; // #3566: operator-only one-shot main push consent
 mod global_manager; // #872 Slice B: global manager v0
 mod manager_issue_worker; // #1100: AgentManagerLaunchIssueWorker handler
 mod operator_restart; // #1122: operator quiet-point restart
@@ -258,13 +261,19 @@ pub struct RpcServer {
     /// `user: true` read (the daemon user's home; a per-process temporary
     /// directory under `cfg(test)`).
     skill_home: std::path::PathBuf,
+    /// local #91: where `DeleteSkill` moves a deleted skill
+    /// (`<data dir>/trash/skills`; a per-process temporary directory under
+    /// `cfg(test)`).
+    skill_trash_dir: std::path::PathBuf,
     /// #1036: directory holding the remote-gate spend ledger and the caps
-    /// file the daemon mirrors for `scripts/cloud-spend.py`.
+    /// file the daemon mirrors for `rsi-cloud spend`.
     cloud_dir: std::path::PathBuf,
     /// hub #3040: the rsi data directory whose `prompts/` and
     /// `trash/prompts/` the operator prompt-file RPCs own (tests point it at
     /// a temp directory).
     prompt_data_dir: std::path::PathBuf,
+    /// #3566: local grants and spent receipts read by the Git pre-push hook.
+    git_push_consent_dir: std::path::PathBuf,
     /// hub #3039: the host files `operator_config` edits (a throwaway
     /// directory under unit tests, never the operator's own files).
     operator_config_paths: crate::operator_config::OperatorConfigPaths,
@@ -277,10 +286,10 @@ pub struct RpcServer {
     connection_drain: tokio_util::sync::CancellationToken,
 }
 
-/// The data directory the prompt-file RPCs own: the rsi data directory, or in
+/// The data directory the operator file RPCs own: the rsi data directory, or in
 /// a unit-test build a fresh path under the temp directory, so no test can
 /// reach the operator's real `~/.rsi/prompts`.
-fn default_prompt_data_dir() -> std::path::PathBuf {
+fn default_operator_data_dir() -> std::path::PathBuf {
     if cfg!(test) {
         std::env::temp_dir().join(format!("rsid-test-prompt-data-{}", Uuid::new_v4()))
     } else {
@@ -337,8 +346,14 @@ impl RpcServer {
             } else {
                 dirs::home_dir().unwrap_or_default()
             },
+            skill_trash_dir: if cfg!(test) {
+                std::env::temp_dir().join(format!("rsid-test-skill-trash-{}", std::process::id()))
+            } else {
+                rsi_common::input_assets::skill_trash_root(&rsi_common::identity::data_dir())
+            },
             cloud_dir: crate::cloud_spend::default_cloud_dir(),
-            prompt_data_dir: default_prompt_data_dir(),
+            prompt_data_dir: default_operator_data_dir(),
+            git_push_consent_dir: default_operator_data_dir().join("git-push-consents"),
             operator_config_paths: crate::operator_config::OperatorConfigPaths::default_for_build(),
             model_control_runtime,
             compile_engine,
@@ -646,6 +661,31 @@ impl RpcServer {
         } else {
             None
         };
+        // #3787: an operator intake seat is bound to a narrow grant. Only an
+        // `Agent*` verb outside it needs the (in-memory) session lookup.
+        if let Some(admission) = admission.as_ref()
+            && !rsi_common::intake_agent::intake_seat_may_call(&request.method)
+            && self
+                .session_manager
+                .get_session(admission.caller.session_id())
+                .await
+                .is_some_and(|session| {
+                    session.agent_role.as_deref()
+                        == Some(rsi_common::intake_agent::INTAKE_AGENT_ROLE)
+                })
+        {
+            return HandleResult::Response(RpcResponse::error(
+                request.id.clone(),
+                RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "intake_seat_verb_denied: the operator intake agent may only file and read Issues; `{}` is outside its grant",
+                        request.method
+                    ),
+                    data: None,
+                },
+            ));
+        }
         // The daemon is serving this admitted call until the handler returns
         // (or is dropped): the DRAIN wait reads this registry (#2353).
         let _in_flight = admission.as_ref().map(|admission| {
@@ -740,6 +780,8 @@ impl RpcServer {
 
         let result = match request.method.as_str() {
             "LaunchSession" => self.handle_launch_session(request).await,
+            // #3787 operator-only: absent from AGENT_VERBS/READ_VERBS/native tools/agent CLI catalog.
+            "LaunchIntakeSession" => self.handle_launch_intake_session(request).await,
             "AgentSpawnChild" => self.handle_agent_spawn_child(request).await,
             "AgentReserveSuccessor" => self.handle_agent_reserve_successor(request).await,
             "AgentGetProgress" => self.handle_agent_get_progress(request).await,
@@ -915,6 +957,12 @@ impl RpcServer {
             // #1406: operator-only (not in the verb registry): clean export of
             // durable state and first-run import on a new machine.
             "ExportPortableBundle" => self.handle_export_portable_bundle(request).await,
+            // #3789: operator-only status and run-now of the GitHub report import.
+            "GetExternalReportSyncStatus" => {
+                self.handle_get_external_report_sync_status(request).await
+            }
+            "SyncExternalReportsNow" => self.handle_sync_external_reports_now(request).await,
+            "AuthorizeMainPush" => self.handle_authorize_main_push(request).await,
             "ImportPortableBundle" => self.handle_import_portable_bundle(request).await,
             "GetHarnessManager" => self.handle_get_harness_manager(request).await,
             "ListHarnessManagerEpics" => self.handle_list_harness_manager_epics(request).await,
@@ -1226,10 +1274,13 @@ impl RpcServer {
             // Read-only lifetime usage aggregate (T8) — operator/TUI-only,
             // deliberately NOT added to READ_VERBS (F-010).
             "GetFleetOverview" => self.handle_get_fleet_overview(request).await,
+            // #3316: bounded per-project dashboard; operator-only like the fleet read.
+            "GetGlobalDashboard" => self.handle_get_global_dashboard(request).await,
             "GetUsageStats" => self.handle_get_usage_stats(request).await,
             // #2757: plan-window utilization per provider, Codex's polled
             // beside Claude's streamed. Operator-only (not in READ_VERBS).
             "GetProviderRateLimits" => self.handle_get_provider_rate_limits(request).await,
+            "ClearProviderUsageHold" => self.handle_clear_provider_usage_hold(request).await,
             "GetEfficiencyMetrics" => self.handle_get_efficiency_metrics(request).await,
             "GetRollingQueue" => self.handle_get_rolling_queue(request).await,
             "EnqueueRollingQueueSource" => self.handle_enqueue_rolling_queue_source(request).await,
@@ -1371,6 +1422,11 @@ impl RpcServer {
             | "GetCodegraphImpact"
             | "DiffCodegraph" => self.handle_codegraph_read(request).await,
             "GetDaemonConfig" => self.handle_get_daemon_config(request).await,
+            "GetHostTuning" => self.handle_get_host_tuning(request).await,
+            "ConfigureHostTuning" => self.handle_configure_host_tuning(request).await,
+            "SwitchHostPreset" | "AgentSwitchHostPreset" => {
+                self.handle_switch_host_preset(request).await
+            }
             "UpdateDaemonConfig" => self.handle_update_daemon_config(request).await,
             // Issue #69 storage lifecycle. Both methods are operator-only by
             // default-deny and remain absent from AGENT_VERBS/READ_VERBS.
@@ -1841,6 +1897,7 @@ pub(crate) fn rpc_production_source() -> String {
         include_str!("rpc/scheduled_jobs.rs"),
         include_str!("rpc/sessions.rs"),
         include_str!("rpc/settings.rs"),
+        include_str!("rpc/host_tuning.rs"),
         include_str!("rpc/storage.rs"),
         include_str!("rpc/topology.rs"),
     ] {

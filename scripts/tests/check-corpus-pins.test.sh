@@ -280,6 +280,7 @@ echo "== pre-commit validates staged corpus bytes =="
 mkdir -p tools/git-hooks thoughts/shared/research scripts
 cp "$GATE" scripts/check-corpus-pins.sh
 cp "$(CDPATH='' cd -- "$HERE/../../tools/git-hooks" && pwd)/pre-commit" tools/git-hooks/pre-commit
+cp "$(CDPATH='' cd -- "$HERE/../../tools/git-hooks" && pwd)/check-rerere" tools/git-hooks/check-rerere
 chmod +x tools/git-hooks/pre-commit
 cat > thoughts/shared/research/staged-packet.md <<EOF
 | # | fix SHA | parent SHA | regression test |

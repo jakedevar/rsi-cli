@@ -52,6 +52,59 @@ pub(crate) struct DecisionGate {
     pub source: &'static str,
 }
 
+/// The launch-block reason of a decision only the operator can answer.
+pub const PENDING_OPERATOR_DECISION: &str = "manager_v2_pending_operator_decision";
+/// The launch-block reason of a decision a manager may rule on (#3240): named
+/// by who can answer it, so a manager never reads its own question as an
+/// operator gate.
+pub const PENDING_MANAGER_DECISION: &str = "manager_v2_pending_manager_decision";
+
+/// The block reason for a decision row whose `answerable_by` is given. Only a
+/// pending manager-answerable row uses the manager spelling; every other row
+/// (a real gate, or an operator answer waiting on delivery) keeps the
+/// operator one.
+#[must_use]
+pub fn decision_block_reason(answerable_by: Option<&str>) -> &'static str {
+    if answerable_by == Some("manager") {
+        PENDING_MANAGER_DECISION
+    } else {
+        PENDING_OPERATOR_DECISION
+    }
+}
+
+/// One pending decision as the manager's notices, the seat handoff and the
+/// health wake read it (#3240).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDecisionSummary {
+    pub key: String,
+    pub epic_id: Option<Uuid>,
+    /// `manager` or `operator`.
+    pub answerable_by: &'static str,
+    /// First line of the question, clipped.
+    pub question: String,
+    /// RFC3339 time the decision was asked.
+    pub created_at: String,
+    pub age_seconds: i64,
+    /// The asking topology execution, when the record is a `topology:` one.
+    pub execution_id: Option<Uuid>,
+    pub target_digest: Option<String>,
+}
+
+/// First line of `question`, at most `max` characters.
+fn question_first_line(question: &str, max: usize) -> String {
+    let line = question
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    let line = line.trim();
+    if line.chars().count() <= max {
+        return line.to_owned();
+    }
+    let mut cut: String = line.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 fn gate_class(raw: &str) -> &'static str {
     match raw {
         "main_or_release" => "main_or_release",
@@ -88,7 +141,6 @@ const GATE_PHRASES: &[(&str, &[&str])] = &[
         "spend",
         &[
             "spend",
-            "budget",
             "billing",
             "purchase",
             "subscription",
@@ -128,6 +180,15 @@ const GATE_PHRASES: &[(&str, &[&str])] = &[
     ("human_approval", &["human approval", "operator approval"]),
 ];
 
+/// Currency words and codes: a money signal beside "budget".
+const MONEY_WORDS: &[&str] = &[
+    "usd", "eur", "gbp", "jpy", "dollar", "dollars", "euro", "euros", "pound", "pounds", "money",
+    "cash", "cents",
+];
+
+/// Tokens on each side of "budget" that may carry its money signal (#3327).
+const BUDGET_MONEY_WINDOW: usize = 3;
+
 /// Formatting and intervening words must not turn an operator gate into a
 /// manager decision (for example, "merge this into `main`" or "delete all
 /// user data"). Match action/target words independently of their order.
@@ -137,11 +198,19 @@ pub fn scan_decision_gate(question: &str) -> Option<&'static str> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
         .collect();
-    let normalized = words.join(" ");
+    // Phrases match from a word boundary, so "suspend" is not "spend"; a word
+    // may still continue past the phrase ("credentials", "purged", "spending").
+    let normalized = format!(" {}", words.join(" "));
     if let Some(class) = GATE_PHRASES.iter().find_map(|(class, phrases)| {
         phrases
             .iter()
-            .any(|phrase| lower.contains(phrase) || normalized.contains(phrase))
+            .any(|phrase| {
+                let phrase: Vec<_> = phrase
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                    .collect();
+                normalized.contains(&format!(" {}", phrase.join(" ")))
+            })
             .then_some(*class)
     }) {
         return Some(class);
@@ -168,6 +237,19 @@ pub fn scan_decision_gate(question: &str) -> Option<&'static str> {
                 .is_some_and(|c| c.is_ascii_digit())
     });
     if names_amount || has(&["buy", "buying", "pay", "paying", "rent", "renting"]) {
+        return Some("spend");
+    }
+    // A budget is a spending gate only beside a money signal; a test time or
+    // build-slot budget is engineering vocabulary (#3307). "Beside" is a small
+    // token window around the word, not anywhere in the text (#3327).
+    let money_beside_budget = words.iter().enumerate().any(|(index, word)| {
+        matches!(*word, "budget" | "budgets")
+            && words[index.saturating_sub(BUDGET_MONEY_WINDOW)
+                ..(index + BUDGET_MONEY_WINDOW + 1).min(words.len())]
+                .iter()
+                .any(|near| MONEY_WORDS.contains(near))
+    });
+    if money_beside_budget {
         return Some("spend");
     }
     if has(&["oauth", "passphrase"])
@@ -451,9 +533,72 @@ impl Store {
         Ok(too_old(created_at, days).then_some("older_than_days"))
     }
 
+    /// The pending decisions of `config`'s ledger, oldest first, at most
+    /// `limit` (#3240). `epic` narrows to one Epic. Reads rows each time.
+    pub fn manager_v2_pending_decision_summaries(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<PendingDecisionSummary>> {
+        let mut statement = self.conn.prepare(
+            "SELECT record_key FROM harness_manager_v2_records
+             WHERE project_id=?1 AND manager_session_id=?2 AND scope_version=?3
+               AND kind='decision' AND archived=0
+               AND json_extract(payload_json,'$.status')='pending'
+               AND (?4 IS NULL OR epic_id=?4)
+             ORDER BY created_at,record_key LIMIT ?5",
+        )?;
+        let keys = statement
+            .query_map(
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    epic.map(|id| id.to_string()),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut out = Vec::new();
+        for key in keys {
+            let Some(record) = self.manager_v2_record(config, "decision", &key)? else {
+                continue;
+            };
+            let has_target = self
+                .manager_v2_record(config, "decision_target", &key)?
+                .is_some();
+            let gate = self.manager_v2_classify_decision(&key, &record.payload, has_target)?;
+            out.push(PendingDecisionSummary {
+                epic_id: record.epic_id,
+                answerable_by: if gate.is_some() {
+                    "operator"
+                } else {
+                    "manager"
+                },
+                question: question_first_line(
+                    record.payload["question"].as_str().unwrap_or_default(),
+                    200,
+                ),
+                created_at: record.created_at.clone(),
+                age_seconds: age_seconds(&record.created_at),
+                execution_id: topology_decision_execution(&key, &record.payload),
+                target_digest: record.payload["target_digest"].as_str().map(str::to_owned),
+                key,
+            });
+        }
+        Ok(out)
+    }
+
     /// Add the board fields to one `decision` row built from `record`:
     /// `gate`, `gate_source`, `answerable_by`, `blocks`, `archived`, `age_seconds`,
-    /// `stale`, `stale_reason`, `owner_manager_session_id` and `scope_version`.
+    /// `stale`, `stale_reason`, `owner_manager_session_id`,
+    /// `current_manager_session_id` and `scope_version`. The owner is the
+    /// ledger's lineage anchor, which survives seat rotation and is what a
+    /// ruling names; the current id is the live seat the decision wakes, read
+    /// at this call, never a cached owner (#3330).
     pub(crate) fn manager_v2_decorate_decision_row(
         &self,
         config: &HarnessManagerConfigV1,
@@ -480,10 +625,11 @@ impl Store {
             "execution_ids": if blocking { execution.into_iter().collect::<Vec<_>>() } else { Vec::new() },
             "work_key": row["work_key"],
             "request_id": row["request_id"],
-            "reason": "manager_v2_pending_operator_decision",
+            "reason": decision_block_reason(row["answerable_by"].as_str()),
         });
         row["archived"] = json!(archived);
         row["owner_manager_session_id"] = json!(config.manager_session_id);
+        row["current_manager_session_id"] = json!(config.current_session_id);
         row["scope_version"] = json!(config.row_version);
         let created = row["created_at"].as_str().unwrap_or_default().to_owned();
         row["age_seconds"] = json!(age_seconds(&created));
@@ -1160,6 +1306,17 @@ impl Store {
             record.row_version,
             &decision,
         )?;
+        // #3240: a question the manager may rule on wakes the seat. The
+        // coordinator's notice pass records it again if this attempt fails,
+        // so a notice error never loses the filed question.
+        if let Some(summary) = self
+            .manager_v2_pending_decision_summaries(config, Some(request.epic), 64)?
+            .into_iter()
+            .find(|d| d.key == request.key)
+            && let Err(error) = self.record_manager_decision_notice(config, &summary)
+        {
+            tracing::warn!(key = %request.key, %error, "manager decision notice not recorded");
+        }
         tx.commit()?;
         Ok(record)
     }

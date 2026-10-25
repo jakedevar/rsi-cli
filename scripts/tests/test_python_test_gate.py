@@ -47,10 +47,69 @@ class PythonTestGate(unittest.TestCase):
         self.assertEqual(self.select("tools/check-released-migrations.py", "tools/widget.py"),
                          ["scripts/tests/test_check_released_migrations.py", "tools/tests/test_widget.py"])
 
+    def test_changed_top_level_tools_suite_selects_itself(self):
+        self.write("tools/test_gadget.py", "import unittest\n")
+        self.assertEqual(self.select("tools/test_gadget.py"), ["tools/test_gadget.py"])
+
+    def test_tools_source_matches_all_three_suite_locations(self):
+        self.write("tools/test_check_released_migrations.py", "import unittest\n")
+        self.write("tools/tests/test_check_released_migrations.py", "def test_check(): pass\n")
+        expected = ["scripts/tests/test_check_released_migrations.py",
+                    "tools/test_check_released_migrations.py",
+                    "tools/tests/test_check_released_migrations.py"]
+        for source in ("tools/check-released-migrations.py", "tools/check_released_migrations.py"):
+            with self.subTest(source=source):
+                self.assertEqual(self.select(source), expected)
+
+    def test_unrelated_change_keeps_top_level_tools_suite_unselected(self):
+        self.write("tools/test_gadget.py", "import unittest\n# gadget-config.json\n")
+        self.assertEqual(self.select("tools/unrelated.py"), [])
+        self.assertEqual(self.select("tools/gadget-config.json"), ["tools/test_gadget.py"])
+        self.assertEqual(self.select("scripts/tests/test_other.py", "tools/widget.py"),
+                         ["scripts/tests/test_other.py", "tools/tests/test_widget.py"])
+
+    def test_top_level_tools_suites_keep_their_runner_and_unavailable_status(self):
+        self.write("tools/test_gadget.py", "import unittest\n")
+        self.write("tools/test_function.py", "def test_function(): pass\n")
+        commands = GATE.test_commands(self.repo, self.select(
+            "tools/test_gadget.py", "tools/test_function.py"), sys.executable)
+        self.assertEqual(commands, [
+            [sys.executable, "-m", "pytest", "-q", "tools/test_function.py"],
+            [sys.executable, "-m", "unittest", "-v", "tools/test_gadget.py"]])
+        with patch.object(GATE.importlib.util, "find_spec", return_value=None):
+            status = GATE.runner_status(commands[0])
+        self.assertEqual((status["status"], status["runner"], status["executed_tests"]),
+                         ("runner_unavailable", "pytest", 0))
+
     def test_changed_test_selects_itself_and_deleted_source_keeps_coverage(self):
         self.assertEqual(self.select("scripts/tests/test_other.py"), ["scripts/tests/test_other.py"])
         self.assertEqual(self.select("scripts/check-touched-shards"),
                          ["scripts/tests/test_check_touched_shards.py"])
+
+    def test_a_new_test_file_selects_the_guards_that_scan_the_whole_directory(self):
+        # #3306: a new scripts/tests/test_x.py landed red because the guard that
+        # scans every file of the directory was not selected with it.
+        self.write("scripts/tests/test_fixture_git_guard.py",
+                   "import unittest\n\n# python-test-gate: scans scripts/tests\n")
+        self.write("scripts/tests/test_install_release_git_hooks.py", "import unittest\n")
+        self.assertEqual(self.select("scripts/tests/test_install_release_git_hooks.py"),
+                         ["scripts/tests/test_fixture_git_guard.py",
+                          "scripts/tests/test_install_release_git_hooks.py"])
+        # A non-test fixture file and a deletion also select the guard.
+        self.assertEqual(self.select("scripts/tests/fixtures/data.txt"),
+                         ["scripts/tests/test_fixture_git_guard.py"])
+        self.assertEqual(self.select("scripts/tests/test_gone.sh"),
+                         ["scripts/tests/test_fixture_git_guard.py"])
+
+    def test_a_scan_guard_is_not_selected_by_paths_outside_its_directory(self):
+        self.write("scripts/tests/test_fixture_git_guard.py",
+                   "import unittest\n# python-test-gate: scans scripts/tests\n")
+        self.assertEqual(self.select("scripts/uncovered.sh", "tools/widget.py", "docs/x.md"),
+                         ["tools/tests/test_widget.py"])
+        # The marker names its directory: a tools/tests scan is not selected by scripts/tests.
+        self.write("tools/tests/test_tools_guard.py", "import unittest\n# python-test-gate: scans tools/tests\n")
+        self.assertEqual(self.select("scripts/tests/test_other.py"),
+                         ["scripts/tests/test_fixture_git_guard.py", "scripts/tests/test_other.py"])
 
     def test_docs_thoughts_and_unmatched_scripts_select_nothing(self):
         self.assertEqual(self.select("docs/widget.md", "thoughts/plan.md", "scripts/uncovered.sh"), [])

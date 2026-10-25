@@ -15,7 +15,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createBridge, rpcCall } from './smoke-bridge.mjs';
 import { FIXTURES, startFakeDaemon } from './smoke-fake.mjs';
-import { connectPage, findChrome, launchChrome, newToken, serve } from './smoke-lib.mjs';
+import { BOOT_ATTEMPTS, bootWithRetries, connectPage, findChrome, launchChrome, newToken, serve } from './smoke-lib.mjs';
+export { BOOT_ATTEMPTS } from './smoke-lib.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DIST = resolve(here, '..', 'dist');
@@ -49,16 +50,60 @@ export function parseVimArgs(argv) {
 
 const q = (s) => JSON.stringify(s);
 
+/**
+ * A navigation is not app readiness: boot awaits several bridge reads after DOMContentLoaded.
+ * Retry only loads interrupted by Chrome (cancellation or ERR_NETWORK_CHANGED), using the shared first-run policy.
+ * An interrupted module ends its wait at once; exhaustion retains every attempt's transport evidence.
+ */
+export async function freshVimPage(page, bridgeLog, { url = `${page.origin}/`, timeout = 12000, attempts = BOOT_ATTEMPTS } = {}) {
+  const eventStart = page.events.length;
+  const bridgeStart = bridgeLog.length;
+  let failure;
+  try {
+    return await bootWithRetries(page, url, (stop) => bootOnce(page, timeout, stop), { attempts });
+  } catch (error) { failure = error; }
+  let dom;
+  try {
+    dom = await page.eval(`({ url: location.href, readyState: document.readyState,
+      boot: document.documentElement.dataset.boot ?? null,
+      bootReport: document.documentElement.dataset.bootReport ?? null,
+      bridgeInstalled: !!globalThis.__TAURI__?.core?.invoke,
+      invokeRetries: (globalThis.__smokeInvokeRetries ?? []).slice(-5),
+      connection: document.querySelector('#conn')?.outerHTML,
+      html: document.documentElement.outerHTML.slice(0, 16000) })`);
+  } catch (captureError) { dom = { captureError: captureError.message }; }
+  const diagnostics = {
+    console: page.events.slice(eventStart).filter((e) => e.method === 'Runtime.exceptionThrown'
+      || e.method === 'Log.entryAdded'
+      || (e.method === 'Runtime.consoleAPICalled' && ['error', 'warning', 'assert'].includes(e.params.type))),
+    network: page.events.slice(eventStart).filter((e) => e.method === 'Network.loadingFailed'),
+    bridge: bridgeLog.slice(bridgeStart),
+    ...(failure.bootAttempts?.length > 1 ? { attempts: failure.bootAttempts } : {}),
+    dom,
+  };
+  throw new Error(`${failure.message}; startup diagnostics: ${JSON.stringify(diagnostics)}`, { cause: failure });
+}
+
+/** One navigation to a booted app: the boot report says ready and a fixture session row is painted. */
+async function bootOnce(page, timeout, stop) {
+  const deadline = Date.now() + timeout;
+  const boot = await page.ready(`document.documentElement.dataset.boot`, { step: 'Vim app boot', timeout,
+    action: `() => ({ state: document.documentElement.dataset.boot, report: document.documentElement.dataset.bootReport })`,
+    stop });
+  if (boot.state !== 'ready') throw new Error(`Vim app boot ${boot.state}: ${boot.report}`);
+  // A generic li can be the empty-list placeholder. Require a painted fixture row.
+  await page.element('#session-list .session-item[data-id]', undefined, {
+    step: 'Vim session list', timeout: Math.max(0, deadline - Date.now()), stop,
+  });
+}
+
 function helpers(page, bridgeLog) {
   const h = {
     page,
     bridgeLog,
     async closeAll() { for (let i = 0; i < 4; i++) { await page.key('Escape'); await sleep(120); } },
     async fresh() {
-      await page.goto(`${page.origin}/`);
-      await sleep(300);
-      if (!(await page.waitFor(`document.querySelectorAll('#session-list li').length > 0`, 12000))) throw new Error('the session list never rendered');
-      await sleep(400);
+      await freshVimPage(page, bridgeLog);
     },
     /** Real key events for a vim-style sequence: `<Esc>`, `<Enter>`, `<C-r>`, `<Left>`, otherwise one key per character. */
     async send(seq) {
@@ -103,10 +148,11 @@ function helpers(page, bridgeLog) {
       await sleep(150);
     },
     async openIssueForm() {
-      await h.command('issues');
-      await sleep(400);
+      // A second form in the same run: the workspace is already open, and `:issues` would be typed into its list as keys.
+      if (await page.eval(`document.getElementById('issues-view').hidden`)) { await h.command('issues'); await sleep(400); }
+      await page.element('#issues-list', '(e) => e.focus()', { step: 'focus the Issues list' });
       await page.key('n'); await sleep(500);
-      if (!(await page.waitFor(`document.querySelector('dialog[open] input[name=title]')`, 4000))) throw new Error('n did not open the Issue form');
+      if (!(await page.waitFor(`document.querySelector('dialog[open] [name=title]')`, 4000))) throw new Error('n did not open the Issue form');
     },
     /** The palette's "Vim keys" action (the top-bar checkbox is not reachable, hub #3101); reads the stored setting back. */
     async toggleVimKeys(on) {
@@ -122,8 +168,44 @@ function helpers(page, bridgeLog) {
 }
 
 const LAUNCH_Q = '#launch-form textarea[name=query]';
-const TITLE = 'dialog[open] input[name=title]';
+const TITLE = 'dialog[open] [name=title]';
 const BODY = 'dialog[open] textarea[name=body]';
+
+const FORM_FIELDS = [['title', TITLE], ['description', BODY], ['labels', 'dialog[open] [name=labels]'], ['assignee', 'dialog[open] [name=assignee]']];
+const FORM_TEXT = 'one two three';
+
+/** Close every open dialog without keys (Esc would also leave the Issues workspace behind it). */
+const closeDialogs = (page) => page.eval(`document.querySelectorAll('dialog[open]').forEach((d) => d.close())`);
+
+/**
+ * One mounted form field through the TUI's contract (hub #3421): it opens in INSERT with the caret at the end of its
+ * text, Esc gives NORMAL only (the dialog stays open), a motion and an operator edit in place, u undoes, i is INSERT
+ * again. Returns the problem, or '' when it all held.
+ */
+async function exerciseField(h, sel) {
+  const { page } = h;
+  await page.element(sel, `(e) => { e.value = ${q(FORM_TEXT)}; e.dispatchEvent(new CustomEvent('rsi-resync')); e.blur(); e.focus(); }`, { step: 'refocus field' });
+  await sleep(200);
+  const opened = await page.element(sel, '(e) => [e.dataset.vimMode, e.selectionStart, e.selectionEnd, document.activeElement === e]');
+  if (opened[0] !== 'insert' || opened[1] !== FORM_TEXT.length || opened[2] !== FORM_TEXT.length || !opened[3]) return `opened as ${JSON.stringify(opened)}, not INSERT at the end`;
+  await page.keys('!');
+  if ((await h.val(sel)) !== FORM_TEXT + '!') return `typing gave ${JSON.stringify(await h.val(sel))}`;
+  await h.send('<Esc>');
+  const tag = await page.eval(`(document.querySelector(${q(sel + ' + .vim-mode-tag')})||{}).textContent||''`);
+  if ((await h.mode(sel)) !== 'normal' || tag !== 'NORMAL') return `Esc gave mode ${await h.mode(sel)} tag ${tag}`;
+  if (!(await page.eval(`!!document.querySelector('dialog[open]')`))) return 'Esc in INSERT closed the dialog';
+  await h.send('0dw');
+  const a = await h.val(sel);
+  await h.send('$x');
+  const b = await h.val(sel);
+  await h.send('u');
+  const c = await h.val(sel);
+  await h.send('i');
+  const m = await h.mode(sel);
+  await h.send('<Esc>');
+  if (a !== 'two three!' || b !== 'two three' || c !== 'two three!' || m !== 'insert') return `0dw → ${JSON.stringify(a)}, $x → ${JSON.stringify(b)}, u → ${JSON.stringify(c)}, i → ${m}`;
+  return '';
+}
 
 export const SCENARIOS = [
   {
@@ -252,7 +334,7 @@ export const SCENARIOS = [
     },
   },
   {
-    id: 'one-line-field', title: "an Issue form's one-line title is a vim field: normal mode, o stays on one line, Enter still submits, Esc Esc closes",
+    id: 'one-line-field', title: "an Issue form's one-line title is a wrapping vim field: normal mode, o stays on one line, Enter still submits and adds no line, Esc Esc closes",
     async run(h) {
       const { page } = h;
       await h.fresh(); await h.openIssueForm();
@@ -273,17 +355,18 @@ export const SCENARIOS = [
       await h.send('J');
       const afterJ = await h.val(TITLE);
       const tag = await page.eval(`(document.querySelector('${TITLE} + .vim-mode-tag')||{}).textContent||''`);
-      // Enter in normal mode must not be swallowed by the editor: the form's submit handler sees the event.
+      // Enter in normal mode must not be swallowed by the editor: the field takes it to submit the form, never as a line break.
       await page.eval(`window.__enterDefaultPrevented = null; window.addEventListener('keydown', (e) => { if (e.key === 'Enter') window.__enterDefaultPrevented = e.defaultPrevented; });`);
       await h.send('<Esc>');
       await page.key('Enter'); await sleep(200);
+      const afterEnter = await h.val(TITLE);
       const enterPrevented = await page.eval(`window.__enterDefaultPrevented`);
       const submitted = h.bridgeLog.some((e) => e.cmd === 'create_issue' && e.outcome === 'refused');
       await h.closeAll();
       const closed = await page.eval(`!document.querySelector('dialog[open]')`);
-      const ok = m1 === 'normal' && a === 'beta gamma' && b === 'ta gamma' && afterO === 'ta gammaZ' && noop === 'ta gammaZ' && afterJ === 'ta gammaZ' && tag === 'NORMAL' && closed && submitted && enterPrevented === false;
+      const ok = m1 === 'normal' && a === 'beta gamma' && b === 'ta gamma' && afterO === 'ta gammaZ' && noop === 'ta gammaZ' && afterJ === 'ta gammaZ' && tag === 'NORMAL' && closed && submitted && enterPrevented === true && !afterEnter.includes('\n');
       return ok
-        ? pass(`title: normal ${m1}, 0dw -> ${JSON.stringify(a)}, 2x -> ${JSON.stringify(b)}, o appended on the same line -> ${JSON.stringify(afterO)}, J no-op, tag ${tag}, Enter was not swallowed (default-prevented ${enterPrevented}) and reached the form's submit, which the read-only bridge refused (create_issue), Esc Esc closed the dialog`)
+        ? pass(`title: normal ${m1}, 0dw -> ${JSON.stringify(a)}, 2x -> ${JSON.stringify(b)}, o appended on the same line -> ${JSON.stringify(afterO)}, J no-op, tag ${tag}, Enter was taken by the field to submit (default-prevented ${enterPrevented}, no line added) and reached the form's submit, which the read-only bridge refused (create_issue), Esc Esc closed the dialog`)
         : fail(`mode ${m1}, ${JSON.stringify([a, b, afterO, noop, afterJ])}, tag ${JSON.stringify(tag)}, closed ${closed}, submit seen ${submitted}, Enter prevented ${enterPrevented}`);
     },
   },
@@ -306,6 +389,211 @@ export const SCENARIOS = [
       return lines === 'zero\nfirst\nsecond' && joined === 'zero first\nsecond' && after === 'second'
         ? pass('o, O, J and dd on a multi-line body')
         : fail(`lines ${JSON.stringify(lines)}, joined ${JSON.stringify(joined)}, after dd ${JSON.stringify(after)}`);
+    },
+  },
+  {
+    id: 'issue-editor-fields', title: "every text field of the Issue editor (title, description, labels, assignee) is a vim field: it opens in INSERT at the end of its text, Esc gives NORMAL only, a motion and an operator edit in place, u undoes, and Ctrl-Enter submits",
+    async run(h) {
+      const { page } = h;
+      await h.fresh(); await h.openIssueForm();
+      const problems = [];
+      for (const [name, sel] of FORM_FIELDS) {
+        const bad = await exerciseField(h, sel);
+        if (bad) problems.push(`${name}: ${bad}`);
+      }
+      const kinds = await page.eval(`['title', 'body', 'labels', 'assignee'].map((n) => { const e = document.querySelector('dialog[open] [name=' + n + ']'); return n + ':' + e.tagName + ':' + (e.dataset.line ?? 'multi'); }).join(' ')`);
+      const before = h.bridgeLog.filter((e) => e.cmd === 'create_issue' && e.outcome === 'refused').length;
+      await h.focus(BODY);
+      await page.key('Enter', { ctrl: true }); await sleep(300);
+      const submitted = h.bridgeLog.filter((e) => e.cmd === 'create_issue' && e.outcome === 'refused').length - before;
+      await closeDialogs(page);
+      if (kinds !== 'title:TEXTAREA:single body:TEXTAREA:multi labels:TEXTAREA:single assignee:TEXTAREA:single') problems.push(`field kinds ${kinds}`);
+      if (submitted !== 1) problems.push(`Ctrl-Enter reached the submit ${submitted} times`);
+      return problems.length ? fail(problems.join('; ')) : pass(`title, description, labels and assignee: ${kinds}; each opened in INSERT at the end, Esc → NORMAL, 0 dw $x u edited in place; Ctrl-Enter submitted once (the read-only bridge refused create_issue)`);
+    },
+  },
+  {
+    id: 'issue-form-esc-contract', title: 'Esc leaves INSERT for NORMAL only; Esc in NORMAL on a dirty form shows UNSAVED CHANGES; a further Esc discards; Tab / Shift-Tab move between fields; the mode shows in the field border',
+    async run(h) {
+      const { page } = h;
+      await h.fresh(); await h.openIssueForm();
+      const open = () => page.eval(`!!document.querySelector('dialog[open] [name=title]')`);
+      const err = () => page.eval(`(document.querySelector('dialog[open] .form-error')||{hidden:true}).hidden ? '' : document.querySelector('dialog[open] .form-error').textContent`);
+      const border = () => page.element(TITLE, `(e) => getComputedStyle(e).borderTopColor`);
+      const steps = [];
+      const trace = [];
+      const snap = async (label) => trace.push(`${label}: ${JSON.stringify(await page.eval(`(() => { const e = document.querySelector('dialog[open] [name=title]'); return e ? { mode: e.dataset.vimMode, value: e.value, sel: [e.selectionStart, e.selectionEnd], active: document.activeElement?.name, err: document.querySelector('dialog[open] .form-error')?.textContent ?? null } : null; })()`))}`);
+      // A form nobody typed in: Esc leaves INSERT, the next Esc closes it.
+      await h.focus(TITLE);
+      await h.send('<Esc>'); steps.push(['pristine Esc 1 → normal, open', (await h.mode(TITLE)) === 'normal' && (await open())]);
+      await h.send('<Esc>'); steps.push(['pristine Esc 2 closes', !(await open())]);
+      await h.openIssueForm(); await h.focus(TITLE);
+      await page.keys('abc');
+      await snap('typed');
+      const insertBorder = await border();
+      steps.push(['opens in insert, typed abc', (await h.mode(TITLE)) === 'insert' && (await h.val(TITLE)) === 'abc']);
+      // Tab / Shift-Tab move between fields; each opens in INSERT at the end of its text.
+      await page.key('Tab'); await sleep(150);
+      steps.push(['Tab → description in insert', (await page.eval(`document.activeElement.name`)) === 'body' && (await h.mode(BODY)) === 'insert']);
+      await page.key('Tab', { shift: true }); await sleep(150);
+      await snap('shift-tab');
+      steps.push(['Shift-Tab → title in insert at its end', (await page.eval(`document.activeElement.name`)) === 'title' && (await h.mode(TITLE)) === 'insert' && JSON.stringify(await h.sel(TITLE)) === '[3,3]']);
+      await h.send('<Esc>');
+      await snap('esc');
+      const normalBorder = await border();
+      steps.push(['Esc in INSERT → NORMAL only (open, no warning)', (await h.mode(TITLE)) === 'normal' && (await open()) && (await err()) === '']);
+      steps.push(['the mode shows in the border', insertBorder !== normalBorder]);
+      await h.send('<Esc>');
+      steps.push(['Esc in NORMAL on a dirty form → UNSAVED CHANGES', (await open()) && /UNSAVED CHANGES/.test(await err())]);
+      await h.send('<Esc>');
+      steps.push(['a further Esc discards', !(await open())]);
+      // The mouse still works: a click lands in the field and the field is a vim field in INSERT.
+      await h.openIssueForm();
+      await page.click(`document.querySelector('dialog[open] [name=assignee]')`);
+      await sleep(150);
+      await page.keys('me');
+      steps.push(['a click focuses a field in insert and types', (await h.val('dialog[open] [name=assignee]')) === 'me' && (await h.mode('dialog[open] [name=assignee]')) === 'insert']);
+      await closeDialogs(page);
+      const bad = steps.filter(([, ok]) => !ok).map(([n]) => n);
+      return bad.length ? fail(`failed: ${bad.join('; ')}; borders ${insertBorder} / ${normalBorder}; ${trace.join(' | ')}`) : pass(`${steps.length} checks: ${steps.map(([n]) => n).join('; ')}`);
+    },
+  },
+  {
+    id: 'title-limit', title: 'the title is cut at 200 characters in the editor: a live counter from 150, typing past 200 is refused and a paste cut with a visible hint; no way of editing adds a line to a one-line field',
+    async run(h) {
+      const { page } = h;
+      await h.fresh(); await h.openIssueForm();
+      const status = () => page.eval(`(() => { const s = document.querySelector('dialog[open] [name=title] ~ .line-status'); return s ? { text: s.textContent, hidden: s.hidden, state: s.dataset.state } : null; })()`);
+      const setTitle = async (text) => {
+        await page.element(TITLE, `(e) => { e.value = ${q(text)}; e.dispatchEvent(new CustomEvent('rsi-resync')); e.blur(); e.focus(); }`, { step: 'set title' });
+        await sleep(150);
+      };
+      const steps = [];
+      await setTitle('x'.repeat(100));
+      steps.push(['no counter below 150', (await status())?.hidden === true]);
+      await setTitle('y'.repeat(150));
+      steps.push(['counter 150/200 from 150', (await status())?.text === '150/200' && !(await status()).hidden]);
+      await setTitle('z'.repeat(197));
+      await page.keys('abcde');
+      let v = await h.val(TITLE);
+      let s = await status();
+      steps.push(['typing past 200 is refused with the hint', v.length === 200 && v.endsWith('zabc') && s?.state === 'refused' && /TITLE LIMIT/.test(s.text) && /200 characters/.test(s.text)]);
+      await page.key('Backspace'); await sleep(100);
+      s = await status();
+      steps.push(['Backspace clears the hint, counter 199/200', (await h.val(TITLE)).length === 199 && s?.text === '199/200' && s.state === 'count']);
+      // A paste is cut to what fits and its line break becomes a space.
+      const paste = (text) => page.element(TITLE, `(e) => { const dt = new DataTransfer(); dt.setData('text/plain', ${q(text)}); e.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })); }`, { step: 'paste' });
+      await paste('A\nBCD'); await sleep(150);
+      v = await h.val(TITLE); s = await status();
+      steps.push(['a paste past 200 is cut with the hint', v.length === 200 && v.endsWith('abA') && s?.state === 'refused']);
+      await setTitle('ab');
+      await h.focus(TITLE);
+      await page.key('Enter', { shift: true }); await sleep(100);
+      await paste('x\ny'); await sleep(150);
+      v = await h.val(TITLE);
+      steps.push(['no line break by Shift-Enter or a paste', v === 'abx y']);
+      // A vim edit that would pass the limit is undone whole, like the TUI's refused key.
+      await setTitle('q'.repeat(150)); await h.send('<Esc>');
+      await h.send('yy'); for (let i = 0; i < 3; i++) await h.send('P');
+      v = await h.val(TITLE);
+      steps.push(['P past 200 is refused whole', v === 'q'.repeat(150)]);
+      await closeDialogs(page);
+      const bad = steps.filter(([, ok]) => !ok).map(([n]) => n);
+      return bad.length ? fail(`failed: ${bad.join('; ')}`) : pass(`${steps.length} checks: ${steps.map(([n]) => n).join('; ')}`);
+    },
+  },
+  {
+    id: 'project-form-fields', title: "the project form's name and folder are wrapping vim fields (create): INSERT at the end, Esc → NORMAL only, 0 dw $x u edit in place, Enter submits, Esc in NORMAL closes",
+    async run(h) {
+      const { page } = h;
+      await h.fresh();
+      await h.palette('New project');
+      if (!(await page.waitFor(`document.querySelector('dialog.pick-form-dialog[open] [name=name]')`, 5000))) return fail('New project did not open the form');
+      const NAME = 'dialog.pick-form-dialog[open] [name=name]';
+      const PATH = 'dialog.pick-form-dialog[open] [name=path]';
+      const problems = [];
+      for (const [name, sel] of [['name', NAME], ['folder', PATH]]) {
+        const bad = await exerciseField(h, sel);
+        if (bad) problems.push(`${name}: ${bad}`);
+      }
+      const kinds = await page.eval(`['name', 'path'].map((n) => { const e = document.querySelector('dialog.pick-form-dialog[open] [name=' + n + ']'); return n + ':' + e.tagName + ':' + e.dataset.line; }).join(' ')`);
+      if (kinds !== 'name:TEXTAREA:single path:TEXTAREA:single') problems.push(`field kinds ${kinds}`);
+      // The last field was left in NORMAL: leave and re-enter each so focus puts it in INSERT again before retyping.
+      for (const [sel, text] of [[PATH, ''], [NAME, 'demo']]) {
+        await page.element(sel, '(e) => { e.blur(); e.focus(); }', { step: 'refocus field' });
+        await h.retype(sel, text);
+      }
+      const before = h.bridgeLog.filter((e) => e.cmd === 'create_project' && e.outcome === 'refused').length;
+      await page.key('Enter'); await sleep(400);
+      const submitted = h.bridgeLog.filter((e) => e.cmd === 'create_project' && e.outcome === 'refused').length - before;
+      if (submitted !== 1) problems.push(`Enter reached the submit ${submitted} times (the read-only bridge refuses create_project)`);
+      if ((await h.val(NAME)) !== 'demo') problems.push(`Enter changed the name to ${JSON.stringify(await h.val(NAME))}`);
+      await h.focus(NAME);
+      await h.send('<Esc>');
+      const stillOpen = await page.eval(`!!document.querySelector('dialog.pick-form-dialog[open]')`);
+      await h.send('<Esc>');
+      const closed = await page.eval(`!document.querySelector('dialog.pick-form-dialog[open]')`);
+      if (!stillOpen || !closed) problems.push(`Esc in INSERT left the form open ${stillOpen}, Esc in NORMAL closed it ${closed}`);
+      await closeDialogs(page);
+      return problems.length ? fail(problems.join('; ')) : pass(`name and folder: ${kinds}; each opened in INSERT at the end, Esc → NORMAL, 0 dw $x u edited in place; Enter submitted once; Esc then Esc closed the form`);
+    },
+  },
+  {
+    id: 'issue-filter-dependency-fields', title: 'the Issue filter, search and dependency inputs are wrapping vim fields too (every text field of every Issue form)',
+    async run(h) {
+      const { page } = h;
+      await h.fresh();
+      await h.command('issues'); await sleep(600);
+      const problems = [];
+      for (const [key, title] of [['f', 'Filter Issues'], ['/', 'Search Issues'], ['b', 'Dependencies of']]) {
+        await page.key(key); await sleep(500);
+        const got = await page.eval(`(document.querySelector('dialog[open] h2')||{}).textContent||''`);
+        if (!got.startsWith(title)) { problems.push(`${key} opened ${JSON.stringify(got)}, not ${title}`); await closeDialogs(page); continue; }
+        const names = await page.eval(`[...document.querySelectorAll('dialog[open] .form-fields [name]')].filter((e) => e.tagName === 'TEXTAREA' || (e.tagName === 'INPUT' && e.type === 'text')).map((e) => e.name + ':' + e.tagName + ':' + (e.dataset.line ?? ''))`);
+        if (names.length === 0) problems.push(`${title}: no text field`);
+        for (const n of names) {
+          const [name, tag, line] = n.split(':');
+          if (tag !== 'TEXTAREA' || line !== 'single') problems.push(`${title}/${name} is ${tag} ${line}, not a wrapping line field`);
+          const bad = await exerciseField(h, `dialog[open] [name=${name}]`);
+          if (bad) problems.push(`${title}/${name}: ${bad}`);
+        }
+        await closeDialogs(page);
+      }
+      return problems.length ? fail(problems.join('; ')) : pass('filter (text, priorities, assignee, labels, provenance), search and the dependency number: every text field is a wrapping line field and edits as a vim field');
+    },
+  },
+  {
+    id: 'form-fields-vim-off', title: 'with Vim keys off the Issue form fields edit plainly: no mode, Esc on a dirty form warns before it discards, Enter submits and adds no line, the title is still cut at 200',
+    async run(h) {
+      const { page } = h;
+      await h.fresh();
+      await h.toggleVimKeys(false);
+      // Vim's `:issues` and `n` are off: the Actions menu opens the workspace and its button the form.
+      await h.palette('Issues workspace');
+      await page.element('#issues-view:not([hidden])', undefined, { step: 'Issues workspace open' });
+      await sleep(400);
+      await page.click(`document.querySelector('#issues-view [data-action=issues-new]')`);
+      if (!(await page.waitFor(`document.querySelector('dialog[open] [name=title]')`, 4000))) return fail('New Issue did not open the form');
+      await h.focus(TITLE);
+      await page.keys('plain text');
+      const steps = [];
+      await page.key('Home'); await page.key('Delete'); await sleep(100);
+      steps.push(['plain Home/Delete editing', (await h.val(TITLE)) === 'lain text']);
+      steps.push(['no vim mode', (await h.mode(TITLE)) === '']);
+      await page.key('Enter'); await sleep(300);
+      steps.push(['Enter adds no line and submits', !(await h.val(TITLE)).includes('\n') && h.bridgeLog.some((e) => e.cmd === 'create_issue' && e.outcome === 'refused')]);
+      await page.element(TITLE, `(e) => { e.value = ${q('w'.repeat(199))}; e.dispatchEvent(new CustomEvent('rsi-resync')); e.blur(); e.focus(); }`, { step: 'long title' });
+      await sleep(100);
+      await page.keys('ab');
+      steps.push(['the cap holds without Vim keys', (await h.val(TITLE)).length === 200]);
+      await page.key('Escape'); await sleep(200);
+      const warned = await page.eval(`!!document.querySelector('dialog[open] [name=title]') && /UNSAVED CHANGES/.test(document.querySelector('dialog[open] .form-error').textContent)`);
+      steps.push(['Esc on a dirty form warns first', warned]);
+      await page.key('Escape'); await sleep(200);
+      steps.push(['a further Esc discards', await page.eval(`!document.querySelector('dialog[open] [name=title]')`)]);
+      await h.toggleVimKeys(true);
+      const bad = steps.filter(([, ok]) => !ok).map(([n]) => n);
+      return bad.length ? fail(`failed: ${bad.join('; ')}`) : pass(`${steps.length} checks: ${steps.map(([n]) => n).join('; ')}`);
     },
   },
   {
@@ -406,28 +694,39 @@ export const SCENARIOS = [
   },
 ];
 
-export async function runVimSuite({ dist = DIST, chromeBin, out, only = null, signal }) {
+export async function runVimSuite({ dist = DIST, chromeBin, out, only = null, signal, scenarios = SCENARIOS }) {
   mkdirSync(out, { recursive: true });
   const fake = await startFakeDaemon(VIM_FIXTURES);
   const bridgeLog = [];
   let server, chrome, page;
   const results = [];
   try {
-    const bridge = createBridge({ call: (m, p) => rpcCall(fake.socket, m, p), record: (e) => bridgeLog.push(e) });
+    const bridge = createBridge({ call: (m, p) => {
+      bridgeLog.push({ method: m, outcome: 'started' });
+      return rpcCall(fake.socket, m, p);
+    }, record: (e) => bridgeLog.push(e) });
     const token = newToken();
     const served = await serve({ dist, bridge, token, onRefusal: (e) => bridgeLog.push(e), signal });
     server = served.server;
-    chrome = await launchChrome(chromeBin, { signal });
-    page = await connectPage(chrome.cdpPort, { signal });
-    page.origin = `http://127.0.0.1:${served.port}`;
-    const h = helpers(page, bridgeLog);
-    for (const s of SCENARIOS) {
+    for (const s of scenarios) {
       if (only && !only.includes(s.id)) continue;
-      let r;
-      try { r = await s.run(h); } catch (e) { r = fail(`threw: ${e.message}`); }
-      const shot = await page.shot(join(out, `${s.id}.png`)).catch(() => null);
-      results.push({ id: s.id, title: s.title, ...r, screenshot: shot });
-      await h.closeAll().catch(() => undefined);
+      try {
+        // Independent scenarios need independent renderers and module caches. Repeated
+        // navigation in a reused runtime produced canceled module loads under the CPU quota (#492),
+        // leaving readyState=complete with no main/boot execution and no console error.
+        chrome = await launchChrome(chromeBin, { signal });
+        page = await connectPage(chrome.cdpPort, { signal });
+        page.origin = `http://127.0.0.1:${served.port}`;
+        let r;
+        try { r = await s.run(helpers(page, bridgeLog)); } catch (e) { r = fail(`threw: ${e.message}`); }
+        const shot = await page.shot(join(out, `${s.id}.png`)).catch(() => null);
+        results.push({ id: s.id, title: s.title, ...r, screenshot: shot });
+      } finally {
+        page?.close();
+        await chrome?.stop();
+        page = undefined;
+        chrome = undefined;
+      }
     }
   } finally {
     page?.close();

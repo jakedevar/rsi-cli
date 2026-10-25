@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::agy::{AgyClient, AgyProcess};
@@ -161,6 +161,26 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
         super::launch::provider_effective_model(provider, config.model.as_deref()).as_deref(),
     ) {
         return Err(DaemonError::PolicyDenied(reason));
+    }
+    // #3177: a bench launch must be provably Harness-only before anything
+    // starts: no Codex process, no fallback to one, whatever the settings say.
+    if config.bench().is_some() {
+        bench_route_preflight(provider, config, inner)?;
+    }
+    // #3154: the OpenRouter spend ceiling also gates this chokepoint, which
+    // continuations, rotations and successors reach without passing through
+    // `freeze_launch_identity`. It judges the last probe of the account usage
+    // and fails closed when that is stale; a cap that is off admits.
+    if crate::openrouter_spend::launch_bills_openrouter(
+        provider,
+        config.openai_base_url.as_deref(),
+        config.model.as_deref(),
+    ) {
+        crate::openrouter_spend::check_launch_cached(
+            inner.runtime_config(),
+            crate::provider_status::ProviderStatusService::global(),
+            chrono::Utc::now(),
+        )?;
     }
     // #2759: the turn the topology executor opened to obtain a node's handoff
     // carries the handoff schema, on the CLIs that take one (Claude
@@ -350,6 +370,51 @@ pub(super) fn spawn_provider_process<L: ProviderLauncher>(
     }
 }
 
+/// #3177: refuse a bench launch unless its route is the Harness with no
+/// fallback possible. `Harness` is the direct API loop. `OpenRouter` must
+/// resolve to the Harness route (an operator `codex_cli` route is refused), the
+/// Codex fallback setting must be off (a failed preflight on a continuation or
+/// rotation could otherwise reach the Codex CLI), and the Harness preflight must
+/// pass. Every other provider runs a CLI or a non-Harness client. The refusal is
+/// `PolicyDenied("bench_route_required:<reason>")`, raised before any launch,
+/// so no process of any kind has started.
+fn bench_route_preflight<L: ProviderLauncher>(
+    provider: SessionProvider,
+    config: &LaunchConfig,
+    inner: &L,
+) -> Result<()> {
+    let refuse = |reason: String| {
+        DaemonError::PolicyDenied(format!(
+            "{}:{reason}",
+            rsi_common::bench_profile::BENCH_ROUTE_REQUIRED
+        ))
+    };
+    match provider {
+        SessionProvider::Harness => Ok(()),
+        SessionProvider::OpenRouter => {
+            let model = config
+                .model
+                .as_deref()
+                .unwrap_or(crate::openrouter::OPENROUTER_DEFAULT_MODEL);
+            let runtime = inner.runtime_config();
+            if runtime.openrouter_route_resolution(model).0
+                != crate::config::OpenRouterRoute::Harness
+            {
+                return Err(refuse("route_not_harness".into()));
+            }
+            if runtime.openrouter_fallback_enabled() {
+                return Err(refuse("fallback_enabled".into()));
+            }
+            openrouter_harness_preflight(model, inner.openrouter_credential_available())
+                .map_err(|cause| refuse(format!("preflight_{cause}")))
+        }
+        other => Err(refuse(format!(
+            "provider_{}",
+            rsi_common::harness_tool_policy::provider_label(other)
+        ))),
+    }
+}
+
 /// #3141: the cause of a refused OpenRouter Harness preflight, if `error` is one.
 pub(super) fn openrouter_preflight_cause(error: &DaemonError) -> Option<&'static str> {
     match error {
@@ -363,7 +428,7 @@ pub(super) fn openrouter_preflight_cause(error: &DaemonError) -> Option<&'static
 /// (`openrouter_harness_preflight:<cause>`) and one visible `System` row;
 /// the caller has already marked the session `Failed`.
 pub(super) async fn record_route_preflight_failure(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: Uuid,
     cause: &'static str,
 ) {
@@ -386,7 +451,7 @@ pub(super) async fn record_route_preflight_failure(
 /// as its stop reason, so the runtime and the store agree on how it ended.
 pub(super) async fn fail_completed_session_for_route_preflight(
     persistence: &super::PersistenceHandle,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     entry: &mut CompletedSession,
     cause: &'static str,
 ) {
@@ -588,6 +653,20 @@ impl<L: ProviderLauncher> ToolPolicyGuard<'_, L> {
         Ok(std::borrow::Cow::Owned(resolved))
     }
 
+    /// #3176: a container-bound session runs only on the Harness loop, whose
+    /// tools reach the container. Every CLI, Local and Antigravity route would
+    /// run its tools on the host, so each is refused, including an OpenRouter or
+    /// Bedrock fallback to the Codex CLI. There is no fallback to the host.
+    fn refuse_container(config: &LaunchConfig) -> Result<()> {
+        if config.exec_target.is_container() {
+            return Err(DaemonError::PolicyDenied(format!(
+                "{}:provider_not_harness",
+                rsi_common::exec_target::EXEC_TARGET_INVALID
+            )));
+        }
+        Ok(())
+    }
+
     /// A route that enforces no part of a policy (Local, Antigravity).
     fn refuse_if_policy(&self) -> Result<()> {
         if self.under_policy() {
@@ -640,6 +719,7 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(ClaudeProcess, mpsc::Receiver<StreamEvent>)> {
+        Self::refuse_container(config)?;
         let config = self.cli_config(config)?;
         self.inner.launch_claude(&config, execution)
     }
@@ -648,6 +728,7 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(CodexProcess, mpsc::Receiver<StreamEvent>)> {
+        Self::refuse_container(config)?;
         let config = self.cli_config(config)?;
         if let Some(refusal) = self.inner.codex_custody_refusal(&config) {
             tracing::warn!("Codex launch refused: the custody hook is not trusted (#2755)");
@@ -660,6 +741,7 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         config: &LaunchConfig,
         initial_admission_permit: AdmissionPermit,
     ) -> Result<(OpenAiProcess, mpsc::Receiver<StreamEvent>)> {
+        Self::refuse_container(config)?;
         self.refuse_if_policy()?;
         self.inner.launch_local(config, initial_admission_permit)
     }
@@ -668,6 +750,7 @@ impl<L: ProviderLauncher> ProviderLauncher for ToolPolicyGuard<'_, L> {
         config: &LaunchConfig,
         execution: CliExecutionCapability,
     ) -> Result<(AgyProcess, mpsc::Receiver<StreamEvent>)> {
+        Self::refuse_container(config)?;
         self.refuse_if_policy()?;
         self.inner.launch_agy(config, execution)
     }
@@ -767,9 +850,8 @@ impl ProviderLauncher for CachedLauncher<'_> {
         initial_admission_permit: AdmissionPermit,
     ) -> Result<(OpenAiProcess, mpsc::Receiver<StreamEvent>)> {
         // Absorbs the Local ad-hoc branch: `launch_session` may carry an inline
-        // custom provider (`openai_base_url`), in which case a per-launch client
-        // is built; `continue_session` always sets `openai_base_url = None`, so
-        // it keeps using the cached client — behavior identical to both sites.
+        // custom provider (`openai_base_url`), including a restored saved
+        // binding on continuation, in which case a per-launch client is built.
         let model = config
             .model
             .clone()
@@ -959,7 +1041,7 @@ pub(super) struct FreshHarnessCtx {
     pub custody_runtime: crate::sandbox::custody::CustodyExecutionRuntime,
     pub active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
     pub completed: Arc<RwLock<HashMap<Uuid, CompletedSession>>>,
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<rsid_core::store_lock::Mutex<Store>>,
     pub event_bus: Arc<crate::bus::EventBus>,
     pub model_call_settlements: ModelCallSettlementHandle,
     pub spawn_coordinator: Arc<SpawnCoordinator>,
@@ -1024,7 +1106,10 @@ impl ProviderLauncher for FreshLauncher {
         config: &LaunchConfig,
         initial_admission_permit: AdmissionPermit,
     ) -> Result<(OpenAiProcess, mpsc::Receiver<StreamEvent>)> {
-        let client = OpenAiClient::new_local()?;
+        let client = match &config.openai_base_url {
+            Some(url) => OpenAiClient::with_config(url.clone(), config.openai_api_key.clone())?,
+            None => OpenAiClient::new_local()?,
+        };
         let model = config
             .model
             .clone()
@@ -1125,7 +1210,9 @@ mod codegraph_rotation_tests {
         let (_manager, handle) =
             crate::codegraph::IndexManager::new(index.path().to_path_buf(), vec![workspace])
                 .unwrap();
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let runtime_config =
             crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
         let agent_message_arbiter =
@@ -1366,7 +1453,214 @@ mod route_tests {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
+    }
+
+    /// #3176: a container-bound session runs only on the Harness loop. The
+    /// OpenRouter Harness route reaches it with the target on the config; the
+    /// Codex CLI route (an explicit opt-in or the preflight fallback), Claude,
+    /// Codex, Local and Antigravity are refused, so a container-bound session
+    /// never falls back to running its tools on the host.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_container_bound_session_runs_only_on_the_harness_loop() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let mut config = route_config("vendor/model".into());
+        config.exec_target = rsi_common::exec_target::ExecTarget::Container(
+            rsi_common::exec_target::ContainerExecTarget {
+                docker_host: "ssh://arch-laptop".into(),
+                container: "tb2-main-1".into(),
+                workdir: "/app".into(),
+                user: None,
+                compose_project: "tb2-trial".into(),
+                pinned_digests: vec![format!("sha256:{}", "a".repeat(64))],
+                per_call_ceiling_secs: 900,
+            },
+        );
+        let permit = AdmissionPermit::for_route_dispatch_test();
+        spawn_provider_process(
+            SessionProvider::OpenRouter,
+            &config,
+            &launcher,
+            &permit,
+            &guard,
+        )
+        .expect("the Harness route runs a container-bound session");
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 1);
+
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("codex_cli"))
+            .unwrap();
+        for provider in [
+            SessionProvider::OpenRouter,
+            SessionProvider::Claude,
+            SessionProvider::Codex,
+            SessionProvider::Local,
+            SessionProvider::Antigravity,
+        ] {
+            // A permit authorizes one CLI claim; each route gets its own.
+            let permit = AdmissionPermit::for_route_dispatch_test();
+            let refused = spawn_provider_process(provider, &config, &launcher, &permit, &guard);
+            let Err(error) = refused else {
+                panic!("{provider:?} must not run a container-bound session");
+            };
+            // #3177: a container-bound session is a bench session, so the typed
+            // `bench_route_required` refusal comes first; the tool guard's
+            // `exec_target_invalid` stays the backstop behind it.
+            let message = error.to_string();
+            assert!(
+                message.contains("bench_route_required:")
+                    || message.contains("exec_target_invalid:provider_not_harness"),
+                "{provider:?}: {message}"
+            );
+        }
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+        assert!(launcher.cli_seen.lock().unwrap().is_empty());
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 1);
+    }
+
+    fn bench_config(model: &str) -> LaunchConfig {
+        let mut config = route_config(model.into());
+        config.bench_profile = Some(rsi_common::bench_profile::BenchLaunchProfile::default());
+        config
+    }
+
+    fn bench_refusal(error: DaemonError) -> String {
+        let DaemonError::PolicyDenied(reason) = error else {
+            panic!("a typed policy refusal, got {error:?}");
+        };
+        reason
+    }
+
+    /// #3177: a bench launch is refused with `bench_route_required:<reason>`
+    /// unless OpenRouter resolves to the Harness route, its preflight passes and
+    /// no Codex fallback is possible. Every refusal happens before a launch, so
+    /// no Codex process starts and no CLI sees the config.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_bench_launch_is_refused_unless_the_route_is_harness_with_no_fallback() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        let spawn = |launcher: &RouteLauncher, config: &LaunchConfig| {
+            spawn_provider_process(
+                SessionProvider::OpenRouter,
+                config,
+                launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard,
+            )
+        };
+
+        // The operator's explicit Codex CLI route: refused, never spawned.
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("codex_cli"))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let reason = bench_refusal(
+            spawn(&launcher, &bench_config("vendor/model"))
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(reason, "bench_route_required:route_not_harness");
+        // The same route is still honoured for a launch that is not a bench one.
+        assert!(spawn(&launcher, &route_config("vendor/model".into())).is_ok());
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 1);
+
+        // The Harness route with a failed preflight: refused even though the
+        // fallback is on, so the Codex CLI is never reached.
+        runtime
+            .update_field("api_route.openrouter", &serde_json::json!("harness"))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), false);
+        let reason = bench_refusal(
+            spawn(&launcher, &bench_config("vendor/model"))
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(reason, "bench_route_required:preflight_missing_credential");
+        let reason = bench_refusal(spawn(&launcher, &bench_config("")).err().unwrap());
+        assert_eq!(reason, "bench_route_required:preflight_unsupported_model");
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
+            .unwrap();
+        let reason = bench_refusal(
+            spawn(&launcher, &bench_config("vendor/model"))
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(reason, "bench_route_required:fallback_enabled");
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 0);
+        assert!(launcher.cli_seen.lock().unwrap().is_empty());
+
+        // Harness route, preflight passes, fallback off: the one allowed path.
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(false))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        let (process, _events) = spawn(&launcher, &bench_config("vendor/model")).unwrap();
+        assert!(matches!(process, ProviderProcess::Harness(_)));
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+        // The direct Harness provider needs no route resolution.
+        let (process, _events) = spawn_provider_process(
+            SessionProvider::Harness,
+            &bench_config("vendor/model"),
+            &launcher,
+            &AdmissionPermit::for_route_dispatch_test(),
+            &guard,
+        )
+        .unwrap();
+        assert!(matches!(process, ProviderProcess::Harness(_)));
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+    }
+
+    /// #3177: no provider that runs a CLI (or any non-Harness client) can run a
+    /// bench launch, and none is launched while refusing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[tokio::test]
+    async fn a_bench_launch_never_reaches_a_cli_provider() {
+        let guard = super::super::spawn_single_flight::acquire_spawn_guard(Uuid::new_v4()).await;
+        let runtime = crate::config::RuntimeConfig::from_config(&crate::config::Config::default());
+        runtime
+            .update_field("api_route.fallback.openrouter", &serde_json::json!(true))
+            .unwrap();
+        runtime
+            .update_field("api_route.fallback.bedrock", &serde_json::json!(true))
+            .unwrap();
+        let launcher = RouteLauncher::new(Arc::clone(&runtime), true);
+        for (provider, label) in [
+            (SessionProvider::Claude, "claude"),
+            (SessionProvider::Codex, "codex"),
+            (SessionProvider::Pioneer, "pioneer"),
+            (SessionProvider::Bedrock, "bedrock"),
+            (SessionProvider::Local, "local"),
+            (SessionProvider::Antigravity, "antigravity"),
+            (SessionProvider::CodexAppServer, "codex_app_server"),
+        ] {
+            let refused = spawn_provider_process(
+                provider,
+                &bench_config("vendor/model"),
+                &launcher,
+                &AdmissionPermit::for_route_dispatch_test(),
+                &guard,
+            );
+            assert_eq!(
+                bench_refusal(refused.err().unwrap()),
+                format!("bench_route_required:provider_{label}")
+            );
+        }
+        assert_eq!(launcher.codex_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(launcher.harness_starts.load(Ordering::SeqCst), 0);
+        assert!(launcher.cli_seen.lock().unwrap().is_empty());
     }
 
     /// Issue #692: the provider-level chokepoint (reached by continuations,

@@ -36,14 +36,17 @@
 //! deploy from ever seeing a gap.
 //!
 //! A staged `interrupt_workers` deploy additionally holds new `test`/`build`
-//! jobs for its whole life, past that cap (#2190): such a deploy stops running
-//! test jobs after their grace, so a job started later would only be killed.
+//! jobs for its whole life, past that cap (#2190), so a job started after the worker
+//! hold neither piles up behind the restart nor begins just before it.
+//! Every other staged deploy holds them to its deadline too, with no retry
+//! window (#3373, [`DeployDrain::hold_jobs_until_deadline`]): it stops no job,
+//! so it reaches quiet only if running jobs drain, and a job started after the
+//! worker hold would keep `job_running` set while the queue sits held.
 //! The hold ends when the deploy settles, is cancelled or reaches its deadline;
-//! see [`DeployDrain::hold_jobs_until_settled`]. While a landing or a build job
-//! (which a deploy cannot preempt) still blocks the quiet point, the deploy does
-//! not stop test jobs either ([`DeployDrain::note_unpreemptible_blocked`]). The
-//! merge queue likewise admits no new batch for the whole staged deploy. A stopped
-//! test job is requeued under its own id (#2278), and when such a deploy times
+//! see [`DeployDrain::hold_jobs_until_settled`]. The
+//! merge queue likewise admits no new batch for the whole staged deploy. A running
+//! ordinary test job is neither stopped nor requeued by such a deploy (#3554):
+//! it keeps running across the restart. When such a deploy times
 //! out the job hold outlives it for a retry window
 //! ([`DeployDrain::hold_jobs_for_retry`]) that starts at the deploy's deadline
 //! and is installed with the staged hold, so the hold is continuous (#2551), is
@@ -222,10 +225,6 @@ pub struct DeployDrain {
     /// When a hold on new job starts was last engaged (or the daemon started):
     /// the base of the `job_admission_timed_out` net for a queued job (#2190).
     job_hold_engaged: Mutex<DateTime<Utc>>,
-    /// The latest time the jobs loop saw the staged deploy blocked by something
-    /// it cannot preempt (a landing or a build job), with the deploy's id: test
-    /// jobs get their grace from then (#2190).
-    unpreemptible_seen: Mutex<Option<(Uuid, DateTime<Utc>)>>,
     /// What the waiting deploy's last quiet-point poll found (#1177).
     blockers: Mutex<Vec<&'static str>>,
     /// The deploy waiting for its quiet point and its own deadline, whether
@@ -268,7 +267,6 @@ impl DeployDrain {
             jobs_held: Mutex::new(None),
             jobs_retry_hold: Mutex::new(None),
             job_hold_engaged: Mutex::new(Utc::now()),
-            unpreemptible_seen: Mutex::new(None),
             blockers: Mutex::new(Vec::new()),
             waiting_deploy: Mutex::new(None),
             hold_cap_secs: AtomicU64::new(UNCAPPED),
@@ -396,8 +394,8 @@ impl DeployDrain {
 
     /// #2190: hold new `test`/`build` job starts for the whole life of `row`
     /// (to its deadline), whether or not the worker-start hold is still engaged.
-    /// For a staged `interrupt_workers` deploy only: it stops running test jobs
-    /// after their grace, so a job admitted meanwhile would be killed. Cleared
+    /// For a staged `interrupt_workers` deploy only: a job admitted meanwhile
+    /// would start just before the restart it survives (#3554). Cleared
     /// when the deploy settles ([`Self::sync_until`]) or is cancelled
     /// ([`Self::release`]).
     pub(crate) fn hold_jobs_until_settled(&self, row: &DeployRow, now: DateTime<Utc>) {
@@ -405,6 +403,17 @@ impl DeployDrain {
         // hold stays continuous across the deadline even before the runner has
         // settled the timeout. It replaces an older deploy's window.
         self.hold_jobs_for_retry(row);
+        self.hold_jobs_until_deadline(row, now);
+    }
+
+    /// #3373: hold new `test`/`build` job starts to the deadline of the staged
+    /// deploy `row` with no retry window. A deploy that does not interrupt
+    /// workers never stops a running job, so it can reach its quiet point only
+    /// if running jobs drain; a job started after the worker-start hold would
+    /// keep `job_running` set to the deadline, hold the merge queue the whole
+    /// time and time the deploy out. Cleared like
+    /// [`Self::hold_jobs_until_settled`].
+    pub(crate) fn hold_jobs_until_deadline(&self, row: &DeployRow, now: DateTime<Utc>) {
         if let Ok(mut jobs) = self.jobs_held.lock() {
             *jobs = (now < row.deadline_at).then_some(Active {
                 deploy_id: row.id,
@@ -524,26 +533,6 @@ impl DeployDrain {
             .max()
     }
 
-    /// Record that the staged deploy `deploy_id` is blocked, at `now`, by
-    /// something it cannot preempt (a landing or a build job): the jobs loop
-    /// calls this every tick it sees such a blocker.
-    pub(crate) fn note_unpreemptible_blocked(&self, deploy_id: Uuid, now: DateTime<Utc>) {
-        if let Ok(mut seen) = self.unpreemptible_seen.lock() {
-            *seen = Some((deploy_id, now));
-        }
-    }
-
-    /// The latest time `deploy_id` was seen blocked by something it cannot
-    /// preempt, if ever (since this daemon started).
-    pub(crate) fn unpreemptible_blocked_at(&self, deploy_id: Uuid) -> Option<DateTime<Utc>> {
-        self.unpreemptible_seen
-            .lock()
-            .ok()
-            .and_then(|seen| *seen)
-            .filter(|(id, _)| *id == deploy_id)
-            .map(|(_, at)| at)
-    }
-
     fn active_at(&self, now: DateTime<Utc>) -> Option<Active> {
         (*self.state.borrow()).filter(|active| now < active.deadline)
     }
@@ -561,7 +550,12 @@ impl DeployDrain {
         self.holds_at(session, has_parent, Utc::now())
     }
 
-    fn holds_at(&self, session: Option<Uuid>, has_parent: bool, now: DateTime<Utc>) -> bool {
+    pub(crate) fn holds_at(
+        &self,
+        session: Option<Uuid>,
+        has_parent: bool,
+        now: DateTime<Utc>,
+    ) -> bool {
         self.active_at(now).is_some_and(|active| {
             has_parent && active.owner.is_none_or(|owner| session != Some(owner))
         })
@@ -601,6 +595,25 @@ impl DeployDrain {
             }
         }
         active.is_some()
+    }
+
+    /// #3885: the staged deploy that holds merge-queue admission right now, if
+    /// any, for `AgentListRollingQueue`'s `held_for_deploy`.
+    #[must_use]
+    pub fn queue_deploy_hold(&self) -> Option<rsi_common::rolling_queue::QueueDeployHoldV1> {
+        self.queue_deploy_hold_at(Utc::now())
+    }
+
+    fn queue_deploy_hold_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Option<rsi_common::rolling_queue::QueueDeployHoldV1> {
+        let queue = self.queue_held.lock().ok()?;
+        let deploy = queue.deploy.filter(|d| now < d.deadline)?;
+        Some(rsi_common::rolling_queue::QueueDeployHoldV1 {
+            deploy_id: deploy.deploy_id,
+            release_by: deploy.deadline.to_rfc3339_opts(SecondsFormat::Nanos, true),
+        })
     }
 
     /// Note a queued manager action that was returned to the queue.
@@ -973,6 +986,37 @@ mod tests {
         assert!(!drain.hold_queue_admission_at(true, now));
     }
 
+    /// #3885: the queue listing names the deploy that holds admission, to its
+    /// deadline, however long the worker-start hold cap is; a settled,
+    /// cancelled or expired deploy (and a daemon with no deploy, such as the
+    /// one a peer deploy leaves alone) shows no hold.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn the_queue_listing_names_the_staged_deploy_that_holds_admission() {
+        let drain = DeployDrain::new();
+        drain.set_hold_cap_secs(60);
+        let now = Utc::now();
+        assert!(drain.queue_deploy_hold_at(now).is_none(), "no hub deploy");
+        let live = row(Uuid::new_v4(), now + chrono::Duration::minutes(30));
+        let worker_end = Some(now - chrono::Duration::seconds(1));
+        drain.sync_until(Some(&live), worker_end, true, now);
+        let later = now + chrono::Duration::minutes(10);
+        let hold = drain
+            .queue_deploy_hold_at(later)
+            .expect("held past the cap");
+        assert_eq!(hold.deploy_id, live.id);
+        assert_eq!(
+            hold.release_by,
+            live.deadline_at.to_rfc3339_opts(SecondsFormat::Nanos, true)
+        );
+        assert!(drain.queue_deploy_hold_at(live.deadline_at).is_none());
+        drain.release(live.id);
+        assert!(drain.queue_deploy_hold_at(now).is_none(), "cancelled");
+        drain.sync_until(Some(&live), worker_end, true, now);
+        drain.sync(None, true, now);
+        assert!(drain.queue_deploy_hold_at(now).is_none(), "settled");
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
     #[test]
     fn the_queue_window_respects_deadlines_disabled_drain_and_deploy_identity() {
@@ -1001,6 +1045,30 @@ mod tests {
         drain.sync_until(Some(&next), worker_end, false, now);
         assert!(!drain.hold_queue_admission_at(true, now));
         assert!(drain.status().held.is_empty());
+    }
+
+    /// #3373: the deadline-only job hold (a deploy that stops no job) ends at
+    /// the deadline with no retry window and is dropped by a settle or cancel.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
+    #[test]
+    fn a_deadline_job_hold_has_no_retry_window() {
+        let drain = DeployDrain::new();
+        let worker = Uuid::new_v4();
+        let now = Utc::now();
+        let live = row(Uuid::new_v4(), now + chrono::Duration::minutes(30));
+        drain.hold_jobs_until_deadline(&live, now);
+        assert!(drain.holds_job_start(Some(worker), true));
+        assert!(drain.holds_job_start(None, false));
+        assert_eq!(drain.job_release_by(), Some(live.deadline_at));
+        assert!(!drain.holds_job_start_at(Some(worker), true, live.deadline_at));
+        drain.hold_jobs_until_deadline(&live, live.deadline_at);
+        assert!(drain.jobs_held_at(live.deadline_at).is_none());
+        drain.hold_jobs_until_deadline(&live, now);
+        drain.sync(None, true, now);
+        assert!(!drain.holds_job_start(Some(worker), true), "settled");
+        drain.hold_jobs_until_deadline(&live, now);
+        drain.release(live.id);
+        assert!(!drain.holds_job_start(Some(worker), true), "cancelled");
     }
 
     /// #2190: a staged `interrupt_workers` deploy holds `test`/`build` job
@@ -1160,25 +1228,5 @@ mod tests {
         drain.release(current.id);
         assert!(drain.retry_hold_owner().is_none());
         assert!(!drain.holds_job_start_at(Some(worker), true, current.deadline_at));
-    }
-
-    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-02"))]
-    #[test]
-    fn the_unpreemptible_blocker_time_is_kept_per_deploy() {
-        let drain = DeployDrain::new();
-        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
-        let now = Utc::now();
-        assert_eq!(drain.unpreemptible_blocked_at(first), None);
-        drain.note_unpreemptible_blocked(first, now);
-        assert_eq!(drain.unpreemptible_blocked_at(first), Some(now));
-        assert_eq!(drain.unpreemptible_blocked_at(second), None);
-        let later = now + chrono::Duration::seconds(5);
-        drain.note_unpreemptible_blocked(second, later);
-        assert_eq!(
-            drain.unpreemptible_blocked_at(first),
-            None,
-            "a new deploy resets it"
-        );
-        assert_eq!(drain.unpreemptible_blocked_at(second), Some(later));
     }
 }

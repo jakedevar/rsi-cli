@@ -9,7 +9,7 @@
 //!   pipeline-research  → branch=main, path=thoughts/shared/research/**
 //!   pipeline-plan      → branch=main, path=thoughts/shared/plans/**
 //!   pipeline-implement → branch != main
-//!   <unset>            → no enforcement (human commits)
+//!   <unset>            → no role enforcement (human commits)
 //!   <unknown>          → fail closed
 
 use std::path::{Path, PathBuf};
@@ -49,11 +49,16 @@ fn setup_repo() -> TempDir {
         &["git", "commit", "-q", "-m", "init"],
     );
 
-    // Copy the hook into .git/hooks/pre-commit and chmod +x.
+    // Copy the hook and its shared-config helper into .git/hooks.
     let hooks_dir = dir.path().join(".git/hooks");
     std::fs::create_dir_all(&hooks_dir).unwrap();
     let dest = hooks_dir.join("pre-commit");
     std::fs::copy(hook_source(), &dest).expect("copy hook");
+    std::fs::copy(
+        hook_source().with_file_name("check-rerere"),
+        hooks_dir.join("check-rerere"),
+    )
+    .expect("copy rerere guard");
     set_executable(&dest);
     dir
 }

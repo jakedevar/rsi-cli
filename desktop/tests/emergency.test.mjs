@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ACTIONS, appMenuModel, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
 import {
   EMERGENCY_ACTIONS, EMERGENCY_COMMAND_BINDINGS, EMERGENCY_KEY_BINDINGS, EMERGENCY_RULES, isEmergencyAction,
 } from '../dist/actions/emergency-spec.js';
@@ -34,7 +34,7 @@ test('the emergency stop is registered with the TUI keys and is always available
   assert.equal(unavailable('emergency-stop', snap({ open: { status: 'Completed', readOnly: true, pauseLevel: 'none', hasQuestion: false } })), null);
   assert.ok(paletteEntries(snap(), 'other').some((e) => e.id === 'emergency-stop'));
   const session = appMenuModel('other', snap()).find((m) => m.id === 'session');
-  assert.ok(session.items.some((n) => n.kind === 'item' && n.id === 'act:emergency-stop'));
+  assert.ok(menuItems(session.items).some((n) => n.id === 'act:emergency-stop'));
 });
 
 test('<Space>X, :stopall and :stop-all run the action; the key path has no press-twice guard like the TUI', () => {
@@ -92,5 +92,5 @@ test('the Tauri command takes no arguments and is in the generated handler list'
   const rs = readFileSync(here('../src-tauri/src/emergency.rs'), 'utf8');
   assert.match(rs, /pub async fn emergency_stop_all\(state: State<'_, AppState>\) -> CmdResult/);
   assert.match(readFileSync(here('../src-tauri/src/handlers.generated.rs'), 'utf8'), /emergency::emergency_stop_all/);
-  assert.match(readFileSync(here('../src-tauri/src/lib.rs'), 'utf8'), /^pub mod emergency;$/m);
+  assert.match(readFileSync(here('../src-tauri/src/modules.generated.rs'), 'utf8'), /^pub mod emergency;$/m);
 });

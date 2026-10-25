@@ -27,6 +27,12 @@ pub const CANDIDATE_INVALID_REQUEST: &str = "candidate_invalid_request";
 pub const CANDIDATE_NOT_AUTHORIZED: &str = "candidate_not_authorized";
 /// The job or session is unknown or outside the caller's scope (identical).
 pub const CANDIDATE_NOT_FOUND: &str = "candidate_not_found";
+/// The whole `candidate_not_found` refusal text (kaizen #254): the code, then
+/// the fix. Static and identical for an unknown and an out-of-scope job or
+/// session, so it is no oracle for foreign jobs. The fix names the mistake a
+/// manager made twice: padding an 8-hex prefix with zeros into a UUID-shaped
+/// id, which is then looked up as that (nonexistent) id.
+pub const CANDIDATE_NOT_FOUND_REFUSAL: &str = "candidate_not_found: no job or session in your reach matches; send the full job id as AgentWorkerRoster latest_job.job_id shows it, or its first 8+ hex characters as they are (never padded with zeros into a UUID), or omit job_id and name the worker's source_session_id";
 /// A job-id prefix names more than one job inside the caller's scope.
 pub const CANDIDATE_JOB_ID_AMBIGUOUS: &str = "candidate_job_id_ambiguous";
 
@@ -40,6 +46,9 @@ pub const CANDIDATE_JOB_NOT_TERMINAL: &str = "candidate_job_not_terminal";
 pub const CANDIDATE_ADMISSION_TIMEOUT: &str = "candidate_admission_timeout";
 /// The job is not a `scoped_test` run, or it left no receipt.
 pub const CANDIDATE_RECEIPT_MISSING: &str = "candidate_receipt_missing";
+/// Candidate/sandbox tools (and legacy jobs without daemon provenance) are
+/// tool-under-test evidence, not trusted verification.
+pub const CANDIDATE_TOOL_UNTRUSTED: &str = "candidate_tool_untrusted";
 /// The run failed (or was lost) before the baseline comparison could name its
 /// reds, so a failure cannot be called old.
 pub const CANDIDATE_JOB_NOT_GREEN: &str = "candidate_job_not_green";
@@ -48,6 +57,8 @@ pub const CANDIDATE_NEW_FAILURES: &str = "candidate_new_failures";
 /// The receipt head is not the source commit. `docs_only_delta` says whether
 /// the commits between them touch documentation only.
 pub const CANDIDATE_HEAD_MISMATCH: &str = "candidate_head_mismatch";
+pub const CANDIDATE_PROFILE_STALE: &str = "candidate_profile_stale";
+pub const CANDIDATE_NO_COMMANDS: &str = "candidate_no_verification_commands";
 /// The candidate no longer merges onto `origin/rolling` (#348): the receipt's
 /// `merges_cleanly_onto_rolling` is false at the verified head, or a fresh
 /// trial merge of `source_commit` onto the current rolling tip conflicts.
@@ -155,9 +166,18 @@ pub struct CandidatePackageV1 {
     pub completed: u64,
 }
 
+/// A candidate-copy run retained alongside the trusted rolling verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateToolEvidenceV1 {
+    pub job_id: Uuid,
+    pub scoped_tool: Option<crate::agent_jobs::ScopedToolProvenanceV1>,
+}
+
 /// What a manager needs to decide whether to enqueue `source_commit`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCheckLandingCandidateResultV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_verification: Option<crate::agent_jobs::ProfileVerificationV1>,
     /// True only when a finished `scoped_test` job's receipt head is
     /// `source_commit` and it reports no new failure.
     pub ok: bool,
@@ -187,6 +207,16 @@ pub struct AgentCheckLandingCandidateResultV1 {
     /// The commit the job verified, as its receipt records it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt_head: Option<String>,
+    /// Daemon-written identity of the selected tool; never receipt.tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_tool: Option<crate::agent_jobs::ScopedToolProvenanceV1>,
+    /// When another job supplied trusted verification, retain the requested
+    /// candidate-tool run as tool-under-test evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_under_test: Option<CandidateToolEvidenceV1>,
+    /// The scoped receipt's failure classification, independent of the red verdict (#516).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     pub head_matches: bool,
     /// When the receipt head is not `source_commit`: whether every path that
     /// differs between them is documentation (see [`is_docs_path`]). Absent
@@ -257,6 +287,7 @@ impl AgentCheckLandingCandidateResultV1 {
 
     fn empty(source_commit: &str) -> Self {
         Self {
+            profile_verification: None,
             ok: false,
             refusal: None,
             detail: None,
@@ -269,6 +300,9 @@ impl AgentCheckLandingCandidateResultV1 {
             job_refusal: None,
             finished_at: None,
             receipt_head: None,
+            scoped_tool: None,
+            tool_under_test: None,
+            failure_class: None,
             head_matches: false,
             docs_only_delta: None,
             delta_files: None,
@@ -351,7 +385,7 @@ impl AgentCheckLandingCandidateResultV1 {
         .to_owned()
     }
 
-    fn refuse(&mut self, code: &str, detail: &str) {
+    pub fn refuse(&mut self, code: &str, detail: &str) {
         self.ok = false;
         self.refusal = Some(code.to_owned());
         self.detail = Some(detail.to_owned());
@@ -417,10 +451,36 @@ pub fn is_scoped_test_job(job: &AgentJobV1) -> bool {
     matches!(&job.params, crate::agent_jobs::JobParams::Test(params) if params.is_scoped_test())
 }
 
+/// Whether the daemon stamped `job` as run with the rolling tool copy. A
+/// missing (legacy) stamp, a candidate or a sandbox tool copy is not trusted:
+/// the tool under test cannot vouch for its own receipt. The one predicate
+/// every verification judge shares with [`assess_candidate`].
+#[must_use]
+pub fn has_rolling_provenance(job: &AgentJobV1) -> bool {
+    job.result
+        .as_ref()
+        .and_then(|result| result.scoped_tool.as_ref())
+        .is_some_and(|tool| tool.source == crate::agent_jobs::ScopedToolSource::Rolling)
+}
+
 /// The head commit a finished job's receipt records.
 #[must_use]
 pub fn receipt_head(job: &AgentJobV1) -> Option<&str> {
+    if let Some(profile) = job.result.as_ref()?.profile_verification.as_ref() {
+        return Some(&profile.binding.head);
+    }
     job.result.as_ref()?.receipt.as_ref()?.get("head")?.as_str()
+}
+
+/// Includes profile recipe jobs without treating arbitrary recipe output as
+/// evidence. Only the daemon can populate profile_verification in stored rows.
+#[must_use]
+pub fn is_verification_job(job: &AgentJobV1) -> bool {
+    is_scoped_test_job(job)
+        || job
+            .result
+            .as_ref()
+            .is_some_and(|r| r.profile_verification.is_some())
 }
 
 fn failures(value: Option<&Value>) -> Option<Vec<CandidateFailureV1>> {
@@ -461,6 +521,58 @@ pub fn assess_candidate(
     result.finished_at = job.finished_at.clone();
     let job_result = job.result.as_ref();
     result.job_refusal = job_result.and_then(|r| r.refusal.clone());
+    result.scoped_tool = job_result.and_then(|r| r.scoped_tool.clone());
+    if let Some(profile) = job_result.and_then(|r| r.profile_verification.as_ref()) {
+        result.profile_verification = Some(profile.clone());
+        result.receipt_head = Some(profile.binding.head.clone());
+        result.head_matches = profile.binding.head == source_commit;
+        if matches!(job.state, JobState::Queued | JobState::Running) {
+            result.refuse(
+                CANDIDATE_JOB_NOT_TERMINAL,
+                "wait for the profile verification job to finish",
+            );
+        } else if profile.binding.version != 1
+            || !profile.binding.clean
+            || profile.binding.cwd != job.cwd
+            || profile.binding.warning_policy != "generic"
+            || profile.binding.profile_digest.len() != 64
+            || profile.binding.tools.is_empty()
+            || profile.binding.tools.iter().any(|tool| {
+                !std::path::Path::new(&tool.path).is_absolute()
+                    || tool.blob.as_ref().is_none_or(|digest| digest.len() != 64)
+            })
+        {
+            result.refuse(
+                CANDIDATE_TOOL_UNTRUSTED,
+                "missing or invalid daemon profile/tool binding; rerun verification",
+            );
+        } else if profile.binding.commands == 0 {
+            result.refuse(
+                CANDIDATE_NO_COMMANDS,
+                "the profile executed no verification command",
+            );
+        } else if job.state != JobState::Succeeded
+            || job.exit_code != Some(0)
+            || job_result.is_none_or(|r| r.refusal.is_some() || r.exit_code != Some(0))
+            || profile.completed_commands != profile.binding.commands
+            || profile.warning_verdict != "generic_command_exit"
+            || job.finished_at.is_none()
+        {
+            result.refuse(
+                CANDIDATE_JOB_NOT_GREEN,
+                "profile verification did not finish successfully; read the job refusal and rerun",
+            );
+        } else if !result.head_matches {
+            result.refuse(
+                CANDIDATE_HEAD_MISMATCH,
+                "profile verification is for another source commit; rerun at source_commit",
+            );
+        } else {
+            result.ok = true;
+            result.detail = Some("verified declared project commands at source_commit; generic warning policy applies (no Rust baseline)".into());
+        }
+        return result;
+    }
 
     let receipt = job_result.and_then(|r| r.receipt.as_ref());
     if let Some(receipt) = receipt {
@@ -505,6 +617,7 @@ pub fn assess_candidate(
             .unwrap_or_default();
         result.tests_completed = result.packages.iter().map(|p| p.completed).sum();
         let text = |key: &str| receipt.get(key).and_then(Value::as_str).map(str::to_owned);
+        result.failure_class = text("failure_class");
         result.plan = text("plan");
         result.uncertain = text("uncertain");
         result.stale_base = text("stale_base");
@@ -555,10 +668,24 @@ pub fn assess_candidate(
         );
         return result;
     }
+    if !has_rolling_provenance(job) {
+        result.refuse(
+            CANDIDATE_TOOL_UNTRUSTED,
+            "daemon provenance does not identify a rolling tool copy: rerun scoped_test with the rolling tool copy (params.scoped_test.rolling_tool:true); this run remains tool-under-test evidence",
+        );
+        return result;
+    }
     let receipt_ok = receipt
         .and_then(|r| r.get("ok"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if result.failure_class.as_deref() == Some("infrastructure_interrupted") {
+        result.refuse(
+            CANDIDATE_JOB_NOT_GREEN,
+            "compile/test processes died by signal: rerun once at the same committed head; this interruption does not count toward the worker's two-run limit",
+        );
+        return result;
+    }
     match &result.new_failures {
         Some(new) if !new.is_empty() => {
             result.refuse(
@@ -591,6 +718,40 @@ pub fn assess_candidate(
     result
 }
 
+/// Supplement an untrusted tool run only with an independently acceptable
+/// rolling-tool job at the same head, owned by the same session. All reported
+/// verification fields then come from that trusted job, never the forged run.
+#[must_use]
+pub fn assess_candidate_with_alternatives<'a>(
+    job: &AgentJobV1,
+    alternatives: impl IntoIterator<Item = &'a AgentJobV1>,
+    source_commit: &str,
+) -> AgentCheckLandingCandidateResultV1 {
+    let result = assess_candidate(job, source_commit);
+    if result.refusal.as_deref() != Some(CANDIDATE_TOOL_UNTRUSTED) {
+        return result;
+    }
+    for alternative in alternatives {
+        if alternative.owner_session_id != job.owner_session_id || alternative.id == job.id {
+            continue;
+        }
+        // This Rust-tool substitution has no live profile recheck. Profile
+        // evidence must take the daemon's dedicated candidate path instead.
+        if !is_scoped_test_job(alternative) || !has_rolling_provenance(alternative) {
+            continue;
+        }
+        let mut trusted = assess_candidate(alternative, source_commit);
+        if trusted.ok {
+            trusted.tool_under_test = Some(CandidateToolEvidenceV1 {
+                job_id: job.id,
+                scoped_tool: result.scoped_tool,
+            });
+            return trusted;
+        }
+    }
+    result
+}
+
 fn bounded_paths(paths: &[String]) -> Vec<String> {
     paths
         .iter()
@@ -613,6 +774,92 @@ fn conflict_reason(paths: &[String], when: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_verification_requires_completed_bound_commands_and_generic_warning_verdict() {
+        use crate::agent_jobs::{
+            ProfileVerificationBindingV1, ProfileVerificationV1, ScopedToolFileV1,
+        };
+        let mut job = job(
+            JobState::Succeeded,
+            Some(0),
+            Some(AgentJobResultV1 {
+                exit_code: Some(0),
+                ..AgentJobResultV1::default()
+            }),
+        );
+        job.result.as_mut().unwrap().profile_verification = Some(ProfileVerificationV1 {
+            binding: ProfileVerificationBindingV1 {
+                version: 1,
+                head: COMMIT.into(),
+                cwd: job.cwd.clone(),
+                clean: true,
+                profile_digest: "a".repeat(64),
+                tools: vec![ScopedToolFileV1 {
+                    path: "/usr/bin/make".into(),
+                    blob: Some("b".repeat(64)),
+                }],
+                argv: vec!["/bin/sh".into()],
+                commands: 1,
+                warning_policy: "generic".into(),
+            },
+            completed_commands: 1,
+            warning_verdict: "generic_command_exit".into(),
+        });
+        assert!(assess_candidate(&job, COMMIT).ok);
+        assert_eq!(
+            assess_candidate(&job, OTHER).refusal.as_deref(),
+            Some(CANDIDATE_HEAD_MISMATCH)
+        );
+        for mutation in 0..7 {
+            let mut invalid = job.clone();
+            let evidence = invalid
+                .result
+                .as_mut()
+                .unwrap()
+                .profile_verification
+                .as_mut()
+                .unwrap();
+            match mutation {
+                0 => evidence.binding.commands = 0,
+                1 => evidence.completed_commands = 0,
+                2 => evidence.warning_verdict = "rust_waiver".into(),
+                3 => evidence.binding.clean = false,
+                4 => invalid.state = JobState::Failed,
+                5 => invalid.exit_code = Some(1),
+                _ => invalid.finished_at = None,
+            }
+            assert!(
+                !assess_candidate(&invalid, COMMIT).ok,
+                "mutation {mutation}"
+            );
+        }
+        let mut forged = job.clone();
+        forged.result.as_mut().unwrap().profile_verification = None;
+        forged.result.as_mut().unwrap().receipt = Some(
+            json!({"profile_verification": job.result.as_ref().unwrap().profile_verification.clone()}),
+        );
+        assert!(!assess_candidate(&forged, COMMIT).ok);
+        let mut untrusted = forged.clone();
+        untrusted.id = Uuid::new_v4();
+        untrusted.result.as_mut().unwrap().receipt = Some(green_receipt(COMMIT));
+        assert_eq!(
+            assess_candidate_with_alternatives(&untrusted, [&job], COMMIT)
+                .refusal
+                .as_deref(),
+            Some(CANDIDATE_TOOL_UNTRUSTED)
+        );
+    }
+    #[test]
+    fn not_found_refusal_leads_with_its_code_and_names_the_fix() {
+        let (code, fix) = CANDIDATE_NOT_FOUND_REFUSAL
+            .split_once(": ")
+            .expect("code: detail");
+        assert_eq!(code, CANDIDATE_NOT_FOUND);
+        assert!(fix.contains("latest_job.job_id"), "{fix}");
+        assert!(fix.contains("never padded with zeros"), "{fix}");
+        assert!(fix.contains("source_session_id"), "{fix}");
+    }
+
     use super::*;
     use crate::agent_jobs::{
         AgentJobResultV1, JobKind, JobParams, JobWake, ScopedTestParams, TestJobParams,
@@ -627,6 +874,7 @@ mod tests {
             scoped_test: Some(ScopedTestParams {
                 base: "origin/rolling".into(),
                 head: None,
+                rolling_tool: false,
             }),
             ..serde_json::from_value(json!({})).expect("default test params")
         })
@@ -653,6 +901,7 @@ mod tests {
             started_at: None,
             finished_at: Some("2026-10-13T00:10:00.000000000Z".into()),
             held: None,
+            hold: None,
             wake: JobWake::Owner,
         }
     }
@@ -661,6 +910,15 @@ mod tests {
         AgentJobResultV1 {
             exit_code: Some(0),
             receipt: Some(receipt),
+            scoped_tool: Some(crate::agent_jobs::ScopedToolProvenanceV1 {
+                source: crate::agent_jobs::ScopedToolSource::Rolling,
+                path: "/daemon/tool/scripts/scoped-test".into(),
+                rev: Some(OTHER.into()),
+                files: vec![crate::agent_jobs::ScopedToolFileV1 {
+                    path: "/daemon/tool/scripts/scoped-test".into(),
+                    blob: Some(COMMIT.into()),
+                }],
+            }),
             ..AgentJobResultV1::default()
         }
     }
@@ -693,6 +951,75 @@ mod tests {
         assert!(result.gate_covers_rest);
         assert_eq!(result.job_id, Some(job.id));
         assert_eq!(result.receipt_head.as_deref(), Some(COMMIT));
+    }
+
+    #[test]
+    fn only_daemon_rolling_provenance_can_verify_a_synthetic_green_receipt() {
+        use crate::agent_jobs::ScopedToolSource;
+        for source in [ScopedToolSource::Candidate, ScopedToolSource::Sandbox] {
+            for claimed_tool in [Value::Null, json!({"source": "rolling", "rev": OTHER})] {
+                let mut receipt = green_receipt(COMMIT);
+                if !claimed_tool.is_null() {
+                    receipt["tool"] = claimed_tool;
+                }
+                let mut result = with_receipt(receipt);
+                result.scoped_tool.as_mut().unwrap().source = source.clone();
+                let untrusted = job(JobState::Succeeded, Some(0), Some(result));
+                let verdict = assess_candidate(&untrusted, COMMIT);
+                assert_eq!(verdict.ok, false);
+                assert_eq!(verdict.refusal.as_deref(), Some(CANDIDATE_TOOL_UNTRUSTED));
+                assert_eq!(verdict.scoped_tool.as_ref().unwrap().source, source);
+                assert!(
+                    verdict
+                        .detail
+                        .unwrap()
+                        .contains("rerun scoped_test with the rolling tool copy")
+                );
+
+                let mut rolling = job(
+                    JobState::Succeeded,
+                    Some(0),
+                    Some(with_receipt(green_receipt(COMMIT))),
+                );
+                rolling.owner_session_id = untrusted.owner_session_id;
+                let verified = assess_candidate_with_alternatives(&untrusted, [&rolling], COMMIT);
+                assert!(verified.ok, "{verified:?}");
+                assert_eq!(verified.job_id, Some(rolling.id));
+                assert_eq!(
+                    verified.scoped_tool.unwrap().source,
+                    ScopedToolSource::Rolling
+                );
+                let evidence = verified.tool_under_test.unwrap();
+                assert_eq!(evidence.job_id, untrusted.id);
+                assert_eq!(evidence.scoped_tool.unwrap().source, source);
+
+                rolling.owner_session_id = Uuid::new_v4();
+                assert_eq!(
+                    assess_candidate_with_alternatives(&untrusted, [&rolling], COMMIT)
+                        .refusal
+                        .as_deref(),
+                    Some(CANDIDATE_TOOL_UNTRUSTED)
+                );
+                rolling.owner_session_id = untrusted.owner_session_id;
+                rolling.result.as_mut().unwrap().receipt.as_mut().unwrap()["head"] = json!(OTHER);
+                assert_eq!(
+                    assess_candidate_with_alternatives(&untrusted, [&rolling], COMMIT)
+                        .refusal
+                        .as_deref(),
+                    Some(CANDIDATE_TOOL_UNTRUSTED)
+                );
+            }
+        }
+        let mut legacy = job(
+            JobState::Succeeded,
+            Some(0),
+            Some(with_receipt(green_receipt(COMMIT))),
+        );
+        legacy.result.as_mut().unwrap().scoped_tool = None;
+        assert_eq!(
+            assess_candidate(&legacy, COMMIT).refusal.as_deref(),
+            Some(CANDIDATE_TOOL_UNTRUSTED)
+        );
     }
 
     #[test]
@@ -930,6 +1257,26 @@ mod tests {
         receipt["merges_cleanly_onto_rolling"] = json!(false);
         receipt["conflict_paths"] = json!(["crates/a.rs", "docs/b.md"]);
         receipt
+    }
+
+    #[test]
+    fn a_signal_interruption_carries_its_class_and_stays_red_516() {
+        for new_failures in [Value::Null, json!([])] {
+            let mut receipt = green_receipt(COMMIT);
+            receipt["ok"] = json!(false);
+            receipt["new_failures"] = new_failures;
+            receipt["failure_class"] = json!("infrastructure_interrupted");
+            let job = job(JobState::Failed, Some(1), Some(with_receipt(receipt)));
+            let result = assess_candidate(&job, COMMIT);
+            assert!(!result.ok);
+            assert_eq!(
+                result.failure_class.as_deref(),
+                Some("infrastructure_interrupted")
+            );
+            assert_eq!(result.refusal.as_deref(), Some(CANDIDATE_JOB_NOT_GREEN));
+            let wire = serde_json::to_value(&result).unwrap();
+            assert_eq!(wire["failure_class"], "infrastructure_interrupted");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Hub-side pull of satellite reports (#1103).
 //!
-//! Runs in the same paced background round as queued manager delivery, never
+//! Runs on the registry tick independently of queued manager delivery, never
 //! as its own socket loop. For each enabled, paired, read- and dispatch-enabled
 //! peer the hub connects over the custody-checked link, re-verifies the pinned
 //! installation, and fetches the reports the satellite's manager queued. The
@@ -10,11 +10,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteIdentityV1, SatelliteUuidV1};
+use chrono::{DateTime, Utc};
+use rsi_common::satellite::{
+    SATELLITE_WIRE_VERSION_V1, SatelliteIdentityV1, SatellitePeerV1, SatelliteUuidV1,
+};
 use rsi_common::satellite_dispatch::{
     SATELLITE_REPORT_MAX_ACKS, SATELLITE_REPORT_MAX_PER_FETCH, SatelliteFetchReportsRequestV1,
     SatelliteReportOutcomeV1, SatelliteReportV1, SatelliteReportVerdictV1,
@@ -37,18 +39,119 @@ const POLL_EVERY: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const POLL_EVERY: Duration = Duration::from_millis(20);
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
+/// Match the satellite's no-pull deadline, including a newly paired peer
+/// that has never answered. Warn at most once per window until recovery.
+const STALLED_AFTER: Duration = Duration::from_secs(
+    rsi_common::satellite_dispatch::SATELLITE_REPORT_UNDELIVERED_AFTER_SECS as u64,
+);
+
+#[derive(Debug)]
+struct PullProgress {
+    installation: Uuid,
+    since: Instant,
+    last_success: Option<DateTime<Utc>>,
+    next_warning: Instant,
+    warned: bool,
+}
+
+/// Separate from the round's async state lock so the registry tick can warn
+/// even while a pull is still waiting. No report contents are logged.
+#[derive(Debug, Default)]
+pub(super) struct PullHealth(HashMap<Uuid, PullProgress>);
+
+impl PullHealth {
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub(super) fn watch(&mut self, peers: &[SatellitePeerV1], now: Instant) {
+        let mut live = std::collections::HashSet::new();
+        for peer in peers {
+            let config = &peer.config;
+            let Some(installation) = config.expected_installation_id else {
+                continue;
+            };
+            if !config.enabled || !config.read_enabled || !config.dispatch_enabled {
+                continue;
+            }
+            let id = config.peer_id.0;
+            live.insert(id);
+            let progress = self.0.entry(id).or_insert_with(|| PullProgress {
+                installation: installation.0,
+                since: now,
+                last_success: None,
+                next_warning: now + STALLED_AFTER,
+                warned: false,
+            });
+            if progress.installation != installation.0 {
+                *progress = PullProgress {
+                    installation: installation.0,
+                    since: now,
+                    last_success: None,
+                    next_warning: now + STALLED_AFTER,
+                    warned: false,
+                };
+            }
+            if now >= progress.next_warning {
+                tracing::warn!(
+                    peer_id = %id,
+                    peer = %config.label,
+                    last_success = %progress.last_success.map(|at| at.to_rfc3339()).unwrap_or_else(|| "never".into()),
+                    stalled_secs = now.saturating_duration_since(progress.since).as_secs(),
+                    "satellite report pull stalled"
+                );
+                progress.warned = true;
+                progress.next_warning = now + STALLED_AFTER;
+            }
+        }
+        self.0.retain(|id, _| live.contains(id));
+    }
+
+    fn succeeded(&mut self, peer: &RegistryPeer, now: Instant, at: DateTime<Utc>) {
+        let Some(progress) = self.0.get_mut(&peer.id) else {
+            return;
+        };
+        if Some(progress.installation) != peer.expected_installation_id {
+            return;
+        }
+        if progress.warned {
+            tracing::info!(peer_id = %peer.id, peer = %peer.label, "satellite report pull recovered");
+        }
+        progress.since = now;
+        progress.last_success = Some(at);
+        progress.next_warning = now + STALLED_AFTER;
+        progress.warned = false;
+    }
+}
 
 /// Process-local pacing and acknowledgement memory. Notices, dedup and the rate
 /// limit live in the store, so losing this only repeats a fetch.
 #[derive(Debug, Default)]
 pub(crate) struct ReportState {
-    next_poll: HashMap<Uuid, Instant>,
-    /// Acknowledgements per peer, tagged with the installation they were
-    /// recorded from; never sent to a satellite with a different identity.
-    pending_acks: HashMap<Uuid, (Uuid, Vec<Uuid>)>,
-    /// The hub's verdicts on the reports it could not record, tagged the same
-    /// way and sent only to a satellite that advertises `report_outcomes`.
-    pending_outcomes: HashMap<Uuid, (Uuid, Vec<SatelliteReportOutcomeV1>)>,
+    pub(super) health: Arc<StdMutex<PullHealth>>,
+    peers: HashMap<Uuid, PeerPull>,
+}
+
+#[derive(Debug, Default)]
+struct PeerPull {
+    state: Arc<Mutex<PeerReportState>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for PeerPull {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PeerReportState {
+    next_poll: Option<Instant>,
+    // Retain acknowledgements across failed pulls, but never across identities.
+    pending_acks: Option<(Uuid, Vec<Uuid>)>,
+    pending_outcomes: Option<(Uuid, Vec<SatelliteReportOutcomeV1>)>,
 }
 
 /// What recording one pulled page decided: the ids safe to acknowledge, and
@@ -126,8 +229,14 @@ pub(crate) async fn fetch_reports(
     None
 }
 
-/// Fetch and record once per due peer.
-pub(crate) async fn report_round(store: &Arc<Mutex<Store>>, root: &Path, state: &mut ReportState) {
+/// Start at most one pull per peer. A slow peer never holds another peer's
+/// next pull (including the pull carrying its acknowledgements). Completed or
+/// panicked tasks are reaped on the next tick; dropping a peer cancels its pull.
+pub(crate) async fn report_tick(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    root: &Path,
+    state: &mut ReportState,
+) {
     let (peers, hub_installation) = {
         let guard = store.lock().await;
         let Ok(view) = guard.satellite_registry_view() else {
@@ -151,55 +260,77 @@ pub(crate) async fn report_round(store: &Arc<Mutex<Store>>, root: &Path, state: 
         (peers, hub_installation)
     };
     let live: std::collections::HashSet<Uuid> = peers.iter().map(|peer| peer.id).collect();
-    state.next_poll.retain(|id, _| live.contains(id));
-    state.pending_acks.retain(|id, _| live.contains(id));
-    state.pending_outcomes.retain(|id, _| live.contains(id));
+    state.peers.retain(|id, _| live.contains(id));
     for peer in peers {
-        let now = Instant::now();
-        if state.next_poll.get(&peer.id).is_some_and(|due| *due > now) {
+        let pull = state.peers.entry(peer.id).or_default();
+        if pull.task.as_ref().is_some_and(|task| !task.is_finished()) {
             continue;
         }
-        state.next_poll.insert(peer.id, now + POLL_EVERY);
-        // A re-appointed project manager retires the notices of the old seat
-        // unretrieved; put those reports in front of the new one (#2242). This
-        // needs no link, so a dark satellite does not hold it back.
-        adopt_orphaned_reports(store, peer.id).await;
-        let acked = state
-            .pending_acks
-            .get(&peer.id)
-            .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
-            .map(|(_, acks)| acks.clone())
-            .unwrap_or_default();
-        let outcomes = state
-            .pending_outcomes
-            .get(&peer.id)
-            .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
-            .map(|(_, outcomes)| outcomes.clone())
-            .unwrap_or_default();
-        let Some((installation, reports)) =
-            fetch_reports(root, &peer, hub_installation, acked, outcomes).await
-        else {
-            continue;
-        };
-        // A full page means more may be queued: pull again next round instead
-        // of waiting out the pacing interval (the queue holds up to 32).
-        let full_page = reports.len() >= SATELLITE_REPORT_MAX_PER_FETCH;
-        let verdicts = record_reports(store, peer.id, installation, reports).await;
-        if full_page && !verdicts.acks.is_empty() {
-            state.next_poll.insert(peer.id, Instant::now());
+        if let Some(task) = pull.task.take() {
+            if let Err(error) = task.await {
+                tracing::warn!(peer_id = %peer.id, %error, "satellite report pull exited; retrying");
+            }
         }
-        state
-            .pending_acks
-            .insert(peer.id, (installation, verdicts.acks));
-        state
-            .pending_outcomes
-            .insert(peer.id, (installation, verdicts.outcomes));
+        let store = Arc::clone(store);
+        let root = root.to_path_buf();
+        let health = Arc::clone(&state.health);
+        let state = Arc::clone(&pull.state);
+        pull.task = Some(tokio::spawn(async move {
+            let mut state = state.lock().await;
+            report_peer(&store, &root, &peer, hub_installation, &health, &mut state).await;
+        }));
     }
+}
+
+async fn report_peer(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    root: &Path,
+    peer: &RegistryPeer,
+    hub_installation: Uuid,
+    health: &StdMutex<PullHealth>,
+    state: &mut PeerReportState,
+) {
+    let now = Instant::now();
+    if state.next_poll.is_some_and(|due| due > now) {
+        return;
+    }
+    state.next_poll = Some(now + POLL_EVERY);
+    // Re-homing needs no link, so a dark satellite does not hold it back.
+    adopt_orphaned_reports(store, peer.id).await;
+    let acked = state
+        .pending_acks
+        .as_ref()
+        .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
+        .map(|(_, acks)| acks.clone())
+        .unwrap_or_default();
+    let outcomes = state
+        .pending_outcomes
+        .as_ref()
+        .filter(|(installation, _)| Some(*installation) == peer.expected_installation_id)
+        .map(|(_, outcomes)| outcomes.clone())
+        .unwrap_or_default();
+    let Some((installation, reports)) =
+        fetch_reports(root, peer, hub_installation, acked, outcomes).await
+    else {
+        return;
+    };
+    health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .succeeded(peer, Instant::now(), Utc::now());
+    // A full page means more may be queued: pull again next tick.
+    let full_page = reports.len() >= SATELLITE_REPORT_MAX_PER_FETCH;
+    let verdicts = record_reports(store, peer.id, installation, reports).await;
+    if full_page && !verdicts.acks.is_empty() {
+        state.next_poll = Some(Instant::now());
+    }
+    state.pending_acks = Some((installation, verdicts.acks));
+    state.pending_outcomes = Some((installation, verdicts.outcomes));
 }
 
 /// Re-home the peer's retired, never-retrieved reports onto the current
 /// manager of its project (see `Store::adopt_orphaned_satellite_reports_for_peer`).
-async fn adopt_orphaned_reports(store: &Arc<Mutex<Store>>, peer_id: Uuid) {
+async fn adopt_orphaned_reports(store: &Arc<rsid_core::store_lock::Mutex<Store>>, peer_id: Uuid) {
     match store
         .lock()
         .await
@@ -225,7 +356,7 @@ async fn adopt_orphaned_reports(store: &Arc<Mutex<Store>>, peer_id: Uuid) {
 /// pin is rechecked per report under the store lock (`verified_installation`
 /// came from the fetch).
 pub(crate) async fn record_reports(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     peer_id: Uuid,
     verified_installation: Uuid,
     reports: Vec<SatelliteReportV1>,
@@ -292,6 +423,118 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    fn watched_peer() -> SatellitePeerV1 {
+        SatellitePeerV1 {
+            config: SatellitePeerConfigV1 {
+                peer_id: SatelliteUuidV1(Uuid::new_v4()),
+                label: "test satellite".into(),
+                expected_installation_id: Some(SatelliteUuidV1(Uuid::new_v4())),
+                enabled: true,
+                read_enabled: true,
+                dispatch_enabled: true,
+            },
+            row_version: 1,
+            links: Vec::new(),
+            observation: None,
+            dispatch_scope: Vec::new(),
+            dispatch_project_scope: Vec::new(),
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn stalled_pulls_log_the_peer_last_success_and_paced_recovery() {
+        #[derive(Clone, Default)]
+        struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for LogBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = LogBuffer::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let peer = watched_peer();
+        let now = Instant::now();
+        let mut health = PullHealth::default();
+        let peers = std::slice::from_ref(&peer);
+        health.watch(peers, now);
+        health.watch(peers, now + STALLED_AFTER - Duration::from_secs(1));
+        assert_eq!(logs.0.lock().unwrap().len(), 0);
+        // A peer that never answers is observable even with no reports or
+        // usable link. The first warning is bounded from initial observation.
+        health.watch(peers, now + STALLED_AFTER);
+        health.watch(peers, now + STALLED_AFTER + Duration::from_secs(1));
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(captured.matches("satellite report pull stalled").count(), 1);
+        assert!(captured.contains(&peer.config.peer_id.0.to_string()));
+        assert!(captured.contains("test satellite"));
+        assert!(captured.contains("last_success=never"));
+
+        let at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let recovered = now + STALLED_AFTER + Duration::from_secs(2);
+        health.succeeded(&registry_peer(&peer), recovered, at);
+        health.watch(peers, recovered + STALLED_AFTER - Duration::from_secs(1));
+        assert!(!health.0[&peer.config.peer_id.0].warned);
+        health.watch(peers, recovered + STALLED_AFTER);
+        health.watch(peers, recovered + STALLED_AFTER * 2);
+        let captured = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            captured.matches("satellite report pull recovered").count(),
+            1
+        );
+        assert_eq!(captured.matches("satellite report pull stalled").count(), 3);
+        assert!(captured.contains(&format!("last_success={}", at.to_rfc3339())));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn pull_monitor_resets_for_policy_pause_unpair_and_new_installation() {
+        let peer = watched_peer();
+        let now = Instant::now();
+        for change in 0..4 {
+            let mut health = PullHealth::default();
+            health.watch(std::slice::from_ref(&peer), now);
+            let mut disabled = peer.clone();
+            match change {
+                0 => disabled.config.enabled = false,
+                1 => disabled.config.read_enabled = false,
+                2 => disabled.config.dispatch_enabled = false,
+                _ => disabled.config.expected_installation_id = None,
+            }
+            health.watch(&[disabled], now + STALLED_AFTER);
+            assert_eq!(health.0.len(), 0);
+            health.watch(std::slice::from_ref(&peer), now + STALLED_AFTER);
+            assert_eq!(health.0[&peer.config.peer_id.0].since, now + STALLED_AFTER);
+            assert!(!health.0[&peer.config.peer_id.0].warned);
+        }
+        let mut health = PullHealth::default();
+        health.watch(std::slice::from_ref(&peer), now);
+        let mut repaired = peer.clone();
+        repaired.config.expected_installation_id = Some(SatelliteUuidV1(Uuid::new_v4()));
+        health.watch(std::slice::from_ref(&repaired), now + STALLED_AFTER);
+        assert!(!health.0[&peer.config.peer_id.0].warned);
+        // A fetch started before a re-pair cannot clear the new pin's clock.
+        health.succeeded(&registry_peer(&peer), now + STALLED_AFTER, Utc::now());
+        assert_eq!(health.0[&peer.config.peer_id.0].last_success, None);
+        health.clear();
+        assert_eq!(health.0.len(), 0);
+        health.watch(&[peer], now + STALLED_AFTER * 2);
+        assert_eq!(health.0.len(), 1);
+        health.watch(&[], now + STALLED_AFTER * 3);
+        assert_eq!(health.0.len(), 0);
+    }
+
     /// A fake satellite that serves identity and the report pull. With
     /// `honor_acks` false it re-offers every report forever (a satellite that
     /// lost the hub's acknowledgements).
@@ -309,7 +552,7 @@ mod tests {
     struct Rig {
         _temp: tempfile::TempDir,
         root: std::path::PathBuf,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         peer: Uuid,
         fake: Fake,
     }
@@ -332,6 +575,7 @@ mod tests {
             reports: Arc::new(StdMutex::new(
                 (0..queued)
                     .map(|index| SatelliteReportV1 {
+                        binaries_dir: None,
                         report_id: Uuid::new_v4(),
                         kind: SatelliteReportKindV1::Enqueue,
                         text: format!("ENQUEUE deadbeef issue=#{index}"),
@@ -411,7 +655,9 @@ mod tests {
                 });
             }
         });
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let peer = Uuid::new_v4();
         {
             let guard = store.lock().await;
@@ -473,6 +719,19 @@ mod tests {
         }
     }
 
+    async fn report_round(
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+        root: &Path,
+        state: &mut ReportState,
+    ) {
+        report_tick(store, root, state).await;
+        for pull in state.peers.values_mut() {
+            if let Some(task) = pull.task.take() {
+                task.await.unwrap();
+            }
+        }
+    }
+
     async fn notices(rig: &Rig) -> i64 {
         rig.store
             .lock()
@@ -488,10 +747,123 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[tokio::test]
+    async fn a_stalled_peer_does_not_delay_another_peers_fetch_or_acknowledgement() {
+        let rig = rig(true, true).await;
+        let slow = Uuid::new_v4();
+        let installation = Uuid::new_v4();
+        let socket = rig.root.join("slow.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        {
+            let guard = rig.store.lock().await;
+            guard
+                .put_satellite_peer(
+                    &SatellitePutPeerRequestV1 {
+                        expected_registry_revision: guard.satellite_registry_revision().unwrap(),
+                        peer: SatellitePeerConfigV1 {
+                            peer_id: SatelliteUuidV1(slow),
+                            label: "slow".into(),
+                            expected_installation_id: Some(SatelliteUuidV1(installation)),
+                            enabled: true,
+                            read_enabled: true,
+                            dispatch_enabled: true,
+                        },
+                        repair_quarantine: false,
+                    },
+                    &rig.root,
+                )
+                .unwrap();
+            guard
+                .put_satellite_link(
+                    &SatellitePutLinkRequestV1 {
+                        expected_registry_revision: guard.satellite_registry_revision().unwrap(),
+                        peer_id: SatelliteUuidV1(slow),
+                        link: SatelliteLinkConfigV1 {
+                            link_id: SatelliteUuidV1(Uuid::new_v4()),
+                            direction: SatelliteLinkDirectionV1::DialHomeReverse,
+                            socket_path: socket.to_string_lossy().into_owned(),
+                            ssh_target: None,
+                            trust_reference: "ssh-config:slow".into(),
+                            enabled: true,
+                            priority: 0,
+                        },
+                    },
+                    &rig.root,
+                )
+                .unwrap();
+        }
+        let (started, fetching) = tokio::sync::oneshot::channel();
+        let (release, stalled) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let request: RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "GetSatelliteIdentity");
+            let response = RpcResponse::success(
+                Some(request.id.into()),
+                serde_json::to_value(crate::satellite::identity(installation, Uuid::new_v4()))
+                    .unwrap(),
+            );
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            stream.get_mut().write_all(&bytes).await.unwrap();
+            line.clear();
+            stream.read_line(&mut line).await.unwrap();
+            let request: RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "FetchHubReports");
+            let params: SatelliteFetchReportsRequestV1 =
+                serde_json::from_value(request.params).unwrap();
+            assert!(params.acked.is_empty());
+            started.send(()).unwrap();
+            let _ = stalled.await;
+        });
+        let mut state = ReportState::default();
+        report_tick(&rig.store, &rig.root, &mut state).await;
+        tokio::time::timeout(Duration::from_secs(2), fetching)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                report_tick(&rig.store, &rig.root, &mut state).await;
+                if !rig.fake.acks_seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("healthy peer fetched and acknowledged while slow peer is held");
+        assert!(!state.peers[&slow].task.as_ref().unwrap().is_finished());
+        assert!(rig.fake.fetches.load(Ordering::SeqCst) >= 2);
+        assert_eq!(rig.fake.acks_seen.lock().unwrap().len(), 1);
+        assert!(rig.fake.reports.lock().unwrap().is_empty());
+        assert_eq!(notices(&rig).await, 1);
+        release.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[tokio::test]
     async fn the_hub_pulls_records_one_notice_and_acknowledges_next_round() {
         let rig = rig(true, true).await;
         let mut state = ReportState::default();
+        let peers = rig
+            .store
+            .lock()
+            .await
+            .satellite_registry_view()
+            .unwrap()
+            .peers;
+        state.health.lock().unwrap().watch(&peers, Instant::now());
         report_round(&rig.store, &rig.root, &mut state).await;
+        assert!(
+            state.health.lock().unwrap().0[&rig.peer]
+                .last_success
+                .is_some()
+        );
         assert_eq!(notices(&rig).await, 1);
         assert!(rig.fake.acks_seen.lock().unwrap().is_empty());
         tokio::time::sleep(Duration::from_millis(40)).await;

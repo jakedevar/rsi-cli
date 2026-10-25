@@ -19,12 +19,14 @@
 //! postcondition checks. The one narrow exception is `retained_successor`:
 //! a never-published master-successor allocation proven pristine and
 //! unique-commit-free is removed without force under the repository lock.
+//! In-band allocation rollback also removes its own never-published root after
+//! a timeout, allowing only clean or missing tracked files and no foreign data.
 
 use super::SandboxAllocation;
 use crate::error::{DaemonError, Result};
 use crate::path_safety::canonicalize_non_strict;
 use crate::process_control::{
-    ProcessContainment, configure_std_process_group, terminate_owned_group_cleanup,
+    EscapeSweep, ProcessContainment, configure_std_process_group, terminate_owned_group_cleanup,
 };
 use rsi_common::types::SandboxKind;
 use sha2::{Digest, Sha256};
@@ -181,6 +183,8 @@ pub struct WorktreeObservation {
     pub head_ref: Option<String>,
     pub clean: bool,
     pub clean_state_digest: String,
+    /// Bounded, escaped status paths from this observation; never file contents.
+    pub dirty_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -293,6 +297,8 @@ struct RegisteredWorktree {
     head: Option<String>,
     branch: Option<String>,
     prunable: bool,
+    /// Git's lock reason (`Some("")` when locked without one), if locked.
+    locked: Option<String>,
 }
 
 struct QuarantineTreeDigestEntry {
@@ -642,17 +648,22 @@ pub fn observe_worktree_ignoring_ignored_locked(
 
 /// Only Git-ignored Python caches are disposable. Keep byte paths (porcelain
 /// -z is unquoted), exact directory components, and all tracked/untracked data.
-/// Requiring every record to be ignored also keeps rename source records from
-/// being mistaken for status records. Cache directories are accepted only when
+/// Requiring every non-stamp record to be ignored also keeps rename source
+/// records from being mistaken for status records. Cache directories are accepted only when
 /// Git reports the collapsed directory itself; individual files below them
-/// must have a `.pyc` final component. The one non-cache record accepted is the
-/// daemon's own root-level build stamp, and only after
+/// must have a `.pyc` final component. The one untracked record accepted is the
+/// daemon's exact root-level build stamp (ignored or untracked), only after
 /// [`daemon_build_stamp_is_authentic`] proves the file at `root` (#2610).
 fn only_regenerable_ignored_output(root: &Path, status: &[u8]) -> bool {
     status
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
         .all(|record| {
+            if record.strip_prefix(b"?? ")
+                == Some(super::execution_scratch::BUILD_ENV_RECORD.as_bytes())
+            {
+                return daemon_build_stamp_is_authentic(root);
+            }
             let Some(path) = record.strip_prefix(b"!! ") else {
                 return false;
             };
@@ -673,6 +684,32 @@ fn only_regenerable_ignored_output(root: &Path, status: &[u8]) -> bool {
                     component == b"__pycache__" || component == b".pytest_cache"
                 })
         })
+}
+
+/// Drop the one untracked record the daemon itself creates: the root-level
+/// build stamp, and only after [`daemon_build_stamp_is_authentic`] proves the
+/// file. Exact byte match on the root-level path; every other record (another
+/// untracked file, a modification, a nested path of the same name) stays and
+/// keeps the root dirty (#3759). Returns the input unchanged when nothing is
+/// dropped so the clean-state digest of other roots does not move.
+fn without_daemon_untracked_stamp(root: &Path, status: Vec<u8>) -> Vec<u8> {
+    let mut expected = b"?? ".to_vec();
+    expected.extend_from_slice(super::execution_scratch::BUILD_ENV_RECORD.as_bytes());
+    if !status
+        .split(|byte| *byte == 0)
+        .any(|record| record == expected)
+        || !daemon_build_stamp_is_authentic(root)
+    {
+        return status;
+    }
+    let mut kept = Vec::with_capacity(status.len());
+    for record in status.split(|byte| *byte == 0).filter(|r| !r.is_empty()) {
+        if record != expected {
+            kept.extend_from_slice(record);
+            kept.push(0);
+        }
+    }
+    kept
 }
 
 /// Largest stamp the daemon writes is a few hundred bytes of env names; refuse
@@ -755,7 +792,9 @@ fn observe_worktree_inner_locked(
     let registered = list_worktrees_locked(origin)?
         .into_iter()
         .find(|entry| same_path(&entry.root, root));
-    let (head_oid, head_ref, clean, clean_state_digest) = if root_exists && !root_is_symlink {
+    let (head_oid, head_ref, clean, clean_state_digest, dirty_detail) = if root_exists
+        && !root_is_symlink
+    {
         let head_oid = run_git_text(
             root,
             &["rev-parse", "--verify", "HEAD^{commit}"],
@@ -786,6 +825,7 @@ fn observe_worktree_inner_locked(
             &status_args.iter().map(String::as_str).collect::<Vec<_>>(),
             "inspect worktree cleanliness",
         )?;
+        let status = without_daemon_untracked_stamp(root, status);
         // Git's non-force worktree removal already discards ignored output.
         // Normalize only the fixed cache allowlist in both audit and rechecks;
         // audit itself performs no filesystem writes.
@@ -796,6 +836,19 @@ fn observe_worktree_inner_locked(
         };
         let (visibility_safe, visibility_digest) = inspect_index_visibility_locked(root)?;
         let clean = status.is_empty() && visibility_safe;
+        let dirty_detail = (!clean).then(|| {
+            // Even six-byte JSON escapes fit the wire's 16 KiB diagnostic cap.
+            let records: Vec<String> = status
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+                .take(16)
+                .map(|record| String::from_utf8_lossy(record).chars().take(128).collect())
+                .collect();
+            format!(
+                "fresh_git_status_v1 records(first 16, each at most 128 chars)={} index_visibility_safe={visibility_safe}",
+                serde_json::to_string(&records).expect("status strings serialize")
+            )
+        });
         let mut digest = Sha256::new();
         digest.update(b"rsi-worktree-clean-state-v2\0");
         digest.update((status.len() as u64).to_be_bytes());
@@ -803,13 +856,14 @@ fn observe_worktree_inner_locked(
         digest.update((visibility_digest.len() as u64).to_be_bytes());
         digest.update(visibility_digest.as_bytes());
         let clean_state_digest = format!("sha256:{:x}", digest.finalize());
-        (head_oid, head_ref, clean, clean_state_digest)
+        (head_oid, head_ref, clean, clean_state_digest, dirty_detail)
     } else {
         (
             None,
             None,
             false,
             format!("sha256:{:x}", Sha256::digest(b"missing")),
+            None,
         )
     };
     Ok(WorktreeObservation {
@@ -822,6 +876,7 @@ fn observe_worktree_inner_locked(
         head_ref,
         clean,
         clean_state_digest,
+        dirty_detail,
     })
 }
 
@@ -2074,26 +2129,66 @@ fn decode_mountinfo_path(encoded: &[u8]) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
-/// Read an exact committed handoff without consulting or changing dirty files.
-/// All Git commands use the existing contained, deadline/output-bounded runner.
-pub fn read_manager_handoff(
+/// The private ref a manager seat with no custody (no sandbox, so no tree of
+/// its own to commit in) points at its committed handoff, in the repository of
+/// its working directory (#172, hub #3315/#3328). Outside `refs/heads`, so no
+/// branch listing, settlement or sandbox cleanup sees it.
+pub fn manager_handoff_ref(session_id: uuid::Uuid) -> String {
+    format!("refs/rsi/manager-handoff/{session_id}")
+}
+
+/// #185: delete the private handoff refs of the given predecessors in the
+/// repository of `cwd`, each only while it still names the commit the store
+/// recorded for it. Touches nothing but `refs/rsi/manager-handoff/<id>` for
+/// exactly those ids: one `for-each-ref` lists them, and each delete is
+/// `update-ref -d <ref> <recorded commit>`, so a ref moved since it was
+/// recorded (or concurrently) is kept. Returns the ids whose ref was deleted.
+pub fn prune_manager_handoff_refs(
     cwd: &Path,
-    handoff: &rsi_common::harness_manager_v2::ManagerCommittedHandoffV2,
-) -> Result<String> {
-    use crate::store::harness_manager_v2::refused;
-    handoff.validate().map_err(refused)?;
-    let check_head = || -> Result<()> {
-        let head = run_git_text(
-            cwd,
-            &["rev-parse", "--verify", "HEAD^{commit}"],
-            "manager handoff HEAD",
-        )?;
-        if head != handoff.source_commit {
-            return Err(refused("manager_succession_handoff_head_changed"));
+    recorded: &[(uuid::Uuid, String)],
+) -> Result<Vec<uuid::Uuid>> {
+    let listing = run_git_text(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/rsi/manager-handoff/",
+        ],
+        "manager handoff ref listing",
+    )?;
+    let present: HashMap<&str, &str> = listing
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .collect();
+    let mut pruned = Vec::new();
+    for (session_id, commit) in recorded {
+        let commit_ok = matches!(commit.len(), 40 | 64)
+            && commit
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let name = manager_handoff_ref(*session_id);
+        if !commit_ok || present.get(name.as_str()) != Some(&commit.as_str()) {
+            continue;
         }
-        Ok(())
-    };
-    check_head()?;
+        match run_git_text(
+            cwd,
+            &["update-ref", "-d", &name, commit],
+            "manager handoff ref prune",
+        ) {
+            Ok(_) => pruned.push(*session_id),
+            Err(error) => tracing::warn!(%session_id, %error, "manager handoff ref kept"),
+        }
+    }
+    Ok(pruned)
+}
+
+/// Whether `commit`'s tree holds exactly the handoff's regular-file blob at
+/// its path (`ls-tree` with literal pathspecs, so no glob or symlink widening).
+fn handoff_tree_entry_matches(
+    cwd: &Path,
+    commit: &str,
+    handoff: &rsi_common::harness_manager_v2::ManagerCommittedHandoffV2,
+) -> Result<bool> {
     let entry = run_git_bytes(
         cwd,
         &[
@@ -2101,19 +2196,71 @@ pub fn read_manager_handoff(
             "ls-tree",
             "-z",
             "--full-tree",
-            &handoff.source_commit,
+            commit,
             "--",
             &handoff.relative_path,
         ],
         "manager handoff tree entry",
     )?;
-    let entry = std::str::from_utf8(&entry)
-        .map_err(|_| refused("manager_succession_handoff_blob_invalid"))?;
+    let Ok(entry) = std::str::from_utf8(&entry) else {
+        return Ok(false);
+    };
     let expected = format!("blob {}\t{}\0", handoff.blob_oid, handoff.relative_path);
-    if !["100644 ", "100755 "]
+    Ok(["100644 ", "100755 "]
         .iter()
-        .any(|mode| entry == format!("{mode}{expected}"))
-    {
+        .any(|mode| entry == format!("{mode}{expected}")))
+}
+
+/// Read an exact committed handoff without consulting or changing dirty files.
+/// All Git commands use the existing contained, deadline/output-bounded runner.
+///
+/// The commit is anchored at `HEAD` of `cwd` (hub #3778: `HEAD` may have moved to a
+/// descendant that still holds the same handoff blob). A seat with no custody also
+/// passes its [`manager_handoff_ref`]: when that ref names `source_commit`, the
+/// ref is the anchor instead, so the seat never commits in a shared tree.
+pub fn read_manager_handoff(
+    cwd: &Path,
+    handoff: &rsi_common::harness_manager_v2::ManagerCommittedHandoffV2,
+    handoff_ref: Option<&str>,
+) -> Result<String> {
+    use crate::store::harness_manager_v2::refused;
+    handoff.validate().map_err(refused)?;
+    let resolve = |anchor: &str| {
+        run_git_text(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{anchor}^{{commit}}"),
+            ],
+            "manager handoff anchor",
+        )
+    };
+    let anchor = handoff_ref
+        .filter(|name| resolve(name).is_ok_and(|commit| commit == handoff.source_commit))
+        .unwrap_or("HEAD");
+    // The anchor must still carry the accepted handoff: it is `source_commit`
+    // itself, or (hub #3778) a descendant of it at which `relative_path` still
+    // resolves to `blob_oid`. A seat that commits one more line to its log after
+    // `succeed_manager` is accepted therefore still settles, while a moved or
+    // changed handoff blob and any HEAD not descending from `source_commit`
+    // keep refusing `manager_succession_handoff_head_changed`. The bytes handed
+    // to the successor never depend on the anchor: they are read below from the
+    // exact `blob_oid` of `source_commit`.
+    let check_head = || -> Result<()> {
+        let current = resolve(anchor)?;
+        if current == handoff.source_commit {
+            return Ok(());
+        }
+        let descends = is_ancestor_locked(cwd, &handoff.source_commit, &current)?;
+        if descends && handoff_tree_entry_matches(cwd, &current, handoff)? {
+            return Ok(());
+        }
+        Err(refused("manager_succession_handoff_head_changed"))
+    };
+    check_head()?;
+    if !handoff_tree_entry_matches(cwd, &handoff.source_commit, handoff)? {
         return Err(refused("manager_succession_handoff_blob_changed"));
     }
     let size = run_git_text(
@@ -2171,6 +2318,52 @@ pub fn observe_clean_head_bounded(cwd: &Path) -> Result<(bool, String)> {
         "inspect child-fork source cleanliness",
     )?;
     Ok((status.is_empty(), observe_head_bounded(cwd)?))
+}
+
+/// #3181: the requested `paths` (files or directories, relative to `cwd`) that are
+/// not committed and clean at HEAD, sorted: a path with no tracked file under it,
+/// and every path Git reports modified, staged, deleted or untracked beneath one.
+/// Empty means every requested path is tracked and unmodified. Same hardened,
+/// byte-bounded Git runner as [`observe_clean_head_bounded`]; pathspecs are literal.
+pub fn paths_not_committed_clean_bounded(cwd: &Path, paths: &[&str]) -> Result<Vec<String>> {
+    let mut bad = std::collections::BTreeSet::new();
+    let mut status_args = vec![
+        "--literal-pathspecs",
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        "--",
+    ];
+    status_args.extend_from_slice(paths);
+    let status = run_git_bytes(cwd, &status_args, "inspect run input cleanliness")?;
+    for entry in status.split(|byte| *byte == 0) {
+        // `XY <path>`; the second path of a rename is its own, shorter record.
+        if entry.len() > 3 {
+            bad.insert(String::from_utf8_lossy(&entry[3..]).into_owned());
+        }
+    }
+    let mut tracked_args = vec!["--literal-pathspecs", "ls-files", "-z", "--"];
+    tracked_args.extend_from_slice(paths);
+    let tracked = run_git_bytes(cwd, &tracked_args, "list run input files")?;
+    let tracked: Vec<String> = tracked
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect();
+    for path in paths {
+        let directory = format!("{}/", path.trim_end_matches('/'));
+        if !tracked
+            .iter()
+            .any(|file| file == path || file.starts_with(&directory))
+        {
+            bad.insert((*path).to_string());
+        }
+    }
+    Ok(bad.into_iter().collect())
 }
 
 /// Logical archive may retain a live worktree only when tracked files are clean
@@ -3083,6 +3276,37 @@ fn stream_git_lines(
     run_bounded_records(command, None, b'\n', true, label, &mut consume)
 }
 
+/// Preserve a terminal session's source commit without replacing existing evidence.
+/// The caller holds the repository mutation lock. A different prior pin is an
+/// error; retain the session and ask its manager rather than discard history.
+pub fn preserve_errored_session_locked(
+    origin: &Path,
+    session: uuid::Uuid,
+    oid: &str,
+) -> Result<String> {
+    require_commit_object_locked(origin, oid)?;
+    let reference = format!("refs/rsi/preserved/{session}");
+    match observe_direct_ref_locked(origin, &reference)? {
+        DirectRefObservation::Commit(prior) if prior == oid => return Ok(reference),
+        DirectRefObservation::Missing => {}
+        _ => {
+            return Err(DaemonError::Process(
+                "error disposition preservation ref changed".into(),
+            ));
+        }
+    }
+    let output = run_git_raw(
+        origin,
+        &["update-ref", &reference, oid, ""],
+        "preserve errored session",
+    )?;
+    if !output.status.success() {
+        return Err(DaemonError::Process("error disposition pin failed".into()));
+    }
+    require_direct_ref_at(origin, &reference, oid, "error disposition preservation")?;
+    Ok(reference)
+}
+
 pub fn resolve_ref_locked(origin: &Path, reference: &str) -> Result<Option<String>> {
     match observe_direct_ref_locked(origin, reference)? {
         DirectRefObservation::Missing => Ok(None),
@@ -3327,6 +3551,30 @@ pub fn source_ref_has_zero_registrations_locked(origin: &Path, source_ref: &str)
         .any(|entry| entry.branch.as_deref() == Some(source_ref)))
 }
 
+/// Git's non-force removal refuses untracked files, but the audit treats the
+/// daemon's authentic untracked build stamp as disposable (#3759): delete
+/// exactly that file first. Tracked or unproven stamps are left for Git to
+/// refuse.
+fn remove_daemon_untracked_stamp(root: &Path) -> Result<()> {
+    let record = super::execution_scratch::BUILD_ENV_RECORD;
+    if !daemon_build_stamp_is_authentic(root) {
+        return Ok(());
+    }
+    let tracked = run_git_raw(
+        root,
+        &["ls-files", "--error-unmatch", "--", record],
+        "check build stamp tracking",
+    )?
+    .status
+    .success();
+    if !tracked {
+        std::fs::remove_file(root.join(record)).map_err(|error| {
+            DaemonError::Process(format!("remove disposable build stamp failed: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 pub fn remove_worktree_non_force_locked(
     origin: &Path,
     original_root: &Path,
@@ -3345,6 +3593,7 @@ pub fn remove_worktree_non_force_locked(
     let root_text = root
         .to_str()
         .ok_or_else(|| DaemonError::InvalidParam("settlement root is not UTF-8".into()))?;
+    remove_daemon_untracked_stamp(root)?;
     let output = run_git_raw(
         origin,
         &["worktree", "remove", root_text],
@@ -5054,6 +5303,7 @@ impl WorktreeListParser {
                 head: None,
                 branch: None,
                 prunable: false,
+                locked: None,
             });
             return Ok(());
         }
@@ -5076,6 +5326,10 @@ impl WorktreeListParser {
             entry.branch = Some(decode_worktree_field(branch, "branch")?);
         } else if record == b"prunable" || record.starts_with(b"prunable ") {
             entry.prunable = true;
+        } else if record == b"locked" {
+            entry.locked = Some(String::new());
+        } else if let Some(reason) = record.strip_prefix(b"locked ") {
+            entry.locked = Some(String::from_utf8_lossy(reason).into_owned());
         }
         Ok(())
     }
@@ -5193,6 +5447,34 @@ pub fn capture_command_bounded_for(
     )
 }
 
+/// Like [`capture_command_bounded_for`], but the child may call `setsid`/`setpgid`: it is put in its own
+/// process group without the inherited seccomp filter that denies both. Use it for a tool that starts
+/// helpers with their own session (Docker's `ssh://` connection helper does), never for a Git call.
+/// The group is killed and reaped at the deadline (and whenever the leader exits or a bound trips) and the
+/// drains stay bounded. On Linux a descendant that escaped the group with `setsid` is killed too (#3900):
+/// the command's environment carries a unique marker, the leader is a child subreaper, and an
+/// `EscapeSweep` SIGKILLs every live marked or descended process. Elsewhere the group kill is the only
+/// containment.
+///
+/// # Errors
+/// The command cannot start, overruns `timeout` or exceeds an output bound.
+pub fn capture_command_bounded_group_for(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    capture_bounded_with_limits(
+        &mut command,
+        label,
+        None,
+        ProcessLimits {
+            execution_timeout: timeout,
+            containment: ProcessContainment::Group,
+            ..ProcessLimits::default()
+        },
+    )
+}
+
 fn capture_bounded_with_input(
     mut command: Command,
     label: &str,
@@ -5270,6 +5552,7 @@ struct ProcessLimits {
     max_stdin_bytes: usize,
     execution_timeout: Duration,
     post_exit_drain_timeout: Duration,
+    containment: ProcessContainment,
 }
 
 impl Default for ProcessLimits {
@@ -5282,6 +5565,7 @@ impl Default for ProcessLimits {
             max_stdin_bytes: MAX_GIT_STDIN_BYTES,
             execution_timeout: GIT_EXECUTION_TIMEOUT,
             post_exit_drain_timeout: GIT_POST_EXIT_DRAIN_TIMEOUT,
+            containment: ProcessContainment::GroupNoEscape,
         }
     }
 }
@@ -5394,9 +5678,19 @@ struct BoundedProcessChild {
     pgid: nix::unistd::Pid,
     /// Reaping has started, or ownership can no longer be proved.
     leader_reaped: bool,
+    /// Present under `ProcessContainment::Group`: also kills descendants that left the group (#3900).
+    sweep: Option<EscapeSweep>,
 }
 
 impl BoundedProcessChild {
+    /// SIGKILL the leader's group, then every descendant that escaped it.
+    fn terminate(&self) {
+        terminate_group_if_owned(self.pgid, self.leader_reaped);
+        if let Some(sweep) = &self.sweep {
+            sweep.sweep((!self.leader_reaped).then_some(self.pgid));
+        }
+    }
+
     fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.leader_reaped = true;
         wait_child(&mut self.child)
@@ -5406,7 +5700,7 @@ impl BoundedProcessChild {
 impl Drop for BoundedProcessChild {
     fn drop(&mut self) {
         if !self.leader_reaped {
-            terminate_group_if_owned(self.pgid, false);
+            self.terminate();
             let _ = self.reap();
         }
     }
@@ -5424,7 +5718,9 @@ fn run_bounded_process(
             "Git {label} stdin exceeded bound"
         )));
     }
-    configure_std_process_group(command, ProcessContainment::GroupNoEscape)?;
+    configure_std_process_group(command, limits.containment)?;
+    let sweep =
+        (limits.containment == ProcessContainment::Group).then(|| EscapeSweep::arm(command));
     if input.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -5440,11 +5736,12 @@ fn run_bounded_process(
         child,
         pgid,
         leader_reaped: false,
+        sweep,
     };
     let (Some(mut stdout), Some(mut stderr)) =
         (child.child.stdout.take(), child.child.stderr.take())
     else {
-        terminate_group_if_owned(pgid, child.leader_reaped);
+        child.terminate();
         drop(child.child.stdin.take());
         let _ = child.reap();
         return Err(DaemonError::Process(format!(
@@ -5460,7 +5757,7 @@ fn run_bounded_process(
                 .map_or(Ok(()), |pipe| set_nonblocking(pipe, label, "stdin"))
         })
     {
-        terminate_group_if_owned(pgid, child.leader_reaped);
+        child.terminate();
         drop(stdin);
         drop(stdout);
         drop(stderr);
@@ -5486,7 +5783,7 @@ fn run_bounded_process(
     let mut termination_started = false;
 
     if failure.is_some() {
-        terminate_group_if_owned(pgid, child.leader_reaped);
+        child.terminate();
         termination_started = true;
         shutdown_deadline = Some(Instant::now() + limits.post_exit_drain_timeout);
     }
@@ -5555,7 +5852,7 @@ fn run_bounded_process(
         }
 
         if failure.is_some() && !termination_started {
-            terminate_group_if_owned(pgid, child.leader_reaped);
+            child.terminate();
             termination_started = true;
             shutdown_deadline = Some(Instant::now() + limits.post_exit_drain_timeout);
         }
@@ -5575,7 +5872,7 @@ fn run_bounded_process(
                 ) {
                     Ok(WaitStatus::StillAlive) => {}
                     Ok(_) => {
-                        terminate_group_if_owned(pgid, child.leader_reaped);
+                        child.terminate();
                         termination_started = true;
                         match child.reap() {
                             Ok(observed) => status = Some(observed),
@@ -5632,7 +5929,7 @@ fn run_bounded_process(
             failure = Some(DaemonError::Process(format!(
                 "Git {label} execution timed out"
             )));
-            terminate_group_if_owned(pgid, child.leader_reaped);
+            child.terminate();
             termination_started = true;
             shutdown_deadline = Some(now + limits.post_exit_drain_timeout);
         }
@@ -5648,7 +5945,7 @@ fn run_bounded_process(
     drop(stdout);
     drop(stderr);
     if status.is_none() {
-        terminate_group_if_owned(pgid, child.leader_reaped);
+        child.terminate();
         status = Some(child.reap().map_err(|error| {
             DaemonError::Process(format!("Git {label} final reap failed: {error}"))
         })?);
@@ -6143,6 +6440,193 @@ pub(crate) fn allocate_replacement(
     })
 }
 
+/// Only test builds can lose a worktree-add acknowledgement, keyed by the
+/// allocation id so concurrent launches cannot consume another test's fault.
+#[cfg(any(test, feature = "test-seam"))]
+static WORKTREE_ADD_TIMEOUTS: LazyLock<Mutex<HashMap<Uuid, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(any(test, feature = "test-seam"))]
+pub fn timeout_worktree_add_for_test(session: Uuid, attempts: usize) {
+    WORKTREE_ADD_TIMEOUTS
+        .lock()
+        .unwrap()
+        .insert(session, attempts);
+}
+
+fn sandbox_git_timeout(cleanup_required: bool) -> DaemonError {
+    DaemonError::StructuredRpc {
+        rpc_code: -32029,
+        message: "Sandbox Git worktree allocation timed out".into(),
+        data: serde_json::json!({
+            "kind": "sandbox_allocation",
+            "code": if cleanup_required { "sandbox_git_timeout_cleanup_required" } else { "sandbox_git_timeout" },
+            "next_step": if cleanup_required { "Inspect and clean the retained allocation before relaunching." } else { "Retry the launch; if the retry limit is reached, relaunch under a new key." }
+        }),
+    }
+}
+
+/// Lock reason Git itself records on a worktree while `git worktree add` is
+/// still populating it; a killed add leaves it behind.
+const GIT_INITIALIZING_LOCK_REASON: &str = "initializing";
+/// Wall floor for the allocation's `git worktree add` and the interrupted-add
+/// inspect. A checkout of a large tree under build load took longer than the
+/// general 30-second Git deadline (#626).
+const ALLOCATION_GIT_TIMEOUT_FLOOR: Duration = Duration::from_secs(120);
+/// The load-scaled allocation deadline never exceeds this many floors.
+const ALLOCATION_GIT_TIMEOUT_MAX_SCALE: f64 = 4.0;
+
+/// One-minute load average, where the host exposes it.
+fn host_load_one_minute() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+        return text.split_whitespace().next()?.parse().ok();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Deadline for the allocation's Git work: the floor, stretched in proportion
+/// to how far the one-minute load exceeds the CPU count, at most four floors.
+fn allocation_git_timeout_for(load_one_minute: Option<f64>, cpus: usize) -> Duration {
+    let cpus = cpus.max(1) as f64;
+    let scale = match load_one_minute {
+        Some(load) if load.is_finite() && load > cpus => {
+            (load / cpus).min(ALLOCATION_GIT_TIMEOUT_MAX_SCALE)
+        }
+        _ => 1.0,
+    };
+    ALLOCATION_GIT_TIMEOUT_FLOOR.mul_f64(scale)
+}
+
+fn allocation_git_timeout() -> Duration {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    allocation_git_timeout_for(host_load_one_minute(), cpus)
+}
+
+/// Stream the interrupted checkout's status and prove every entry is a tracked
+/// file that is still missing. Output is consumed record by record, so the
+/// size of a large half-made checkout never fails the inspection; only an
+/// entry that is not a plain missing tracked file marks it foreign.
+fn interrupted_allocation_holds_only_missing_tracked_files(
+    root: &Path,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut command = git_command();
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])
+        .current_dir(root);
+    let mut only_missing = true;
+    run_bounded_records_with_limits(
+        &mut command,
+        None,
+        b'\0',
+        true,
+        "inspect interrupted sandbox allocation",
+        ProcessLimits {
+            execution_timeout: timeout,
+            ..ProcessLimits::record_stream()
+        },
+        &mut |record| {
+            let record = record.strip_suffix(b"\0").unwrap_or(record);
+            if !record.starts_with(b" D ") && !record.starts_with(b"D  ") {
+                only_missing = false;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(only_missing)
+}
+
+/// In-band rollback while the repository lock is still held, before this
+/// allocation has ever been returned or published. The caller proved both the
+/// root and branch absent before add. Never prune other roots or erase foreign
+/// files: only a matching registered root, with clean or missing tracked files,
+/// is removable. This covers an interrupted checkout without adopting it.
+fn cleanup_timed_out_allocation(origin: &Path, root: &Path, branch: &str, oid: &str) -> Result<()> {
+    cleanup_timed_out_allocation_within(origin, root, branch, oid, allocation_git_timeout())
+}
+
+fn cleanup_timed_out_allocation_within(
+    origin: &Path,
+    root: &Path,
+    branch: &str,
+    oid: &str,
+    inspect_timeout: Duration,
+) -> Result<()> {
+    let reference = format!("refs/heads/{branch}");
+    let registered = registration_for_path(origin, root)?;
+    if let Some(entry) = registered {
+        // Only Git's own mark of an add in progress may be released; any other
+        // lock belongs to someone else and is preserved.
+        let lock_is_ours = entry
+            .locked
+            .as_deref()
+            .is_none_or(|reason| reason == GIT_INITIALIZING_LOCK_REASON);
+        if !lock_is_ours
+            || entry.branch.as_deref() != Some(reference.as_str())
+            || entry.head.as_deref() != Some(oid)
+            || resolve_ref_locked(origin, &reference)?.as_deref() != Some(oid)
+            || !std::fs::symlink_metadata(root)?.is_dir()
+            || repository_identity_path(root)? != repository_identity_path(origin)?
+        {
+            return Err(sandbox_git_timeout(true));
+        }
+        if !interrupted_allocation_holds_only_missing_tracked_files(root, inspect_timeout)
+            .map_err(|_| sandbox_git_timeout(true))?
+        {
+            return Err(sandbox_git_timeout(true));
+        }
+        let root_text = root.to_str().ok_or_else(|| sandbox_git_timeout(true))?;
+        // Force is confined to this never-published allocation and only permits
+        // the missing tracked files proven above; no user edits can be dropped.
+        // A second force releases Git's own `initializing` lock.
+        let mut remove_args = vec!["worktree", "remove", "--force"];
+        if entry.locked.is_some() {
+            remove_args.push("--force");
+        }
+        remove_args.push(root_text);
+        let removed = run_git_raw(
+            origin,
+            &remove_args,
+            "rollback interrupted sandbox allocation",
+        )?;
+        if !removed.status.success() {
+            return Err(sandbox_git_timeout(true));
+        }
+    }
+    if std::fs::symlink_metadata(root).is_ok() || registration_for_path(origin, root)?.is_some() {
+        return Err(sandbox_git_timeout(true));
+    }
+    if let Some(actual) = resolve_ref_locked(origin, &reference)? {
+        if actual != oid {
+            return Err(sandbox_git_timeout(true));
+        }
+        let removed = run_git_raw(
+            origin,
+            &["update-ref", "-d", &reference, oid],
+            "rollback interrupted sandbox branch",
+        )?;
+        if !removed.status.success() {
+            return Err(sandbox_git_timeout(true));
+        }
+    }
+    if resolve_ref_locked(origin, &reference)?.is_some() {
+        return Err(sandbox_git_timeout(true));
+    }
+    Ok(())
+}
+
 fn allocate_locked(
     base_dir: &Path,
     root_id: Uuid,
@@ -6196,8 +6680,14 @@ fn allocate_locked(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| default_branch(&session_id));
 
-    // 4. `git worktree add -b <branch> --quiet <root> <commit>` is atomic wrt
-    //    directory + branch creation and is explicit about the source revision.
+    // Establish exclusive ownership for timeout rollback before Git mutates.
+    if resolve_ref_locked(origin, &format!("refs/heads/{branch}"))?.is_some() {
+        return Err(DaemonError::InvalidParam(
+            "sandbox branch already exists".into(),
+        ));
+    }
+
+    // 4. Add from the explicit source revision.
     let root_str = canonical_root
         .to_str()
         .ok_or_else(|| DaemonError::InvalidParam("sandbox root is not valid UTF-8".to_string()))?;
@@ -6213,7 +6703,43 @@ fn allocate_locked(
             &source_commit,
         ])
         .current_dir(origin);
-    let add = capture_bounded(add_command, "git worktree add")?;
+    let add = capture_bounded_with_limits(
+        &mut add_command,
+        "git worktree add",
+        None,
+        ProcessLimits {
+            execution_timeout: allocation_git_timeout(),
+            ..ProcessLimits::default()
+        },
+    );
+    #[cfg(any(test, feature = "test-seam"))]
+    let add = {
+        let mut faults = WORKTREE_ADD_TIMEOUTS.lock().unwrap();
+        if add.as_ref().is_ok_and(|output| output.status.success())
+            && let Some(remaining) = faults.get_mut(&session_id)
+            && *remaining > 0
+        {
+            *remaining -= 1;
+            Err(DaemonError::Process(
+                "Git git worktree add execution timed out".into(),
+            ))
+        } else {
+            add
+        }
+    };
+    let add = match add {
+        Err(DaemonError::Process(ref message))
+            if message == "Git git worktree add execution timed out" =>
+        {
+            let cleaned =
+                cleanup_timed_out_allocation(origin, &canonical_root, &branch, &source_commit);
+            if let Err(error) = &cleaned {
+                tracing::warn!(%session_id, %error, "Timed-out sandbox allocation requires cleanup");
+            }
+            return Err(sandbox_git_timeout(cleaned.is_err()));
+        }
+        result => result?,
+    };
 
     if !add.status.success() {
         let stderr = String::from_utf8_lossy(&add.stderr);
@@ -6237,6 +6763,15 @@ fn allocate_locked(
         branch: Some(branch),
         origin: origin.to_path_buf(),
     })
+}
+
+/// Whether the daemon would allocate a git-worktree sandbox from `origin`: the
+/// one predicate every sandbox allocation passes. Every agent-spawned session
+/// is given such a sandbox, so a registered project root that satisfies it is
+/// a shared worktree agents reach only through sandboxes (hard rule 2).
+#[must_use]
+pub fn origin_admits_sandbox(origin: &Path) -> bool {
+    validate_allocation_origin(origin).is_ok()
 }
 
 fn validate_allocation_origin(origin: &Path) -> Result<()> {
@@ -6585,6 +7120,230 @@ mod tests {
         git(repository, &["add", "tracked"]);
         git(repository, &["commit", "-qm", "base"]);
         git(repository, &["rev-parse", "HEAD"])
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn timed_out_worktree_add_rolls_back_and_can_allocate_again() {
+        let temp = crate::test_support::disk_backed_tempdir("allocation-timeout");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).unwrap();
+        let oid = initialize_repository(&repository);
+        let id = Uuid::new_v4();
+        timeout_worktree_add_for_test(id, 1);
+        let error = allocate(&sandboxes, id, &repository, &oid, None).unwrap_err();
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("typed timeout")
+        };
+        assert_eq!(data["code"], "sandbox_git_timeout");
+        // Reusing both identities proves no root, registration or branch remains.
+        let allocation = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        assert_eq!(git(&allocation.root, &["rev-parse", "HEAD"]), oid);
+        assert_eq!(
+            std::fs::read_to_string(allocation.root.join("tracked")).unwrap(),
+            "base\n"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn timeout_rollback_removes_a_partial_checkout_and_branch_only_residue() {
+        let temp = crate::test_support::disk_backed_tempdir("partial-allocation-timeout");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).unwrap();
+        let oid = initialize_repository(&repository);
+        let id = Uuid::new_v4();
+        let allocation = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        std::fs::remove_file(allocation.root.join("tracked")).unwrap();
+        with_repository_mutation(&repository, || {
+            cleanup_timed_out_allocation(
+                &repository,
+                &allocation.root,
+                allocation.branch.as_deref().unwrap(),
+                &oid,
+            )
+        })
+        .unwrap();
+        // Also cover Git's own abort cleanup leaving only the freshly made ref.
+        git(
+            &repository,
+            &["branch", allocation.branch.as_deref().unwrap(), &oid],
+        );
+        with_repository_mutation(&repository, || {
+            cleanup_timed_out_allocation(
+                &repository,
+                &allocation.root,
+                allocation.branch.as_deref().unwrap(),
+                &oid,
+            )
+        })
+        .unwrap();
+        let retried = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        assert_eq!(git(&retried.root, &["rev-parse", "HEAD"]), oid);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn timeout_rollback_preserves_foreign_files_and_preexisting_branches() {
+        let temp = crate::test_support::disk_backed_tempdir("foreign-allocation-timeout");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).unwrap();
+        let oid = initialize_repository(&repository);
+        let id = Uuid::new_v4();
+        let allocation = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        std::fs::write(allocation.root.join("foreign"), "preserve me").unwrap();
+        let error = with_repository_mutation(&repository, || {
+            cleanup_timed_out_allocation(
+                &repository,
+                &allocation.root,
+                allocation.branch.as_deref().unwrap(),
+                &oid,
+            )
+        })
+        .unwrap_err();
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("typed cleanup refusal")
+        };
+        assert_eq!(data["code"], "sandbox_git_timeout_cleanup_required");
+        assert_eq!(
+            std::fs::read_to_string(allocation.root.join("foreign")).unwrap(),
+            "preserve me"
+        );
+        let other = Uuid::new_v4();
+        assert!(
+            allocate(
+                &sandboxes,
+                other,
+                &repository,
+                &oid,
+                allocation.branch.as_deref()
+            )
+            .is_err()
+        );
+        assert_eq!(git(&allocation.root, &["rev-parse", "HEAD"]), oid);
+    }
+
+    /// #626: a half-made checkout of a large tree has more status entries than
+    /// the capped capture holds; the streamed inspect still proves them all
+    /// missing tracked files, and a locked-`initializing` registration (what a
+    /// killed `git worktree add` leaves) is released with the root and branch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn timeout_rollback_cleans_a_large_locked_initializing_checkout() {
+        let temp = crate::test_support::disk_backed_tempdir("large-allocation-timeout");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).unwrap();
+        initialize_repository(&repository);
+        let bulk = repository.join("bulk");
+        std::fs::create_dir(&bulk).unwrap();
+        for index in 0..2500 {
+            std::fs::write(
+                bulk.join(format!(
+                    "a-deliberately-long-file-name-for-the-status-bound-{index:05}"
+                )),
+                "x\n",
+            )
+            .unwrap();
+        }
+        git(&repository, &["add", "bulk"]);
+        git(&repository, &["commit", "-qm", "bulk"]);
+        let oid = git(&repository, &["rev-parse", "HEAD"]);
+        let id = Uuid::new_v4();
+        let allocation = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        let branch = allocation.branch.clone().unwrap();
+        std::fs::remove_dir_all(allocation.root.join("bulk")).unwrap();
+        std::fs::remove_file(allocation.root.join("tracked")).unwrap();
+        let plain_status = run_git_raw(
+            &allocation.root,
+            &["status", "--porcelain=v1", "-z"],
+            "fixture status",
+        );
+        assert!(
+            plain_status.is_err(),
+            "fixture must exceed the capped capture"
+        );
+        git(
+            &repository,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                GIT_INITIALIZING_LOCK_REASON,
+                allocation.root.to_str().unwrap(),
+            ],
+        );
+        with_repository_mutation(&repository, || {
+            cleanup_timed_out_allocation(&repository, &allocation.root, &branch, &oid)
+        })
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&allocation.root).is_err());
+        assert!(
+            with_repository_mutation(&repository, || {
+                registration_for_path(&repository, &allocation.root)
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            with_repository_mutation(&repository, || {
+                resolve_ref_locked(&repository, &format!("refs/heads/{branch}"))
+            })
+            .unwrap()
+            .is_none()
+        );
+        let retried = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        assert_eq!(git(&retried.root, &["rev-parse", "HEAD"]), oid);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn timeout_rollback_preserves_a_foreign_lock() {
+        let temp = crate::test_support::disk_backed_tempdir("locked-allocation-timeout");
+        let repository = temp.path().join("repository");
+        let sandboxes = temp.path().join("sandboxes");
+        std::fs::create_dir(&sandboxes).unwrap();
+        let oid = initialize_repository(&repository);
+        let id = Uuid::new_v4();
+        let allocation = allocate(&sandboxes, id, &repository, &oid, None).unwrap();
+        let branch = allocation.branch.clone().unwrap();
+        std::fs::remove_file(allocation.root.join("tracked")).unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "operator hold",
+                allocation.root.to_str().unwrap(),
+            ],
+        );
+        let error = with_repository_mutation(&repository, || {
+            cleanup_timed_out_allocation(&repository, &allocation.root, &branch, &oid)
+        })
+        .unwrap_err();
+        let DaemonError::StructuredRpc { data, .. } = error else {
+            panic!("typed cleanup refusal")
+        };
+        assert_eq!(data["code"], "sandbox_git_timeout_cleanup_required");
+        assert!(allocation.root.is_dir());
+        assert_eq!(git(&allocation.root, &["rev-parse", "HEAD"]), oid);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn allocation_timeout_is_generous_and_scales_with_host_load() {
+        let floor = ALLOCATION_GIT_TIMEOUT_FLOOR;
+        assert!(floor >= Duration::from_secs(120));
+        assert_eq!(allocation_git_timeout_for(None, 8), floor);
+        assert_eq!(allocation_git_timeout_for(Some(3.0), 8), floor);
+        assert_eq!(allocation_git_timeout_for(Some(f64::NAN), 8), floor);
+        assert_eq!(allocation_git_timeout_for(Some(16.0), 8), floor * 2);
+        assert_eq!(allocation_git_timeout_for(Some(400.0), 8), floor * 4);
+        assert_eq!(allocation_git_timeout_for(Some(2.0), 0), floor * 2);
     }
 
     /// #2159: git may remove an emptied ref directory while the symref
@@ -10003,6 +10762,73 @@ esac
         .expect("observe worktree")
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_observes_untracked_stamp_in_makefile_project_401() {
+        let temp = crate::test_support::disk_backed_tempdir("makefile-stamp-401");
+        let repository = stamped_repository(&temp);
+        git(&repository, &["rm", ".gitignore", "tracked"]);
+        std::fs::write(repository.join("Makefile"), "test:\n\t@true\n").unwrap();
+        git(&repository, &["add", "Makefile"]);
+        git(&repository, &["commit", "-qm", "Makefile only"]);
+        write_daemon_stamp(&repository);
+        // Empty daemon scratch directories do not authorize ignoring target data.
+        std::fs::create_dir_all(repository.join("target/.rsi-tmp")).unwrap();
+        let observe = || {
+            with_repository_mutation(&repository, || {
+                observe_worktree_locked(&repository, &repository)
+            })
+            .unwrap()
+        };
+        let baseline = observe();
+        assert_eq!(baseline.clean, cfg!(unix), "ownership proof is Unix-only");
+        std::fs::write(repository.join("target/authored.txt"), "retain me").unwrap();
+        let dirty = observe();
+        assert!(!dirty.clean);
+        assert_ne!(dirty.clean_state_digest, baseline.clean_state_digest);
+        assert!(dirty.dirty_detail.unwrap().contains("target/authored.txt"));
+        std::fs::remove_file(repository.join("target/authored.txt")).unwrap();
+        assert_eq!(observe().clean_state_digest, baseline.clean_state_digest);
+        // A tracked marker is source, even if it has the daemon's JSON shape.
+        git(&repository, &["add", ".rsi-build-env.json"]);
+        git(&repository, &["commit", "-qm", "tracked marker"]);
+        std::fs::write(
+            repository.join(".rsi-build-env.json"),
+            br#"{"version":1,"env":{}}"#,
+        )
+        .unwrap();
+        assert!(!observe().clean);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_unproven_untracked_stamps_401() {
+        let temp = crate::test_support::disk_backed_tempdir("unproven-stamp-401");
+        let repository = stamped_repository(&temp);
+        git(&repository, &["rm", ".gitignore"]);
+        git(&repository, &["commit", "-qm", "no ignores"]);
+        let stamp = repository.join(super::super::execution_scratch::BUILD_ENV_RECORD);
+        for body in [
+            "not json",
+            r#"{"version":2,"env":{}}"#,
+            r#"{"version":1,"env":{},"authored":true}"#,
+        ] {
+            std::fs::write(&stamp, body).unwrap();
+            assert!(!settlement_clean(&repository));
+        }
+        std::fs::remove_file(&stamp).unwrap();
+        let elsewhere = temp.path().join("authored-marker");
+        std::fs::write(&elsewhere, br#"{"version":1,"env":{}}"#).unwrap();
+        std::fs::hard_link(&elsewhere, &stamp).unwrap();
+        assert!(!settlement_clean(&repository));
+        std::fs::remove_file(&stamp).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, &stamp).unwrap();
+            assert!(!settlement_clean(&repository));
+        }
+    }
+
     #[cfg(unix)]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
@@ -10116,6 +10942,89 @@ esac
         std::fs::write(repository.join("tracked"), "base\n").expect("restore");
         std::fs::write(repository.join("new-source.rs"), "fn main() {}\n").expect("untracked");
         assert!(!settlement_clean(&repository));
+    }
+
+    /// A repository whose `.gitignore` lacks the stamp entry, so the stamp
+    /// shows as `?? .rsi-build-env.json` (#3759).
+    fn unignored_stamp_repository(temp: &tempfile::TempDir) -> PathBuf {
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        git(&repository, &["init", "-q", "-b", "main"]);
+        git(&repository, &["config", "user.email", "stamp@example.test"]);
+        git(&repository, &["config", "user.name", "Stamp Test"]);
+        std::fs::write(repository.join("tracked"), "base\n").expect("tracked file");
+        git(&repository, &["add", "tracked"]);
+        git(&repository, &["commit", "-qm", "base"]);
+        repository
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_accepts_an_untracked_daemon_stamp_3759() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = unignored_stamp_repository(&temp);
+        write_daemon_stamp(&repository);
+        let status = git(&repository, &["status", "--porcelain"]);
+        assert!(status.contains("?? .rsi-build-env.json"), "{status}");
+        assert!(settlement_clean(&repository));
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_other_untracked_files_beside_the_untracked_stamp_3759() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = unignored_stamp_repository(&temp);
+        write_daemon_stamp(&repository);
+        assert!(settlement_clean(&repository), "positive control");
+        std::fs::write(repository.join("other.txt"), "data\n").expect("other file");
+        assert!(!settlement_clean(&repository));
+        std::fs::remove_file(repository.join("other.txt")).expect("remove other");
+        // Same name below the root is not the stamp.
+        std::fs::create_dir(repository.join("sub")).expect("subdirectory");
+        std::fs::write(repository.join("sub/.rsi-build-env.json"), "x").expect("nested");
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn settlement_retains_an_unauthentic_untracked_stamp_3759() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = unignored_stamp_repository(&temp);
+        std::fs::write(
+            repository.join(super::super::execution_scratch::BUILD_ENV_RECORD),
+            "operator notes\n",
+        )
+        .expect("foreign stamp");
+        assert!(!settlement_clean(&repository));
+    }
+
+    #[cfg(unix)]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn removal_clears_only_the_untracked_authentic_stamp_3759() {
+        let stamp = super::super::execution_scratch::BUILD_ENV_RECORD;
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = unignored_stamp_repository(&temp);
+        write_daemon_stamp(&repository);
+        remove_daemon_untracked_stamp(&repository).expect("clear stamp");
+        assert!(!repository.join(stamp).exists());
+        assert!(settlement_clean(&repository));
+
+        // A tracked stamp is source, never cleared.
+        write_daemon_stamp(&repository);
+        git(&repository, &["add", stamp]);
+        remove_daemon_untracked_stamp(&repository).expect("keep tracked");
+        assert!(repository.join(stamp).exists());
+
+        // An unproven file is left for Git to refuse.
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let repository = unignored_stamp_repository(&temp);
+        std::fs::write(repository.join(stamp), "operator notes\n").expect("foreign");
+        remove_daemon_untracked_stamp(&repository).expect("keep foreign");
+        assert!(repository.join(stamp).exists());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
@@ -10499,6 +11408,77 @@ esac
         assert!(!marker.exists(), "quiet descendant survived group closure");
     }
 
+    /// #3890: the bench runner's Docker `ssh://` helper starts ssh with `setsid`, which the Git
+    /// no-escape filter turns into EPERM (reported as "permission denied ... docker.example.com").
+    /// The group-contained capture the bench runner uses lets a descendant call `setsid`, and still
+    /// bounds the run; the Git capture keeps denying it.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn group_capture_lets_a_descendant_call_setsid_while_the_git_capture_denies_it() {
+        let script = "setsid --wait sh -c 'printf escaped'";
+        let mut group = Command::new("sh");
+        group.args(["-c", script]);
+        let output =
+            capture_command_bounded_group_for(group, "bench runner", Duration::from_secs(10))
+                .expect("group capture runs");
+        assert!(
+            output.status.success(),
+            "setsid failed under Group containment"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "escaped");
+
+        let mut no_escape = Command::new("sh");
+        no_escape.args(["-c", script]);
+        let denied = capture_command_bounded_for(no_escape, "git call", Duration::from_secs(10))
+            .expect("no-escape capture runs");
+        assert!(
+            !denied.status.success(),
+            "the Git capture must keep denying setsid"
+        );
+        assert_ne!(String::from_utf8_lossy(&denied.stdout), "escaped");
+    }
+
+    /// #3900: a command whose child calls `setsid` and outlives the deadline must not survive the
+    /// bounded call; the group kill alone cannot reach it.
+    #[cfg(target_os = "linux")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn group_capture_kills_a_setsid_descendant_at_the_deadline() {
+        let temp = tempfile::tempdir().expect("pid file directory");
+        let pid_file = temp.path().join("escaped.pid");
+        let mut command = Command::new("sh");
+        command.env("PID_FILE", &pid_file).args([
+            "-c",
+            "setsid sh -c 'echo $$ > \"$PID_FILE\"; exec sleep 30' & wait",
+        ]);
+        let error =
+            capture_command_bounded_group_for(command, "bench runner", Duration::from_millis(1500))
+                .expect_err("the deadline must fire");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        let escaped: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the escaped child published its pid")
+            .trim()
+            .parse()
+            .expect("pid");
+        let gone = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| {
+                    stat.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .starts_with('Z')
+                })
+                .unwrap_or(true)
+        };
+        let dead = (0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(25));
+            gone(escaped)
+        });
+        assert!(dead, "setsid descendant {escaped} survived the deadline");
+    }
+
     #[cfg(target_os = "linux")]
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[test]
@@ -10691,6 +11671,68 @@ esac
         assert!(
             error.to_string().contains("extended attributes or ACLs"),
             "{error}"
+        );
+    }
+
+    /// #185: the handoff-ref prune deletes exactly the listed predecessors'
+    /// refs that still name their recorded commit; a ref moved since it was
+    /// recorded, another seat's ref, `refs/heads` and the tree stay as they were.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn prune_manager_handoff_refs_deletes_only_recorded_unmoved_refs_185() {
+        let temp = tempfile::tempdir().expect("fixture");
+        let repo = temp.path().join("repo");
+        let base = initialize_repository(&repo);
+        std::fs::write(repo.join("tracked"), "second\n").expect("tracked file");
+        git(&repo, &["commit", "-qam", "second"]);
+        let second = git(&repo, &["rev-parse", "HEAD"]);
+        let (aged, moved, absent, other) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        git(&repo, &["update-ref", &manager_handoff_ref(aged), &base]);
+        // Recorded at `base`, since moved to `second`.
+        git(&repo, &["update-ref", &manager_handoff_ref(moved), &second]);
+        git(&repo, &["update-ref", &manager_handoff_ref(other), &base]);
+        let heads = git(&repo, &["for-each-ref", "refs/heads"]);
+        let status = git(&repo, &["status", "--porcelain"]);
+
+        let pruned = prune_manager_handoff_refs(
+            &repo,
+            &[
+                (aged, base.clone()),
+                (moved, base.clone()),
+                (absent, base.clone()),
+            ],
+        )
+        .expect("prune");
+        assert_eq!(pruned, vec![aged]);
+        let refs = git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/rsi/",
+            ],
+        );
+        let mut expected = vec![
+            format!("{} {second}", manager_handoff_ref(moved)),
+            format!("{} {base}", manager_handoff_ref(other)),
+        ];
+        expected.sort();
+        let mut listed: Vec<String> = refs.lines().map(str::to_owned).collect();
+        listed.sort();
+        assert_eq!(listed, expected);
+        assert_eq!(git(&repo, &["for-each-ref", "refs/heads"]), heads);
+        assert_eq!(git(&repo, &["status", "--porcelain"]), status);
+        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), second);
+        // Idempotent: a second pass finds nothing left to prune.
+        assert!(
+            prune_manager_handoff_refs(&repo, &[(aged, base.clone()), (moved, base)])
+                .expect("second prune")
+                .is_empty()
         );
     }
 }

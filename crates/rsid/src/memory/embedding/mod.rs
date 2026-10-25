@@ -434,7 +434,6 @@ mod tests {
     use crate::store::Store;
     use rsi_common::model_control::{InvocationOwner, ModelControlMode};
     use std::sync::Arc;
-    use tokio::sync::Mutex;
 
     // --- l2_normalize tests ---
 
@@ -636,7 +635,7 @@ mod tests {
             let store = Store::open_in_memory().expect("model-control store");
             store.set_model_control_mode(mode).expect("control mode");
             let control = EmbeddingControl {
-                store: Arc::new(Mutex::new(store)),
+                store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
                 event_bus: Arc::new(EventBus::new(8)),
                 owner: InvocationOwner::default(),
                 provider: provider_label.to_string(),

@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 
 use rsi_common::agent_failure_signatures::SignatureIssueSource;
 use rsi_common::agent_jobs::{AgentJobV1, JobParams, JobState};
+use rsi_common::agent_landing_candidate::has_rolling_provenance;
 use rsi_common::failure_signature::{parse_issue_blocks, status_is_live};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -39,6 +40,9 @@ pub(crate) enum Reason {
     StaleHead,
     Incomplete,
     NewFailures,
+    /// Every receipt for the commit came from a tool copy the daemon does not
+    /// stamp as the rolling one (candidate, sandbox or no stamp).
+    UntrustedTool,
 }
 
 impl Reason {
@@ -48,6 +52,7 @@ impl Reason {
             Self::StaleHead => "stale_head",
             Self::Incomplete => "incomplete",
             Self::NewFailures => "new_failures",
+            Self::UntrustedTool => "candidate_tool_untrusted",
         }
     }
 }
@@ -208,8 +213,11 @@ pub(crate) fn handoff_format_continuation_message(
          Next step: repeat your final message so that its very first line is exactly \
          `PIPELINE HANDOFF — <STAGE>:` (an em dash, an uppercase stage, a trailing colon; \
          use the stage your instructions name), followed by doc_path, manifest_path, status and a \
-         summary. Any prose belongs after that block. Do not redo any work; if you already \
-         filed or found everything, say `nothing new` in the summary.\n\
+         summary. A `blocked` or `human_gate` status also needs blocker, blocker_class, \
+         blocker_evidence and blocker_question in this same message (this is your only format \
+         correction, so give every missing field at once). Any prose belongs after that block. \
+         Do not redo any work; if you already filed or found everything, say `nothing new` in \
+         the summary.\n\
          {}",
         continuation_marker(delivery_id),
     );
@@ -380,10 +388,33 @@ pub(crate) fn judge(
             None,
         ));
     }
-    let Some(job) = scoped
+    let at_head: Vec<&AgentJobV1> = scoped
         .iter()
-        .find(|job| job.state.is_terminal() && receipt_head(job) == Some(head))
+        .copied()
+        .filter(|job| job.state.is_terminal() && receipt_head(job) == Some(head))
+        .collect();
+    // The tool under test cannot vouch for its own receipt (#3793): only a run
+    // the daemon stamped as the rolling tool copy verifies, exactly the
+    // `AgentCheckLandingCandidate` rule. A trusted run at the same head wins
+    // over a newer untrusted one.
+    let Some(job) = at_head
+        .iter()
+        .copied()
+        .find(|job| has_rolling_provenance(job))
     else {
+        if let Some(untrusted) = at_head.first().copied() {
+            return Err(unverified(
+                Reason::UntrustedTool,
+                format!(
+                    "scoped_test job {} at {head} has no daemon provenance naming the rolling \
+                     tool copy (candidate, sandbox or unstamped run): rerun scoped_test with \
+                     params.scoped_test.rolling_tool:true; that run stays tool-under-test \
+                     evidence",
+                    untrusted.id
+                ),
+                Some(evidence_of(untrusted, Vec::new(), Vec::new())),
+            ));
+        }
         // No job verified this commit: name the newest receipt's commit, or
         // the job that ended without one.
         return Err(
@@ -505,6 +536,27 @@ fn evidence_of(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use rsi_common::agent_jobs::{ScopedToolProvenanceV1, ScopedToolSource};
+
+    /// #3319: the one format continuation names the whole BLOCKED field set, so
+    /// a worker never repairs a blocker handoff one missing field at a time.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn handoff_format_continuation_names_the_full_blocked_field_set() {
+        let message = handoff_format_continuation_message(
+            "missing required fields `blocker`, `blocker_evidence`",
+            1,
+            1,
+            Uuid::nil(),
+        );
+        for needed in [
+            "missing required fields `blocker`, `blocker_evidence`",
+            "blocker, blocker_class, blocker_evidence and blocker_question",
+            "PIPELINE HANDOFF — <STAGE>:",
+        ] {
+            assert!(message.contains(needed), "{needed}: {message}");
+        }
+    }
     use rsi_common::agent_jobs::AgentJobResultV1;
     use rsi_common::failure_signature::{FENCE_INFO, digest};
 
@@ -521,9 +573,29 @@ mod tests {
     const RED_TEST: &str =
         "session::rotation::tests::final_pipeline_handoff_from_epic_lead_still_rotates";
 
+    fn stamp(source: ScopedToolSource) -> ScopedToolProvenanceV1 {
+        ScopedToolProvenanceV1 {
+            source,
+            path: "/tool/scripts/scoped-test".into(),
+            rev: None,
+            files: Vec::new(),
+        }
+    }
+
+    /// `job` with its daemon provenance replaced (`None` is a legacy, unstamped job).
+    fn with_tool(mut job: AgentJobV1, source: Option<ScopedToolSource>) -> AgentJobV1 {
+        job.result.as_mut().expect("result").scoped_tool = source.map(stamp);
+        job
+    }
+
     fn job_from(owner: Uuid, state: &str, result: Option<&str>, scoped: bool) -> AgentJobV1 {
-        let result: Option<AgentJobResultV1> =
+        let mut result: Option<AgentJobResultV1> =
             result.map(|text| serde_json::from_str(text).expect("result"));
+        // The daemon stamps every real scoped_test job with its tool source; the
+        // fixtures default to the trusted rolling copy.
+        if let Some(result) = result.as_mut() {
+            result.scoped_tool = Some(stamp(ScopedToolSource::Rolling));
+        }
         let params = if scoped {
             json!({"kind":"test","scoped_test":{"base":"origin/rolling"}})
         } else {
@@ -707,6 +779,72 @@ mod tests {
         let blind = job_from(owner, "failed", Some(&result.to_string()), true);
         let err = judge(&[blind], owner, REAL_RED_HEAD, &signatures).unwrap_err();
         assert_eq!(err.reason, Reason::Incomplete);
+    }
+
+    /// #3793: only a run the daemon stamped as the rolling tool copy verifies,
+    /// on the green and on the tracked-baseline-red path alike; a candidate,
+    /// sandbox or unstamped (legacy) run fails closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn only_a_rolling_tool_run_verifies_green_or_baseline_red() {
+        let owner = Uuid::new_v4();
+        let signatures = known(&[(RED_TEST, 2123)]);
+        for (label, source) in [
+            ("candidate", Some(ScopedToolSource::Candidate)),
+            ("sandbox", Some(ScopedToolSource::Sandbox)),
+            ("missing", None),
+        ] {
+            let green = with_tool(
+                job_from(owner, "succeeded", Some(REAL_GREEN), true),
+                source.clone(),
+            );
+            let err = judge(&[green], owner, REAL_GREEN_HEAD, &known(&[])).unwrap_err();
+            assert_eq!(err.reason, Reason::UntrustedTool, "green {label}");
+            assert_eq!(err.to_json()["reason"], "candidate_tool_untrusted");
+            assert_eq!(
+                err.evidence.as_ref().map(|e| e.head.as_str()),
+                Some(REAL_GREEN_HEAD)
+            );
+
+            let red = with_tool(job_from(owner, "failed", Some(REAL_RED), true), source);
+            let err = judge(&[red], owner, REAL_RED_HEAD, &signatures).unwrap_err();
+            assert_eq!(err.reason, Reason::UntrustedTool, "baseline red {label}");
+        }
+        for (job, head) in [
+            (
+                job_from(owner, "succeeded", Some(REAL_GREEN), true),
+                REAL_GREEN_HEAD,
+            ),
+            (
+                job_from(owner, "failed", Some(REAL_RED), true),
+                REAL_RED_HEAD,
+            ),
+        ] {
+            assert!(judge(&[job], owner, head, &signatures).is_ok());
+        }
+    }
+
+    /// A newer candidate-tool run never shadows an older rolling-tool run of the
+    /// same head; with only the candidate run the commit stays unverified.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    #[test]
+    fn a_trusted_run_at_the_head_wins_over_a_newer_untrusted_one() {
+        let owner = Uuid::new_v4();
+        let trusted = job_from(owner, "succeeded", Some(REAL_GREEN), true);
+        let forged = with_tool(
+            job_from(owner, "succeeded", Some(REAL_GREEN), true),
+            Some(ScopedToolSource::Candidate),
+        );
+        let evidence = judge(
+            &[forged.clone(), trusted.clone()],
+            owner,
+            REAL_GREEN_HEAD,
+            &known(&[]),
+        )
+        .unwrap();
+        assert_eq!(evidence.job_id, trusted.id);
+        let err = judge(&[forged], owner, REAL_GREEN_HEAD, &known(&[])).unwrap_err();
+        assert_eq!(err.reason, Reason::UntrustedTool);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]

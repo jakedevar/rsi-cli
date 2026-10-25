@@ -20,7 +20,6 @@ use rsi_common::rolling_queue::DeployQaWarningV1;
 use rsi_common::satellite::{SATELLITE_WIRE_VERSION_V1, SatelliteUuidV1};
 use rsi_common::satellite_dispatch::{SATELLITE_TARGET_NOT_AUTHORIZED, SatelliteDeployRequestV1};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 fn receipt(
@@ -31,9 +30,12 @@ fn receipt(
     AgentRequestDeployReceiptV1 {
         interrupt_workers: interrupt.requested,
         interrupted_workers: interrupt.interrupted,
-        job_grace_secs: interrupt
-            .requested
-            .then_some(rsi_common::agent_deploy::DEPLOY_JOB_GRACE_SECS),
+        expected_interrupted_workers: Vec::new(),
+        expected_requeued_jobs: Vec::new(),
+        requeued_jobs: Vec::new(),
+        expected_surviving_jobs: Vec::new(),
+        surviving_jobs: Vec::new(),
+        job_grace_secs: None,
         cancelled_jobs: interrupt.cancelled_jobs,
         deploy_id: row.id,
         state: row.state,
@@ -58,10 +60,24 @@ pub(crate) fn receipt_with_blockers(
     replayed: bool,
 ) -> Result<AgentRequestDeployReceiptV1> {
     let mut receipt = receipt(row, interrupt, replayed);
+    for id in &receipt.cancelled_jobs {
+        if store.agent_job_requeued_by_deploy(*id)? == Some(row.id) {
+            receipt.requeued_jobs.push(*id);
+        }
+    }
+    // #3554: the jobs a restart left running, as the restarting poll marked them.
+    receipt.surviving_jobs = store.deploy_surviving_jobs(row.id)?;
     if row.state == DeployState::Staged
         && let Some(owner) = row.owner_session_id
     {
-        receipt.blockers = store.deploy_quiet_blocker_details_with(owner, true)?;
+        // #3554: a running ordinary test job of an `interrupt_workers` deploy
+        // keeps running across the restart and is no blocker.
+        let surviving = crate::agent_jobs::deploy_surviving_jobs_or_none(store, row);
+        receipt.blockers = store.deploy_quiet_blocker_details_surviving(owner, true, &surviving)?;
+        if receipt.interrupt_workers {
+            receipt.expected_interrupted_workers = store.deploy_mid_turn_workers(owner)?;
+            receipt.expected_surviving_jobs = surviving;
+        }
         receipt.waiting_since = store
             .agent_deploy_created_at(row.id)?
             .map(|at| at.to_rfc3339_opts(SecondsFormat::Nanos, true));
@@ -252,7 +268,8 @@ impl AgentControlHandle {
                 drain.release(row.id);
             }
         }
-        Ok(receipt(&row, interrupt, false))
+        let store = self.store.lock().await;
+        receipt_with_blockers(&store, &row, interrupt, false)
     }
 
     /// #1017 slice 2: ask the paired satellite to run its own deploy flow over
@@ -328,7 +345,7 @@ pub(crate) struct DeployReplayScope<'a> {
 /// Authority is the caller's job (the manager on the hub, the allowlisted hub
 /// on a satellite).
 pub(crate) async fn stage_owned_deploy(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     owner: Uuid,
     scope: Option<DeployReplayScope<'_>>,
     request: AgentRequestDeployRequestV1,

@@ -23,6 +23,24 @@ use std::time::{Duration, Instant};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_API_BODY_BYTES: usize = 64 * 1024;
+/// The model catalog is megabytes; the same bound as discovery's own fetch.
+const MAX_CATALOG_BODY_BYTES: usize = 8 * 1024 * 1024;
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+/// A failed account-usage read is retried no sooner than this.
+const USAGE_RETRY_AFTER: Duration = Duration::from_secs(15);
+/// How long a catalog fetch's prices are served before the daemon fetches the
+/// catalog again for a price read.
+const PRICE_TTL: chrono::Duration = chrono::Duration::hours(1);
+/// A model the fetched catalog did not list is looked for again no sooner.
+const PRICE_RETRY: chrono::Duration = chrono::Duration::seconds(60);
+
+/// The last successful read of the account `total_usage` (#3154): the figure
+/// the spend ceiling is judged against, with the time it was read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpendProbe {
+    pub total_usage: f64,
+    pub at: DateTime<Utc>,
+}
 
 /// The two OpenRouter account endpoints, behind a trait so tests never touch
 /// the network.
@@ -32,6 +50,12 @@ pub trait OpenRouterApi: Send + Sync {
     async fn key(&self, secret: &SecretString) -> ProbeOutcome;
     /// `GET {base}/api/v1/credits`.
     async fn credits(&self, secret: &SecretString) -> ProbeOutcome;
+    /// `GET {base}/api/v1/models` (#3154: the catalog's per-token prices). The
+    /// body limit is the catalog's, not the small account-endpoint limit. A
+    /// stub that does not serve the catalog keeps this default.
+    async fn models(&self, _secret: &SecretString) -> ProbeOutcome {
+        ProbeOutcome::Unsupported
+    }
 }
 
 /// Production client. The base URL is a field so a test can aim it at a mock.
@@ -54,12 +78,23 @@ impl Default for HttpOpenRouterApi {
 
 impl HttpOpenRouterApi {
     async fn get(&self, path: &str, secret: &SecretString) -> ProbeOutcome {
+        self.get_limited(path, secret, MAX_API_BODY_BYTES, API_TIMEOUT)
+            .await
+    }
+
+    async fn get_limited(
+        &self,
+        path: &str,
+        secret: &SecretString,
+        max_body_bytes: usize,
+        timeout: Duration,
+    ) -> ProbeOutcome {
         if self.offline {
             return ProbeOutcome::Offline;
         }
         let Ok(http) = reqwest::Client::builder()
             .connect_timeout(API_TIMEOUT)
-            .timeout(API_TIMEOUT)
+            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
             .build()
         else {
@@ -83,9 +118,9 @@ impl HttpOpenRouterApi {
             let Ok(chunk) = chunk else {
                 return ProbeOutcome::Failed;
             };
-            let room = MAX_API_BODY_BYTES.saturating_sub(body.len());
+            let room = max_body_bytes.saturating_sub(body.len());
             body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            if body.len() >= MAX_API_BODY_BYTES {
+            if body.len() >= max_body_bytes {
                 break;
             }
         }
@@ -100,6 +135,15 @@ impl OpenRouterApi for HttpOpenRouterApi {
     }
     async fn credits(&self, secret: &SecretString) -> ProbeOutcome {
         self.get("/api/v1/credits", secret).await
+    }
+    async fn models(&self, secret: &SecretString) -> ProbeOutcome {
+        self.get_limited(
+            "/api/v1/models",
+            secret,
+            MAX_CATALOG_BODY_BYTES,
+            CATALOG_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -142,6 +186,18 @@ pub struct ProviderStatusService {
     api: Arc<dyn OpenRouterApi>,
     ttl: Duration,
     cache: tokio::sync::Mutex<HashMap<&'static str, (Instant, LiveProbe)>>,
+    /// Latest successful account-usage read (#3154), kept apart from the
+    /// status cache so a failed probe never erases it: it ages instead, and an
+    /// armed cap fails closed once it is stale.
+    usage: parking_lot::Mutex<Option<SpendProbe>>,
+    /// When the spend ceiling last tried to read the account usage, success or
+    /// not: a failing provider is retried every [`USAGE_RETRY_AFTER`], not on
+    /// every model call of every running session.
+    usage_attempted: parking_lot::Mutex<Option<Instant>>,
+    /// Single-flight guard of the catalog price fetch.
+    price_fetch: tokio::sync::Mutex<()>,
+    /// When this service last fetched the catalog for a price read.
+    prices_fetched: parking_lot::Mutex<Option<DateTime<Utc>>>,
 }
 
 impl ProviderStatusService {
@@ -151,7 +207,117 @@ impl ProviderStatusService {
             api,
             ttl,
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            usage: parking_lot::Mutex::new(None),
+            usage_attempted: parking_lot::Mutex::new(None),
+            price_fetch: tokio::sync::Mutex::new(()),
+            prices_fetched: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The latest successful account-usage read, `None` before the first.
+    #[must_use]
+    pub fn usage_probe(&self) -> Option<SpendProbe> {
+        *self.usage.lock()
+    }
+
+    /// Record an account-usage read. Keeps the newer of two reads.
+    pub fn record_usage_probe(&self, total_usage: f64, at: DateTime<Utc>) {
+        let mut usage = self.usage.lock();
+        if usage.is_none_or(|current| current.at <= at) {
+            *usage = Some(SpendProbe { total_usage, at });
+        }
+    }
+
+    /// Test seam: overwrite the recorded usage read, however old.
+    #[cfg(test)]
+    pub(crate) fn set_usage_probe_for_test(&self, probe: Option<SpendProbe>) {
+        *self.usage.lock() = probe;
+        *self.usage_attempted.lock() = None;
+    }
+
+    /// The account usage no older than `max_age`, probing the provider when
+    /// the last read is older (bypassing the 60 s status cache). `force` always
+    /// probes: arming a cap takes a fresh baseline. On a failed probe the
+    /// previous read is returned as it is, aging toward stale; `None` before
+    /// any read succeeded.
+    pub async fn refresh_usage(
+        &self,
+        vault: &VaultHandle,
+        max_age: chrono::Duration,
+        force: bool,
+    ) -> Option<SpendProbe> {
+        let now = Utc::now();
+        if !force {
+            if let Some(probe) = self.usage_probe()
+                && now - probe.at < max_age
+            {
+                return Some(probe);
+            }
+            if self
+                .usage_attempted
+                .lock()
+                .is_some_and(|at| at.elapsed() < USAGE_RETRY_AFTER)
+            {
+                return self.usage_probe();
+            }
+        }
+        *self.usage_attempted.lock() = Some(Instant::now());
+        self.openrouter_probe_with(vault, now, true).await;
+        self.usage_probe()
+    }
+
+    /// The prices of `models` from the daemon's own OpenRouter discovery,
+    /// fetching the catalog first when the last fetch is older than an hour.
+    /// Returns `(prices, unknown model ids)`; a failed fetch leaves whatever an
+    /// earlier fetch discovered.
+    pub async fn model_prices(
+        &self,
+        vault: &VaultHandle,
+        models: &[String],
+    ) -> (
+        Vec<rsi_common::openrouter_spend::OpenRouterModelPriceV1>,
+        Vec<String>,
+    ) {
+        // This service's own last fetch decides, not the process-wide table
+        // (the model picker also fills it, from a narrower query): the catalog
+        // is fetched when this service never did or its copy is over an hour
+        // old, and again, at most once a minute, for a model it does not list.
+        let _flight = self.price_fetch.lock().await;
+        let age = (*self.prices_fetched.lock()).map(|at| Utc::now() - at);
+        let missing = models.iter().any(|model| {
+            crate::model_control::discovered_price(
+                model.strip_prefix("openrouter/").unwrap_or(model),
+            )
+            .is_none()
+        });
+        let due = match age {
+            None => true,
+            Some(age) => age >= PRICE_TTL || (missing && age >= PRICE_RETRY),
+        };
+        if due && let Ok(Some(resolved)) = vault.resolve(Slot::Openrouter) {
+            *self.prices_fetched.lock() = Some(Utc::now());
+            if let ProbeOutcome::Http { status, body } = self.api.models(&resolved.secret).await
+                && (200..300).contains(&status)
+            {
+                let _ = crate::openrouter::publish_catalog_prices(&body);
+            }
+        }
+        let mut prices = Vec::new();
+        let mut unknown = Vec::new();
+        for model in models {
+            let id = model.strip_prefix("openrouter/").unwrap_or(model);
+            match crate::model_control::discovered_price(id) {
+                Some(found) => prices.push(rsi_common::openrouter_spend::OpenRouterModelPriceV1 {
+                    model: model.clone(),
+                    prompt_usd_per_mtok: found.price.input_per_mtok,
+                    completion_usd_per_mtok: found.price.output_per_mtok,
+                    input_cache_read_usd_per_mtok: found.price.cache_read_per_mtok,
+                    fetched_at: found.fetched_at,
+                }),
+                None => unknown.push(model.clone()),
+            }
+        }
+        (prices, unknown)
     }
 
     /// Process-wide production instance (real HTTP, 60 s TTL).
@@ -166,7 +332,18 @@ impl ProviderStatusService {
     }
 
     async fn openrouter_probe(&self, vault: &VaultHandle, now: DateTime<Utc>) -> LiveProbe {
-        {
+        self.openrouter_probe_with(vault, now, false).await
+    }
+
+    /// The OpenRouter probe; `force` skips the status cache (#3154: the spend
+    /// ceiling reads the account usage itself, never a cached copy).
+    async fn openrouter_probe_with(
+        &self,
+        vault: &VaultHandle,
+        now: DateTime<Utc>,
+        force: bool,
+    ) -> LiveProbe {
+        if !force {
             let cache = self.cache.lock().await;
             if let Some((at, probe)) = cache.get("openrouter")
                 && at.elapsed() < self.ttl
@@ -204,6 +381,9 @@ impl ProviderStatusService {
                             let (total, used) = parse_openrouter_credits(body);
                             credit.total_credits = total;
                             credit.total_usage = used;
+                            if let Some(used) = used.filter(|used| used.is_finite()) {
+                                self.record_usage_probe(used, now);
+                            }
                             credit.account_remaining = total.zip(used).map(|(t, u)| t - u);
                         }
                     }
@@ -369,6 +549,10 @@ impl ProviderStatusService {
             models_unavailable: Vec::new(),
             login: None,
             contract: None,
+            spend_cap: None,
+            model_prices: Vec::new(),
+            model_prices_unknown: Vec::new(),
+            run_budget: None,
         }
     }
 }

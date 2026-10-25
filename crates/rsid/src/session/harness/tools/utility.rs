@@ -186,13 +186,13 @@ impl HarnessTool for ContextStatusTool {
 
 pub(crate) struct CompactTool {
     state: Arc<UtilityToolState>,
-    store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+    store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
 }
 
 impl CompactTool {
     pub(crate) fn new(
         state: Arc<UtilityToolState>,
-        store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+        store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
     ) -> Self {
         Self { state, store }
     }

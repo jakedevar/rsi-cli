@@ -1,0 +1,26 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListModels",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:ListFoundationModels",
+        "bedrock:GetFoundationModel",
+        "bedrock:ListInferenceProfiles",
+        "bedrock:GetInferenceProfile"
+      ],
+      "Resource": "*",
+      "Condition": { "StringLike": { "aws:RequestedRegion": "us-*" } }
+    },
+    {
+      "Sid": "InvokeModels",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:us-*::foundation-model/*",
+        "arn:aws:bedrock:us-*:625527221604:inference-profile/*"
+      ]
+    }
+  ]
+}

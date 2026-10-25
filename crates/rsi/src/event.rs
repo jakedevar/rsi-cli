@@ -222,6 +222,16 @@ fn global_guard_holds(app: &crate::app::App, guard: crate::key_tables::GlobalGua
     }
 }
 
+/// The hint shown when Ctrl-C is pressed where it has no other meaning
+/// (#3434). Ctrl-C never quits rsi; the documented exits are `:q` and `ZZ`.
+pub(crate) fn ctrl_c_hint(app: &crate::app::App) -> &'static str {
+    if app.editing_mode_prompt.is_some() {
+        "Ctrl-C does not quit rsi. Choose a mode, or press q to quit"
+    } else {
+        "Ctrl-C does not quit rsi. Press Esc, then :q (or ZZ) to quit"
+    }
+}
+
 /// Run one global-intercept effect.
 async fn run_global_effect(app: &mut crate::app::App, effect: crate::key_tables::GlobalEffect) {
     use crate::key_tables::GlobalEffect;
@@ -244,7 +254,10 @@ async fn run_global_effect(app: &mut crate::app::App, effect: crate::key_tables:
                 let _ = term.write_input(&[0x03]);
             }
         }
-        GlobalEffect::Quit => app.quit = true,
+        GlobalEffect::CtrlCHint => {
+            app.notify(ctrl_c_hint(app));
+            app.mark_dirty();
+        }
         GlobalEffect::ToggleTerminal => {
             crate::action_handler::dispatch_lc_action(app, LcAction::ToggleTerminal).await;
         }
@@ -308,17 +321,17 @@ async fn step_once_with_clock<C: EventClock>(
     use modalkit::key::TerminalKey;
 
     // The first-start editing-mode prompt (#1628) owns every key until the
-    // operator answers; only the global quit chord escapes it.
+    // operator answers; only `q` (quit) escapes it. Ctrl-C shows the hint.
     if app.editing_mode_prompt.is_some() {
         if key.kind != KeyEventKind::Press {
             return KeyStepResult::default();
         }
-        let quit = crate::key_tables::lookup(crate::key_tables::GLOBAL_KEY_INTERCEPTS, key, |g| {
+        let hint = crate::key_tables::lookup(crate::key_tables::GLOBAL_KEY_INTERCEPTS, key, |g| {
             global_guard_holds(app, g)
         })
         .map(|entry| entry.effect)
-        .filter(|effect| matches!(effect, crate::key_tables::GlobalEffect::Quit));
-        if let Some(effect) = quit {
+        .filter(|effect| matches!(effect, crate::key_tables::GlobalEffect::CtrlCHint));
+        if let Some(effect) = hint {
             run_global_effect(app, effect).await;
         } else {
             crate::editing_mode_prompt::handle_key(app, key).await;
@@ -783,7 +796,8 @@ pub async fn run_event_loop(
                                 crate::overlay::try_paste_text_overlay(app, &text)
                                     || crate::file_viewer::try_paste_text_file_viewer(app, &text)
                             } else {
-                                crate::file_viewer::try_paste_text_file_viewer(app, &text)
+                                app.paste_into_issue_editor(&text)
+                                    || crate::file_viewer::try_paste_text_file_viewer(app, &text)
                                     || crate::input_bar::try_paste_text_input_bar(app, &text)
                             };
                             if handled {
@@ -1425,7 +1439,9 @@ pub async fn run_event_loop(
         app.poll_land_watch().await;
         app.poll_todo_panel().await;
         app.poll_manager_roster_refresh().await;
+        crate::overlay::launch_settings::tick_grant_context(app).await;
         crate::overlay::global_manager_workspace::tick(app).await;
+        crate::overlay::global_dashboard::tick(app).await;
         crate::overlay::fleet::tick(app).await;
 
         if let Some(mode) = app.pending_manual.take() {
@@ -4101,6 +4117,7 @@ mod tests {
                         retry_key: "pin".to_string(),
                         error: None,
                         submitted: false,
+                        text: Default::default(),
                     });
                     *app.active_tab_mut()
                         .layout
@@ -4296,7 +4313,7 @@ mod tests {
         #[rustfmt::skip]
         const PINNED: &[(&str, &str, &str)] = &[
             ("list", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("list", "Ctrl-C", "quit=true"),
+            ("list", "Ctrl-C", "notes=1"),
             ("list", "Ctrl-O", "-"),
             ("list", "Ctrl-I", "-"),
             ("list", "Ctrl-H", "notes=1; panes=list[Archive#0]"),
@@ -4329,7 +4346,7 @@ mod tests {
             ("list", "Ctrl-T", "-"),
             ("list", "Ctrl-S", "-"),
             ("detail", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("detail", "Ctrl-C", "quit=true"),
+            ("detail", "Ctrl-C", "notes=1"),
             ("detail", "Ctrl-O", "-"),
             ("detail", "Ctrl-I", "-"),
             ("detail", "Ctrl-H", "-"),
@@ -4362,7 +4379,7 @@ mod tests {
             ("detail", "Ctrl-T", "-"),
             ("detail", "Ctrl-S", "-"),
             ("jumplist", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("jumplist", "Ctrl-C", "quit=true"),
+            ("jumplist", "Ctrl-C", "notes=1"),
             ("jumplist", "Ctrl-O", "focus=SessionDetail; panes=detail[Some(1) scroll=Some(0) cursor=None tail=Some(true)]"),
             ("jumplist", "Ctrl-I", "focus=SessionDetail; jump=2; panes=detail[Some(2) scroll=Some(0) cursor=None tail=Some(true)]"),
             ("jumplist", "Ctrl-H", "notes=1; panes=list[Archive#0]"),
@@ -4395,7 +4412,7 @@ mod tests {
             ("jumplist", "Ctrl-T", "-"),
             ("jumplist", "Ctrl-S", "-"),
             ("detail_insert", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("detail_insert", "Ctrl-C", "quit=true"),
+            ("detail_insert", "Ctrl-C", "notes=1"),
             ("detail_insert", "Ctrl-O", "-"),
             ("detail_insert", "Ctrl-I", "-"),
             ("detail_insert", "Ctrl-H", "-"),
@@ -4428,7 +4445,7 @@ mod tests {
             ("detail_insert", "Ctrl-T", "-"),
             ("detail_insert", "Ctrl-S", "-"),
             ("prompt_overlay", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("prompt_overlay", "Ctrl-C", "quit=true"),
+            ("prompt_overlay", "Ctrl-C", "notes=1"),
             ("prompt_overlay", "Ctrl-O", "-"),
             ("prompt_overlay", "Ctrl-I", "-"),
             ("prompt_overlay", "Ctrl-H", "-"),
@@ -4461,7 +4478,7 @@ mod tests {
             ("prompt_overlay", "Ctrl-T", "-"),
             ("prompt_overlay", "Ctrl-S", "-"),
             ("prompt_config_pending", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("prompt_config_pending", "Ctrl-C", "quit=true"),
+            ("prompt_config_pending", "Ctrl-C", "notes=1"),
             ("prompt_config_pending", "Ctrl-O", "-"),
             ("prompt_config_pending", "Ctrl-I", "-"),
             ("prompt_config_pending", "Ctrl-H", "-"),
@@ -4528,7 +4545,7 @@ mod tests {
             ("terminal", "Ctrl-S", "-"),
             ("terminal", "Ctrl-\\", "overlay=None"),
             ("stale_issue_editor", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("stale_issue_editor", "Ctrl-C", "quit=true"),
+            ("stale_issue_editor", "Ctrl-C", "notes=1"),
             ("stale_issue_editor", "Ctrl-O", "-"),
             ("stale_issue_editor", "Ctrl-I", "-"),
             ("stale_issue_editor", "Ctrl-H", "-"),
@@ -4551,8 +4568,8 @@ mod tests {
             ("stale_issue_editor", "Ctrl-Tab", "-"),
             ("stale_issue_editor", "Ctrl-Shift-Tab", "-"),
             ("stale_issue_editor", "Ctrl-Shift-BackTab", "-"),
-            ("stale_issue_editor", "Up", "notes=1"),
-            ("stale_issue_editor", "Down", "notes=1"),
+            ("stale_issue_editor", "Up", "-"),
+            ("stale_issue_editor", "Down", "-"),
             ("stale_issue_editor", "Esc", "-"),
             ("stale_issue_editor", "Enter", "notes=1"),
             ("stale_issue_editor", "Backspace", "-"),
@@ -4561,7 +4578,7 @@ mod tests {
             ("stale_issue_editor", "Ctrl-T", "-"),
             ("stale_issue_editor", "Ctrl-S", "-"),
             ("quick_input", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("quick_input", "Ctrl-C", "quit=true"),
+            ("quick_input", "Ctrl-C", "notes=1"),
             ("quick_input", "Ctrl-O", "input=abo"),
             ("quick_input", "Ctrl-I", "input=abi"),
             ("quick_input", "Ctrl-H", "input=abh"),
@@ -4594,7 +4611,7 @@ mod tests {
             ("quick_input", "Ctrl-T", "input=abt"),
             ("quick_input", "Ctrl-S", "input=abs"),
             ("quick_input_config_pending", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("quick_input_config_pending", "Ctrl-C", "quit=true"),
+            ("quick_input_config_pending", "Ctrl-C", "notes=1"),
             ("quick_input_config_pending", "Ctrl-O", "input=abo"),
             ("quick_input_config_pending", "Ctrl-I", "input=abi"),
             ("quick_input_config_pending", "Ctrl-H", "input=abh"),
@@ -4627,7 +4644,7 @@ mod tests {
             ("quick_input_config_pending", "Ctrl-T", "input=abt"),
             ("quick_input_config_pending", "Ctrl-S", "input=abs"),
             ("command", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("command", "Ctrl-C", "quit=true"),
+            ("command", "Ctrl-C", "notes=1"),
             ("command", "Ctrl-O", "command=zzo"),
             ("command", "Ctrl-I", "command=zzi"),
             ("command", "Ctrl-H", "command=zzh"),
@@ -4660,7 +4677,7 @@ mod tests {
             ("command", "Ctrl-T", "command=zzt"),
             ("command", "Ctrl-S", "command=zzs"),
             ("search", "Ctrl-Alt-G", "overlay=KeybindingsHelp"),
-            ("search", "Ctrl-C", "quit=true"),
+            ("search", "Ctrl-C", "notes=1"),
             ("search", "Ctrl-O", "search=Fixo"),
             ("search", "Ctrl-I", "search=Fixi"),
             ("search", "Ctrl-H", "search=Fixh"),
@@ -4737,7 +4754,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn standard_ctrl_c_copies_a_selection_and_otherwise_quits() {
+    async fn standard_ctrl_c_copies_a_selection_and_otherwise_hints() {
         let (mut app, id) = standard_composer("standard");
         type_text(&mut app, "hello").await;
         press(&mut app, KeyCode::Char('a'), KeyModifiers::CONTROL).await;
@@ -4756,10 +4773,16 @@ mod tests {
             "hello"
         );
 
-        // Collapse the selection: Ctrl-C keeps its global meaning.
+        // Collapse the selection: Ctrl-C shows the hint and never quits.
         press(&mut app, KeyCode::Right, KeyModifiers::NONE).await;
         press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
-        assert!(app.quit, "Ctrl-C without a selection still quits");
+        assert!(!app.quit, "Ctrl-C without a selection must not quit");
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message.contains("Ctrl-C does not quit rsi")),
+            "Ctrl-C without a selection shows the exit hint"
+        );
     }
 
     #[tokio::test]

@@ -16,6 +16,11 @@ pub enum EvalError {
     #[error("bench record error: {0}")]
     Bench(String),
 
+    #[error(
+        "digest refused: task {task} (attempt {attempt}) is not in split.json `search`; held-out content never enters the candidate store"
+    )]
+    HeldOutRefused { task: String, attempt: u32 },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

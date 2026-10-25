@@ -60,9 +60,11 @@ fn runtime_config() -> Arc<RuntimeConfig> {
     RuntimeConfig::from_config(&Config::from_env())
 }
 
-fn store() -> Arc<tokio::sync::Mutex<Store>> {
+fn store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
     let path = std::env::temp_dir().join(format!("compile-prompt-{}.db", Uuid::new_v4()));
-    Arc::new(tokio::sync::Mutex::new(Store::open(&path).expect("store")))
+    Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open(&path).expect("store"),
+    ))
 }
 
 fn canned_result() -> CompileResult {

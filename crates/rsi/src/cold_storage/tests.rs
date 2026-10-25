@@ -67,7 +67,7 @@ async fn app_with_daemon(
     tempfile::TempDir,
     tokio::task::JoinHandle<()>,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let socket = dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let mut app = app_test_helpers::with_session_list(1);
@@ -672,6 +672,9 @@ fn the_cold_storage_tab_lists_the_switch_the_status_and_the_run_row() {
     assert_eq!(
         ids,
         vec![
+            SettingId::ErrorDispositionEnabled,
+            SettingId::ErrorDispositionGraceMinutes,
+            SettingId::ErrorDispositionContinuationBudget,
             SettingId::ColdArchiveEnabled,
             SettingId::ColdArchiveAfterDays,
             SettingId::ColdArchiveDir,
@@ -690,5 +693,5 @@ fn the_cold_storage_tab_lists_the_switch_the_status_and_the_run_row() {
     }
     let rows =
         crate::settings_keys::daemon_feature_rows_for_section(&app, SettingsSection::ColdStorage);
-    assert_eq!(rows.len(), 6);
+    assert_eq!(rows.len(), 9);
 }

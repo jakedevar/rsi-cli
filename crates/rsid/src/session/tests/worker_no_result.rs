@@ -1,10 +1,12 @@
 //! Issue #1098: a worker never silently ends without RESULT.
 use super::*;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::session::worker_result_guard::{
+    ChildrenOutcome, live_descendant_count, settled_descendants,
+};
 use crate::session::worker_result_guard::{
     NO_RESULT_STOP_REASON, install_test_provider_pid, no_result_wake_id,
 };
-#[cfg(target_os = "linux")]
-use crate::session::worker_result_guard::{live_descendant_count, settled_descendant_count};
 use rsi_common::types::WakeMode;
 use std::sync::Arc;
 
@@ -175,21 +177,10 @@ impl LiveRun {
     }
 }
 
-/// Every child of `pid` (helpers included), by `/proc/*/stat`.
+/// Every child of `pid` (helpers included), from the guard's process table
+/// (`/proc` on Linux, libproc on macOS, #193).
 fn raw_child_count(pid: u32) -> usize {
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
-        .filter(|stat| {
-            stat.rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-                .and_then(|ppid| ppid.parse::<u32>().ok())
-                == Some(pid)
-        })
-        .count()
+    crate::session::worker_result_guard::direct_child_count(pid)
 }
 
 impl Drop for LiveRun {
@@ -229,6 +220,12 @@ async fn no_result_with_live_child_gets_one_continuation_then_no_result() {
     assert_eq!(wake.wake_session_id, Some(worker.id));
     assert!(wake.message.contains("RESULT"));
     assert!(wake.message.contains("PIPELINE HANDOFF — <STAGE>:"));
+    assert!(wake.message.contains("AgentSubmitJob with wake:\"none\""));
+    assert!(
+        wake.message
+            .contains("AgentScheduleWake with mode:\"when\"")
+    );
+    assert!(wake.message.contains("then end the turn"));
     assert_eq!(wake_count(&f, worker.id).await, 1);
 
     // The continuation also ends without RESULT: terminal `no_result`, and no
@@ -252,13 +249,101 @@ async fn running_agent_job_counts_as_owned_work() {
             .conn
             .execute(
                 "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,log_path,status_path,state,created_at,row_version)
-                 VALUES(?1,?2,'test','{}','/tmp','unit-1098','/tmp/log','/tmp/status','running',?3,1)",
+                 VALUES(?1,?2,'test','{\"wake\":\"none\"}','/tmp','unit-1098','/tmp/log','/tmp/status','running',?3,1)",
                 rusqlite::params![Uuid::new_v4().to_string(), worker.id.to_string(), now],
             )
             .unwrap();
     }
     run_turn(&f, &worker, "waiting for the job").await;
     assert_eq!(wake_count(&f, worker.id).await, 1);
+}
+
+/// #364: the job's owner wake is only materialized at settlement. Until then
+/// either open state parks the worker, even if it also has live descendants.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test]
+async fn owner_wake_job_parks_until_settlement_without_a_wake() {
+    use rsi_common::agent_jobs::{AgentJobResultV1, JobState};
+
+    for state in ["queued", "running"] {
+        for params in [r#"{"kind":"test"}"#, r#"{"kind":"test","wake":"owner"}"#] {
+            let f = fixture();
+            let (_parent, worker) = worker_pair(&f).await;
+            let run = LiveRun::start(None);
+            install_test_provider_pid(worker.id, run.sh.id());
+            let job = Uuid::new_v4();
+            {
+                let store = f.manager.store.lock().await;
+                let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                        log_path,status_path,state,created_at,row_version)
+                     VALUES(?1,?2,'test',?3,'/tmp','unit-364','/tmp/log','/tmp/status',?4,?5,1)",
+                        rusqlite::params![
+                            job.to_string(),
+                            worker.id.to_string(),
+                            params,
+                            state,
+                            now
+                        ],
+                    )
+                    .unwrap();
+            }
+            run_turn(&f, &worker, "waiting for my job's owner wake").await;
+            assert_eq!(wake_count(&f, worker.id).await, 0);
+            assert_eq!(stored(&f, worker.id).await.status, SessionStatus::Completed);
+
+            // Model a missing completion wake using the store's real silent
+            // settlement path. Other owned work remains, so the existing
+            // no-result rule applies again on the next turn boundary.
+            {
+                let store = f.manager.store.lock().await;
+                store
+                    .settle_agent_job(
+                        job,
+                        JobState::Succeeded,
+                        &AgentJobResultV1 {
+                            exit_code: Some(0),
+                            ..Default::default()
+                        },
+                        false,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+                assert!(
+                    !store
+                        .owner_running_job_has_completion_wake(worker.id)
+                        .unwrap()
+                );
+            }
+            run_turn(&f, &worker, "the job ended but other work remains").await;
+            assert_eq!(wake_count(&f, worker.id).await, 1);
+
+            // Following the nudge by submitting an owner-wake job parks the
+            // next turn too, rather than recording a second miss.
+            f.manager
+                .store
+                .lock()
+                .await
+                .conn
+                .execute(
+                    "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,
+                        log_path,status_path,state,created_at,row_version)
+                     SELECT ?2,owner_session_id,kind,params_json,cwd,'unit-364-next',
+                        log_path,status_path,'running',created_at,1 FROM agent_jobs WHERE id=?1",
+                    rusqlite::params![job.to_string(), Uuid::new_v4().to_string()],
+                )
+                .unwrap();
+            run_turn(&f, &worker, "waiting for my new job result").await;
+            let parked = stored(&f, worker.id).await;
+            assert_eq!(parked.status, SessionStatus::Completed);
+            assert_ne!(parked.stop_reason.as_deref(), Some(NO_RESULT_STOP_REASON));
+            assert_eq!(wake_count(&f, worker.id).await, 1);
+        }
+    }
 }
 
 /// #1734: a running job whose completion is awaited by an enabled
@@ -277,7 +362,7 @@ async fn running_job_with_completion_wake_is_not_nudged() {
             .conn
             .execute(
                 "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,log_path,status_path,state,created_at,row_version)
-                 VALUES(?1,?2,'test','{}','/tmp','unit-1734','/tmp/log','/tmp/status','running',?3,1)",
+                 VALUES(?1,?2,'test','{\"wake\":\"none\"}','/tmp','unit-1734','/tmp/log','/tmp/status','running',?3,1)",
                 rusqlite::params![job_id.to_string(), worker.id.to_string(), now],
             )
             .unwrap();
@@ -291,16 +376,19 @@ async fn running_job_with_completion_wake_is_not_nudged() {
                 &WakeWhenState {
                     predicate: WakePredicate {
                         sha_on_rolling: None,
+                        shas_on_rolling: None,
                         issue_closed: None,
                         todo_closed: None,
                         topology_execution_settled: None,
                         health_anomaly: None,
                         settlement_run_settled: None,
                         jobs_terminal: Some(vec![job_id]),
+                        fire: None,
                     },
                     armed_at: chrono::Utc::now(),
                     deadline: None,
                     repo_dir: None,
+                    delivered_shas: Vec::new(),
                 },
                 false,
             )
@@ -736,7 +824,7 @@ async fn finished_worker_and_reviewer_get_no_nudge() {
 /// #1459: a foreground command that has just returned is still winding down
 /// (its `sleep` stands in for the shell, wrapper or pipe tail) when the
 /// provider emits its result. One sample sees it; the settled count does not.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn just_finished_foreground_command_is_not_a_live_descendant() {
@@ -756,25 +844,28 @@ fn just_finished_foreground_command_is_not_a_live_descendant() {
         "one sample sees the winding-down command"
     );
     assert_eq!(
-        settled_descendant_count(pid, std::time::Duration::from_millis(800)),
-        0,
+        settled_descendants(pid, std::time::Duration::from_millis(800)),
+        ChildrenOutcome::None,
         "the command exited within the settle window"
     );
     let _ = sh.wait();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
 #[test]
 fn still_running_command_survives_the_settle_window() {
     let run = LiveRun::start(None);
     assert_eq!(
-        settled_descendant_count(run.sh.id(), std::time::Duration::from_millis(100)),
-        1
+        settled_descendants(run.sh.id(), std::time::Duration::from_millis(100)),
+        ChildrenOutcome::Alive
     );
 }
 
-/// A copy of `sleep` named like the provider's MCP gateway.
+/// A copy of `sleep` named like the provider's MCP gateway. Linux only: macOS
+/// kills a copied arm64e system binary at exec and a symlink keeps the target's
+/// `comm`, so no system binary can stand in for a renamed helper there; the
+/// helper walk itself is the same code on both platforms (#193).
 #[cfg(target_os = "linux")]
 fn helper_named_sleeper(dir: &std::path::Path) -> std::path::PathBuf {
     let sleep = ["/usr/bin/sleep", "/bin/sleep"]
@@ -981,7 +1072,7 @@ async fn own_running_job(f: &Fixture, worker: &Session) {
         .conn
         .execute(
             "INSERT INTO agent_jobs(id,owner_session_id,kind,params_json,cwd,unit_name,log_path,status_path,state,created_at,row_version)
-             VALUES(?1,?2,'test','{}','/tmp',?4,'/tmp/log','/tmp/status','running',?3,1)",
+             VALUES(?1,?2,'test','{\"wake\":\"none\"}','/tmp',?4,'/tmp/log','/tmp/status','running',?3,1)",
             rusqlite::params![
                 Uuid::new_v4().to_string(),
                 worker.id.to_string(),
@@ -1108,4 +1199,351 @@ fn declared_result_prefixes_come_from_report_format_lines_only() {
         )
         .is_empty()
     );
+}
+
+/// #3378: the process-table probe fails closed. These drive the settled probe
+/// over a scripted table reader so each unreadable path is exercised without
+/// a host that really cannot read `/proc`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+mod fail_closed_probe {
+    use crate::session::worker_result_guard::{
+        BSD_SZOMB, BsdRow, ChildrenOutcome, PID_LIST_ATTEMPTS, ProbeUnknown, ProcBsdShortInfo,
+        ProcRow, ProcessTable, bsd_row_from, list_all_pids_with, probe_children_with,
+        read_proc_dir,
+    };
+    use std::time::Duration;
+
+    const PARENT: u32 = 500;
+    const NO_WAIT: Duration = Duration::ZERO;
+
+    fn row(pid: u32, ppid: u32, comm: &str) -> ProcRow {
+        ProcRow {
+            pid,
+            ppid,
+            comm: comm.to_string(),
+            zombie: false,
+        }
+    }
+
+    fn table(rows: Vec<ProcRow>, unreadable_rows: usize) -> Result<ProcessTable, ProbeUnknown> {
+        Ok(ProcessTable {
+            rows,
+            unreadable_rows,
+        })
+    }
+
+    fn child_table(unreadable_rows: usize) -> Result<ProcessTable, ProbeUnknown> {
+        table(vec![row(600, PARENT, "cargo")], unreadable_rows)
+    }
+
+    /// Run the probe against a sequence of reads (the last repeats) and return
+    /// the outcome with the number of reads made.
+    fn probe(
+        retries: usize,
+        mut reads: Vec<Result<ProcessTable, ProbeUnknown>>,
+    ) -> (ChildrenOutcome, usize) {
+        let mut calls = 0;
+        let mut read = || {
+            calls += 1;
+            if reads.len() > 1 {
+                reads.remove(0)
+            } else {
+                reads[0].clone()
+            }
+        };
+        let outcome = probe_children_with(PARENT, NO_WAIT, retries, NO_WAIT, &mut read);
+        (outcome, calls)
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn readable_tables_keep_their_answers() {
+        assert_eq!(probe(2, vec![table(vec![], 0)]).0, ChildrenOutcome::None);
+        assert_eq!(probe(2, vec![child_table(0)]).0, ChildrenOutcome::Alive);
+        // A first sample's child that exited before the second is gone.
+        assert_eq!(
+            probe(2, vec![child_table(0), table(vec![], 0)]).0,
+            ChildrenOutcome::None
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn enumeration_error_is_unknown_after_bounded_retries() {
+        let (outcome, calls) = probe(2, vec![Err(ProbeUnknown::EnumerationFailed)]);
+        assert_eq!(
+            outcome,
+            ChildrenOutcome::Unknown(ProbeUnknown::EnumerationFailed)
+        );
+        assert_eq!(calls, 3, "one read plus the two bounded retries");
+        assert!(outcome.blocks_finalize());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn unsupported_platform_is_an_explicit_unknown_without_retry() {
+        let (outcome, calls) = probe(2, vec![Err(ProbeUnknown::Unsupported)]);
+        assert_eq!(outcome, ChildrenOutcome::Unknown(ProbeUnknown::Unsupported));
+        assert_eq!(calls, 1);
+        assert!(outcome.blocks_finalize());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn unreadable_row_without_a_live_child_is_unknown() {
+        let (outcome, calls) = probe(2, vec![table(vec![], 1)]);
+        assert_eq!(
+            outcome,
+            ChildrenOutcome::Unknown(ProbeUnknown::RowUnreadable)
+        );
+        assert_eq!(calls, 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_definite_live_child_is_alive_despite_an_unreadable_row() {
+        let (outcome, calls) = probe(2, vec![child_table(1)]);
+        assert_eq!(outcome, ChildrenOutcome::Alive);
+        assert_eq!(calls, 2, "one read per settle sample, no retry");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_transient_failure_is_retried_to_a_readable_answer() {
+        let (outcome, _) = probe(
+            2,
+            vec![Err(ProbeUnknown::EnumerationFailed), table(vec![], 0)],
+        );
+        assert_eq!(outcome, ChildrenOutcome::None);
+        let (outcome, _) = probe(2, vec![table(vec![], 1), child_table(0)]);
+        assert_eq!(outcome, ChildrenOutcome::Alive);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn an_incomplete_second_sample_cannot_prove_the_child_exited() {
+        let (outcome, _) = probe(0, vec![child_table(0), table(vec![], 1)]);
+        assert_eq!(
+            outcome,
+            ChildrenOutcome::Unknown(ProbeUnknown::RowUnreadable)
+        );
+        let (outcome, _) = probe(
+            0,
+            vec![child_table(0), Err(ProbeUnknown::EnumerationFailed)],
+        );
+        assert_eq!(
+            outcome,
+            ChildrenOutcome::Unknown(ProbeUnknown::EnumerationFailed)
+        );
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_host_without_a_process_table_reads_unknown() {
+        assert_eq!(
+            crate::session::worker_result_guard::settled_descendants(1, NO_WAIT),
+            ChildrenOutcome::Unknown(ProbeUnknown::Unsupported)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn proc_directory_rows_are_read_or_counted_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write_stat = |pid: &str, stat: &str| {
+            std::fs::create_dir(root.join(pid)).unwrap();
+            std::fs::write(root.join(pid).join("stat"), stat).unwrap();
+        };
+        write_stat("100", "100 (cargo test) S 500 100 100 0 -1");
+        write_stat("101", "101 (defunct) Z 500 100 100 0 -1");
+        // Malformed: no closing paren / no parent field.
+        write_stat("102", "102 garbage");
+        write_stat("103", "103 (short) S");
+        // Unreadable: `stat` is a directory, so the read fails (not ENOENT).
+        std::fs::create_dir_all(root.join("104").join("stat")).unwrap();
+        // Gone: the pid directory has no `stat` (the process exited).
+        std::fs::create_dir(root.join("105")).unwrap();
+        // Not a process.
+        std::fs::create_dir(root.join("self")).unwrap();
+
+        let table = read_proc_dir(root).expect("the directory lists");
+        let mut pids: Vec<(u32, u32, bool)> = table
+            .rows
+            .iter()
+            .map(|r| (r.pid, r.ppid, r.zombie))
+            .collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![(100, 500, false), (101, 500, true)]);
+        assert_eq!(table.unreadable_rows, 3, "102, 103 and 104 cannot be read");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn an_unreadable_proc_directory_is_an_enumeration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-proc");
+        assert_eq!(
+            read_proc_dir(&missing).err(),
+            Some(ProbeUnknown::EnumerationFailed)
+        );
+    }
+
+    /// Hub #3398: a listing that fits its buffer is returned as written.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_pid_listing_that_fits_its_buffer_is_returned_whole() {
+        let mut calls = 0;
+        let pids = list_all_pids_with(3, |buffer| {
+            calls += 1;
+            buffer[..3].copy_from_slice(&[1, 42, 500]);
+            Some(3)
+        });
+        assert_eq!(pids, Ok(vec![1, 42, 500]));
+        assert_eq!(calls, 1);
+    }
+
+    /// Hub #3398: a full buffer may have dropped pids, so the listing reruns
+    /// with a larger buffer and the complete second listing is returned.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_saturated_pid_listing_retries_with_a_larger_buffer() {
+        let mut sizes = Vec::new();
+        let pids = list_all_pids_with(0, |buffer| {
+            sizes.push(buffer.len());
+            if sizes.len() == 1 {
+                buffer.fill(7);
+                return Some(buffer.len());
+            }
+            buffer[..2].copy_from_slice(&[7, 501]);
+            Some(2)
+        });
+        assert_eq!(pids, Ok(vec![7, 501]));
+        assert_eq!(sizes.len(), 2);
+        assert!(sizes[1] > sizes[0], "the retry buffer is larger: {sizes:?}");
+    }
+
+    /// Hub #3398: a listing still full after every attempt, or a failed call,
+    /// fails closed instead of reading a partial table as complete.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn a_pid_listing_saturated_on_every_attempt_is_an_enumeration_error() {
+        let mut calls = 0;
+        let pids = list_all_pids_with(10, |buffer| {
+            calls += 1;
+            Some(buffer.len())
+        });
+        assert_eq!(pids, Err(ProbeUnknown::EnumerationFailed));
+        assert_eq!(calls, PID_LIST_ATTEMPTS);
+        assert_eq!(
+            list_all_pids_with(10, |_| None),
+            Err(ProbeUnknown::EnumerationFailed)
+        );
+    }
+
+    fn short_info(pid: u32, ppid: u32, uid: u32, comm: &str) -> ProcBsdShortInfo {
+        let mut info = ProcBsdShortInfo {
+            pbsi_pid: pid,
+            pbsi_ppid: ppid,
+            pbsi_uid: uid,
+            pbsi_ruid: uid,
+            pbsi_svuid: uid,
+            ..Default::default()
+        };
+        info.pbsi_comm[..comm.len()].copy_from_slice(comm.as_bytes());
+        info
+    }
+
+    /// The macOS table over scripted short-info reads.
+    fn bsd_table(
+        reads: Vec<std::io::Result<ProcBsdShortInfo>>,
+    ) -> Result<ProcessTable, ProbeUnknown> {
+        let mut table = ProcessTable::default();
+        for read in reads {
+            match bsd_row_from(read) {
+                BsdRow::Row(row) => table.rows.push(row),
+                BsdRow::Gone => {}
+                BsdRow::Unreadable => table.unreadable_rows += 1,
+            }
+        }
+        Ok(table)
+    }
+
+    /// Hub #3401 / #251: another user's process (root's launchd, a setuid
+    /// command) is a readable row, not an unreadable one, so a host full of
+    /// other users' processes still proves "no owned children", and a
+    /// descendant that changed uid is still walked.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn other_users_processes_are_rows_not_unreadable() {
+        let host = || {
+            vec![
+                Ok(short_info(1, 0, 0, "launchd")),
+                Ok(short_info(88, 1, 0, "WindowServer")),
+                Ok(short_info(PARENT, 1, 501, "claude")),
+            ]
+        };
+        let table = bsd_table(host()).expect("table");
+        assert_eq!(table.unreadable_rows, 0);
+        assert_eq!(probe(2, vec![bsd_table(host())]).0, ChildrenOutcome::None);
+
+        let mut with_setuid_child = host();
+        with_setuid_child.push(Ok(short_info(601, PARENT, 0, "sudo")));
+        assert_eq!(
+            probe(2, vec![bsd_table(with_setuid_child)]).0,
+            ChildrenOutcome::Alive
+        );
+    }
+
+    /// An exited process is gone; any other refused or short read could be an
+    /// owned child and keeps the probe fail-closed.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn bsd_reads_classify_gone_refused_and_zombie_rows() {
+        const ESRCH: i32 = 3;
+        const EPERM: i32 = 1;
+        assert!(matches!(
+            bsd_row_from(Err(std::io::Error::from_raw_os_error(ESRCH))),
+            BsdRow::Gone
+        ));
+        assert!(matches!(
+            bsd_row_from(Err(std::io::Error::from_raw_os_error(EPERM))),
+            BsdRow::Unreadable
+        ));
+        assert!(matches!(
+            bsd_row_from(Err(std::io::Error::other("short read"))),
+            BsdRow::Unreadable
+        ));
+        let mut zombie = short_info(602, PARENT, 501, "sleep");
+        zombie.pbsi_status = BSD_SZOMB;
+        let BsdRow::Row(row) = bsd_row_from(Ok(zombie)) else {
+            panic!("a filled struct is a row");
+        };
+        assert_eq!(
+            (row.pid, row.ppid, row.comm.as_str(), row.zombie),
+            (602, PARENT, "sleep", true)
+        );
+
+        let refused = bsd_table(vec![
+            Ok(short_info(1, 0, 0, "launchd")),
+            Err(std::io::Error::from_raw_os_error(EPERM)),
+        ]);
+        assert_eq!(
+            probe(2, vec![refused]).0,
+            ChildrenOutcome::Unknown(ProbeUnknown::RowUnreadable)
+        );
+    }
+
+    /// The real reader on a Mac: root's launchd (another uid) reads as a row.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+    #[test]
+    fn macos_short_info_reads_another_users_process() {
+        let read = crate::session::worker_result_guard::read_bsd_short_info(1);
+        let BsdRow::Row(row) = bsd_row_from(read) else {
+            panic!("launchd's short info is readable by any user");
+        };
+        assert_eq!((row.pid, row.ppid), (1, 0));
+    }
 }

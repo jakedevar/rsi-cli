@@ -19,7 +19,7 @@ async fn connect_catalog(
     tokio::task::JoinHandle<Vec<Value>>,
     Observed,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let path = dir.path().join("c.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let observed: Observed = Arc::default();
@@ -121,7 +121,7 @@ async fn active_session_limit_is_top_level_and_keyboard_save_uses_edited_value()
         .iter()
         .position(|row| row.field == policy::Field::Concurrency)
         .unwrap();
-    assert!(screen(&mut app).contains("Active session limit: 4"));
+    assert!(flat(&screen(&mut app)).contains("Active session limit 4"));
     for _ in 0..target {
         key(&mut app, KeyCode::Char('j')).await;
     }
@@ -135,7 +135,7 @@ async fn active_session_limit_is_top_level_and_keyboard_save_uses_edited_value()
     let requests = finish(task).await;
     assert_eq!(requests[1]["params"]["policy"]["max_active_sessions"], 20);
     assert_eq!(policy_mut(&mut app).draft.max_active_sessions, 20);
-    assert!(screen(&mut app).contains("Active session limit: 20"));
+    assert!(flat(&screen(&mut app)).contains("Active session limit 20"));
 }
 
 #[tokio::test]
@@ -693,7 +693,7 @@ async fn keyboard_identical_zero_is_touched_and_cancelling_text_keeps_the_key() 
     )
     .await;
     assert_eq!(policy_mut(&mut app).draft.max_recovery_attempts, 0);
-    assert_eq!(policy_mut(&mut app).draft.max_created_sessions, 32);
+    assert_eq!(policy_mut(&mut app).draft.max_created_sessions, 256);
     assert_eq!(
         policy_mut(&mut app).classification().preset,
         ManagerPolicyPreset::Custom
@@ -906,7 +906,7 @@ fn catalog_scroll_keeps_last_model_identity_visible_in_small_viewport() {
 async fn cancel_inflight_catalog_aborts_its_reader_and_late_result_cannot_edit_policy() {
     let (mut app, config) = fixture();
     let saved = policy_config(&config);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::socket_tempdir().unwrap();
     let path = dir.path().join("held.sock");
     let listener = UnixListener::bind(&path).unwrap();
     let (seen_send, seen) = tokio::sync::oneshot::channel();
@@ -999,7 +999,7 @@ async fn operator_delegation_row_renders_and_saving_full_stores_the_grant() {
         .into_iter()
         .find(|r| r.field == field)
         .unwrap();
-    assert_eq!(row.label, "Grant Operator delegation");
+    assert_eq!(row.label, "Operator delegation");
     assert_eq!(row.value, "false");
     activate(
         &mut app,
@@ -1008,7 +1008,7 @@ async fn operator_delegation_row_renders_and_saving_full_stores_the_grant() {
     .await;
     focus(&mut app, field);
     let text = screen(&mut app);
-    assert!(text.contains("Grant Operator delegation: true"), "{text}");
+    assert!(flat(&text).contains("[x] Operator delegation"), "{text}");
     assert!(text.contains("Call allowlisted operator methods"), "{text}");
     assert!(
         policy_mut(&mut app)
@@ -1075,7 +1075,9 @@ async fn older_saved_full_without_operator_delegation_renders_custom_unwidened()
     assert!(!row.modified);
     let text = screen(&mut app);
     assert!(text.contains("Saved: Custom"), "{text}");
-    assert!(text.contains("Draft: Custom"), "{text}");
+    assert!(text.contains("Preset Custom"), "{text}");
+    assert!(text.contains("draft unchanged"), "{text}");
+    assert_eq!(policy_mut(&mut app).draft_line(), None);
 }
 
 /// Toggling the grant on a Custom draft marks it modified against the saved
@@ -1120,7 +1122,7 @@ async fn toggling_operator_delegation_on_custom_draft_saves_it() {
     assert_eq!(row.saved.as_deref(), Some("false"));
     let text = screen(&mut app);
     assert!(
-        text.contains("Grant Operator delegation: true (saved false)"),
+        flat(&text).contains("[x] Operator delegation (saved off)"),
         "{text}"
     );
     key(&mut app, KeyCode::Char('s')).await;
@@ -1174,7 +1176,7 @@ async fn toggling_storage_control_on_custom_draft_saves_it() {
     activate(&mut app, field).await;
     let text = screen(&mut app);
     assert!(
-        text.contains("Grant Storage control: true (saved false)"),
+        flat(&text).contains("[x] Storage control (saved off)"),
         "{text}"
     );
     key(&mut app, KeyCode::Char('s')).await;
@@ -1225,7 +1227,7 @@ async fn daemon_settings_grant_and_bounds_save_with_the_policy() {
         .into_iter()
         .find(|r| r.field == field)
         .unwrap();
-    assert_eq!(row.label, "Grant Daemon settings");
+    assert_eq!(row.label, "Daemon settings");
     assert_eq!(row.value, "false");
     // Default: no allowlisted key is adjustable.
     let bound = policy::Field::SettingBound(0);
@@ -1359,7 +1361,7 @@ async fn toggling_deploy_on_custom_draft_saves_it() {
     assert_eq!(row.value, "false");
     activate(&mut app, field).await;
     let text = screen(&mut app);
-    assert!(text.contains("Grant Deploy: true (saved false)"), "{text}");
+    assert!(flat(&text).contains("[x] Deploy (saved off)"), "{text}");
     key(&mut app, KeyCode::Char('s')).await;
     let requests = finish(task).await;
     assert_eq!(

@@ -55,6 +55,13 @@ fn operator_node(
     parent: Option<&PortfolioNodeV1>,
     level: u16,
 ) -> (PortfolioNodeV1, Uuid) {
+    // This policy fixture exercises metered budgets.
+    store
+        .set_daemon_setting("claude_billing_mode", "metered_api")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "metered_api")
+        .unwrap();
     let seat = session(store, None);
     let mut request = root(label, seat, projects, &format!("op-{label}-{seat}"));
     request.parent_node_id = parent.map(|parent| parent.node_id);
@@ -138,6 +145,13 @@ fn appoint_child(
     projects: &[Uuid],
     level: u16,
 ) -> (PortfolioNodeV1, Uuid) {
+    // This policy fixture exercises metered budgets.
+    store
+        .set_daemon_setting("claude_billing_mode", "metered_api")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "metered_api")
+        .unwrap();
     let request = appoint_request(
         child_target(label, projects, level),
         &format!("child-{label}"),
@@ -1670,6 +1684,13 @@ fn node_with(
     level: u16,
     edit: impl FnOnce(&mut ManagerPolicyV2),
 ) -> (PortfolioNodeV1, Uuid) {
+    // This policy fixture exercises metered budgets.
+    store
+        .set_daemon_setting("claude_billing_mode", "metered_api")
+        .unwrap();
+    store
+        .set_daemon_setting("codex_billing_mode", "metered_api")
+        .unwrap();
     let seat = session(store, None);
     let mut request = root(label, seat, projects, &format!("op-{label}-{seat}"));
     request.parent_node_id = parent.map(|parent| parent.node_id);
@@ -2045,6 +2066,10 @@ fn an_appointment_launch_needs_its_origin() {
 /// `cost`, created by the ledger of the node `seat` seats (a journaled
 /// `create_session` naming it as its target), or by no node.
 fn node_worker(store: &Store, project: Uuid, seat: Option<Uuid>, cost: f64) -> Uuid {
+    // These budget fixtures model a metered Codex login.
+    store
+        .set_daemon_setting("codex_billing_mode", "metered_api")
+        .unwrap();
     let mut parent = None;
     for (kind, status) in [
         (SessionKind::Group, SessionStatus::Completed),
@@ -2138,9 +2163,8 @@ fn live_sessions_charge_their_origin_and_its_ancestors_never_a_descendant() {
     node_gate(&store, low_seat, p).unwrap();
     // The descendant's worker fills its own cap ...
     let low_worker = node_worker(&store, p, Some(low_seat), 0.0);
-    assert_eq!(
-        refusal(node_gate(&store, low_seat, p)),
-        "manager_v2_concurrency_capacity"
+    assert!(
+        refusal(node_gate(&store, low_seat, p)).starts_with("manager_v2_concurrency_capacity:")
     );
     // ... and is the ancestor's third of four.
     node_gate(&store, top_seat, p).unwrap();
@@ -2154,9 +2178,8 @@ fn live_sessions_charge_their_origin_and_its_ancestors_never_a_descendant() {
         .unwrap();
     // Work no node originated is every node's: it fills the ancestor.
     node_worker(&store, p, None, 0.0);
-    assert_eq!(
-        refusal(node_gate(&store, top_seat, p)),
-        "manager_v2_concurrency_capacity"
+    assert!(
+        refusal(node_gate(&store, top_seat, p)).starts_with("manager_v2_concurrency_capacity:")
     );
 }
 
@@ -2249,13 +2272,11 @@ fn an_appointed_seat_is_charged_to_its_grantor_and_its_ancestors() {
     // three slots, and the ancestor's two workers, the mid's two and the
     // seat fill its five.
     node_worker(&store, p, Some(mid_seat), 0.0);
-    assert_eq!(
-        refusal(node_gate(&store, mid_seat, p)),
-        "manager_v2_concurrency_capacity"
+    assert!(
+        refusal(node_gate(&store, mid_seat, p)).starts_with("manager_v2_concurrency_capacity:")
     );
-    assert_eq!(
-        refusal(node_gate(&store, top_seat, p)),
-        "manager_v2_concurrency_capacity"
+    assert!(
+        refusal(node_gate(&store, top_seat, p)).starts_with("manager_v2_concurrency_capacity:")
     );
 }
 
@@ -2296,7 +2317,7 @@ fn a_descendants_appointed_seat_fills_its_ancestors_caps() {
             admit_seat(&store, &second).unwrap(),
             "manager_v2_concurrency_capacity",
         ),
-        Err(error) => assert_eq!(code(error), "manager_v2_concurrency_capacity"),
+        Err(error) => assert!(code(error).starts_with("manager_v2_concurrency_capacity:")),
     }
     let live: i64 = store
         .conn

@@ -22,8 +22,9 @@ use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::agent_jobs::AgentJobV1;
 use rsi_common::agent_landing_candidate::{
     AgentCheckLandingCandidateRequestV1, AgentCheckLandingCandidateResultV1,
-    CANDIDATE_JOB_ID_AMBIGUOUS, CANDIDATE_NOT_AUTHORIZED, CANDIDATE_NOT_FOUND, RollingMergeProbe,
-    assess_candidate, is_scoped_test_job, job_id_hex, receipt_head,
+    CANDIDATE_JOB_ID_AMBIGUOUS, CANDIDATE_NOT_AUTHORIZED, CANDIDATE_NOT_FOUND_REFUSAL,
+    CANDIDATE_TOOL_UNTRUSTED, RollingMergeProbe, assess_candidate,
+    assess_candidate_with_alternatives, is_verification_job, job_id_hex, receipt_head,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,8 +36,10 @@ const PREFIX_SCAN_LIMIT: usize = 64;
 /// A session's newest jobs searched for its `scoped_test` runs.
 const SESSION_JOB_SCAN_LIMIT: usize = 100;
 
+/// One text for an unknown and an out-of-scope job or session: the code, then
+/// the fix (kaizen #254).
 fn not_found() -> DaemonError {
-    DaemonError::InvalidParam(CANDIDATE_NOT_FOUND.into())
+    DaemonError::InvalidParam(CANDIDATE_NOT_FOUND_REFUSAL.into())
 }
 
 impl AgentControlHandle {
@@ -74,7 +77,7 @@ impl AgentControlHandle {
                 if !self.candidate_in_reach(caller, owner).await {
                     return Err(not_found());
                 }
-                match self.candidate_session_job(owner, commit).await? {
+                match self.candidate_session_job(caller, owner, commit).await? {
                     Some(job) => job,
                     None => {
                         return Ok(AgentCheckLandingCandidateResultV1::no_job(
@@ -87,7 +90,29 @@ impl AgentControlHandle {
         };
 
         let mut result = assess_candidate(&job, commit);
-        if let Some(head) = receipt_head(&job)
+        let checked_job = job.clone();
+        let profile_stale = tokio::task::spawn_blocking(move || {
+            crate::agent_jobs::profile_verification::check_profile_binding(&checked_job).is_err()
+        })
+        .await
+        .unwrap_or(true);
+        if profile_stale {
+            result.refuse(rsi_common::agent_landing_candidate::CANDIDATE_PROFILE_STALE,
+                "source, profile or runner differs from the daemon binding or cannot be read; rerun verification in the source's registered worktree");
+        }
+        if result.refusal.as_deref() == Some(CANDIDATE_TOOL_UNTRUSTED) {
+            let alternatives = self
+                .store
+                .lock()
+                .await
+                .list_agent_jobs(job.owner_session_id, SESSION_JOB_SCAN_LIMIT)?;
+            result = assess_candidate_with_alternatives(
+                &job,
+                alternatives.iter().map(|row| &row.job),
+                commit,
+            );
+        }
+        if let Some(head) = result.receipt_head.as_deref()
             && head != commit
         {
             let (from, to) = (head.to_owned(), commit.to_owned());
@@ -101,7 +126,7 @@ impl AgentControlHandle {
             }
         }
         let probe = self
-            .candidate_rolling_merge(caller, job.owner_session_id, commit.to_owned())
+            .candidate_rolling_merge(caller, &job, commit.to_owned())
             .await;
         result.apply_rolling_merge(&probe);
         Ok(result)
@@ -113,10 +138,13 @@ impl AgentControlHandle {
     async fn candidate_rolling_merge(
         &self,
         caller: Uuid,
-        owner: Uuid,
+        job: &AgentJobV1,
         commit: String,
     ) -> RollingMergeProbe {
-        let repos = self.candidate_repos(caller, owner).await;
+        let mut repos = self.candidate_repos(caller, job.owner_session_id).await;
+        if crate::agent_jobs::profile_verification::recorded_profile_binding(job).is_some() {
+            repos.insert(0, PathBuf::from(&job.cwd));
+        }
         tokio::task::spawn_blocking(move || {
             for repo in &repos {
                 match rolling_merge_probe(repo, &commit) {
@@ -165,12 +193,6 @@ impl AgentControlHandle {
         let mut reach: HashMap<Uuid, bool> = HashMap::new();
         let mut matches = Vec::new();
         for (job_id, owner) in rows {
-            if request
-                .source_session_id
-                .is_some_and(|session| session != owner)
-            {
-                continue;
-            }
             let reached = match reach.get(&owner) {
                 Some(reached) => *reached,
                 None => {
@@ -180,6 +202,19 @@ impl AgentControlHandle {
                 }
             };
             if reached {
+                {
+                    let job = self
+                        .store
+                        .lock()
+                        .await
+                        .get_agent_job(job_id)?
+                        .ok_or_else(not_found)?
+                        .job;
+                    let source = request.source_session_id.unwrap_or(owner);
+                    if !self.candidate_source_matches(caller, source, &job).await {
+                        continue;
+                    }
+                }
                 matches.push(job_id);
             }
         }
@@ -199,17 +234,40 @@ impl AgentControlHandle {
     /// The session's `scoped_test` job to judge: the newest whose receipt head
     /// is `commit`, else its newest `scoped_test` job (so a rerun still in
     /// flight, or a run at an older head, is reported rather than hidden).
-    async fn candidate_session_job(&self, owner: Uuid, commit: &str) -> Result<Option<AgentJobV1>> {
-        let rows = self
+    async fn candidate_session_job(
+        &self,
+        caller: Uuid,
+        owner: Uuid,
+        commit: &str,
+    ) -> Result<Option<AgentJobV1>> {
+        let mut rows = self
             .store
             .lock()
             .await
             .list_agent_jobs(owner, SESSION_JOB_SCAN_LIMIT)?;
-        let scoped: Vec<AgentJobV1> = rows
-            .into_iter()
-            .map(|row| row.job)
-            .filter(is_scoped_test_job)
-            .collect();
+        // Manager-owned verification is discoverable by worktree too. Read
+        // only the caller's jobs; every cross-owner match rechecks live scope.
+        if caller != owner {
+            let managed = self
+                .store
+                .lock()
+                .await
+                .list_agent_jobs(caller, SESSION_JOB_SCAN_LIMIT)?;
+            for row in managed {
+                if self.candidate_source_matches(caller, owner, &row.job).await {
+                    rows.push(row);
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.job.created_at.cmp(&a.job.created_at));
+        let mut scoped = Vec::new();
+        for row in rows {
+            if is_verification_job(&row.job)
+                && self.candidate_source_matches(caller, owner, &row.job).await
+            {
+                scoped.push(row.job);
+            }
+        }
         let at_head = scoped
             .iter()
             .position(|job| receipt_head(job) == Some(commit));
@@ -217,6 +275,56 @@ impl AgentControlHandle {
             Some(index) => scoped.into_iter().nth(index),
             None => scoped.into_iter().next(),
         })
+    }
+
+    /// Owner mismatch is allowed only for a live scoped manager's profile job
+    /// in this exact worker's registered custody root and project. The caller
+    /// must reach both identities; matching a path alone grants nothing.
+    async fn candidate_source_matches(&self, caller: Uuid, source: Uuid, job: &AgentJobV1) -> bool {
+        if !self.candidate_in_reach(caller, source).await {
+            return false;
+        }
+        let profile_job =
+            crate::agent_jobs::profile_verification::recorded_profile_binding(job).is_some();
+        if source == job.owner_session_id && !profile_job {
+            return true;
+        }
+        if !profile_job {
+            return false;
+        }
+        let manager = self
+            .store
+            .lock()
+            .await
+            .agent_authority_projection(job.owner_session_id)
+            .is_ok_and(|projection| projection.is_manager);
+        if source != job.owner_session_id
+            && (!manager || !self.candidate_in_reach(job.owner_session_id, source).await)
+        {
+            return false;
+        }
+        let Some(session) = self.get_session(source).await else {
+            return false;
+        };
+        let root = match session.sandbox_root {
+            Some(root) => root,
+            None if source == job.owner_session_id => session.working_dir,
+            None => return false,
+        };
+        let project = self
+            .store
+            .lock()
+            .await
+            .agent_job_project(job.id)
+            .ok()
+            .flatten();
+        if project.is_none() || project != session.project_id {
+            return false;
+        }
+        let cwd = PathBuf::from(&job.cwd);
+        tokio::task::spawn_blocking(move || {
+            matches!((root.canonicalize(), cwd.canonicalize()), (Ok(root), Ok(cwd)) if root == cwd)
+        }).await.unwrap_or(false)
     }
 
     /// `git diff --name-only from to` (bounded, #2344), run in the job owner's checkout and then
@@ -243,5 +351,19 @@ impl AgentControlHandle {
         })
         .await
         .unwrap_or(DeltaRead::Unreadable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn not_found_keeps_its_friction_code_and_names_the_fix() {
+        let error = super::not_found();
+        assert_eq!(
+            crate::friction::agent_refusal_code(&error),
+            "candidate_not_found"
+        );
+        assert!(error.to_string().contains("source_session_id"), "{error}");
     }
 }

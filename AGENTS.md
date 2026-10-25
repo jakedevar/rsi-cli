@@ -14,6 +14,12 @@ stranded on a branch.
   its intent and acceptance criteria; tests assert that intent. When code
   conflicts with the stated principle, change the code.
 - Read the code you change and follow its existing patterns. Keep diffs focused.
+- **Languages (operator directive, all projects, 2026-10-22).** Python is
+  forbidden, including scripts, tooling and tests. Prefer Rust; Go is
+  permitted when needed; any other scripting must be more efficient than
+  Python. Never write, extend or run Python yourself (no `python3` in a shell,
+  no new `.py` file, no Python check by hand). This overrides older
+  instructions, including the TypeScript/Bun plan of #3477.
 - Make technical decisions yourself and note consequential ones in your commit
   or handoff. Send product choices to the portfolio manager. Escalate only
   `main` or releases, real spending, credentials, or deleting user data to the
@@ -45,12 +51,14 @@ what to do instead. The numbers are cited by those refusals; keep them stable.
 1. **Git.** Never force-push (`--force`, `--force-with-lease`, `+refspec`; the
    shell hooks refuse it, #2320). Fetch and integrate before pushing; `rolling`
    only moves by fast-forward (pre-push hook and lander). Never merge or push
-   `main` without explicit operator consent (the pre-push hook refuses agent
-   pushes to `main`).
+   `main` without explicit operator consent (the pre-push hook requires an
+   unused, unexpired `AuthorizeMainPush` grant for the exact remote URL and SHA;
+   consent never permits a forced update).
 2. **Sandbox.** Work and commit in your `sandbox_root` on its assigned branch,
    never in the shared `~/rsi` worktree (`working_dir`). Checkout, switch and
    `reset --hard` of the sandbox branch are refused by the shell hooks (#2320);
-   child launches pin to its commits.
+   child launches pin to its commits. `git commit --amend` is also refused;
+   commit a follow-up instead.
    Preserve the ancestry of your allocated source: merge `origin/rolling`
    when needed, never rebase a source stack. The queue's lander integrates
    `rolling`; rewriting source ancestry can strand custody-bound job wakes.
@@ -59,7 +67,7 @@ what to do instead. The numbers are cited by those refusals; keep them stable.
    `crates/rsid-store/src/store/migrations/vNNN.rs`; released migrations are
    immutable. Numbering, pin, renumbering and rewind-teardown steps are in
    `crates/rsid-store/AGENTS.md` ("New migrations"); the lander derives the
-   `tools/released-migrations.json` pin at publication, and `tools/check-released-migrations.py`,
+   `tools/released-migrations.json` pin at publication, and `scripts/repo-guard released-migrations`,
    the pre-push static guards and the lander policy refuse a wrong number or a
    pin that cannot be derived and name the fix. Timestamps are RFC3339 with nanoseconds, UUIDs
    are lowercase, enum strings match serde exactly. Sandbox tombstones flip
@@ -91,6 +99,7 @@ what to do instead. The numbers are cited by those refusals; keep them stable.
     RPC/TUI surface in the same change (no SQL-only knobs). Operator-only
     methods stay out of `AGENT_VERBS`, `READ_VERBS`, native tools and the agent
     CLI catalog.
+    New-setting checklist: [settings guidance](docs/settings-live-apply-audit.md#new-setting-checklist).
 11. **Long cargo runs.** Scope them with `scripts/scoped-test`, or name exact
     tests (`cargo test -p rsid --lib -- --exact <full::test::path>`; the shell
     hook refuses bare-word and module-prefix filters, #1656), run in the
@@ -127,8 +136,18 @@ diagnostics and repairs. Providers (`Session.provider`): `Claude`, `Codex`,
 
 ## Build and test
 
+Transitional bridge (PM ruling, 2026-10-22, #3482): the daemon's gate
+machinery is still Python today: the `scoped_test` job runner, `scripts/cargo-slot`,
+the lander gates and the installed git hooks. It is the only path that can land
+its own Rust replacements, so it keeps running, reached only through
+`AgentSubmitJob` and the automatic hooks, until each piece is ported. Do not
+invoke any of it by hand. A lane with no allowed runner (cloud sweep, bench) is
+held until its port lands: report the tooling blocker, never skip the gate, and
+never call an unexecuted check green.
+
 ```bash
-make release-install      # build release binaries (plus the desktop UI if node/webkit2gtk exist), relink ~/.local/bin, restart rsid
+make release-install      # build release rsi + rsid only (never the desktop UI), relink ~/.local/bin, restart rsid
+make desktop-install      # explicit desktop UI build + install (needs node/webkit2gtk)
 ./scripts/dev-daemon.sh   # dev daemon (must run before the TUI)
 ./scripts/dev-tui.sh
 scripts/scoped-test       # default worker verification: derived filters, bounded time and CPU

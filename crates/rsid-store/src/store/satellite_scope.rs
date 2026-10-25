@@ -1225,6 +1225,7 @@ mod tests {
                         policy: SatelliteManagerPolicyPatchV1 {
                             allowed_launches: vec![choice.clone()],
                             max_created_sessions: 1,
+                            created_sessions_window_hours: None,
                             max_active_sessions: 1,
                             provider_limits: vec![ManagerProviderLimitV2 {
                                 provider: rsi_common::SessionProvider::Claude,
@@ -1238,6 +1239,7 @@ mod tests {
             rig.store.queue_hub_report(
                 caller,
                 &AgentReportToHubRequestV1 {
+                    binaries_dir: None,
                     kind: SatelliteReportKindV1::Result,
                     text: "RESULT ok".into(),
                 },
@@ -1270,6 +1272,130 @@ mod tests {
         assert!(report(&rig, reseated).is_err());
     }
 
+    /// hub #3859: a failed seat of a paired satellite queues one short typed
+    /// `RESULT` line the hub pulls, carrying the terminal reason, the reset
+    /// time and the provider's limit sentence; nothing else crosses.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn a_failed_manager_seat_queues_one_typed_report_for_the_hub() {
+        use rsi_common::harness_manager::{ManagerSeatConditionV1, ManagerSeatStateV1};
+        use rsi_common::satellite_dispatch::SatelliteReportKindV1;
+        use rsi_common::types::{ConversationEvent, EventType, Role};
+        let rig = rig();
+        let tip = rig.session(SessionStatus::Failed);
+        rig.appoint(tip, None);
+        rig.grant("operator-grant");
+        let now = chrono::Utc::now();
+        let reset = now + chrono::Duration::hours(30);
+        rig.store
+            .insert_event(&ConversationEvent {
+                id: 0,
+                session_id: tip,
+                sequence: 1,
+                event_type: EventType::Message,
+                role: Some(Role::Assistant),
+                created_at: now,
+                content: "**Process Error (claude)**\n```\nYou've hit your weekly limit \u{b7} resets Oct 27, 9am\n```".into(),
+                tool_name: None,
+                tool_input: None,
+                offload_id: None,
+                tool_use_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        let seat = ManagerSeatStateV1 {
+            state: ManagerSeatConditionV1::Recovering,
+            tip_session_id: tip,
+            since: now,
+            attempts: 0,
+            max_attempts: 3,
+            not_before: Some(reset),
+            reason: "manager_seat_usage_limit_hold".into(),
+            next_action: None,
+            last_invocation_id: None,
+            last_error_class: None,
+            last_terminal_reason: Some("api_error".into()),
+        };
+        let report_id = rig
+            .store
+            .queue_manager_seat_report(&seat, now)
+            .unwrap()
+            .expect("queued");
+        let pulled = rig
+            .store
+            .take_hub_reports(rig.hub, &[], &[])
+            .unwrap()
+            .reports;
+        assert_eq!(pulled.len(), 1);
+        let report = &pulled[0];
+        assert_eq!(
+            (report.report_id, report.kind),
+            (report_id, SatelliteReportKindV1::Result)
+        );
+        let peer = rig.store.satellite_installation_id().unwrap();
+        let expected = format!(
+            "satellite_manager_seat_failed project={} peer={peer} seat={tip} state=recovering \
+             terminal_reason=api_error reason=manager_seat_usage_limit_hold reset_at={} \
+             limit=\"You've hit your weekly limit \u{b7} resets Oct 27, 9am\"",
+            rig.project,
+            reset.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        );
+        assert_eq!(report.text, expected);
+        assert!(report.text.len() <= 1024);
+
+        // A live seat, and a session that is not the declared seat, report nothing.
+        let live = ManagerSeatStateV1 {
+            state: ManagerSeatConditionV1::Live,
+            ..seat.clone()
+        };
+        assert_eq!(
+            rig.store.queue_manager_seat_report(&live, now).unwrap(),
+            None
+        );
+        let other = rig.session(SessionStatus::Failed);
+        let foreign = ManagerSeatStateV1 {
+            tip_session_id: other,
+            ..seat
+        };
+        assert_eq!(
+            rig.store.queue_manager_seat_report(&foreign, now).unwrap(),
+            None
+        );
+    }
+
+    /// hub #3859: a daemon that pairs no hub (the hub itself, a standalone
+    /// install) queues nothing for its own failed seat.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn a_daemon_without_a_paired_hub_reports_no_seat_failure() {
+        use rsi_common::harness_manager::{ManagerSeatConditionV1, ManagerSeatStateV1};
+        let store = Store::open_in_memory().expect("in-memory store");
+        let tip = {
+            let session = make_test_session();
+            store.insert_session(&session).unwrap();
+            session.id
+        };
+        let seat = ManagerSeatStateV1 {
+            state: ManagerSeatConditionV1::Down,
+            tip_session_id: tip,
+            since: chrono::Utc::now(),
+            attempts: 0,
+            max_attempts: 0,
+            not_before: None,
+            reason: "manager_seat_recovery_disabled".into(),
+            next_action: None,
+            last_invocation_id: None,
+            last_error_class: None,
+            last_terminal_reason: None,
+        };
+        assert_eq!(
+            store
+                .queue_manager_seat_report(&seat, chrono::Utc::now())
+                .unwrap(),
+            None
+        );
+    }
+
     /// #3028: a spent created-sessions cap on a seat whose policy a hub pushed
     /// tells the seat to report to the hub (whose PM raises it with
     /// `AgentPushSatelliteManagerPolicy`); a seat the operator configured keeps
@@ -1287,7 +1413,7 @@ mod tests {
             let config = rig.store.get_harness_manager(rig.project).unwrap().unwrap();
             let error = rig
                 .store
-                .own_creation_refusal(&config, container, 32, 32)
+                .own_creation_refusal(&config, container, 256, 256)
                 .unwrap()
                 .to_string();
             CreationCapRefusalV1::parse(&error).unwrap_or_else(|| panic!("{error}"))
@@ -1320,7 +1446,8 @@ mod tests {
                             model: "model".into(),
                             effort: Some("high".into()),
                         }],
-                        max_created_sessions: 32,
+                        max_created_sessions: 256,
+                        created_sessions_window_hours: None,
                         max_active_sessions: 1,
                         provider_limits: vec![ManagerProviderLimitV2 {
                             provider: rsi_common::SessionProvider::Claude,
@@ -1337,11 +1464,9 @@ mod tests {
                 .starts_with("report to the hub: AgentReportToHub kind=result"),
             "{pushed:?}"
         );
-        assert!(
-            pushed
-                .raise_in
-                .contains("max_created_sessions used 32 of 32")
-        );
+        assert!(pushed.raise_in.contains(
+            "max_created_sessions used 256 of 256 in the last created_sessions_window_hours"
+        ));
         assert!(pushed.raise_in.contains("AgentPushSatelliteManagerPolicy"));
         assert!(pushed.raise_in.ends_with(&operator.raise_in), "{pushed:?}");
         // The push patch carries no container cap: that stays operator-only.

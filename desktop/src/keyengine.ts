@@ -69,6 +69,14 @@ export function displayKeys(tokens: readonly KeyToken[]): string {
 
 export type Platform = 'mac' | 'other';
 
+/** What the Vim keys switch changes (its tooltip in the top bar and Settings, and its palette detail); static/index.html spells the same text. */
+export const VIM_KEYS_TIP =
+  'Vim keys on: single letters such as j, k and a act on the app while you are not typing in a text field, and hints show those keys. Off: use the buttons and menus; Enter, Esc and the Actions… palette still work.';
+
+/** The line under the first-run "Use Vim-style keys?" question: where the switch actually is (the top bar, and Settings). */
+export const VIM_FIRST_RUN_NOTE =
+  'You can change this any time with the Vim keys switch in the top bar, or in Settings \u203a Workspace \u203a Editing Mode (Vim keys in this window).';
+
 /** From navigator.userAgentData.platform, navigator.platform or the user agent. */
 export function detectPlatform(platformString: string | undefined): Platform {
   return /mac|iphone|ipad/i.test(platformString ?? '') ? 'mac' : 'other';
@@ -348,6 +356,11 @@ export class KeyEngine<A extends string = string> {
     return this.mode === 'command' || this.keys.length > 0 || this.count !== '';
   }
 
+  /** True while a `:` command line is open (a chord or count alone is not). */
+  commandLineOpen(): boolean {
+    return this.mode === 'command';
+  }
+
   reset(): void {
     this.mode = 'normal';
     this.keys = [];
@@ -614,5 +627,60 @@ export function writeVimKeys(storage: StorageLike | undefined, on: boolean): voi
     storage?.setItem(VIM_KEYS_STORAGE_KEY, on ? 'on' : 'off');
   } catch {
     // Storage can be unavailable (private mode); the toggle still applies this run.
+  }
+}
+
+// ---------- first-run choice (local #208) ----------
+
+/** 'pending' while the first-run question is open, 'answered' once it was answered (or never needed). */
+export const VIM_KEYS_ASKED_KEY = 'rsi.desktop.vimKeysAsked';
+
+/** Storage that can also list its keys (window.localStorage). */
+export interface ListableStorage extends StorageLike {
+  readonly length: number;
+  key(i: number): string | null;
+}
+
+/** Any key an earlier desktop run wrote: this is an existing install, not a first run. */
+function hasDesktopState(storage: ListableStorage): boolean {
+  for (let i = 0; i < storage.length; i++) {
+    const k = storage.key(i);
+    if (k !== null && k !== VIM_KEYS_ASKED_KEY && (k.startsWith('rsi.') || k.startsWith('rsi-desktop.'))) return true;
+  }
+  return false;
+}
+
+/**
+ * On launch: should the desktop ask "Use Vim-style keys?", and is the switch on meanwhile?
+ * A new install is asked once with the switch off (the default answer is No, stored at once so
+ * a window closed before answering stays off and asks again). An existing install (any earlier
+ * desktop state) keeps its current setting and is never asked. Storage that cannot be read
+ * asks nothing and keeps the old default.
+ */
+export function vimKeysFirstRun(storage: ListableStorage | undefined): { ask: boolean; on: boolean } {
+  if (!storage) return { ask: false, on: true };
+  try {
+    const asked = storage.getItem(VIM_KEYS_ASKED_KEY);
+    if (asked === 'answered') return { ask: false, on: readVimKeys(storage) };
+    if (asked === 'pending') return { ask: true, on: readVimKeys(storage) };
+    if (hasDesktopState(storage)) {
+      storage.setItem(VIM_KEYS_ASKED_KEY, 'answered');
+      return { ask: false, on: readVimKeys(storage) };
+    }
+    storage.setItem(VIM_KEYS_STORAGE_KEY, 'off');
+    storage.setItem(VIM_KEYS_ASKED_KEY, 'pending');
+    return { ask: true, on: false };
+  } catch {
+    return { ask: false, on: true };
+  }
+}
+
+/** The first-run answer: store the choice and never ask again (Settings › Workspace › Editing Mode changes it later). */
+export function answerVimKeysFirstRun(storage: StorageLike | undefined, on: boolean): void {
+  writeVimKeys(storage, on);
+  try {
+    storage?.setItem(VIM_KEYS_ASKED_KEY, 'answered');
+  } catch {
+    // This run only.
   }
 }

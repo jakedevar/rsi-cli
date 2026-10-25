@@ -141,6 +141,7 @@ Groups contain Epics; Epics contain Story, Task and Bug leaves. Projects scope s
 |  | `:project-new [arg]` | Create project | Creates a project: `:project-new <name> [path]`, or opens the form. |
 |  | `:project-edit [arg]` | Edit project | Edits the named or current project. |
 |  | `:project-delete <arg>` | Delete project | Deletes the named project; the name argument is required. |
+|  | `:intake <arg>` | Operator intake | Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager. |
 |  | `:card [arg]` | Edit entity card | Opens the entity card editor for the current project or the named entity. |
 | `<Space>C` |  | Change session project | Moves the selected session to another project. |
 
@@ -158,12 +159,13 @@ The harness manager coordinates Epic leads under an operator-owned scope and pol
 |  | `:manager inbox` | Open manager inbox | Opens the harness manager inbox of lead requests and replies. |
 |  | `:manager inspect` | Open manager inspect | Opens the harness manager inspect view (workers, work, requests, topology and events). |
 | `gL` | `:lead` `:setlead` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
-|  | `:manager` | Open harness manager | Opens the harness manager overlay. |
+|  | `:manager` | Open harness manager | Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor. |
 |  | `:manager appoint` | Appoint harness manager | Appoints the selected session as the harness manager. |
 |  | `:manager scope` | Edit manager scope | Edits the harness manager's scope. |
 |  | `:manager clear` | Clear manager scope | Clears the harness manager's scope. |
 |  | `:fleet` | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `gm` | `:global-manager` `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `gd` | `:dashboard` `:gd` | Open global dashboard | Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project. |
 |  | `:manager global [arg]` | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 |  | `:manager global appoint [arg]` | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 |  | `:manager global revoke` | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
@@ -252,6 +254,7 @@ Launch, continue, interrupt, archive, delete, rotate and retry sessions, stop al
 | `X` |  | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | `:pause soft` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | `:pause clear` | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
+| `<Space>hu` | `:provider-clear-hold` | Clear provider usage hold | After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits. |
 | `<Space>c` | `:continue [arg]` `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` |  | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | `:archive` `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
@@ -302,6 +305,7 @@ Operator views: diagnostics, memory search, graph review, the recursive DAG brow
 | `<Space>i` | `:issues` | Open or focus Issues workspace | Opens the Issues workspace pane for the current project, or focuses it if already open. |
 |  | `:issue [arg]` | Open an issue by number | Opens the Issues workspace on the issue with the given number (`:issue 2377` or `:issue #2377`), including closed and archived issues; without a number it opens the go-to-number prompt. |
 |  | `:cold-archive [arg]` | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
+|  | `:external-reports [arg]` | External reports | `:external-reports` shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; `:external-reports sync` runs one import pass now with the hub's own gh login; `:external-reports filter` filters the focused Issues pane to the `external-report` label. Imported reports are untrusted P4 Issues until triage promotes them. |
 |  | `:diagnostics` `:diag` | Open diagnostics | Opens the diagnostics overlay. |
 | `<Space>v` | `:graph` | Open graph review | Opens the visual workflow graph review editor. |
 |  | `:topology-resolve [arg]` | Resolve preserved topology work | Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: `:topology-resolve [<execution_id>] inspect\|accept\|retry\|discard [<commit>]` (the id may be omitted when exactly one is blocked; discard needs the full preserved commit). |
@@ -368,9 +372,9 @@ Every settings row by group and section: what it does, what kind of value it is,
 
 | Keys | Command | Action | What it does |
 | --- | --- | --- | --- |
-| Settings: `h` `Left` |  | Return to categories | Returns focus from the settings items to the category rail. |
-| Settings: `l` `Right` |  | Enter selected category | Moves focus from the category rail into the selected category's items. |
-| Settings: `Space` |  | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
+| Settings: `h` `Left` |  | Return to categories | Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row. |
+| Settings: `l` `Right` |  | Enter selected category | Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w. |
+| Settings: `Space` |  | Toggle or activate setting | Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row. |
 | Settings: `a` |  | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | Settings: `d` |  | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | Settings: `e` |  | Enable or disable skill | Enables or disables the selected Claude skill. |
@@ -528,13 +532,16 @@ Manage provider credentials stored in the key vault.
 
 #### Cloud Spend
 
-Daily cap and stop line for remote (cloud) gate spend.
+Spend ceilings: the remote (cloud) gate daily cap and stop line, and the OpenRouter account ceiling.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Cloud spend | Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC. | read-only | daemon (cloud spend) | when applied · no restart |
-| Cloud spend stop line (USD) | Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes. | choice | daemon field `cloud_spend_stop_line_usd` | when applied · no restart |
+| Cloud spend stop line (USD) | Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; rsi-cloud spend reads it from the caps file the daemon writes. | choice | daemon field `cloud_spend_stop_line_usd` | when applied · no restart |
 | Cloud spend daily cap (USD) | Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop. | choice | daemon field `cloud_spend_daily_cap_usd` | when applied · no restart |
+| OpenRouter spend ceiling | The armed OpenRouter ceiling: spent since arming, what is left and the state (off, ok, warn, reached, probe_stale). Spend is the OpenRouter account usage the daemon probes (at most once a minute) plus the cost of the calls settled since, minus the usage recorded when the cap was armed. The agent read is spend_cap on the openrouter entry of AgentGetProviderStatus. | read-only | daemon (openrouter spend) | when applied · no restart |
+| OpenRouter spend cap (USD) | USD of OpenRouter spend, counted from the moment this is armed, at which the daemon stops OpenRouter-billed work. 0 (the default) is off. Enter opens a text editor. Arming (0 to a positive amount) takes a fresh probe of the OpenRouter account usage and records it as the baseline; the stop line is baseline + cap, and a failed probe refuses to arm. Changing an armed cap keeps its baseline; 0 turns it off and forgets the baseline. While armed, OpenRouter-billed launches (the OpenRouter provider on any route, and Harness sessions on the OpenRouter endpoint) are refused with openrouter_spend_cap_reached once spend plus a small per-launch reserve reaches the stop line, and also refused (openrouter_spend_cap_probe_stale) whenever the account usage could not be probed for five minutes; a running Harness session ends at its next model call past the line. | action | daemon field `openrouter_spend_cap_usd` | when activated |
+| OpenRouter spend warn line (%) | Percent of the OpenRouter cap at which the manager gets one notice per arming. | choice | daemon field `openrouter_spend_warn_pct` | when applied · no restart |
 
 ### AGENT AUTOMATION — What does the daemon do on its own when agents fail?
 
@@ -560,8 +567,9 @@ When a session rotates to a fresh context, and the manager and worker context ca
 | Context rotation threshold (Claude Code) | Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_claude_pct` | when applied · no restart |
 | Context rotation threshold (Codex) | Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%. | choice | daemon field `context_rotation_codex_pct` | when applied · no restart |
 | Coordinator context cap (0 off, 1-100 = % of window) | Live context at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff. Read or set a provider or model override with :context-cap <Provider[/model]> [pct\|tokens\|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. An unknown window disables percentage caps. Needs context rotation on. | choice | daemon field `coordinator_context_cap_tokens` | when applied · no restart |
+| Manager wake-turn cap (per hour, 0 off) | Wake-driven turns a manager seat may start per rolling hour before the daemon coalesces its routine notices (a lead's state, work rows, non-blocked intents) into the next free slot (0 off, else 1-60, default 0). A manager cannot refuse a wake, so a turn-rate cap in prose does not hold. With a cap set, a seat that has used it keeps routine-only deliveries armed and reads them in one coalesced turn when a turn ages out of the hour. Mail, operator answers, failures, gates, merge-queue and satellite outcomes and safety anomalies are never held; one delivered past a spent cap is counted as a bypass. The seat's turns used, coalesced wakes and bypasses show in its coordinator budget (authority catalog and the global manager seat views). It applies to the next delivery; a self-armed wake (a job end or timer the seat set) is not held. | choice | daemon field `manager_max_turns_per_hour` | when applied · no restart |
 | Worker context cap (0 off, 1-100 = % of window) | Live context at which a worker with a launching manager or Epic lead is told to pass the baton (commit, append a handoff to its Issue, end its turn) and its launcher gets a worker_context_cap notice. Read or set a provider or model override with :worker-context-cap <Provider[/model]> [pct\|tokens\|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. Managers may propose it within operator bounds. | choice | daemon field `worker_context_cap_tokens` | when applied · no restart |
-| Provider lifecycle hooks | Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart. StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, when it fits the provider's 10,000-character hook-context cap; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks. | choice | daemon field `provider_lifecycle_hooks` | next spawn |
+| Provider lifecycle hooks | Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart. StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, within the provider's 10,000-character cap per hook. Claude splits long preambles at startup part boundaries into labelled chunks with one handler each; an indivisible part that cannot fit stays in the prompt. Delivery is recorded after every chunk is claimed; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks. | choice | daemon field `provider_lifecycle_hooks` | next spawn |
 
 #### Stall Detection
 
@@ -606,6 +614,7 @@ The background queue, the topology executor, how child sessions are kept running
 | Follow agent-created projects | Switches to the new project's tab when an agent creates a project (AgentCreateProject). On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is. | toggle | daemon field `follow_agent_created_projects` | when applied · no restart |
 | Health alert: hub disk used (%) | Hub root filesystem use at or above which a manager's armed health_anomaly wake fires (0 off, else 50-99 %, default 90). A manager (project manager or portfolio seat) arms one `health_anomaly` wake instead of an hourly check-in turn. The daemon evaluates it every minute with no model call and resumes the manager once, naming each condition, when one holds: this one, a PM seat stuck behind a refused succession or over its rotation threshold, blocked or overrun topology work, a hot CPU, a satellite below its disk floor, a provider fault, or a red rolling QA no Issue tracks. Takes effect at the next evaluation. | choice | daemon field `health_disk_used_pct` | when applied · no restart |
 | Health alert: CPU hot (C) | CPU temperature that, held for three minutes, fires a manager's armed health_anomaly wake (0 off, else 60-110 C, default 80). Read from the hub's hottest CPU sensor (Linux hwmon). A host with no readable sensor never fires. This is separate from the job thermal hold, which stops new jobs at a higher temperature. Takes effect at the next evaluation. | choice | daemon field `health_thermal_c` | when applied · no restart |
+| Health alert: provider window used (%) | Warn when a provider plan window is projected to exhaust before reset, above this utilization (0 off, else 1-100, default 70). Uses the faster of average burn since the window opened and recent observed burn, up to 24 hours. The warning names the provider, window, projected exhaustion and reset. Takes effect at the next health evaluation. | choice | daemon field `health_provider_window_used_pct` | when applied · no restart |
 | Health alert: work stuck (min) | Minutes a topology execution may stay blocked, a node attempt may run past its wall limit, or a red rolling QA may go untracked before health_anomaly fires (0 off, else 5-720, default 30). Counted from the moment the execution blocked, the attempt's execution deadline passed, or the red full-library QA run finished with no open Issue tracking it. Takes effect at the next evaluation. | choice | daemon field `health_stuck_minutes` | when applied · no restart |
 
 #### Recursive DAG
@@ -634,6 +643,18 @@ Code-graph indexing of project source.
 
 ### PROVIDERS & SANDBOXES — Where and how do agents run?
 
+#### Provider Billing
+
+Subscription plan usage and metered billing classification.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Claude billing mode | Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps. | choice | daemon field `claude_billing_mode` | when applied · no restart |
+| Codex billing mode | Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps. | choice | daemon field `codex_billing_mode` | when applied · no restart |
+| CodexAppServer billing mode | Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps. | choice | daemon field `codexappserver_billing_mode` | when applied · no restart |
+| Pioneer billing mode | Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps. | choice | daemon field `pioneer_billing_mode` | when applied · no restart |
+| Antigravity billing mode | Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps. | choice | daemon field `antigravity_billing_mode` | when applied · no restart |
+
 #### Provider Isolation
 
 How provider processes are sandboxed and isolated.
@@ -649,7 +670,7 @@ How provider processes are sandboxed and isolated.
 | Codex user config isolation | Isolation of the operator's Codex config for new Codex processes: off, user (ignore config.toml), rules (ignore execpolicy rules) or all. user passes --ignore-user-config so $CODEX_HOME/config.toml (model, profile, mcp_servers, hooks, approval_policy) is not loaded; rules passes --ignore-rules so user and project execpolicy .rules files are not loaded; all passes both. Auth still uses CODEX_HOME and every override RSI passes still applies. off adds no flag. | choice | daemon field `codex_config_isolation` | next spawn |
 | Provider launch overrides | Extra Claude Code / Codex CLI launch options, from an allowlist (default none). Enter opens a JSON editor; the daemon checks each option and the editor shows its reason when it refuses. A JSON object of per-provider lists, e.g. {"codex":["model_reasoning_summary=concise"],"claude":["--append-system-prompt=Be terse."]}. Claude takes the flags --append-system-prompt and --betas (passed as --flag=value; the fallback chain and spend cap have their own settings); Codex takes the config keys model_reasoning_summary, model_verbosity, service_tier, web_search, hide_agent_reasoning, show_raw_agent_reasoning and agents.enabled (passed as -c key=value). Anything that widens privilege (--dangerously-skip-permissions, --permission-mode, --add-dir, permissions.*, sandbox.*, hooks.*, approval_policy, sandbox_mode, mcp_servers.*) or that RSI sets itself (model, effort, resume, --fallback-model, --max-budget-usd, and the Codex subagent model and concurrency cap, which have their own settings) is refused with provider_launch_override_denied; any other key with provider_launch_override_unknown_key, as is a Claude flag the installed CLI does not know. Applied at the next CLI launch (each Claude turn) and recorded on the session as a launch-overrides row. Empty clears. | action | daemon field `provider_launch_overrides` | when activated |
 | Claude fallback models | Ordered models a Claude session falls back to when its model is overloaded or unavailable, comma-separated, at most three. Default is empty (no fallback). Enter opens a text editor. Passed as --fallback-model=a,b to each new Claude CLI session (#2762); the CLI tries them in order per turn and retries the primary at the start of each turn. It does not apply to auth, billing or rate-limit errors, and is not passed to Bedrock-routed models or when the list names only the session's own model. A result that shows a chain member served part of the run adds a model_fallback_used row (from, to) to the session transcript. Running sessions keep the value they started with. | action | daemon field `claude_fallback_models` | when activated |
-| Claude spend cap per session (USD) | Estimated spend, in USD, at which a new Claude CLI session stops. 0 (the default) is off. Enter opens a text editor. Passed as --max-budget-usd=<n> to each new Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Meant for API- or Bedrock-billed sessions; a subscription login is not billed per token, so leave it 0 there. Running sessions keep the value they started with. | action | daemon field `claude_max_budget_usd` | when activated |
+| Claude spend cap per session (USD) | Metered usage, in USD, at which a new API- or cloud-billed Claude CLI session stops. 0 (the default) is off. Enter opens a text editor. Passed as --max-budget-usd=<n> to each new metered Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Subscription billing mode ignores this dollar cap and uses plan windows instead. API- and Bedrock-billed sessions keep the cap. Running sessions keep the value they started with. | action | daemon field `claude_max_budget_usd` | when activated |
 | Vault: legacy env fallback | Allow provider keys from legacy environment variables when no vault credential exists. | toggle | daemon field `vault.env_compat` | when applied · no restart |
 | Vault: check TTL | Cache provider key check results for this many seconds. | choice | daemon field `vault.check_ttl_secs` | when applied · no restart |
 
@@ -704,6 +725,17 @@ Web access, egress, tool budgets and completion gates for Harness sessions.
 | MCP deferred tool threshold | Above this many permitted MCP tools, advertise only tool_search; revealed tools become callable. Set to 0 to always defer MCP tools. The maximum is 256, matching the per-session MCP tool cap. | choice | daemon field `mcp.deferred_tool_threshold` | next spawn |
 | Harness iterations per turn | Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000). | choice | daemon field `harness_max_iterations_per_turn` | next spawn |
 
+#### Benchmarks
+
+Container hosts and limits for benchmark Harness runs.
+
+| Setting | What it does | Kind | Stored in | Applies |
+| --- | --- | --- | --- | --- |
+| Benchmark docker hosts | Docker hosts a benchmark Harness session may run its shell tools on, comma-separated (for example ssh://arch-laptop). Default is empty: every container exec target is refused. Enter opens a text editor. A Harness session bound to a benchmark container runs shell, exec_command and write_stdin through docker -H <host> exec instead of on the daemon host (#3176). The daemon only accepts a host listed here, and also checks that the container is running, belongs to the registered compose project as service main and uses a pinned image digest. Checked at every launch, continuation and rotation, so a change applies to the next one. | action | daemon field `bench.docker_hosts` | when activated |
+| Benchmark jobs enabled | Master switch of the bench job kind: when off (the default) no benchmark run is admitted. A run also needs the docker host allowlist, a launch grant and, for a paid run, an armed OpenRouter spend cap. The appointed manager or an Epic lead runs one pinned Terminal-Bench configuration with one bench job (#3181). The daemon checks this switch at submit and again when the job starts, so turning it off stops a queued run from starting. A run never spends beyond the budget it was admitted with. | toggle | daemon field `bench.enabled` | next spawn |
+| Benchmark concurrency | Most Terminal-Bench trials a bench job runs at once on the laptop (1 to 8, default 4). The laptop needs 4 GB of free memory per trial plus 4 GB. | choice | daemon field `bench.max_concurrency` | next spawn |
+| Benchmark laptop host | The ssh host that runs Harbor and the task containers for a bench job (default arch-laptop). A run config's docker host must be ssh:// plus this host. Enter opens a text editor. The job reaches the laptop over ssh with the hub's existing access, forwards the run's adapter socket to it, and copies the Harbor job directory back. Use a plain host name or alias, optionally user@host; options and URLs are refused. | action | daemon field `bench.laptop_host` | when activated |
+
 #### Claude Hooks
 
 Claude Code hooks.
@@ -724,7 +756,7 @@ Claude user skills.
 
 #### Resource Limits
 
-Memory and CPU limits for the daemon, workers and build slice.
+Memory and CPU limits. :manager tune opens this host's resource probe, profile and presets.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
@@ -736,7 +768,7 @@ Memory and CPU limits for the daemon, workers and build slice.
 | Worker slice MemoryMax (MiB) | Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid. | choice | daemon field `worker_scope_memory_max_mib` | after daemon restart |
 | Worker slice MemorySwapMax (MiB) | Aggregate worker swap ceiling; applies after restarting rsid. | choice | daemon field `worker_scope_memory_swap_max_mib` | after daemon restart |
 | Worker slice CPUWeight | Relative CPU weight of the aggregate worker slice; applies after restarting rsid. | choice | daemon field `worker_scope_cpu_weight` | after daemon restart |
-| Worker CPU quota | CPU cap of each worker, as a percentage of one CPU (400 = four cores, default 400; 0 disables the cap). Each worker session runs in its own systemd scope; this sets that scope's CPUQuota, so one worker's builds, tests or runaway loops cannot take more than this share of the host. A halted worker's whole scope is killed, so no descendant outlives it. Applies to workers started after the change; running workers keep their quota. Linux only: other platforms have no scope and ignore it. | choice | daemon field `worker_cpu_quota_percent` | when applied · no restart |
+| Worker CPU quota | CPU cap of each worker, as a percentage of one CPU (400 = four cores, default 400; 0 disables the cap). Each worker session runs in its own systemd scope; this sets that scope's CPUQuota, so one worker's builds, tests or runaway loops cannot take more than this share of the host. A halted worker's whole scope is killed, so no descendant outlives it. Applies to workers started after the change; running workers keep their quota. Linux only: other platforms have no scope and ignore it. | choice | daemon field `worker_cpu_quota_percent` | next spawn |
 | Hub build CPU budget | Share of the host's CPUs that all cargo builds and tests RSI starts may use together, as a percentage of its logical CPUs (default 50, range 10-100). Every cargo build and test unit RSI starts (job units, scoped-test, merge-queue gates, the library QA run) runs in one systemd user slice, rsi-build.slice, whose CPUQuota is this share of the host's logical CPUs (50% of 32 threads is 16 cores) at a low CPUWeight, so concurrent jobs share one budget and the desktop stays responsive. Each job also sizes its own thread count from the budget. Applying a change rewrites the slice at once, including for units already running; read it back with systemctl --user show rsi-build.slice -p CPUQuotaPerSecUSec. Linux only: other platforms have no slice and report that no budget is available. | choice | daemon field `hub_build_cpu_percent` | when applied · no restart |
 | Completed transcript cache (bytes) | Daemon RAM limit for completed transcript reads; 0 disables retention. | choice | daemon field `completed_transcript_cache_max_bytes` | when applied · no restart |
 
@@ -747,6 +779,7 @@ Host-load admission, CPU andon and the build governor's slots and floors.
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
 | Host load limit for new launches | Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds). Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything. | choice | daemon field `host_load_admission_threshold` | when applied · no restart |
+| Worker build reserve (GiB) | Free disk reserved above the governor floor before a new worker launch (0-64, default 8; 0 disables reserve). Holds new manager workers and topology launches until free disk reaches the governor floor plus this target estimate. Build and test jobs use the governor floor alone. Lead recovery and worker-owned children remain exempt. | choice | daemon field `worker_build_reserve_gb` | when applied · no restart |
 | CPU andon: CPU-minutes per tree | One agent process tree (a session's provider scope or a job unit) past this many CPU-minutes is a runaway (0 off, default 240). The daemon samples cgroup CPU time once a minute (Linux; unsupported elsewhere), records a runaway_process friction event and tells the owning manager the session and a suggested halt. It never stops the tree itself. | choice | daemon field `cpu_andon_cpu_minutes` | when applied · no restart |
 | CPU andon: host load | At or above this 1-minute host load, one agent process tree using a dominant share of it is a runaway (0 off, default 40). Same andon as the CPU-minutes trigger: a runaway_process friction event and one manager notice per tree, never an automatic stop. | choice | daemon field `cpu_andon_host_load` | when applied · no restart |
 | Build slots | Concurrent cargo build/test runs the resource governor admits (1-16); default 4. | choice | daemon field `governor_build_slots` | when applied · no restart |
@@ -765,7 +798,7 @@ Merge queue batching and gates, test-job timeouts and deploy drain limits.
 | --- | --- | --- | --- | --- |
 | Rolling merge queue | Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish. | toggle | daemon field `rolling_queue_enabled` | when applied · no restart |
 | Merge queue batch size | Maximum ready sources merged into one candidate and gated together (1-8). | choice | daemon field `rolling_queue_batch_size` | when applied · no restart |
-| Merge queue gate timeout (min) | Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 60). When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch. | choice | daemon field `rolling_queue_gate_timeout_mins` | when applied · no restart |
+| Merge queue gate timeout (min) | Wall-time budget of one lander run of a merge-queue batch; each bisect step gets it too (30-1440 minutes, default 60). When a lander run goes past it, the running lander is stopped and every member still suspect is refused with queue_gate_timeout, which wakes its owner; members an earlier red run had already left out go back to the queue at their position; the queue then moves on. | choice | daemon field `rolling_queue_gate_timeout_mins` | when applied · no restart |
 | Merge queue full-QA interval (min) | Minimum time between two starts of the merge queue's async full-library QA run (0-240 minutes, default 60). A landing gated on queue-derived filters or a bounded selection owes one full rsid and rsid-store library, bin and integration test run; landings published in between coalesce into the next run, which runs at a lower CPU weight than gates. 0 starts it as soon as the previous run ends. | choice | daemon field `rolling_queue_full_qa_interval_mins` | when applied · no restart |
 | QA target size cap (GiB) | Size above which the shared full-library QA build target is emptied before the next run (0 off, else 10-500 GiB, default 30). Each QA run removes the build artifacts a newer run superseded, so the target stays near one commit's footprint (about 15-20 GiB). This cap is the backstop: a target still over it is emptied before the next run starts, which then rebuilds cold. It applies on the hub and on a satellite running a QA run for the hub, and takes effect at the next QA start. | choice | daemon field `qa_target_max_gib` | when applied · no restart |
 | Job thermal hold (C) | CPU temperature at or above which no new build or test job starts (0 off, else 60-110 C, default 85). A job submitted while the host's hottest CPU sensor (Linux hwmon: k10temp Tctl/Tdie, coretemp) is at or above this temperature is held, shown as held_for_thermal, with no unit and no timeout clock; it starts, in submission order, once the host is below the ceiling. It applies on the hub and on a satellite alike. Running jobs are not stopped. Hosts without a readable CPU sensor, and other platforms, never hold. Takes effect at the next job start. | choice | daemon field `job_thermal_ceiling_c` | when applied · no restart |
@@ -778,7 +811,7 @@ Merge queue batching and gates, test-job timeouts and deploy drain limits.
 
 #### Sandbox Storage
 
-Sandbox disk use, source-worktree settlement, archived sandbox purge and the stored tool-result cap.
+Sandbox disk use, source-worktree settlement, archived sandbox purge, the stored tool-result cap and pasted-image retention.
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
@@ -790,6 +823,7 @@ Sandbox disk use, source-worktree settlement, archived sandbox purge and the sto
 | Disk pressure free space (GB) | Free-space threshold for automatic source settlement; default 100 GB (1024³ bytes per GB), capped at 25% of disk size. Machine local setting, from 1 to 4096 GB. Uses the smaller of this value and 25% of the filesystem: a 192 GB disk has a 48 GB default threshold. Settlement retains untouched roots once free space reaches the effective threshold. Pool trimming has separate controls. | choice | daemon field `disk_pressure_min_free_gb` | when applied · no restart |
 | Purge archived sandboxes | Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. **Destructive.** | toggle | daemon field `archived_sandbox_purge_enabled` | when applied · no restart |
 | Stored tool-result cap (KiB) | Largest body of a tool result kept in the database, in KiB (0 or 4-1024, default 32); a longer one keeps its first and last half around a marker that records its original size. Tool output such as raw cargo logs is most of the database and grows it about 2 GB a month. The cap applies to every provider as a tool result is stored: only the stored copy is cut, so the live session and the TUI still see the whole output. It applies to results stored after the change; rows already stored are never rewritten. A resumed Harness session replays the stored body, marker included. 0 stores every result whole. | choice | daemon field `tool_result_storage_cap_kib` | when applied · no restart |
+| Keep referenced pasted images (days) | Days the daemon keeps a pasted image that a message or conversation named (0 keeps it forever, the default; else 7-3650). Applies to images pasted through the daemon (~/.rsi/paste/rsid). An image no message, conversation or enabled scheduled job ever named is removed 7 days after its last upload whatever this says. A named image is part of your conversation history, so it is removed only when this is above 0 and its last upload is older than that, and never while a queued message, a running session or an enabled scheduled job still names it. Read at each retention pass (daemon start, and after an upload at most hourly). **Destructive.** | choice | daemon field `paste_retention_referenced_days` | when applied · no restart |
 
 #### Cold Storage
 
@@ -797,6 +831,9 @@ The compressed archive of old session data: switch, age, directory, status and a
 
 | Setting | What it does | Kind | Stored in | Applies |
 | --- | --- | --- | --- | --- |
+| Resolve errored sessions | Automatically soft-delete empty failures, resume infrastructure interruptions and archive final errors while retaining diagnosis and work. | toggle | daemon field `error_disposition_enabled` | when applied · no restart |
+| Error grace (minutes) | Minimum terminal age before disposition (1-1440 minutes, default 15). | choice | daemon field `error_disposition_grace_minutes` | when applied · no restart |
+| Error continuations per day | Maximum daemon continuations per session in 24 hours (0-10, default 3); drains hold continuations. | choice | daemon field `error_disposition_continuation_budget` | when applied · no restart |
 | Cold-storage archive | Moves the bulky rows of old Archived and Deleted sessions into verified, compressed archive files and out of rsi.db (default on). A background pass runs at most every 6 hours at the lowest CPU and I/O priority, outside startup. It writes each cold session's tool rows to an append-only archive file under the archive directory, fsyncs it and reads it back against its checksums; only then, and only while a backup of rsi.db younger than 24 hours exists in ~/.rsi/backups (the pass takes one itself when none does), it deletes those rows from the live database and returns the freed space in small steps. Transcripts still open whole; :cold-restore puts a session's rows back. Shrinking the file once happens at the next supervised restart (:cold-archive compact asks for it). A weekly pass re-reads every archived chunk, and every failure raises an operator to-do. The archive directory is the row below; back it up with the rest of ~/.rsi. The status rows below show what the archive holds and the last pass; the run row (or :cold-archive run) starts a copy-only pass now, :cold-archive move a full one. | toggle | daemon field `cold_archive_enabled` | when applied · no restart |
 | Cold-storage age (days) | A session is cold when its newest event is at least this many days old (3-3650, default 14). Age is measured by the newest conversation event, not the session's updated time, which sandbox maintenance bumps in bulk. Only Archived and Deleted sessions qualify, and a session that a live manager, worker, wake, job, queue entry or topology still references is never cold. Read at the start of each pass. | choice | daemon field `cold_archive_after_days` | when applied · no restart |
 | Cold-storage directory | Where archive files are written: an absolute path outside every sandbox root, or empty for <data dir>/archive. Enter opens a text editor. The daemon checks the path before saving it and again when a pass starts: a symlink or .. that leads into a sandbox root or a .git directory is refused, and the editor shows the reason and keeps your text. Existing archive files keep their recorded path, so a change only affects new files. Back the directory up with the rest of ~/.rsi. | action | daemon field `cold_archive_dir` | when activated |
@@ -877,6 +914,8 @@ These daemon settings are persisted and read by the daemon, but no TUI surface e
 | Daemon field | How it is set today | Tracking |
 | --- | --- | --- |
 | `retry_max_default` | `RSI_RETRY_MAX_DEFAULT` at daemon start, or `UpdateDaemonConfig`; stored, not applied to default launches (only seeds the retry kill-switch) | #2236 |
+| `openrouter_spend_baseline_usd` | written by arming openrouter_spend_cap_usd (a fresh probe of the account usage) | #3154 |
+| `openrouter_spend_armed_at` | written by arming openrouter_spend_cap_usd (the time of that probe) | #3154 |
 | `api_route.fallback` | `UpdateDaemonConfig` (legacy alias of `api_route.fallback.bedrock`; never touches OpenRouter); the Bedrock fallback row is the editor | #3141 |
 
 ## 12. Ex-command reference
@@ -902,6 +941,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:kill` | `:ki` | Soft interrupt running session | Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it. |
 | `:pause soft` |  | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `:pause clear` |  | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
+| `:provider-clear-hold` |  | Clear provider usage hold | After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits. |
 | `:continue [arg]` | `:cont [arg]` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `:archive` | `:arc` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
 | `:delete` | `:del` | Delete selected session | Deletes the selected session after the double-tap `DD` (moves it to the trash). |
@@ -910,6 +950,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:manager-reseat [arg]` |  | Reseat failed manager | Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; `:manager-reseat <provider>[/<model>] <reason>`. Run twice to confirm. |
 | `:cold-restore` |  | Restore from cold storage | Puts the focused archived session's rows back from the cold-storage archive into the live database (`:cold-restore`). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way. |
 | `:cold-archive [arg]` |  | Cold-storage archive | `:cold-archive` shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); `:cold-archive run` starts a stage pass (copy and verify, delete nothing), `move` also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, `verify` re-reads every archived chunk and `compact` schedules the one-time database compaction for the next supervised restart. |
+| `:external-reports [arg]` |  | External reports | `:external-reports` shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; `:external-reports sync` runs one import pass now with the hub's own gh login; `:external-reports filter` filters the focused Issues pane to the `external-report` label. Imported reports are untrusted P4 Issues until triage promotes them. |
 | `:archives` |  | Open archives | Switches the session list to the Archive zone. |
 | `:model [arg]` | `:mod [arg]` | Choose model | Opens the model picker, or `:model <name>` selects a model for new launches. |
 | `:sessions` | `:ls` | List sessions | Lists sessions in the session list. |
@@ -921,6 +962,7 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:project-new [arg]` |  | Create project | Creates a project: `:project-new <name> [path]`, or opens the form. |
 | `:project-edit [arg]` |  | Edit project | Edits the named or current project. |
 | `:project-delete <arg>` |  | Delete project | Deletes the named project; the name argument is required. |
+| `:intake <arg>` |  | Operator intake | Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager. |
 | `:set` | `:settings` | Open settings | Opens the settings pane. |
 | `:stopall` | `:stop-all` | Emergency stop all | Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD. |
 | `:hooks` |  | Open hook settings | Opens settings at the Claude hooks list. |
@@ -936,12 +978,13 @@ Every `:` command, its aliases and argument form. Type a unique alias and Enter,
 | `:ask [arg]` |  | Ask a question | Opens the dialectic question overlay; `:ask <question>` asks directly. |
 | `:term` | `:terminal` `:shell` | Toggle terminal | Toggles the embedded terminal overlay (the shell keeps running when hidden). |
 | `:lead` | `:setlead` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
-| `:manager` |  | Open harness manager | Opens the harness manager overlay. |
+| `:manager` |  | Open harness manager | Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor. |
 | `:manager appoint` |  | Appoint harness manager | Appoints the selected session as the harness manager. |
 | `:manager scope` |  | Edit manager scope | Edits the harness manager's scope. |
 | `:manager clear` |  | Clear manager scope | Clears the harness manager's scope. |
 | `:fleet` |  | Open fleet workspace | Shows active agents and usage rates across all projects. |
 | `:global-manager` | `:gm` `:manager workspace` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `:dashboard` | `:gd` | Open global dashboard | Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project. |
 | `:manager global [arg]` |  | Show global manager grant | Shows the active global manager grant; `:manager global set <active\|sessions\|containers\|spend\|groups> <value>` changes one per-project cap; `:manager global add-project <names...>` adds projects to the grant; `:manager global configure <JSON>` sends a full typed grant request. |
 | `:manager global appoint [arg]` |  | Appoint global manager | Appoints the focused session as the global manager over the named projects (comma-separated; default: every project). |
 | `:manager global revoke` |  | Revoke global manager | Revokes the active global manager grant; the seat keeps its session but loses its authority. |
@@ -993,6 +1036,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `X` | INTERRUPT NOW | Press twice within five seconds to cancel the active turn and mark it HARD. |
 | `<Space>hs` | Downgrade hard pause to soft | Changes the selected session's HARD marker to SOFT so a granted manager may restart it. |
 | `<Space>hc` | Clear operator pause | Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm. |
+| `<Space>hu` | Clear provider usage hold | After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits. |
 | `<Space>c` | Continue selected session | `<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly. |
 | `P` | Pin or unpin selected session | Pins or unpins the selected session at the top of the list. |
 | `<Space>a` | Archive selected session | Archives the selected session (reversible with U from the Archive zone). |
@@ -1014,6 +1058,7 @@ Every Normal-mode chord, from the action registry. Vim motions such as `j`, `k`,
 | `<Space>v` | Open graph review | Opens the visual workflow graph review editor. |
 | `gL` | Set Epic lead | Sets the focused leaf session as the lead of its parent Epic. |
 | `gm` | Open global manager workspace | Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session. |
+| `gd` | Open global dashboard | Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project. |
 | `<Space>q` | Close pane | Closes the focused pane. |
 | `>` | Next tab | Switches to the next tab. |
 | `<` | Previous tab | Switches to the previous tab. |
@@ -1142,11 +1187,11 @@ Keys of the settings pane (category rail and items).
 | `k` | Move selection or scroll up | Moves the selection up one row, or scrolls the focused view up. |
 | `Enter` | Open or activate selection | Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting. |
 | `Delete` | Reset selected role | Resets the selected theme role to the active theme's default color. |
-| `h` | Return to categories | Returns focus from the settings items to the category rail. |
-| `Left` | Return to categories | Returns focus from the settings items to the category rail. |
-| `l` | Enter selected category | Moves focus from the category rail into the selected category's items. |
-| `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. |
-| `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, or activates the selected settings row. |
+| `h` | Return to categories | Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row. |
+| `Left` | Return to categories | Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row. |
+| `l` | Enter selected category | Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w. |
+| `Right` | Enter selected category | Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w. |
+| `Space` | Toggle or activate setting | Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row. |
 | `a` | Add item | Adds an item to the selected settings list (hooks, providers, budgets and similar lists). |
 | `d` | Delete item | Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot. |
 | `e` | Enable or disable skill | Enables or disables the selected Claude skill. |
@@ -1282,7 +1327,7 @@ Keys the event loop decodes itself, before or beside the Vim keymap. Each table 
 | --- | --- | --- |
 | `Ctrl-Alt-G` | any context | toggle contextual help without typing into the active editor |
 | `Ctrl-C` | embedded terminal open | send SIGINT to the embedded terminal's shell |
-| `Ctrl-C` | any context | quit rsi |
+| `Ctrl-C` | any context | does not quit; shows the hint naming the proper exit (:q or ZZ) |
 | `Ctrl-\` | any context | toggle the embedded terminal overlay (the shell keeps running) |
 | `Ctrl-O` | normal mode, no overlay, not inserting | jump back in the session jumplist |
 | `Ctrl-I` | normal mode, no overlay, not inserting | jump forward in the session jumplist |
@@ -1690,8 +1735,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter projects |
 | `Enter` | Select project |
 | `Ctrl-N` | New project |
@@ -1705,8 +1750,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter labels |
 | `Enter` | Assign label |
 | `Ctrl-N` | New label |
@@ -1720,8 +1765,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 
 | Keys | Action |
 | --- | --- |
-| `j / k, Down / Up` | Move selection |
-| `g / G` | Jump to first / last |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Home / End` | Jump to first / last |
 | `Type, Backspace` | Filter parents |
 | `Enter` | Set parent |
 | `Esc` | Close picker |
@@ -1734,9 +1779,10 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | --- | --- |
 | `Tab / Shift-Tab` | Next / previous field |
 | `Type, Backspace` | Edit focused field |
+| `Esc, h j k l w b e 0 $, x dd cw ciw, u` | Vim editing in Name and Path: Esc leaves insert mode |
 | `Left / Right` | Cycle color (color field) |
 | `Enter` | Save project |
-| `Esc` | Cancel |
+| `Esc` | Cancel (from normal mode) |
 
 #### Label Form
 
@@ -1825,6 +1871,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `j / k, Down / Up` | Move selection |
 | `g / G` | Jump to first / last |
 | `Enter / Space` | Edit selected policy field |
+| `x / Delete` | Remove the focused allowed model (draft only) |
 | `s` | Save policy |
 | `r` | Reload policy |
 | `Esc / q` | Close manager |
@@ -1898,6 +1945,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `x` | Halt the selected seat session (soft stop) |
 | `X` | Halt the selected seat session now (press twice) |
 | `a` | Archive the selected earlier seat session |
+| `g e` | Edit global manager coverage and permissions; b views budget; y on Review saves |
 | `n` | Launch and appoint a manager (seat, launch, scope, grant) |
 | `b` | Budget panel: every cap of the global node and each PM as used / limit, binding cap marked |
 | `b: + / 0-9` | Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back |
@@ -1907,6 +1955,24 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `p` | Open the selected project's tab |
 | `T` | Open the manager tree |
 | `F` | Open the fleet workspace |
+| `r` | Refresh the snapshot |
+| `:` | Open the command palette |
+| `Esc / q` | Close (Esc leaves typing or the conversation first) |
+
+#### Global Dashboard
+
+| Keys | Action |
+| --- | --- |
+| `j / k, Down / Up` | Move selection |
+| `g / G` | Jump to first / last |
+| `w` | Cycle the window: 1h, 24h, 7d |
+| `s` | Cycle the sort: agents, tokens, cost, Issues |
+| `Enter / l` | Open the selected project's tab and session list |
+| `t` | Show or hide the conversation pane |
+| `i` | Type to the top-level manager; Enter sends |
+| `n` | Start a top-level manager (the appoint flow) when none is live |
+| `Tab` | Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends |
+| `gm` | Open the global manager workspace |
 | `r` | Refresh the snapshot |
 | `:` | Open the command palette |
 | `Esc / q` | Close (Esc leaves typing or the conversation first) |
@@ -1942,6 +2008,7 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | `j / k, Down / Up` | Move selection |
 | `J / K, PageDown / PageUp` | Page selection |
 | `Enter` | Audit selected worktree |
+| `n` | Audit next custody page |
 | `A` | Begin authorization |
 | `r` | Refresh receipt |
 | `Esc / q` | Close |
@@ -2143,8 +2210,8 @@ The file viewer's own `:` command line (`:q` closes the viewer, not rsi).
 | Keys | Action |
 | --- | --- |
 | `Type, Backspace` | Search memory |
-| `j / k, Down / Up` | Move selection |
-| `Esc / q` | Close |
+| `Down / Up, Ctrl-J / Ctrl-K` | Move selection |
+| `Esc` | Close |
 
 #### Dialectic
 
@@ -2280,6 +2347,7 @@ Screens without an overlay key catalog, and where their keys are documented.
 | Remote settings | The page owns its enable, device and project keys. | keybindings.md § Remote Settings |
 | Manager tree (:manager tree) | The tree owns its fold, paging, jump and in-tree action keys. | keybindings.md § Manager Tree |
 | Legacy scratch adoption | The browser owns its select, adopt and refresh keys. | keybindings.md § Legacy Scratch Adoption |
+| Host tuning (:manager tune) | The panel owns its profile, preset, bounds and apply/undo keys. | keybindings.md § Host Tuning |
 
 ### Surfaces documented by hand
 

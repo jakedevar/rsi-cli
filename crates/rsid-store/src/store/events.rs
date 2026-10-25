@@ -8,7 +8,7 @@ use crate::error::{DaemonError, Result};
 use chrono::{DateTime, Utc};
 use rsi_common::closure_kernel::ConversationEventProvenanceV1;
 use rsi_common::types::{ConversationEvent, EventType, Role};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 impl Store {
@@ -547,8 +547,88 @@ impl Store {
     ///
     /// The row must be live (#2384): an id that matches no row, such as one
     /// whose session moved to cold storage, is an error, not a silent no-op.
+    ///
+    /// #179 paste-reference fence: the paste retention pass reads events up to
+    /// its event mark (`Store::paste_reference_marks`, the newest id) and, late,
+    /// only the rows inserted past it; an in-place rewrite moves no mark. So a
+    /// rewrite never adds a pasted image name to the row's text (content,
+    /// tool input, metadata): new content naming an image the row did not
+    /// name is refused, in the same transaction as the write, and the row is
+    /// left unchanged. A new
+    /// reference is a new event (an insert past the mark).
+    ///
+    /// #215, the drop side of the same rule: the retention pass keeps an image
+    /// only while some stored text names it ("an image a message once named is
+    /// conversation history", #86), and nothing else remembers that this row
+    /// once did. So new content must also keep every name the old content
+    /// carried, unless the row's tool input or metadata (which this rewrite
+    /// does not touch) still names it; a compressed or offloaded row keeps its
+    /// image names, for example in a short stub. A dropping rewrite is refused
+    /// (`paste_reference_dropped`) the same way, leaving the row unchanged.
+    /// Both checks use the one paste-name matcher,
+    /// `rsi_common::input_assets::paste_image_names_in`, so the row's set of
+    /// named images is exactly the same before and after the write.
     pub fn update_event_content(&self, event_id: i64, new_content: &str) -> Result<()> {
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT content, COALESCE(tool_input, ''), COALESCE(metadata, '') \
+                 FROM conversation_events WHERE id = ?1",
+                params![event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((content, tool_input, metadata)) = row else {
+            return Err(DaemonError::Store(format!(
+                "update_event_content: event {event_id} is not a live conversation event"
+            )));
+        };
+        let names_in = |texts: &[&str]| {
+            let mut names = std::collections::BTreeSet::new();
+            for text in texts {
+                rsi_common::input_assets::paste_image_names_in(text, &mut |name| {
+                    names.insert(name);
+                });
+            }
+            names
+        };
+        let untouched = names_in(&[tool_input.as_str(), metadata.as_str()]);
+        let old_names = names_in(&[content.as_str()]);
+        let new_names = names_in(&[new_content]);
+        let added = new_names
+            .difference(&old_names)
+            .filter(|name| !untouched.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !added.is_empty() {
+            let added = added.join(", ");
+            return Err(DaemonError::Store(format!(
+                "update_event_content: paste_reference_added: the new content of event \
+                 {event_id} names pasted image(s) {added} the row did not name; an in-place \
+                 rewrite moves no paste-retention mark, so a new reference must be a new event"
+            )));
+        }
+        let dropped = old_names
+            .difference(&new_names)
+            .filter(|name| !untouched.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !dropped.is_empty() {
+            let dropped = dropped.join(", ");
+            return Err(DaemonError::Store(format!(
+                "update_event_content: paste_reference_dropped: the new content of event \
+                 {event_id} no longer names pasted image(s) {dropped} the row names; paste \
+                 retention keeps an image only while stored history names it, so a rewrite \
+                 must keep every pasted image name (for example in a short stub)"
+            )));
+        }
+        let changed = tx.execute(
             "UPDATE conversation_events SET content = ?1 WHERE id = ?2",
             params![new_content, event_id],
         )?;
@@ -557,6 +637,7 @@ impl Store {
                 "update_event_content: event {event_id} is not a live conversation event"
             )));
         }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -762,5 +843,124 @@ mod tests {
         tool_result_cap::set_cap_kib(tool_result_cap::TOOL_RESULT_STORAGE_CAP_KIB_DEFAULT);
         assert_eq!(row.content, body);
         assert_eq!(row.metadata, None);
+    }
+
+    /// #179 and #215: an in-place rewrite must keep exactly the pasted image
+    /// names its row carries. It may move a name out of its content only when
+    /// the row's tool input or metadata still names it; it may neither add a
+    /// name nor drop one, and a refused rewrite leaves the row exactly as it
+    /// was.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn update_event_content_keeps_the_rows_paste_names_and_refuses_a_new_one() {
+        let (store, session) = store_with_session();
+        let upload = format!("{}.png", "a".repeat(64));
+        let in_metadata = format!("{}.webp", "b".repeat(64));
+        let fresh = format!("{}.jpg", "c".repeat(64));
+        let tui = "0123abcd-0123-4abc-8def-0123456789ab.png";
+        let original = format!("ran it\n/home/op/.rsi/paste/rsid/{upload}\nexit 0");
+        let mut event = tool_result(
+            session,
+            1,
+            original,
+            Some(json!({ "attachment": in_metadata })),
+        );
+        event.tool_input = Some(Box::new(json!({ "path": tui })));
+        let id = store.insert_event(&event).unwrap();
+
+        let kept = format!("[offloaded] {upload} {in_metadata} {tui}");
+        store.update_event_content(id, &kept).unwrap();
+        assert_eq!(stored(&store, session, 1).content, kept);
+        // `in_metadata` and `tui` leave the content but the row's metadata
+        // and tool input, which the rewrite does not touch, still name them.
+        let stub = format!("[offloaded] {upload}");
+        store.update_event_content(id, &stub).unwrap();
+        assert_eq!(stored(&store, session, 1).content, stub);
+
+        let refused = store.update_event_content(id, "[offloaded]").unwrap_err();
+        assert!(
+            refused.to_string().contains("paste_reference_dropped")
+                && refused.to_string().contains(&upload),
+            "{refused}"
+        );
+        assert_eq!(stored(&store, session, 1).content, stub);
+
+        for adding in [
+            format!("[offloaded] {upload} now names {fresh}"),
+            format!("[offloaded] {fresh}"),
+        ] {
+            let refused = store.update_event_content(id, &adding).unwrap_err();
+            assert!(
+                refused.to_string().contains("paste_reference_added"),
+                "{refused}"
+            );
+            assert_eq!(stored(&store, session, 1).content, stub);
+        }
+
+        let missing = store.update_event_content(id + 1, "anything").unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("is not a live conversation event"),
+            "{missing}"
+        );
+    }
+
+    /// #215: the invariant the drop refusal protects. A row that is the only
+    /// stored text naming a pasted image still names it, for the "ever
+    /// referenced" scan paste retention runs, after every rewrite attempt:
+    /// a rewrite that would drop the name is refused, one that keeps it in a
+    /// stub succeeds, and the scan finds the name either way.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn a_rewrite_that_would_drop_the_only_paste_reference_is_refused_and_the_scan_still_finds_it() {
+        let (store, session) = store_with_session();
+        let only = format!("{}.gif", "d".repeat(64));
+        let original = format!(
+            "cat /home/op/.rsi/paste/rsid/{only}\n{}",
+            "a long tool output line\n".repeat(50)
+        );
+        let id = store
+            .insert_event(&tool_result(session, 1, original.clone(), None))
+            .unwrap();
+        let scanned = |store: &Store| {
+            let mut names = std::collections::BTreeSet::new();
+            let mut after = 0;
+            loop {
+                let next = store
+                    .paste_reference_scan_chunk(
+                        crate::store::PasteReferenceSource::ConversationEvents,
+                        after,
+                        16,
+                        &mut |text: &str| {
+                            rsi_common::input_assets::paste_image_names_in(text, &mut |name| {
+                                names.insert(name);
+                            });
+                        },
+                    )
+                    .unwrap();
+                match next {
+                    Some(next) => after = next,
+                    None => break,
+                }
+            }
+            names
+        };
+        assert!(scanned(&store).contains(&only));
+
+        for dropping in ["[offloaded]", "[offloaded] see the earlier read", ""] {
+            let refused = store.update_event_content(id, dropping).unwrap_err();
+            assert!(
+                refused.to_string().contains("paste_reference_dropped"),
+                "{refused}"
+            );
+            assert_eq!(stored(&store, session, 1).content, original);
+            assert!(scanned(&store).contains(&only), "after {dropping:?}");
+        }
+
+        let stub = format!("[offloaded] read {only}");
+        store.update_event_content(id, &stub).unwrap();
+        assert_eq!(stored(&store, session, 1).content, stub);
+        assert!(scanned(&store).contains(&only));
     }
 }

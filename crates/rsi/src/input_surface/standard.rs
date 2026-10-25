@@ -174,7 +174,7 @@ pub(super) fn handle_standard_key(
             surface.textarea.cancel_selection();
             surface.textarea.select_all();
         }
-        // Copy: a no-op without a selection (the global Ctrl-C meaning is
+        // Copy: a no-op without a selection (the global Ctrl-C hint is
         // decided one layer up, before this key reaches the surface).
         KeyCode::Char('c' | 'C') if ctrl && !alt => {
             if !copy_selection(surface) {

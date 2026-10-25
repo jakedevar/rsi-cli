@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -192,6 +192,8 @@ struct ScenarioOptions {
     /// The operator's retry budget for the turn's root call. The daemon
     /// default allows no retry (A9), so a scenario that retries sets one.
     retry_budget: Option<u32>,
+    /// Send earlier reasoning back as the OpenRouter route does (#3170).
+    replay_reasoning: bool,
 }
 
 impl Default for ScenarioOptions {
@@ -209,6 +211,7 @@ impl Default for ScenarioOptions {
             credential: None,
             failures: Vec::new(),
             retry_budget: None,
+            replay_reasoning: false,
         }
     }
 }
@@ -238,7 +241,9 @@ async fn run_scenario_with(
     query: &str,
     options: ScenarioOptions,
 ) -> Outcome {
-    let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().expect("store"),
+    ));
     run_turn_with(
         &store,
         uuid::Uuid::new_v4(),
@@ -255,7 +260,7 @@ async fn run_scenario_with(
 /// (a launch or a `session.continue.resume`), `history` is the rebuilt
 /// transcript of the earlier turns.
 async fn run_turn(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: uuid::Uuid,
     root_key: &str,
     registry: HarnessToolRegistry,
@@ -276,7 +281,7 @@ async fn run_turn(
 /// [`run_turn`] with explicit route quirks, effort, iteration cap, working
 /// directory and history.
 async fn run_turn_with(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     session_id: uuid::Uuid,
     root_key: &str,
     registry: HarnessToolRegistry,
@@ -300,7 +305,8 @@ async fn run_turn_with(
             .unwrap_or_else(|| ApiCredential::explicit(Some(MODEL_KEY_SENTINEL))),
         options.quirks,
     )
-    .expect("provider");
+    .expect("provider")
+    .with_reasoning_replay(options.replay_reasoning);
 
     let permit = root_permit_keyed(store, session_id, root_key).await;
     if let Some(max_retries) = options.retry_budget {
@@ -838,6 +844,8 @@ async fn the_final_answer_retry_turn_sends_tool_choice_none_on_mercury() {
         probe_registry(),
         vec![
             tool_call_reply("call_1", "probe_tool", r#"{"q":"one"}"#),
+            cut_off.clone(),
+            cut_off.clone(),
             cut_off,
             text_reply("Done."),
         ],
@@ -849,17 +857,24 @@ async fn the_final_answer_retry_turn_sends_tool_choice_none_on_mercury() {
     )
     .await;
 
-    assert_eq!(outcome.requests.len(), 3);
+    assert_eq!(outcome.requests.len(), 5);
     // `max` is Mercury's `high`; the first two calls use it.
     assert_eq!(outcome.requests[0]["reasoning_effort"], "high");
     assert_eq!(outcome.requests[1]["reasoning_effort"], "high");
     assert!(outcome.requests[1].get("tool_choice").is_none());
+    // #4028: the two length-stop recoveries keep tools callable, at `low` effort
+    // and the 32,768 ceiling.
+    for recovery in [2, 3] {
+        assert_eq!(outcome.requests[recovery]["reasoning_effort"], "low");
+        assert_eq!(outcome.requests[recovery]["max_completion_tokens"], 32_768);
+        assert!(outcome.requests[recovery].get("tool_choice").is_none());
+    }
     // The retry turn: `low` effort, the 32,768 ceiling, tools kept but not
     // callable.
-    assert_eq!(outcome.requests[2]["reasoning_effort"], "low");
-    assert_eq!(outcome.requests[2]["max_completion_tokens"], 32_768);
-    assert_eq!(outcome.requests[2]["tool_choice"], "none");
-    assert_eq!(outcome.tool_names(2), ["probe_tool"]);
+    assert_eq!(outcome.requests[4]["reasoning_effort"], "low");
+    assert_eq!(outcome.requests[4]["max_completion_tokens"], 32_768);
+    assert_eq!(outcome.requests[4]["tool_choice"], "none");
+    assert_eq!(outcome.tool_names(4), ["probe_tool"]);
     assert!(outcome.events.iter().any(|event| {
         event.event_type == "assistant" && event.data.to_string().contains("Done.")
     }));
@@ -969,7 +984,9 @@ async fn a_follow_up_turn_searches_again_from_persisted_history() {
     let vendor = MockServer::start().await;
     mount_ok(&vendor, ok_body()).await;
     let (page_server, _pages) = serve(|_| html(PAGE)).await;
-    let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(
+        Store::open_in_memory().expect("store"),
+    ));
     let session_id = uuid::Uuid::new_v4();
 
     // Turn 1: three model calls (search, fetch, answer).
@@ -1085,4 +1102,99 @@ async fn a_follow_up_turn_searches_again_from_persisted_history() {
         outcome.assert_key_only_in_authorization();
         outcome.assert_secret_absent(SEARCH_KEY_SENTINEL);
     }
+}
+
+/// #3170: the model's thinking from a tool step is streamed, kept on the
+/// assistant message and sent back on the next request of the chain; a route
+/// that does not replay never sees it. The final answer's thinking is stored
+/// beside it and a resumed session rebuilds it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn streamed_reasoning_is_replayed_on_the_tool_chain_and_rebuilt_on_resume() {
+    let details = json!({"type": "reasoning.text", "index": 0, "text": "check the probe first"});
+    let replies = || {
+        vec![
+            sse(&[
+                json!({"choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "reasoning": "check the probe first",
+                    "reasoning_details": [details.clone()],
+                    "tool_calls": [{"index": 0, "id": "call_think", "type": "function",
+                        "function": {"name": "probe_tool", "arguments": "{\"q\":\"one\"}"}}]
+                }}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+                usage_chunk(),
+            ]),
+            sse(&[
+                json!({"choices": [{"index": 0, "delta": {
+                    "role": "assistant", "reasoning": "it worked", "content": "Probe done.",
+                    "reasoning_details": [{"type": "reasoning.text", "index": 0, "text": "it worked"}]
+                }}]}),
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+                usage_chunk(),
+            ]),
+        ]
+    };
+
+    let replaying = run_scenario_with(
+        probe_registry(),
+        replies(),
+        "Run the probe.",
+        ScenarioOptions {
+            replay_reasoning: true,
+            ..ScenarioOptions::default()
+        },
+    )
+    .await;
+    assert_eq!(replaying.requests.len(), 2);
+    assert_well_formed(&replaying.requests[1]);
+    let messages = replaying.requests[1]["messages"].as_array().unwrap();
+    let step = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("the tool step is carried");
+    assert_eq!(step["reasoning_details"], json!([details]));
+    assert!(step.get("reasoning").is_none(), "one form, not both");
+    assert_eq!(step["tool_calls"][0]["id"], "call_think");
+    assert!(
+        replaying.requests[0]["messages"]
+            .to_string()
+            .find("check the probe first")
+            .is_none(),
+        "the first request has nothing to replay"
+    );
+
+    // Another route is byte-for-byte unchanged: no reasoning on the wire.
+    let plain = run_scenario_with(
+        probe_registry(),
+        replies(),
+        "Run the probe.",
+        ScenarioOptions::default(),
+    )
+    .await;
+    let second = plain.requests[1].to_string();
+    assert!(!second.contains("check the probe first"), "{second}");
+    assert!(!second.contains("reasoning_details"), "{second}");
+
+    // The final answer's thinking is persisted and a resumed session rebuilds it.
+    let session_id = uuid::Uuid::new_v4();
+    let mut sequence = 0;
+    let persisted = persist_turn(session_id, "Run the probe.", &replaying, &mut sequence);
+    assert!(
+        persisted
+            .iter()
+            .any(|row| row.event_type == EventType::Thinking && row.content == "it worked")
+    );
+    let rebuilt = crate::session::SessionManager::events_to_harness_messages(&persisted);
+    let answer = rebuilt
+        .iter()
+        .find(|m| m.content == "Probe done.")
+        .expect("the answer is rebuilt");
+    assert_eq!(answer.reasoning.as_deref(), Some("it worked"));
+    assert_eq!(
+        answer.reasoning_details,
+        Some(vec![
+            json!({"type": "reasoning.text", "index": 0, "text": "it worked"})
+        ])
+    );
 }

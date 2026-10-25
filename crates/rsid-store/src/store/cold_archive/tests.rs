@@ -2381,7 +2381,7 @@ fn a_stage_pass_through_the_shared_store_mutex_matches_the_direct_pass() {
         read,
     } = fx;
     let run_id = store.cold_begin_run("scheduled", ColdMode::Stage).unwrap();
-    let shared = std::sync::Arc::new(tokio::sync::Mutex::new(store));
+    let shared = std::sync::Arc::new(rsid_core::store_lock::Mutex::new(store));
     let report = run_stage_pass(
         &shared,
         &read,

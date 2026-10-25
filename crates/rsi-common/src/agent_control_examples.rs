@@ -17,14 +17,17 @@ use crate::agent_coordination::{
     AgentArchiveErrorCodeV1, AgentContinueErrorCodeV1, AgentMessageErrorCodeV1,
 };
 use crate::agent_deploy::{
-    DEPLOY_CAPABILITY_REQUIRED, DEPLOY_EXECUTE_REQUIRED, DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT,
-    DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED, DEPLOY_SHA_INVALID, DEPLOY_SHA_MISMATCH,
-    DEPLOY_TARGET_MISMATCH,
+    DEPLOY_BINARIES_DIR_NOT_ABSOLUTE, DEPLOY_CAPABILITY_REQUIRED, DEPLOY_EXECUTE_REQUIRED,
+    DEPLOY_IN_PROGRESS, DEPLOY_KEY_CONFLICT, DEPLOY_NEEDS_SUPERVISOR, DEPLOY_NOT_AUTHORIZED,
+    DEPLOY_SHA_INVALID, DEPLOY_SHA_MISMATCH, DEPLOY_TARGET_MISMATCH,
 };
 use crate::agent_jobs::{
-    JOB_DIR_NOT_ALLOWED, JOB_INVALID_PARAMS, JOB_INVALID_REQUEST, JOB_KEY_CONFLICT,
-    JOB_KEY_INVALID, JOB_KIND_NOT_AUTHORIZED, JOB_KIND_UNSUPPORTED, JOB_LAUNCH_FAILED,
-    JOB_NAME_INVALID, JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED, JOB_TOOLCHAIN_MISMATCH,
+    BENCH_CONFIG_INVALID, BENCH_CONFIG_UNCOMMITTED, BENCH_DISABLED, BENCH_DOCKER_HOST_NOT_ALLOWED,
+    BENCH_LAPTOP_HOST_MISMATCH, BENCH_OVERLAY_INVALID, BENCH_OVERLAY_LEAK_AUDIT_FAILED,
+    BENCH_PIN_CHECK_FAILED, BENCH_PREFLIGHT_FAILED, BENCH_SPEND_CAP_OFF, JOB_DIR_NOT_ALLOWED,
+    JOB_INVALID_PARAMS, JOB_INVALID_REQUEST, JOB_KEY_CONFLICT, JOB_KEY_INVALID,
+    JOB_KIND_NOT_AUTHORIZED, JOB_KIND_UNSUPPORTED, JOB_LAUNCH_FAILED, JOB_NAME_INVALID,
+    JOB_NOT_FOUND, JOB_PLATFORM_UNSUPPORTED, JOB_PROJECT_ROOT_SANDBOXED, JOB_TOOLCHAIN_MISMATCH,
 };
 use crate::agent_landing_candidate::{
     CANDIDATE_ADMISSION_TIMEOUT, CANDIDATE_HEAD_MISMATCH, CANDIDATE_INVALID_REQUEST,
@@ -63,17 +66,20 @@ use crate::portfolio_nodes::{
 };
 use crate::rolling_queue::{
     QUEUE_DISABLED, QUEUE_DUPLICATE_SOURCE, QUEUE_ENTRY_IN_FLIGHT, QUEUE_ENTRY_NOT_FOUND,
-    QUEUE_ENTRY_SETTLED, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS, QUEUE_GATE_TIMEOUT,
-    QUEUE_INVALID_REQUEST, QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED, QUEUE_PROBE_TIMEOUT,
-    QUEUE_REASON_INVALID, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
+    QUEUE_ENTRY_SETTLED, QUEUE_EXPEDITE_CAP_REACHED, QUEUE_EXPEDITE_NOT_AUTHORIZED,
+    QUEUE_EXPEDITE_REASON_INVALID, QUEUE_FILTER_INVALID, QUEUE_FILTER_MATCHES_NO_TESTS,
+    QUEUE_GATE_TIMEOUT, QUEUE_INVALID_REQUEST, QUEUE_KEY_INVALID, QUEUE_NOT_AUTHORIZED,
+    QUEUE_PROBE_TIMEOUT, QUEUE_REASON_INVALID, QUEUE_REGATE_EXHAUSTED, QUEUE_SOURCE_INVALID,
     QUEUE_SOURCE_SESSION_OUT_OF_SCOPE, QUEUE_SUPERSEDES_NOT_DESCENDANT, QUEUE_TIP_READ_TIMEOUT,
 };
 use crate::rpc::AgentIssueErrorCodeV1;
 use crate::satellite_dispatch::{
     SATELLITE_ISSUE_REF_INVALID, SATELLITE_ISSUE_REF_UNAVAILABLE, SATELLITE_ISSUE_REFS_TOO_LARGE,
     SATELLITE_MESSAGE_INVALID, SATELLITE_MESSAGE_KEY_CONFLICT, SATELLITE_MESSAGE_KEY_INVALID,
-    SATELLITE_MESSAGE_QUEUE_FULL, SATELLITE_REPORT_INVALID, SATELLITE_REPORT_NOT_AUTHORIZED,
-    SATELLITE_REPORT_QUEUE_FULL, SATELLITE_TARGET_NOT_AUTHORIZED,
+    SATELLITE_MESSAGE_QUEUE_FULL, SATELLITE_REPORT_BINARIES_DIR_NOT_ABSOLUTE,
+    SATELLITE_REPORT_BINARIES_DIR_NOT_ALLOWED, SATELLITE_REPORT_BINARIES_DIR_REQUIRED,
+    SATELLITE_REPORT_BINARIES_DIR_UNRESOLVABLE, SATELLITE_REPORT_INVALID,
+    SATELLITE_REPORT_NOT_AUTHORIZED, SATELLITE_REPORT_QUEUE_FULL, SATELLITE_TARGET_NOT_AUTHORIZED,
 };
 use crate::standing_directives::{
     STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT, STANDING_DIRECTIVE_INVALID_REQUEST,
@@ -260,7 +266,9 @@ impl AgentControlVerbV1 {
                 "kind": "build", "params": {"command": "check", "workspace": true},
                 "name": "check", "idempotency_key": "job-v1"
             }),
-            AgentControlVerbV1::GetJob => serde_json::json!({"job_id": issue}),
+            // Use an ID already in the caller's read scope; a citation alone
+            // does not authorize it. Compact and full have the same scope.
+            AgentControlVerbV1::GetJob => serde_json::json!({"job_id": issue, "fields": "compact"}),
             AgentControlVerbV1::ListJobs => serde_json::json!({"limit": 10}),
             AgentControlVerbV1::CancelJob => serde_json::json!({"job_id": issue}),
             AgentControlVerbV1::EnqueueLandingSource => serde_json::json!({
@@ -295,7 +303,7 @@ impl AgentControlVerbV1 {
                 "test_id": "session::launch::tests::example_test"
             }),
             AgentControlVerbV1::WorkerRoster => serde_json::json!({
-                "states": ["stranded", "parked_on_job"], "limit": 20
+                "fields": "summary", "limit": 20
             }),
             AgentControlVerbV1::GlobalOverview => serde_json::json!({}),
             AgentControlVerbV1::ManagerOverview => serde_json::json!({}),
@@ -379,6 +387,9 @@ impl AgentControlVerbV1 {
                 "sha": "0123456789abcdef0123456789abcdef01234567",
                 "binaries_dir": "/tmp/bin", "idempotency_key": "deploy-v1"
             }),
+            AgentControlVerbV1::SwitchHostPreset => {
+                serde_json::json!({"action":"apply","name":"day/shared"})
+            }
             AgentControlVerbV1::TopologyResolveAttempt => serde_json::json!({
                 "execution_id": issue, "attempt_id": issue, "action": "discard",
                 "expected_row_version": 3, "idempotency_key": "discard-v1",
@@ -466,6 +477,14 @@ const UPDATE_ISSUE_REFUSALS: &[AgentControlRefusalV1] = issue_refusals!(
     refusal(
         AgentIssueErrorCodeV1::BoundIssueNotAppendOnly.as_str(),
         "send {handoff} alone (no body copy) instead; to append to body, re-read the Issue with AgentGetIssue and send its current body byte for byte followed by your appended text (#1750)",
+    ),
+    refusal(
+        AgentIssueErrorCodeV1::BodyWouldDropTail.as_str(),
+        "the new body does not keep the end of the current body (a read cut short?); to add a note send {handoff} alone, or re-read the Issue with AgentGetIssue and resend the whole body, or set replace_body:true to replace it on purpose (#3052)",
+    ),
+    refusal(
+        AgentIssueErrorCodeV1::InvalidFailureSignature.as_str(),
+        "fix the rsi-failure-signature block named in diagnostic (JSON with schema_version 1, test_id, matcher, issue, class regression|flake|env|seed) and resend; unchanged blocks are not checked (#3595)",
     ),
 );
 
@@ -630,6 +649,16 @@ const MANAGER_SUCCESSION_ROTATION_DISABLED: AgentControlRefusalV1 = refusal(
     "manager_succession_rotation_disabled",
     "the operator setting context_rotation_enabled is off, so succeed_manager refuses a new succession before any successor is queued or reserved and your seat, epoch and wakes stay as they are; an identical-key retry of a succession already queued still returns its stored receipt, and the Overview row keeps that unresolved_operation_id instead of the denial. Otherwise keep working and ask the operator to enable it; Overview shows the same denial (operator_enable_context_rotation); do not cancel wakes",
 );
+/// #172/#640: a seat with no sandbox can use an existing shared-HEAD ancestor
+/// or anchor a new handoff at its private ref without committing in the root.
+const MANAGER_SUCCESSION_HANDOFF_HEAD_CHANGED: AgentControlRefusalV1 = refusal(
+    "manager_succession_handoff_head_changed",
+    "HEAD must equal source_commit or descend from it with the same regular-file blob at relative_path; this includes the shared root's HEAD when no private ref names source_commit. A private ref naming source_commit anchors independently of HEAD. With a sandbox, commit the handoff there and pass that HEAD. Without one (a reseated seat in the shared root), use a qualifying existing commit or create a new handoff with plumbing only, never commit in the shared tree: in your working directory run `git hash-object -w <file>`, `printf '100644 blob <blob>\\t<name>\\n' | git mktree`, `git commit-tree -m handoff <tree>` and `git update-ref refs/rsi/manager-handoff/<your session id> <commit>`, then pass {source_commit:<commit>, relative_path:<name>, blob_oid:<blob>}. The successor forks from source_commit and reads the exact blob; after the queued receipt, commit nothing more and end the turn",
+);
+const HOME_PROJECT_SUCCESSION_REFUSED: AgentControlRefusalV1 = refusal(
+    crate::types::Project::HOME_SUCCESSION_REFUSED,
+    "you are a portfolio seat in the RSI home project: hand your seat on with AgentManagerAppointChild on your own node and a host-local handoff file; never commit in $HOME",
+);
 
 const SPAWN_REFUSALS: &[AgentControlRefusalV1] = &[
     refusal(
@@ -681,7 +710,7 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
     ),
     refusal(
         JOB_INVALID_PARAMS,
-        "fix the kind-specific params; see the schema description for the kind; an over-size filter is named by field path (params.filters[i] or params.test_filters[i]), truncated text, byte length and limit",
+        "the refusal text is `job_invalid_params: <field>: <fix>`: it names the offending field (a params.* path, source_session_id or worktree) and one fix, so correct that field and retry; see the schema description for the kind; an over-size filter is named by field path (params.filters[i] or params.test_filters[i]), truncated text, byte length and limit",
     ),
     refusal(
         crate::agent_jobs::JOB_TIMEOUT_NOT_AUTHORIZED,
@@ -704,6 +733,14 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
         "the scoped-test or check-touched-shards copy that would run loads a scripts/ helper its tree lacks; the refusal names the file; commit it with the change that loads it and resubmit",
     ),
     refusal(
+        crate::agent_jobs::JOB_SCOPED_TEST_ROLLING_TOOL_UNAVAILABLE,
+        "the forced rolling tool copy cannot be resolved, materialized or matched to its Git blobs; fetch origin/rolling and rerun scoped_test with rolling_tool:true",
+    ),
+    refusal(
+        crate::agent_jobs::JOB_SCOPED_TEST_REF_UNRESOLVED,
+        "params.scoped_test.base or head does not resolve to a commit in the job worktree; the refusal names the field and ref; pass a full 40-hex SHA or a fetched ref and resubmit",
+    ),
+    refusal(
         crate::agent_jobs::JOB_SOURCE_RECORD_FAILED,
         "the daemon could not write the build job source record beside the job log, so the build was refused rather than run unenforced; check the jobs directory is writable and has free space, then resubmit",
     ),
@@ -713,7 +750,7 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
     ),
     refusal(
         crate::agent_jobs::JOB_RECIPE_NOT_ALLOWED,
-        "declare this recipe in the worktree .rsi/jobs.toml before submitting it",
+        "declare this recipe in the worktree .rsi/jobs.toml before submitting it; the declared recipes include desktop-install (build desktop/src-tauri and run scripts/install-desktop.sh --required in a job-owned throwaway HOME, #3239)",
     ),
     refusal(
         crate::agent_jobs::JOB_RECIPE_INVALID,
@@ -738,12 +775,60 @@ const JOB_REFUSALS: &[AgentControlRefusalV1] = &[
         "macOS supports package test, build and recipe jobs; use Linux for shard, candidate-receipt, landing and cloud jobs; other operating systems have no durable backend",
     ),
     refusal(
+        crate::agent_jobs::JOB_TEST_SOURCE_UNCONTAINED,
+        "macOS test jobs require the system sandbox-exec lifecycle fence, including candidate, baseline and recipe execution; use a supported host when it is unavailable; there is no uncontained fallback",
+    ),
+    refusal(
         JOB_DIR_NOT_ALLOWED,
-        "run the job from your own sandbox directory",
+        "run the job from your own sandbox directory; a session with no sandbox may run only a declared .rsi/jobs.toml recipe job, and only when its working_dir is its own project's registered path",
+    ),
+    refusal(
+        JOB_PROJECT_ROOT_SANDBOXED,
+        "your project's registered path is a git repository whose agent sessions get sandboxes, so a recipe job never runs in that shared worktree; submit it from a sandboxed session of the project",
     ),
     refusal(
         JOB_KIND_NOT_AUTHORIZED,
-        "landing, cloud_gate and cloud_sweep jobs are for the appointed manager or an Epic lead; use build or test",
+        "landing, cloud_gate, cloud_sweep and bench jobs are for the appointed manager or an Epic lead; use build or test",
+    ),
+    refusal(
+        BENCH_DISABLED,
+        "the operator has not enabled benchmark jobs (setting bench.enabled); ask the operator",
+    ),
+    refusal(
+        BENCH_CONFIG_INVALID,
+        "params.config must be a committed eval/bench/tb2/runs/*.toml or eval/bench/tb2/candidates/<id>/run.toml that parses and names real tasks; the refusal carries the reason",
+    ),
+    refusal(
+        BENCH_OVERLAY_INVALID,
+        "fix the run overlay (eval/bench/tb2/candidates/<id>/overlay.toml): the refusal names the field and the limit; an overlay can only narrow the bench tools and cannot set web, egress or budgets",
+    ),
+    refusal(
+        BENCH_OVERLAY_LEAK_AUDIT_FAILED,
+        "remove the held-out or search-split task content the audit reported from the overlay and its files, commit, and resubmit",
+    ),
+    refusal(
+        BENCH_CONFIG_UNCOMMITTED,
+        "commit the run config and the files it reads, then resubmit from a clean checkout; the refusal names the paths",
+    ),
+    refusal(
+        BENCH_DOCKER_HOST_NOT_ALLOWED,
+        "the config's docker host is not in bench.docker_hosts; the operator adds it",
+    ),
+    refusal(
+        BENCH_LAPTOP_HOST_MISMATCH,
+        "the config's docker host must be ssh:// plus the operator's bench.laptop_host",
+    ),
+    refusal(
+        BENCH_SPEND_CAP_OFF,
+        "a model-driven run needs the OpenRouter spend cap armed; ask the operator to arm it (a run with no model may run with the cap off)",
+    ),
+    refusal(
+        BENCH_PIN_CHECK_FAILED,
+        "the runner's pin check found drift from the pinned dataset (the hub checkout or the plan); fix or re-pin the dataset files, then resubmit",
+    ),
+    refusal(
+        BENCH_PREFLIGHT_FAILED,
+        "the runner is unavailable or its preflight failed (host, docker, platform, disk or memory); the refusal names the check",
     ),
     refusal(
         JOB_KEY_CONFLICT,
@@ -798,7 +883,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         WAKE_WHEN_PREDICATE_INVALID,
-                        "set exactly one when predicate: jobs_terminal, sha_on_rolling, issue_closed, todo_closed, topology_execution_settled, settlement_run_settled or health_anomaly",
+                        "set exactly one when predicate: jobs_terminal, sha_on_rolling, shas_on_rolling, issue_closed, todo_closed, topology_execution_settled, settlement_run_settled or health_anomaly; fire (all or each) only beside shas_on_rolling",
                     ),
                     refusal(
                         WAKE_WHEN_HEALTH_MANAGER_ONLY,
@@ -818,7 +903,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         WAKE_WHEN_JOB_NOT_FOUND,
-                        "name only the job ids your own AgentSubmitJob calls returned (result.id); the newest file under the shared jobs log directory may be another session's job",
+                        "name job ids you own or may watch through proven manager succession or an explicit Issue-worker continuation; unrelated ids stay denied",
                     ),
                     refusal(
                         WAKE_WHEN_TIMEOUT_INVALID,
@@ -826,7 +911,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         WAKE_WHEN_CAP_REACHED,
-                        "cancel an enabled wake with AgentCancelWake or reuse a wake name",
+                        "at most 16 enabled when wakes per session (topology_execution_settled counted apart, 128): batch commits into one shas_on_rolling wake with fire each, cancel an enabled wake with AgentCancelWake or reuse a wake name",
                     ),
                     refusal(
                         WAKE_WHEN_FIELD_MISPLACED,
@@ -887,6 +972,14 @@ impl AgentControlVerbV1 {
                     MANAGER_CAPABILITY_DENIED,
                     MANAGER_PROJECT_NOT_IN_SCOPE,
                     refusal(
+                        "manager_v2_request_out_of_scope",
+                        "request_withdraw requires the current manager of the request's sending slot lineage; another manager's Epic coverage is insufficient",
+                    ),
+                    refusal(
+                        "manager_v2_request_settled",
+                        "the request is already settled; an exact idempotent retry replays the receipt, otherwise inspect requests and choose a pending request",
+                    ),
+                    refusal(
                         "manager_review_work_version_changed",
                         "request_review expected_row_version is the work row's current row_version; the refusal names it (current_row_version=N), or read AgentManagerInspect with section work",
                     ),
@@ -904,12 +997,26 @@ impl AgentControlVerbV1 {
             }
             Self::ManagerControl => {
                 const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "manager_v2_action_started_use_agent_halt",
+                        "the create was claimed or started; use AgentHalt on its target_session_id",
+                    ),
+                    refusal(
+                        "manager_v2_action_not_queued_create",
+                        "withdraw_queued_create accepts only a still-queued create_session operation",
+                    ),
+                    refusal(
+                        "manager_v2_action_changed",
+                        "read AgentManagerGetAction and use its current row_version; a claimed create must be halted with AgentHalt",
+                    ),
                     MANAGER_INVALID_REQUEST,
                     MANAGER_IDEMPOTENCY_CONFLICT,
                     MANAGER_CAPABILITY_DENIED,
                     MANAGER_PAUSED,
                     MANAGER_HUMAN_OR_RECOVERY_OWNER,
                     MANAGER_SUCCESSION_ROTATION_DISABLED,
+                    MANAGER_SUCCESSION_HANDOFF_HEAD_CHANGED,
+                    HOME_PROJECT_SUCCESSION_REFUSED,
                     MANAGER_PROJECT_NOT_IN_SCOPE,
                     refusal(
                         crate::global_manager::MANAGER_TARGET_OWNED_BY_ANCESTOR,
@@ -954,7 +1061,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         AGENT_READ_EVENTS_SCOPE_DENIED,
-                        "read only your own session and lineage, sessions you control, or sessions in your manager scope",
+                        "read only your own session and lineage, sessions you control, sessions in your manager scope, or (Issue-bound worker, live binding) a same-project non-manager session that created your bound Issue or whose full lowercase UUID is cited in its body, launch brief or newest 64 handoffs authored outside your continuation lineage (AgentReadSessionEvents only; no prefix matching; manager seats including former seats and their continuations are excluded)",
                     ),
                     refusal(
                         "agent_read_events_invalid_limit",
@@ -984,7 +1091,7 @@ impl AgentControlVerbV1 {
             Self::GetJob => {
                 const R: &[AgentControlRefusalV1] = &[refusal(
                     JOB_NOT_FOUND,
-                    "read only job ids you submitted; list yours with AgentListJobs",
+                    "absent or inaccessible within your current read scope; this code does not distinguish them. Recover your own ids with AgentListJobs. The review_of exception covers eligible implementer scoped_test jobs (each owner's newest, or older full UUIDs cited in the reviewed Issue's body or newest 64 handoffs); recipe jobs and copied IDs alone do not qualify. Reading a receipt does not prove the reviewed SHA, or grant List, watch, cancel or ownership authority",
                 )];
                 R
             }
@@ -1004,6 +1111,22 @@ impl AgentControlVerbV1 {
                     refusal(
                         SATELLITE_REPORT_INVALID,
                         "send a short non-empty line within the size bound without control characters",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_BINARIES_DIR_REQUIRED,
+                        "send binaries_dir for deploy_ready; enqueue and result keep free-text reports",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_BINARIES_DIR_NOT_ABSOLUTE,
+                        "send an absolute satellite staging directory or ~/ for expansion on the satellite",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_BINARIES_DIR_UNRESOLVABLE,
+                        "stage into an existing directory and ensure the satellite daemon can resolve its home and staging root",
+                    ),
+                    refusal(
+                        SATELLITE_REPORT_BINARIES_DIR_NOT_ALLOWED,
+                        "use a directory under the satellite daemon's staging root; symlinks and parent components must stay within it",
                     ),
                     refusal(
                         SATELLITE_REPORT_QUEUE_FULL,
@@ -1069,7 +1192,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         QUEUE_FILTER_INVALID,
-                        "use PACKAGE=FILTER test_filters within the schema bounds (at most 32 filters of 256 bytes each, and not together with derive_filters); the refusal names the field path (test_filters[i]), the offending filter (truncated) with its byte length and the 256-byte limit; derive_filters:true has no such limits",
+                        "use PACKAGE=FILTER test_filters within the schema bounds (at most 32 filters of 256 bytes each); the refusal names the field path (test_filters[i]), the offending filter (truncated) with its byte length and the 256-byte limit; derive_filters:true has no such limits",
                     ),
                     refusal(
                         QUEUE_FILTER_MATCHES_NO_TESTS,
@@ -1081,7 +1204,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         QUEUE_ENTRY_NOT_FOUND,
-                        "supersedes must name an entry id from the same enqueuer and project; list your queued entries",
+                        "supersedes must name an entry id in your cancellation scope and project (including a predecessor manager seat); list your queued entries; the refusal echoes the id it checked and names a visible entry whose id starts the same way, so a mistyped or truncated id is the usual cause: copy the full id from AgentListRollingQueue",
                     ),
                     refusal(
                         QUEUE_ENTRY_IN_FLIGHT,
@@ -1114,6 +1237,18 @@ impl AgentControlVerbV1 {
                     refusal(
                         QUEUE_REGATE_EXHAUSTED,
                         "an out-of-band push to rolling cost a second regate; merge the new tip and enqueue again",
+                    ),
+                    refusal(
+                        QUEUE_EXPEDITE_NOT_AUTHORIZED,
+                        "only the current appointed manager may expedite a landing; an Epic lead enqueues without expedite and the manager expedites it if it cannot wait",
+                    ),
+                    refusal(
+                        QUEUE_EXPEDITE_REASON_INVALID,
+                        "expedite.reason is 1 to 256 bytes with no control character",
+                    ),
+                    refusal(
+                        QUEUE_EXPEDITE_CAP_REACHED,
+                        "the project already holds 2 live expedited entries (the refusal lists them): enqueue without expedite, or cancel a queued expedited entry with AgentCancelRollingQueueEntry; a gating batch is never preempted",
                     ),
                     refusal(
                         QUEUE_GATE_TIMEOUT,
@@ -1173,7 +1308,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         CANDIDATE_NOT_FOUND,
-                        "the job or session does not exist or is outside your scope (the two look the same): name a worker you manage or lead",
+                        "the job or session does not exist or is outside your scope (the two look the same): send the full job id (AgentWorkerRoster latest_job.job_id) or its first 8+ hex characters unpadded, or omit job_id and name the source_session_id of a worker you manage or lead",
                     ),
                     refusal(
                         CANDIDATE_JOB_ID_AMBIGUOUS,
@@ -1253,7 +1388,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         "target_not_authorized",
-                        "check Deploy authority, Execute mode, pairing, dispatch, declared scope and the satellite inbound allowlist",
+                        "check Deploy authority, Execute mode, pairing, dispatch, declared scope and the satellite inbound allowlist; the operator must correct a missing grant or pairing/scope on the relevant host, or run ReseatHarnessManager on the satellite for the appointed failed seat",
                     ),
                     refusal(
                         RESEAT_SEAT_LIVE,
@@ -1265,7 +1400,7 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         SATELLITE_RESEAT_BOUNDS,
-                        "the provider, model and effort must be inside your project's effective launch grant; name one it allows",
+                        "supply an explicit model and a provider/model/effort tuple inside your project's effective launch grant, including ancestor ceilings; if no healthy tuple is allowed, the operator must authorize it in the hub grant (ConfigureHarnessManagerPolicy or ConfigurePortfolioNodeLaunches as applicable), or run ReseatHarnessManager on the satellite; do not widen your own authority",
                     ),
                     refusal(
                         SATELLITE_RESEAT_INVALID,
@@ -1273,11 +1408,36 @@ impl AgentControlVerbV1 {
                     ),
                     refusal(
                         SATELLITE_RESEAT_UNREACHABLE,
-                        "restore the paired link, read the satellite's scope status, then retry",
+                        "the request never reached the satellite: restore the paired link, then retry",
+                    ),
+                    refusal(
+                        SATELLITE_RESEAT_UNCERTAIN,
+                        "the request was sent but no usable reply came back (reason= names the timeout); the satellite may have reseated: read its seat (AgentGetDaemonInfo, or a read of the live seat's continued_from) and do NOT retry blindly (a retry after success is manager_seat_live)",
                     ),
                     refusal(
                         SATELLITE_RESEAT_REFUSED,
                         "the satellite refused with a code outside this list (no appointment, revoked scope or a non-root seat); inspect it locally",
+                    ),
+                ];
+                R
+            }
+            Self::SwitchHostPreset => {
+                const R: &[AgentControlRefusalV1] = &[
+                    refusal(
+                        "host_tuning_manager_required",
+                        "only the current Execute, unpaused manager seat may switch saved presets; refresh AgentGetAuthorityCatalog",
+                    ),
+                    refusal(
+                        "host_tuning_preset_unknown",
+                        "ask the operator to save a named preset through :manager tune",
+                    ),
+                    refusal(
+                        "host_tuning_manager_bound",
+                        "the operator's manager bound refuses this value; use another saved preset or ask the operator to change its bounds",
+                    ),
+                    refusal(
+                        "host_tuning_pending",
+                        "undo or retry the interrupted switch before selecting another preset",
                     ),
                 ];
                 R
@@ -1295,6 +1455,10 @@ impl AgentControlVerbV1 {
                     refusal(
                         DEPLOY_EXECUTE_REQUIRED,
                         "deploy needs Execute mode and an unpaused seat",
+                    ),
+                    refusal(
+                        DEPLOY_BINARIES_DIR_NOT_ABSOLUTE,
+                        "with peer_id, copy the absolute satellite binaries_dir from its deploy_ready report; the hub never expands ~",
                     ),
                     refusal(
                         DEPLOY_SHA_INVALID,
@@ -1449,7 +1613,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         crate::agent_worker_roster::WORKER_ROSTER_INVALID_REQUEST,
-                        "send limit 1..=256, a non-nil project_id and each state at most once; omit project_id for your own scope",
+                        "send fields summary|full, limit 1..=256, a non-nil project_id and each state at most once; omit project_id for your own scope",
                     ),
                     refusal(
                         crate::agent_worker_roster::WORKER_ROSTER_NOT_AUTHORIZED,
@@ -1467,7 +1631,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         "manager_issue_worker_invalid_request",
-                        "send issue (display number >= 1), a non-empty brief, launch and an idempotency_key",
+                        "send issue (display number >= 1), a non-empty brief, launch and an idempotency_key; review_of and continue_from are mutually exclusive: omit continue_from to launch a fresh review with the latest implementer handoff",
                     ),
                     refusal(
                         "manager_issue_worker_issue_unavailable",
@@ -1619,6 +1783,10 @@ impl AgentControlVerbV1 {
                         "source_settlement_busy",
                         "AgentAuditSourceWorktreeCohort only: a settlement run holds the repository (data.holder_run_id); nothing was written and there is no plan; re-audit after data.retry_after_secs. This read has no idempotency_key: re-ask it as is",
                     ),
+                    refusal(
+                        "source_settlement_audit_pending",
+                        "AgentAuditSourceWorktreeCohort only: the audit of a large cohort is still proving its roots and keeps running in the daemon (data.audit_id); nothing was written and there is no plan yet; re-send the same audit after data.retry_after_secs (arm one resume wake with in_seconds, do not poll) to receive it",
+                    ),
                 ];
                 R
             }
@@ -1651,7 +1819,7 @@ impl AgentControlVerbV1 {
                 const R: &[AgentControlRefusalV1] = &[
                     refusal(
                         STANDING_DIRECTIVE_NOT_AUTHORIZED,
-                        "write only to a manager scope strictly below your own seat (a project PM writes to its areas, a portfolio seat to what it covers), and clear only a directive a manager relayed; the operator clears its own",
+                        "write only to a manager scope strictly below your own seat (a project PM writes to its areas, a portfolio seat to what it covers), and clear only a directive a manager relayed or ruled (a manager ruling only by the scope that wrote it); the operator clears its own",
                     ),
                     refusal(
                         STANDING_DIRECTIVE_INVALID_REQUEST,
@@ -2037,6 +2205,49 @@ mod tests {
     }
 
     #[test]
+    fn job_read_guidance_describes_bounded_review_scope_and_generic_unavailability() {
+        let descriptor = agent_control_catalog_v1()
+            .iter()
+            .find(|descriptor| descriptor.verb == AgentControlVerbV1::GetJob)
+            .unwrap();
+        for guidance in [
+            "newest four eligible implementer sessions",
+            "newest 64 handoffs",
+            "Recipe jobs and copied IDs alone do not qualify",
+            "absent or inaccessible",
+            "Reading a receipt does not prove it verifies the reviewed SHA",
+            "no List, watch, cancel or ownership authority",
+        ] {
+            assert!(descriptor.description.contains(guidance), "{guidance}");
+        }
+        let schema = descriptor.parameters();
+        assert!(
+            schema["properties"]["job_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("current read scope")
+        );
+        let refusal = AgentControlVerbV1::GetJob
+            .refusals()
+            .iter()
+            .find(|refusal| refusal.code == crate::agent_jobs::JOB_NOT_FOUND)
+            .unwrap();
+        assert!(refusal.next_action.contains("absent or inaccessible"));
+        assert!(refusal.next_action.contains("does not distinguish them"));
+        assert!(
+            refusal
+                .next_action
+                .contains("eligible implementer scoped_test")
+        );
+        assert!(
+            refusal
+                .next_action
+                .contains("Recover your own ids with AgentListJobs")
+        );
+        assert_eq!(descriptor.verb.example()["fields"], "compact");
+    }
+
+    #[test]
     fn manager_control_advertises_the_disabled_rotation_refusal_without_destructive_advice() {
         let refusal = AgentControlVerbV1::ManagerControl
             .refusals()
@@ -2064,6 +2275,39 @@ mod tests {
             "Agents never run the lander directly",
         ] {
             assert!(refusal.next_action.contains(guidance), "{guidance}");
+        }
+    }
+
+    #[test]
+    fn satellite_reseat_policy_refusals_name_the_operator_recovery_path() {
+        let refusals = AgentControlVerbV1::ReseatSatelliteManager.refusals();
+        for code in [
+            "target_not_authorized",
+            crate::manager_reseat::SATELLITE_RESEAT_BOUNDS,
+        ] {
+            let action = refusals
+                .iter()
+                .find(|r| r.code == code)
+                .unwrap()
+                .next_action;
+            assert!(action.contains("operator"), "{code}");
+            assert!(
+                action.contains("ReseatHarnessManager on the satellite"),
+                "{code}"
+            );
+        }
+        let bounds = refusals
+            .iter()
+            .find(|r| r.code == crate::manager_reseat::SATELLITE_RESEAT_BOUNDS)
+            .unwrap()
+            .next_action;
+        for guidance in [
+            "explicit model",
+            "ancestor ceilings",
+            "ConfigureHarnessManagerPolicy",
+            "ConfigurePortfolioNodeLaunches",
+        ] {
+            assert!(bounds.contains(guidance), "{guidance}");
         }
     }
 

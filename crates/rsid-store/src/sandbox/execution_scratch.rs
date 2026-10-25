@@ -180,6 +180,74 @@ pub fn install_target_pool_script_for_test(root: PathBuf, script: PathBuf) {
         .insert(root, script);
 }
 
+/// Resolve the `info/exclude` file Git reads for the worktree at `root`
+/// without spawning Git: a linked worktree's `.git` file names its admin
+/// directory, whose `commondir` names the shared directory Git reads
+/// `info/exclude` from (a worktree's own admin directory has none).
+fn worktree_exclude_path(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot_git).ok()?;
+    let common = if meta.is_dir() {
+        dot_git
+    } else if meta.is_file() {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let admin = PathBuf::from(text.lines().next()?.strip_prefix("gitdir:")?.trim());
+        let admin = if admin.is_absolute() {
+            admin
+        } else {
+            root.join(admin)
+        };
+        match std::fs::read_to_string(admin.join("commondir")) {
+            Ok(text) => {
+                let common = PathBuf::from(text.trim());
+                if common.is_absolute() {
+                    common
+                } else {
+                    admin.join(common)
+                }
+            }
+            Err(_) => admin,
+        }
+    } else {
+        return None;
+    };
+    Some(common.join("info").join("exclude"))
+}
+
+/// Make Git ignore the daemon's own root-level build stamp for the worktree
+/// at `root`, so a sandbox is never dirty from a file the harness wrote
+/// (#3759). Idempotent; the anchored pattern matches only the root file.
+/// Best effort: a missing repository or unwritable file changes nothing.
+pub fn exclude_build_env_record(root: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let Some(path) = worktree_exclude_path(root) else {
+        return Ok(());
+    };
+    let line = format!("/{BUILD_ENV_RECORD}");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if existing.lines().any(|entry| entry == line) {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let separator = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    file.write_all(format!("{separator}{line}\n").as_bytes())
+}
+
 /// A target the seeder may fill: absent, or holding only the daemon's own
 /// scratch and records.
 fn target_is_unseeded(target: &Path) -> bool {
@@ -442,6 +510,9 @@ impl SandboxExecutionScratch {
                     .map(|value| (name.to_string(), serde_json::Value::String(value.clone())))
             })
             .collect();
+        if let Err(error) = exclude_build_env_record(&self.root) {
+            tracing::warn!(root = %self.root.display(), %error, "cannot exclude the build stamp from git status");
+        }
         let body = serde_json::json!({ "version": 1, "env": set });
         // Create a private, unique file without following an existing symlink.
         // Both paths stay outside target, so cleaning it cannot interrupt a stamp.
@@ -658,6 +729,59 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn build_stamp_is_excluded_from_a_new_linked_worktree_3759() {
+        fn git(dir: &Path, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@example.test"]);
+        git(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("a"), "a\n").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let tree = temp.path().join("tree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                tree.to_str().unwrap(),
+            ],
+        );
+
+        exclude_build_env_record(&tree).unwrap();
+        exclude_build_env_record(&tree).unwrap();
+        std::fs::write(tree.join(BUILD_ENV_RECORD), "{}").unwrap();
+        std::fs::create_dir(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub").join(BUILD_ENV_RECORD), "x").unwrap();
+        assert_eq!(
+            git(&tree, &["status", "--porcelain", "--untracked-files=all"]),
+            "?? sub/.rsi-build-env.json\n"
+        );
+        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude
+                .lines()
+                .filter(|l| *l == "/.rsi-build-env.json")
+                .count(),
+            1
+        );
+    }
     /// Per-process open-descriptor directory (`/proc` is Linux-only).
     #[cfg(target_os = "linux")]
     const OPEN_DESCRIPTOR_DIR: &str = "/proc/self/fd";
@@ -860,23 +984,30 @@ mod tests {
             })
             .collect::<Vec<_>>()
         };
-        let pool_script = Path::new(rsi_common::manifest_dir!()).join("../../scripts/target-pool");
+        // What the pool tool's key depends on in the environment (#453): the key hashes the
+        // toolchain, the recipe and exactly these variables, so two environments yield one key
+        // iff this material is equal. The list mirrors `KEY_ENV_EXACT` / `KEY_ENV_PREFIX` in
+        // `rsi-repo-guards` `target_pool.rs`; a test there pins the two together. (The tool is
+        // not linked into this crate: its `serde_json` feature set would change the topology
+        // starters' canonical digests in this crate's test build.)
         let key_under = |env: BTreeMap<String, String>| {
-            let output = std::process::Command::new("python3")
-                .arg(&pool_script)
-                .arg("key")
-                .arg("--repo")
-                .arg(fixture.path())
-                .env_clear()
-                .envs(&env)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_string()
+            const EXACT: [&str; 8] = [
+                "CARGO_INCREMENTAL",
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_BUILD_RUSTFLAGS",
+                "RUSTDOCFLAGS",
+                "CARGO_BUILD_TARGET",
+                "CARGO_TARGET_APPLIES_TO_HOST",
+                "RUSTUP_TOOLCHAIN",
+            ];
+            env.into_iter()
+                .filter(|(name, _)| {
+                    EXACT.contains(&name.as_str()) || name.starts_with("CARGO_PROFILE_")
+                })
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
 
         let seed_key = key_under(effective(overrides_of(seed.as_std().get_envs())));

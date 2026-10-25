@@ -6,6 +6,10 @@
 //! `menu-action` event. Only `act:<action>` (menu bar) and `ctx:<action>`
 //! (right-click) ids are accepted, so a menu event can only name a registry
 //! action, never anything else.
+//!
+//! The bar installs menu by menu (#305): a top-level menu that breaks a cap
+//! is logged and left out, and the rest still install; only a bar with no
+//! menu that can be installed is refused.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,10 +25,13 @@ pub const MENU_EVENT_NAME: &str = "menu-action";
 pub const APP_PREFIX: &str = "act";
 pub const CONTEXT_PREFIX: &str = "ctx";
 
+// Mirrored by MENU_LIMITS in src/registry.ts (tests/registry.test.mjs pins them).
 const MAX_SUBMENUS: usize = 12;
 const MAX_ITEMS: usize = 64;
 const MAX_TEXT: usize = 96;
 const MAX_ACTION_ID: usize = 48;
+/// Menu levels: a top-level menu (1) and up to two levels of nested submenus.
+const MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +71,11 @@ pub enum MenuNode {
     Predefined {
         item: Predefined,
     },
+    /// A nested submenu (menu bar only), e.g. View > Files.
+    Submenu {
+        text: String,
+        items: Vec<MenuNode>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -83,6 +95,20 @@ pub struct ItemState {
 #[derive(Debug, Clone, Serialize)]
 pub struct MenuActionEvent {
     pub id: String,
+}
+
+/// A top-level menu `set_app_menu` left out, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedMenu {
+    pub id: String,
+    pub reason: String,
+}
+
+/// What `set_app_menu` installed: the menu ids in the bar and the ones left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MenuInstallReport {
+    pub installed: Vec<String>,
+    pub skipped: Vec<SkippedMenu>,
 }
 
 /// `act:archive`, `ctx:copy-session-id`: the prefix, then 1..=48 of `[a-z0-9-]`.
@@ -120,7 +146,7 @@ fn check_text(what: &str, text: &str) -> Result<(), String> {
 }
 
 /// The only accelerator shape the registry emits: `CmdOrCtrl+` [`Shift+`] one
-/// letter or digit.
+/// letter, digit or comma (Settings, Cmd-,).
 pub fn valid_accelerator(accel: &str) -> bool {
     let Some(rest) = accel.strip_prefix("CmdOrCtrl+") else {
         return false;
@@ -129,13 +155,16 @@ pub fn valid_accelerator(accel: &str) -> bool {
     key.len() == 1
         && key
             .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b',')
 }
 
+/// `depth` is this level's: 1 for a top-level menu or a right-click menu.
+/// `app_bar`: predefined items and nested submenus are allowed (the menu bar).
 fn validate_nodes(
     nodes: &[MenuNode],
     prefix: &str,
-    allow_predefined: bool,
+    app_bar: bool,
+    depth: usize,
     seen: &mut HashSet<String>,
 ) -> Result<(), String> {
     if nodes.len() > MAX_ITEMS {
@@ -164,35 +193,90 @@ fn validate_nodes(
             }
             MenuNode::Separator => {}
             MenuNode::Predefined { item } => {
-                if !allow_predefined {
+                if !app_bar {
                     return Err(format!("{item:?} is only allowed in the menu bar"));
                 }
+            }
+            MenuNode::Submenu { text, items } => {
+                if !app_bar {
+                    return Err("nested submenus are only allowed in the menu bar".into());
+                }
+                if depth >= MAX_DEPTH {
+                    return Err(format!("submenus nest deeper than {MAX_DEPTH} levels"));
+                }
+                check_text("submenu", text)?;
+                if items.is_empty() {
+                    return Err(format!("submenu {text:?} is empty"));
+                }
+                validate_nodes(items, prefix, app_bar, depth + 1, seen)
+                    .map_err(|e| format!("{text}: {e}"))?;
             }
         }
     }
     Ok(())
 }
 
-/// The menu bar model: bounded, `act:` ids, unique ids, sane text.
-pub fn validate_app_menu(menu: &[SubmenuSpec]) -> Result<(), String> {
+/// One top-level menu. Its item ids join `seen` only when the whole menu is
+/// valid, so a menu that is left out does not block the ids of a later one.
+fn validate_submenu(sm: &SubmenuSpec, seen: &mut HashSet<String>) -> Result<(), String> {
+    let id_ok =
+        !sm.id.is_empty() && sm.id.len() <= 16 && sm.id.bytes().all(|b| b.is_ascii_lowercase());
+    if !id_ok {
+        return Err(format!("submenu id {:?} is not a lowercase word", sm.id));
+    }
+    check_text(&sm.id, &sm.text)?;
+    let mut mine = seen.clone();
+    validate_nodes(&sm.items, APP_PREFIX, true, 1, &mut mine)?;
+    *seen = mine;
+    Ok(())
+}
+
+/// Which top-level menus of the bar can be installed: the valid ones in order,
+/// and each one left out with its reason. Refused only when the bar is empty,
+/// has too many menus, or has no valid menu at all.
+pub fn plan_app_menu(
+    menu: &[SubmenuSpec],
+) -> Result<(Vec<&SubmenuSpec>, Vec<SkippedMenu>), String> {
     if menu.is_empty() || menu.len() > MAX_SUBMENUS {
         return Err(format!("menu bar needs 1 to {MAX_SUBMENUS} submenus"));
     }
     let mut seen = HashSet::new();
     let mut subs = HashSet::new();
+    let mut keep = Vec::new();
+    let mut skipped = Vec::new();
     for sm in menu {
-        let id_ok =
-            !sm.id.is_empty() && sm.id.len() <= 16 && sm.id.bytes().all(|b| b.is_ascii_lowercase());
-        if !id_ok || !subs.insert(sm.id.as_str()) {
-            return Err(format!(
-                "submenu id {:?} is not a unique lowercase word",
-                sm.id
-            ));
+        let res = if subs.insert(sm.id.as_str()) {
+            validate_submenu(sm, &mut seen)
+        } else {
+            Err(format!("submenu id {:?} appears twice", sm.id))
+        };
+        match res {
+            Ok(()) => keep.push(sm),
+            Err(reason) => skipped.push(SkippedMenu {
+                id: sm.id.clone(),
+                reason,
+            }),
         }
-        check_text(&sm.id, &sm.text)?;
-        validate_nodes(&sm.items, APP_PREFIX, true, &mut seen)?;
     }
-    Ok(())
+    if keep.is_empty() {
+        let why: Vec<String> = skipped
+            .iter()
+            .map(|s| format!("{}: {}", s.id, s.reason))
+            .collect();
+        return Err(format!("no menu can be installed ({})", why.join("; ")));
+    }
+    Ok((keep, skipped))
+}
+
+/// The whole menu bar model, strictly: bounded, `act:` ids, unique ids, sane
+/// text, every menu valid. `set_app_menu` itself installs what fits
+/// (`plan_app_menu`).
+pub fn validate_app_menu(menu: &[SubmenuSpec]) -> Result<(), String> {
+    let (_, skipped) = plan_app_menu(menu)?;
+    match skipped.first() {
+        None => Ok(()),
+        Some(s) => Err(format!("{}: {}", s.id, s.reason)),
+    }
 }
 
 /// A right-click menu: `ctx:` items and separators only.
@@ -200,7 +284,7 @@ pub fn validate_context_menu(items: &[MenuNode]) -> Result<(), String> {
     if items.is_empty() {
         return Err("context menu is empty".into());
     }
-    validate_nodes(items, CONTEXT_PREFIX, false, &mut HashSet::new())
+    validate_nodes(items, CONTEXT_PREFIX, false, 1, &mut HashSet::new())
 }
 
 fn build_node<R: Runtime, M: Manager<R>>(
@@ -237,6 +321,10 @@ fn build_node<R: Runtime, M: Manager<R>>(
         )?),
         MenuNode::Separator => Box::new(PredefinedMenuItem::separator(m)?),
         MenuNode::Predefined { item } => Box::new(predefined(m, *item)?),
+        MenuNode::Submenu { text, items } => {
+            let built = build_items(m, items)?;
+            Box::new(Submenu::with_items(m, text, true, &refs(&built))?)
+        }
     })
 }
 
@@ -283,24 +371,51 @@ fn refs<R: Runtime>(items: &[Box<dyn IsMenuItem<R>>]) -> Vec<&dyn IsMenuItem<R>>
     items.iter().map(|b| b.as_ref()).collect()
 }
 
+/// The process-log line for a menu left out of the bar.
+pub fn skipped_line(s: &SkippedMenu) -> String {
+    format!(
+        "rsi-desktop: menu {:?} not installed: {}",
+        s.id,
+        s.reason.replace(['\n', '\r'], " ")
+    )
+}
+
 /// Install the menu bar (the macOS app menu; the window menu bar on Linux and
-/// Windows).
+/// Windows), menu by menu: one that breaks a cap or that Tauri cannot build is
+/// logged and left out, the others install. The report names both.
 #[tauri::command]
-pub async fn set_app_menu(app: AppHandle, menu: Vec<SubmenuSpec>) -> Result<(), String> {
-    validate_app_menu(&menu)?;
-    let build = || -> tauri::Result<Menu<tauri::Wry>> {
-        let bar = Menu::new(&app)?;
-        for sm in &menu {
-            let items = build_items(&app, &sm.items)?;
-            let sub =
-                Submenu::with_id_and_items(&app, sm.id.as_str(), &sm.text, true, &refs(&items))?;
-            bar.append(&sub)?;
+pub async fn set_app_menu(
+    app: AppHandle,
+    menu: Vec<SubmenuSpec>,
+) -> Result<MenuInstallReport, String> {
+    let (keep, mut skipped) = plan_app_menu(&menu).inspect_err(|e| {
+        eprintln!("rsi-desktop: menu bar not installed: {e}");
+    })?;
+    let bar = Menu::new(&app).map_err(|e| e.to_string())?;
+    let mut installed = Vec::new();
+    for sm in keep {
+        let built = build_items(&app, &sm.items).and_then(|items| {
+            Submenu::with_id_and_items(&app, sm.id.as_str(), &sm.text, true, &refs(&items))
+        });
+        match built.and_then(|sub| bar.append(&sub)) {
+            Ok(()) => installed.push(sm.id.clone()),
+            Err(e) => skipped.push(SkippedMenu {
+                id: sm.id.clone(),
+                reason: e.to_string(),
+            }),
         }
-        Ok(bar)
-    };
-    let bar = build().map_err(|e| e.to_string())?;
-    app.set_menu(bar).map_err(|e| e.to_string())?;
-    Ok(())
+    }
+    for s in &skipped {
+        eprintln!("{}", skipped_line(s));
+    }
+    if installed.is_empty() {
+        return Err("no menu could be built".into());
+    }
+    app.set_menu(bar).map_err(|e| {
+        eprintln!("rsi-desktop: menu bar not installed: {e}");
+        e.to_string()
+    })?;
+    Ok(MenuInstallReport { installed, skipped })
 }
 
 /// Show a right-click menu at the cursor.
@@ -402,6 +517,8 @@ mod tests {
         assert!(valid_accelerator("CmdOrCtrl+N"));
         assert!(valid_accelerator("CmdOrCtrl+Shift+K"));
         assert!(valid_accelerator("CmdOrCtrl+1"));
+        assert!(valid_accelerator("CmdOrCtrl+,"));
+        assert!(!valid_accelerator("CmdOrCtrl+;"));
         assert!(!valid_accelerator("Ctrl+N"));
         assert!(!valid_accelerator("CmdOrCtrl+n"));
         assert!(!valid_accelerator("CmdOrCtrl+F3"));
@@ -478,6 +595,107 @@ mod tests {
             { "id": "file", "text": "File", "items": [{ "kind": "predefined", "item": "format_disk" }] }
         ]))
         .is_err());
+    }
+
+    #[test]
+    fn an_over_cap_menu_is_left_out_and_the_rest_install() {
+        let item = |id: String| json!({ "kind": "item", "id": id, "text": "x", "enabled": true });
+        let many: Vec<_> = (0..=MAX_ITEMS).map(|i| item(format!("act:v{i}"))).collect();
+        let menu = parse_menu(json!([
+            { "id": "file", "text": "File", "items": [item("act:launch".into())] },
+            { "id": "view", "text": "View", "items": many },
+            { "id": "help", "text": "Help", "items": [item("act:help".into())] },
+        ]));
+        let (keep, skipped) = plan_app_menu(&menu).expect("the bar still installs");
+        let ids: Vec<&str> = keep.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["file", "help"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].id, "view");
+        assert_eq!(
+            skipped[0].reason,
+            format!("menu has more than {MAX_ITEMS} items")
+        );
+        assert_eq!(
+            skipped_line(&skipped[0]),
+            format!(
+                "rsi-desktop: menu \"view\" not installed: menu has more than {MAX_ITEMS} items"
+            )
+        );
+        // The strict check still names the bad menu.
+        assert!(validate_app_menu(&menu).unwrap_err().starts_with("view: "));
+    }
+
+    #[test]
+    fn a_left_out_menu_does_not_claim_its_ids() {
+        // View fails on its second item; File then reuses View's first id and still installs.
+        let menu = parse_menu(json!([
+            { "id": "view", "text": "View", "items": [
+                { "kind": "item", "id": "act:launch", "text": "New", "enabled": true },
+                { "kind": "item", "id": "act:bad", "text": "a & b", "enabled": true },
+            ]},
+            { "id": "file", "text": "File", "items": [
+                { "kind": "item", "id": "act:launch", "text": "New", "enabled": true },
+            ]},
+            { "id": "file", "text": "File again", "items": [
+                { "kind": "item", "id": "act:other", "text": "Other", "enabled": true },
+            ]},
+        ]));
+        let (keep, skipped) = plan_app_menu(&menu).unwrap();
+        assert_eq!(keep.len(), 1);
+        assert_eq!(keep[0].id, "file");
+        let reasons: Vec<&str> = skipped.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(reasons, ["view", "file"]);
+        assert!(skipped[1].reason.contains("appears twice"));
+    }
+
+    #[test]
+    fn a_bar_with_no_valid_menu_is_refused() {
+        let menu = parse_menu(json!([
+            { "id": "File", "text": "File", "items": [] },
+        ]));
+        let err = plan_app_menu(&menu).unwrap_err();
+        assert!(err.starts_with("no menu can be installed"), "{err}");
+        let too_many: Vec<_> = (0..=MAX_SUBMENUS)
+            .map(|i| json!({ "id": format!("m{}", "x".repeat(i)), "text": "M", "items": [] }))
+            .collect();
+        assert!(plan_app_menu(&parse_menu(json!(too_many))).is_err());
+    }
+
+    #[test]
+    fn nested_submenus_are_bounded() {
+        let leaf = json!({ "kind": "item", "id": "act:files-save", "text": "Save file", "enabled": true, "accelerator": "CmdOrCtrl+S" });
+        let nested = |items: serde_json::Value| json!({ "kind": "submenu", "text": "Files", "items": items });
+        let bar = |items: serde_json::Value| {
+            parse_menu(json!([{ "id": "view", "text": "View", "items": items }]))
+        };
+        validate_app_menu(&bar(json!([nested(json!([leaf.clone()]))]))).unwrap();
+        // Two nested levels fit (3 in all); a third does not.
+        validate_app_menu(&bar(json!([nested(json!([nested(json!(
+            [leaf.clone()]
+        ))]))])))
+        .unwrap();
+        assert!(
+            validate_app_menu(&bar(json!([nested(json!([nested(json!([nested(
+                json!([leaf.clone()])
+            )]))]))])))
+            .is_err()
+        );
+        assert!(validate_app_menu(&bar(json!([nested(json!([]))]))).is_err());
+        // Ids stay unique across levels.
+        assert!(
+            validate_app_menu(&bar(json!([leaf.clone(), nested(json!([leaf.clone()]))]))).is_err()
+        );
+        // Each level has the item cap.
+        let many: Vec<_> = (0..=MAX_ITEMS)
+            .map(|i| json!({ "kind": "item", "id": format!("act:f{i}"), "text": "x", "enabled": true }))
+            .collect();
+        assert!(validate_app_menu(&bar(json!([nested(json!(many))]))).is_err());
+        // Right-click menus stay flat.
+        let ctx: Vec<MenuNode> = serde_json::from_value(json!([
+            { "kind": "submenu", "text": "More", "items": [{ "kind": "item", "id": "ctx:archive", "text": "A", "enabled": true }] }
+        ]))
+        .unwrap();
+        assert!(validate_context_menu(&ctx).is_err());
     }
 
     #[test]

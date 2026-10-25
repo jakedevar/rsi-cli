@@ -5,10 +5,16 @@
 //! and dispatches execution by name.
 
 pub mod arguments;
+#[cfg(test)]
+mod bench_policy_tests; // #3177
 pub mod codegraph;
 mod completion_gate;
 mod custody_guard;
 pub mod exec;
+mod exec_pty;
+pub(crate) mod exec_target;
+#[cfg(all(test, unix))]
+mod exec_target_tests;
 pub mod git;
 pub mod memory;
 pub(crate) mod process_registry;
@@ -53,6 +59,13 @@ pub struct HarnessToolRegistry {
     launch_invocation_id: Option<uuid::Uuid>,
     execution_scratch: Option<crate::sandbox::execution_scratch::SandboxExecutionScratch>,
     deferred_mcp: Arc<RwLock<DeferredMcpCatalog>>,
+    /// #3176: where this session's shell tools run. A container target refuses
+    /// every host-touching tool at every execution entry point.
+    exec_target: rsi_common::exec_target::ExecTarget,
+    /// #3178: a bench session's live trace, written by the loop ports.
+    trace: Option<Arc<crate::bench::trace::TraceSink>>,
+    /// #4028: the launch's output-token ceiling for a length-stop recovery call.
+    recovery_max_output_tokens: Option<u32>,
 }
 
 pub(crate) struct ProcessTurnGuard(Option<Arc<exec::ProcessRegistry>>);
@@ -95,7 +108,34 @@ impl HarnessToolRegistry {
             launch_invocation_id: None,
             execution_scratch: None,
             deferred_mcp: Arc::new(RwLock::new(DeferredMcpCatalog::default())),
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            trace: None,
+            recovery_max_output_tokens: None,
         }
+    }
+
+    /// #4028: set the length-stop recovery ceiling. Set once, before the registry
+    /// is frozen into the agent loop.
+    pub fn set_recovery_max_output_tokens(&mut self, cap: Option<u32>) {
+        self.recovery_max_output_tokens = cap;
+    }
+
+    /// The launch's length-stop recovery ceiling, if it set one.
+    #[must_use]
+    pub fn recovery_max_output_tokens(&self) -> Option<u32> {
+        self.recovery_max_output_tokens
+    }
+
+    /// #3178: attach a bench session's live trace. Set once, before the registry
+    /// is frozen into the agent loop; the loop ports record into it.
+    pub fn set_trace(&mut self, trace: Arc<crate::bench::trace::TraceSink>) {
+        self.trace = Some(trace);
+    }
+
+    /// The attached bench trace, if any.
+    #[must_use]
+    pub(crate) fn trace_sink(&self) -> Option<Arc<crate::bench::trace::TraceSink>> {
+        self.trace.clone()
     }
 
     /// Bind the session's tool policy. Set once, before the registry is frozen
@@ -112,6 +152,24 @@ impl HarnessToolRegistry {
             .as_ref()
             .map(|policy| policy.egress_policy())
             .unwrap_or_default()
+    }
+
+    /// Where the file tools may reach: the working directory unless the
+    /// session policy opts into the task environment (#3172).
+    pub fn file_path_scope(&self) -> rsi_common::harness_tool_policy::FilePathScope {
+        self.policy
+            .as_ref()
+            .map(|policy| policy.file_path_scope())
+            .unwrap_or_default()
+    }
+
+    /// Extra environment names a host `shell` / `exec_command` launch passes
+    /// through (#3169); empty unless the session policy lists some.
+    pub fn env_passthrough(&self) -> Arc<[String]> {
+        self.policy
+            .as_ref()
+            .map(|policy| policy.env_passthrough())
+            .unwrap_or_else(|| Arc::from([]))
     }
 
     /// Server-side context editing is requested for this session (default on;
@@ -131,6 +189,19 @@ impl HarnessToolRegistry {
     /// The policy gate shared by every execution entry point: a denial or an
     /// exhausted budget settles as a tool-error result without running the tool.
     fn policy_refusal(&self, name: &str) -> Option<ToolResult> {
+        // #3176: a container-bound session never runs a tool on the daemon host.
+        // Besides leaving them unregistered, a call that still names one (a
+        // stale transcript, a forced call) is refused here, before the tool runs.
+        if self.exec_target.is_container()
+            && !exec_target::CONTAINER_TARGET_TOOLS.contains(&name)
+            && (exec_target::is_host_tool(name) || self.tools.contains_key(name))
+        {
+            return Some(ToolResult {
+                success: false,
+                output: String::new(),
+                error_msg: Some(exec_target::host_tool_refusal_message(name)),
+            });
+        }
         self.policy
             .as_ref()?
             .admit_call(name, false)
@@ -173,6 +244,17 @@ impl HarnessToolRegistry {
         working_dir: &Path,
         cancel: &CancellationToken,
     ) -> completion_gate::CompletionGateOutcome {
+        // A gate runs a host shell; a container-bound session has none, so the
+        // gate fails closed instead of running on the host (#3176).
+        if self.exec_target.is_container() {
+            return completion_gate::CompletionGateOutcome {
+                success: false,
+                output: exec_target::host_tool_refusal_message("completion_gate"),
+                exit_code: None,
+                timed_out: false,
+                cancelled: false,
+            };
+        }
         completion_gate::execute_completion_gate(
             &gate.command,
             working_dir,
@@ -306,6 +388,8 @@ impl HarnessToolRegistry {
             event_sink,
             policy: ToolPolicy {
                 egress: self.egress_policy(),
+                file_paths: self.file_path_scope(),
+                env_passthrough: self.env_passthrough(),
                 ..ToolPolicy::default()
             },
         };
@@ -506,7 +590,7 @@ impl HarnessToolRegistry {
     pub fn default_tools(
         memory_handle: Option<&crate::memory::worker::MemoryHandle>,
         project_id: Option<uuid::Uuid>,
-        store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+        store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
         origin_session_id: Option<uuid::Uuid>,
         launch_invocation_id: Option<uuid::Uuid>,
         default_working_dir: Option<std::path::PathBuf>,
@@ -535,7 +619,7 @@ impl HarnessToolRegistry {
     pub fn default_tools_with_execution_scratch(
         memory_handle: Option<&crate::memory::worker::MemoryHandle>,
         project_id: Option<uuid::Uuid>,
-        store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+        store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
         origin_session_id: Option<uuid::Uuid>,
         launch_invocation_id: Option<uuid::Uuid>,
         default_working_dir: Option<std::path::PathBuf>,
@@ -565,7 +649,7 @@ impl HarnessToolRegistry {
     pub(crate) fn default_tools_with_process_registry(
         memory_handle: Option<&crate::memory::worker::MemoryHandle>,
         project_id: Option<uuid::Uuid>,
-        store: Option<Arc<tokio::sync::Mutex<crate::store::Store>>>,
+        store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
         origin_session_id: Option<uuid::Uuid>,
         launch_invocation_id: Option<uuid::Uuid>,
         default_working_dir: Option<std::path::PathBuf>,
@@ -738,6 +822,61 @@ impl HarnessToolRegistry {
     }
 }
 
+impl HarnessToolRegistry {
+    /// #3176: the tool set of a container-bound session: the plan, context and
+    /// compaction tools, `read_output`, and `shell`, `exec_command` and
+    /// `write_stdin` running through `docker exec` in the target container. No
+    /// file tool, `apply_patch`, `git`, `view_image`, web, codegraph, memory,
+    /// `schedule_wake` or `rsi_control` tool is registered, so nothing can touch
+    /// the daemon host.
+    pub(crate) fn container_target_tools(
+        target: &rsi_common::exec_target::ContainerExecTarget,
+        store: Option<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
+        origin_session_id: Option<uuid::Uuid>,
+        launch_invocation_id: Option<uuid::Uuid>,
+        process_registry: Arc<exec::ProcessRegistry>,
+    ) -> Self {
+        let exec_target = rsi_common::exec_target::ExecTarget::Container(target.clone());
+        let mut registry = Self::new();
+        registry.session_id = origin_session_id;
+        registry.launch_invocation_id = launch_invocation_id;
+        registry.exec_target = exec_target.clone();
+        let utility_state = Arc::clone(&registry.utility_state);
+        registry.register(Arc::new(utility::UpdatePlanTool));
+        registry.register(Arc::new(utility::ContextStatusTool::new(Arc::clone(
+            &utility_state,
+        ))));
+        registry.register(Arc::new(utility::CompactTool::new(utility_state, store)));
+        registry.register(Arc::new(
+            shell::ShellTool::new(origin_session_id, launch_invocation_id, None)
+                .with_exec_target(exec_target.clone()),
+        ));
+        registry.register(Arc::new(
+            exec::ExecCommandTool::new(
+                Arc::clone(&process_registry),
+                origin_session_id,
+                launch_invocation_id,
+                None,
+            )
+            .with_exec_target(exec_target),
+        ));
+        registry.register(Arc::new(exec::WriteStdinTool::new(Arc::clone(
+            &process_registry,
+        ))));
+        registry.register(Arc::new(read_output::ReadOutputTool::new(
+            registry.spill_config(),
+        )));
+        registry.process_registry = Some(process_registry);
+        registry
+    }
+
+    /// The exec target this registry's shell tools run against.
+    #[cfg(test)]
+    pub(crate) fn exec_target(&self) -> &rsi_common::exec_target::ExecTarget {
+        &self.exec_target
+    }
+}
+
 impl Default for HarnessToolRegistry {
     fn default() -> Self {
         Self::new()
@@ -796,6 +935,26 @@ impl HarnessToolRegistry {
         self.spill = Arc::new(config);
     }
 
+    /// The spill store settings for one tool's result: the registry's, with the
+    /// session policy's `output_spill` thresholds for a command tool on top
+    /// (#3173). No entry keeps the default.
+    pub(crate) fn spill_config_for(&self, name: &str) -> rsi_common::spill::SpillConfig {
+        let mut config = (*self.spill).clone();
+        if let Some(set) = self
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.policy().output_spill_for(name))
+        {
+            if let Some(bytes) = set.max_bytes {
+                config.max_bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+            }
+            if let Some(lines) = set.max_lines {
+                config.max_lines = usize::try_from(lines).unwrap_or(usize::MAX);
+            }
+        }
+        config
+    }
+
     fn spill_key(&self) -> String {
         match self.session_id {
             Some(id) => rsi_common::spill::session_key(&id.to_string()),
@@ -826,8 +985,9 @@ impl HarnessToolRegistry {
             return result;
         }
         let exit = result_exit_code(name, &result);
+        let spill = self.spill_config_for(name);
         let bounded = truncation::spill_or_truncate(
-            &self.spill,
+            &spill,
             &self.spill_key(),
             name,
             exit,
@@ -1353,7 +1513,7 @@ mod tests {
         use std::collections::HashMap;
         let active = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let completed = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
@@ -1379,7 +1539,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn rotation_and_fresh_share_identical_tool_set() {
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let caller = uuid::Uuid::new_v4();
@@ -1436,6 +1596,8 @@ mod tests {
             rsi_common::agent_control_schema::agent_control_catalog_v1()
                 .iter()
                 .filter_map(|descriptor| descriptor.native_tool)
+                // #3774: gateway-only tools are not in this in-process registry.
+                .filter(|native| !native.mcp_gateway_only())
                 .map(|native| native.name().to_string()),
         );
         assert_eq!(fresh, expected, "unified Harness tool roster drifted");
@@ -1444,7 +1606,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
     #[test]
     fn agent_bound_native_tool_schemas_match_the_common_catalog() {
-        let store = Arc::new(tokio::sync::Mutex::new(
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
             crate::store::Store::open_in_memory().unwrap(),
         ));
         let caller = uuid::Uuid::new_v4();
@@ -1470,29 +1632,14 @@ mod tests {
         assert_eq!(
             rpc_only,
             std::collections::BTreeSet::from([
-                "AgentContinueChild",
                 "AgentArchiveChild",
-                "AgentManagerDelegateNode",
-                "AgentManagerEscalate",
-                "AgentManagerListEscalations",
-                "AgentManagerResolveEscalation",
-                "AgentEnqueueLandingSource",
-                "AgentGetProviderStatus",
-                "AgentSubmitJob",
-                "AgentGetJob",
-                "AgentListJobs",
-                "AgentCancelJob",
-                "AgentSendSatelliteMessage",
                 "AgentReportToHub",
-                "AgentGetDaemonInfo",
-                "AgentRequestDeploy",
                 "AgentPushSatelliteManagerPolicy",
                 "AgentReseatSatelliteManager",
+                "AgentSwitchHostPreset",
                 "AgentGlobalAppointManager",
                 "AgentManagerAppointChild",
                 "AgentManagerRevokeChild",
-                // #1028 and #1042 landed both wake verbs as RPC-only by design.
-                "AgentCancelWake",
             ]),
             "the native Harness RPC-only verb set changed without review"
         );
@@ -1501,6 +1648,11 @@ mod tests {
                 continue;
             };
             let native_name = native_tool.name();
+            // #3774: served by the MCP gateway only, not by this registry.
+            if native_tool.mcp_gateway_only() {
+                assert!(specs.iter().all(|spec| spec.name != native_name));
+                continue;
+            }
             let spec = specs
                 .iter()
                 .find(|spec| spec.name == native_name)
@@ -1606,6 +1758,94 @@ mod tests {
                 None,
             )
             .await
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    struct NamedOutput(&'static str, String);
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[async_trait::async_trait]
+    impl HarnessTool for NamedOutput {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "Return fixed output"
+        }
+        fn parameters_json(&self) -> &str {
+            r#"{"type":"object"}"#
+        }
+        async fn execute(&self, _args: serde_json::Value, _working_dir: &Path) -> ToolResult {
+            ToolResult {
+                success: true,
+                output: self.1.clone(),
+                error_msg: None,
+            }
+        }
+    }
+
+    /// #3173: a preset's `output_spill` threshold is respected for the command
+    /// tool it names, and only for that tool; the default stays 8 KiB / 200 lines.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+    #[tokio::test]
+    async fn a_policy_spill_threshold_is_respected_for_its_command_tool_only() {
+        use rsi_common::harness_tool_policy::{HarnessToolPolicy, OutputSpill};
+        // 150 lines, about 5 KB: under the 8 KiB / 200 line default, and big
+        // enough that a stub is a real saving (a smaller one stays inline).
+        let mid: String = (0..150)
+            .map(|n| format!("a reasonably long line number {n}\n"))
+            .collect();
+        let build = |dir: &Path, spill: Option<OutputSpill>| {
+            let mut registry = spill_registry(dir);
+            registry.register(Arc::new(NamedOutput("shell", mid.clone())));
+            registry.register(Arc::new(NamedOutput("exec_command", mid.clone())));
+            if let Some(spill) = spill {
+                let mut policy = HarnessToolPolicy::default();
+                policy.output_spill.insert("shell".into(), spill);
+                assert_eq!(policy.validate(), Ok(()));
+                registry.set_policy(Arc::new(policy::ToolPolicyRuntime::new(policy)));
+            }
+            registry
+        };
+
+        // Default: unchanged, the output is returned whole.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = build(dir.path(), None);
+        assert_eq!(run(&registry, "shell", json!({})).await.output, mid);
+
+        // A line threshold below the output spills `shell`, not `exec_command`.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = build(
+            dir.path(),
+            Some(OutputSpill {
+                max_bytes: None,
+                max_lines: Some(100),
+            }),
+        );
+        let shell = run(&registry, "shell", json!({})).await;
+        assert!(
+            shell.output.starts_with(rsi_common::spill::STUB_PREFIX),
+            "{}",
+            shell.output
+        );
+        assert_eq!(run(&registry, "exec_command", json!({})).await.output, mid);
+
+        // A byte threshold below the output spills it too.
+        let dir = tempfile::tempdir().unwrap();
+        let registry = build(
+            dir.path(),
+            Some(OutputSpill {
+                max_bytes: Some(4096),
+                max_lines: None,
+            }),
+        );
+        assert!(
+            run(&registry, "shell", json!({}))
+                .await
+                .output
+                .starts_with(rsi_common::spill::STUB_PREFIX)
+        );
+        assert_eq!(run(&registry, "exec_command", json!({})).await.output, mid);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]

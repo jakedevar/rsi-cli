@@ -76,7 +76,7 @@ pub fn build_request_body(
             MessageRole::User => {
                 messages.push(json!({
                     "role": "user",
-                    "content": msg.content,
+                    "content": [{"type": "text", "text": msg.content}],
                 }));
             }
             MessageRole::Assistant => {
@@ -165,7 +165,7 @@ pub fn build_request_body(
     }
 
     // Build tools array in Anthropic format
-    let tools: Vec<Value> = request
+    let mut tools: Vec<Value> = request
         .tools
         .iter()
         .map(|t| match &t.kind {
@@ -188,6 +188,20 @@ pub fn build_request_body(
         .filter(|tool| !tool.is_null())
         .collect();
 
+    // Explicit ephemeral checkpoints work on both Messages and Bedrock InvokeModel
+    // (not Converse's cachePoint shape). At most three: tools, system, latest
+    // user/tool result. Derive them afresh on the wire; never edit the transcript.
+    // https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
+    if let Some(tool) = tools.last_mut() {
+        tool["cache_control"] = json!({"type": "ephemeral"});
+    }
+    if let Some(message) = messages.iter_mut().rev().find(|msg| msg["role"] == "user")
+        && let Some(block) = message["content"].as_array_mut().and_then(|b| b.last_mut())
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+
     let mut body = json!({
         "model": request.model,
         "messages": messages,
@@ -195,7 +209,10 @@ pub fn build_request_body(
     });
 
     if let Some(ref sys) = system_content {
-        body["system"] = json!(sys);
+        body["system"] = json!([{
+            "type": "text", "text": sys,
+            "cache_control": {"type": "ephemeral"},
+        }]);
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
@@ -362,6 +379,7 @@ pub fn parse_chat_response(json: &Value) -> ChatResponse {
             ..usage
         },
         reasoning_content: None,
+        reasoning_details: None,
         stop_reason,
     }
 }
@@ -386,6 +404,151 @@ mod tests {
         }
     }
 
+    fn cache_markers(value: &Value) -> usize {
+        match value {
+            Value::Object(object) => {
+                usize::from(object.contains_key("cache_control"))
+                    + object.values().map(cache_markers).sum::<usize>()
+            }
+            Value::Array(array) => array.iter().map(cache_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn stable_prefix_and_latest_user_have_ephemeral_breakpoints_on_both_routes() {
+        let mut request = request("claude-sonnet-5", None);
+        request
+            .messages
+            .insert(0, ChatMessage::system("Stable instructions"));
+        request.tools = ["shell", "read"]
+            .into_iter()
+            .map(|name| HarnessToolSpec {
+                name: name.into(),
+                description: format!("Use {name}"),
+                parameters_json: r#"{"type":"object"}"#.into(),
+                freeform: None,
+                kind: HarnessToolSpecKind::Function,
+            })
+            .collect();
+        // A foreign hosted tool is filtered before selecting the tools checkpoint.
+        request.tools.push(HarnessToolSpec {
+            name: "web_search".into(),
+            description: String::new(),
+            parameters_json: "{}".into(),
+            freeform: None,
+            kind: HarnessToolSpecKind::ResponsesWebSearch,
+        });
+        let direct = build_request_body(&request, false, true);
+        for body in [direct.clone(), bedrock_body(direct)] {
+            assert_eq!(
+                body["system"],
+                json!([{
+                    "type": "text", "text": "Stable instructions",
+                    "cache_control": {"type": "ephemeral"},
+                }])
+            );
+            assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                body["tools"][1]["cache_control"],
+                json!({"type":"ephemeral"})
+            );
+            assert_eq!(
+                body["messages"][0]["content"],
+                json!([{
+                    "type": "text", "text": "test",
+                    "cache_control": {"type": "ephemeral"},
+                }])
+            );
+            assert_eq!(cache_markers(&body), 3);
+        }
+    }
+
+    #[test]
+    fn rolling_tool_result_breakpoint_is_bounded_on_long_transcripts() {
+        let mut request = request("claude-sonnet-5", None);
+        request
+            .messages
+            .insert(0, ChatMessage::system("Stable instructions"));
+        request.tools.push(HarnessToolSpec {
+            name: "shell".into(),
+            description: "Run a command".into(),
+            parameters_json: "{}".into(),
+            freeform: None,
+            kind: HarnessToolSpecKind::Function,
+        });
+        for turn in 0..80 {
+            let id = format!("tool-{turn}");
+            let mut assistant = ChatMessage::assistant("Running it");
+            assistant.tool_calls.push(ToolCall {
+                id: id.clone(),
+                name: "shell".into(),
+                arguments: "{}".into(),
+                hosted: false,
+                hosted_result: None,
+            });
+            request
+                .messages
+                .extend([assistant, ChatMessage::tool_result(&id, "ok")]);
+            let body = build_request_body(&request, false, true);
+            let messages = body["messages"].as_array().unwrap();
+            let result = &messages.last().unwrap()["content"][0];
+            assert_eq!(result["type"], "tool_result");
+            assert_eq!(result["tool_use_id"], id);
+            assert_eq!(result["cache_control"], json!({"type":"ephemeral"}));
+            assert_eq!(cache_markers(&body), 3);
+            assert_eq!(cache_markers(&body["messages"]), 1);
+        }
+    }
+
+    #[test]
+    fn growing_turns_keep_prefix_bytes_and_transcript_content_identical() {
+        let mut request = request("claude-sonnet-5", None);
+        request.tools.push(HarnessToolSpec {
+            name: "shell".into(),
+            description: "Run a command".into(),
+            parameters_json: "{}".into(),
+            freeform: None,
+            kind: HarnessToolSpecKind::Function,
+        });
+        request
+            .messages
+            .insert(0, ChatMessage::system("Stable instructions"));
+        let first = build_request_body(&request, false, true);
+        let transcript = serde_json::to_vec(&request.messages).unwrap();
+        for turn in 0..25 {
+            request.messages.extend([
+                ChatMessage::assistant("answer"),
+                ChatMessage::user(&format!("next {turn}")),
+            ]);
+            let next = build_request_body(&request, false, true);
+            assert_eq!(
+                serde_json::to_vec(&first["system"]).unwrap(),
+                serde_json::to_vec(&next["system"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&first["tools"]).unwrap(),
+                serde_json::to_vec(&next["tools"]).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_vec(&request.messages[..2]).unwrap(),
+                transcript
+            );
+            // cache_control is wire metadata, excluded from Anthropic's cache key.
+            // Moving that sole marker must preserve all earlier content bytes.
+            let mut before = first["messages"][0].clone();
+            before["content"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("cache_control");
+            assert_eq!(
+                serde_json::to_vec(&before).unwrap(),
+                serde_json::to_vec(&next["messages"][0]).unwrap()
+            );
+            assert_eq!(cache_markers(&next), 3);
+        }
+    }
+
     #[test]
     fn tool_result_error_flag_is_sent_only_for_failures() {
         let mut successful = request("claude-opus-5", None);
@@ -396,7 +559,8 @@ mod tests {
             json!({
                 "type": "tool_result",
                 "tool_use_id": "call-1",
-                "content": "ok"
+                "content": "ok",
+                "cache_control": {"type": "ephemeral"}
             })
         );
 

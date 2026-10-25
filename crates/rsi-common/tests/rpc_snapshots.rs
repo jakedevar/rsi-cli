@@ -301,6 +301,7 @@ fn fixture_model_control_status() -> ModelControlStatusReport {
 fn snap_launch_session_request() {
     let params = LaunchSessionParams {
         completion_gates: None,
+        agent_role: None,
         query: "implement feature X".to_string(),
         title: None,
         working_dir: Some(PathBuf::from("/tmp/repo")),

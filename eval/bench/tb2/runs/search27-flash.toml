@@ -1,0 +1,21 @@
+# Run config (#3135, #3685): the first paid RSI-harness run on the search split with the
+# cheapest configured model, deepseek/deepseek-v4.1-flash, k=1. The task list is the 30 search
+# tasks minus the 3 that the $0 oracle run (job 2aa4e94a, 2026-10-23) found unsolvable or
+# environment-limited (see "Oracle findings" in eval/bench/README.md): caffe-cifar-10,
+# install-windows-3.11 and rstan-to-pystan. Per-task cap $0.40, so the worst case is $10.80;
+# concurrency 3: four trials need 4 x 4 GiB + 4 GiB (21.5 GB) on the laptop and the preflight refused it
+# at 19.3 GB available (memory_insufficient). Submit with budget_usd 11. Needs bench.enabled, bench.docker_hosts, allowed_launches for
+# (OpenRouter, deepseek/deepseek-v4.1-flash, high) and an armed OpenRouter spend cap.
+schema_version = 1
+name = "search27-flash"
+description = "RSI harness, deepseek-v4.1-flash, 27 search tasks (oracle-solvable), k=1"
+host = "ssh://arch-laptop"
+tasks = ["break-filter-js-from-html", "code-from-image", "constraints-scheduling", "db-wal-recovery", "dna-assembly", "extract-elf", "extract-moves-from-video", "feal-differential-cryptanalysis", "financial-document-processor", "fix-git", "git-leak-recovery", "git-multibranch", "headless-terminal", "hf-model-inference", "merge-diff-arc-agi-task", "multi-source-data-merger", "openssl-selfsigned-cert", "password-recovery", "path-tracing-reverse", "polyglot-rust-c", "pytorch-model-recovery", "raman-fitting", "regex-chess", "sparql-university", "sqlite-with-gcov", "torch-pipeline-parallelism", "winning-avg-corewars"]
+k = 1
+concurrency = 3
+
+[agent]
+kind = "rsi"
+model = "deepseek/deepseek-v4.1-flash"
+effort = "high"
+per_task_cap_usd = 0.40

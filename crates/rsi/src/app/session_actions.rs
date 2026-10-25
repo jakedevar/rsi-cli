@@ -1051,11 +1051,7 @@ impl App {
     pub async fn archive_session_by_id(&mut self, session_id: Uuid) {
         // For active sessions: mark for auto-archive on completion
         if let Some(state) = self.sessions.get(&session_id)
-            && matches!(
-                state.session.status,
-                rsi_common::types::SessionStatus::Running
-                    | rsi_common::types::SessionStatus::Starting
-            )
+            && defers_archive(state.session.status)
         {
             let desired = !state.session.pending_archive;
             match self.client.mark_pending_archive(session_id, desired).await {
@@ -1625,15 +1621,42 @@ impl App {
     }
 }
 
+/// Whether Archive on a session in this status marks it to archive when it finishes
+/// (`MarkPendingArchive`) instead of sending `ArchiveSession`. rsid refuses `ArchiveSession`
+/// for any session it still holds as active, which includes `WaitingApproval` (parked on a
+/// question or approval, process still live), and its finalizer honours the pending mark
+/// whatever status the session ends from (local #315).
+pub(crate) fn defers_archive(status: rsi_common::types::SessionStatus) -> bool {
+    use rsi_common::types::SessionStatus;
+    matches!(
+        status,
+        SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingApproval
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{App, command_frontmatter_model_conflict};
+    use super::{App, command_frontmatter_model_conflict, defers_archive};
     use crate::{client::DaemonClient, settings::CustomProviderEntry};
     use rsi_common::types::SessionProvider;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn archive_defers_for_every_status_rsid_still_holds_as_active() {
+        use rsi_common::types::SessionStatus::*;
+        for status in [Starting, Running, WaitingApproval] {
+            assert!(
+                defers_archive(status),
+                "{status:?} defers to MarkPendingArchive"
+            );
+        }
+        for status in [Completed, Failed, Interrupted, Archived, Deleted] {
+            assert!(!defers_archive(status), "{status:?} archives at once");
+        }
+    }
 
     #[test]
     fn abandon_confirmation_requires_the_same_session_command_within_ten_seconds() {

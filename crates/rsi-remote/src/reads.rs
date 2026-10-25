@@ -12,9 +12,10 @@ use rsi_common::{
     harness_manager_v2::{AnswerHarnessManagerDecisionRequestV2, ManagerMutationReceiptV2},
     remote_decision_targets::RemoteGetDecisionTargetsV1,
     remote_manager_v2::{
-        ConversationRequestV2, ConversationResponseV2, ListManagerSeatsRequestV2,
-        ListManagerSeatsResponseV2, METHOD_CONVERSATION, METHOD_LIST_SEATS, METHOD_SEND,
-        SendMessageReceiptV2, SendMessageRequestV2,
+        ConversationRequestV2, ConversationResponseV2, DashboardRequestV2, DashboardResponseV2,
+        ListManagerSeatsRequestV2, ListManagerSeatsResponseV2, METHOD_CONVERSATION,
+        METHOD_DASHBOARD, METHOD_LIST_SEATS, METHOD_PROVIDERS, METHOD_SEND, ProvidersRequestV2,
+        ProvidersResponseV2, SendMessageReceiptV2, SendMessageRequestV2,
     },
     remote_read::ReadRequestV1,
     rpc::REMOTE_BUSY,
@@ -254,6 +255,8 @@ pub const GATEWAY_DAEMON_METHODS: &[&str] = &[
     "RemoteGetDecisionTargetsV1",
     METHOD_LIST_SEATS,
     METHOD_CONVERSATION,
+    METHOD_DASHBOARD,
+    METHOD_PROVIDERS,
     "AnswerHarnessManagerDecision",
     "AnswerPendingDecisionV1",
     METHOD_SEND,
@@ -272,6 +275,10 @@ pub enum OperatorCall {
     ManagerConversation(ConversationRequestV2),
     /// API v2: one message to a seat (the closed write, `messages`).
     SendManagerMessage(SendMessageRequestV2),
+    /// API v2 (hub #3287): satellites and running agents, labels and counts.
+    Dashboard(DashboardRequestV2),
+    /// API v2 (hub #3796): each provider's plan windows and spend, labels and numbers.
+    Providers(ProvidersRequestV2),
 }
 
 impl OperatorCall {
@@ -284,6 +291,8 @@ impl OperatorCall {
             Self::ManagerSeats(_) => METHOD_LIST_SEATS,
             Self::ManagerConversation(_) => METHOD_CONVERSATION,
             Self::SendManagerMessage(_) => METHOD_SEND,
+            Self::Dashboard(_) => METHOD_DASHBOARD,
+            Self::Providers(_) => METHOD_PROVIDERS,
         }
     }
 
@@ -300,6 +309,8 @@ impl OperatorCall {
             Self::ManagerSeats(request) => serde_json::to_value(request),
             Self::ManagerConversation(request) => serde_json::to_value(request),
             Self::SendManagerMessage(request) => serde_json::to_value(request),
+            Self::Dashboard(request) => serde_json::to_value(request),
+            Self::Providers(request) => serde_json::to_value(request),
         }
         .map_err(|_| ReadError::Malformed)?;
         Ok(json!({
@@ -505,6 +516,12 @@ impl OperatorDispatch for DaemonReads {
             }
             OperatorCall::SendManagerMessage(_) => {
                 serde_json::from_value::<SendMessageReceiptV2>(result.clone()).is_ok()
+            }
+            OperatorCall::Dashboard(_) => {
+                serde_json::from_value::<DashboardResponseV2>(result.clone()).is_ok()
+            }
+            OperatorCall::Providers(_) => {
+                serde_json::from_value::<ProvidersResponseV2>(result.clone()).is_ok()
             }
             _ => true,
         };
@@ -1182,6 +1199,89 @@ mod tests {
         );
     }
 
+    /// hub #3287: the gateway forwards a dashboard only as its exact wire
+    /// type; an object with any other field (here a link's SSH target) is a
+    /// malformed read, never passed to the phone.
+    #[tokio::test]
+    async fn dashboard_reply_with_an_extra_field_is_malformed() {
+        let good = json!({
+            "observed_at": "2026-10-19T19:30:00.000000000Z",
+            "satellites": [{"label": "mac-mini", "reachable": true, "build_sha": null,
+                "last_seen_at": null, "running_agents": null}],
+            "satellites_truncated": false,
+            "agents": [{"provider": "Claude", "effort": "high", "running": 2}],
+            "agents_total": 2,
+            "agents_truncated": false,
+            "agents_incomplete": false,
+        });
+        let mut leaked = good.clone();
+        leaked["satellites"][0]["ssh_target"] = json!("operator@192.0.2.44");
+        for (result, accepted) in [(good, true), (leaked, false)] {
+            let dir = crate::test_support::short_tempdir().unwrap();
+            let line = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string() + "\n";
+            let (socket, seen) = start_fake(dir.path(), line.into_bytes());
+            let reads = DaemonReads::new(socket);
+            let reply = reads
+                .call(&OperatorCall::Dashboard(DashboardRequestV2 {}))
+                .await;
+            assert_eq!(reply.is_ok(), accepted, "{reply:?}");
+            if !accepted {
+                assert_eq!(
+                    reply.unwrap_err(),
+                    OperatorError::Transport(ReadError::Malformed)
+                );
+            }
+            let sent: Value =
+                serde_json::from_str(seen.lock().unwrap().clone().unwrap().trim_end()).unwrap();
+            assert_eq!(sent["method"], json!(METHOD_DASHBOARD));
+            assert_eq!(sent["params"], json!({}));
+        }
+    }
+
+    /// hub #3796: the gateway forwards the providers read only as its exact
+    /// wire type; an object with any other field (here an account id) is a
+    /// malformed read, never passed to the phone.
+    #[tokio::test]
+    async fn providers_reply_with_an_extra_field_is_malformed() {
+        let good = json!({
+            "observed_at": "2026-10-22T12:00:00.000000000Z",
+            "providers": [{
+                "provider": "Claude", "status": "allowed", "binding_window": "five_hour",
+                "overage_status": null, "is_using_overage": false,
+                "observed_at": "2026-10-22T12:00:00.000000000Z", "stale_reason": null,
+                "windows": [{"key": "five_hour", "utilization": 0.5,
+                    "resets_at": null, "resets_at_epoch": null}],
+                "windows_reason": null, "windows_truncated": false,
+                "spend": {"cost_1h_usd": 1.0, "cost_24h_usd": 2.0}, "spend_reason": null,
+                "models": [], "models_truncated": false,
+            }],
+            "providers_truncated": false,
+            "windows_incomplete": false,
+        });
+        let mut leaked = good.clone();
+        leaked["providers"][0]["account_id"] = json!("acct-123");
+        for (result, accepted) in [(good, true), (leaked, false)] {
+            let dir = crate::test_support::short_tempdir().unwrap();
+            let line = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string() + "\n";
+            let (socket, seen) = start_fake(dir.path(), line.into_bytes());
+            let reads = DaemonReads::new(socket);
+            let reply = reads
+                .call(&OperatorCall::Providers(ProvidersRequestV2 {}))
+                .await;
+            assert_eq!(reply.is_ok(), accepted, "{reply:?}");
+            if !accepted {
+                assert_eq!(
+                    reply.unwrap_err(),
+                    OperatorError::Transport(ReadError::Malformed)
+                );
+            }
+            let sent: Value =
+                serde_json::from_str(seen.lock().unwrap().clone().unwrap().trim_end()).unwrap();
+            assert_eq!(sent["method"], json!(METHOD_PROVIDERS));
+            assert_eq!(sent["params"], json!({}));
+        }
+    }
+
     #[test]
     fn failures_map_to_distinct_statuses() {
         assert_eq!(ReadError::Busy.http_status(), 503);
@@ -1277,6 +1377,8 @@ mod tests {
         let v2 = [
             "/api/v2/projects".to_string(),
             format!("/api/v2/projects/{id}/managers/{id}/conversation"),
+            "/api/v2/dashboard".to_string(),
+            "/api/v2/providers".to_string(),
         ];
         let mut named: Vec<&str> = v1
             .iter()

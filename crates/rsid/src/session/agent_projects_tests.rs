@@ -17,7 +17,7 @@ use rsi_common::harness_manager_v2::{
 };
 use rsi_common::types::{SessionKind, SessionProvider, SessionStatus};
 
-type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 struct Fixture {
     control: AgentControlHandle,
@@ -1141,4 +1141,57 @@ async fn a_symlinked_data_dir_keeps_its_target_unregistrable_without_roots() {
         .agent_create_project(f.pm, create("Sibling", &ok))
         .await
         .unwrap();
+}
+
+/// Hub #3315: `AgentUpdateProject` never re-paths the built-in home project,
+/// even for its own project manager; a rename is an ordinary edit.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn agent_update_project_refuses_to_repath_the_home_project() {
+    let f = fixture().await;
+    let home = subdir(&f, "home");
+    let moved = subdir(&f, "moved-home");
+    let home_pm = {
+        let guard = f.store.lock().await;
+        guard.ensure_home_project(&home).unwrap();
+        let pm = add_session(&guard, Some(Project::HOME_ID), SessionStatus::Completed);
+        guard
+            .configure_harness_manager(&ConfigureHarnessManagerRequestV1 {
+                project_id: Project::HOME_ID,
+                session_id: pm,
+                epic_ids: None,
+                group_ids: vec![],
+                expected_row_version: 0,
+            })
+            .unwrap();
+        set_pm_policy(&guard, Project::HOME_ID, execute());
+        pm
+    };
+    let mut request = update(Project::HOME_ID);
+    request.path = Some(moved.to_string_lossy().into_owned());
+    assert_eq!(
+        code(
+            f.control
+                .agent_update_project(home_pm, request)
+                .await
+                .unwrap_err()
+        ),
+        Project::HOME_REPATH_REFUSED
+    );
+    let mut rename = update(Project::HOME_ID);
+    rename.name = Some("Home base".into());
+    let renamed = f
+        .control
+        .agent_update_project(home_pm, rename)
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "Home base");
+    let stored = f
+        .store
+        .lock()
+        .await
+        .get_project(Project::HOME_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.path.as_deref(), Some(home.as_path()));
 }

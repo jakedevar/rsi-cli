@@ -12,7 +12,7 @@ use rsi_common::portfolio_nodes::ConfigurePortfolioNodeRequestV1;
 use rsi_common::standing_directives::{
     STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT, STANDING_DIRECTIVE_INVALID_REQUEST,
     STANDING_DIRECTIVE_LIMIT, STANDING_DIRECTIVE_MAX_ACTIVE_PER_SCOPE,
-    STANDING_DIRECTIVE_NOT_AUTHORIZED, STANDING_DIRECTIVE_NOT_FOUND,
+    STANDING_DIRECTIVE_NOT_AUTHORIZED, STANDING_DIRECTIVE_NOT_FOUND, render_standing_directives,
 };
 use rsi_common::types::{SessionProvider, SessionStatus};
 use std::path::PathBuf;
@@ -100,6 +100,7 @@ fn input<'a>(
         scope,
         text,
         provenance,
+        kind: Default::default(),
         expires_in_secs: ttl,
         idempotency_key: key,
     }
@@ -502,4 +503,185 @@ fn the_table_refuses_a_session_row_without_provenance_and_a_half_cleared_row() {
     assert!(insert("operator", None, None, Some("operator")).is_err());
     assert!(insert("stranger", None, None, None).is_err());
     assert!(insert("operator", None, None, None).is_ok());
+}
+
+fn ruling<'a>(
+    scope: ManagerNodeRefV1,
+    text: &'a str,
+    note: Option<&'a str>,
+    key: &'a str,
+) -> StandingDirectiveSetInput<'a> {
+    StandingDirectiveSetInput {
+        kind: StandingDirectiveKindV1::Manager,
+        ..input(scope, text, note, None, key)
+    }
+}
+
+/// #3736: a manager's own standing ruling is stored with its seat as author and
+/// the manager provenance, is delivered to the scope's seat labelled
+/// manager-authored, and is cleared only by the scope that wrote it.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+#[test]
+fn a_manager_ruling_is_manager_authored_scoped_below_the_seat_and_cleared_only_by_its_scope_3736() {
+    const THROTTLE: &str = "No new Codex implementers fleet-wide; reviews only.";
+    let s = seats();
+    let project = ManagerNodeRefV1::Project {
+        project_id: s.project,
+    };
+    let gm = s.store.standing_directive_agent_actor(s.portfolio).unwrap();
+    let pm = s.store.standing_directive_agent_actor(s.pm).unwrap();
+
+    let ruled = s
+        .store
+        .standing_directive_set(
+            &gm,
+            &ruling(project, THROTTLE, Some("capacity"), "t"),
+            now(),
+        )
+        .unwrap();
+    let directive = ruled.directive;
+    assert_eq!(directive.source, StandingDirectiveSourceV1::Manager);
+    assert_eq!(directive.author, format!("session:{}", s.portfolio));
+    assert_eq!(directive.text, THROTTLE);
+    let node = s.store.tier_caller_node(s.portfolio).unwrap().unwrap();
+    assert_eq!(
+        directive.provenance.as_deref(),
+        Some(format!("manager:{} capacity", node.as_ref_text()).as_str())
+    );
+
+    // The PM seat reads it, labelled manager-authored; a replay is the same row.
+    let for_pm = s.store.standing_directives_for_seat(s.pm, now()).unwrap();
+    assert_eq!(for_pm, vec![directive.clone()]);
+    let block = render_standing_directives(&for_pm).unwrap();
+    assert!(
+        block.contains("MANAGER-AUTHORED ruling (not operator words)"),
+        "{block}"
+    );
+    assert!(block.contains(THROTTLE), "{block}");
+    assert!(
+        s.store
+            .standing_directive_set(
+                &gm,
+                &ruling(project, THROTTLE, Some("capacity"), "t"),
+                now()
+            )
+            .unwrap()
+            .deduplicated
+    );
+    // The same key with the same words as an operator relay is a different request.
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_set(
+                    &gm,
+                    &input(project, THROTTLE, Some("capacity"), None, "t"),
+                    now()
+                )
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_IDEMPOTENCY_CONFLICT
+    );
+
+    // Scope outside the grant: the PM holds the project, not above it; the
+    // portfolio node covers neither itself nor a foreign scope.
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_set(&pm, &ruling(project, "x", None, "own"), now())
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_NOT_AUTHORIZED
+    );
+    let own_portfolio = ManagerNodeRefV1::Portfolio {
+        node_id: portfolio_id(&s),
+    };
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_set(&gm, &ruling(own_portfolio, "x", None, "own"), now())
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_NOT_AUTHORIZED
+    );
+    // The operator never writes a manager ruling, and no operator relay can
+    // carry the manager mark.
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_set(
+                    &StandingDirectiveActor::Operator,
+                    &ruling(project, "x", None, "op"),
+                    now()
+                )
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_INVALID_REQUEST
+    );
+    let forged = format!("manager:{} operator said so", node.as_ref_text());
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_set(
+                    &gm,
+                    &input(project, "x", Some(&forged), None, "forge"),
+                    now()
+                )
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_INVALID_REQUEST
+    );
+
+    // A manager's ruling for the area below the PM: only the PM scope clears it,
+    // not the GM above (it is the PM's decision), and the operator's own
+    // directive stays out of any manager's reach.
+    let area = s.store.tier_caller_node(s.area).unwrap().unwrap();
+    let pm_ruling = s
+        .store
+        .standing_directive_set(&pm, &ruling(area, "Area: reviews first.", None, "a"), now())
+        .unwrap()
+        .directive;
+    assert_eq!(pm_ruling.source, StandingDirectiveSourceV1::Manager);
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_clear(&gm, pm_ruling.id, now())
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_NOT_AUTHORIZED
+    );
+    let operator = s
+        .store
+        .standing_directive_set(
+            &StandingDirectiveActor::Operator,
+            &input(project, "Operator's own.", None, None, "own-op"),
+            now(),
+        )
+        .unwrap()
+        .directive;
+    assert_eq!(operator.source, StandingDirectiveSourceV1::Operator);
+    assert_eq!(
+        code(
+            s.store
+                .standing_directive_clear(&gm, operator.id, now())
+                .unwrap_err()
+        ),
+        STANDING_DIRECTIVE_NOT_AUTHORIZED
+    );
+    // The writing scope clears its ruling; the operator clears any.
+    assert!(
+        s.store
+            .standing_directive_clear(&pm, pm_ruling.id, now())
+            .unwrap()
+            .directive
+            .cleared_at
+            .is_some()
+    );
+    assert!(
+        s.store
+            .standing_directive_clear(&gm, directive.id, now())
+            .unwrap()
+            .directive
+            .cleared_at
+            .is_some()
+    );
 }

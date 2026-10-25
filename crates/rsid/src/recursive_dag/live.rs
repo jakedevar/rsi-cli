@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::scheduler_core::{
@@ -315,7 +314,7 @@ struct RecursiveDagLiveSchedulerLaunchedStep {
 /// than scheduler-loop reachability.
 #[allow(dead_code)]
 pub(crate) struct RecursiveDagLiveSchedulerDriver<L> {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     executor: RecursiveDagLiveExecutor<L>,
     enabled: bool,
 }
@@ -325,7 +324,10 @@ impl<L> RecursiveDagLiveSchedulerDriver<L>
 where
     L: RecursiveDagLiveSessionLauncher,
 {
-    pub(crate) fn new(store: Arc<Mutex<Store>>, executor: RecursiveDagLiveExecutor<L>) -> Self {
+    pub(crate) fn new(
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+        executor: RecursiveDagLiveExecutor<L>,
+    ) -> Self {
         Self {
             store,
             executor,
@@ -334,7 +336,7 @@ where
     }
 
     pub(crate) fn disabled(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         executor: RecursiveDagLiveExecutor<L>,
     ) -> Self {
         Self {
@@ -344,7 +346,10 @@ where
         }
     }
 
-    pub(crate) fn enabled(store: Arc<Mutex<Store>>, executor: RecursiveDagLiveExecutor<L>) -> Self {
+    pub(crate) fn enabled(
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+        executor: RecursiveDagLiveExecutor<L>,
+    ) -> Self {
         Self {
             store,
             executor,
@@ -757,7 +762,7 @@ impl RecursiveDagLiveSessionLauncher for SessionManager {
 #[allow(dead_code)]
 pub(crate) struct RecursiveDagLiveSessionManagerBinding {
     manager: Arc<SessionManager>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
 }
 
 #[allow(dead_code)]
@@ -866,7 +871,7 @@ struct CapturedRecursiveDagLiveOutput {
 }
 
 async fn commit_completed_live_attempt_output<R>(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     reader: &R,
     live_attempt_id: RecursiveLiveAttemptId,
 ) -> Result<RecursiveDagLiveOutputCommitResult>
@@ -915,7 +920,7 @@ where
 }
 
 pub(crate) async fn commit_recoverable_completed_live_attempt_outputs_after_restart(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     reader: &SessionManager,
     budget: RecursiveRecoveryBudget,
 ) -> Result<(usize, usize, usize)> {
@@ -1231,7 +1236,7 @@ impl RecursiveDagLiveSessionInterrupter for MissingRecursiveDagLiveSessionInterr
 
 #[allow(dead_code)]
 pub(crate) struct RecursiveDagLiveExecutor<L> {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     launcher: L,
     interrupter: Arc<dyn RecursiveDagLiveSessionInterrupter>,
     enabled: bool,
@@ -1242,7 +1247,7 @@ impl<L> RecursiveDagLiveExecutor<L>
 where
     L: RecursiveDagLiveSessionLauncher,
 {
-    pub(crate) fn disabled(store: Arc<Mutex<Store>>, launcher: L) -> Self {
+    pub(crate) fn disabled(store: Arc<rsid_core::store_lock::Mutex<Store>>, launcher: L) -> Self {
         Self {
             store,
             launcher,
@@ -1252,7 +1257,7 @@ where
     }
 
     pub(crate) fn enabled(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         launcher: L,
         interrupter: Arc<dyn RecursiveDagLiveSessionInterrupter>,
     ) -> Self {
@@ -1265,7 +1270,7 @@ where
     }
 
     #[cfg(test)]
-    fn enabled_for_test(store: Arc<Mutex<Store>>, launcher: L) -> Self {
+    fn enabled_for_test(store: Arc<rsid_core::store_lock::Mutex<Store>>, launcher: L) -> Self {
         Self {
             store,
             launcher,
@@ -1276,7 +1281,7 @@ where
 
     #[cfg(test)]
     fn enabled_for_test_with_interrupter(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         launcher: L,
         interrupter: Arc<dyn RecursiveDagLiveSessionInterrupter>,
     ) -> Self {
@@ -1946,6 +1951,9 @@ fn launch_config_from_envelope(envelope: &RecursiveDagLiveLaunchEnvelope) -> Lau
         topology_iteration: 0,
         closure_selector: None,
         structured_handoff: false,
+        exec_target: rsi_common::exec_target::ExecTarget::Host,
+        bench_profile: None,
+        loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
     }
 }
 
@@ -1984,7 +1992,7 @@ mod tests {
     }
 
     struct FakeLauncherState {
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         result: StdMutex<FakeLauncherResult>,
         calls: StdMutex<Vec<(RecursiveDagLiveLaunchEnvelope, LaunchConfig)>>,
         model_call_count: AtomicUsize,
@@ -2004,7 +2012,10 @@ mod tests {
     }
 
     impl FakeLauncher {
-        fn new(store: Arc<Mutex<Store>>, result: FakeLauncherResult) -> Self {
+        fn new(
+            store: Arc<rsid_core::store_lock::Mutex<Store>>,
+            result: FakeLauncherResult,
+        ) -> Self {
             Self {
                 state: Arc::new(FakeLauncherState {
                     store,
@@ -2114,7 +2125,7 @@ mod tests {
 
     struct LiveFixture {
         _dir: tempfile::TempDir,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         graph_id: RecursiveTaskGraphId,
         root_id: RecursiveTaskId,
         dependency_id: RecursiveTaskId,
@@ -2297,7 +2308,7 @@ mod tests {
             .expect("start attempt");
         LiveFixture {
             _dir: dir,
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             graph_id,
             root_id,
             dependency_id,
@@ -2759,7 +2770,7 @@ mod tests {
     }
 
     async fn validation_count_for_live(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         live_attempt_id: RecursiveLiveAttemptId,
     ) -> i64 {
         let store = store.lock().await;
@@ -4253,7 +4264,7 @@ mod tests {
 
     struct LiveSchedulerFixture {
         _dir: tempfile::TempDir,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         graph_id: RecursiveTaskGraphId,
         root_id: RecursiveTaskId,
     }
@@ -4290,7 +4301,7 @@ mod tests {
             .expect("create live graph");
         LiveSchedulerFixture {
             _dir: dir,
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             graph_id,
             root_id,
         }

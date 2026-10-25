@@ -315,14 +315,14 @@ impl SavedPendingRuntimeCapture {
         mode: DecisionModeV1,
         limit: usize,
     ) -> Result<PendingPreparedPage> {
-        let native = required_observed(&self.inner.native_runtime)?;
+        let native = runtime_only_schedule_native(required_observed(&self.inner.native_runtime)?);
         let slots = required_observed(&self.inner.question_slots)?;
         prepare_pending_page(
             conn,
             self.inner.project,
             self.inner.session,
             store,
-            native,
+            &native,
             slots,
             previous_after,
             start,
@@ -341,7 +341,7 @@ impl SavedPendingRuntimeCapture {
         fallback_present: bool,
     ) -> Result<([Option<PendingKey>; 4], PendingPagePosition)> {
         let native = match &self.inner.native_runtime {
-            PendingRead::Observed { value, .. } => value,
+            PendingRead::Observed { value, .. } => runtime_only_schedule_native(value),
             PendingRead::Busy { .. } => return Err(ReadError::Busy),
             PendingRead::Unavailable { .. } => return Err(ReadError::SourceUnavailable),
         };
@@ -350,7 +350,7 @@ impl SavedPendingRuntimeCapture {
             PendingRead::Busy { .. } => return Err(ReadError::Busy),
             PendingRead::Unavailable { .. } => return Err(ReadError::SourceUnavailable),
         };
-        position.resume(native, slots, fallback_present)
+        position.resume(&native, slots, fallback_present)
     }
 }
 
@@ -1243,12 +1243,27 @@ impl PendingPreparedPage {
     pub fn finish(self, acquired: &PendingAcquiredSources) -> Result<PendingFinishedPage> {
         let (native, native_recheck) = required_observed(&acquired.native_runtime)?;
         let (slots, slots_recheck) = required_observed(&acquired.question_slots)?;
-        if *native_recheck != NativeRuntimeApprovalRecheck::NoObservedChange
+        // A session with no live native approval writer (every provider but the
+        // app-server one) has an unavailable native source, not a failed read:
+        // coverage reports it Unavailable and the durable sources still page.
+        let native_unavailable =
+            !matches!(native.state, NativeRuntimeApprovalListState::Present(_));
+        if (*native_recheck != NativeRuntimeApprovalRecheck::NoObservedChange
+            && !native_unavailable)
             || *slots_recheck != RuntimeQuestionSlotRecheck::NoObservedChange
             || acquired.coverage.len() != 8
         {
             return Err(ReadError::SourceUnavailable);
         }
+        if native_unavailable
+            && !acquired.coverage.iter().any(|row| {
+                row.source == SourceV1::NativeRuntime && row.state == CoverageStateV1::Unavailable
+            })
+        {
+            return Err(ReadError::InvalidSource);
+        }
+        let native = &runtime_only_schedule_native(native);
+        let native_recheck = &NativeRuntimeApprovalRecheck::NoObservedChange;
         let fallback = required_observed(&acquired.store.fallback)?.as_ref();
         self.next_position
             .resume(native, slots, fallback.is_some())?;
@@ -1844,17 +1859,21 @@ pub fn selected_saved_decision(
 ) -> Result<SelectedDecisionV1> {
     let (native, native_recheck) = required_observed(&acquired.native_runtime)?;
     let (slots, slots_recheck) = required_observed(&acquired.question_slots)?;
-    if *native_recheck != NativeRuntimeApprovalRecheck::NoObservedChange
+    let native_unavailable = !matches!(native.state, NativeRuntimeApprovalListState::Present(_));
+    if (*native_recheck != NativeRuntimeApprovalRecheck::NoObservedChange && !native_unavailable)
         || *slots_recheck != RuntimeQuestionSlotRecheck::NoObservedChange
         || acquired.coverage.len() != 8
         || native.session != slots.session
     {
         return Err(ReadError::SourceUnavailable);
     }
+    // No live native writer: the native source is Unavailable in coverage and
+    // contributes no runtime rows; durable sources still answer the selection.
+    let no_native_rows = Vec::new();
     let native_rows = match &native.state {
         NativeRuntimeApprovalListState::Present(rows) => rows,
         NativeRuntimeApprovalListState::Missing | NativeRuntimeApprovalListState::SourceChanged => {
-            return Err(ReadError::SourceUnavailable);
+            &no_native_rows
         }
     };
     let native_id = selected

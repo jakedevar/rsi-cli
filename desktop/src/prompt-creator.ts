@@ -20,9 +20,12 @@ import {
   NEW_PROMPT_CONTENT, type PromptEntry, formatSize, movePromptCursor, newPromptName, promptCursorAfter, promptListKey,
   relativeTime,
 } from './prompt-creator-model.js';
-import { isVimKeysOn } from './vimkeys.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
 import { modeOf } from './vim-field.js';
 import { focusOwnsKey } from './modal-gate.js';
+import { emptyText } from './empty-states.js';
+import { syncListbox } from './listbox-a11y.js';
+import { loadView } from './view-load.js';
 
 interface Creator {
   dir: string;
@@ -52,13 +55,20 @@ export function isPromptCreatorOpen(): boolean {
   return !!dlg?.open;
 }
 
+type PromptListing = { dir?: string; files: PromptEntry[]; truncated?: boolean };
+
+const fetchListing = (): Promise<PromptListing> => invoke<PromptListing>('list_prompt_files');
+
+function applyListing(list: PromptListing, select: string | null): void {
+  st.dir = list.dir ?? '';
+  st.files = list.files ?? [];
+  st.truncated = !!list.truncated;
+  st.at = promptCursorAfter(st.files, select, st.at);
+}
+
 async function loadList(select: string | null = null): Promise<boolean> {
   try {
-    const list = await invoke<{ dir?: string; files: PromptEntry[]; truncated?: boolean }>('list_prompt_files');
-    st.dir = list.dir ?? '';
-    st.files = list.files ?? [];
-    st.truncated = !!list.truncated;
-    st.at = promptCursorAfter(st.files, select, st.at);
+    applyListing(await fetchListing(), select);
     return true;
   } catch (e) {
     toast(`Failed to list prompts: ${String(e)}`);
@@ -76,6 +86,7 @@ function draw(): void {
     const li = el('li', `pick-item pc-card${i === st.at ? ' sel' : ''}${f.name === st.editing ? ' open' : ''}`);
     li.setAttribute('role', 'option');
     li.setAttribute('aria-selected', String(i === st.at));
+    li.dataset.key = f.name;
     li.append(el('div', 'pc-name', f.name), el('div', 'pc-first', f.first_line || '(empty)'),
       el('div', 'pc-meta', [relativeTime(f.mtime, now), formatSize(f.size)].filter(Boolean).join(' · ')));
     li.addEventListener('click', () => { st.at = i; draw(); });
@@ -84,6 +95,7 @@ function draw(): void {
   }));
   if (st.truncated) ui.list.append(el('li', 'pick-empty', 'The listing was truncated by the daemon.'));
   ui.list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
+  if (dlg) syncListbox(ui.list, dlg);
   ui.editorBox.hidden = st.editing === null;
   ui.editorTitle.textContent = st.editing ? `${st.editing}${st.dirty ? ' ●' : ''}` : '';
   dlg?.classList.toggle('pc-editing', st.editing !== null);
@@ -102,7 +114,7 @@ function build(): HTMLDialogElement {
   const list = el('ul', 'pick-list pc-list');
   list.setAttribute('role', 'listbox');
   list.setAttribute('aria-label', 'Prompts');
-  const empty = el('div', 'dialog-note', 'No prompts yet. Ctrl+N creates one.');
+  const empty = el('div', 'dialog-note', emptyText('prompts', true, currentPlatform()));
   const err = errorLine();
   const newBtn = button('New (Ctrl+N)');
   const delBtn = button('Delete to trash (d)', 'btn danger');
@@ -307,7 +319,14 @@ function close(): void {
 /** `<Space>gP`: open the prompt creator, or close it when it is open. */
 export async function togglePromptCreator(): Promise<void> {
   if (dlg?.open) { close(); return; }
-  if (!(await loadList(null))) return;
+  await loadView({
+    key: 'prompt-creator', title: 'Prompts', failed: 'Failed to list prompts',
+    read: fetchListing,
+    open: (list) => { applyListing(list, null); showPromptCreator(); },
+  });
+}
+
+function showPromptCreator(): void {
   dlg = build();
   st.editing = null;
   st.dirty = false;

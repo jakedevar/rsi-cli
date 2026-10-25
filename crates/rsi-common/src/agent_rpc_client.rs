@@ -271,7 +271,26 @@ mod tests {
     use serde_json::json;
     use std::io::BufRead as _;
     use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+
+    /// A fresh test directory under `/tmp` so `<dir>/daemon.sock` fits
+    /// `sun_path` (104 bytes on macOS) even when the sandbox `TMPDIR` is long
+    /// (#176). Removed on drop; production socket paths are unchanged.
+    fn socket_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("rsi-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        // macOS `sun_path` is 104 bytes; leave room for `/daemon.sock`.
+        assert!(
+            dir.path().as_os_str().len() + "/daemon.sock".len() < 104,
+            "socket dir {} too long for sun_path",
+            dir.path().display()
+        );
+        dir
+    }
 
     fn read_request(stream: &UnixStream) -> Value {
         stream
@@ -286,7 +305,7 @@ mod tests {
 
     #[test]
     fn dispatch_retries_when_socket_appears_after_300ms() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         let server_socket = socket.clone();
         let server = thread::spawn(move || {
@@ -311,7 +330,7 @@ mod tests {
 
     #[test]
     fn dispatch_retries_refused_stale_socket() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         drop(UnixListener::bind(&socket).unwrap());
         assert_eq!(
@@ -341,7 +360,7 @@ mod tests {
 
     #[test]
     fn missing_socket_expires_within_hook_budget() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let budget = crate::boundary_mail_hook::CONFIRM_TIMEOUT;
         let started = Instant::now();
         let err = dispatch_with_timeout(
@@ -372,37 +391,62 @@ mod tests {
 
     #[test]
     fn response_timeout_uses_budget_left_after_connect_retry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         let server_socket = socket.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = Arc::clone(&done);
+        // The server never blocks on a client that gave up: a blocking
+        // `accept()` here hung the whole test run when a stalled host let the
+        // client's budget expire before the socket appeared (#194).
         let server = thread::spawn(move || {
             thread::sleep(Duration::from_millis(300));
             let listener = UnixListener::bind(server_socket).unwrap();
-            let (stream, _) = listener.accept().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            && !server_done.load(Ordering::SeqCst) =>
+                    {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            // An accepted socket may inherit the listener's non-blocking mode.
+            stream.set_nonblocking(false).unwrap();
             read_request(&stream);
-            // Keep the socket open past the client's whole-call budget.
-            thread::sleep(Duration::from_millis(400));
+            // Keep the socket open until the client's whole-call budget is spent.
+            while !server_done.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            true
         });
+        let budget = Duration::from_millis(1200);
         let started = Instant::now();
-        let err = dispatch_with_timeout(
-            &socket,
-            "AgentGetStatus",
-            json!({}),
-            Duration::from_millis(600),
-        )
-        .unwrap_err();
+        let err = dispatch_with_timeout(&socket, "AgentGetStatus", json!({}), budget).unwrap_err();
         let elapsed = started.elapsed();
-        assert!(matches!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ));
-        assert!(elapsed < Duration::from_millis(850), "elapsed: {elapsed:?}");
-        server.join().unwrap();
+        done.store(true, Ordering::SeqCst);
+        let connected = server.join().unwrap();
+        assert!(
+            connected,
+            "client gave up before the server bound (host stalled?): {err}"
+        );
+        assert!(
+            response_timeout(&err).is_some(),
+            "expected a response timeout after connecting, got {err:?}"
+        );
+        assert!(
+            elapsed >= budget && elapsed < budget + Duration::from_millis(250),
+            "elapsed: {elapsed:?}"
+        );
     }
 
     #[test]
     fn trickling_response_cannot_extend_deadline() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -433,7 +477,7 @@ mod tests {
 
     #[test]
     fn slow_response_is_a_typed_replayable_timeout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {
@@ -483,7 +527,7 @@ mod tests {
 
     #[test]
     fn connect_timeout_is_not_a_response_timeout() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let err = dispatch_with_timeout(
             &dir.path().join("missing.sock"),
             "AgentGetStatus",
@@ -496,7 +540,7 @@ mod tests {
 
     #[test]
     fn request_is_not_replayed_after_server_closes_connection() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = socket_tempdir();
         let socket = dir.path().join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = thread::spawn(move || {

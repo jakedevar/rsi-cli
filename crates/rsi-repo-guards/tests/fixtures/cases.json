@@ -1,0 +1,16 @@
+[
+  {"name":"identity-assignments-and-ascii-predecessors","guard":"identity-assertions","args":["sample.rs"],"files":{"sample.rs":"title: Some(\"Orchid\")\n!screen.contains(\"Orchid\"); !other.contains(\"Orchid\")\na!screen.contains(\"Orchid\")\n_!screen.contains(\"Orchid\")\n9!screen.contains(\"Orchid\")\né!screen.contains(\"Orchid\")\n!screen.contains(\"chrome\")\n"}},
+  {"name":"identity-late-assignment-and-crlf","guard":"identity-assertions","args":["sample.rs"],"files":{"sample.rs":" !out.contains(\"Petal's\")\r\nname = \"Petal's\"\r\n"}},
+  {"name":"identity-escapes","guard":"identity-assertions","args":["sample.rs"],"files":{"sample.rs":"query: \"A\\\"B\"\n!out.contains(\"A\\\"B\")\n"}},
+  {"name":"identity-default-and-order","guard":"identity-assertions","args":[],"files":{"crates/z.rs":"name: \"Zinnia\"\n!out.contains(\"Zinnia\")\n","crates/a.rs":"display_title = \"Aster\"\n!out.contains(\"Aster\")\n","crates/readme.txt":"name: \"Iris\"\n!out.contains(\"Iris\")\n"}},
+  {"name":"identity-missing-and-clean","guard":"identity-assertions","args":["missing.rs","sample.rs"],"files":{"sample.rs":"short_summary: \"Fern\"\nassert!(out.contains(\"Fern\"));\n!out.contains(\"chrome\");\n"}},
+  {"name":"personal-default-skips","guard":"personal-paths","args":[],"files":{"safe.txt":"$HOME/rsi ~/rsi /home/user/rsi remote.example.net 203.0.113.10\n","thoughts/history.md":"{IP}\n","Cargo.lock":"{IP}\n","image.svg":"{IP}\n","binary.dat":"ignored\u0000{IP}\n"}},
+  {"name":"personal-public-and-leading-zeros","guard":"personal-paths","args":["sample.txt"],"files":{"sample.txt":"bad={IP} resolver=8.8.8.8\nversion=1.2.3.4.5 invalid=999.1.2.3 leading=01.2.3.4\n"}},
+  {"name":"personal-fixture-exemption","guard":"personal-paths","args":["./crates/rsi-common/src/egress_policy.rs","crates/rsid/src/session/harness/egress.rs","egress_policy.rs"],"files":{"crates/rsi-common/src/egress_policy.rs":"host={IP}\n","crates/rsid/src/session/harness/egress.rs":"host={IP}\n","egress_policy.rs":"host={IP}\n"}},
+  {"name":"personal-missing","guard":"personal-paths","args":["missing.txt"],"files":{}},
+  {"name":"operator-staged-private-output","guard":"operator-identifiers","args":["--staged"],"ids":"# synthetic contacts\norchid@example.invalid\n555-0100-0199\n","files":{"thoughts/contact.md":"first\nORCHID@EXAMPLE.INVALID 555-0100-0199\n"}},
+  {"name":"operator-clean","guard":"operator-identifiers","args":["--staged"],"ids":"orchid@example.invalid\n","files":{"notes.md":"the operator's release contact (local config)\n"}},
+  {"name":"operator-no-list","guard":"operator-identifiers","args":["--staged"],"files":{"notes.md":"orchid@example.invalid\n"}},
+  {"name":"operator-empty-list","guard":"operator-identifiers","args":["--staged"],"ids":"# comment\n\n","files":{"notes.md":"orchid@example.invalid\n"}},
+  {"name":"operator-unreadable-range","guard":"operator-identifiers","args":["--range","deadbeef..cafebabe"],"ids":"orchid@example.invalid\n","files":{"notes.md":"orchid@example.invalid\n"}}
+]

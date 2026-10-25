@@ -538,7 +538,12 @@ async fn test_e2e_startup_readiness_withheld_rpc() -> E2eResult<()> {
                 test_error(format!("draft after held-RPC resize missing: {error:?}"))
             })?;
 
-        term.send_key(Key::Ctrl('c'))
+        // The refused draft is still open in the prompt overlay, which owns
+        // every key: Ctrl-Q closes it, then the real `:q` command quits.
+        term.send_key(Key::Ctrl('q'))
+            .await
+            .map_err(|error| test_error(format!("close held-RPC draft: {error:?}")))?;
+        quit_tui(&term)
             .await
             .map_err(|error| test_error(format!("quit held-RPC TUI: {error:?}")))?;
         term.wait_exit()
@@ -587,6 +592,13 @@ async fn test_e2e_codex_capability_display() -> E2eResult<()> {
     let mut harness = E2eHarness::new()?;
     let result = harness.run_codex_capability_display().await;
     harness.shutdown_daemon();
+    if result.is_err() {
+        eprintln!(
+            "[codex-capability] phase={} daemon log:\n{}",
+            harness.phase,
+            fs::read_to_string(harness.artifacts_dir.join("rsid.log")).unwrap_or_default()
+        );
+    }
     result
 }
 
@@ -703,9 +715,15 @@ impl E2eHarness {
     }
 
     fn start_daemon(&mut self) -> E2eResult<()> {
-        let rsid_log_file = fs::File::create(self.artifacts_dir.join("rsid.log"))?;
+        self.start_daemon_command(Command::new(&self.rsid_bin_path))
+    }
 
-        let mut cmd = Command::new(&self.rsid_bin_path);
+    fn start_daemon_with_fixture_scopes(&mut self) -> E2eResult<()> {
+        self.start_daemon_command(fixture_daemon_command(&self.rsid_bin_path, &self.bin_dir)?)
+    }
+
+    fn start_daemon_command(&mut self, mut cmd: Command) -> E2eResult<()> {
+        let rsid_log_file = fs::File::create(self.artifacts_dir.join("rsid.log"))?;
         cmd.env_remove("RSI_SESSION_TOKEN")
             .env_remove("RSI_SESSION_ID")
             .env("HOME", &self.home_dir)
@@ -764,6 +782,7 @@ impl E2eHarness {
                                 &[
                                     "host_load_admission_threshold",
                                     "governor_min_free_disk_gb",
+                                    "sandbox_min_free_gib",
                                     "job_thermal_ceiling_c",
                                 ]
                                 .map(|field| (field.to_string(), serde_json::json!(0))),
@@ -1049,7 +1068,8 @@ impl E2eHarness {
                 .timeout(Duration::from_secs(5))
                 .await
                 .map_err(|error| test_error(format!("fixture project missing: {error:?}")))?;
-            term.send_key(Key::Char('j'))
+            // Down, not `j`: the project picker types every printable key into its filter (#3288).
+            term.send_key(Key::Down)
                 .await
                 .map_err(|error| test_error(format!("select fixture project: {error:?}")))?;
             term.enter()
@@ -1096,7 +1116,9 @@ impl E2eHarness {
                 .map_err(|error| test_error(format!("final Issue page missing row: {error:?}")))?;
 
             // The create form is a real pane child; dirty Escape is a two-step
-            // discard and returns to the same UUID-owned Local selection.
+            // discard and returns to the same UUID-owned Local selection. Its
+            // fields are vim textareas (#3421): the first Esc only leaves
+            // insert mode, then Esc from normal mode asks to discard.
             term.send_key(Key::Char('n'))
                 .await
                 .map_err(|error| test_error(format!("open Issue create form: {error:?}")))?;
@@ -1107,6 +1129,15 @@ impl E2eHarness {
             term.type_str("discarded e2e draft")
                 .await
                 .map_err(|error| test_error(format!("type Issue draft: {error:?}")))?;
+            term.send_key(Key::Escape)
+                .await
+                .map_err(|error| test_error(format!("leave Issue insert mode: {error:?}")))?;
+            term.expect("NORMAL")
+                .timeout(Duration::from_secs(5))
+                .await
+                .map_err(|error| {
+                    test_error(format!("Issue field normal mode missing: {error:?}"))
+                })?;
             term.send_key(Key::Escape)
                 .await
                 .map_err(|error| test_error(format!("arm Issue draft discard: {error:?}")))?;
@@ -1550,7 +1581,7 @@ impl E2eHarness {
                 .await
                 .map_err(|error| test_error(format!("fresh preview state missing: {error:?}")))?;
 
-            term.send_key(Key::Ctrl('c'))
+            quit_tui(&term)
                 .await
                 .map_err(|error| test_error(format!("quit delayed-preview TUI: {error:?}")))?;
             term.wait_exit().await.map_err(|error| {
@@ -1590,7 +1621,7 @@ impl E2eHarness {
         const CONFIGURED_TITLE: &str = "CODEX CAPABILITY CONFIGURED E2E";
 
         self.phase = "codex-capability-daemon-startup";
-        self.start_daemon()?;
+        self.start_daemon_with_fixture_scopes()?;
         self.phase = "codex-capability-daemon-readiness";
         let mut client = self.wait_for_daemon().await?;
 
@@ -1707,7 +1738,7 @@ impl E2eHarness {
 
         self.phase = "codex-capability-restart";
         self.shutdown_daemon();
-        self.start_daemon()?;
+        self.start_daemon_with_fixture_scopes()?;
         let mut client = self.wait_for_daemon().await?;
         let reopened_rows = client
             .list_sessions()
@@ -2525,6 +2556,46 @@ impl E2eHarness {
     }
 }
 
+/// Provider fixtures run under the test job's bounds, without reaching the
+/// host user manager (whose bus cannot authenticate peers in a PID namespace).
+/// Bind the direct scope runner only inside this daemon's private mount
+/// namespace. The production binary and host systemd launcher stay intact.
+fn fixture_daemon_command(daemon: &Path, bin_dir: &Path) -> E2eResult<Command> {
+    #[cfg(target_os = "linux")]
+    {
+        let runner = bin_dir.join("systemd-run-fixture");
+        fs::write(
+            &runner,
+            include_bytes!("../../rsid/tests/fixtures/process_scope_direct_runner.sh"),
+        )?;
+        fs::set_permissions(&runner, fs::Permissions::from_mode(0o755))?;
+        let mut command = Command::new(find_executable("unshare")?);
+        command
+            .args([
+                "--user",
+                "--map-current-user",
+                "--keep-caps",
+                "--mount",
+                "--propagation",
+                "private",
+                "--",
+                "/bin/sh",
+                "-eu",
+                "-c",
+                "mount --bind \"$1\" /usr/bin/systemd-run; shift; exec \"$@\"",
+                "rsi-e2e-daemon",
+            ])
+            .arg(runner)
+            .arg(daemon);
+        Ok(command)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = bin_dir;
+        Ok(Command::new(daemon))
+    }
+}
+
 fn install_provider_stubs(bin_dir: &Path) -> E2eResult<()> {
     let stub_content =
         "#!/bin/sh\necho \"rsi e2e provider stub invoked unexpectedly\" >&2\nexit 1\n";
@@ -2693,6 +2764,43 @@ exec "$RSI_E2E_REAL_GIT" "$@"
     permissions.set_mode(0o755);
     fs::set_permissions(wrapper, permissions)?;
     Ok(())
+}
+
+/// Quit the TUI the way an operator does (#3434): Ctrl-C only shows a hint, so
+/// Escape out of any overlay or insert state, then run the real `:q` command.
+/// Every e2e test that ends its TUI goes through this one helper.
+///
+/// An overlay that owns every key and closes on `q` (the graph review) is left
+/// with a second attempt that presses `q` first. A TUI that still has not
+/// exited afterwards is killed so a teardown never waits on it forever.
+async fn quit_tui(term: &Terminal) -> E2eResult<()> {
+    let send = |key: Key| async move {
+        term.send_key(key)
+            .await
+            .map(|_| ())
+            .map_err(|error| test_error(format!("quit key: {error:?}")))
+    };
+    for close_overlay_first in [false, true] {
+        if close_overlay_first {
+            send(Key::Char('q')).await?;
+        }
+        send(Key::Escape).await?;
+        send(Key::Escape).await?;
+        for c in ":q".chars() {
+            send(Key::Char(c)).await?;
+        }
+        send(Key::Enter).await?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if term.has_exited().await {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    term.kill()
+        .await
+        .map_err(|error| test_error(format!("kill TUI that ignored :q: {error:?}")))
 }
 
 fn test_error(message: impl Into<String>) -> Box<dyn Error + Send + Sync> {

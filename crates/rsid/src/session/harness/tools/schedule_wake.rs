@@ -9,7 +9,6 @@ use rsi_common::agent_control_schema::AgentControlVerbV1;
 use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 pub use crate::store_support::schedule_wake_job::{ScheduleWakeRequest, build_scheduled_job};
@@ -24,7 +23,7 @@ pub(crate) struct WakeWhenRequest {
     pub name: Option<String>,
     pub predicate: rsi_common::wake_predicate::WakePredicate,
     pub timeout_seconds: Option<i64>,
-    /// The caller's own repository directory, for `sha_on_rolling`.
+    /// The caller's own repository directory, for rolling commit predicates.
     pub working_dir: PathBuf,
     pub provider: Option<rsi_common::types::SessionProvider>,
     pub model: Option<String>,
@@ -52,6 +51,7 @@ pub(crate) fn build_wake_when_job(
             .timeout_seconds
             .map(|seconds| now + chrono::Duration::seconds(seconds)),
         repo_dir: Some(req.working_dir.to_string_lossy().into_owned()),
+        delivered_shas: Vec::new(),
     };
     let job = ScheduledJob {
         id: Uuid::new_v4(),
@@ -79,7 +79,7 @@ pub(crate) fn build_wake_when_job(
 /// Captured at construction from `LaunchConfig`; never exposed through the
 /// JSON schema — the agent cannot widen its own session context.
 pub struct ScheduleWakeTool {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     /// The RSI session UUID of the originating harness session.
     /// Used for `mode:"resume"` and `mode:"on_terminal"` jobs.
     origin_session_id: Option<Uuid>,
@@ -100,7 +100,7 @@ pub struct ScheduleWakeTool {
 impl ScheduleWakeTool {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         origin_session_id: Option<Uuid>,
         default_working_dir: PathBuf,
         provider: Option<rsi_common::types::SessionProvider>,
@@ -315,7 +315,7 @@ impl HarnessTool for ScheduleWakeTool {
              registers the deterministic master-orchestrate program sentinel. In 'when' \
              mode the daemon evaluates the 'when' predicate (jobs_terminal: every listed \
              AgentSubmitJob job you own is terminal; sha_on_rolling: that commit is on \
-             origin/rolling; issue_closed: that Issue number in your project is Closed; todo_closed: that operator to-do id in your scope is done or dismissed; topology_execution_settled: that topology execution id is succeeded, failed, cancelled or blocked; settlement_run_settled: that source-worktree settlement run id (from AgentApplySourceWorktreeCohort) is finished; health_anomaly: manager seats only, the daemon checks its health conditions every minute with no model turn and wakes you only when one holds) and resumes this session ONCE when it is true, unsatisfiable \
+             origin/rolling; shas_on_rolling: all 1-32 distinct commits are on origin/rolling, reporting each SHA's state (with fire 'each', once per landing until the last lands; one wake watches every queued source, and a session holds at most 16 enabled 'when' wakes, refused wake_when_cap_reached past that); issue_closed: that Issue number in your project is Closed; todo_closed: that operator to-do id in your scope is done or dismissed; topology_execution_settled: that topology execution id is succeeded, failed, cancelled or blocked; settlement_run_settled: that source-worktree settlement run id (from AgentApplySourceWorktreeCohort) is finished; health_anomaly: manager seats only, the daemon checks its health conditions every minute with no model turn and wakes you only when one holds) and resumes this session ONCE when it is true, unsatisfiable \
              or past 'timeout_seconds' (timed_out true), carrying each job's id, name, \
              state, exit code and refusal; submit the batch with wake 'none' first. Jobs fire \
              within ~60 seconds of the requested time. One-shot or recurring."
@@ -504,12 +504,12 @@ mod tests {
     use crate::store::Store;
     use std::path::Path;
 
-    fn make_store() -> Arc<Mutex<Store>> {
+    fn make_store() -> Arc<rsid_core::store_lock::Mutex<Store>> {
         let store = Store::open_in_memory().expect("in-memory store");
-        Arc::new(Mutex::new(store))
+        Arc::new(rsid_core::store_lock::Mutex::new(store))
     }
 
-    fn make_tool(store: Arc<Mutex<Store>>) -> ScheduleWakeTool {
+    fn make_tool(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> ScheduleWakeTool {
         ScheduleWakeTool::new(
             store,
             Some(Uuid::new_v4()),
@@ -524,7 +524,13 @@ mod tests {
     /// Watch-capable fixture: a control handle over the SAME store as the
     /// tool (as in production, where both come from the `SessionManager`),
     /// with a persisted caller, its direct child, and an unrelated stranger.
-    async fn make_watch_tool() -> (ScheduleWakeTool, Arc<Mutex<Store>>, Uuid, Uuid, Uuid) {
+    async fn make_watch_tool() -> (
+        ScheduleWakeTool,
+        Arc<rsid_core::store_lock::Mutex<Store>>,
+        Uuid,
+        Uuid,
+        Uuid,
+    ) {
         use crate::session::agent_verbs::tests::test_session;
         use crate::session::spawn_coordinator::SpawnCoordinator;
         use std::collections::HashMap;
@@ -997,6 +1003,7 @@ mod tests {
             project_id: None,
             name: Some("check".into()),
             params: JobParams::Build(BuildJobParams {
+                release_members: Vec::new(),
                 command: BuildCommand::Check,
                 package: None,
                 workspace: true,
@@ -1005,6 +1012,7 @@ mod tests {
                 no_default_features: false,
                 features: Vec::new(),
                 shards: Vec::new(),
+                bins: Vec::new(),
                 cpu_quota_percent: None,
                 sha: None,
             }),

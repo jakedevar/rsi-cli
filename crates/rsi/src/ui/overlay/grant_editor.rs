@@ -59,7 +59,8 @@ fn row_line(editor: &GrantEditor, row: GrantRow, selected: bool) -> Line<'static
     match row {
         GrantRow::Capability(_) | GrantRow::Launch(_) => {
             let on = value == "[x]";
-            Line::from(vec![
+            let hint = editor.launch_hint(row);
+            let mut spans = vec![
                 marker,
                 Span::styled(
                     value,
@@ -77,7 +78,14 @@ fn row_line(editor: &GrantEditor, row: GrantRow, selected: bool) -> Line<'static
                 ),
                 Span::raw(" "),
                 Span::styled(editor.label(row), label_style),
-            ])
+            ];
+            if let Some(hint) = hint {
+                spans.push(Span::styled(
+                    format!("  {hint}"),
+                    Style::default().fg(theme::peach()),
+                ));
+            }
+            Line::from(spans)
         }
         GrantRow::Preset | GrantRow::Mode => {
             let mut spans = vec![
@@ -266,6 +274,32 @@ mod tests {
         ] {
             assert!(text.contains(needle), "{needle} in\n{text}");
         }
+    }
+
+    #[test]
+    fn a_launch_the_ancestor_grant_does_not_cover_carries_the_hint() {
+        let launches = default_allowed_launches();
+        let mut policy = default_project_policy();
+        policy.allowed_launches = launches[..2].to_vec();
+        let mut editor =
+            GrantEditor::for_manager(policy, HarnessManagerScopeModeV1::Project, launches.clone());
+        editor.set_ancestor_launches(Some(vec![launches[0].clone()]));
+        editor.select_row(GrantRow::Launch(1));
+        let text = render(&editor, 120, 50);
+        let line = |needle: &str| {
+            text.lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in\n{text}"))
+                .to_string()
+        };
+        assert!(
+            line(&launches[1].display()).contains("not granted by global manager"),
+            "{text}"
+        );
+        assert!(
+            text.contains("add with :manager portfolio launch add"),
+            "the footer names the fix:\n{text}"
+        );
     }
 
     #[test]

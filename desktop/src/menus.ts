@@ -6,10 +6,12 @@
 // context menu stays.
 import { api, inTauri } from './api.js';
 import { dispatch, setContextEvent, snapshot } from './commands.js';
+import { isTypingTarget } from './keyengine.js';
 import { select } from './sessions.js';
-import { appMenuModel, contextMenuModel, menuState, parseMenuId } from './registry.js';
+import { appMenuModel, contextMenuModel, isNewSessionChord, type MenuInstallReport, menuInstallProblem, menuState, parseMenuId } from './registry.js';
+import { reportRuntimeError } from './runtime-notice.js';
 import { onUiChange } from './state.js';
-import { currentPlatform } from './vimkeys.js';
+import { currentPlatform, isVimKeysOn } from './vimkeys.js';
 
 export const MENU_EVENT = 'menu-action';
 
@@ -39,14 +41,44 @@ function popup(kind: 'session-row' | 'event'): void {
   api.popupContextMenu(contextMenuModel(kind, snapshot())).catch(() => undefined);
 }
 
+/**
+ * Cmd-N (Ctrl-N off macOS) opens New session from anywhere, the message box included, with the Vim keys off too
+ * (#305), as Cmd-K and Cmd-, do. With the Vim keys on, the list's own Ctrl-N binding (the key engine) keeps it
+ * outside text fields. An open dialog keeps the chord (the palette moves down with Ctrl-N), and so does the
+ * terminal overlay's shell. A native menu accelerator firing as well is dropped by the dispatch Deduper.
+ */
+export function wireNewSessionChord(): void {
+  window.addEventListener('keydown', (ev) => {
+    if (ev.defaultPrevented || !isNewSessionChord(ev, currentPlatform())) return;
+    if (document.querySelector('dialog[open]')) return;
+    const t = document.activeElement as HTMLElement | null;
+    if (ev.ctrlKey && t?.closest('.terminal-overlay')) return;
+    if (isVimKeysOn() && !isTypingTarget(t)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    dispatch('launch', { source: 'key' });
+  }, { capture: true });
+}
+
+/** Tell the operator, not just the console, when the bar did not fully install (menu.rs logged it already). */
+function reportMenuInstall(model: ReturnType<typeof appMenuModel>, report: MenuInstallReport | null, failure?: unknown): void {
+  const text = menuInstallProblem(model, report, currentPlatform(), failure);
+  if (!text) return;
+  console.warn(text);
+  const raw = failure !== undefined ? String((failure as Error)?.message ?? failure) : JSON.stringify(report?.skipped ?? []);
+  reportRuntimeError(`menu bar: ${raw}`, () => undefined, Date.now(), text);
+}
+
 export async function initMenus(): Promise<void> {
+  wireNewSessionChord();
   if (!inTauri()) return;
   const model = appMenuModel(currentPlatform(), snapshot());
   try {
-    await api.setAppMenu(model);
+    const report = await api.setAppMenu(model);
     lastState = JSON.stringify(menuState(model));
+    reportMenuInstall(model, report ?? null);
   } catch (e) {
-    console.warn('app menu not installed', e);
+    reportMenuInstall(model, null, e);
   }
   const listen = (globalThis as unknown as { __TAURI__?: TauriEvents }).__TAURI__?.event?.listen;
   if (listen) void listen(MENU_EVENT, (e) => onMenuAction(e.payload));

@@ -5,8 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/slices.mjs && tsc -p . && node scripts/copy-static.mjs",
-    "typecheck": "tsc -p . --noEmit",
-    "test": "node scripts/slices.mjs --check && npm run build && node scripts/parity.mjs --check && node scripts/source-guard.mjs --check && node --test tests/*.test.mjs",
+    "typecheck": "node scripts/slices.mjs && tsc -p . --noEmit",
+    "test": "npm run build && node scripts/parity.mjs && node scripts/source-guard.mjs --check && node --test tests/*.test.mjs",
+    "test:vim-repeat": "npm run build && node scripts/smoke-vim-repeat.mjs",
+    "parity": "node scripts/slices.mjs && node scripts/parity.mjs --print",
+    "audit": "npm run build && node scripts/audit.mjs",
+    "smoke:webkit": "npm run build && node scripts/smoke-webkit.mjs",
+    "smoke:app": "node scripts/smoke-app.mjs",
     "tauri": "cargo tauri"
   },
   "devDependencies": {

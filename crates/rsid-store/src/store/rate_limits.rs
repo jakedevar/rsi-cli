@@ -16,9 +16,131 @@ use super::Store;
 use super::row_mappers::{session_provider_to_str, str_to_session_provider};
 use crate::error::Result;
 use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
-use rusqlite::params;
+use rusqlite::{Transaction, TransactionBehavior, params};
 
 impl Store {
+    /// Invalidate old telemetry without deleting account history. Internal state,
+    /// not an operator setting; the operator uses ClearProviderUsageHold.
+    pub fn invalidate_provider_rate_limits(
+        &self,
+        provider: rsi_common::types::SessionProvider,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let key = format!(
+            "provider_rate_limits.invalidated_at.{}",
+            session_provider_to_str(provider)
+        );
+        let previous = self.get_daemon_setting(&key)?;
+        if previous
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at >= now)
+        {
+            return Ok(());
+        }
+        self.set_daemon_setting(
+            &key,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        )
+    }
+
+    /// Compare opaque account fingerprints across probes and daemon restarts.
+    /// The first identifiable account establishes a baseline; missing identity
+    /// must never clear a known hold. No personal account fields are persisted.
+    pub fn observe_provider_rate_limit_account(
+        &self,
+        provider: rsi_common::types::SessionProvider,
+        fingerprint: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let key = format!(
+            "provider_rate_limits.account.{}",
+            session_provider_to_str(provider)
+        );
+        let previous = self.get_daemon_setting(&key)?;
+        let changed = previous.as_deref().is_some_and(|old| old != fingerprint);
+        if changed {
+            self.invalidate_provider_rate_limits(provider, now)?;
+        }
+        if previous.as_deref() != Some(fingerprint) {
+            self.set_daemon_setting(&key, fingerprint)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Fresh evidence is required after a released wake was refused again.
+    pub(super) fn provider_capacity_observed_since(
+        &self,
+        provider: rsi_common::types::SessionProvider,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        let invalidated_at = self.get_daemon_setting(&format!(
+            "provider_rate_limits.invalidated_at.{}",
+            session_provider_to_str(provider),
+        ))?;
+        let switched = invalidated_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| at > since);
+        Ok(switched
+            || self
+                .load_provider_rate_limit_snapshots()?
+                .iter()
+                .any(|snapshot| snapshot.provider == provider && snapshot.observed_at > since))
+    }
+
+    /// Keep a durable marker even for a wake outside a manager notice cohort.
+    pub fn mark_provider_window_wake_hold(
+        &self,
+        id: uuid::Uuid,
+        provider: rsi_common::types::SessionProvider,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_jobs SET schedule_json=json_set(schedule_json,'$.provider_window_hold',?2)
+             WHERE id=?1 AND enabled=1 AND json_valid(schedule_json)",
+            params![id.to_string(), session_provider_to_str(provider)],
+        )?;
+        Ok(())
+    }
+
+    /// Manager episodes release their own wakes with their normal bounded
+    /// staggering. Wakes without an episode must also recover on a switch.
+    pub(super) fn release_unmanaged_provider_window_wakes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, json_extract(schedule_json,'$.provider_window_hold') FROM scheduled_jobs j
+             WHERE enabled=1 AND json_valid(schedule_json)
+               AND json_extract(schedule_json,'$.provider_window_hold') IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM harness_manager_v2_events e
+                 WHERE e.kind='provider_window_work' AND json_extract(e.payload_json,'$.kind')='wake'
+                   AND json_extract(e.payload_json,'$.id')=j.id)",
+        )?;
+        let held = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, provider) in held {
+            let provider = str_to_session_provider(&provider)?;
+            if self
+                .provider_usage_window_hold_until(provider, now)?
+                .is_none()
+            {
+                self.conn.execute(
+                    "UPDATE scheduled_jobs SET next_fire_at=MIN(next_fire_at,?2),
+                       schedule_json=json_remove(schedule_json,'$.provider_window_hold')
+                     WHERE id=?1 AND enabled=1",
+                    params![id, now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Upsert every window in a snapshot, latest-wins.
     ///
     /// Windows are keyed by the provider's own `unifiedWindows` key rather than
@@ -84,6 +206,8 @@ impl Store {
             "SELECT provider, window_key, utilization, resets_at_epoch, status,
                     rate_limit_type, overage_status, is_using_overage, observed_at
              FROM provider_rate_limit_windows
+             WHERE observed_at > COALESCE((SELECT value FROM daemon_settings
+                 WHERE key = 'provider_rate_limits.invalidated_at.' || provider), '')
              ORDER BY provider ASC, window_key ASC",
         )?;
 
@@ -164,5 +288,120 @@ impl Store {
             }
         }
         Ok(snapshots)
+    }
+}
+
+#[cfg(all(
+    test,
+    any(not(feature = "test-shard-mode"), feature = "test-shard-store-03")
+))]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Utc};
+    use rsi_common::types::SessionProvider;
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn account_switch_invalidates_old_windows_and_fresh_usage_enforces_again() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let snapshot = |provider, observed_at| ProviderRateLimitSnapshot {
+            provider,
+            status: Some("rejected".into()),
+            rate_limit_type: None,
+            overage_status: None,
+            is_using_overage: false,
+            observed_at,
+            windows: vec![ProviderRateLimitWindow {
+                window_key: "seven_day".into(),
+                utilization: 1.0,
+                resets_at_epoch: Some((now + Duration::days(4)).timestamp()),
+            }],
+            stale_reason: None,
+        };
+        store
+            .upsert_provider_rate_limit_snapshot(&snapshot(SessionProvider::Claude, now), None)
+            .unwrap();
+        store
+            .upsert_provider_rate_limit_snapshot(&snapshot(SessionProvider::Codex, now), None)
+            .unwrap();
+        // The first observation cannot establish which account old rows belonged to.
+        assert!(
+            !store
+                .observe_provider_rate_limit_account(SessionProvider::Claude, "account-a", now)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .observe_provider_rate_limit_account(SessionProvider::Claude, "account-a", now)
+                .unwrap()
+        );
+        assert!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Claude, Utc::now())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-b",
+                    now + Duration::seconds(1)
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Claude, Utc::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Codex, Utc::now())
+                .unwrap()
+                .is_some()
+        );
+        let retained: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM provider_rate_limit_windows",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 2, "invalidation preserves the rows");
+        assert!(
+            !store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-b",
+                    now + Duration::seconds(2)
+                )
+                .unwrap()
+        );
+        store
+            .upsert_provider_rate_limit_snapshot(
+                &snapshot(SessionProvider::Claude, now + Duration::seconds(3)),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Claude, Utc::now())
+                .unwrap()
+                .is_some(),
+            "fresh exhausted telemetry still gates launches"
+        );
+        store
+            .invalidate_provider_rate_limits(SessionProvider::Claude, now + Duration::seconds(4))
+            .unwrap();
+        assert!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Claude, Utc::now())
+                .unwrap()
+                .is_none()
+        );
     }
 }

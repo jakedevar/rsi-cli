@@ -52,7 +52,13 @@ function is_ai_trailer(line,    rest, name, addr, lt, gt, domain, local, at) {
 }
 {
   if (tolower($0) ~ /^[ \t]*co-authored-by:/ && is_ai_trailer($0)) next
-  if (tolower($0) ~ /^[ \t]*(.?.?.?.?)?generated (with|by) \[?(claude|codex|openai|chatgpt|copilot|gemini)/) next
+  # The banner may be indented by any whitespace and may open with an emoji and a space
+  # ("🤖 Generated with ..."): up to four non-alphanumeric, non-space characters (an emoji; in a
+  # C/POSIX locale it is four BYTES, which is why the old `.?.?.?.?` allowance missed the emoji and
+  # its space) and then spaces. The prefix is one contiguous run, so a deeply quoted documentary
+  # line such as `> > > Generated with ...` is not matched (#482). The product must end at a
+  # word boundary, so a line about "ClaudeCompat" is documentary text, not the banner.
+  if (tolower($0) ~ /^[ \t]*[^a-z0-9 \t]?[^a-z0-9 \t]?[^a-z0-9 \t]?[^a-z0-9 \t]?[ \t]*generated (with|by) \[?(claude|codex|openai|chatgpt|copilot|gemini)([^a-z0-9]|$)/) next
   print
 }
 ' "$msg_file" > "$tmp"

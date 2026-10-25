@@ -29,3 +29,19 @@ pub fn short_socket_dir(prefix: &str) -> tempfile::TempDir {
 pub fn short_socket_path(label: &str) -> PathBuf {
     PathBuf::from("/tmp").join(format!("rsi-test-{label}-{}.sock", uuid::Uuid::new_v4()))
 }
+
+/// A fresh temp dir for a fake-daemon Unix socket (`<dir>/daemon.sock`).
+/// On unix it lives under `/tmp`, so the socket path fits `SUN_LEN` (104
+/// bytes on macOS) even when `TMPDIR` is a long sandbox path; elsewhere it
+/// is the platform default temp dir, as before (#80). Drop-in for
+/// `tempfile::tempdir()`.
+pub fn socket_tempdir() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    {
+        tempfile::Builder::new().prefix("rsi-").tempdir_in("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir()
+    }
+}

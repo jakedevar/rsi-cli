@@ -367,7 +367,7 @@ test('every manager RPC the desktop calls is an operator method the TUI client u
   const methods = [...new Set(commands().values())].sort();
   assert.deepEqual(methods, [
     'AnswerHarnessManagerDecision', 'ArchiveStaleManagerDecisions', 'ConfigureHarnessManager', 'ConfigureHarnessManagerPolicy',
-    'ConfigurePortfolioNode', 'GetFleetOverview', 'GetGlobalManager', 'GetGlobalManagerBudget', 'GetGlobalManagerWorkspace',
+    'ConfigurePortfolioNode', 'GetFleetOverview', 'GetGlobalDashboard', 'GetGlobalManager', 'GetGlobalManagerBudget', 'GetGlobalManagerWorkspace',
     'GetHarnessManager', 'GetHarnessManagerPolicy', 'GetHarnessManagerState', 'GetManagerNode', 'GetManagerTree',
     'GetPortfolioNode', 'ListFrictionRollup', 'ListHarnessManagerScope', 'ListOperatorEscalations', 'ListPortfolioNodes',
     'ListStaleManagerDecisions', 'RevokeGlobalManager', 'RevokeManagerNode', 'RevokePortfolioNode',

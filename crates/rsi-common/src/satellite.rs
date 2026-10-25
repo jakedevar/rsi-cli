@@ -148,6 +148,17 @@ pub struct SatellitePlatformV1 {
     pub arch: String,
 }
 
+/// Disk admission facts sampled by the satellite's job governor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatelliteGovernorDiskV1 {
+    pub free_bytes: Option<u64>,
+    pub floor_bytes: u64,
+    /// Longest continuous disk hold among live governor waiters. `Some(0)`
+    /// means holding now; `None` means no disk waiter, not an unknown duration.
+    #[serde(default)]
+    pub oldest_wait_seconds: Option<u64>,
+}
+
 /// Non-secret operational facts a satellite reports beside its identity.
 /// Every field is optional or bounded; QA placement also consumes admission
 /// and platform.
@@ -165,11 +176,22 @@ pub struct SatelliteHealthV1 {
     /// SQLite `user_version` of the satellite database.
     #[serde(default)]
     pub schema_version: Option<i32>,
+    /// Sessions currently in a live provider turn.
     pub sessions_running: u32,
+    /// Completed workers parked by the same derivation as AgentWorkerRoster.
+    /// Absent on older satellites; a reported zero means measured idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_parked: Option<u32>,
+    /// Non-terminal daemon jobs (queued or running), including jobs of live turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_jobs: Option<u32>,
     pub sessions_waiting_approval: u32,
     /// Free bytes on the filesystem holding the rsi data directory.
     #[serde(default)]
     pub disk_free_bytes: Option<u64>,
+    /// The job governor's disk reading and continuous disk wait; absent on old peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governor_disk: Option<SatelliteGovernorDiskV1>,
     /// One-minute load average times 1000 (Linux `/proc/loadavg`).
     #[serde(default)]
     pub load_avg_1m_milli: Option<u32>,
@@ -193,6 +215,10 @@ pub struct SatelliteHealthV1 {
     /// satellite seats no manager or is older.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub manager_launches: Vec<crate::satellite_manager_policy::SatelliteManagerLaunchesV1>,
+    /// Each declared project's seat and saved policy, including missing seats.
+    /// Separate from the legacy eight-row summary so old hub validators work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_policies: Option<Vec<crate::satellite_manager_policy::SatelliteManagerLaunchesV1>>,
     /// #2120: whether a hub full-library QA run would enter now, from the
     /// same gates its job meets (build governor floor included). Absent from
     /// satellites that do not serve hub QA runs.
@@ -218,6 +244,36 @@ pub struct SatelliteHealthV1 {
     /// Absent on old peers; no independent store evidence on an RPC timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_probe_elapsed_ms: Option<u32>,
+    /// #4008: this host's model invocations and token totals by provider over
+    /// the last hour and 24 hours, so a capacity owner can attribute a shared
+    /// account's burn to a host. Counts only; bounded by
+    /// [`SATELLITE_MAX_USAGE_ROWS`]; absent from older satellites.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage: Vec<ProviderUsageRollupV1>,
+}
+
+/// Rollup window label: the last hour.
+pub const USAGE_WINDOW_1H: &str = "1h";
+/// Rollup window label: the last 24 hours.
+pub const USAGE_WINDOW_24H: &str = "24h";
+
+/// Most usage rows a host reports: 16 providers times the two windows.
+pub const SATELLITE_MAX_USAGE_ROWS: usize = 32;
+
+/// One provider's invocations and token totals over one window on one host
+/// (#4008). Secret-free: a provider name, a window label and counts, never an
+/// account, key, prompt or path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsageRollupV1 {
+    pub provider: String,
+    /// [`USAGE_WINDOW_1H`] or [`USAGE_WINDOW_24H`].
+    pub window: String,
+    pub invocations: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub reasoning_tokens: u64,
 }
 
 /// Closed watchdog causes: never carry logs, paths or arbitrary error text.
@@ -382,8 +438,19 @@ impl SatelliteHealthV1 {
         {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
+        if self.usage.len() > SATELLITE_MAX_USAGE_ROWS
+            || self.usage.iter().any(|row| {
+                !text_ok(&row.provider)
+                    || ![USAGE_WINDOW_1H, USAGE_WINDOW_24H].contains(&row.window.as_str())
+            })
+        {
+            return Err(SatelliteValidationError::InvalidIdentity);
+        }
         if self.manager_launches.len()
             > crate::satellite_manager_policy::SATELLITE_MAX_MANAGER_LAUNCH_ROWS
+            || self.manager_policies.as_ref().is_some_and(|rows| {
+                rows.len() > crate::satellite_dispatch::SATELLITE_INBOUND_MAX_ENTRIES
+            })
         {
             return Err(SatelliteValidationError::InvalidIdentity);
         }
@@ -534,6 +601,13 @@ pub struct SatellitePutLinkRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SatelliteObservationV1 {
+    /// Activity from the last reported health, unknown until a successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_running: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers_parked: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_jobs: Option<u32>,
     /// Process-local platform from the last successful identity poll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<SatellitePlatformV1>,
@@ -932,6 +1006,92 @@ mod tests {
             sessions: vec![session(uuid("dddddddd-dddd-4ddd-8ddd-dddddddddddd"))],
             next_cursor: Some("opaque-v1".into()),
         }
+    }
+
+    #[test]
+    fn governor_disk_health_is_optional_and_round_trips() {
+        let mut wire = json!({
+            "daemon_version": "1.0.0", "uptime_seconds": 1,
+            "sessions_running": 0, "sessions_waiting_approval": 0
+        });
+        let old: SatelliteHealthV1 = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(old.governor_disk, None);
+        wire["governor_disk"] = json!({
+            "free_bytes": 27_u64 << 30, "floor_bytes": 30_u64 << 30,
+            "oldest_wait_seconds": 2400
+        });
+        let health: SatelliteHealthV1 = serde_json::from_value(wire.clone()).unwrap();
+        health.validate().unwrap();
+        assert_eq!(
+            health.governor_disk.as_ref().unwrap().oldest_wait_seconds,
+            Some(2400)
+        );
+        assert_eq!(
+            serde_json::to_value(health).unwrap()["governor_disk"],
+            wire["governor_disk"]
+        );
+    }
+
+    #[test]
+    fn activity_counts_preserve_unknown_and_round_trip_reported_counts() {
+        let legacy = json!({
+            "daemon_version": "1.0.0", "uptime_seconds": 1,
+            "sessions_running": 1, "sessions_waiting_approval": 0
+        });
+        let old: SatelliteHealthV1 = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.workers_parked, None);
+        assert_eq!(old.open_jobs, None);
+        for count in [0, 2] {
+            let mut wire = legacy.clone();
+            wire["workers_parked"] = json!(count);
+            wire["open_jobs"] = json!(count);
+            let health: SatelliteHealthV1 = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(health.sessions_running, 1);
+            assert_eq!(health.workers_parked, Some(count));
+            assert_eq!(health.open_jobs, Some(count));
+            assert_eq!(
+                serde_json::to_value(health).unwrap()["workers_parked"],
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn usage_rollup_is_optional_bounded_and_validated_4008() {
+        let mut wire = serde_json::to_value(identity()).unwrap();
+        wire["health"] = json!({
+            "daemon_version": "1.0.0", "uptime_seconds": 1,
+            "sessions_running": 0, "sessions_waiting_approval": 0
+        });
+        let legacy: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+        legacy.validate().unwrap();
+        let legacy_health = legacy.health.unwrap();
+        assert!(legacy_health.usage.is_empty());
+        assert!(
+            serde_json::to_value(&legacy_health)
+                .unwrap()
+                .get("usage")
+                .is_none()
+        );
+        let row = |provider: &str, window: &str| {
+            json!({"provider": provider, "window": window, "invocations": 9,
+                   "input_tokens": 1, "output_tokens": 2, "cache_creation_tokens": 3,
+                   "cache_read_tokens": 6_300_000, "reasoning_tokens": 4})
+        };
+        wire["health"]["usage"] = json!([row("Claude", "1h"), row("Claude", "24h")]);
+        let reported: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+        reported.validate().unwrap();
+        let usage = reported.health.unwrap().usage;
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].cache_read_tokens, 6_300_000);
+        for bad in [row("Claude", "7d"), row("", "1h"), row("has space", "1h")] {
+            wire["health"]["usage"] = json!([bad]);
+            let invalid: SatelliteIdentityV1 = serde_json::from_value(wire.clone()).unwrap();
+            assert!(invalid.validate().is_err());
+        }
+        wire["health"]["usage"] = json!(vec![row("Claude", "1h"); SATELLITE_MAX_USAGE_ROWS + 1]);
+        let excessive: SatelliteIdentityV1 = serde_json::from_value(wire).unwrap();
+        assert!(excessive.validate().is_err());
     }
 
     #[test]

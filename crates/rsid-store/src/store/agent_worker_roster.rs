@@ -59,8 +59,8 @@ impl Store {
         self.agent_worker_roster_at(caller, request, Utc::now())
     }
 
-    /// [`Self::agent_worker_roster`] with the clock named, so the stale-strand
-    /// cutoff is testable.
+    /// [`Self::agent_worker_roster`] with the clock named, so the history
+    /// cutoffs are testable.
     pub(crate) fn agent_worker_roster_at(
         &self,
         caller: Uuid,
@@ -95,7 +95,9 @@ impl Store {
         truncated |= queued_launches.len() > page;
         queued_launches.truncate(page);
         let stale_before = now - chrono::Duration::days(WORKER_ROSTER_STALE_STRANDED_DAYS);
+        let finished_before = now - chrono::Duration::hours(1);
         let mut stale_stranded_hidden = 0u32;
+        let mut hidden_finished = 0u32;
         let mut workers = Vec::new();
         for id in candidates.into_iter().take(WORKER_ROSTER_SCAN_CAP) {
             let Some(worker_session) = self.get_session(id)? else {
@@ -108,11 +110,21 @@ impl Store {
                 continue;
             }
             // #2362: old strands are history; the default view drops them.
-            if request.states.is_empty()
+            if !request.full_history()
                 && worker.state == WorkerRosterStateV1::Stranded
                 && worker_session.updated_at < stale_before
             {
                 stale_stranded_hidden += 1;
+                continue;
+            }
+            if !request.full_history()
+                && matches!(
+                    worker.state,
+                    WorkerRosterStateV1::FinalHandoff | WorkerRosterStateV1::Failed
+                )
+                && worker_session.updated_at < finished_before
+            {
+                hidden_finished += 1;
                 continue;
             }
             if workers.len() == page {
@@ -140,6 +152,7 @@ impl Store {
             counts,
             truncated,
             stale_stranded_hidden,
+            hidden_finished,
         })
     }
 
@@ -153,7 +166,8 @@ impl Store {
         let mut statement = self.conn.prepare(
             "SELECT o.id,o.target_session_id,o.not_before
                FROM harness_manager_v2_operations o
-              WHERE o.kind=?1 AND o.state='queued' AND o.not_before<=?2
+              WHERE o.kind=?1 AND o.state='queued'
+                AND (o.not_before<=?2 OR json_extract(o.outcome_json,'$.outcome')='sandbox_git_timeout')
                 AND json_extract(o.payload_json,'$.request.operation.action')='create_session'
                 AND json_extract(o.payload_json,'$.issue_binding.continue_from') IS NULL
                 AND ((?3 IS NOT NULL AND o.project_id=?3)
@@ -408,9 +422,13 @@ impl Store {
         rows.iter().map(|id| parse_id(id, "worker")).collect()
     }
 
-    /// One worker's roster row; `None` for a session that is not a live worker
-    /// (archived or deleted).
-    fn roster_worker(&self, session: &Session) -> Result<Option<RosterWorkerV1>> {
+    /// Shared roster state and final-report flag. Health uses this same
+    /// derivation so parked capacity cannot drift from the worker roster.
+    /// `None` for archived or deleted sessions.
+    pub(crate) fn worker_roster_state(
+        &self,
+        session: &Session,
+    ) -> Result<Option<(WorkerRosterStateV1, bool)>> {
         let id = session.id;
         // Only a turn that has ended can carry a final report; a mid-turn
         // session reports false rather than a half-written turn.
@@ -434,9 +452,11 @@ impl Store {
                     WorkerRosterStateV1::ParkedOnJob
                 } else if self.owner_armed_result_wake(id)?.is_some() {
                     WorkerRosterStateV1::ParkedOnWake
-                } else if self.worker_published_issue_handoff(id)? {
-                    // #2362: the verdict is on the Issue; only the marker is
-                    // missing from the turn.
+                } else if self.worker_published_issue_handoff(id)?
+                    || self.worker_has_settled_assignment(id)?
+                {
+                    // The durable handoff, review receipt or settled execution
+                    // is completion evidence even without a transcript marker.
                     reported = true;
                     WorkerRosterStateV1::FinalHandoff
                 } else {
@@ -445,6 +465,14 @@ impl Store {
             }
             _ => return Ok(None),
         };
+        Ok(Some((state, reported)))
+    }
+
+    fn roster_worker(&self, session: &Session) -> Result<Option<RosterWorkerV1>> {
+        let Some((state, reported)) = self.worker_roster_state(session)? else {
+            return Ok(None);
+        };
+        let id = session.id;
         let open_jobs: i64 = self.conn.query_row(
             "SELECT count(*) FROM agent_jobs
               WHERE owner_session_id=?1 AND state IN ('queued','running')",
@@ -474,6 +502,18 @@ impl Store {
     fn worker_published_issue_handoff(&self, worker: Uuid) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM issue_handoffs WHERE author_session_id=?1)",
+            params![worker.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn worker_has_settled_assignment(&self, worker: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM manager_review_receipts WHERE reviewer_session_id=?1)
+                 OR EXISTS(SELECT 1 FROM topology_node_attempts a
+                     JOIN topology_executions e ON e.id=a.execution_id
+                     WHERE a.session_id=?1
+                       AND e.status IN ('succeeded','failed','cancelled','blocked'))",
             params![worker.to_string()],
             |row| row.get(0),
         )?)
@@ -521,6 +561,7 @@ impl Store {
             exit_code: exit_code.and_then(|code| i32::try_from(code).ok()),
             refusal: text("/refusal"),
             receipt_head: text("/receipt/head"),
+            failure_class: text("/receipt/failure_class").or_else(|| text("/failure_class")),
             merges_cleanly_onto_rolling: result
                 .as_ref()
                 .and_then(|value| value.pointer("/receipt/merges_cleanly_onto_rolling"))
@@ -538,6 +579,7 @@ impl Store {
                         .collect()
                 })
                 .unwrap_or_default(),
+            hold: None,
         }))
     }
 

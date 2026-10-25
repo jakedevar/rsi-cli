@@ -26,7 +26,7 @@ use rsi_common::program_runs::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub(crate) trait ProgramRunClock: Send + Sync {
@@ -126,7 +126,7 @@ impl From<ProgramRunStoreError> for ProgramRunControlError {
 
 #[derive(Clone)]
 pub(crate) struct ProgramRunControlHandle {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     clock: Arc<dyn ProgramRunClock>,
     active: Option<Arc<RwLock<HashMap<Uuid, TrackedSession>>>>,
     agent_tokens: Option<Arc<RwLock<AgentTokenRegistry>>>,
@@ -165,7 +165,10 @@ pub(crate) struct BoundProgramRunSchedulerAuthority {
 
 impl ProgramRunControlHandle {
     #[cfg(test)]
-    pub(crate) fn new(store: Arc<Mutex<Store>>, clock: Arc<dyn ProgramRunClock>) -> Self {
+    pub(crate) fn new(
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
+        clock: Arc<dyn ProgramRunClock>,
+    ) -> Self {
         Self {
             store,
             clock,
@@ -176,7 +179,7 @@ impl ProgramRunControlHandle {
     }
 
     pub(crate) fn new_with_live_witnesses(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         clock: Arc<dyn ProgramRunClock>,
         active: Arc<RwLock<HashMap<Uuid, TrackedSession>>>,
         agent_tokens: Arc<RwLock<AgentTokenRegistry>>,
@@ -555,7 +558,7 @@ impl BoundProgramRunSchedulerAuthority {
     ) -> Result<
         (
             tokio::sync::RwLockReadGuard<'_, HashMap<Uuid, TrackedSession>>,
-            tokio::sync::MutexGuard<'_, Store>,
+            rsid_core::store_lock::LabeledGuard<'_, Store>,
             tokio::sync::RwLockReadGuard<'_, AgentTokenRegistry>,
             BoundControllerWriteAuthority,
         ),
@@ -766,7 +769,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-05"))]
     #[test]
     fn d05_operator_authority_is_construction_bound() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let handle = ProgramRunControlHandle::new(store, Arc::new(SystemProgramRunClock));
         let project_id = Uuid::new_v4();
         let bound = handle.bind_operator(project_id).unwrap();

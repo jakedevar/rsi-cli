@@ -1,0 +1,38 @@
+---
+source: crates/rsi/src/ui/todo_panel.rs
+expression: snapshot
+---
+To-do · 2 open · 2 new
+
+╭─────────────────────────────────────╮
+│ ▸ ● Log in to Codex NEW             │
+│ │ codex login                       │
+│ scope · portfolio                   │
+│ issue #1747 · 3h                    │
+╰─────────────────────────────────────╯
+
+╭─────────────────────────────────────╮
+│   • Restore the grants after t… NEW │
+│ │ rsi grant restore --scope portfol │
+│ │ io:global --caps v8 --caps v8 --… │
+│ scope · portfolio                   │
+│ issue #1747 · 2h                    │
+╰─────────────────────────────────────╯
+
+Closed since your last visit
+
+╭─────────────────────────────────────╮
+│   ◆ Grant repaired                  │
+│ ✓ done                              │
+│ │ rsi grant show                    │
+│ scope · portfolio                   │
+│ issue #1747 · 3h                    │
+╰─────────────────────────────────────╯
+
+╭─────────────────────────────────────╮
+│   ◆ Old request                     │
+│ × dismissed                         │
+│ │ rsi grant show                    │
+│ scope · portfolio                   │
+│ issue #1747 · 3h                    │
+╰─────────────────────────────────────╯

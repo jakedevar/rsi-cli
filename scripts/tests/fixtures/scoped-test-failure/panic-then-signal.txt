@@ -1,0 +1,6 @@
+test store::assertion ... panic output
+thread 'store::assertion' (123) panicked at src/store.rs:42:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+SCOPED_PROCESS_SIGNAL SIGTERM

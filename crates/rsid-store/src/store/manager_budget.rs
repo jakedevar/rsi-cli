@@ -12,7 +12,7 @@
 
 use super::Store;
 use super::harness_manager_v2::{PortfolioHead, refused};
-use super::manager_actions::head_created_count;
+use super::manager_actions::{head_created_count, head_created_times, window_usage};
 use super::manager_resources::portfolio_coverage_config;
 use crate::error::Result;
 use rsi_common::harness_manager::HarnessManagerConfigV1;
@@ -113,17 +113,30 @@ impl Store {
         let mut chain = Vec::new();
         if let Some(since) = heads.iter().map(|head| head.started.as_str()).min() {
             let since = since.to_string();
-            let sessions = self.portfolio_creation_charges(project, false, &since)?;
-            let containers = self.portfolio_creation_charges(project, true, &since)?;
+            let now = chrono::Utc::now();
+            let sessions = self.portfolio_creation_charges(project, false, &since, now)?;
+            let containers = self.portfolio_creation_charges(project, true, &since, now)?;
             let epics = self.global_project_epics(project)?;
             for head in &heads {
-                chain.push(self.budget_portfolio_node(
-                    project,
-                    head,
-                    &epics,
-                    head_created_count(&sessions, head),
-                    head_created_count(&containers, head),
-                )?);
+                chain.push(
+                    self.budget_portfolio_node(
+                        project,
+                        head,
+                        &epics,
+                        // #3416: sessions count over the head's rolling window.
+                        window_usage(
+                            &head_created_times(&sessions, head),
+                            head.record
+                                .grant
+                                .project_policy
+                                .created_sessions_window_hours,
+                            i64::from(head.record.grant.project_policy.max_created_sessions),
+                            now,
+                        )
+                        .used,
+                        head_created_count(&containers, head),
+                    )?,
+                );
             }
         }
         if let Some(pm) = self.budget_project_manager(project, name)? {

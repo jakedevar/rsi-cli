@@ -3,10 +3,13 @@
 //! It holds the information architecture (groups, sections, rows) and each
 //! row's summary, owner and apply class (Epic M design A.3, D.1, D.2, D.5).
 //!
-//! Slice (a) ships the metadata and the operator manual's settings chapter
-//! reads it. The settings page itself is migrated onto this registry in
-//! slice (c) (`row_value` / `activate`); until then the page keeps its own
-//! row tables.
+//! When adding or changing a row in `SETTINGS`, run
+//! `node desktop/scripts/settings.mjs` from the repository root and commit
+//! `desktop/src/settings.generated.ts`. Map new rows in `widgetFor` /
+//! `OVERLAY_ROW_IDS` in `desktop/src/settings-model.ts` (register overlays in
+//! their owning desktop view). Intentional TUI-only preferences also need
+//! `TUI_ONLY` in `desktop/tests/settings-state.test.mjs` and `tuiOnlyRows` in
+//! `desktop/parity-audit.json`. The desktop lane checks both steps.
 
 use rsi_common::daemon_config_catalog::ApplyClass;
 
@@ -121,11 +124,13 @@ pub enum SettingsSection {
     Scheduling,
     RecursiveDag,
     CodeIntelligence,
+    ProviderBilling,
     ProviderIsolation,
     ProviderSubagents,
     ProviderSkills,
     ApiRoutes,
     HarnessTools,
+    Benchmarks,
     ClaudeHooks,
     ClaudeSkills,
     ResourceLimits,
@@ -164,11 +169,13 @@ impl SettingsSection {
         Self::Scheduling,
         Self::RecursiveDag,
         Self::CodeIntelligence,
+        Self::ProviderBilling,
         Self::ProviderIsolation,
         Self::ProviderSubagents,
         Self::ProviderSkills,
         Self::ApiRoutes,
         Self::HarnessTools,
+        Self::Benchmarks,
         Self::ClaudeHooks,
         Self::ClaudeSkills,
         Self::ResourceLimits,
@@ -205,11 +212,13 @@ impl SettingsSection {
             | Self::Scheduling
             | Self::RecursiveDag
             | Self::CodeIntelligence => SettingsGroup::AgentAutomation,
-            Self::ProviderIsolation
+            Self::ProviderBilling
+            | Self::ProviderIsolation
             | Self::ProviderSubagents
             | Self::ProviderSkills
             | Self::ApiRoutes
             | Self::HarnessTools
+            | Self::Benchmarks
             | Self::ClaudeHooks
             | Self::ClaudeSkills => SettingsGroup::ProvidersAndSandboxes,
             Self::ResourceLimits
@@ -249,11 +258,13 @@ impl SettingsSection {
             Self::Scheduling => "Scheduling",
             Self::RecursiveDag => "Recursive DAG",
             Self::CodeIntelligence => "Code Intelligence",
+            Self::ProviderBilling => "Provider Billing",
             Self::ProviderIsolation => "Provider Isolation",
             Self::ProviderSubagents => "Subagent Governance",
             Self::ProviderSkills => "Provider Skills",
             Self::ApiRoutes => "API Routes",
             Self::HarnessTools => "Harness Tools",
+            Self::Benchmarks => "Benchmarks",
             Self::ClaudeHooks => "Claude Hooks",
             Self::ClaudeSkills => "Claude Skills",
             Self::ResourceLimits => "Resource Limits",
@@ -286,7 +297,9 @@ impl SettingsSection {
             Self::Budgets => "Model budget policies.",
             Self::Usage => "Usage telemetry and stop/cancel actions.",
             Self::ProviderKeys => "Manage provider credentials stored in the key vault.",
-            Self::CloudSpend => "Daily cap and stop line for remote (cloud) gate spend.",
+            Self::CloudSpend => {
+                "Spend ceilings: the remote (cloud) gate daily cap and stop line, and the OpenRouter account ceiling."
+            }
             Self::RetriesRecovery => "What the daemon does when a session fails or stalls.",
             Self::ContextRotation => {
                 "When a session rotates to a fresh context, and the manager and worker context caps."
@@ -298,6 +311,7 @@ impl SettingsSection {
             }
             Self::RecursiveDag => "Recursive DAG control gates, run leases and the graph views.",
             Self::CodeIntelligence => "Code-graph indexing of project source.",
+            Self::ProviderBilling => "Subscription plan usage and metered billing classification.",
             Self::ProviderIsolation => "How provider processes are sandboxed and isolated.",
             Self::ProviderSubagents => {
                 "Which model Claude and Codex subagents run on and how many may run at once."
@@ -307,10 +321,11 @@ impl SettingsSection {
             Self::HarnessTools => {
                 "Web access, egress, tool budgets and completion gates for Harness sessions."
             }
+            Self::Benchmarks => "Container hosts and limits for benchmark Harness runs.",
             Self::ClaudeHooks => "Claude Code hooks.",
             Self::ClaudeSkills => "Claude user skills.",
             Self::ResourceLimits => {
-                "Memory and CPU limits for the daemon, workers and build slice."
+                "Memory and CPU limits. :manager tune opens this host's resource probe, profile and presets."
             }
             Self::BuildGovernor => {
                 "Host-load admission, CPU andon and the build governor's slots and floors."
@@ -319,7 +334,7 @@ impl SettingsSection {
                 "Merge queue batching and gates, test-job timeouts and deploy drain limits."
             }
             Self::SandboxStorage => {
-                "Sandbox disk use, source-worktree settlement, archived sandbox purge and the stored tool-result cap."
+                "Sandbox disk use, source-worktree settlement, archived sandbox purge, the stored tool-result cap and pasted-image retention."
             }
             Self::ColdStorage => {
                 "The compressed archive of old session data: switch, age, directory, status and a run-now action."
@@ -378,6 +393,7 @@ setting_ids! {
     SubmitOnEnter,
     AutoOpenQuestionPanel,
     PromptCompiler,
+    PasteRetentionReferencedDays,
     EditingMode,
     DefaultModel,
     TitleModel,
@@ -403,6 +419,7 @@ setting_ids! {
     ContextRotationClaudePct,
     ContextRotationCodexPct,
     CoordinatorContextCap,
+    ManagerMaxTurnsPerHour,
     WorkerContextCap,
     StallDetection,
     StallClassifier,
@@ -445,6 +462,7 @@ setting_ids! {
     DeployRestartsPerHour,
     SupervisorShutdownGrace,
     HostLoadAdmissionThreshold,
+    WorkerBuildReserveGb,
     WorkerCpuQuotaPercent,
     HubBuildCpuPercent,
     RollingQueueBatchSize,
@@ -453,6 +471,12 @@ setting_ids! {
     QaTargetMaxGib,
     CodexLiveCatalogTtl,
     CodexRateLimitPoll,
+    ClaudeBillingMode,
+    CodexBillingMode,
+    CodexAppServerBillingMode,
+    PioneerBillingMode,
+    AntigravityBillingMode,
+
     ProviderLifecycleHooks,
     ProviderSkillDelivery,
     ProviderContractCanary,
@@ -462,6 +486,7 @@ setting_ids! {
     HealthDiskUsedPct,
     HealthThermal,
     HealthStuckMinutes,
+    HealthProviderWindowUsedPct,
     JobTestTimeout,
     CpuAndonCpuMinutes,
     CpuAndonHostLoad,
@@ -472,6 +497,10 @@ setting_ids! {
     HarnessEgressMode,
     HarnessWebSearchBackend,
     HarnessSearxngUrl,
+    BenchDockerHosts,
+    BenchEnabled,
+    BenchMaxConcurrency,
+    BenchLaptopHost,
     HarnessContextEditing,
     HarnessSearchCap,
     HarnessFetchCap,
@@ -524,7 +553,13 @@ setting_ids! {
     CloudSpendStatus,
     CloudSpendStopLine,
     CloudSpendDailyCap,
+    OpenRouterSpendStatus,
+    OpenRouterSpendCap,
+    OpenRouterSpendWarnPct,
     ArchivedSandboxPurge,
+    ErrorDispositionEnabled,
+    ErrorDispositionGraceMinutes,
+    ErrorDispositionContinuationBudget,
     ColdArchiveEnabled,
     ColdArchiveAfterDays,
     ColdArchiveDir,
@@ -1161,7 +1196,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Cloud spend stop line (USD)",
         summary: "Cumulative remote-gate spend at which a new remote run is refused.",
         detail: Some(
-            "Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes.",
+            "Whole dollars. Replaces the stop line in the spend ledger header; rsi-cloud spend reads it from the caps file the daemon writes.",
         ),
         keywords: &["cloud", "spend", "budget", "stop", "grant", "gate"],
         kind: SettingKind::Cycle,
@@ -1180,6 +1215,55 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["cloud", "spend", "budget", "daily", "gate"],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("cloud_spend_daily_cap_usd"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::OpenRouterSpendStatus,
+        section: SettingsSection::CloudSpend,
+        label: "OpenRouter spend ceiling",
+        summary: "The armed OpenRouter ceiling: spent since arming, what is left and the state (off, ok, warn, reached, probe_stale).",
+        detail: Some(
+            "Spend is the OpenRouter account usage the daemon probes (at most once a minute) plus the cost of the calls settled since, minus the usage recorded when the cap was armed. The agent read is spend_cap on the openrouter entry of AgentGetProviderStatus.",
+        ),
+        keywords: &["openrouter", "spend", "ceiling", "budget", "cap", "usage"],
+        kind: SettingKind::ReadOnly,
+        owner: SettingOwner::DaemonState("openrouter spend"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::OpenRouterSpendCap,
+        section: SettingsSection::CloudSpend,
+        label: "OpenRouter spend cap (USD)",
+        summary: "USD of OpenRouter spend, counted from the moment this is armed, at which the daemon stops OpenRouter-billed work. 0 (the default) is off. Enter opens a text editor.",
+        detail: Some(
+            "Arming (0 to a positive amount) takes a fresh probe of the OpenRouter account usage and records it as the baseline; the stop line is baseline + cap, and a failed probe refuses to arm. Changing an armed cap keeps its baseline; 0 turns it off and forgets the baseline. While armed, OpenRouter-billed launches (the OpenRouter provider on any route, and Harness sessions on the OpenRouter endpoint) are refused with openrouter_spend_cap_reached once spend plus a small per-launch reserve reaches the stop line, and also refused (openrouter_spend_cap_probe_stale) whenever the account usage could not be probed for five minutes; a running Harness session ends at its next model call past the line.",
+        ),
+        keywords: &[
+            "openrouter",
+            "spend",
+            "ceiling",
+            "budget",
+            "cap",
+            "usd",
+            "limit",
+            "stop",
+        ],
+        kind: SettingKind::Action,
+        owner: SettingOwner::Daemon("openrouter_spend_cap_usd"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::OpenRouterSpendWarnPct,
+        section: SettingsSection::CloudSpend,
+        label: "OpenRouter spend warn line (%)",
+        summary: "Percent of the OpenRouter cap at which the manager gets one notice per arming.",
+        detail: None,
+        keywords: &["openrouter", "spend", "warn", "notice", "percent"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("openrouter_spend_warn_pct"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
@@ -1303,6 +1387,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::ManagerMaxTurnsPerHour,
+        section: SettingsSection::ContextRotation,
+        label: "Manager wake-turn cap (per hour, 0 off)",
+        summary: "Wake-driven turns a manager seat may start per rolling hour before the daemon coalesces its routine notices (a lead's state, work rows, non-blocked intents) into the next free slot (0 off, else 1-60, default 0).",
+        detail: Some(
+            "A manager cannot refuse a wake, so a turn-rate cap in prose does not hold. With a cap set, a seat that has used it keeps routine-only deliveries armed and reads them in one coalesced turn when a turn ages out of the hour. Mail, operator answers, failures, gates, merge-queue and satellite outcomes and safety anomalies are never held; one delivered past a spent cap is counted as a bypass. The seat's turns used, coalesced wakes and bypasses show in its coordinator budget (authority catalog and the global manager seat views). It applies to the next delivery; a self-armed wake (a job end or timer the seat set) is not held.",
+        ),
+        keywords: &[
+            "manager", "seat", "turn", "wake", "rate", "cap", "hour", "coalesce", "budget",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("manager_max_turns_per_hour"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::WorkerContextCap,
         section: SettingsSection::ContextRotation,
         label: "Worker context cap (0 off, 1-100 = % of window)",
@@ -1324,7 +1424,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         label: "Provider lifecycle hooks",
         summary: "Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart.",
         detail: Some(
-            "StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, when it fits the provider's 10,000-character hook-context cap; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks.",
+            "StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, within the provider's 10,000-character cap per hook. Claude splits long preambles at startup part boundaries into labelled chunks with one handler each; an indivisible part that cannot fit stays in the prompt. Delivery is recorded after every chunk is claimed; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks.",
         ),
         keywords: &[
             "provider",
@@ -1643,6 +1743,28 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::HealthProviderWindowUsedPct,
+        section: SettingsSection::Scheduling,
+        label: "Health alert: provider window used (%)",
+        summary: "Warn when a provider plan window is projected to exhaust before reset, above this utilization (0 off, else 1-100, default 70).",
+        detail: Some(
+            "Uses the faster of average burn since the window opened and recent observed burn, up to 24 hours. The warning names the provider, window, projected exhaustion and reset. Takes effect at the next health evaluation.",
+        ),
+        keywords: &[
+            "health",
+            "provider",
+            "window",
+            "usage",
+            "reset",
+            "exhaustion",
+            "anomaly",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("health_provider_window_used_pct"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::HealthStuckMinutes,
         section: SettingsSection::Scheduling,
         label: "Health alert: work stuck (min)",
@@ -1786,6 +1908,76 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["codegraph", "index", "code intelligence"],
         kind: SettingKind::Bool,
         owner: SettingOwner::Daemon("codegraph_indexing_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ClaudeBillingMode,
+        section: SettingsSection::ProviderBilling,
+        label: "Claude billing mode",
+        summary: "Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars.",
+        detail: Some(
+            "Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.",
+        ),
+        keywords: &["billing", "subscription", "plan", "metered", "cost"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("claude_billing_mode"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CodexBillingMode,
+        section: SettingsSection::ProviderBilling,
+        label: "Codex billing mode",
+        summary: "Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars.",
+        detail: Some(
+            "Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.",
+        ),
+        keywords: &["billing", "subscription", "plan", "metered", "cost"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("codex_billing_mode"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::CodexAppServerBillingMode,
+        section: SettingsSection::ProviderBilling,
+        label: "CodexAppServer billing mode",
+        summary: "Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars.",
+        detail: Some(
+            "Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.",
+        ),
+        keywords: &["billing", "subscription", "plan", "metered", "cost"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("codexappserver_billing_mode"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::PioneerBillingMode,
+        section: SettingsSection::ProviderBilling,
+        label: "Pioneer billing mode",
+        summary: "Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars.",
+        detail: Some(
+            "Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.",
+        ),
+        keywords: &["billing", "subscription", "plan", "metered", "cost"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("pioneer_billing_mode"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::AntigravityBillingMode,
+        section: SettingsSection::ProviderBilling,
+        label: "Antigravity billing mode",
+        summary: "Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars.",
+        detail: Some(
+            "Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.",
+        ),
+        keywords: &["billing", "subscription", "plan", "metered", "cost"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("antigravity_billing_mode"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
@@ -1948,9 +2140,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::ClaudeMaxBudgetUsd,
         section: SettingsSection::ProviderIsolation,
         label: "Claude spend cap per session (USD)",
-        summary: "Estimated spend, in USD, at which a new Claude CLI session stops. 0 (the default) is off. Enter opens a text editor.",
+        summary: "Metered usage, in USD, at which a new API- or cloud-billed Claude CLI session stops. 0 (the default) is off. Enter opens a text editor.",
         detail: Some(
-            "Passed as --max-budget-usd=<n> to each new Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Meant for API- or Bedrock-billed sessions; a subscription login is not billed per token, so leave it 0 there. Running sessions keep the value they started with.",
+            "Passed as --max-budget-usd=<n> to each new metered Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Subscription billing mode ignores this dollar cap and uses plan windows instead. API- and Bedrock-billed sessions keep the cap. Running sessions keep the value they started with.",
         ),
         keywords: &["claude", "budget", "spend", "cost", "cap", "usd", "limit"],
         kind: SettingKind::Action,
@@ -2337,6 +2529,82 @@ pub static SETTINGS: &[SettingSpec] = &[
         destructive: false,
     },
     SettingSpec {
+        id: SettingId::BenchDockerHosts,
+        section: SettingsSection::Benchmarks,
+        label: "Benchmark docker hosts",
+        summary: "Docker hosts a benchmark Harness session may run its shell tools on, comma-separated (for example ssh://arch-laptop). Default is empty: every container exec target is refused. Enter opens a text editor.",
+        detail: Some(
+            "A Harness session bound to a benchmark container runs shell, exec_command and write_stdin through docker -H <host> exec instead of on the daemon host (#3176). The daemon only accepts a host listed here, and also checks that the container is running, belongs to the registered compose project as service main and uses a pinned image digest. Checked at every launch, continuation and rotation, so a change applies to the next one.",
+        ),
+        keywords: &[
+            "benchmark",
+            "bench",
+            "docker",
+            "container",
+            "host",
+            "exec",
+            "terminal-bench",
+        ],
+        kind: SettingKind::Action,
+        owner: SettingOwner::Daemon("bench.docker_hosts"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::BenchEnabled,
+        section: SettingsSection::Benchmarks,
+        label: "Benchmark jobs enabled",
+        summary: "Master switch of the bench job kind: when off (the default) no benchmark run is admitted. A run also needs the docker host allowlist, a launch grant and, for a paid run, an armed OpenRouter spend cap.",
+        detail: Some(
+            "The appointed manager or an Epic lead runs one pinned Terminal-Bench configuration with one bench job (#3181). The daemon checks this switch at submit and again when the job starts, so turning it off stops a queued run from starting. A run never spends beyond the budget it was admitted with.",
+        ),
+        keywords: &[
+            "benchmark",
+            "bench",
+            "job",
+            "enable",
+            "terminal-bench",
+            "harbor",
+        ],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("bench.enabled"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::BenchMaxConcurrency,
+        section: SettingsSection::Benchmarks,
+        label: "Benchmark concurrency",
+        summary: "Most Terminal-Bench trials a bench job runs at once on the laptop (1 to 8, default 4). The laptop needs 4 GB of free memory per trial plus 4 GB.",
+        detail: None,
+        keywords: &[
+            "benchmark",
+            "bench",
+            "concurrency",
+            "trials",
+            "harbor",
+            "laptop",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("bench.max_concurrency"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::BenchLaptopHost,
+        section: SettingsSection::Benchmarks,
+        label: "Benchmark laptop host",
+        summary: "The ssh host that runs Harbor and the task containers for a bench job (default arch-laptop). A run config's docker host must be ssh:// plus this host. Enter opens a text editor.",
+        detail: Some(
+            "The job reaches the laptop over ssh with the hub's existing access, forwards the run's adapter socket to it, and copies the Harbor job directory back. Use a plain host name or alias, optionally user@host; options and URLs are refused.",
+        ),
+        keywords: &["benchmark", "bench", "laptop", "host", "ssh", "harbor"],
+        kind: SettingKind::Action,
+        owner: SettingOwner::Daemon("bench.laptop_host"),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
+        destructive: false,
+    },
+    SettingSpec {
         id: SettingId::ClaudeHooks,
         section: SettingsSection::ClaudeHooks,
         label: "Claude hooks",
@@ -2467,7 +2735,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         keywords: &["worker", "cpu", "quota", "limit", "scope", "load", "cores"],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("worker_cpu_quota_percent"),
-        apply: SettingApply::Daemon(ApplyClass::Live),
+        apply: SettingApply::Daemon(ApplyClass::NextSpawn),
         destructive: false,
     },
     SettingSpec {
@@ -2518,6 +2786,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         ],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("host_load_admission_threshold"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::WorkerBuildReserveGb,
+        section: SettingsSection::BuildGovernor,
+        label: "Worker build reserve (GiB)",
+        summary: "Free disk reserved above the governor floor before a new worker launch (0-64, default 8; 0 disables reserve).",
+        detail: Some(
+            "Holds new manager workers and topology launches until free disk reaches the governor floor plus this target estimate. Build and test jobs use the governor floor alone. Lead recovery and worker-owned children remain exempt.",
+        ),
+        keywords: &["worker", "build", "reserve", "disk", "launch", "admission"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("worker_build_reserve_gb"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },
@@ -2663,9 +2945,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         id: SettingId::RollingQueueGateTimeout,
         section: SettingsSection::MergeQueue,
         label: "Merge queue gate timeout (min)",
-        summary: "Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 60).",
+        summary: "Wall-time budget of one lander run of a merge-queue batch; each bisect step gets it too (30-1440 minutes, default 60).",
         detail: Some(
-            "When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch.",
+            "When a lander run goes past it, the running lander is stopped and every member still suspect is refused with queue_gate_timeout, which wakes its owner; members an earlier red run had already left out go back to the queue at their position; the queue then moves on.",
         ),
         keywords: &["merge", "queue", "gate", "timeout", "landing"],
         kind: SettingKind::Cycle,
@@ -2924,6 +3206,64 @@ pub static SETTINGS: &[SettingSpec] = &[
         ],
         kind: SettingKind::Cycle,
         owner: SettingOwner::Daemon("tool_result_storage_cap_kib"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::PasteRetentionReferencedDays,
+        section: SettingsSection::SandboxStorage,
+        label: "Keep referenced pasted images (days)",
+        summary: "Days the daemon keeps a pasted image that a message or conversation named (0 keeps it forever, the default; else 7-3650).",
+        detail: Some(
+            "Applies to images pasted through the daemon (~/.rsi/paste/rsid). An image no message, conversation or enabled scheduled job ever named is removed 7 days after its last upload whatever this says. A named image is part of your conversation history, so it is removed only when this is above 0 and its last upload is older than that, and never while a queued message, a running session or an enabled scheduled job still names it. Read at each retention pass (daemon start, and after an upload at most hourly).",
+        ),
+        keywords: &[
+            "paste",
+            "image",
+            "clipboard",
+            "retention",
+            "days",
+            "cleanup",
+            "screenshot",
+        ],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("paste_retention_referenced_days"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: true,
+    },
+    SettingSpec {
+        id: SettingId::ErrorDispositionEnabled,
+        section: SettingsSection::ColdStorage,
+        label: "Resolve errored sessions",
+        summary: "Automatically soft-delete empty failures, resume infrastructure interruptions and archive final errors while retaining diagnosis and work.",
+        detail: None,
+        keywords: &["error", "failed", "interrupted", "recovery"],
+        kind: SettingKind::Bool,
+        owner: SettingOwner::Daemon("error_disposition_enabled"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ErrorDispositionGraceMinutes,
+        section: SettingsSection::ColdStorage,
+        label: "Error grace (minutes)",
+        summary: "Minimum terminal age before disposition (1-1440 minutes, default 15).",
+        detail: None,
+        keywords: &["error", "failed", "interrupted", "recovery"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("error_disposition_grace_minutes"),
+        apply: SettingApply::Daemon(ApplyClass::Live),
+        destructive: false,
+    },
+    SettingSpec {
+        id: SettingId::ErrorDispositionContinuationBudget,
+        section: SettingsSection::ColdStorage,
+        label: "Error continuations per day",
+        summary: "Maximum daemon continuations per session in 24 hours (0-10, default 3); drains hold continuations.",
+        detail: None,
+        keywords: &["error", "failed", "interrupted", "recovery"],
+        kind: SettingKind::Cycle,
+        owner: SettingOwner::Daemon("error_disposition_continuation_budget"),
         apply: SettingApply::Daemon(ApplyClass::Live),
         destructive: false,
     },

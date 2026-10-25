@@ -2343,10 +2343,10 @@ async fn test_q_does_not_quit() {
 }
 
 #[tokio::test]
-async fn test_ctrl_c_quits() {
+async fn test_ctrl_c_does_not_quit() {
     let mut app = test_app();
     feed_key(&mut app, ctrl_key('c')).await;
-    assert!(app.quit);
+    assert!(!app.quit, "Ctrl-C never quits rsi (#3434)");
 }
 
 #[test]

@@ -3,8 +3,9 @@
 // and forget, as the TUI does.
 import { el, toast } from './dom.js';
 import {
-  type EspState, HIT_COLOR, MISS_COLOR, ROUNDS, SQUARE_COLORS, SQUARE_KEYS, espHint, espKey, liveFlash, newGame, saveParams,
+  type EspState, HIT_COLOR, MISS_COLOR, ROUNDS, SQUARE_KEYS, espHint, espKey, flashTextOn, liveFlash, newGame, saveParams, squareColorsOn,
 } from './esp-model.js';
+import { parseHex } from './theme-model.js';
 import { graphsApi } from './graphs-api.js';
 import { engineBusy } from './graphs.js';
 import { uiChanged } from './state.js';
@@ -57,19 +58,24 @@ function draw(): void {
   const head = el('div', 'esp-head', `Round ${s.round}/${ROUNDS}`);
   if (s.interactive || s.round === ROUNDS) head.append(el('span', 'esp-score', `Correct ${s.correct}/${ROUNDS}`));
   const grid = el('div', 'esp-grid');
+  // The glyph colours follow the theme: read on the card's own surface so Light and High Contrast stay readable (#301).
+  const rootVars = getComputedStyle(document.documentElement);
+  const surface = parseHex(rootVars.getPropertyValue('--mantle')) ?? '#181825';
+  const textColor = parseHex(rootVars.getPropertyValue('--text')) ?? '#cdd6f4';
+  const colors = squareColorsOn(surface, textColor);
   SQUARE_KEYS.forEach((k, i) => {
     const sq = el('button', 'esp-sq', k);
     sq.type = 'button';
     sq.tabIndex = -1;
-    const color = SQUARE_COLORS[i]!;
+    const color = colors[i]!;
     if (flash && flash.index === i) {
       sq.style.background = flash.hit ? HIT_COLOR : MISS_COLOR;
       sq.style.borderColor = flash.hit ? HIT_COLOR : MISS_COLOR;
-      sq.style.color = flash.hit ? '#000' : '#fff';
+      sq.style.color = flashTextOn(flash.hit);
       sq.classList.add('flash');
     } else if (s.cursor === i) {
-      sq.style.borderColor = '#fff';
-      sq.style.color = '#fff';
+      sq.style.borderColor = textColor;
+      sq.style.color = textColor;
       sq.classList.add('cursor');
     } else {
       sq.style.borderColor = color;

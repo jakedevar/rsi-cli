@@ -64,7 +64,7 @@
     "key:<Space>a": {
       "status": "done",
       "location": "src/keybindings.ts, src/commands.ts, src/approvals.ts",
-      "note": "archive with a confirm dialog; also Session menu, right-click, Archive button"
+      "note": "archive with a confirm dialog; also Session menu, right-click, Archive button. On a Starting, Running or WaitingApproval session (every status rsid still holds as active) it marks the session to archive when it finishes (MarkPendingArchive, as the TUI does) and a second press clears the mark: button reads Archive when finished / Cancel auto-archive, header and row show the pending marker (local #308, #315)"
     },
     "key:<Space>c": {
       "status": "done",

@@ -33,79 +33,77 @@
 # scripts/scoped-test do not take a second slot inside a held one (#1560).
 # CARGO_TARGET_DIR is never set or changed: the caller's target (a sandbox's,
 # a lander side's) reaches the command as given (#938).
+# The probes and the governor client are Rust (#423, #465): `rsi-repo-guard cargo-slot ...`
+# (status, free-gb, start, queue-head, rpc). This script keeps admission, the single
+# deadline, the FIFO locks and the child lifecycle. Nothing is built here: this script runs
+# while a build waits for its slot. With no usable binary it exits 127 and says so.
+#
+# Which binary (#3893): the one that matches the running governor comes first, so a stale
+# sandbox build can never shadow it. Order, first USABLE hit wins: $RSI_REPO_GUARD_BIN,
+# beside this script and in ../bin (the installed lib/ and bin/ copies under ~/.rsi),
+# ~/.rsi/install and ~/.local/bin (the deployed pair), ~/.rsi/bin, then the caller's
+# CARGO_TARGET_DIR and the checkout's target builds, then PATH. A candidate is probed
+# before it is trusted (`cargo-slot start` must exit 0 and `cargo-slot rpc` must print its
+# usage, both without touching the daemon, each under a short timeout); one that fails (a
+# build from before the subcommand existed prints `unknown guard 'cargo-slot'`) is skipped
+# and its path is named in a `guard-skipped` phase line.
+# phase: a job log shows where a run is and how long it waited (#1591). Format
+# `rsi-phase <epoch> <name>[: detail]`, one line, flushed at once; the daemon reads the last
+# one into a job_timed_out result.
+phase() { printf 'rsi-phase %s %s\n' "$(date +%s)" "$*" >&2; }
+# probe_run <command...>: run under a short timeout where timeout(1) exists.
+probe_run() {
+  if command -v timeout >/dev/null 2>&1; then timeout "${RSI_CARGO_GUARD_PROBE_SEC:-10}" "$@"; else "$@"; fi
+}
+# cargo_slot_probe_guard <path>: 0 when the binary can serve cargo-slot; 1 with the reason in
+# probe_reason.
+probe_reason=""
+cargo_slot_probe_guard() {
+  local candidate=$1 out rc
+  out=$(probe_run "$candidate" cargo-slot start "$$" 2>&1 </dev/null); rc=$?
+  if [ "$rc" -ne 0 ]; then
+    probe_reason="cargo-slot start exited $rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+    return 1
+  fi
+  out=$(probe_run "$candidate" cargo-slot rpc 2>&1 </dev/null) || true
+  case "$out" in
+    *"rpc acquire"*) return 0 ;;
+  esac
+  probe_reason="cargo-slot rpc is not supported: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  return 1
+}
+cargo_slot_find_guard() {
+  local here checkout candidate
+  here=$(CDPATH='' cd "$(dirname "$0")" 2>/dev/null && pwd -P) || here=.
+  checkout=$(dirname "$here")
+  for candidate in \
+    "${RSI_REPO_GUARD_BIN:-}" \
+    "$here/rsi-repo-guard" \
+    "$here/../bin/rsi-repo-guard" \
+    "$HOME/.rsi/install/rsi-repo-guard" \
+    "$HOME/.local/bin/rsi-repo-guard" \
+    "$HOME/.rsi/bin/rsi-repo-guard" \
+    "${CARGO_TARGET_DIR:+$CARGO_TARGET_DIR/release/rsi-repo-guard}" \
+    "${CARGO_TARGET_DIR:+$CARGO_TARGET_DIR/debug/rsi-repo-guard}" \
+    "$checkout/target/release/rsi-repo-guard" \
+    "$checkout/target/debug/rsi-repo-guard" \
+    "$(command -v rsi-repo-guard 2>/dev/null)"; do
+    [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    if cargo_slot_probe_guard "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+    phase "guard-skipped: $candidate ($probe_reason)"
+  done
+  return 1
+}
+guard=$(cargo_slot_find_guard) || guard=""
+if [ -z "$guard" ]; then
+  echo "cargo-slot: rsi-repo-guard is not installed, or every copy failed its probe (see the guard-skipped lines above); run make release-install, or build it with: cargo build --release -p rsi-repo-guards --bin rsi-repo-guard" >&2
+  exit 127
+fi
 if [ "${1:-}" = --status ]; then
-  python3 - <<'PY'
-import fcntl, json, os, pathlib, socket, sys
-
-def local_state():
-    """Live local fallback holders and ordered tickets, as printable lines (#2778)."""
-    root = pathlib.Path.home() / ".rsi"
-    lines = []
-    locks = []
-    for pattern in ("build-slot-*.lock", "check-slot-*.lock", "cargo-slot*.lock"):
-        locks.extend(root.glob(pattern))
-    for lock in sorted(set(locks)):
-        try:
-            with lock.open("a") as handle:
-                try: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    marker = pathlib.Path(str(lock) + ".holder")
-                    label = marker.read_text().strip() if marker.exists() else "pid unknown"
-                    lines.append(f"holder {lock.name}: {label}")
-                else: fcntl.flock(handle, fcntl.LOCK_UN)
-        except OSError: pass
-    for pool in ("lander", "build", "check"):
-        tickets = root / "cargo-slot-queue" / pool / "tickets"
-        try:
-            waiting = []
-            for ticket in sorted(p for p in tickets.iterdir() if p.is_file()):
-                try: pid = int(ticket.name.rsplit(".", 1)[1])
-                except (IndexError, ValueError): continue
-                try: os.kill(pid, 0)
-                except ProcessLookupError: continue  # stale: the next waiter removes it
-                except OSError: pass
-                waiting.append(pid)
-            for position, pid in enumerate(waiting):
-                lines.append(f"queue {pool} position {position} pid {pid}")
-        except OSError: pass
-    return lines
-
-def daemon_snapshot():
-    path = os.environ.get("RSI_DAEMON_SOCKET_PATH") or os.path.expanduser("~/.rsi/daemon.sock")
-    s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(path)
-    s.sendall(b'{"jsonrpc":"2.0","id":1,"method":"GetResourceGovernor","params":{}}\n')
-    data = b""
-    while not data.endswith(b"\n"):
-        part = s.recv(65536)
-        if not part: raise ConnectionError("daemon closed the status request")
-        data += part
-    snap = json.loads(data).get("result")
-    if not isinstance(snap, dict): raise RuntimeError("governor status unavailable")
-    return snap
-
-# RSI_CARGO_SLOT_LOCAL=1 makes commands bypass the daemon, so status reports the local
-# backend alone. Otherwise the daemon's snapshot comes first and any live local holder or
-# waiter (a fallback run still going after the daemon recovered) follows under its own label.
-if os.environ.get("RSI_CARGO_SLOT_LOCAL"):
-    print("local fallback (RSI_CARGO_SLOT_LOCAL=1: daemon skipped)")
-    for line in local_state(): print(line)
-    sys.exit(0)
-try:
-    snap = daemon_snapshot()
-except Exception as e:
-    print(f"local fallback (governor status unavailable: {e})")
-    for line in local_state(): print(line)
-    sys.exit(0)
-for lease in sorted(snap.get("leases", []), key=lambda x: x.get("granted_at", "")):
-    print(f"holder {lease.get('class')} pid {lease.get('pid')}: {lease.get('label') or ''}")
-for item in snap.get("queue", []):
-    print(f"queue {item.get('class')} position {item.get('position')} pid {item.get('pid')}: {item.get('label') or ''}")
-local = local_state()
-if local:
-    print("local fallback (live local holders and waiters beside the daemon)")
-    for line in local: print(line)
-PY
-  exit $?
+  exec "$guard" cargo-slot status
 fi
 is_lander=0
 # An argument right after --bin/-p/--package/--example names a build target, not
@@ -120,30 +118,7 @@ for a in "$@"; do case "$prev" in --bin|-p|--package|--example) prev="$a"; conti
 # with "Disk quota exceeded". quotactl_fd(2) is Linux 5.14+ (tmpfs quotas
 # 6.6+); no quota, or no way to read one, leaves the free space uncapped.
 user_free_gb() {
-  python3 - "$1" 2>/dev/null <<'PY' || echo 0
-import ctypes, os, platform, struct, sys
-path = sys.argv[1]
-st = os.statvfs(path)
-free = st.f_bavail * st.f_frsize
-# quotactl_fd is syscall 443 on every Linux ABI except the offset mips/alpha ones.
-if sys.platform.startswith("linux") and not platform.machine().startswith(("mips", "alpha")):
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            dqblk = ctypes.create_string_buffer(72)  # struct if_dqblk
-            cmd = (0x800007 << 8) | 0  # QCMD(Q_GETQUOTA, USRQUOTA)
-            libc = ctypes.CDLL(None, use_errno=True)
-            if libc.syscall(443, fd, ctypes.c_uint(cmd), ctypes.c_uint(os.geteuid()), dqblk) == 0:
-                hard_kib, _soft, used = struct.unpack_from("=QQQ", dqblk.raw)
-                valid = struct.unpack_from("=I", dqblk.raw, 64)[0]
-                if hard_kib and (valid & 5) == 5:  # QIF_BLIMITS | QIF_SPACE
-                    free = min(free, max(0, hard_kib * 1024 - used))
-        finally:
-            os.close(fd)
-    except (OSError, AttributeError):
-        pass
-print(free // (1 << 30))
-PY
+  "$guard" cargo-slot free-gb "$1" 2>/dev/null || echo 0
 }
 
 # Lander test I/O goes to RAM: a private TMPDIR under /dev/shm (tmpfs) when this
@@ -201,10 +176,6 @@ cleanup_ticket() {
   ticket_file=""
 }
 
-# Phase lines (#1591): a job log shows where a run is and how long it waited.
-# Format `rsi-phase <epoch> <name>[: detail]`, one line, flushed at once; the
-# daemon reads the last one into a job_timed_out result.
-phase() { printf 'rsi-phase %s %s\n' "$(date +%s)" "$*" >&2; }
 wait_t0=$SECONDS
 wait_beat=$SECONDS
 # A single deadline covers governor retries AND local fallback (#1854).
@@ -229,8 +200,14 @@ admission_check() {
 }
 admission_sleep() {
   admission_check
-  local delay=$1 remaining=$((admission_max - (SECONDS - wait_t0)))
+  local delay=$1 remaining=$((admission_max - (SECONDS - wait_t0))) until_ask
   [ "$delay" -gt "$remaining" ] && delay=$remaining
+  # In the local fallback never sleep past the next governor re-ask (#3893).
+  if [ -n "${in_fallback:-}" ]; then
+    until_ask=$((governor_reask - (SECONDS - last_ask)))
+    [ "$until_ask" -lt 1 ] && until_ask=1
+    [ "$delay" -gt "$until_ask" ] && delay=$until_ask
+  fi
   sleep "$delay"
   admission_check
 }
@@ -253,7 +230,10 @@ run_child() {
   admission_check
   phase "slot-granted: waited $((SECONDS - wait_t0))s ($class); running"
   exec 3<&0
-  nice -n 19 ionice -c3 env RSI_CARGO_SLOT_HELD=1 CARGO_BUILD_JOBS="${RSI_JOB_BUILD_JOBS:-4}" CARGO_PROFILE_DEV_DEBUG=line-tables-only "$@" <&3 3<&- 8>&- 9>&- &
+  # ionice is util-linux: a host without it (macOS) runs the child at nice 19 alone.
+  if command -v ionice >/dev/null 2>&1; then io_nice="ionice -c3"; else io_nice=""; fi
+  # shellcheck disable=SC2086
+  nice -n 19 $io_nice env RSI_CARGO_SLOT_HELD=1 CARGO_BUILD_JOBS="${RSI_JOB_BUILD_JOBS:-4}" CARGO_PROFILE_DEV_DEBUG=line-tables-only "$@" <&3 3<&- 8>&- 9>&- &
   child=$!
   exec 3<&-
   trap 'kill -TERM "$child" 2>/dev/null' TERM HUP
@@ -270,59 +250,25 @@ run_child() {
 }
 
 # --- daemon (governor) mode ------------------------------------------------
-RPC_PY=$(cat <<'PY'
-import json, os, socket, sys
-sock = os.environ.get("RSI_DAEMON_SOCKET_PATH") or os.path.expanduser("~/.rsi/daemon.sock")
-op = sys.argv[1]
-if op == "acquire":
-    method = "AcquireAdmission"
-    params = {"class": sys.argv[2], "pid": int(sys.argv[3]), "label": sys.argv[4][:200]}
-    if len(sys.argv) > 5 and sys.argv[5]:
-        params["ticket_id"] = sys.argv[5]
-else:
-    method = "ReleaseAdmission"
-    params = {"lease_id": sys.argv[2]}
-try:
-    s = socket.socket(socket.AF_UNIX)
-    s.settimeout(5)
-    s.connect(sock)
-    s.sendall((json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}) + "\n").encode())
-    buf = b""
-    while not buf.endswith(b"\n"):
-        chunk = s.recv(65536)
-        if not chunk:
-            raise ConnectionResetError("governor closed before a complete reply")
-        buf += chunk
-    reply = json.loads(buf)
-except (TimeoutError, ConnectionResetError, BrokenPipeError) as error:
-    # A busy daemon can reply after the five-second read deadline. Keep the
-    # ticket and retry instead of abandoning policy after one slow RPC.
-    print("retry " + type(error).__name__ + ": " + str(error).replace("\n", " ")[:200])
-    sys.exit(0)
-except Exception as error:
-    print("unreachable " + type(error).__name__ + ": " + str(error).replace("\n", " ")[:200])
-    sys.exit(0)
-if "error" in reply and reply["error"]:
-    msg = str(reply["error"].get("message", ""))
-    print(("badticket " if "ticket" in msg else "unreachable ") + msg.replace("\n", " "))
-    sys.exit(0)
-r = reply.get("result") or {}
-if op == "release":
-    print("released")
-elif r.get("status") == "granted":
-    print("granted", r["lease_id"])
-elif r.get("status") == "queued":
-    print("queued", r["ticket_id"], r["position"], r.get("message", "").replace("\n", " "))
-else:
-    print("unreachable")
-PY
-)
-PYTHON=/usr/bin/python3; [ -x "$PYTHON" ] || PYTHON=$(command -v python3)
-
-rpc() { [ -n "$PYTHON" ] && "$PYTHON" -c "$RPC_PY" "$@" 2>/dev/null; }
+# The governor client: `rsi-repo-guard cargo-slot rpc acquire CLASS PID LABEL [TICKET] | release LEASE`.
+# rpc_call runs it in this shell (no subshell, so the state survives) and sets rpc_rc, rpc_out
+# (the reply line) and rpc_err (the client's own words when it failed). The client prints one
+# reply line on stdout and nothing on stderr when it works, so stderr is merged in and read
+# only when the exit status is non-zero: a failure is never discarded (#3893).
+rpc_rc=0 rpc_out="" rpc_err=""
+rpc_call() {
+  local all
+  all=$("$guard" cargo-slot rpc "$@" 2>&1 </dev/null); rpc_rc=$?
+  if [ "$rpc_rc" -eq 0 ]; then
+    rpc_out=${all##*$'\n'}; rpc_err=""
+  else
+    rpc_out=""; rpc_err=$(printf '%s' "$all" | tr '\n' ' ' | cut -c1-300)
+  fi
+  return 0
+}
 
 release_lease() {
-  [ -n "$lease" ] && rpc release "$lease" >/dev/null
+  [ -n "$lease" ] && rpc_call release "$lease"
   lease=""
 }
 
@@ -353,15 +299,29 @@ reclaim_idle_pool() {
 }
 
 # governed_wait: 0 = granted (lease set), 1 = daemon unusable (use local gates).
+# A client that exits non-zero is a transient fault, not "unreachable": it is retried (with the
+# client's stderr in the wait note) and only after $gov_fail_max consecutive failures does the
+# run take the local gates, naming the error. RSI_GOVERNOR_ONCE=1 (the 60 s re-ask from the
+# local fallback) gives up at the first failure instead.
+gov_fail_max=3
 governed_wait() {
   [ -n "${RSI_CARGO_SLOT_LOCAL:-}" ] && return 1
-  [ -n "$PYTHON" ] || return 1
-  local label out status id pos msg ticket="" lastmsg=""
+  local label out status id pos msg ticket="" lastmsg="" fails=0
   label="$*"
   phase "slot-wait: asking the governor for a $class slot"
   while :; do
     admission_check
-    out=$(rpc acquire "$class" "$$" "$label" "$ticket") || return 1
+    rpc_call acquire "$class" "$$" "$label" "$ticket"
+    if [ "$rpc_rc" -ne 0 ]; then
+      fails=$((fails + 1))
+      phase "governor-error: RPC client exited $rpc_rc (attempt $fails): ${rpc_err:-no output}"
+      if [ -n "${RSI_GOVERNOR_ONCE:-}" ] || [ "$fails" -ge "$gov_fail_max" ]; then return 1; fi
+      wait_note "governor wait" "RPC client failed (exit $rpc_rc), retrying: ${rpc_err:-no output}"
+      admission_sleep 2
+      continue
+    fi
+    fails=0
+    out=$rpc_out
     read -r status id pos msg <<<"$out"
     case "$status" in
       granted) lease="$id"; return 0 ;;
@@ -372,7 +332,7 @@ governed_wait() {
           lastmsg="$msg"
         fi
         case "$msg" in
-          *"GB free on /"*) reclaim_idle_pool ;;
+          *"free on /"*) reclaim_idle_pool ;;
         esac
         case "$msg" in
           *memory*|*workers\ slice*) wait_note "memory wait (governor)" "$msg" ;;
@@ -385,7 +345,7 @@ governed_wait() {
         wait_note "governor wait" "transient RPC failure: ${out#retry }"
         admission_sleep 2 ;;
       *)
-        phase "governor-error: ${out:-RPC client failed}"
+        phase "governor-error: ${out:-RPC client gave no reply}"
         release_lease
         return 1 ;;
 
@@ -400,9 +360,13 @@ trap 'release_lease; [ -n "$LTMP" ] && rm -rf -- "$LTMP"; exit 143' TERM HUP
 if governed_wait "$@"; then
   run_child "$@"
 fi
-phase "slot-wait: governor unreachable; using the local slot gates"
+governor_reask=${RSI_CARGO_GOVERNOR_REASK_SEC:-60}
+case "$governor_reask" in ''|*[!0-9]*|0) governor_reask=60;; esac
+phase "slot-wait: governor unreachable; using the local slot gates (asking the governor again every ${governor_reask}s)"
 # --- local fallback (rsid unreachable): FIFO slot tickets plus the same gates ---
 MIN_FREE_GB=${RSI_CARGO_MIN_FREE_GB:-30}
+# The legacy _GB setting is in binary GiB, as in the daemon governor.
+min_free_bytes=$((MIN_FREE_GB * 1073741824))
 if [ $is_lander -eq 1 ]; then
   N=${RSI_LANDER_SLOTS:-5}
   # Landers use the legacy lock files so runs under the older script count.
@@ -437,7 +401,7 @@ take_ticket() {
   seq=$((seq + 1))
   printf '%s\n' "$seq" >"$queue_dir/sequence.tmp.$$"
   mv -f -- "$queue_dir/sequence.tmp.$$" "$queue_dir/sequence"
-  start=$(python3 -c 'import sys; p="/proc/%s/stat"%sys.argv[1]; s=open(p).read(); print(s[s.rfind(")")+2:].split()[19])' "$$" 2>/dev/null || echo 0)
+  start=$("$guard" cargo-slot start "$$" 2>/dev/null || echo 0)
   name="$((9 - prio))$(printf '%020d' "$seq").$$"
   printf '%s %s\n' "$$" "$start" >"$ticket_dir/$name"
   ticket_file="$ticket_dir/$name"
@@ -449,29 +413,7 @@ queue_slot() {
   local head slot
   exec 8>>"$queue_dir/lock"
   flock 8
-  head=$(python3 - "$ticket_dir" <<'PY'
-import errno, os, pathlib, sys
-d = pathlib.Path(sys.argv[1])
-live = []
-for p in sorted(d.iterdir()):
-    try:
-        name_pid = int(p.name.rsplit(".", 1)[1])
-        fields = p.read_text().split()
-        pid, start = int(fields[0]), fields[1]
-        if pid != name_pid: p.unlink(missing_ok=True); continue
-        try: os.kill(pid, 0)
-        except OSError as e:
-            if e.errno == errno.ESRCH: p.unlink(missing_ok=True); continue
-        stat = pathlib.Path(f"/proc/{pid}/stat")
-        if start != "0" and stat.exists():
-            raw = stat.read_text(); fields = raw[raw.rfind(")") + 2:].split()
-            if fields[0] == "Z" or fields[19] != start: p.unlink(missing_ok=True); continue
-        live.append(p.name)
-    except (OSError, ValueError, IndexError):
-        p.unlink(missing_ok=True)
-print(live[0] if live else "")
-PY
-)
+  head=$("$guard" cargo-slot queue-head "$ticket_dir")
   if [ -n "$ticket_file" ] && [ "$head" = "${ticket_file##*/}" ]; then
     for slot in $(seq 0 $((N-1))); do
       exec 9>>"$(lock_for "$slot")"
@@ -496,13 +438,32 @@ case "$slot_poll" in ''|*[!0-9]*|0) slot_poll=5;; esac
 # unit's affinity (2 CPUs) and made the gate wait for load < 2 forever (#1854).
 host_cpus() { getconf _NPROCESSORS_ONLN 2>/dev/null || nproc --all 2>/dev/null || nproc; }
 
+# A governor that was down or faulty when this run started may answer later: ask it again
+# every $governor_reask s and leave the local gates the moment it answers (#3893). While rsid
+# holds the slots the local gates can never succeed, so a fallback that never re-asked starved
+# a whole admission budget. A failed ask costs one RPC and leaves the local ticket in place.
+last_ask=$SECONDS
+in_fallback=1
+reask_governor() {
+  [ -n "${RSI_CARGO_SLOT_LOCAL:-}" ] && return 1
+  [ $((SECONDS - last_ask)) -ge "$governor_reask" ] || return 1
+  last_ask=$SECONDS
+  phase "slot-wait: asking the governor again from the local fallback"
+  RSI_GOVERNOR_ONCE=1 governed_wait "$@" || return 1
+  cleanup_ticket
+  phase "slot-wait: the governor answered; leaving the local slot gates"
+  return 0
+}
 while :; do
   admission_check
-  free_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-  if [ "${free_gb:-0}" -lt "$MIN_FREE_GB" ]; then
-    [ $warned -eq 0 ] && echo "cargo-slot: only ${free_gb} GB free on / (< ${MIN_FREE_GB}); waiting for space" >&2 && warned=1
+  if reask_governor "$@"; then run_child "$@"; fi
+  free_bytes=$(df -B1 --output=avail / | tail -1 | tr -dc '0-9')
+  if [ "${free_bytes:-0}" -lt "$min_free_bytes" ]; then
+    free_gib=$(awk -v bytes="${free_bytes:-0}" 'BEGIN { printf "%.1f", bytes / 1073741824 }')
+    disk_detail="${free_gib} GiB (${free_bytes:-0} bytes) free on /, floor ${MIN_FREE_GB} GiB (${min_free_bytes} bytes)"
+    [ $warned -eq 0 ] && echo "cargo-slot: only ${disk_detail}; waiting for space" >&2 && warned=1
     reclaim_idle_pool
-    wait_note "local disk wait" "disk free ${free_gb} GB < ${MIN_FREE_GB}"
+    wait_note "local disk wait" "$disk_detail"
     beat "$wait_phase: $wait_message"
     admission_sleep 30; continue
   fi

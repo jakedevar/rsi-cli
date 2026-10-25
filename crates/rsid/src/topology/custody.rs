@@ -406,6 +406,37 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// A bounded, fail-closed proof that `head` only merges rolling into an
+/// already reviewed `base`. Conflict resolutions and ordinary commits need
+/// a delta review. Recompute Git's clean merge tree rather than trusting a
+/// worker's description or merely counting merge parents.
+pub(crate) fn only_rolling_merges(repo: &Path, base: &str, head: &str) -> bool {
+    let prove = || -> Result<bool> {
+        if base == head || !commit_is_ancestor(repo, base, head)? {
+            return Ok(false);
+        }
+        let mut tip = head.to_owned();
+        for _ in 0..32 {
+            if tip == base {
+                return Ok(true);
+            }
+            let parents = git(repo, &["rev-list", "--parents", "-n", "1", &tip])?;
+            let parts: Vec<_> = parents.split_whitespace().collect();
+            if parts.len() != 3 || !commit_is_ancestor(repo, parts[2], "origin/rolling")? {
+                return Ok(false);
+            }
+            let expected = git(repo, &["merge-tree", "--write-tree", parts[1], parts[2]])?;
+            let actual = git(repo, &["rev-parse", &format!("{tip}^{{tree}}")])?;
+            if expected != actual {
+                return Ok(false);
+            }
+            tip = parts[1].to_owned();
+        }
+        Ok(tip == base)
+    };
+    prove().unwrap_or(false)
+}
+
 /// Whether `ancestor` is a commit reachable from `descendant` in `repo` (#2651).
 /// A commit the repository does not have, or an unresolvable ref, is `false`.
 ///
@@ -453,6 +484,49 @@ fn verify_exact_commit(repo: &Path, commit: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run `attempt`; on failure wait `delay` and run it exactly once more.
+async fn retry_once_after<T, F, Fut>(delay: std::time::Duration, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    match attempt().await {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            tracing::warn!(error = %first, "rolling base fetch failed; retrying once");
+            tokio::time::sleep(delay).await;
+            attempt().await
+        }
+    }
+}
+
+/// Fetch `origin/rolling`; a failure carries git's own stderr (ref lock, remote
+/// read, ...) so the refusal can name the cause.
+async fn fetch_origin_rolling(root: &Path) -> Result<()> {
+    let fetch = tokio::process::Command::new("git")
+        .args([
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "origin",
+            "+refs/heads/rolling:refs/remotes/origin/rolling",
+        ])
+        .current_dir(root)
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), fetch)
+        .await
+        .map_err(|_| DaemonError::InvalidParam("rolling base fetch timed out".into()))?
+        .map_err(DaemonError::Io)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(DaemonError::InvalidParam(format!(
+        "cannot fetch origin/rolling: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
 pub(crate) async fn resolve_execution_base(
     working_dir: &Path,
     explicit_commit: Option<&str>,
@@ -469,26 +543,12 @@ pub(crate) async fn resolve_execution_base(
         verify_exact_commit(&root, commit)?;
         return Ok((root, commit.to_owned()));
     }
-    let fetch = tokio::process::Command::new("git")
-        .args([
-            "fetch",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "origin",
-            "+refs/heads/rolling:refs/remotes/origin/rolling",
-        ])
-        .current_dir(&root)
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(std::time::Duration::from_secs(20), fetch)
-        .await
-        .map_err(|_| DaemonError::InvalidParam("rolling base fetch timed out".into()))?
-        .map_err(DaemonError::Io)?;
-    if !output.status.success() {
-        return Err(DaemonError::InvalidParam(
-            "cannot fetch origin/rolling".into(),
-        ));
-    }
+    // A concurrent fetch or lander publication can hold the remote-tracking
+    // ref lock; that is transient, so retry once before refusing (#616).
+    retry_once_after(std::time::Duration::from_millis(500), || {
+        fetch_origin_rolling(&root)
+    })
+    .await?;
     let commit = git(
         &root,
         &[
@@ -1098,6 +1158,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, DaemonError::InvalidParam(_)));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn rolling_fetch_failure_names_git_stderr() {
+        let (repo, _) = repo();
+        let error = resolve_execution_base(repo.path(), None).await.unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("cannot fetch origin/rolling:"), "{text}");
+        assert!(text.contains("origin"), "{text}");
+        assert!(
+            text.trim_end_matches('.').len() > "cannot fetch origin/rolling:".len() + 8,
+            "git's stderr must follow the prefix: {text}"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[tokio::test]
+    async fn transient_first_attempt_is_retried_once() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let value = retry_once_after(std::time::Duration::from_millis(1), || async {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Err(DaemonError::InvalidParam("cannot lock ref".into())),
+                _ => Ok(7),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = retry_once_after(std::time::Duration::from_millis(1), || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err::<(), _>(DaemonError::InvalidParam("still locked".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("still locked"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]

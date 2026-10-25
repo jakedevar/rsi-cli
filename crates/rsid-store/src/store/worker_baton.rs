@@ -7,7 +7,9 @@
 //! - (a) queues one durable agent mail to the worker with the baton protocol
 //!   (commit, append a handoff to its Issue, end the turn with
 //!   `PIPELINE HANDOFF — BATON <sha>` and a closing `Friction:` line, #1332),
-//!   delivered at its next tool boundary;
+//!   delivered at its next tool boundary. A topology node session (#3340) is
+//!   told its execution takes that line as the node outcome and continues the
+//!   node itself, instead of expecting a manager to relaunch it;
 //! - (b) records one typed `worker_context_cap` notice for the launcher: a
 //!   manager-inbox notice when the launcher is the project's manager lineage,
 //!   otherwise (an Epic lead, or a global seat acting in a project) a durable
@@ -115,6 +117,11 @@ pub struct WorkerBatonRecord {
     /// #2898: what passed the baton.
     #[serde(default)]
     pub trigger: WorkerBatonTrigger,
+    /// #3340: the worker is a topology node session, so its execution (not
+    /// its launcher) continues the node from the commit the baton names.
+    /// Records written before #3340 read as `false`.
+    #[serde(default)]
+    pub topology_node: bool,
 }
 
 /// What one crossing did.
@@ -262,6 +269,7 @@ impl Store {
         let Some(launcher) = self.worker_baton_launcher(worker)? else {
             return Ok(WorkerBatonOutcome::NoLauncher);
         };
+        let topology_node = self.is_topology_node_session(worker)?;
         self.put_worker_baton(
             worker,
             &WorkerBatonRecord {
@@ -273,6 +281,7 @@ impl Store {
                 worker_mail_id: None,
                 launcher_notice: None,
                 trigger,
+                topology_node,
             },
         )?;
         self.deliver_worker_baton(worker)?;
@@ -429,6 +438,7 @@ fn notice_state(worker: Uuid, record: &WorkerBatonRecord) -> serde_json::Value {
         "issue_display_number": record.launcher.issue_display_number,
         "measured_tokens": record.measured_tokens,
         "cap": record.cap_tokens,
+        "topology_node": record.topology_node,
         "crossed_at": record.crossed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
     })
 }
@@ -460,19 +470,29 @@ pub fn baton_steps(record: &WorkerBatonRecord) -> String {
             "Publish a handoff to Issue #{issue} with `AgentUpdateIssue {{display_number: {issue}, handoff: \"<complete handoff>\", expected_row_version: <any positive>, idempotency_key: \"<unique>\"}}` and no other field. The handoff holds what is done, what is left, the commit SHA, test state, the next step and your `Friction:` line. Do not read the Issue again and do not copy its body: the handoff is stored as its own record."
         ),
     );
-    format!(
-        "1. Commit your work on your sandbox branch (WIP is fine).\n2. {handoff}\n3. End your turn with a final message whose first line is `PIPELINE HANDOFF — BATON <sha>` and whose last line is `Friction: none | #N[, #M] | <one line, not filed because ...>` (the kaizen Issues you filed, or the problem you could not file).\nYour launcher was told and will continue from your commit with a fresh worker."
-    )
+    let ending = if record.topology_node {
+        "3. End your turn with a final message whose first line is `PIPELINE HANDOFF — BATON <sha>` (your last commit) and whose last line is `Friction: none | #N[, #M] | <one line, not filed because ...>` (the kaizen Issues you filed, or the problem you could not file). Between them say what is done, what is left and the next step, and name the tests you ran or did not run.\nYou are a topology node: the execution accepts that line as your outcome, preserves your commit and relaunches this node from it with a fresh session that receives your final message as context (a few times at most). Write this baton line instead of a stage handoff such as `PIPELINE HANDOFF — IMPLEMENTATION:`; no manager will relaunch you by hand."
+    } else {
+        "3. End your turn with a final message whose first line is `PIPELINE HANDOFF — BATON <sha>` and whose last line is `Friction: none | #N[, #M] | <one line, not filed because ...>` (the kaizen Issues you filed, or the problem you could not file).\nYour launcher was told and will continue from your commit with a fresh worker."
+    };
+    format!("1. Commit your work on your sandbox branch (WIP is fine).\n2. {handoff}\n{ending}")
 }
 
 fn launcher_mail(worker: Uuid, record: &WorkerBatonRecord) -> String {
+    let crossed = match record.trigger {
+        WorkerBatonTrigger::ContextCap => "crossed its context cap",
+        WorkerBatonTrigger::PreCompact => "is being compacted by its provider (PreCompact hook)",
+    };
+    let next = if record.topology_node {
+        "It is a topology node session: when it has ended its turn the execution preserves its commit and relaunches the node from it with the baton as context (a few continuations at most), so do not relaunch it yourself; a node past that budget blocks as preserved_work for ResolveTopologyAttempt.".to_string()
+    } else {
+        format!(
+            "When it has ended its turn, continue its Issue with a fresh worker (AgentManagerLaunchIssueWorker with continue_from: \"{worker}\", or a new child from its commit)."
+        )
+    };
     format!(
-        "[rsi daemon, #1254 worker_context_cap] {}\nWorker {worker} {} and was told to commit, append a handoff and end its turn. When it has ended its turn, continue its Issue with a fresh worker (AgentManagerLaunchIssueWorker with continue_from: \"{worker}\", or a new child from its commit).",
+        "[rsi daemon, #1254 worker_context_cap] {}\nWorker {worker} {crossed} and was told to commit, append a handoff and end its turn. {}",
         notice_state(worker, record),
-        match record.trigger {
-            WorkerBatonTrigger::ContextCap => "crossed its context cap",
-            WorkerBatonTrigger::PreCompact =>
-                "is being compacted by its provider (PreCompact hook)",
-        }
+        next
     )
 }

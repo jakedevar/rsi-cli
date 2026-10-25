@@ -368,7 +368,7 @@ where
     }
     .await;
     h.final_screen_text = Some(term.screen().await.text());
-    let _ = term.send_key(Key::Ctrl('c')).await;
+    let _ = quit_tui(&term).await;
     let manager_id = fixture.manager.id;
     let _ = fixture.client.interrupt_session(manager_id).await;
     h.shutdown_daemon();

@@ -14,7 +14,9 @@
 set -u
 ref="${1:?usage: candidate-receipt.sh <ref>}"
 repo="$(git rev-parse --show-toplevel)" || exit 2
-checker="$repo/scripts/check-touched-shards"
+# The Rust guard (#465; this once ran the old script through an interpreter): this checkout's
+# scripts/repo-guard builds it with the caller's cargo setup.
+checker="$repo/scripts/repo-guard"
 [ -x "$checker" ] || { echo "candidate-receipt: $checker missing" >&2; exit 2; }
 
 # Best effort: refresh rolling, and a branch that is not local yet.
@@ -44,4 +46,4 @@ git -C "$repo" worktree add --detach --quiet "$work/wt" "$sha" || exit 2
 exec 9>"$cache/.lock"
 flock 9
 export CARGO_TARGET_DIR="$cache"
-python3 "$checker" --compile --repo "$work/wt" --base origin/rolling --head "$sha" --receipt-line
+"$checker" check-touched-shards --compile --repo "$work/wt" --base origin/rolling --head "$sha" --receipt-line

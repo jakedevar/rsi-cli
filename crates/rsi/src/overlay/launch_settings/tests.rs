@@ -827,6 +827,7 @@ async fn launch_blank_with_planned_manager(app: &mut App) -> crate::app::Interac
     press(app, ctrl(KeyCode::Char('o'))).await;
     press(app, key(KeyCode::Char('G'))).await;
     press(app, key(KeyCode::Char(' '))).await;
+    load_empty_grant_context(app);
     // Launch straight from the settings side.
     press(app, ctrl(KeyCode::Enter)).await;
     assert!(app.interactive_launch_pending.is_some());
@@ -841,7 +842,7 @@ async fn launch_blank_with_planned_manager(app: &mut App) -> crate::app::Interac
 
 #[tokio::test]
 async fn launch_appoints_the_new_session_and_grants_the_planned_policy() {
-    let temp_dir = tempfile::tempdir().expect("socket directory");
+    let temp_dir = crate::test_support::socket_tempdir().expect("socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
     let project_id = Uuid::new_v4();
@@ -898,6 +899,20 @@ async fn launch_appoints_the_new_session_and_grants_the_planned_policy() {
     assert_eq!(call["policy"]["mode"], "execute");
 }
 
+/// Simulate a successful read for tests of editing a brand-new grant.
+fn load_empty_grant_context(app: &mut App) {
+    let project_id = app.current_project_id.expect("project");
+    app.manager_grant_context_request = None;
+    apply_grant_context(
+        app,
+        project_id,
+        &GrantContextState::Loaded(ManagerGrantContext {
+            saved: None,
+            ancestor_launches: None,
+        }),
+    );
+}
+
 /// Plan a manager and open its grant page from the settings side.
 async fn open_grant_page_with_manager(app: &mut App) {
     crate::overlay::open_blank_popup(app);
@@ -905,12 +920,13 @@ async fn open_grant_page_with_manager(app: &mut App) {
     press(app, ctrl(KeyCode::Char('o'))).await;
     press(app, key(KeyCode::Char('G'))).await;
     press(app, key(KeyCode::Char(' '))).await;
+    load_empty_grant_context(app);
     press(app, key(KeyCode::Char('p'))).await;
 }
 
 #[tokio::test]
 async fn the_grant_page_edits_the_grant_and_launch_sends_it_in_the_one_atomic_call() {
-    let temp_dir = tempfile::tempdir().expect("socket directory");
+    let temp_dir = crate::test_support::socket_tempdir().expect("socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
     let project_id = Uuid::new_v4();
@@ -1006,6 +1022,7 @@ async fn the_grant_page_needs_a_planned_manager_and_flips_back_like_the_rest() {
     press(&mut app, key(KeyCode::Char('G'))).await;
     press(&mut app, key(KeyCode::Char(' '))).await;
     assert_eq!(selected(&app), Some(LaunchSettingRow::Manager));
+    load_empty_grant_context(&mut app);
     // With one planned, the last row is the Grant row and Enter opens it.
     press(&mut app, key(KeyCode::Char('G'))).await;
     assert_eq!(selected(&app), Some(LaunchSettingRow::ManagerGrant));
@@ -1067,7 +1084,7 @@ async fn choosing_a_preset_resets_the_edited_grant_and_unplanning_drops_it() {
 
 #[tokio::test]
 async fn refused_appointment_still_lands_the_launch_and_names_the_retry() {
-    let temp_dir = tempfile::tempdir().expect("socket directory");
+    let temp_dir = crate::test_support::socket_tempdir().expect("socket directory");
     let socket_path = temp_dir.path().join("daemon.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
     let project_id = Uuid::new_v4();
@@ -1095,4 +1112,546 @@ async fn refused_appointment_still_lands_the_launch_and_names_the_retry() {
     );
     drop(app);
     server.await.expect("daemon");
+}
+
+// === Saved grant survives a re-seat (#3270) ===================================
+
+fn saved_grant() -> ManagerPolicyV2 {
+    let mut policy = crate::overlay::global_manager_command::default_project_policy();
+    policy.allowed_launches = crate::overlay::global_manager_command::default_allowed_launches()
+        .into_iter()
+        .take(3)
+        .collect();
+    policy.max_active_sessions = 25;
+    policy.max_created_containers = 64;
+    policy.max_created_sessions = 1024;
+    policy
+}
+
+/// Answer the manager RPCs of one appointment; the project already has
+/// `saved` (row version 7).
+fn spawn_manager_daemon(
+    listener: tokio::net::UnixListener,
+    project_id: Uuid,
+    session_id: Uuid,
+    saved: Option<ManagerPolicyV2>,
+) -> tokio::task::JoinHandle<Vec<serde_json::Value>> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    tokio::spawn(async move {
+        let mut seen = Vec::new();
+        let (stream, _) = listener.accept().await.expect("manager client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "GetHarnessManager" => serde_json::Value::Null,
+                "GetHarnessManagerPolicy" => saved.as_ref().map_or(serde_json::Value::Null, |p| {
+                    serde_json::to_value(HarnessManagerPolicyConfigV2 {
+                        project_id,
+                        manager_session_id: Uuid::new_v4(),
+                        scope_version: 1,
+                        row_version: 7,
+                        policy: p.clone(),
+                        updated_at: chrono::Utc::now(),
+                        revoked: false,
+                    })
+                    .unwrap()
+                }),
+                "ConfigureHarnessManagerWithPolicy" => {
+                    let policy: ManagerPolicyV2 =
+                        serde_json::from_value(request["params"]["policy"].clone()).unwrap();
+                    serde_json::to_value(ConfigureHarnessManagerWithPolicyResultV2 {
+                        config: manager_config(project_id, session_id, 1),
+                        scope_outcome: Default::default(),
+                        policy: HarnessManagerPolicyConfigV2 {
+                            project_id,
+                            manager_session_id: session_id,
+                            scope_version: 1,
+                            row_version: 8,
+                            policy,
+                            updated_at: chrono::Utc::now(),
+                            revoked: false,
+                        },
+                    })
+                    .unwrap()
+                }
+                other => panic!("unexpected manager RPC {other}"),
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": result,
+            });
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            seen.push(request);
+        }
+        seen
+    })
+}
+
+async fn appoint_against_saved_grant(
+    saved: Option<ManagerPolicyV2>,
+    preset_chosen: bool,
+) -> (String, serde_json::Value, ManagerLaunchPlan) {
+    let temp_dir = tempfile::tempdir().expect("socket directory");
+    let socket_path = temp_dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("listener");
+    let project_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let server = spawn_manager_daemon(listener, project_id, session_id, saved);
+    let plan = ManagerLaunchPlan {
+        project_id,
+        scope: ManagerLaunchScope::Project,
+        preset: DEFAULT_MANAGER_LAUNCH_PRESET,
+    };
+    let message = appoint_launched_manager(
+        socket_path,
+        session_id,
+        ManagerAppointment {
+            plan,
+            grant: None,
+            preset_chosen,
+        },
+    )
+    .await
+    .expect("appointment succeeds");
+    let seen = server.await.expect("daemon");
+    let call = seen
+        .iter()
+        .find(|request| request["method"] == "ConfigureHarnessManagerWithPolicy")
+        .expect("the appointment call")["params"]
+        .clone();
+    (message, call, plan)
+}
+
+#[tokio::test]
+async fn an_unedited_appointment_regrants_the_saved_grant_not_the_preset() {
+    let saved = saved_grant();
+    let (message, call, _) = appoint_against_saved_grant(Some(saved.clone()), false).await;
+    let sent: ManagerPolicyV2 = serde_json::from_value(call["policy"].clone()).unwrap();
+    assert_eq!(sent, saved, "the operator's last values are re-granted");
+    assert_eq!(sent.allowed_launches.len(), 3);
+    assert_eq!(
+        (
+            sent.max_active_sessions,
+            sent.max_created_containers,
+            sent.max_created_sessions
+        ),
+        (25, 64, 1024)
+    );
+    assert_eq!(call["expected_policy_version"], 7);
+    assert!(
+        message.contains("re-granting the saved grant"),
+        "the confirmation says what was granted: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_chosen_preset_or_a_project_without_a_saved_grant_applies_the_preset() {
+    let (message, call, plan) = appoint_against_saved_grant(Some(saved_grant()), true).await;
+    let sent: ManagerPolicyV2 = serde_json::from_value(call["policy"].clone()).unwrap();
+    assert_eq!(sent, plan.policy(), "an explicit preset wins");
+    assert_eq!(
+        message,
+        "Manager appointed for the whole project with the Execute policy"
+    );
+
+    let (message, call, plan) = appoint_against_saved_grant(None, false).await;
+    let sent: ManagerPolicyV2 = serde_json::from_value(call["policy"].clone()).unwrap();
+    assert_eq!(sent, plan.policy(), "no saved grant: the preset");
+    assert_eq!(
+        message,
+        "Manager appointed for the whole project with the Execute policy"
+    );
+}
+
+/// Plan a manager from the settings side without opening the grant page.
+async fn plan_manager(app: &mut App) {
+    crate::overlay::open_blank_popup(app);
+    type_text(app, "run the project").await;
+    press(app, ctrl(KeyCode::Char('o'))).await;
+    press(app, key(KeyCode::Char('G'))).await;
+    press(app, key(KeyCode::Char(' '))).await;
+}
+
+#[tokio::test]
+async fn the_grant_page_starts_from_the_saved_grant_and_marks_uncovered_launches() {
+    let mut app = test_app();
+    let project_id = Uuid::new_v4();
+    app.current_project_id = Some(project_id);
+    plan_manager(&mut app).await;
+    let saved = saved_grant();
+    let covered = saved.allowed_launches[0].clone();
+    apply_grant_context(
+        &mut app,
+        project_id,
+        &GrantContextState::Loaded(ManagerGrantContext {
+            saved: Some(saved.clone()),
+            ancestor_launches: Some(vec![covered]),
+        }),
+    );
+    assert!(launch(&app).regrants_saved_grant());
+    let rows = render_rows(&mut app);
+    assert!(
+        row_containing(&rows, "Grant").contains("re-grants the saved grant"),
+        "{rows:?}"
+    );
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    let editor = launch(&app).grant.as_ref().expect("grant page");
+    assert_eq!(editor.finish(), saved, "the page opens on the saved values");
+    assert_eq!(
+        editor.uncovered_launches(),
+        saved.allowed_launches.iter().skip(1).collect::<Vec<_>>(),
+        "entries the ancestor grant does not cover are named"
+    );
+
+    // Picking a preset is an explicit choice: the saved grant no longer applies.
+    let mut chosen = launch(&app).clone();
+    chosen.grant = None;
+    chosen.preset_chosen = true;
+    assert!(!chosen.regrants_saved_grant());
+}
+
+#[tokio::test]
+async fn a_grant_context_arriving_late_seeds_a_waiting_page_and_preserves_later_edits() {
+    let mut app = test_app();
+    let project_id = Uuid::new_v4();
+    app.current_project_id = Some(project_id);
+    plan_manager(&mut app).await;
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    let saved = saved_grant();
+    let context = GrantContextState::Loaded(ManagerGrantContext {
+        saved: Some(saved.clone()),
+        ancestor_launches: None,
+    });
+    apply_grant_context(&mut app, project_id, &context);
+    assert_eq!(
+        launch(&app).grant.as_ref().map(GrantEditor::finish),
+        Some(saved.clone()),
+        "an untouched page picks up the saved grant"
+    );
+
+    // An edited page keeps the operator's edit.
+    press(&mut app, key(KeyCode::Char('j'))).await;
+    press(&mut app, key(KeyCode::Char('l'))).await;
+    let edited = launch(&app).grant.as_ref().map(GrantEditor::finish);
+    assert_ne!(edited, Some(saved.clone()));
+    apply_grant_context(&mut app, project_id, &context);
+    assert_eq!(launch(&app).grant.as_ref().map(GrantEditor::finish), edited);
+}
+
+// === Unknown saved grants never become preset drafts (#3300) ================
+
+/// A daemon retaining its saved policy across one failed read and its retry.
+/// Return every RPC and the final policy so submission attempts are observable.
+fn spawn_grant_read_daemon(
+    listener: tokio::net::UnixListener,
+    project_id: Uuid,
+    saved: Option<ManagerPolicyV2>,
+    failure: Option<&'static str>,
+) -> tokio::task::JoinHandle<(Vec<String>, Option<ManagerPolicyV2>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    tokio::spawn(async move {
+        let mut methods = Vec::new();
+        let mut saved = saved;
+        for attempt in 0..if failure.is_some() { 2 } else { 1 } {
+            let (stream, _) = listener.accept().await.expect("grant client");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.expect("request") {
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                let method = request["method"].as_str().unwrap();
+                methods.push(method.to_owned());
+                if attempt == 0 && failure == Some("timeout") {
+                    // The client must enforce its deadline and close this read.
+                    assert_eq!(lines.next_line().await.unwrap(), None);
+                    break;
+                }
+                let fail = attempt == 0
+                    && ((failure == Some("rpc") && method == "GetHarnessManagerPolicy")
+                        || (failure == Some("ancestor_rpc") && method == "ListPortfolioNodes"));
+                let result = match method {
+                    "GetHarnessManagerPolicy" => {
+                        saved.as_ref().map_or(serde_json::Value::Null, |policy| {
+                            serde_json::to_value(HarnessManagerPolicyConfigV2 {
+                                project_id,
+                                manager_session_id: Uuid::new_v4(),
+                                scope_version: 1,
+                                row_version: 7,
+                                policy: policy.clone(),
+                                updated_at: chrono::Utc::now(),
+                                revoked: false,
+                            })
+                            .unwrap()
+                        })
+                    }
+                    "ListPortfolioNodes" => serde_json::json!({"nodes": []}),
+                    "ConfigureHarnessManagerWithPolicy" => {
+                        saved = Some(
+                            serde_json::from_value(request["params"]["policy"].clone()).unwrap(),
+                        );
+                        serde_json::Value::Null
+                    }
+                    other => panic!("unexpected grant RPC {other}"),
+                };
+                let response = if fail {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32000,"message":"grant read unavailable"}})
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                };
+                writer
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                if fail {
+                    break;
+                }
+            }
+        }
+        (methods, saved)
+    })
+}
+
+async fn finish_grant_read(app: &mut App) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tick_grant_context(app).await;
+            if app.manager_grant_context_task.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bounded grant read");
+}
+
+async fn failed_grant_read_preserves_saved_policy_and_recovers(failure: &'static str) {
+    let temp_dir = crate::test_support::socket_tempdir().unwrap();
+    let socket_path = temp_dir.path().join("daemon.sock");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let project_id = Uuid::new_v4();
+    let mut saved = saved_grant();
+    saved.allowed_launches = crate::overlay::global_manager_command::default_allowed_launches()
+        .into_iter()
+        .take(10)
+        .collect();
+    assert_eq!(saved.allowed_launches.len(), 10);
+    let server = spawn_grant_read_daemon(listener, project_id, Some(saved.clone()), Some(failure));
+    let mut app = test_app_at(socket_path);
+    app.poll.connected = true;
+    app.poll.authoritative_config_ready = true;
+    app.current_project_id = Some(project_id);
+    plan_manager(&mut app).await;
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    assert_eq!(launch(&app).grant_context, GrantContextState::Loading);
+    row_containing(&render_rows(&mut app), "Loading saved grant");
+    press(&mut app, ctrl(KeyCode::Enter)).await;
+    assert!(app.interactive_launch_pending.is_none());
+
+    finish_grant_read(&mut app).await;
+    assert!(matches!(
+        launch(&app).grant_context,
+        GrantContextState::Failed { .. }
+    ));
+    let expected_reason = match failure {
+        "timeout" => "timed out",
+        "ancestor_rpc" => "ancestor grants read failed",
+        _ => "saved grant read failed",
+    };
+    assert!(
+        matches!(&launch(&app).grant_context, GrantContextState::Failed { reason }
+        if reason.contains(expected_reason))
+    );
+    row_containing(&render_rows(&mut app), "Saved grant unavailable");
+    assert!(launch(&app).grant_open && launch(&app).grant.is_none());
+    // Editing and every launch placement stay blocked on the failed page.
+    for event in [
+        key(KeyCode::Char('j')),
+        key(KeyCode::Char(' ')),
+        ctrl(KeyCode::Enter),
+        ctrl(KeyCode::Char('t')),
+        ctrl(KeyCode::Char('s')),
+    ] {
+        press(&mut app, event).await;
+    }
+    assert!(launch(&app).grant_open && launch(&app).grant.is_none());
+    assert!(app.interactive_launch_pending.is_none());
+    assert!(app.manager_grant_context_request.is_none());
+    tick_grant_context(&mut app).await;
+    assert!(
+        app.manager_grant_context_task.is_none(),
+        "no unbounded automatic retry"
+    );
+    // Returning to the front cannot bypass submission protection either.
+    press(&mut app, key(KeyCode::Tab)).await;
+    press(&mut app, ctrl(KeyCode::Enter)).await;
+    assert!(app.interactive_launch_pending.is_none());
+    // Cover the regular overlay submit path as well as stacked prompts.
+    let idx = app.focused_input_idx;
+    app.overlay = std::mem::replace(&mut app.input_overlays[idx], OverlayState::None);
+    assert!(!crate::overlay::prompt::submit_prompt(&mut app).await);
+    assert!(app.interactive_launch_pending.is_none());
+    app.input_overlays[idx] = std::mem::replace(&mut app.overlay, OverlayState::None);
+
+    // The front is still in insert mode; Ctrl+O reopens settings in either mode.
+    assert_eq!(prompt_mode(&app), PopupMode::Insert);
+    press(&mut app, ctrl(KeyCode::Char('o'))).await;
+    assert!(launch(&app).open);
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    assert_eq!(app.manager_grant_context_request, Some(project_id));
+    finish_grant_read(&mut app).await;
+    assert!(matches!(
+        launch(&app).grant_context,
+        GrantContextState::Loaded(_)
+    ));
+    let policy = launch(&app)
+        .grant
+        .as_ref()
+        .expect("recovered editor")
+        .finish();
+    assert_eq!(policy, saved);
+    assert_eq!(policy.allowed_launches.len(), 10);
+    assert_eq!(
+        (
+            policy.max_active_sessions,
+            policy.max_created_containers,
+            policy.max_created_sessions
+        ),
+        (25, 64, 1024)
+    );
+    assert!(launch(&app).appointment().is_some());
+    let (methods, retained) = server.await.unwrap();
+    let mut expected = vec!["GetHarnessManagerPolicy"];
+    if failure == "ancestor_rpc" {
+        expected.push("ListPortfolioNodes");
+    }
+    expected.extend(["GetHarnessManagerPolicy", "ListPortfolioNodes"]);
+    assert_eq!(methods, expected, "only context reads reached the daemon");
+    assert_eq!(
+        retained,
+        Some(saved),
+        "failed-page submits preserve the saved grant"
+    );
+}
+
+#[tokio::test]
+async fn failed_saved_grant_read_blocks_submission_and_retry_loads_saved_values() {
+    failed_grant_read_preserves_saved_policy_and_recovers("rpc").await;
+}
+
+#[tokio::test]
+async fn timed_out_grant_read_blocks_submission_and_retry_loads_saved_values() {
+    failed_grant_read_preserves_saved_policy_and_recovers("timeout").await;
+}
+
+#[tokio::test]
+async fn failed_ancestor_grant_read_blocks_submission_and_retry_loads_saved_values() {
+    failed_grant_read_preserves_saved_policy_and_recovers("ancestor_rpc").await;
+}
+
+#[tokio::test]
+async fn connect_and_join_failures_are_explicit_and_reopening_retries() {
+    let temp_dir = crate::test_support::socket_tempdir().unwrap();
+    let socket_path = temp_dir.path().join("missing.sock");
+    let project_id = Uuid::new_v4();
+    let mut app = test_app_at(socket_path.clone());
+    app.current_project_id = Some(project_id);
+    plan_manager(&mut app).await;
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    finish_grant_read(&mut app).await;
+    assert!(
+        matches!(&launch(&app).grant_context, GrantContextState::Failed { reason }
+        if reason.contains("connect failed"))
+    );
+    assert!(launch(&app).grant.is_none());
+    // A panicked worker is delivered as Failed, rather than silently discarded.
+    app.manager_grant_context_task = Some((
+        project_id,
+        tokio::spawn(async { panic!("read task failed") }),
+    ));
+    finish_grant_read(&mut app).await;
+    assert!(
+        matches!(&launch(&app).grant_context, GrantContextState::Failed { reason }
+        if reason.contains("grant read task failed"))
+    );
+    row_containing(&render_rows(&mut app), "Saved grant unavailable");
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    let server = spawn_grant_read_daemon(listener, project_id, None, None);
+    press(&mut app, key(KeyCode::Esc)).await;
+    press(&mut app, key(KeyCode::Char('p'))).await;
+    finish_grant_read(&mut app).await;
+    assert_eq!(
+        launch(&app).grant_context,
+        GrantContextState::Loaded(ManagerGrantContext {
+            saved: None,
+            ancestor_launches: None,
+        })
+    );
+    let plan = launch(&app).manager.unwrap();
+    assert_eq!(
+        launch(&app).grant.as_ref().map(GrantEditor::finish),
+        Some(plan.policy()),
+        "a successful no-saved-grant read seeds the preset"
+    );
+    row_containing(&render_rows(&mut app), "GRANT · Execute");
+    assert_eq!(
+        server.await.unwrap().0,
+        vec!["GetHarnessManagerPolicy", "ListPortfolioNodes"]
+    );
+}
+
+#[test]
+fn ancestor_launches_intersect_the_live_nodes_covering_the_project() {
+    use rsi_common::global_manager::GlobalManagerGrantV1;
+    use rsi_common::portfolio_nodes::PortfolioNodeV1;
+    let launches = crate::overlay::global_manager_command::default_allowed_launches();
+    let project_id = Uuid::new_v4();
+    let node = |state: &str, projects: Vec<Uuid>, allowed: Vec<_>| {
+        let now = chrono::Utc::now();
+        let mut policy = crate::overlay::global_manager_command::default_project_policy();
+        policy.allowed_launches = Vec::new();
+        PortfolioNodeV1 {
+            node_id: Uuid::new_v4(),
+            tier_label: "global".into(),
+            state: state.into(),
+            authority_epoch: 1,
+            parent_node_id: None,
+            grantor: "operator".into(),
+            seat_root_session_id: Uuid::new_v4(),
+            max_direct_reports: 5,
+            child_policy: None,
+            grant: GlobalManagerGrantV1 {
+                grant_id: Uuid::new_v4(),
+                grant_version: 1,
+                seat_session_id: Uuid::new_v4(),
+                state: state.into(),
+                project_ids: projects,
+                allowed_launches: allowed,
+                project_policy: policy,
+                operator_origin: "operator_rpc".into(),
+                created_at: now,
+                updated_at: now,
+            },
+            created_at: now,
+            updated_at: now,
+        }
+    };
+    let nodes = vec![
+        node("active", vec![project_id], launches[..4].to_vec()),
+        node("active", vec![project_id], launches[2..6].to_vec()),
+        node("revoked", vec![project_id], launches[..1].to_vec()),
+        node("active", vec![Uuid::new_v4()], launches[..1].to_vec()),
+    ];
+    assert_eq!(
+        ancestor_launches_of(&nodes, project_id),
+        Some(launches[2..4].to_vec()),
+        "every live covering node narrows the set"
+    );
+    assert_eq!(ancestor_launches_of(&nodes, Uuid::new_v4()), None);
 }

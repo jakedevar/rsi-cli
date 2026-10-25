@@ -16,11 +16,19 @@ if ! metadata="$($cargo_command metadata --no-deps --format-version 1)"; then
     echo "check-standalone-packages: cannot read the workspace with $cargo_command metadata" >&2
     exit 2
 fi
-packages="$(printf '%s' "$metadata" | python3 -I -c '
-import json, sys
-for package in sorted(p["name"] for p in json.load(sys.stdin)["packages"]):
-    print(package)
-')" || { echo "check-standalone-packages: cannot parse the workspace metadata" >&2; exit 2; }
+# Package names come from the `"packages":[{"name":"P","version":"V",...` objects
+# `cargo metadata` prints (a package object is the only one whose `name` is followed
+# by `version`; targets and dependencies are shaped differently), read with plain
+# text tools: no interpreter, no extra host dependency on the QA host.
+case "$metadata" in
+    *'"packages":['*) ;;
+    *) echo "check-standalone-packages: cannot parse the workspace metadata" >&2; exit 2 ;;
+esac
+packages="$(printf '%s' "$metadata" \
+    | { grep -o '{"name":"[^"]*","version":"' || true; } \
+    | sed -e 's/^{"name":"//' -e 's/","version":"$//' \
+    | LC_ALL=C sort)" \
+    || { echo "check-standalone-packages: cannot parse the workspace metadata" >&2; exit 2; }
 if [[ -z "$packages" ]]; then
     echo "check-standalone-packages: the workspace has no packages" >&2
     exit 2

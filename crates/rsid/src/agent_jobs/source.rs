@@ -44,7 +44,9 @@ fn record_path(log_path: &str) -> PathBuf {
 }
 
 fn is_build(kind: JobKind) -> bool {
-    kind == JobKind::Build
+    // A bench job (#3181) also runs exactly one commit: its transport ships the
+    // adapter tree and the pinned configuration from this worktree.
+    matches!(kind, JobKind::Build | JobKind::Bench)
 }
 
 /// Submit-time step for a `build` job: observe the worktree and enforce the
@@ -70,6 +72,11 @@ pub(super) fn at_submit(params: &JobParams, cwd: &Path) -> Result<Option<SourceS
         return Err(DaemonError::InvalidParam(format!(
             "{JOB_SOURCE_SHA_MISMATCH}: params.sha {pin} is not the job worktree HEAD {}; pass the commit the worktree is on or omit sha",
             state.head
+        )));
+    }
+    if !build.release_members.is_empty() && state.dirty {
+        return Err(DaemonError::InvalidParam(format!(
+            "{JOB_SOURCE_SHA_MISMATCH}: release_members requires a clean worktree at params.sha {pin}; commit the intended source before submitting"
         )));
     }
     Ok(Some(state))

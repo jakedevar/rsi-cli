@@ -2,6 +2,7 @@
 
 pub mod content;
 pub mod file_renderer;
+pub mod form_field;
 pub mod glyphs;
 pub mod height;
 pub mod highlight;
@@ -110,7 +111,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
 
     let has_transient_footer = !has_detail && should_render_root_footer(app);
-    let build_banner = app.local_build_warning.clone().map(local_build_banner);
+    let build_banner = app.persistent_banner_text().map(local_build_banner);
     let banner_height = build_banner.as_ref().map_or(0, |banner| {
         u16::try_from(banner.line_count(area.width)).unwrap_or(u16::MAX)
     });
@@ -147,7 +148,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Overlay rendered last — drawn on top of everything (painter's algorithm)
-    overlay::render_overlay(frame, frame.area(), app);
+    // Persistent daemon guidance must remain visible in fullscreen consoles too.
+    let overlay_area = if banner_height > 0 {
+        Rect {
+            y: main_area.y,
+            height: area.bottom().saturating_sub(main_area.y),
+            ..area
+        }
+    } else {
+        area
+    };
+    overlay::render_overlay(frame, overlay_area, app);
     crate::editing_mode_prompt::render(frame, frame.area(), app);
     app.overlay_visible_last_frame = overlay_is_visible;
 

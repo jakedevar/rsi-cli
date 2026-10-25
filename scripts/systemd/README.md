@@ -83,6 +83,17 @@ holder/supervisor path, rather than the direct systemd socket unit.
    `GetHealthStatus` answer from the launched process tree, verifies the
    launcher is still alive, and exits nonzero with `NO DAEMON IS RUNNING` if
    none comes. Treat any nonzero exit as an outage, not as a finished step.
+   The restart is scoped to this install (#3476): the installer stops, and
+   waits on, only the rsid that serves its socket (`RSI_DAEMON_SOCKET_PATH`,
+   `RSI_SOCKET`, else `$HOME/.rsi/daemon.sock`), read from each candidate
+   process's own environment (`/proc/PID/environ` on Linux, `ps eww` on macOS)
+   or, on macOS, by the Unix socket it holds (`lsof`, #399: macOS 27 hides some
+   processes' environment from `ps eww`; the same helper, `rsid_running_pids` in `scripts/rsid-processes.sh`, serves
+   the launchd path and `rsid-start-satellite`). An rsid of another RSI home or
+   socket (a test's temp home, a dev daemon) and a process that neither source
+   places on this install's socket are never signalled and never waited on. The install output
+   names the socket it is restarting. Never replace this with a host-wide
+   `pgrep` or `pkill`.
 6. Verify a live daemon and socket before reporting step 5 done. All three must
    pass, with the installed `rsi-rpc` and the configured socket (default
    `~/.rsi/daemon.sock`):

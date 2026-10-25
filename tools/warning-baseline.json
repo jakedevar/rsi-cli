@@ -7,11 +7,8 @@
         "lib",
         "lib test"
       ],
-      "residual": "Both constants sit inside RSI-RELEASED-MIGRATION regions, which are byte-immutable (tools/check-released-migrations.py), and are read only by cfg(test) fixtures, so a cfg(test) gate cannot be added without editing a released region.",
-      "warnings": {
-        "crates/rsid-store/src/store/agent_deploys_operator.rs|dead_code|constant `COPY_COLUMNS` is never used": 1,
-        "crates/rsid-store/src/store/migrations/support.rs|dead_code|constant `V113_CONVERGED_FULL_CATALOG_FINGERPRINT` is never used": 1
-      }
+      "residual": "Frozen test-only constants are handled outside released bytes: COPY_COLUMNS by its parent module lint scope (#648), V113_CONVERGED_FULL_CATALOG_FINGERPRINT by an anonymous const reference after the support include (#653).",
+      "warnings": {}
     },
     "rsi": {
       "configs": [
@@ -66,6 +63,15 @@
     },
     "rsi-turn-shim": {
       "configs": [
+        "bin",
+        "bin test"
+      ],
+      "warnings": {}
+    },
+    "rsi-cloud": {
+      "configs": [
+        "lib",
+        "lib test",
         "bin",
         "bin test"
       ],

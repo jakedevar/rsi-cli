@@ -16,7 +16,19 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
+toml = "0.8"
 tempfile = "3"
+sha2 = "0.10"
+rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
+rustpython-ast = { version = "0.4", default-features = false, features = ["visitor", "num-bigint"] }
+glob = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6.2"
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 temp-env = { workspace = true }

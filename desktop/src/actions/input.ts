@@ -10,12 +10,13 @@
 import { sendMessage } from '../actions.js';
 import { invoke } from '../api.js';
 import { type Invocation, type SliceRuntime, dispatch, snapshot } from '../commands.js';
+import { initAttachments, insertImage } from '../attachments.js';
 import { $, el, toast } from '../dom.js';
 import { openAbsoluteFile } from '../files.js';
 import {
   type ComposerState, type Correction, type ConfigState, type Geometry, type GlobalAction, type SlashCommand, type SlashRoot, Jumplist,
   NO_GEOMETRY, SIDEBAR_DEFAULT, acceptSlash, columnStep, compileFailure, compileOutcome, configGate, filterSlash,
-  dataUrlBase64, geometryStep, imageReference, moveSuggestion, paneStep, parseGeometry, previewKey, recentFiles,
+  geometryStep, moveSuggestion, paneStep, parseGeometry, previewKey, recentFiles,
   pasteImageMime, relativeTo, routeGlobal, sidebarStep, slashQuery, slashRoot, slashRootKey, submitKey, toggleSequence,
 } from '../input-model.js';
 import { isTypingTarget, keyToken } from '../keyengine.js';
@@ -29,10 +30,13 @@ import { currentSessions, isReadOnly, onUiChange, selected, state } from '../sta
 import { isContainer } from '../tree.js';
 import { VimEditor, type VimMode } from '../vim-editor.js';
 import { type VimField, enterInsert, isSingleLine, isVimField, modeOf, onVimMode, prepareForTyping, resetField, vimKey } from '../vim-field.js';
+import { sendChord, sendPlaceholder } from '../keylabel.js';
 import { currentPlatform, isVimKeysOn } from '../vimkeys.js';
 import { detailFocus, setDetailFocus } from './detail.js';
 import { type InputActionId, type InputSnapshot, SLICE } from './input-spec.js';
 import { focusOwnsKey } from '../modal-gate.js';
+import { sessionListOwnsKey } from '../sessionlist-keys.js';
+import { syncListbox } from '../listbox-a11y.js';
 
 // ---------- local settings ----------
 
@@ -162,6 +166,7 @@ function popup(): HTMLElement {
     p = el('div', 'g1-suggest');
     p.id = 'g1-suggest';
     p.setAttribute('role', 'listbox');
+    p.setAttribute('aria-label', 'Slash commands');
     p.hidden = true;
     document.body.append(p);
   }
@@ -169,6 +174,7 @@ function popup(): HTMLElement {
 }
 
 function hideSuggestions(): void {
+  sugg.field?.removeAttribute('aria-activedescendant'); // the composer stops pointing at a row that is gone (local #318)
   sugg.field = null;
   sugg.items = [];
   popup().hidden = true;
@@ -209,12 +215,15 @@ function drawSuggestions(): void {
   p.replaceChildren(...sugg.items.map((c, i) => {
     const row = el('div', `g1-suggest-row${i === sugg.at ? ' sel' : ''}`);
     row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', String(i === sugg.at));
+    row.dataset.key = c.name;
     row.append(el('span', 'k', `/${c.name}`), el('span', 't', c.description));
     row.addEventListener('mousedown', (ev) => { ev.preventDefault(); sugg.at = i; acceptSuggestion(); });
     return row;
   }));
   const r = f.getBoundingClientRect();
   p.hidden = false;
+  syncListbox(p, f);
   const h = p.offsetHeight;
   p.style.left = `${Math.round(r.left)}px`;
   p.style.width = `${Math.round(Math.min(r.width, 520))}px`;
@@ -282,7 +291,7 @@ function renderPreview(): void {
   if (!c.clarify) acts.append(btn('Accept (a)', 'btn primary', () => previewAction('accept')));
   acts.append(
     btn('Discard (d / Esc)', 'btn', () => previewAction('discard')),
-    btn('Send original (Ctrl+Enter)', 'btn', () => previewAction('send-original')),
+    btn(`Send original (${sendChord(currentPlatform())})`, 'btn', () => previewAction('send-original')),
   );
   p.replaceChildren(el('div', 'g1-correction-title', title), el('pre', 'g1-correction-text', c.text), acts);
   p.hidden = false;
@@ -375,7 +384,7 @@ function openInputModal(): void {
   dlg.replaceChildren(
     el('h2', undefined, 'Message'),
     area,
-    el('div', 'dialog-note', 'Ctrl+Enter sends. Esc (in Vim keys: Esc then Esc or q) closes and keeps the text in the message box. Ctrl+Arrow moves this window, Ctrl+Shift+Arrow resizes it, Ctrl+0 resets it.'),
+    el('div', 'dialog-note', `${submitOnEnter ? `Enter (insert mode) or ${sendChord(currentPlatform())}` : sendChord(currentPlatform())} sends${submitOnEnter ? '' : '; Enter adds a line'}. Esc (in Vim keys: Esc then Esc or q) closes and keeps the text in the message box. Ctrl+Arrow moves this window, Ctrl+Shift+Arrow resizes it, Ctrl+0 resets it.`),
   );
   dlg.showModal();
   area.focus();
@@ -397,8 +406,10 @@ function openRecent(arg: string | undefined): void {
   const dlg = dialog('g1-recent-dialog');
   const list = el('ul', 'pick-list');
   list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', 'Recent files');
   files.forEach((f, i) => {
     const li = el('li', 'pick-item');
+    li.setAttribute('role', 'option'); // opened by number or click: no cursor to follow
     li.append(el('span', 'k', `gf${i + 1}`), el('span', 'mono', f));
     li.addEventListener('click', () => { dlg.close(); open(f); });
     list.append(li);
@@ -634,6 +645,14 @@ function copyYank(text: string): void {
   void navigator.clipboard?.writeText(text).catch(() => undefined);
 }
 
+/** Close a dialog as Esc would: its `cancel` handler may veto (a dirty form asks first). */
+function closeLikeEsc(dlg: HTMLDialogElement | null): void {
+  if (!dlg) return;
+  const cancel = new Event('cancel', { cancelable: true });
+  dlg.dispatchEvent(cancel);
+  if (!cancel.defaultPrevented) dlg.close();
+}
+
 /** A vim field's key; true when it was the editor's. */
 function fieldKey(ev: KeyboardEvent, field: VimField): boolean {
   if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'AltGraph'].includes(ev.key)) return false;
@@ -665,7 +684,7 @@ function fieldKey(ev: KeyboardEvent, field: VimField): boolean {
   // A one-line field's Enter still submits its form from normal mode.
   if (t === 'Enter' && isSingleLine(field)) return false;
   if (t === 'q') {
-    field.closest('dialog')?.close();
+    closeLikeEsc(field.closest('dialog'));
     ev.preventDefault();
     ev.stopPropagation();
     return true;
@@ -680,6 +699,8 @@ function onKeyDown(ev: KeyboardEvent): void {
   if (ev.defaultPrevented || ev.isComposing) return;
   const active = document.activeElement as HTMLElement | null;
   if (active?.closest('.xterm, .terminal-overlay')) return;
+  // The focused session list's own keys (local #226): Left/Right fold there, not step.
+  if (sessionListOwnsKey(ev, active)) return;
   // Ctrl-Alt-G: help, from anywhere and without typing into the field.
   if (isHelpChord(ev)) {
     ev.preventDefault();
@@ -751,19 +772,6 @@ function routePaste(active: HTMLElement | null, dlg: HTMLDialogElement | null, t
   if (isVimField(target)) { entry = null; enterInsert(target, 'A'); }
 }
 
-/** Read a clipboard file as base64 (a `data:` URL, its payload kept). */
-function fileBase64(file: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error('cannot read the clipboard image'));
-    reader.onload = () => {
-      const data = typeof reader.result === 'string' ? dataUrlBase64(reader.result) : null;
-      if (data) resolve(data); else reject(new Error('the clipboard image is empty'));
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
 /**
  * An image on the clipboard goes to rsid (`UploadPasteImage`, hub #3044),
  * which stores it under ~/.rsi/paste/rsid/ on the daemon host; the returned
@@ -781,15 +789,10 @@ function onPaste(ev: ClipboardEvent): void {
   ev.preventDefault();
   ev.stopPropagation();
   if (isVimField(field)) prepareForTyping(field);
-  void fileBase64(file).then(
-    (data) => invoke<{ path: string }>('upload_paste_image', { request: { mime, data_base64: data } }),
-  ).then((r) => {
-    const ref = imageReference(r.path);
-    const at = field.selectionStart ?? field.value.length;
-    field.setRangeText(ref, at, field.selectionEnd ?? at, 'end');
-    field.dispatchEvent(new Event('input', { bubbles: true }));
-    toast(`Image saved to ${r.path}`, true);
-  }, (e: unknown) => toast(`Image paste failed: ${String(e)}`));
+  void insertImage(field, file, mime, file.name, field.selectionStart ?? field.value.length).then(
+    (path) => toast(`Image saved to ${path}`, true),
+    (e: unknown) => toast(`Image paste failed: ${String(e)}`),
+  );
 }
 
 // ---------- daemon config gate ----------
@@ -844,7 +847,7 @@ export function runInput(id: InputActionId, inv: Invocation): void {
       submitOnEnter = !submitOnEnter;
       setItem(SUBMIT_KEY, submitOnEnter ? 'on' : 'off');
       composer().placeholder = composerHint();
-      toast(submitOnEnter ? 'Enter sends; Shift+Enter adds a line' : 'Ctrl+Enter sends; Enter adds a line', true);
+      toast(submitOnEnter ? 'Enter sends; Shift+Enter adds a line' : `${sendChord(currentPlatform())} sends; Enter adds a line`, true);
       return;
     case 'input-modal': openInputModal(); return;
     case 'compile-prompt': void runCorrection('compile'); return;
@@ -854,7 +857,7 @@ export function runInput(id: InputActionId, inv: Invocation): void {
 
 const composerHint = (): string => (submitOnEnter
   ? 'Message this session (Enter sends, Shift+Enter adds a line)'
-  : 'Message this session (Ctrl+Enter to send)');
+  : sendPlaceholder(currentPlatform()));
 
 const INPUT_CSS = `
 .g1-mode { font: 11px var(--mono, monospace); color: var(--subtext); padding: 0 6px; align-self: center; }
@@ -950,6 +953,7 @@ export function initInput(): void {
   });
 
   initPendingCount();
+  initAttachments();
   pollConfig();
 }
 

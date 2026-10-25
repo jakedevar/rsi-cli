@@ -25,7 +25,6 @@ use rsi_common::satellite_dispatch::{
     find_remote_terminal, satellite_launch_failure_class,
 };
 use tokio::io::BufReader;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::hub::registry_peer;
@@ -199,7 +198,7 @@ pub(crate) async fn deliver_one(
 
 /// Settle expired rows, then attempt each still-queued row once (paced).
 pub(crate) async fn dispatch_round(
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     root: &Path,
     state: &mut DispatchState,
 ) {
@@ -261,7 +260,11 @@ pub(crate) fn deliver_request(
     }
 }
 
-async fn attempt(store: &Arc<Mutex<Store>>, root: &Path, row: &QueuedSatelliteMessage) {
+async fn attempt(
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
+    root: &Path,
+    row: &QueuedSatelliteMessage,
+) {
     let prepared = {
         let guard = store.lock().await;
         // Re-read policy on every attempt so an operator switching dispatch
@@ -369,7 +372,7 @@ mod tests {
     struct Rig {
         _temp: tempfile::TempDir,
         root: std::path::PathBuf,
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         owner: Uuid,
         peer: Uuid,
         remote: Uuid,
@@ -512,7 +515,9 @@ mod tests {
                 });
             }
         });
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let session = rsid_store::test_support::make_test_session();
         let peer = Uuid::new_v4();
         {

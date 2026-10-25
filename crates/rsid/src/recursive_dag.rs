@@ -7,7 +7,7 @@
 
 pub(crate) mod live;
 mod scheduler_core;
-#[cfg(feature = "dev-fixtures")]
+#[cfg(any(feature = "dev-fixtures", all(test, feature = "test-shard-other-02")))]
 pub mod smoke_fixture;
 
 use crate::error::{DaemonError, Result};

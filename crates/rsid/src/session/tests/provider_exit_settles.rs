@@ -10,14 +10,120 @@ use super::*;
 /// events are consumed before the stop), then let the reconciler signal the
 /// exited provider while the stream is still open. Returns the stored row.
 async fn settle_after_clean_exit(events: Vec<StreamEvent>, last_text: &str) -> Session {
-    let (manager, _dir) = manager();
+    settle_after_clean_exit_as(events, last_text, false).await.0
+}
+
+/// #3765: an appointed manager seat's provider exits 0 without a final result
+/// event. The seat settles `Completed` (idle), keeps a daemon-armed
+/// `health_anomaly` backstop and stays woken by the next manager mail.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manager_seat_exiting_zero_without_a_result_stays_live_3765() {
+    let (row, manager, _dir) = settle_after_clean_exit_as(
+        vec![assistant("partial 3765 turn")],
+        "partial 3765 turn",
+        true,
+    )
+    .await;
+    assert_eq!(row.status, SessionStatus::Completed);
+    assert_eq!(row.stop_reason.as_deref(), Some("completed"));
+    let store = manager.store.lock().await;
+    let backstops: Vec<_> = store
+        .list_owned_scheduled_jobs(row.id, false, 50)
+        .unwrap()
+        .into_iter()
+        .filter(|(job, _)| {
+            job.name
+                .starts_with(crate::session::manager_idle::IDLE_BACKSTOP_NAME_PREFIX)
+        })
+        .collect();
+    assert_eq!(backstops.len(), 1, "one daemon backstop on the idle seat");
+    let job = &backstops[0].0;
+    assert_eq!(job.wake_session_id, Some(row.id));
+    assert_eq!(job.wake_mode, rsi_common::types::WakeMode::Resume);
+    assert!(
+        store
+            .wake_when_state(job.id)
+            .unwrap()
+            .is_some_and(|state| state.predicate.health_anomaly.is_some()),
+        "the backstop is a health_anomaly wake"
+    );
+    assert!(store.session_has_enabled_resume_wake(row.id).unwrap());
+}
+
+/// #3765: a non-manager worker's clean exit without a result stays
+/// Interrupted and gets no backstop.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-03"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_exiting_zero_without_a_result_is_unchanged_3765() {
+    let (row, manager, _dir) = settle_after_clean_exit_as(
+        vec![assistant("partial 3765 worker")],
+        "partial 3765 worker",
+        false,
+    )
+    .await;
+    assert_eq!(row.status, SessionStatus::Interrupted);
+    assert_eq!(
+        row.stop_reason.as_deref(),
+        Some("interrupted:provider_exit:exit_code=0")
+    );
+    assert!(
+        !manager
+            .store
+            .lock()
+            .await
+            .session_has_enabled_resume_wake(row.id)
+            .unwrap()
+    );
+}
+
+/// [`settle_after_clean_exit`] for a session that is, or is not, the appointed
+/// project manager seat (#3765); also returns the manager for store reads
+/// (and the temp dir that must outlive them).
+async fn settle_after_clean_exit_as(
+    events: Vec<StreamEvent>,
+    last_text: &str,
+    appointed_manager: bool,
+) -> (Session, std::sync::Arc<SessionManager>, TempDir) {
+    let (manager, dir) = manager();
     let session_id = Uuid::new_v4();
     let mut session = bare_session(session_id);
     session.status = SessionStatus::Running;
     session.provider = SessionProvider::Claude;
     session.stop_reason = None;
     session.terminal_reason = None;
-    insert_row(&manager, &session).await;
+    if appointed_manager {
+        let project = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        session.project_id = Some(project);
+        let store = manager.store.lock().await;
+        store
+            .insert_project(&rsi_common::types::Project {
+                id: project,
+                name: format!("idle {project}"),
+                path: None,
+                description: None,
+                color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+                context_files: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .configure_harness_manager(
+                &rsi_common::harness_manager::ConfigureHarnessManagerRequestV1 {
+                    project_id: project,
+                    session_id,
+                    epic_ids: None,
+                    group_ids: vec![],
+                    expected_row_version: 0,
+                },
+            )
+            .unwrap();
+    } else {
+        insert_row(&manager, &session).await;
+    }
 
     // The provider child already exited with code 0.
     let (mut tracked, _controls) =
@@ -99,13 +205,14 @@ async fn settle_after_clean_exit(events: Vec<StreamEvent>, last_text: &str) -> S
         .expect("monitor finalizes after the reconciler signal")
         .expect("monitor task");
     drop(provider_tx);
-    manager
+    let row = manager
         .store
         .lock()
         .await
         .get_session(session_id)
         .expect("read session")
-        .expect("session row")
+        .expect("session row");
+    (row, manager, dir)
 }
 
 fn assistant(text: &str) -> StreamEvent {

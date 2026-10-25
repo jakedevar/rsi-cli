@@ -38,6 +38,19 @@ RELEASE_GUARD_KEEP_DIR=""
 # The source fingerprint release_guard_prepare saw before the build.
 RELEASE_GUARD_SOURCE_TREE=""
 
+# shellcheck source=scripts/repo-guard-bin.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/repo-guard-bin.sh"
+
+# release_guard_tool <operation> [arg...]: run `rsi-repo-guard release-guard <operation>`
+# (#465; these were inline interpreter heredocs). Its stdout and exit status are the
+# operation's; a build that lacks the subcommand, or none at all, fails closed.
+release_guard_tool() {
+    # A build through scripts/repo-guard may start a long-lived child (an sccache server): it must
+    # not inherit fd 8, which holds the release lock.
+    rsid_resolve_repo_guard "" release-guard 8>&- || return 1
+    "$RSI_GUARD_BIN" release-guard "$@"
+}
+
 # release_guard_lock <target-dir>
 #   Hold an exclusive lock on <target-dir>/.rsi-release.lock on fd 8 until
 #   release_guard_unlock or exit. flock(2) locks belong to the open file, so the
@@ -47,16 +60,9 @@ RELEASE_GUARD_SOURCE_TREE=""
 release_guard_lock() {
     mkdir -p "$1"
     exec 8>>"$1/$RELEASE_GUARD_LOCK"
-    python3 - <<'PY'
-import fcntl
-import sys
-
-try:
-    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
-    print("Waiting for another release build into this target to finish (#938) ...", file=sys.stderr, flush=True)
-    fcntl.flock(8, fcntl.LOCK_EX)
-PY
+    # The lock is `rsi-repo-guard release-guard lock-fd 8` (#465): flock(2) on the
+    # inherited descriptor, waiting (and saying so) when another build holds it.
+    release_guard_tool lock-fd 8 || return 1
 }
 
 release_guard_unlock() {
@@ -181,23 +187,7 @@ release_guard_link_dir_list() {
 #   <release-dir>: an installed link a build or cleanup there would change or
 #   leave dangling (#262, hub #2801). Read-only; prints nothing when none does.
 release_guard_links_into() {
-    python3 - "$@" <<'PY'
-import os
-import sys
-
-release, *link_dirs = sys.argv[1:]
-release = os.path.realpath(release)
-for directory in dict.fromkeys(link_dirs):
-    try:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-    except OSError:
-        continue
-    for entry in entries:
-        if not entry.is_symlink():
-            continue
-        if os.path.realpath(entry.path).startswith(release + os.sep):
-            print(entry.path)
-PY
+    release_guard_tool links-into "$@"
 }
 
 # release_guard_preserve_links <target-dir>
@@ -230,89 +220,7 @@ release_guard_prune_kept() {
 #   in this run's RELEASE_GUARD_LINK_DIRS) still protects its copy. A kept copy
 #   is removed only when neither a scanned link nor a recorded one resolves to it.
 release_guard_kept() {
-    python3 - "$1" "$2" "$RELEASE_GUARD_KEEP_DIR" "${RELEASE_GUARD_LINK_DIRS[@]}" <<'PY'
-import fcntl
-import hashlib
-import os
-import shutil
-import sys
-import tempfile
-
-mode, release, keep, *link_dirs = sys.argv[1:]
-link_dirs = list(dict.fromkeys(link_dirs))
-os.makedirs(keep, exist_ok=True)
-keep_real = os.path.realpath(keep)
-manifest = os.path.join(keep, ".links")
-
-
-def symlinks(directory):
-    try:
-        return [entry.path for entry in os.scandir(directory) if entry.is_symlink()]
-    except OSError:
-        return []
-
-
-with open(os.path.join(keep, ".lock"), "a") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    try:
-        with open(manifest) as recorded_links:
-            recorded = {line.rstrip("\n") for line in recorded_links if line.strip()}
-    except FileNotFoundError:
-        recorded = set()
-
-    if mode == "preserve":
-        release = os.path.realpath(release)
-        for directory in link_dirs:
-            for path in symlinks(directory):
-                real = os.path.realpath(path)
-                if not real.startswith(release + os.sep) or not os.path.isfile(real):
-                    continue
-                digest = hashlib.sha256()
-                with open(real, "rb") as source:
-                    for chunk in iter(lambda: source.read(1 << 20), b""):
-                        digest.update(chunk)
-                kept = os.path.join(keep, f"{os.path.basename(real)}.{digest.hexdigest()[:16]}")
-                if not os.path.isfile(kept):
-                    handle, temp = tempfile.mkstemp(dir=keep, prefix=".keep-")
-                    os.close(handle)
-                    shutil.copyfile(real, temp)
-                    os.chmod(temp, 0o755)
-                    os.replace(temp, kept)
-                link_temp = os.path.join(directory, f".{os.path.basename(path)}.keep-{os.getpid()}")
-                try:
-                    os.unlink(link_temp)
-                except FileNotFoundError:
-                    pass
-                os.symlink(kept, link_temp)
-                os.replace(link_temp, path)
-                recorded.add(path)
-                print(f"Kept installed link {path} -> {kept} before cleaning {release} (#938).", file=sys.stderr)
-
-    # Prune (#2188): keep exactly the copies a live link resolves to.
-    live = {}
-    for path in recorded.union(*(symlinks(directory) for directory in link_dirs)):
-        if os.path.islink(path):
-            real = os.path.realpath(path)
-            if os.path.dirname(real) == keep_real and os.path.isfile(real):
-                live[path] = real
-    referenced = set(live.values())
-    for entry in os.scandir(keep):
-        if entry.name in (".lock", ".links") or not entry.is_file(follow_symlinks=False):
-            continue
-        # `.keep-*` are copies a run died writing; every writer holds the lock.
-        if entry.name.startswith(".keep-") or os.path.realpath(entry.path) not in referenced:
-            try:
-                os.unlink(entry.path)
-            except OSError as error:  # a failed prune never blocks a cleanup or install
-                print(f"warning: cannot prune kept copy {entry.path}: {error}", file=sys.stderr)
-                continue
-            if not entry.name.startswith("."):
-                print(f"Pruned kept copy {entry.path}: no installed link resolves to it (#2188).", file=sys.stderr)
-    handle, temp = tempfile.mkstemp(dir=keep, prefix=".links-")
-    with os.fdopen(handle, "w") as links:
-        links.writelines(f"{path}\n" for path in sorted(live))
-    os.replace(temp, manifest)
-PY
+    release_guard_tool kept "$1" "$2" "$RELEASE_GUARD_KEEP_DIR" "${RELEASE_GUARD_LINK_DIRS[@]}"
 }
 
 # release_guard_clean_workspace <root> <target-dir>
@@ -323,8 +231,11 @@ release_guard_clean_workspace() {
     local -a args=()
     manifest="${RELEASE_GUARD_MANIFEST:-$root/Cargo.toml}"
     release_guard_preserve_links "$2"
+    # `cargo metadata --no-deps` lists only the workspace's packages, each object
+    # starting `{"name":"X","version":"V"` (dependency entries carry no version
+    # there), so the member names come out with grep and sed (#465).
     members="$(cargo metadata --format-version 1 --no-deps --manifest-path "$manifest" 8>&- \
-        | python3 -c 'import json, sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))')"
+        | grep -o '{"name":"[^"]*","version":"' | sed 's/^{"name":"//; s/","version":"$//')"
     while IFS= read -r name; do
         if [[ -n "$name" ]]; then
             args+=(-p "$name")
@@ -438,6 +349,99 @@ release_guard_check_link() {
     fi
     if [[ -n "$rsid" ]] && ! release_guard_check_sha "$root" "$rsid"; then
         echo "The release rsid does not match this checkout; $remedy." >&2
+        return 1
+    fi
+}
+
+# release_guard_receipt_target <receipt-file> <override-dir|""> <allowed-dir>...
+#   Print the canonical cargo target directory a build receipt may deploy from,
+#   before anything reads, locks or executes it (#3513, #3514). The check is the
+#   `release-target` guard of crates/rsi-repo-guards (hub #3715, #3716), run through
+#   scripts/repo-guard; a guard that cannot be built or run refuses the deploy.
+#   The receipt's `target_dir` (bare or under `result`, #282), when the key is
+#   present at all, must be a non-empty absolute string (null, a number, a list
+#   or an object is refused) and - with symlinks and `..` resolved - equal one
+#   <allowed-dir> (the registered release target the build job used, or the
+#   caller's own cargo target); the resolved path is the one printed.
+#   A non-empty <override-dir> (--target-dir) must itself be absolute and
+#   canonical (no `..`, no symlink component), an existing directory, and resolve
+#   to one <allowed-dir> too: it never widens the allowed set. It is the only way
+#   to deploy a receipt that names no `target_dir` (a job from before #282), and
+#   when the receipt names one too, they must agree.
+#   Exit 2, printing nothing, for a receipt whose `target_dir` key is absent and
+#   no override. Exit 1 with a message naming the field for anything else wrong
+#   (missing or unreadable receipt, missing/relative/non-string/not-allowed
+#   target_dir, bad override, no guard binary): fail closed.
+release_guard_receipt_target() {
+    local receipt="$1" override="$2"
+    shift 2
+    if [[ ! -f "$receipt" ]]; then
+        echo "Build receipt $receipt does not exist (#157)." >&2
+        return 1
+    fi
+    local root guard
+    root="$(CDPATH='' cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)" || {
+        echo "Cannot locate the checkout of $(dirname "${BASH_SOURCE[0]}") to find rsi-repo-guard; refusing to trust the build receipt (#3715)." >&2
+        return 1
+    }
+    # Fail closed (same lookup as every other guard, scripts/repo-guard): a missing
+    # or unbuildable guard binary refuses the deploy, it never skips the check. Its
+    # exit 2 would read as "receipt names no target_dir" below, so map it to 1 here.
+    guard="$("$root/scripts/repo-guard" --bin)" || {
+        echo "Cannot run the rsi-repo-guard binary that checks the build receipt's target; refusing to trust $receipt. Build it first: (cd '$root' && cargo build --release -p rsi-repo-guards --bin rsi-repo-guard) (#3715)." >&2
+        return 1
+    }
+    "$guard" release-target "$receipt" "$override" "$@"
+}
+
+# release_guard_check_receipt <root> <receipt-file> [rsid-binary]
+#   For --link-only --build-receipt: a build job (AgentSubmitJob `build`) leaves
+#   no builder record because it runs cargo directly, but the daemon stamps its
+#   receipt with the one commit it compiled. Succeed only when <receipt-file>
+#   (the job's result JSON, bare or under `result`) is a finished build
+#   (exit_code 0, no refusal) of a clean tree whose source_head is this
+#   checkout's HEAD, this checkout has no edits or new files since, and, with
+#   <rsid-binary>, rsid embeds that commit. Otherwise name the mismatch and fail.
+release_guard_check_receipt() {
+    local root="$1" receipt="$2" rsid="${3:-}" real head parsed status source_head detail
+    local current_tree head_tree
+    local remedy="build it here (make release-install), or pass --allow-foreign-build to link it anyway"
+    real="$(release_guard_worktree "$root")"
+    if [[ ! -f "$receipt" ]]; then
+        echo "Build receipt $receipt does not exist (#157)." >&2
+        return 1
+    fi
+    parsed="$(release_guard_tool receipt-status "$receipt")" || {
+        echo "Cannot read build receipt $receipt: the receipt helper failed (#157)." >&2
+        return 1
+    }
+    IFS='|' read -r status source_head detail <<<"$parsed"
+    case "$status" in
+        ok) ;;
+        unreadable) echo "Cannot read build receipt $receipt: $detail (#157)." >&2; return 1 ;;
+        refused) echo "The build job in $receipt was refused ($detail); $remedy (#157)." >&2; return 1 ;;
+        failed) echo "The build job in $receipt did not succeed ($detail); $remedy (#157)." >&2; return 1 ;;
+        nohead) echo "The build receipt $receipt carries no source_head, so it proves nothing about the binaries; $remedy (#157)." >&2; return 1 ;;
+        dirty) echo "The build job in $receipt compiled a dirty tree (HEAD $source_head) or did not record it; $remedy (#157)." >&2; return 1 ;;
+        *) echo "Cannot interpret build receipt $receipt (#157)." >&2; return 1 ;;
+    esac
+    head="$(release_guard_head "$root")"
+    if [[ -z "$head" ]]; then
+        echo "$real is not a git checkout, so a build receipt cannot be matched to it; $remedy (#157)." >&2
+        return 1
+    fi
+    if [[ "$source_head" != "$head" ]]; then
+        echo "The build job compiled $source_head, but $real is at $head; $remedy (#157)." >&2
+        return 1
+    fi
+    head_tree="$(git -C "$real" rev-parse --verify --quiet "HEAD^{tree}" 2>/dev/null)" || head_tree=""
+    current_tree="$(release_guard_source_tree "$root")"
+    if [[ -z "$head_tree" || "$current_tree" != "$head_tree" ]]; then
+        echo "The sources in $real differ from commit $head (uncommitted edits or new files); $remedy (#157)." >&2
+        return 1
+    fi
+    if [[ -n "$rsid" ]] && ! release_guard_check_sha "$root" "$rsid"; then
+        echo "The release rsid does not match the build job's commit; $remedy." >&2
         return 1
     fi
 }

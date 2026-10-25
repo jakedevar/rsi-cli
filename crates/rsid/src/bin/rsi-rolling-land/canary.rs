@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub(super) const SCHEMA_VERSION: u8 = 1;
 
 pub(super) fn default_root() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("RSI_ROLLING_CANARY_DIR") {
+    if let Some(path) = crate::lander_env::var_os("RSI_ROLLING_CANARY_DIR") {
         return Ok(PathBuf::from(path));
     }
     dirs::home_dir()
@@ -837,7 +837,7 @@ pub(super) fn runner_command(
             (w.to_path_buf(), a)
         },
     );
-    let mut cmd = std::process::Command::new(&program);
+    let mut cmd = crate::lander_env::command(&program);
     cmd.args(&args);
     cmd.env("RSI_ROLLING_CANARY_DIR", root);
     cmd.env_remove("RSI_SESSION_TOKEN");
@@ -854,7 +854,7 @@ pub(super) fn runner_systemd_command(
     wrapper: Option<&Path>,
     unit: &str,
 ) -> std::process::Command {
-    let mut cmd = std::process::Command::new("systemd-run");
+    let mut cmd = crate::lander_env::command("systemd-run");
     cmd.args(["--user", "--collect", "--quiet", "--unit", unit]);
     for key in [
         "PATH",
@@ -864,7 +864,7 @@ pub(super) fn runner_systemd_command(
         "CARGO_HOME",
         "RUSTUP_HOME",
     ] {
-        if let Some(value) = std::env::var_os(key) {
+        if let Some(value) = crate::lander_env::var_os(key) {
             let mut assignment = std::ffi::OsString::from(format!("{key}="));
             assignment.push(value);
             cmd.arg("-E").arg(assignment);
@@ -1530,17 +1530,32 @@ mod tests {
     fn runner_command_removes_session_token() {
         let exe = PathBuf::from("/usr/bin/rsi-rolling-land");
         let root = PathBuf::from("/tmp/canary-test");
+        // #192: the runner starts from the lander environment alone, so the
+        // token is in that environment here and must not reach the child.
+        let _env = crate::lander_env::current()
+            .as_ref()
+            .clone()
+            .with_var("RSI_SESSION_TOKEN", "lander-token")
+            .with_var("RSI_CANARY_KEPT_192", "kept")
+            .enter();
         let cmd = runner_command(&exe, &root, None);
 
-        // Check envs
+        // The child environment is exactly the explicit one (env_clear).
         let envs: std::collections::HashMap<_, _> = cmd.get_envs().collect();
         assert_eq!(
             envs.get(std::ffi::OsStr::new("RSI_ROLLING_CANARY_DIR")),
             Some(&Some(std::ffi::OsStr::new(&root)))
         );
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("RSI_SESSION_TOKEN")),
-            Some(&None)
+            envs.get(std::ffi::OsStr::new("RSI_CANARY_KEPT_192")),
+            Some(&Some(std::ffi::OsStr::new("kept")))
+        );
+        assert!(
+            !matches!(
+                envs.get(std::ffi::OsStr::new("RSI_SESSION_TOKEN")),
+                Some(Some(_))
+            ),
+            "the session token reached the runner"
         );
     }
 
@@ -1583,9 +1598,13 @@ mod tests {
 
     #[test]
     fn default_root_uses_env_var() {
-        unsafe { std::env::set_var("RSI_ROLLING_CANARY_DIR", "/custom/canary/dir") };
+        // #192: the lander environment of this thread, not the process's.
+        let _env = crate::lander_env::current()
+            .as_ref()
+            .clone()
+            .with_var("RSI_ROLLING_CANARY_DIR", "/custom/canary/dir")
+            .enter();
         let root = default_root().unwrap();
         assert_eq!(root, PathBuf::from("/custom/canary/dir"));
-        unsafe { std::env::remove_var("RSI_ROLLING_CANARY_DIR") };
     }
 }

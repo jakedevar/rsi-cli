@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ACTIONS, appMenuModel, contextMenuModel, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, contextMenuModel, keyHints, paletteEntries, unavailable } from '../dist/registry.js';
 import {
   LIFECYCLE_ACTIONS, LIFECYCLE_COMMAND_BINDINGS, LIFECYCLE_KEY_BINDINGS, LIFECYCLE_RULES, isLifecycleAction,
 } from '../dist/actions/lifecycle-spec.js';
@@ -96,7 +96,7 @@ test('the keys run their actions through the TUI keymap', () => {
 
 test('the menus list the lifecycle actions and the row menu offers the session ones', () => {
   const menus = appMenuModel('other', snap());
-  const ids = (name) => menus.find((m) => m.id === name).items.filter((n) => n.kind === 'item').map((n) => n.id);
+  const ids = (name) => menuItems(menus.find((m) => m.id === name).items).map((n) => n.id);
   assert.ok(ids('session').includes('act:delete-session'));
   assert.ok(ids('session').includes('act:unarchive-session'));
   assert.ok(ids('go').includes('act:open-trash'));
@@ -416,7 +416,7 @@ test('insert mode: Enter and Ctrl/Cmd-Enter submit, Shift-Enter and letters go t
   assert.equal(questionKey(st, key('Enter', { meta: true })).effect, 'submit');
 });
 
-test('normal mode: Ctrl-Enter submits, d declines, Esc and q hide, other keys are left alone', () => {
+test('normal mode: Ctrl-Enter submits, d lets the agent decide, Esc and q hide, other keys are left alone', () => {
   const st = openQuestion([single]);
   assert.equal(questionKey(st, key('Enter', { ctrl: true })).effect, 'submit');
   assert.equal(questionKey(st, key('d')).effect, 'decline');

@@ -1,5 +1,5 @@
 # Pinned Terminal-Bench 2.0 definition (#3175). Do not edit by hand:
-# regenerate with refresh_dataset.py; pin_check.py fails a run on any drift.
+# regenerate with rsi-eval bench tb2 refresh-dataset; rsi-eval bench tb2 pin-check fails a run on any drift.
 
 [dataset]
 name = "terminal-bench-2"

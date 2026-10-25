@@ -244,10 +244,13 @@ pub struct Credentials {
 }
 
 /// `sizeof(struct kinfo_proc)` on arm64 and x86_64 macOS, and the offsets this
-/// module reads from it (`p_stat`, `p_pid`, `e_pcred.p_ruid`,
-/// `e_ucred.cr_uid`), verified against `proc_bsdinfo` by
+/// module reads from it (`p_starttime.tv_sec`, `p_starttime.tv_usec`,
+/// `p_stat`, `p_pid`, `e_pcred.p_ruid`, `e_ucred.cr_uid`), verified against
+/// `proc_bsdinfo` by
 /// `kinfo_credentials_agree_with_bsdinfo_for_every_readable_process`.
 const KINFO_PROC_SIZE: usize = 648;
+const KINFO_START_SEC_OFFSET: usize = 0;
+const KINFO_START_USEC_OFFSET: usize = 8;
 const KINFO_STAT_OFFSET: usize = 36;
 const KINFO_PID_OFFSET: usize = 40;
 const KINFO_RUID_OFFSET: usize = 392;
@@ -262,9 +265,35 @@ fn kinfo_word(record: &[u8], offset: usize) -> u32 {
     ])
 }
 
+/// What one `sysctl(KERN_PROC_PID)` record says about a process.
+struct KinfoRecord {
+    credentials: Credentials,
+    /// Microseconds since the epoch (`p_starttime`), the value
+    /// `pbi_start_tvsec`/`pbi_start_tvusec` give (both are the kernel's
+    /// `p_start`).
+    started_micros: u64,
+}
+
 /// Credentials from `sysctl(KERN_PROC_PID)`, readable for a process
 /// `proc_pidinfo` withholds from this caller.
 fn kinfo_credentials(pid: libc::pid_t) -> Result<Credentials, i32> {
+    kinfo_record(pid).map(|record| record.credentials)
+}
+
+/// The start time of `pid` in microseconds since the epoch, from
+/// `sysctl(KERN_PROC_PID)`: readable for every user's process, where
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` refuses another uid's with `EPERM`
+/// (#252). Equal to [`process_start`]'s `started_micros` for a process both
+/// can read.
+///
+/// # Errors
+/// The `errno` of the failed read (`ESRCH` exited), or `EIO` for a malformed
+/// record.
+pub fn process_table_start_micros(pid: libc::pid_t) -> Result<u64, i32> {
+    kinfo_record(pid).map(|record| record.started_micros)
+}
+
+fn kinfo_record(pid: libc::pid_t) -> Result<KinfoRecord, i32> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
     let mut record = vec![0u8; KINFO_PROC_SIZE];
     let mut size: libc::size_t = KINFO_PROC_SIZE;
@@ -289,10 +318,22 @@ fn kinfo_credentials(pid: libc::pid_t) -> Result<Credentials, i32> {
     if size != KINFO_PROC_SIZE || kinfo_word(&record, KINFO_PID_OFFSET) != pid as u32 {
         return Err(libc::EIO);
     }
-    Ok(Credentials {
-        uid: kinfo_word(&record, KINFO_UID_OFFSET),
-        ruid: kinfo_word(&record, KINFO_RUID_OFFSET),
-        zombie: record[KINFO_STAT_OFFSET] == SZOMB,
+    let mut seconds = [0u8; 8];
+    seconds.copy_from_slice(&record[KINFO_START_SEC_OFFSET..KINFO_START_SEC_OFFSET + 8]);
+    let started_micros = u64::try_from(i64::from_ne_bytes(seconds))
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000_000))
+        .and_then(|micros| {
+            micros.checked_add(u64::from(kinfo_word(&record, KINFO_START_USEC_OFFSET)))
+        })
+        .ok_or(libc::EIO)?;
+    Ok(KinfoRecord {
+        credentials: Credentials {
+            uid: kinfo_word(&record, KINFO_UID_OFFSET),
+            ruid: kinfo_word(&record, KINFO_RUID_OFFSET),
+            zombie: record[KINFO_STAT_OFFSET] == SZOMB,
+        },
+        started_micros,
     })
 }
 
@@ -861,21 +902,38 @@ mod tests {
                 }
                 continue;
             };
-            let Ok(kinfo) = kinfo_credentials(pid) else {
+            let Ok(kinfo) = kinfo_record(pid) else {
                 continue;
             };
             assert_eq!(
-                (kinfo.uid, kinfo.ruid, kinfo.zombie),
+                (
+                    kinfo.credentials.uid,
+                    kinfo.credentials.ruid,
+                    kinfo.credentials.zombie,
+                    kinfo.started_micros
+                ),
                 (
                     info.pbi_uid,
                     info.pbi_ruid,
-                    info.pbi_status == u32::from(SZOMB)
+                    info.pbi_status == u32::from(SZOMB),
+                    info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
                 ),
                 "pid {pid}"
             );
             compared += 1;
         }
         assert!(compared > 0, "no process was cross-checked");
+        // #252: root's launchd, whose bsdinfo another user cannot read, still
+        // has a start time in the process table.
+        assert!(process_table_start_micros(1).expect("launchd start") > 0);
+        let own = std::process::id() as libc::pid_t;
+        assert_eq!(
+            process_table_start_micros(own),
+            process_start(own).map(|start| start.started_micros)
+        );
+        assert!(exited(
+            process_table_start_micros(99_998).expect_err("no such process")
+        ));
         let own = credentials(std::process::id() as libc::pid_t).unwrap();
         assert_eq!(own.uid, nix::unistd::geteuid().as_raw());
         assert_eq!(own.ruid, nix::unistd::getuid().as_raw());

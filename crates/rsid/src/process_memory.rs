@@ -23,7 +23,7 @@
 use rsi_common::rpc::ProcessMemoryReport;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// glibc arena cap applied at startup. The default (8 per core) let every
 /// blocking thread grow and keep its own arena.
@@ -44,6 +44,15 @@ static RSS_AT_READY: OnceLock<u64> = OnceLock::new();
 static HEAP_SAMPLED: AtomicBool = AtomicBool::new(false);
 static HEAP_IN_USE: AtomicU64 = AtomicU64::new(0);
 static HEAP_FREE: AtomicU64 = AtomicU64::new(0);
+/// Process-relative clock for the heap sample's age (#3491).
+static CLOCK: OnceLock<Instant> = OnceLock::new();
+/// Milliseconds on `CLOCK` when the heap counters were last sampled.
+static HEAP_SAMPLED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    let started = CLOCK.get_or_init(Instant::now);
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Heap counters from the allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +205,48 @@ pub fn rss_bytes() -> Option<u64> {
     (resident > 0).then_some(resident)
 }
 
+/// Highest resident set size this process has reached (`VmHWM`), so a spike
+/// that was freed and trimmed before anyone looked is still reported (#3491).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn peak_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    peak_rss_from_status(&status)
+}
+
+/// `VmHWM` in bytes from a `/proc/<pid>/status` document.
+#[cfg(any(target_os = "linux", test))]
+fn peak_rss_from_status(status: &str) -> Option<u64> {
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?;
+    let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// Peak resident set size from `getrusage(RUSAGE_SELF)` (`ru_maxrss` is bytes
+/// on macOS).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<nix::libc::rusage>::zeroed();
+    // SAFETY: getrusage fills the struct we pass; it is read only on success.
+    let status = unsafe { nix::libc::getrusage(nix::libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if status != 0 {
+        return None;
+    }
+    // SAFETY: getrusage returned 0, so it initialized the whole struct.
+    let peak = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(peak).ok().filter(|peak| *peak > 0)
+}
+
+/// No portable peak-resident source on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
+pub fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// No portable resident-size source on this platform.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[must_use]
@@ -212,6 +263,7 @@ pub fn trim_and_sample() {
     if let Some(stats) = heap_stats() {
         HEAP_IN_USE.store(stats.in_use_bytes, Ordering::Relaxed);
         HEAP_FREE.store(stats.free_bytes, Ordering::Relaxed);
+        HEAP_SAMPLED_AT_MS.store(clock_ms(), Ordering::Relaxed);
         HEAP_SAMPLED.store(true, Ordering::Release);
     }
 }
@@ -257,6 +309,9 @@ pub fn report() -> Option<ProcessMemoryReport> {
         allocator: allocator_name().to_string(),
         heap_in_use_bytes: sampled.then(|| HEAP_IN_USE.load(Ordering::Relaxed)),
         heap_free_bytes: sampled.then(|| HEAP_FREE.load(Ordering::Relaxed)),
+        rss_peak_bytes: peak_rss_bytes(),
+        heap_sample_age_secs: sampled
+            .then(|| clock_ms().saturating_sub(HEAP_SAMPLED_AT_MS.load(Ordering::Relaxed)) / 1000),
         arena_max: (arena_max > 0).then_some(arena_max),
         mmap_threshold_bytes: (mmap_threshold > 0).then_some(u64::from(mmap_threshold)),
         thp_disabled: THP_DISABLED.load(Ordering::Relaxed).then_some(true),
@@ -288,6 +343,41 @@ mod portable_tests {
         let report = report().expect("a report whenever RSS is readable");
         assert!(report.rss_bytes > 0);
     }
+
+    /// #3491: a spike that was freed before the next health read must stay
+    /// visible, so the report carries the process peak next to the live size.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn the_report_keeps_a_freed_spike_as_the_resident_peak() {
+        let block = vec![1_u8; 96 * 1024 * 1024];
+        let touched = block
+            .iter()
+            .step_by(4096)
+            .map(|&byte| u64::from(byte))
+            .sum::<u64>();
+        assert_eq!(touched, 96 * 1024 * 1024 / 4096);
+        let during = rss_bytes().expect("rss while the block is live");
+        drop(block);
+        release_free_memory();
+        let report = report().expect("a report whenever RSS is readable");
+        let peak = report
+            .rss_peak_bytes
+            .expect("linux and macos report a peak");
+        assert!(
+            peak >= during,
+            "peak {peak} must cover the spike {during} even after it was freed"
+        );
+        assert!(peak >= report.rss_bytes);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
+    #[test]
+    fn peak_resident_size_reads_the_high_water_mark_line() {
+        let status = "Name:\trsid\nVmPeak:\t 3 kB\nVmHWM:\t 2817788 kB\nVmRSS:\t 328448 kB\n";
+        assert_eq!(peak_rss_from_status(status), Some(2_817_788 * 1024));
+        assert_eq!(peak_rss_from_status("Name:\trsid\n"), None);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -308,6 +398,8 @@ mod tests {
             assert!(report.heap_in_use_bytes.is_some_and(|bytes| bytes > 0));
             assert!(report.heap_free_bytes.is_some());
             assert!(report.arena_count.is_some_and(|count| count >= 1));
+            // A fresh sample is seconds old at most; the report says how old it is.
+            assert!(report.heap_sample_age_secs.is_some_and(|age| age <= 5));
         }
     }
 
@@ -363,12 +455,21 @@ mod tests {
             .find("process_memory::configure_allocator()")
             .expect("main configures the allocator");
         let runtime = main_body
-            .find("Builder::new_multi_thread()")
-            .expect("main builds the runtime");
+            .find("build_daemon_runtime()")
+            .expect("main builds the runtime through build_daemon_runtime");
         assert!(configure < runtime, "allocator tuning precedes the runtime");
         assert!(
-            main_rs.contains("\nfn main() -> Result<()> {"),
-            "main builds its runtime explicitly"
+            !main_body.contains("Builder::new_multi_thread()"),
+            "main builds its runtime only through build_daemon_runtime"
+        );
+        let builder_start = main_rs
+            .find("\nfn build_daemon_runtime() -> ")
+            .expect("build_daemon_runtime exists");
+        let builder_body = &main_rs[builder_start..];
+        let builder_body = &builder_body[..builder_body.find("\n}\n").expect("builder end")];
+        assert!(
+            builder_body.contains("Builder::new_multi_thread()"),
+            "build_daemon_runtime is the function that builds the runtime"
         );
     }
 

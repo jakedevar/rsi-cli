@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/rsi-pool-bootstrap.log) 2>&1
+
+# Lifetime backstop first, before any download can fail: the instance's
+# shutdown behavior is terminate and its root volume is deleted on
+# termination, so this removes all compute and storage even if the hub never
+# runs terraform destroy. scripts/cloud-pool.sh moves it (shutdown -c, then a
+# new +N) when it renews the lease.
+shutdown -h +${lease_minutes} 'rsi pool lease reached'
+
+# AL2023 mounts /tmp as tmpfs, and custody tests refuse tmpfs sandbox roots
+# (Issue #933); keep /tmp on the encrypted root disk like a normal build host.
+if [ "$(findmnt -n -o FSTYPE /tmp || true)" = tmpfs ]; then
+  systemctl mask --now tmp.mount || umount -l /tmp
+fi
+chmod 1777 /tmp
+
+dnf install -y git tar gzip python3.11 sqlite gcc gcc-c++ make cmake \
+  pkgconf-pkg-config openssl-devel fontconfig-devel
+
+RUN_AS='${run_as}'
+TARGET_DIR='${target_dir}'
+id "$RUN_AS" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RUN_AS"
+runuser -u "$RUN_AS" -- bash -c \
+  'curl -fsSL --proto =https --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${rust_toolchain} --component rustfmt --component clippy'
+runuser -u "$RUN_AS" -- bash -c \
+  'curl -fsSL --proto =https --tlsv1.2 https://get.nexte.st/${nextest_version}/linux | tar -xzf - -C "$HOME/.cargo/bin"'
+runuser -u "$RUN_AS" -- bash -c '"$HOME/.cargo/bin/rustc" --version && "$HOME/.cargo/bin/cargo" nextest --version'
+
+# Warm local cargo target for the length of the lease (no sccache bucket: S4a is
+# skipped for the trial). Every cargo build the run-as user starts, including
+# the lander's remote shards (sudo -H -u, cleared environment), shares this
+# directory through the user's cargo config, so a second run on the host
+# starts warm. The directory lives on the root volume and dies with the host.
+install -d -o "$RUN_AS" -g "$RUN_AS" "$TARGET_DIR"
+RUN_AS_HOME=$(getent passwd "$RUN_AS" | cut -d: -f6)
+install -d -o "$RUN_AS" -g "$RUN_AS" "$RUN_AS_HOME/.cargo"
+cat >>"$RUN_AS_HOME/.cargo/config.toml" <<CARGO_CONFIG
+[build]
+target-dir = "$TARGET_DIR"
+CARGO_CONFIG
+chown "$RUN_AS:$RUN_AS" "$RUN_AS_HOME/.cargo/config.toml"
+printf 'export RSI_POOL_TARGET_DIR=%s\n' "$TARGET_DIR" >/etc/profile.d/rsi-pool.sh
+
+# scripts/cloud-pool.sh waits for this marker before it records the lease as ready.
+touch /var/lib/rsi-pool-ready

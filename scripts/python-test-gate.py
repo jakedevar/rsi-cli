@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """Select matching Python tests for changed files; never invoke Cargo.
 
-Changed tests select themselves. Script stems match test_<stem>.py (hyphens
-become underscores), including tools covered by scripts/tests. A test that
+Discover suites recursively in scripts/tests and tools/tests, plus top-level
+tools/test_*.py. Changed tests select themselves. Script stems match
+test_<stem>.py (hyphens become underscores), including tools covered by
+scripts/tests. A test that
 mentions a changed file's basename also observes it, covering config/fixtures
 and scripts whose test filename differs. A path outside scripts/ and tools/ (a
 committed manifest, lockfile or fixture a test reads) selects a test that names
 its full repo-relative path, never its basename (`Cargo.toml` is everywhere).
 Deleted sources still select tests present in the candidate. Docs/thoughts
 paths do not select anything.
+
+Directory-wide guards: a test that scans every file of a test directory (the
+fixture-Git guard, the shell-test registry) declares it with a line
+`# python-test-gate: scans scripts/tests` (or `tools/tests`). Any added, changed
+or deleted file under that directory selects every test declaring it, so a new
+`scripts/tests/test_x.py` cannot land red against a guard the gate skipped (#3306).
 
 Runners: repo unittest suites run under stdlib `python3 -m unittest`, which every
 host has. Function-style tools suites keep `python3 -m pytest`; `runner_status`
@@ -22,6 +30,7 @@ import ast
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -50,16 +59,31 @@ def observes(test, text, path):
     return path.as_posix() in text
 
 
+SCANS_MARKER = re.compile(r"^#\s*python-test-gate:\s*scans\s+(\S+?)/?\s*$", re.MULTILINE)
+
+
+def scanned_directories(text):
+    """The repo-relative test directories a test declares it scans whole."""
+    return {Path(match) for match in SCANS_MARKER.findall(text)}
+
+
+def scans_changed_path(text, path):
+    """Whether `text` declares a scan of a directory that contains the changed `path`."""
+    return any(directory in path.parents for directory in scanned_directories(text))
+
+
 def selected_tests(repo, paths):
     paths = [Path(path) for path in paths if Path(path).parts and Path(path).parts[0] not in IGNORED_ROOTS]
     if not paths:
         return []
-    tests = sorted(set(path.relative_to(repo) for root in ("scripts/tests", "tools/tests")
-                       for path in (repo / root).rglob("test_*.py")))
+    tests = sorted(
+        {path.relative_to(repo) for root in ("scripts/tests", "tools/tests")
+         for path in (repo / root).rglob("test_*.py")}
+        | {path.relative_to(repo) for path in (repo / "tools").glob("test_*.py")})
     selected = []
     for test in tests:
         text = (repo / test).read_text(encoding="utf-8")
-        if any(observes(test, text, path) for path in paths):
+        if any(observes(test, text, path) or scans_changed_path(text, path) for path in paths):
             selected.append(test.as_posix())
     return selected
 

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Python-free entry (#363): Run every QA lane against the exact fetched rolling tree.
+# Builds crates/rsi-repo-guards on demand (scripts/repo-guard) and runs the `run-rolling-qa`
+# guard with the same flags, output and exit codes as the legacy script of the same name
+# (which stays until its callers switch; hub #3621 owns the trusted executable).
+set -eu
+root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
+exec "$root/scripts/repo-guard" run-rolling-qa "$@"

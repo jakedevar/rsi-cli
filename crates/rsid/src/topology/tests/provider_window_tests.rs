@@ -402,3 +402,311 @@ async fn an_unknown_window_reset_keeps_one_episode_through_rechecks() {
     assert_eq!(recovered[0].state["resumed_count"], 3);
     assert_eq!(notice_count(&harness).await, 2);
 }
+
+/// Record a model turn of `provider` that settled `status` (with `error_class`).
+async fn turn(
+    harness: &Harness,
+    provider: &str,
+    status: &str,
+    error_class: Option<&str>,
+    completed_at: DateTime<Utc>,
+) {
+    harness
+        .executor
+        .store
+        .lock()
+        .await
+        .conn
+        .execute(
+            "INSERT INTO model_invocations
+             (id,purpose,invocation_kind,foreground,paid_risk,admission_status,status,
+              trigger_source,session_id,provider,error_class,created_at,completed_at)
+             VALUES(?1,'session.continue.resume','session_lifecycle','foreground','paid_capable',
+                    'admitted',?2,'release-test',?6,?3,?4,?5,?5)",
+            rusqlite::params![
+                Uuid::new_v4().to_string(),
+                status,
+                provider,
+                error_class,
+                completed_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                Uuid::new_v4().to_string()
+            ],
+        )
+        .unwrap();
+}
+
+/// Hold three wakes behind an exhausted Claude window; return them with the
+/// harness, the manager and the launcher (the window stays exhausted).
+async fn held_wakes() -> (
+    Harness,
+    Uuid,
+    Arc<EventBus>,
+    Arc<WakeLauncher>,
+    Vec<ScheduledJob>,
+) {
+    let harness = Harness::new();
+    let (_, manager, worker) = manager_fixture(&harness).await;
+    window(&harness, Utc::now() + Duration::hours(16), true).await;
+    let wakes = wakes(&harness, worker, 3).await;
+    let bus = Arc::new(EventBus::new(128));
+    let launcher = Arc::new(WakeLauncher {
+        held: AtomicBool::new(true),
+        delivered: AtomicUsize::new(0),
+    });
+    tick(&harness, &bus, &launcher, &wakes).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 0);
+    (harness, manager, bus, launcher, wakes)
+}
+
+async fn due_pass(harness: &Harness, bus: &Arc<EventBus>, launcher: &Arc<WakeLauncher>) {
+    let launcher: Arc<dyn SessionLauncher> = launcher.clone();
+    crate::scheduler::process_due_wake_when(&harness.executor.store, bus, &launcher).await;
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_later_successful_turn_of_the_held_provider_releases_its_held_wakes() {
+    let (harness, manager, bus, launcher, wakes) = held_wakes().await;
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 0);
+
+    // The stored window still reads exhausted until its reset; a Claude turn
+    // that finished cleanly after the hold proves the account accepts work.
+    launcher.held.store(false, Ordering::SeqCst);
+    turn(&harness, "Claude", "completed", None, Utc::now()).await;
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 3);
+    for wake in &wakes {
+        let store = harness.executor.store.lock().await;
+        let job = store.get_scheduled_job(&wake.id).unwrap().unwrap();
+        assert!(job.last_fired_at.is_some(), "released wake was delivered");
+    }
+    let notices = notices(&harness, manager).await;
+    let phases: Vec<_> = notices.iter().map(|n| n.state["phase"].clone()).collect();
+    assert!(phases.contains(&serde_json::json!("resumed")), "{phases:?}");
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_turn_of_another_provider_or_before_the_hold_or_refused_keeps_the_hold() {
+    let (harness, _, bus, launcher, wakes) = held_wakes().await;
+    launcher.held.store(false, Ordering::SeqCst);
+    turn(&harness, "Codex", "completed", None, Utc::now()).await;
+    turn(
+        &harness,
+        "Claude",
+        "completed",
+        None,
+        Utc::now() - Duration::hours(1),
+    )
+    .await;
+    turn(
+        &harness,
+        "Claude",
+        "failed",
+        Some("manager_v2_provider_usage_limit"),
+        Utc::now(),
+    )
+    .await;
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 0);
+    for wake in &wakes {
+        let store = harness.executor.store.lock().await;
+        let job = store.get_scheduled_job(&wake.id).unwrap().unwrap();
+        assert!(job.next_fire_at > Utc::now() + Duration::hours(10));
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_released_backlog_is_staggered_and_a_cleared_window_releases_it() {
+    let harness = Harness::new();
+    let (_, manager, worker) = manager_fixture(&harness).await;
+    let reset = Utc::now() + Duration::hours(16);
+    window(&harness, reset, true).await;
+    let wakes = wakes(&harness, worker, 6).await;
+    let bus = Arc::new(EventBus::new(128));
+    let launcher = Arc::new(WakeLauncher {
+        held: AtomicBool::new(true),
+        delivered: AtomicUsize::new(0),
+    });
+    tick(&harness, &bus, &launcher, &wakes).await;
+
+    // A fresh rate_limit_event reads capacity before the stored reset.
+    window(&harness, reset, false).await;
+    launcher.held.store(false, Ordering::SeqCst);
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(
+        launcher.delivered.load(Ordering::SeqCst),
+        4,
+        "one admission-sized batch is due now"
+    );
+    let waiting = {
+        let store = harness.executor.store.lock().await;
+        wakes
+            .iter()
+            .filter_map(|wake| store.get_scheduled_job(&wake.id).unwrap())
+            .filter(|job| job.last_fired_at.is_none())
+            .count()
+    };
+    assert_eq!(waiting, 2, "the rest wait for the next stagger slot");
+    let held = notices(&harness, manager).await;
+    assert!(held.iter().any(|n| n.state["phase"] == "resumed"));
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn switched_account_releases_held_wakes_before_old_reset() {
+    let (harness, _, bus, launcher, wakes) = held_wakes().await;
+    {
+        let store = harness.executor.store.lock().await;
+        store
+            .observe_provider_rate_limit_account(SessionProvider::Claude, "account-a", Utc::now())
+            .unwrap();
+        assert!(
+            !store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-a",
+                    Utc::now()
+                )
+                .unwrap()
+        );
+    }
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 0);
+    {
+        let store = harness.executor.store.lock().await;
+        assert!(
+            store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-b",
+                    Utc::now()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .provider_usage_window_hold_until(SessionProvider::Claude, Utc::now())
+                .unwrap(),
+            None
+        );
+    }
+    launcher.held.store(false, Ordering::SeqCst);
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 3);
+    for wake in wakes {
+        assert!(
+            harness
+                .executor
+                .store
+                .lock()
+                .await
+                .get_scheduled_job(&wake.id)
+                .unwrap()
+                .unwrap()
+                .last_fired_at
+                .is_some()
+        );
+    }
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn clearing_hold_releases_a_wake_without_a_manager_notice() {
+    let harness = Harness::new();
+    let worker = {
+        let store = harness.executor.store.lock().await;
+        let mut worker = rsid_store::test_support::make_test_session();
+        worker.provider = SessionProvider::Claude;
+        worker.status = SessionStatus::Completed;
+        worker.project_id = None;
+        store.insert_session(&worker).unwrap();
+        worker.id
+    };
+    window(&harness, Utc::now() + Duration::days(4), true).await;
+    let wakes = wakes(&harness, worker, 1).await;
+    let bus = Arc::new(EventBus::new(128));
+    let launcher = Arc::new(WakeLauncher {
+        held: AtomicBool::new(true),
+        delivered: AtomicUsize::new(0),
+    });
+    tick(&harness, &bus, &launcher, &wakes).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 0);
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(
+        launcher.delivered.load(Ordering::SeqCst),
+        0,
+        "same account stays held"
+    );
+    harness
+        .executor
+        .store
+        .lock()
+        .await
+        .invalidate_provider_rate_limits(SessionProvider::Claude, Utc::now())
+        .unwrap();
+    launcher.held.store(false, Ordering::SeqCst);
+    due_pass(&harness, &bus, &launcher).await;
+    assert_eq!(launcher.delivered.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn switched_account_releases_reserved_node_launches_before_old_reset() {
+    let harness = Harness::new();
+    let (project, _, _) = manager_fixture(&harness).await;
+    window(&harness, Utc::now() + Duration::days(4), true).await;
+    {
+        let store = harness.executor.store.lock().await;
+        store
+            .observe_provider_rate_limit_account(SessionProvider::Claude, "account-a", Utc::now())
+            .unwrap();
+    }
+    let execution = start_launches(&harness, project).await;
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(harness.launches().len(), 0);
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|a| a.status == AttemptStatus::Reserved)
+    );
+    {
+        let store = harness.executor.store.lock().await;
+        assert!(
+            !store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-a",
+                    Utc::now()
+                )
+                .unwrap()
+        );
+    }
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(harness.launches().len(), 0, "unchanged account stays held");
+    {
+        let store = harness.executor.store.lock().await;
+        assert!(
+            store
+                .observe_provider_rate_limit_account(
+                    SessionProvider::Claude,
+                    "account-b",
+                    Utc::now()
+                )
+                .unwrap()
+        );
+    }
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(harness.launches().len(), 3);
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|a| a.status == AttemptStatus::Running)
+    );
+}

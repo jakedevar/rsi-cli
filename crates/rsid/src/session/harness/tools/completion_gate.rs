@@ -30,12 +30,12 @@ pub(super) async fn execute_completion_gate(
     egress: rsi_common::egress_policy::EgressMode,
     cancel: &CancellationToken,
 ) -> CompletionGateOutcome {
-    let identity = ShellLaunchIdentity {
+    let identity = ShellLaunchIdentity::host(
         session_id,
         invocation_id,
-        execution_scratch: execution_scratch.cloned(),
+        execution_scratch.cloned(),
         egress,
-    };
+    );
     let Ok(command) = scoped_shell_command(command, working_dir, &identity) else {
         return CompletionGateOutcome {
             success: false,

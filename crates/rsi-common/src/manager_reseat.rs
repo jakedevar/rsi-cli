@@ -37,6 +37,9 @@ pub const RESEAT_INVALID: &str = "manager_reseat_invalid";
 pub const REQUEST_HUB_MANAGER_RESEAT_METHOD: &str = "RequestHubManagerReseat";
 pub const SATELLITE_RESEAT_INVALID: &str = "satellite_reseat_invalid";
 pub const SATELLITE_RESEAT_UNREACHABLE: &str = "satellite_reseat_unreachable";
+/// The request was sent but no usable reply came back (timeout, lost
+/// connection, malformed reply): the satellite may have reseated (#3291).
+pub const SATELLITE_RESEAT_UNCERTAIN: &str = "satellite_reseat_uncertain";
 pub const SATELLITE_RESEAT_REFUSED: &str = "satellite_reseat_refused";
 /// The requested provider/model/effort is outside the hub's effective launch
 /// grant for the project; a reseat never widens it.
@@ -209,14 +212,24 @@ pub fn successor_brief(
          unavailable. Reason recorded by the operator: {reason}\n\n\
          The appointment, its scope and its policy are already yours, and mail and wakes of the \
          previous seat were handed to you. Start with AgentGetAuthorityCatalog, then read the \
-         manager inbox and progress to see what was in flight, and follow \
-         .claude/skills/rsi-project-manager/SKILL.md. The previous seat will not resume."
+         manager inbox and progress to see what was in flight. Follow the catalog's current \
+         role playbook file reference or its binary-shipped role guidance fallback. \
+         The previous seat will not resume."
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successor_uses_the_catalog_playbook_reference_or_guidance_fallback() {
+        let predecessor = Uuid::from_u128(1);
+        let brief = successor_brief(predecessor, SessionProvider::Codex, "provider unavailable");
+        assert!(brief.contains(&predecessor.to_string()));
+        assert!(brief.contains("Start with AgentGetAuthorityCatalog"));
+        assert!(brief.contains("Follow the catalog's current role playbook file reference or its binary-shipped role guidance fallback"));
+    }
 
     fn params() -> ReseatHarnessManagerParams {
         ReseatHarnessManagerParams {

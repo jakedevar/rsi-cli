@@ -1,6 +1,6 @@
 //! Creation and active-session usage for the policy editor header (#674).
 //!
-//! Lifetime created sessions against `max_created_sessions` (the count the
+//! Sessions created in the rolling window (#3416) against `max_created_sessions` (the count the
 //! daemon's admission gate charges) and the active cohort, loaded in the
 //! background from operator Inspect Resources so opening Policy never blocks.
 use super::{PolicyState, catalog};
@@ -16,15 +16,25 @@ use tokio::{
 };
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreationUsage {
     pub created: i64,
     pub created_limit: Option<i64>,
     pub created_remaining: Option<i64>,
+    /// #3416: the rolling window the count covers, in hours.
+    pub window_hours: Option<u16>,
+    /// #3416: when the next creation leaves the window (RFC3339).
+    pub next_free_at: Option<String>,
+    /// #3416: every charged creation ever (informational).
+    pub lifetime_total: Option<i64>,
     pub active: i64,
+    /// #3417: each operator provider grant with its live spend.
+    pub grants: Vec<rsi_common::provider_grant::ProviderGrantStatusV1>,
+    /// #3417: the daemon setting `bench.enabled`.
+    pub bench_enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UsageView {
     Loading,
     Loaded(CreationUsage),
@@ -57,9 +67,16 @@ pub fn usage_from_resources(page: &ManagerInspectionV2) -> Result<CreationUsage,
             .ok_or("Resources row has no created_sessions")?,
         created_limit: created["limit"].as_i64(),
         created_remaining: created["remaining"].as_i64(),
+        window_hours: created["window_hours"]
+            .as_u64()
+            .and_then(|h| u16::try_from(h).ok()),
+        next_free_at: created["next_free_at"].as_str().map(str::to_string),
+        lifetime_total: created["lifetime_total"].as_i64(),
         active: row["active_sessions"]
             .as_i64()
             .ok_or("Resources row has no active_sessions")?,
+        grants: serde_json::from_value(row["provider_grants"].clone()).unwrap_or_default(),
+        bench_enabled: row["bench_enabled"].as_bool(),
     })
 }
 
@@ -80,13 +97,35 @@ impl UsageView {
             Self::Loaded(u) => {
                 let limit = created_limit.map(i64::from).or(u.created_limit);
                 let created = limit.map_or_else(
-                    || format!("{} created · no saved quota", u.created),
-                    |limit| {
-                        format!(
-                            "{}/{limit} created · {} left",
+                    || {
+                        // A window-less count is the lifetime count (#3418).
+                        let kind = if u.window_hours.is_some() {
+                            ""
+                        } else {
+                            " (lifetime)"
+                        };
+                        format!("{} created{kind} · no saved quota", u.created)
+                    },
+                    |limit| match u.window_hours {
+                        // #3416: say what the quota means: a rolling window
+                        // that refills, with the lifetime total beside it.
+                        Some(hours) => format!(
+                            "{} · {} left{}",
+                            rsi_common::manager_budget::creation_window_summary(
+                                u.created,
+                                limit,
+                                hours,
+                                u.next_free_at.as_deref(),
+                            ),
+                            (limit - u.created).max(0),
+                            u.lifetime_total
+                                .map_or_else(String::new, |n| format!(" · {n} ever")),
+                        ),
+                        None => format!(
+                            "{}/{limit} created (lifetime) · {} left",
                             u.created,
                             (limit - u.created).max(0)
-                        )
+                        ),
                     },
                 );
                 format!(

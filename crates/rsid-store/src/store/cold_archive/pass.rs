@@ -51,6 +51,7 @@ const MAX_LISTED_ERRORS: usize = 20;
 
 /// Short access to the store between the heavy steps of a pass.
 pub trait ColdStoreAccess {
+    #[track_caller]
     fn with_store<R>(&self, f: impl FnOnce(&Store) -> ColdResult<R>) -> ColdResult<R>;
 }
 
@@ -58,6 +59,7 @@ pub trait ColdStoreAccess {
 pub struct DirectStoreAccess<'a>(pub &'a Store);
 
 impl ColdStoreAccess for DirectStoreAccess<'_> {
+    #[track_caller]
     fn with_store<R>(&self, f: impl FnOnce(&Store) -> ColdResult<R>) -> ColdResult<R> {
         f(self.0)
     }
@@ -65,7 +67,8 @@ impl ColdStoreAccess for DirectStoreAccess<'_> {
 
 /// The daemon's store behind its mutex. For a pass thread that holds no
 /// custody root lock or repository mutex.
-impl ColdStoreAccess for Arc<tokio::sync::Mutex<Store>> {
+impl ColdStoreAccess for Arc<rsid_core::store_lock::Mutex<Store>> {
+    #[track_caller]
     fn with_store<R>(&self, f: impl FnOnce(&Store) -> ColdResult<R>) -> ColdResult<R> {
         let guard = self
             .blocking_lock_checked()

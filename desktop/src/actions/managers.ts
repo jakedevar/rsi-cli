@@ -10,8 +10,8 @@ import type { ActionSpec, SliceSpec, UiSnapshot } from '../registry.js';
 export type ManagersActionId =
   | 'mgr-tree' | 'mgr-board' | 'mgr-decisions' | 'mgr-inbox' | 'mgr-inspect' | 'mgr-policy'
   | 'mgr-scope' | 'mgr-appoint' | 'mgr-clear'
-  | 'mgr-global' | 'mgr-global-grant' | 'mgr-global-revoke' | 'mgr-budget' | 'mgr-fleet'
-  | 'mgr-portfolio' | 'mgr-escalations' | 'mgr-friction'
+  | 'mgr-global' | 'mgr-dashboard' | 'mgr-global-grant' | 'mgr-global-revoke' | 'mgr-budget' | 'mgr-fleet'
+  | 'mgr-portfolio' | 'mgr-portfolio-appoint' | 'mgr-escalations' | 'mgr-friction'
   | 'mgr-global-appoint' | 'mgr-node' | 'mgr-restart'
   | 'mgr-refresh' | 'mgr-close';
 
@@ -25,7 +25,7 @@ export interface ManagersSnapshot {
 }
 
 export const MANAGERS_ACTIONS: readonly ActionSpec[] = [
-  { id: 'mgr-tree', title: 'Manager tree', group: 'view', menuBreak: true, detail: 'The global grant, portfolio nodes, project seats, area nodes and led Epics (:manager tree)' },
+  { id: 'mgr-tree', title: 'Manager tree', group: 'view', menuBreak: true, detail: 'Every manager, from the top down: the global manager, managers over several projects, each project’s manager and the managers under it (:manager tree)' },
   { id: 'mgr-board', title: 'Manager board', group: 'view', detail: 'The project manager’s board: decisions, requests, leads and health (<Space>gb)' },
   { id: 'mgr-decisions', title: 'Manager decisions', group: 'view', detail: 'Decisions waiting on the operator (<Space>gd)' },
   { id: 'mgr-inbox', title: 'Manager inbox', group: 'view', noMenu: true, detail: 'Lead requests and replies (:manager inbox)' },
@@ -39,10 +39,12 @@ export const MANAGERS_ACTIONS: readonly ActionSpec[] = [
   { id: 'mgr-global-appoint', title: 'Appoint selected session as global manager…', group: 'view', noMenu: true, detail: ':manager global appoint [--defaults] [projects]: the focused session over the named projects (default: every project)' },
   { id: 'mgr-global-revoke', title: 'Revoke global manager…', group: 'view', noMenu: true, detail: 'The seat keeps its session but loses its authority; asks first' },
   { id: 'mgr-budget', title: 'Manager budget panel', group: 'view', detail: 'Every cap of the global node and each PM as used / limit (gm, then b)' },
+  { id: 'mgr-dashboard', title: 'Global dashboard', group: 'view', detail: 'RSI-wide metrics: a row per project with agents, tokens, cost and Issue flow, plus the top-level manager (gd, :dashboard)' },
   { id: 'mgr-fleet', title: 'Fleet workspace', group: 'view', detail: 'Active agents and usage rates across all projects (:fleet)' },
   { id: 'mgr-portfolio', title: 'Manager portfolio nodes', group: 'view', noMenu: true, detail: 'Managers above project level (:manager portfolio)' },
+  { id: 'mgr-portfolio-appoint', title: 'Appoint a portfolio manager…', group: 'view', detail: 'The selected session becomes a manager over several projects; you name it first (:manager portfolio appoint <label>)' },
   { id: 'mgr-escalations', title: 'Manager escalations', group: 'view', noMenu: true, detail: 'Escalations at the top of their chain (:manager escalations)' },
-  { id: 'mgr-node', title: 'Manager area nodes', group: 'view', noMenu: true, detail: ':manager node [list|get <UUID>|configure <JSON>|revoke <UUID> <epoch>]' },
+  { id: 'mgr-node', title: 'Manager area nodes', group: 'view', noMenu: true, detail: 'Managers for one area of a project: list, show, change or revoke them (:manager node)' },
   { id: 'mgr-restart', title: 'Operator quiet-point restart', group: 'view', noMenu: true, detail: ':manager restart [status|now|cancel]' },
   { id: 'mgr-friction', title: 'Manager friction rollup', group: 'view', noMenu: true, detail: 'Refusals and timeouts by signature (:manager friction [hours])' },
   { id: 'mgr-refresh', title: 'Refresh manager view', group: 'view', noMenu: true, detail: 'r inside the view' },
@@ -71,8 +73,10 @@ export const MANAGERS_RULES: Readonly<Record<ManagersActionId, Rule>> = {
   'mgr-node': () => null,
   'mgr-restart': () => null,
   'mgr-budget': () => null,
+  'mgr-dashboard': () => null,
   'mgr-fleet': () => null,
   'mgr-portfolio': () => null,
+  'mgr-portfolio-appoint': (s) => (s.managers?.seatCandidate ? null : 'Select the session to appoint in the session list first'),
   'mgr-escalations': () => null,
   'mgr-friction': () => null,
   'mgr-refresh': open,
@@ -90,6 +94,7 @@ export const MANAGERS_KEY_BINDINGS: Readonly<Record<string, DesktopBinding<Manag
   '<Space>gb': b('mgr-board'),
   '<Space>gd': b('mgr-decisions'),
   gm: b('mgr-global'),
+  gd: b('mgr-dashboard'),
 };
 
 /** TUI `:` commands (canonical names; aliases resolve through the keymap). */
@@ -110,6 +115,7 @@ export const MANAGERS_COMMAND_BINDINGS: Readonly<Record<string, DesktopBinding<M
   'manager global appoint': b('mgr-global-appoint'),
   'manager node': b('mgr-node'),
   'manager restart': b('mgr-restart'),
+  dashboard: b('mgr-dashboard'),
   fleet: b('mgr-fleet'),
   'manager portfolio': b('mgr-portfolio'),
   'manager escalations': b('mgr-escalations'),

@@ -38,6 +38,9 @@ const PROVIDER_AUTH_INVALID_SUBJECT_PREFIX: &str = "provider_auth_invalid:";
 const PROVIDER_LOGIN_REQUIRED_SUBJECT_PREFIX: &str = "provider_login_required:";
 /// Subject prefix of the project-wide provider CLI contract notice (#2755).
 const PROVIDER_CONTRACT_DEGRADED_SUBJECT_PREFIX: &str = "provider_contract_degraded:";
+/// Subject prefix of the project-wide OpenRouter spend notice (#3154):
+/// `openrouter_spend:<warn|reached>`, versioned by the arming time.
+const OPENROUTER_SPEND_SUBJECT_PREFIX: &str = "openrouter_spend:";
 const MODEL_UNAVAILABLE_SUBJECT_PREFIX: &str = "model_unavailable:";
 const PROVIDER_WINDOW_SUBJECT_PREFIX: &str = "provider_window:";
 /// #2756: subject prefix of a worker's provider-session health notice
@@ -167,19 +170,27 @@ thread_local! {
 }
 
 /// Notices the seat must act on and so must never hide behind a backlog (#2871):
-/// a satellite report (ENQUEUE, DEPLOY_READY, RESULT), a QA Issue and a worker
+/// an actionable satellite report (DEPLOY-READY), a QA Issue and a worker
 /// context cap. They wake an idle recipient on arrival even while older
 /// delivered notices still await retrieval, and `AgentManagerInbox` returns them
 /// ahead of routine notices so a one-page read cannot miss them. Fixed SQL
 /// fragment over `harness_manager_notices` columns; the subjects match
 /// `QA_ISSUE_SUBJECT_PREFIX`, `SATELLITE_REPORT_NOTICE_SUBJECT` and
-/// `WORKER_CONTEXT_CAP_SUBJECT_PREFIX` (a test compares them).
+/// `WORKER_CONTEXT_CAP_SUBJECT_PREFIX` (a test compares them); an operator
+/// intake P1 (`operator_intake:`, #3787) is actionable too. Callers exclude
+/// `ROUTINE_NOTICE_PREDICATE` too. Informational reports never bypass a
+/// delivered backlog, even after their digest expires (#3976): otherwise the
+/// delivery tranche limit could turn one large digest into several wakes.
 const ACTIONABLE_NOTICE_PREDICATE: &str = "(kind='ledger_change' AND (
-        subject_id='satellite_report'
+        (subject_id='satellite_report' AND NOT (CASE WHEN json_valid(state_json)
+            THEN COALESCE((json_extract(state_json,'$.informational_only')=1
+                AND json_extract(state_json,'$.report_kind') IN ('RESULT','ENQUEUE')),0)
+            ELSE 0 END))
         OR subject_id LIKE 'qa_issue:%'
+        OR subject_id LIKE 'operator_intake:%'
         OR subject_id LIKE 'worker_context_cap:%'))";
 
-/// Routine notices that are visible on demand and never justify a wake of
+/// Routine notices that are visible on demand and do not currently justify a wake of
 /// their own (#1675): a successful action receipt, a completed or pending
 /// sandbox target reclaim, a successful operating-intent resume, and an Epic
 /// intent-ledger bump whose projected state needs no manager action (#2322:
@@ -189,7 +200,15 @@ const ACTIONABLE_NOTICE_PREDICATE: &str = "(kind='ledger_change' AND (
 /// `active_session_ids` / work row versions, and the state of a topology node
 /// session (#2533: the execution's own settled/blocked notice covers it), and
 /// a `review:*` notice of a review a topology node owns (#2606: the settled
-/// wake's outcome digest carries the verdict; a standalone review still wakes).
+/// wake's outcome digest carries the verdict; a standalone review still wakes),
+/// a satellite ENQUEUE report the hub daemon takes in itself and the digest
+/// notice of such an intake that needs no decision (#3345: `auto_intake`,
+/// `needs_attention` false; a pre-merge review, a refusal or a stall still wakes),
+/// informational satellite RESULT/ENQUEUE reports and landed-result echoes
+/// (#3976). These wait for another wake or their fixed 30-minute digest
+/// deadline, whichever comes first. Legacy notices without a stamped deadline
+/// use recorded_at + 1800 seconds. DEPLOY-READY,
+/// satellite report failures and intake records needing attention still wake.
 /// An Epic intent `blocked` notice is routine until it has stayed the latest
 /// state of that intent for `INTENT_BLOCKED_DEBOUNCE_SECS` (#2577); a
 /// `worker`/other later notice supersedes it for good. A `stale_lead` intent
@@ -212,6 +231,16 @@ const ROUTINE_NOTICE_PREDICATE: &str = "(CASE WHEN json_valid(state_json) THEN C
         OR (kind='session_state' AND json_extract(state_json,'$.coalesced')=1)
         OR (kind='ledger_change' AND subject_id LIKE 'review:%'
             AND json_extract(state_json,'$.topology_owned')=1)
+        OR (kind='ledger_change'
+            AND ((subject_id='satellite_report'
+                  AND json_extract(state_json,'$.informational_only')=1
+                  AND json_extract(state_json,'$.report_kind') IN ('RESULT','ENQUEUE'))
+                 OR json_extract(state_json,'$.record_kind')='issue_result_landed')
+            AND COALESCE(json_extract(state_json,'$.digest_until_unix'),
+                         CAST(strftime('%s',recorded_at) AS INTEGER)+1800)
+                > CAST(strftime('%s','now') AS INTEGER))
+        OR (kind='ledger_change' AND subject_id LIKE 'satellite_intake:%'
+            AND json_extract(state_json,'$.needs_attention')=0)
         OR (kind='ledger_change' AND json_extract(state_json,'$.record_kind')='intent'
             AND json_extract(state_json,'$.payload.state')='blocked'
             AND json_extract(state_json,'$.debounce_until_unix') IS NOT NULL
@@ -225,12 +254,36 @@ const ROUTINE_NOTICE_PREDICATE: &str = "(CASE WHEN json_valid(state_json) THEN C
                              AND later.retired_at IS NULL)))
     ), 0) ELSE 0 END)";
 
+/// Notices a manager's per-hour turn budget may coalesce into a later turn
+/// (#4021): the state of a lead that is not failed, waiting on approval, asking
+/// a question or lost, `work` ledger rows, and an Epic intent whose state is
+/// not `blocked` or `stale_lead`. Everything else (mail, operator answers,
+/// failed or uncertain actions, requests, decisions, satellite and queue
+/// outcomes, reviews, intake, worker caps) is urgent and delivers past a spent
+/// budget. An `ACTIONABLE_NOTICE_PREDICATE` notice is never deferrable. Same
+/// columns as `ROUTINE_NOTICE_PREDICATE`; malformed or unrecognized JSON is
+/// urgent.
+const BUDGET_DEFERRABLE_NOTICE_PREDICATE: &str = "(CASE WHEN json_valid(state_json) THEN COALESCE((
+        (kind='session_state'
+            AND COALESCE(json_extract(state_json,'$.lead_lost'),0)=0
+            AND json_extract(state_json,'$.recovery_code') IS NULL
+            AND json_extract(state_json,'$.question') IS NULL
+            AND COALESCE(json_extract(state_json,'$.status'),'')
+                NOT IN ('Failed','WaitingApproval'))
+        OR (kind='ledger_change' AND json_extract(state_json,'$.record_kind')='work')
+        OR (kind='ledger_change' AND json_extract(state_json,'$.record_kind')='intent'
+            AND COALESCE(json_extract(state_json,'$.payload.state'),'')
+                IN ('paused','complete','resolved','worker','recovery_action',
+                    'dependency_wait','monitoring','status_only'))
+    ), 0) ELSE 0 END)";
+
 /// An Epic intent `blocked` notice still inside its debounce window and not
-/// yet superseded by a later notice for the same intent (#2577): it is not a
-/// wake now, but the transport stays armed so it wakes once if the Epic is
-/// still blocked when the window ends. Same columns as `ROUTINE_NOTICE_PREDICATE`.
+/// yet superseded by a later notice for the same intent (#2577), or an
+/// informational report/landed-result echo inside its digest window (#3976).
+/// It cannot wake now, but keeps the transport armed until the window ends.
+/// Same columns as `ROUTINE_NOTICE_PREDICATE`.
 const DEBOUNCING_NOTICE_PREDICATE: &str = "(CASE WHEN json_valid(state_json) THEN COALESCE((
-        kind='ledger_change' AND json_extract(state_json,'$.record_kind')='intent'
+        (kind='ledger_change' AND json_extract(state_json,'$.record_kind')='intent'
         AND json_extract(state_json,'$.payload.state')='blocked'
         AND json_extract(state_json,'$.debounce_until_unix')
             > CAST(strftime('%s','now') AS INTEGER)
@@ -239,7 +292,15 @@ const DEBOUNCING_NOTICE_PREDICATE: &str = "(CASE WHEN json_valid(state_json) THE
                          AND later.kind=harness_manager_notices.kind
                          AND later.subject_id=harness_manager_notices.subject_id
                          AND later.sequence>harness_manager_notices.sequence
-                         AND later.retired_at IS NULL)
+                         AND later.retired_at IS NULL))
+        OR (kind='ledger_change'
+            AND ((subject_id='satellite_report'
+                  AND json_extract(state_json,'$.informational_only')=1
+                  AND json_extract(state_json,'$.report_kind') IN ('RESULT','ENQUEUE'))
+                 OR json_extract(state_json,'$.record_kind')='issue_result_landed')
+            AND COALESCE(json_extract(state_json,'$.digest_until_unix'),
+                         CAST(strftime('%s',recorded_at) AS INTEGER)+1800)
+                > CAST(strftime('%s','now') AS INTEGER))
     ), 0) ELSE 0 END)";
 
 /// Superseded `work` / `intent` ledger notices retired per inbox read (#309).
@@ -250,6 +311,12 @@ const SUPERSEDED_LEDGER_NOTICE_BATCH: i64 = 512;
 /// between nodes with nothing for the manager to do; a block that outlives
 /// this window with no successor is real.
 const INTENT_BLOCKED_DEBOUNCE_SECS: i64 = 120;
+
+/// Maximum quiet time for informational satellite reports and landed-result
+/// echoes (#3976). Fixed policy rather than an operator knob: keep hub-action
+/// requests bounded without adding configuration and its RPC/TUI surface.
+/// The legacy SQL fallback above uses the same 1800 seconds.
+pub(super) const MANAGER_NOTICE_DIGEST_SECS: i64 = 30 * 60;
 
 #[cfg(any(test, feature = "test-seam"))]
 thread_local! {
@@ -273,7 +340,7 @@ fn intent_block_is_debounced(record: &super::harness_manager_v2::ManagerRecordV2
         && record.payload["state"] == "blocked"
         && !matches!(
             record.payload["reason"].as_str(),
-            Some("pending_operator_decision" | "work_plan_required")
+            Some("pending_operator_decision" | "pending_manager_decision" | "work_plan_required")
         )
 }
 
@@ -575,13 +642,21 @@ impl Store {
         state: &Value,
         event_wake: bool,
     ) -> Result<Option<Uuid>> {
-        let lead = self.manager_lead(config.project_id, epic)?;
-        let (job_id, route_source, recipient) = if event_wake {
-            self.manager_action_watch_identity(config)
+        // An event wake routes to the seat, not through an Epic lead (#3240: a
+        // topology review Epic may have none), so only the lead-routed notice
+        // requires one.
+        let lead = if event_wake {
+            self.manager_lead(config.project_id, epic).ok()
         } else {
-            let (job, source, target, _) =
-                self.manager_watch_identity(config, &lead, to_manager)?;
+            Some(self.manager_lead(config.project_id, epic)?)
+        };
+        let (job_id, route_source, recipient) = if let Some(lead) =
+            lead.as_ref().filter(|_| !event_wake)
+        {
+            let (job, source, target, _) = self.manager_watch_identity(config, lead, to_manager)?;
             (job, source, target)
+        } else {
+            self.manager_action_watch_identity(config)
         };
         if route_source == recipient && !event_wake {
             return Ok(None);
@@ -610,8 +685,8 @@ impl Store {
             {
                 if event_wake {
                     self.ensure_manager_action_watch(config, subject_version)?;
-                } else {
-                    self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+                } else if let Some(lead) = lead.as_ref() {
+                    self.ensure_manager_watch(config, lead, to_manager, subject_version, false)?;
                 }
                 self.refresh_manager_notice_job(job_id)?;
             }
@@ -628,8 +703,8 @@ impl Store {
                 config,
                 &format!("{kind}:{subject_id}:{subject_version}"),
             )?;
-        } else {
-            self.ensure_manager_watch(config, &lead, to_manager, subject_version, false)?;
+        } else if let Some(lead) = lead.as_ref() {
+            self.ensure_manager_watch(config, lead, to_manager, subject_version, false)?;
         }
         let direction = if to_manager { "to_manager" } else { "to_lead" };
         let recorded_at = now();
@@ -681,6 +756,7 @@ impl Store {
         let question = manager_notice_question_projection(&lead.pending_question)?;
         let mut state = json!({
             "session_id":lead.id,
+            "epic_id":epic,
             "status":lead.status,
             "stop_reason":lead.stop_reason,
             "question":question.clone(),
@@ -688,6 +764,11 @@ impl Store {
             "event_sequence":event_sequence,
             "session_updated_at":lead.updated_at,
         });
+        if lead.status == SessionStatus::Failed {
+            state["lead_lost"] = json!(true);
+            state["lead_session_id"] = json!(lead.id);
+            state["cause"] = json!("failed");
+        }
         // #2533: a topology node session's state change is covered by its
         // execution's settled / blocked notice. Keep it readable in the inbox
         // but never wake the manager for it (a pending question still wakes).
@@ -1128,7 +1209,8 @@ impl Store {
             SucceedManager { .. }
             | CreateContainer { .. }
             | Integrate { .. }
-            | SettleUncertainAction { .. } => Ok(None),
+            | SettleUncertainAction { .. }
+            | WithdrawQueuedCreate { .. } => Ok(None),
             ResumeLead { .. }
             | PauseLead { .. }
             | RetryLead { .. }
@@ -1613,6 +1695,84 @@ impl Store {
         Ok(Some(job_id))
     }
 
+    /// One project-wide notice per OpenRouter spend line crossed (#3154):
+    /// `kind` is `warn` (the warn line) or `reached` (the stop line). The
+    /// subject is the kind and the version is the arming time, so a line is
+    /// announced once per arming however often the pass runs, across restarts;
+    /// re-arming the cap is a new announcement. `detail` is the bounded
+    /// one-line state (`rsi_common::openrouter_spend::summary_line`).
+    pub fn record_openrouter_spend_notice(
+        &self,
+        project_id: Uuid,
+        kind: &str,
+        armed_at: DateTime<Utc>,
+        detail: &str,
+    ) -> Result<Option<Uuid>> {
+        if !matches!(kind, "warn" | "reached") {
+            return Ok(None);
+        }
+        let Some(config) = self.get_harness_manager_notice_config(project_id)? else {
+            return Ok(None);
+        };
+        if config.current_session_id.is_none()
+            || config.is_revoked()
+            || self
+                .get_harness_manager_policy(project_id)?
+                .is_none_or(|policy| policy.revoked)
+        {
+            return Ok(None);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let (job_id, _, _) = self.manager_action_watch_identity(&config);
+        let subject = format!("{OPENROUTER_SPEND_SUBJECT_PREFIX}{kind}");
+        let version = armed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices
+             WHERE job_id=?1 AND kind='ledger_change' AND subject_id=?2 AND subject_version=?3)",
+            params![job_id.to_string(), subject, version],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Ok(None);
+        }
+        self.ensure_manager_action_watch(&config, &version)?;
+        let advice = if kind == "reached" {
+            "The stop line is reached: new OpenRouter-billed launches are refused \
+             (openrouter_spend_cap_reached) and running Harness sessions stop at their next \
+             model call. Stop paid runs and report to the operator."
+        } else {
+            "The warn line is crossed. Finish or stop the current paid run, launch no further \
+             paid run without checking spend_cap in AgentGetProviderStatus, and report to the \
+             operator."
+        };
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'ledger_change',?6,?7,?8,?7,?7)",
+            params![
+                Uuid::new_v4().to_string(),
+                job_id.to_string(),
+                project_id.to_string(),
+                config.manager_session_id.to_string(),
+                config.row_version,
+                subject,
+                version,
+                serde_json::to_string(&json!({
+                    "record_kind": "openrouter_spend",
+                    "line": kind,
+                    "armed_at": armed_at,
+                    "gate": "technical",
+                    "detail": format!("OpenRouter spend cap: {detail}. {advice}"),
+                }))?,
+            ],
+        )?;
+        self.refresh_manager_notice_job(job_id)?;
+        tx.commit()?;
+        Ok(Some(job_id))
+    }
+
     /// One project-wide notice per unavailable-model episode (#2735). The
     /// subject is the provider and model and the version is the episode's first
     /// refusal, so repeated refusals never wake the manager again; a model that
@@ -1689,6 +1849,54 @@ impl Store {
         self.refresh_manager_notice_job(job_id)?;
         tx.commit()?;
         Ok(Some(job_id))
+    }
+
+    /// Called in the disposition transaction; subject dedupes across passes and seats.
+    pub(crate) fn record_error_disposition_notice(
+        &self,
+        session: &Session,
+        diagnosis: &Value,
+        observed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        if self.error_disposition_report_up(session.id, diagnosis)? {
+            return Ok(true);
+        }
+        let Some(project) = session.project_id else {
+            return Ok(false);
+        };
+        let Some(config) = self.get_harness_manager_notice_config(project)? else {
+            return Ok(false);
+        };
+        if config.current_session_id.is_none()
+            || config.current_session_id == Some(session.id)
+            || config.is_revoked()
+        {
+            return Ok(false);
+        }
+        let (job_id, _, _) = self.manager_action_watch_identity(&config);
+        let subject = format!("error_disposition:{}", session.id);
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM harness_manager_notices WHERE subject_id=?1)",
+            [&subject],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(true);
+        }
+        let at = observed_at.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        self.ensure_manager_action_watch(&config, &at)?;
+        self.conn.execute(
+            "INSERT INTO harness_manager_notices
+             (id,job_id,project_id,manager_session_id,scope_version,epic_id,direction,
+              source_session_id,recipient_session_id,kind,subject_id,subject_version,
+              state_json,recorded_at,queued_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,'to_manager',NULL,?4,'ledger_change',?6,?7,?8,?7,?7)",
+            params![Uuid::new_v4().to_string(),job_id.to_string(),project.to_string(),
+                config.manager_session_id.to_string(),config.row_version,subject,at,
+                serde_json::to_string(&json!({"record_kind":"error_disposition", "diagnosis":diagnosis,
+                    "detail":"Daemon could not resolve this errored session; extend the disposition rules."}))?])?;
+        self.refresh_manager_notice_job(job_id)?;
+        Ok(true)
     }
 
     /// One project-wide notice per worker session and health kind (#2756): the
@@ -2220,6 +2428,48 @@ impl Store {
         )
     }
 
+    /// #3240: one actionable notice per pending decision a manager may rule
+    /// on. It is an event-wake `ledger_change` on the seat's action watch, so
+    /// it wakes the current seat and re-homes to a successor like the review
+    /// notices; `insert_manager_notice` dedupes on (key, digest), so a repeat
+    /// pass adds none. A decision only the operator can answer has its own
+    /// operator path and records nothing here.
+    pub(crate) fn record_manager_decision_notice(
+        &self,
+        config: &HarnessManagerConfigV1,
+        decision: &super::PendingDecisionSummary,
+    ) -> Result<Option<Uuid>> {
+        let Some(epic) = decision
+            .epic_id
+            .filter(|_| decision.answerable_by == "manager")
+        else {
+            return Ok(None);
+        };
+        if self
+            .get_harness_manager_notice_config(config.project_id)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.insert_manager_notice(
+            config,
+            epic,
+            true,
+            "ledger_change",
+            &format!("decision:{}", decision.key),
+            decision.target_digest.as_deref().unwrap_or("asked"),
+            None,
+            &json!({"record_kind":"decision","state":"pending",
+                    "reason":"pending_manager_decision",
+                    "answerable_by":"manager",
+                    "decision_key":decision.key,
+                    "summary":decision.question,
+                    "execution_id":decision.execution_id,
+                    "next_action":"Rule with AgentManagerUpdate decision_ruling (see AgentManagerInspect section rulings); the asking run stays parked until you do."}),
+            true,
+        )
+    }
+
     pub fn refresh_manager_notice_job(&self, job_id: Uuid) -> Result<()> {
         let unsettled: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM harness_manager_notices
@@ -2285,9 +2535,9 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        // #2577: a debouncing blocked intent is listed (the message must be
-        // right when its window ends) but is not routine-settled and not yet
-        // a wake; it keeps the transport armed until it supersedes or wakes.
+        // List debouncing intents and digest reports now, so the persisted
+        // message is ready when the deadline passes without another write.
+        // They keep the transport armed but cannot justify early delivery.
         // sql-dynamic-ok: the predicate is a fixed constant; ids are bound.
         let debouncing_query = format!(
             "SELECT count(*) FROM harness_manager_notices
@@ -2354,11 +2604,61 @@ impl Store {
             // reconciliation retries this disabled row after capacity frees),
             // and never arm a wake for routine-only notices (#1675).
             self.conn.execute(
-                "UPDATE scheduled_jobs SET message=?2,updated_at=?3 WHERE id=?1",
+                "UPDATE scheduled_jobs SET message=?2,enabled=0,updated_at=?3 WHERE id=?1",
                 params![job_id.to_string(), rendered, now()],
             )?;
         }
         Ok(())
+    }
+
+    /// Whether the wake this manager watch would deliver may be coalesced by
+    /// the seat's turn budget (#4021). `None`: no pending notice would wake the
+    /// seat. `Some(true)`: every wake-worthy undelivered notice is deferrable.
+    /// `Some(false)`: at least one is urgent (mail, an operator answer, a
+    /// failure, a gate, a queue or satellite outcome, a safety record), so the
+    /// delivery bypasses a spent budget.
+    pub fn manager_watch_wake_deferrable(&self, job_id: Uuid) -> Result<Option<bool>> {
+        // sql-dynamic-ok: the predicates are fixed constants; ids are bound.
+        let query = format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN direction='to_manager'
+                                       AND {BUDGET_DEFERRABLE_NOTICE_PREDICATE}
+                                       AND NOT {ACTIONABLE_NOTICE_PREDICATE}
+                                      THEN 0 ELSE 1 END),0)
+             FROM harness_manager_notices
+             WHERE job_id=?1 AND retired_at IS NULL AND settled_at IS NULL
+               AND delivered_at IS NULL AND NOT {ROUTINE_NOTICE_PREDICATE}"
+        );
+        let (wake, urgent): (i64, i64) =
+            self.conn.query_row(&query, [job_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        Ok((wake > 0).then_some(urgent == 0))
+    }
+
+    /// Wake-driven turns `session_id` started since `since` (RFC3339 UTC with
+    /// nanoseconds): admitted resume or fresh-launch invocations (#4021).
+    pub fn manager_seat_turns_since(&self, session_id: Uuid, since: &str) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM model_invocations
+             WHERE session_id=?1 AND admission_status='admitted'
+               AND purpose IN ('session.continue.resume','session.launch.fresh')
+               AND created_at>=?2",
+            params![session_id.to_string(), since],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// The operator's per-seat turn cap (`manager_max_turns_per_hour`; 0 or an
+    /// unreadable value is off, so a bad row can only fall back to no cap).
+    pub fn manager_turn_cap_per_hour(&self) -> u32 {
+        self.get_daemon_setting(rsi_common::coordinator_budget::MANAGER_TURNS_PER_HOUR_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .filter(|cap| *cap <= rsi_common::coordinator_budget::MANAGER_TURNS_PER_HOUR_MAX)
+            .unwrap_or(rsi_common::coordinator_budget::MANAGER_TURNS_PER_HOUR_DEFAULT)
     }
 
     pub fn manager_watch_delivery_state(&self, job_id: Uuid) -> Result<Option<bool>> {
@@ -2426,7 +2726,7 @@ impl Store {
             "SELECT EXISTS(SELECT 1 FROM harness_manager_notices
              WHERE job_id=?1 AND retired_at IS NULL
                AND settled_at IS NULL AND delivered_at IS NULL
-               AND {ACTIONABLE_NOTICE_PREDICATE})"
+               AND {ACTIONABLE_NOTICE_PREDICATE} AND NOT {ROUTINE_NOTICE_PREDICATE})"
         );
         Ok(self
             .conn
@@ -3219,13 +3519,19 @@ impl Store {
                 || subject_id.starts_with(PROVIDER_AUTH_INVALID_SUBJECT_PREFIX)
                 || subject_id.starts_with(PROVIDER_LOGIN_REQUIRED_SUBJECT_PREFIX)
                 || subject_id.starts_with(PROVIDER_CONTRACT_DEGRADED_SUBJECT_PREFIX)
+                || subject_id.starts_with(OPENROUTER_SPEND_SUBJECT_PREFIX)
                 || subject_id.starts_with(MODEL_UNAVAILABLE_SUBJECT_PREFIX)
                 || subject_id.starts_with(PROVIDER_WINDOW_SUBJECT_PREFIX)
                 || subject_id.starts_with(PROVIDER_SESSION_HEALTH_SUBJECT_PREFIX)
+                || subject_id.starts_with("error_disposition:")
                 || subject_id.starts_with(QA_ISSUE_SUBJECT_PREFIX)
+                || subject_id.starts_with(super::intake_notice::OPERATOR_INTAKE_SUBJECT_PREFIX)
+                || subject_id
+                    .starts_with(rsi_common::satellite_intake::INTAKE_NOTICE_SUBJECT_PREFIX)
                 || subject_id
                     .starts_with(super::issue_result_landed::ISSUE_RESULT_LANDED_SUBJECT_PREFIX)
-                || subject_id.starts_with(super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX))
+                || subject_id.starts_with(super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX)
+                || subject_id.starts_with(super::disk_hold_notice::DISK_HOLD_SUBJECT_PREFIX))
             {
                 return Ok(());
             }
@@ -3517,7 +3823,7 @@ impl Store {
             let limit = arguments.len() + 1;
             arguments.push(SqlValue::Integer(MAX_NOTICE_RETRIEVAL_SCAN));
             let actionable_filter = if actionable_only {
-                format!(" AND {ACTIONABLE_NOTICE_PREDICATE}")
+                format!(" AND {ACTIONABLE_NOTICE_PREDICATE} AND NOT {ROUTINE_NOTICE_PREDICATE}")
             } else {
                 String::new()
             };
@@ -3643,6 +3949,10 @@ impl Store {
                         || row
                             .public
                             .subject_id
+                            .starts_with(OPENROUTER_SPEND_SUBJECT_PREFIX)
+                        || row
+                            .public
+                            .subject_id
                             .starts_with(MODEL_UNAVAILABLE_SUBJECT_PREFIX)
                         || row
                             .public
@@ -3652,13 +3962,27 @@ impl Store {
                             .public
                             .subject_id
                             .starts_with(PROVIDER_SESSION_HEALTH_SUBJECT_PREFIX)
+                        || row.public.subject_id.starts_with("error_disposition:")
                         || row.public.subject_id.starts_with(QA_ISSUE_SUBJECT_PREFIX)
+                        || row
+                            .public
+                            .subject_id
+                            .starts_with(super::intake_notice::OPERATOR_INTAKE_SUBJECT_PREFIX)
+                        || row
+                            .public
+                            .subject_id
+                            .starts_with(rsi_common::satellite_intake::INTAKE_NOTICE_SUBJECT_PREFIX)
                         || row.public.subject_id.starts_with(
                             super::issue_result_landed::ISSUE_RESULT_LANDED_SUBJECT_PREFIX,
                         )
-                        || row.public.subject_id.starts_with(
-                            super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX,
-                        ))
+                        || row
+                            .public
+                            .subject_id
+                            .starts_with(super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX)
+                        || row
+                            .public
+                            .subject_id
+                            .starts_with(super::disk_hold_notice::DISK_HOLD_SUBJECT_PREFIX))
                     && row.public.epic_id.is_none())))
             || row
                 .public
@@ -4185,6 +4509,82 @@ impl Store {
             .collect()
     }
 
+    /// Retain the last observed lead independently of the live pointer. Cleanup
+    /// may clear that pointer before the next notice pass (#3908). The record
+    /// changes only on availability transitions; its version dedupes each loss
+    /// and the seat-routed transport works even after the lead disappears.
+    fn reconcile_manager_lead_presence(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<()> {
+        let key = epic.to_string();
+        let previous = self.manager_v2_record(config, "lead_presence", &key)?;
+        let pointer = self.get_session(epic)?.and_then(|row| row.lead_session_id);
+        let lead_id = pointer.or_else(|| {
+            previous.as_ref()?.payload["lead_session_id"]
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+        });
+        let Some(lead_id) = lead_id else {
+            return Ok(());
+        };
+        let lead = self.get_session(lead_id)?;
+        let cause = match lead.as_ref().map(|row| row.status) {
+            None => Some("missing"),
+            Some(SessionStatus::Archived) => Some("archived"),
+            Some(SessionStatus::Deleted) => Some("deleted"),
+            Some(SessionStatus::Failed) => Some("failed"),
+            _ if pointer.is_none() => Some("unassigned"),
+            _ => None,
+        };
+        // A loss remains one episode if a later cleanup changes Failed to
+        // Archived, or removes the pointer. Preserve the first known cause.
+        let state = if let Some(previous) = previous.as_ref().filter(|record| {
+            record.payload["lead_session_id"] == json!(lead_id)
+                && record.payload["lost"] == true
+                && cause.is_some()
+        }) {
+            previous.payload.clone()
+        } else {
+            json!({"lead_session_id":lead_id,"lost":cause.is_some(),"cause":cause})
+        };
+        // Presence is reconciliation's internal projection, not a new ledger
+        // event: emitting one would invalidate the notice signature while the
+        // notice pass itself runs and re-arm otherwise unchanged watches.
+        let record = match previous {
+            Some(record) if record.payload == state => record,
+            previous => self.manager_v2_put_record(
+                config,
+                "lead_presence",
+                &key,
+                Some(epic),
+                previous.map_or(0, |record| record.row_version),
+                &state,
+            )?,
+        };
+        // Failed leads already have a semantic session-state notice. Retain
+        // that transport and subject, and do not announce its later cleanup
+        // as a second loss.
+        if state["lost"] != true || state["cause"] == "failed" {
+            return Ok(());
+        }
+        self.insert_manager_notice(
+            config,
+            epic,
+            true,
+            "session_state",
+            &format!("lead-loss:{epic}"),
+            &record.row_version.to_string(),
+            Some(lead_id),
+            &json!({"epic_id":epic,"lead_session_id":lead_id,"lead_lost":true,
+                "cause":state["cause"],"stop_reason":lead.as_ref().and_then(|row| row.stop_reason.as_ref()),
+                "next_action":"inspect_lead"}),
+            true,
+        )?;
+        Ok(())
+    }
+
     pub fn manager_v2_reconcile_notices(&self, config: &HarnessManagerConfigV1) -> Result<()> {
         if self
             .get_harness_manager_policy(config.project_id)?
@@ -4194,6 +4594,10 @@ impl Store {
         }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         for epic in self.manager_notice_epic_page(config, "v2_epics")? {
+            self.reconcile_manager_lead_presence(config, epic)?;
+            for decision in self.manager_v2_pending_decision_summaries(config, Some(epic), 64)? {
+                self.record_manager_decision_notice(config, &decision)?;
+            }
             let Ok(lead) = self.manager_lead(config.project_id, epic) else {
                 continue;
             };
@@ -4325,6 +4729,68 @@ mod tests {
             |_, _, _, _| unreachable!(),
         )
     }
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn epic_lead_loss_notifies_once_after_pointer_clear_or_failure() {
+        for status in [
+            SessionStatus::Archived,
+            SessionStatus::Deleted,
+            SessionStatus::Failed,
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let (config, lead) = fixture(&store, policy());
+            let epic = lead.parent_id.unwrap();
+            store.manager_v2_reconcile_notices(&config).unwrap();
+            store
+                .manager_inbox(config.manager_session_id, &Default::default())
+                .unwrap();
+            store.update_session_status(lead.id, status).unwrap();
+            if status != SessionStatus::Failed {
+                store.clear_lead_session_if_matches(lead.id).unwrap();
+            }
+            for _ in 0..3 {
+                store.manager_v2_reconcile_notices(&config).unwrap();
+            }
+            let subject = if status == SessionStatus::Failed {
+                lead.id.to_string()
+            } else {
+                format!("lead-loss:{epic}")
+            };
+            let (count, job, payload): (i64, String, String) = store.conn.query_row(
+                "SELECT COUNT(*),job_id,state_json FROM harness_manager_notices WHERE subject_id=?1 AND json_extract(state_json,'$.lead_lost')=1",
+                [&subject], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            ).unwrap();
+            assert_eq!(count, 1);
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(payload["epic_id"], json!(epic));
+            assert_eq!(payload["lead_session_id"], json!(lead.id));
+            assert_eq!(payload["cause"], format!("{status:?}").to_lowercase());
+            let job = Uuid::parse_str(&job).unwrap();
+            assert_eq!(store.manager_watch_delivery_state(job).unwrap(), Some(true));
+            store
+                .manager_inbox(config.manager_session_id, &Default::default())
+                .unwrap();
+            store.manager_v2_reconcile_notices(&config).unwrap();
+            assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 0);
+            // Failure then archival is still the same loss, even after retrieval.
+            store
+                .update_session_status(lead.id, SessionStatus::Archived)
+                .unwrap();
+            store.clear_lead_session_if_matches(lead.id).unwrap();
+            store.manager_v2_reconcile_notices(&config).unwrap();
+            let count: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_manager_notices WHERE subject_id=?1
+                       AND json_extract(state_json,'$.lead_lost')=1",
+                    [&subject],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
     fn policy() -> ManagerPolicyV2 {
         ManagerPolicyV2 {
             capabilities: vec![ManagerCapabilityV2::WorkPlan],
@@ -4745,6 +5211,87 @@ mod tests {
         );
     }
 
+    /// #3154: crossing the OpenRouter warn line sends ONE manager notice per
+    /// arming, however often the pass runs; the stop line is its own notice;
+    /// re-arming the cap is a new announcement.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn openrouter_spend_warn_notice_is_sent_once_per_arming() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, _) = fixture(&store, policy());
+        let armed = Utc::now() - chrono::Duration::hours(2);
+        let detail = "warn: spent $82.50 of $100.00 since arming, $17.50 left (warn 80%)";
+        assert!(
+            store
+                .record_openrouter_spend_notice(config.project_id, "warn", armed, detail)
+                .unwrap()
+                .is_some(),
+            "the first crossing notifies the manager"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                store
+                    .record_openrouter_spend_notice(config.project_id, "warn", armed, detail)
+                    .unwrap(),
+                None,
+                "the pass runs again: no second notice"
+            );
+        }
+        // The stop line is a separate, stronger notice.
+        assert!(
+            store
+                .record_openrouter_spend_notice(
+                    config.project_id,
+                    "reached",
+                    armed,
+                    "reached: spent $100.10 of $100.00 since arming"
+                )
+                .unwrap()
+                .is_some()
+        );
+        // An unknown line is refused without a notice.
+        assert_eq!(
+            store
+                .record_openrouter_spend_notice(config.project_id, "bogus", armed, detail)
+                .unwrap(),
+            None
+        );
+        let manager = config.current_session_id.unwrap();
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, manager, true, 32, None)
+            .unwrap();
+        let warn: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.subject_id == "openrouter_spend:warn")
+            .collect();
+        assert_eq!(warn.len(), 1, "{notices:?}");
+        assert_eq!(warn[0].state["record_kind"], "openrouter_spend");
+        assert!(
+            warn[0].state["detail"]
+                .as_str()
+                .is_some_and(|text| text.contains("$82.50") && text.contains("warn line")),
+            "{}",
+            warn[0].state
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.subject_id == "openrouter_spend:reached")
+        );
+        // Re-arming (a new baseline time) is a new announcement.
+        assert!(
+            store
+                .record_openrouter_spend_notice(
+                    config.project_id,
+                    "warn",
+                    armed + chrono::Duration::hours(1),
+                    detail
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
     fn provider_contract_degraded_notice_is_one_per_episode_and_names_the_reason() {
@@ -5112,6 +5659,7 @@ mod tests {
 
     fn satellite_report(text: &str) -> rsi_common::satellite_dispatch::SatelliteReportV1 {
         rsi_common::satellite_dispatch::SatelliteReportV1 {
+            binaries_dir: None,
             report_id: Uuid::new_v4(),
             kind: rsi_common::satellite_dispatch::SatelliteReportKindV1::Result,
             text: text.into(),
@@ -5131,7 +5679,7 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
     #[test]
-    fn satellite_report_is_one_labelled_notice_that_wakes_the_manager_once() {
+    fn satellite_report_is_one_labelled_notice_queued_for_the_next_real_wake() {
         use super::super::satellite_reports::{ReportRecord, SATELLITE_REPORT_LABEL};
         let store = Store::open_in_memory().unwrap();
         let (config, _) = fixture(&store, policy());
@@ -5147,21 +5695,14 @@ mod tests {
         );
         assert_eq!(satellite_notice_count(&store), 1);
 
-        // One transport job, enabled, bound to the manager, whose wake text is
-        // the fixed notice line: the satellite's text never reaches the prompt.
+        // The notice stays bound to the manager, quiet until its digest deadline.
         let (job_id, _, _) = store.manager_action_watch_identity(&config);
         let job = store.get_scheduled_job(&job_id).unwrap().unwrap();
         assert!(job.enabled);
         assert_eq!(job.wake_session_id, Some(config.manager_session_id));
-        assert_eq!(
-            job.message.lines().nth(1),
-            Some(
-                format!(
-                    "- ledger_change subject=satellite_report version={peer}:{}",
-                    report.report_id
-                )
-                .as_str()
-            )
+        assert!(
+            job.message
+                .contains("ledger_change subject=satellite_report")
         );
         assert_eq!(job.message.lines().count(), 2);
 
@@ -5189,7 +5730,303 @@ mod tests {
         assert!(SATELLITE_REPORT_LABEL.contains("not an operator instruction"));
     }
 
-    /// #2871: an actionable notice (a satellite ENQUEUE) arriving while 40
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    fn informational_batch(store: &Store, config: &HarnessManagerConfigV1, lead: &Session) -> Uuid {
+        let (job, _, _) = store.manager_action_watch_identity(config);
+        for (subject, state) in [
+            (
+                "satellite_report",
+                json!({"record_kind":"satellite_report",
+                "report_kind":"RESULT","informational_only":true,
+                "digest_until_unix":Utc::now().timestamp() + 1800}),
+            ),
+            (
+                "satellite_report",
+                json!({"record_kind":"satellite_report",
+                "report_kind":"RESULT","informational_only":true}),
+            ),
+            (
+                "satellite_report",
+                json!({"record_kind":"satellite_report",
+                "report_kind":"ENQUEUE","informational_only":true,"auto_intake":true}),
+            ),
+            (
+                "satellite_intake:peer:report",
+                json!({"record_kind":"satellite_intake",
+                "state":"enqueued","informational_only":true,"needs_attention":false}),
+            ),
+            (
+                "issue_result_landed:1",
+                json!({"record_kind":"issue_result_landed"}),
+            ),
+        ] {
+            store
+                .insert_manager_notice(
+                    config,
+                    lead.parent_id.unwrap(),
+                    true,
+                    "ledger_change",
+                    subject,
+                    &Uuid::new_v4().to_string(),
+                    None,
+                    &state,
+                    true,
+                )
+                .unwrap();
+        }
+        job
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn informational_only_batch_arms_no_wake_3973() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, policy());
+        store
+            .manager_inbox(config.manager_session_id, &Default::default())
+            .unwrap();
+        let job = informational_batch(&store, &config, &lead);
+        assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 5);
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 0);
+        assert_eq!(store.manager_notice_first_wake_pending(job).unwrap(), None);
+        assert_eq!(
+            store.manager_watch_delivery_state(job).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            store.get_scheduled_job(&job).unwrap().unwrap().enabled,
+            true
+        );
+        // Restart/reconciliation preserves the armed timer without delivering early.
+        store.refresh_manager_notice_job(job).unwrap();
+        assert_eq!(
+            store.get_scheduled_job(&job).unwrap().unwrap().enabled,
+            true
+        );
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, config.current_session_id.unwrap(), true, 32, None)
+            .unwrap();
+        assert_eq!(notices.len(), 5);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    fn set_notice_clock(store: &Store, at: chrono::DateTime<Utc>) {
+        // Override only this test connection's two-argument strftime. Delegate
+        // formatting/parsing to real SQLite; immutable notice rows stay intact.
+        let sqlite = std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap());
+        let at = at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        store
+            .conn
+            .create_scalar_function(
+                "strftime",
+                2,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_INNOCUOUS,
+                move |context| {
+                    let format = context.get::<String>(0)?;
+                    let value = context.get::<String>(1)?;
+                    sqlite.lock().unwrap().query_row(
+                        "SELECT strftime(?1,?2)",
+                        params![format, if value == "now" { &at } else { &value }],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                },
+            )
+            .unwrap();
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn informational_digest_expires_and_delivers_the_whole_batch_once_3976() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, policy());
+        store
+            .manager_inbox(config.manager_session_id, &Default::default())
+            .unwrap();
+        let job = informational_batch(&store, &config, &lead);
+        assert_eq!(store.manager_notice_first_wake_pending(job).unwrap(), None);
+        // Expire the first RESULT, legacy RESULT, ENQUEUE and landed echo.
+        // Keep the intake state routine. No writer/reconciliation call is
+        // required for the enabled transport's delivery predicate to change.
+        let after_window = Utc::now() + chrono::Duration::seconds(MANAGER_NOTICE_DIGEST_SECS + 5);
+        set_notice_clock(&store, after_window);
+        let expired = after_window.timestamp() - 1;
+        assert!(store.get_scheduled_job(&job).unwrap().unwrap().enabled);
+        assert_eq!(store.manager_watch_delivery_state(job).unwrap(), Some(true));
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 4);
+        assert_eq!(
+            store.manager_notice_first_wake_pending(job).unwrap(),
+            Some(5)
+        );
+        // A fresh report joins this delivery; it cannot slide the old deadline.
+        store
+            .insert_manager_notice(
+                &config,
+                lead.parent_id.unwrap(),
+                true,
+                "ledger_change",
+                "satellite_report",
+                "later",
+                None,
+                &json!({"record_kind":"satellite_report",
+                "report_kind":"RESULT","informational_only":true,
+                "digest_until_unix":after_window.timestamp() + MANAGER_NOTICE_DIGEST_SECS}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store.manager_notice_first_wake_pending(job).unwrap(),
+            Some(6)
+        );
+        // Exceed the settlement's 16-row delivery tranche. The remainder
+        // must ride this wake's inbox read rather than cause more wakes.
+        for index in 0..20 {
+            store
+                .insert_manager_notice(
+                    &config,
+                    lead.parent_id.unwrap(),
+                    true,
+                    "ledger_change",
+                    "satellite_report",
+                    &format!("burst-{index}"),
+                    None,
+                    &json!({"record_kind":"satellite_report",
+                    "report_kind":"RESULT","informational_only":true,
+                    "digest_until_unix":expired}),
+                    true,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.manager_notice_first_wake_pending(job).unwrap(),
+            Some(26)
+        );
+        let (_, capture) = store.capture_watch_fire(job).unwrap().unwrap();
+        let delivered = Utc::now();
+        assert!(
+            store
+                .settle_watch_fire(&capture, job, Some(&delivered), Some(&delivered), true)
+                .unwrap()
+        );
+        assert_eq!(store.manager_notice_undelivered_count(job).unwrap(), 10);
+        assert_eq!(store.manager_notice_first_wake_pending(job).unwrap(), None);
+        store.refresh_manager_notice_job(job).unwrap();
+        assert_eq!(store.manager_notice_first_wake_pending(job).unwrap(), None);
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, config.current_session_id.unwrap(), true, 32, None)
+            .unwrap();
+        assert_eq!(notices.len(), 26);
+        assert_eq!(
+            store.manager_watch_delivery_state(job).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn legacy_digest_deadline_uses_original_recording_time_3976() {
+        let store = Store::open_in_memory().unwrap();
+        let (config, lead) = fixture(&store, policy());
+        store
+            .manager_inbox(config.manager_session_id, &Default::default())
+            .unwrap();
+        let job = informational_batch(&store, &config, &lead);
+        // Three legacy rows have no stamped deadline. Time passing, including
+        // a reconciliation, must use their original recording time.
+        set_notice_clock(
+            &store,
+            Utc::now() + chrono::Duration::seconds(MANAGER_NOTICE_DIGEST_SECS + 5),
+        );
+        assert_eq!(store.manager_notice_undelivered_wake_count(job).unwrap(), 4);
+        store.refresh_manager_notice_job(job).unwrap();
+        assert_eq!(
+            store.manager_notice_first_wake_pending(job).unwrap(),
+            Some(5)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn mixed_notice_batch_arms_wake_for_one_actionable_notice_3973() {
+        for (kind, subject, state) in [
+            (
+                "ledger_change",
+                "decision:1",
+                json!({"record_kind":"decision","state":"pending"}),
+            ),
+            (
+                "session_state",
+                "question",
+                json!({"question":{"questions":[{"question":"Choose"}]}}),
+            ),
+            ("session_state", "failure", json!({"status":"failed"})),
+            ("action_result", "refused", json!({"state":"refused"})),
+            ("message", "mail", json!({"informational_only":true})),
+            (
+                "ledger_change",
+                "satellite_report_failure",
+                json!({"record_kind":"satellite_report_failure",
+                "informational_only":true,"failure":"refused"}),
+            ),
+            (
+                "ledger_change",
+                "satellite_intake:peer:attention",
+                json!({"record_kind":"satellite_intake",
+                "informational_only":true,"needs_attention":true,"state":"needs_review"}),
+            ),
+            (
+                "ledger_change",
+                "satellite_report",
+                json!({"record_kind":"satellite_report",
+                "informational_only":true,"report_kind":"DEPLOY-READY"}),
+            ),
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let (config, lead) = fixture(&store, policy());
+            store
+                .manager_inbox(config.manager_session_id, &Default::default())
+                .unwrap();
+            let job = informational_batch(&store, &config, &lead);
+            store
+                .insert_manager_notice(
+                    &config,
+                    lead.parent_id.unwrap(),
+                    true,
+                    kind,
+                    subject,
+                    "actionable",
+                    None,
+                    &state,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                store.manager_notice_undelivered_wake_count(job).unwrap(),
+                1,
+                "{subject}"
+            );
+            assert_eq!(
+                store.manager_notice_first_wake_pending(job).unwrap(),
+                Some(6),
+                "{subject}"
+            );
+            assert_eq!(
+                store.manager_watch_delivery_state(job).unwrap(),
+                Some(true),
+                "{subject}"
+            );
+            let scheduled = store.get_scheduled_job(&job).unwrap().unwrap();
+            assert!(scheduled.enabled, "{subject}");
+            assert!(
+                scheduled
+                    .message
+                    .contains(&format!("{kind} subject={subject} version=actionable")),
+                "{subject}"
+            );
+        }
+    }
+
+    /// #2871: an actionable notice (a satellite DEPLOY-READY) arriving while 40
     /// older notices are delivered but unsettled wakes the idle recipient once,
     /// and one page of `AgentManagerInbox` returns it ahead of the backlog.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -5229,11 +6066,12 @@ mod tests {
             "routine backlog awaiting retrieval coalesces"
         );
 
-        let mut enqueue = satellite_report("ENQUEUE abc issue=#2 status=queued");
-        enqueue.kind = rsi_common::satellite_dispatch::SatelliteReportKindV1::Enqueue;
+        let mut deploy = satellite_report("DEPLOY-READY staged");
+        deploy.kind = rsi_common::satellite_dispatch::SatelliteReportKindV1::DeployReady;
+        deploy.binaries_dir = Some("/tmp/staged".into());
         assert_eq!(
             store
-                .record_satellite_report(peer, peer, &enqueue, Utc::now())
+                .record_satellite_report(peer, peer, &deploy, Utc::now())
                 .unwrap(),
             ReportRecord::Recorded
         );
@@ -5261,7 +6099,7 @@ mod tests {
         assert_eq!(first.len(), 5);
         assert!(more);
         assert_eq!(first[0].subject_id, "satellite_report");
-        assert_eq!(first[0].state["report_kind"], "ENQUEUE");
+        assert_eq!(first[0].state["report_kind"], "DEPLOY-READY");
         // Paging still reaches every routine notice exactly once.
         let mut seen: Vec<String> = first.iter().map(|n| n.subject_id.clone()).collect();
         let mut after = 0;
@@ -5292,6 +6130,7 @@ mod tests {
         for needle in [
             super::super::satellite_reports::SATELLITE_REPORT_NOTICE_SUBJECT,
             QA_ISSUE_SUBJECT_PREFIX,
+            super::super::intake_notice::OPERATOR_INTAKE_SUBJECT_PREFIX,
             super::super::worker_baton::WORKER_CONTEXT_CAP_SUBJECT_PREFIX,
         ] {
             assert!(
@@ -5299,6 +6138,59 @@ mod tests {
                 "{needle} missing from the predicate"
             );
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
+    #[test]
+    fn operator_intake_notice_is_recorded_once_per_issue_and_wakes_3787() {
+        use super::super::intake_notice::OperatorIntakeNotice;
+        let store = Store::open_in_memory().unwrap();
+        let (config, _) = fixture(&store, policy());
+        let notice = OperatorIntakeNotice {
+            issue_number: 41,
+            title: "the TUI will not start".into(),
+            priority: 1,
+            labels: vec!["operator-request".into()],
+        };
+        let first = store
+            .record_operator_intake_notice(config.project_id, &notice)
+            .unwrap();
+        assert!(first.is_some(), "a live seat is notified");
+        assert_eq!(
+            store
+                .record_operator_intake_notice(config.project_id, &notice)
+                .unwrap(),
+            None,
+            "a replay never mails twice"
+        );
+        let other = OperatorIntakeNotice {
+            issue_number: 42,
+            ..notice.clone()
+        };
+        assert!(
+            store
+                .record_operator_intake_notice(config.project_id, &other)
+                .unwrap()
+                .is_some(),
+            "a different Issue is its own notice"
+        );
+        let manager = config.current_session_id.unwrap();
+        let (notices, _) = store
+            .retrieve_manager_notices(&config, manager, true, 32, None)
+            .unwrap();
+        let mine = notices
+            .iter()
+            .filter(|n| n.subject_id.starts_with("operator_intake:"))
+            .collect::<Vec<_>>();
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().any(|n| n.subject_id == "operator_intake:41"));
+        // No manager seat, no notice.
+        assert_eq!(
+            store
+                .record_operator_intake_notice(Uuid::new_v4(), &notice)
+                .unwrap(),
+            None
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-03"))]
@@ -6878,6 +7770,7 @@ mod tests {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let operation = action_operation(
             &config,
@@ -6939,6 +7832,7 @@ mod tests {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let operation = action_operation(
             &config,
@@ -7061,6 +7955,7 @@ mod tests {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let operation = action_operation(
             &config,
@@ -7116,6 +8011,7 @@ mod tests {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let operation = action_operation(
             &config,
@@ -7708,6 +8604,7 @@ mod tests {
             operator_result: None,
             sandbox_source: None,
             cancelled_wakes: None,
+            outcome_detail: None,
         };
         let operation = action_operation(
             &config,

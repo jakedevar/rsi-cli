@@ -42,7 +42,7 @@ impl Store {
                     mi.model AS model,
                     substr(COALESCE(mi.created_at, s.created_at), 1, 10) AS day,
                     CASE WHEN mi.id = s.model_invocation_id THEN 1 ELSE 0 END AS chat_count,
-                    COALESCE(ci.cost_increment_usd, 0) AS cost_usd,
+                    COALESCE({linked_cost}, 0) AS cost_usd,
                     COALESCE(mi.input_tokens, 0) AS input_tokens,
                     COALESCE(mi.output_tokens, 0) AS output_tokens,
                     COALESCE(mi.cache_creation_tokens, 0) AS cache_creation_tokens,
@@ -63,7 +63,7 @@ impl Store {
                     s.model AS model,
                     substr(s.created_at, 1, 10) AS day,
                     1 AS chat_count,
-                    COALESCE(s.cost_usd, 0) AS cost_usd,
+                    COALESCE({legacy_cost}, 0) AS cost_usd,
                     COALESCE(s.total_prompt_tokens, s.total_input_tokens, 0) AS input_tokens,
                     COALESCE(s.total_output_tokens, 0) AS output_tokens,
                     COALESCE(s.total_cache_creation_tokens, 0) AS cache_creation_tokens,
@@ -80,7 +80,7 @@ impl Store {
                     model,
                     substr(created_at, 1, 10) AS day,
                     0 AS chat_count,
-                    COALESCE(estimated_cost_usd, 0) AS cost_usd,
+                    COALESCE({background_cost}, 0) AS cost_usd,
                     COALESCE(input_tokens, 0) AS input_tokens,
                     COALESCE(output_tokens, 0) AS output_tokens,
                     COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens,
@@ -102,7 +102,10 @@ impl Store {
             // The predecessor window sorts only the counted sessions `ids`
             // names (the same set `linked_session_rollup` joins), not every
             // admitted invocation of the store (#330, hub #2972).
-            cost_increment = crate::model_control::cost::cost_increment_for_ids_sql!()
+            cost_increment = crate::model_control::cost::cost_increment_for_ids_sql!(),
+            linked_cost = "CASE WHEN rsi_billing_mode(mi.provider,mi.model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))='subscription' THEN 0.0 ELSE ci.cost_increment_usd END",
+            legacy_cost = "CASE WHEN rsi_billing_mode(s.provider,s.model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))='subscription' THEN 0.0 ELSE s.cost_usd END",
+            background_cost = "CASE WHEN rsi_billing_mode(provider,model,(SELECT json_group_object(key,value) FROM daemon_settings WHERE key IN ('claude_billing_mode','codex_billing_mode','codexappserver_billing_mode','pioneer_billing_mode','antigravity_billing_mode','billing_login.claude','billing_login.codex')))='subscription' THEN 0.0 ELSE estimated_cost_usd END"
         );
         // One pass over the rollup (#333, hub #2998): the cost window under it
         // is the expensive part, and the three aggregates (totals, per model,
@@ -181,6 +184,19 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Dollar-accounting fixtures use API logins. Subscription coverage lives
+    // in provider_billing::tests and never treats CLI list prices as bills.
+    fn metered_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
+        store
+            .set_daemon_setting("codex_billing_mode", "metered_api")
+            .unwrap();
+        store
+    }
+
     use crate::model_control::{InvocationCompletion, ModelAdmissionRequest, registry};
     use chrono::TimeZone;
     use rsi_common::model_control::{
@@ -290,7 +306,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_aggregates_and_excludes_per_d4() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let project_a = Uuid::new_v4();
         let project_b = Uuid::new_v4();
         let day1 = chrono::Utc.with_ymd_and_hms(2026, 7, 1, 12, 0, 0).unwrap();
@@ -391,7 +407,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_empty_db_coalesces_to_zero() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let stats = store.usage_stats(None).unwrap();
         assert_eq!(stats.lifetime_chats, 0);
         assert_eq!(stats.total_cost_usd, 0.0);
@@ -403,7 +419,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_rolls_linked_ledger_rows_and_background_invocations() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
         let project_id = Uuid::new_v4();
 
         let mut session = base_session();
@@ -565,7 +581,7 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     #[test]
     fn usage_stats_attributes_linked_session_tokens_to_invocation_model() {
-        let store = Store::open_in_memory().unwrap();
+        let store = metered_store();
 
         let mut session = base_session();
         session.model = Some("session-model".to_string());
@@ -726,7 +742,7 @@ mod tests {
         let project = Uuid::new_v4();
         let project_text = project.to_string();
         let measure = |other_rows: usize| {
-            let mut store = Store::open_in_memory().unwrap();
+            let mut store = metered_store();
             let other = Uuid::new_v4();
             seed_cumulative_session(&store, project, "p1", 9, SessionStatus::Completed);
             seed_cumulative_session(&store, project, "p2", 4, SessionStatus::Completed);
@@ -785,6 +801,9 @@ mod tests {
     /// tokens, 3 output tokens and 5 ms of wall time per row.
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
     fn seed_priced_session(store: &Store, project: Uuid, model: &str, day: &str, rows: usize) {
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
         let mut session = base_session();
         session.project_id = Some(project);
         store.insert_session(&session).unwrap();
@@ -964,7 +983,7 @@ mod tests {
     fn usage_stats_evaluates_the_rollup_once_333() {
         use crate::sandbox::startup_restore_tests::vm_ops_during;
 
-        let mut store = Store::open_in_memory().unwrap();
+        let mut store = metered_store();
         let project = Uuid::new_v4();
         for session in 0..40 {
             seed_priced_session(&store, project, "model-a", "2026-10-14", 25 + session % 3);

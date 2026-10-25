@@ -7,6 +7,14 @@ export function defaultSocket() {
   return process.env.RSI_DAEMON_SOCKET || join(homedir(), '.rsi', 'daemon.sock');
 }
 
+/** The text the Rust side makes of a JSON-RPC error (src-tauri/src/daemon.rs parse_response): `daemon error <code>: <message>[ | next_action: <step>][ [<data.code>]]`. */
+export function daemonErrorText(error) {
+  const code = Number.isInteger(error?.code) ? error.code : 0;
+  const next = typeof error?.data?.next_action === 'string' && error.data.next_action.trim() ? ` | next_action: ${error.data.next_action.trim()}` : '';
+  const typed = typeof error?.data?.code === 'string' ? ` [${error.data.code}]` : '';
+  return `daemon error ${code}: ${error?.message ?? 'unknown error'}${next}${typed}`;
+}
+
 /** One JSON-RPC 2.0 call over the daemon socket (one line out, one line in), as daemon.rs does. */
 export function rpcCall(socketPath, method, params, timeoutMs = 20000) {
   return new Promise((resolve, reject) => {
@@ -21,7 +29,7 @@ export function rpcCall(socketPath, method, params, timeoutMs = 20000) {
       if (nl < 0) return;
       try {
         const res = JSON.parse(buf.slice(0, nl));
-        if (res.error) done(reject, new Error(`daemon error ${res.error.code}: ${res.error.message}`));
+        if (res.error) done(reject, new Error(daemonErrorText(res.error)));
         else done(resolve, res.result ?? null);
       } catch (e) { done(reject, new Error(`malformed daemon response: ${e.message}`)); }
     });

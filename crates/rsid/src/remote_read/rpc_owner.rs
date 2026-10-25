@@ -1,9 +1,11 @@
 //! Operator-local Remote read RPC dispatch. The public gateway remains closed;
 //! it must establish its own configured project scope before forwarding reads.
+use super::dashboard::{parse_dashboard, spawn_dashboard_read};
 use super::decision_targets::{parse_request, spawn_decision_targets_read};
 use super::manager_v2::{
     parse_conversation, parse_list, spawn_conversation_read, spawn_list_seats_read,
 };
+use super::providers::{parse_providers, spawn_providers_read, spend_cache};
 use super::{
     ReadError, RemoteCursorSigner, RemoteReadCompleted, RemoteReadLimiter, spawn_decisions_read,
     spawn_history_read, spawn_info_read, spawn_projects_read, spawn_selected_session_read,
@@ -54,6 +56,8 @@ pub fn is_operator_read_method(method: &str) -> bool {
             | "RemoteGetDecisionTargetsV1"
             | "RemoteListManagerSeatsV2"
             | "RemoteGetManagerConversationV2"
+            | "RemoteGetDashboardV2"
+            | "RemoteGetProvidersV2"
     )
 }
 
@@ -99,6 +103,37 @@ pub async fn send_operator_read<W: AsyncWrite + Unpin>(
             Ok(request) => {
                 settle(
                     spawn_list_seats_read(limiter, Arc::clone(manager.store()), request),
+                    id,
+                    writer,
+                )
+                .await
+            }
+            Err(error) => send_error(writer, id, error).await,
+        };
+    }
+    if rpc.method == rsi_common::remote_manager_v2::METHOD_DASHBOARD {
+        return match parse_dashboard(rpc) {
+            Ok(request) => {
+                settle(
+                    spawn_dashboard_read(limiter, Arc::clone(manager.store()), request),
+                    id,
+                    writer,
+                )
+                .await
+            }
+            Err(error) => send_error(writer, id, error).await,
+        };
+    }
+    if rpc.method == rsi_common::remote_manager_v2::METHOD_PROVIDERS {
+        return match parse_providers(rpc) {
+            Ok(request) => {
+                settle(
+                    spawn_providers_read(
+                        limiter,
+                        Arc::clone(manager.store()),
+                        spend_cache(),
+                        request,
+                    ),
                     id,
                     writer,
                 )

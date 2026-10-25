@@ -4,7 +4,7 @@
 // the DOM side is actions/sessionops-run.ts.
 import type { DesktopBinding } from '../keyengine.js';
 import type { ActionSpec, SliceSpec, UiSnapshot } from '../registry.js';
-import { type OpsSession, commitBlock, rotateBlock, testingBlock } from '../sessionops-model.js';
+import { LAND_TOOLTIP, type OpsSession, commitBlock, rotateBlock, testingBlock } from '../sessionops-model.js';
 
 export type SessionOpsActionId =
   | 'toggle-pin' | 'toggle-testing' | 'toggle-rotation' | 'cancel-retry'
@@ -27,13 +27,13 @@ export const SESSIONOPS_ACTIONS: readonly ActionSpec[] = [
   { id: 'cancel-retry', title: 'Cancel pending retry', group: 'session', contexts: ['session-row'], detail: 'Cancels the session’s pending automatic retry (↻N/M)' },
   { id: 'rotate-session', title: 'Rotate session context', group: 'session', menuBreak: true, contexts: ['session-row'], detail: 'Rotates into a fresh context, carrying a handoff forward' },
   { id: 'commit-push', title: 'Commit and push', group: 'session', contexts: ['session-row'], detail: 'Continues the open session with /ci_commit' },
-  { id: 'land-session', title: 'Land session branch…', group: 'session', contexts: ['session-row'], detail: 'First press shows the commit; press again within 30 s to queue it' },
+  { id: 'land-session', title: 'Land session branch…', group: 'session', contexts: ['session-row'], detail: LAND_TOOLTIP },
 ];
 
 type Rule = (s: UiSnapshot) => string | null;
 
 const NEED_TARGET = 'Open a session or move the cursor onto one first (j/k)';
-const NEED_OPEN = 'Open a session first (j/k, then Enter)';
+const NEED_OPEN = 'Open a session first: click one in the list (j/k, then Enter)';
 
 const target = (more?: (t: OpsSession, s: UiSnapshot) => string | null): Rule => (s) => {
   const t = s.ops?.target;

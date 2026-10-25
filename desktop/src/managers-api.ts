@@ -4,6 +4,7 @@ import { invoke } from './api.js';
 import type {
   BudgetSnapshot, FleetOverview, ManagerConfig, PortfolioNode, StatePage, StatePolicy, TreePage, Workspace,
 } from './managers-model.js';
+import type { DashboardWindow, GlobalDashboard } from './dashboard-model.js';
 
 type Json = Record<string, unknown>;
 
@@ -32,6 +33,8 @@ export const managersApi = {
   revokeGlobal: (expectedGrantVersion: number, idempotencyKey: string) =>
     invoke<Json>('global_manager_revoke', { expectedGrantVersion, idempotencyKey }),
   fleet: () => invoke<FleetOverview>('fleet_overview'),
+  /** `GetGlobalDashboard {window}` (#3366): the `gd` view's bounded snapshot. */
+  dashboard: (window: DashboardWindow) => invoke<GlobalDashboard>('global_dashboard', { window }),
   portfolioNodes: (includeRevoked: boolean) => invoke<{ nodes: PortfolioNode[] }>('portfolio_nodes_list', { includeRevoked }),
   portfolioNode: (nodeId: string) => invoke<PortfolioNode | null>('portfolio_node_get', { nodeId }),
   configurePortfolio: (request: Json, confirmCapReductions: boolean) =>

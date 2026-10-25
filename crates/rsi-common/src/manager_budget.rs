@@ -206,6 +206,88 @@ pub struct CreationCapRefusalV1 {
     pub window_start: Option<String>,
     /// The exact TUI path that raises this cap.
     pub raise_in: String,
+    /// #3416: the rolling window `used` counts over, in hours (sessions
+    /// only; a container cap is a lifetime count and carries `None`).
+    #[serde(default)]
+    pub window_hours: Option<u16>,
+    /// #3416: when the next creation leaves the window and a slot frees
+    /// (RFC3339), or `None` when nothing is counted in the window.
+    #[serde(default)]
+    pub next_free_at: Option<String>,
+}
+
+/// #206: the share of a creation cap at which a manager is warned (the
+/// `manager_creation_cap_near` health condition), in percent.
+pub const CREATION_CAP_WARN_PCT: i64 = 80;
+
+/// #206: one of a manager seat's own creation caps, counted and limited
+/// exactly as its `manager_v2_creation_limit` refusal counts it, with the
+/// raise path that refusal prints. Read-only: the overview and the health
+/// wake show it; admission alone enforces the cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreationCapUsageV1 {
+    /// `max_created_sessions` or `max_created_containers`.
+    pub cap_field: String,
+    pub used: i64,
+    pub limit: i64,
+    /// The exact path that raises this cap (the refusal's `raise_in`).
+    pub raise_in: String,
+    /// #3416: the rolling window `used` counts over, in hours (sessions
+    /// only).
+    #[serde(default)]
+    pub window_hours: Option<u16>,
+    /// #3416: when the next creation leaves the window (RFC3339).
+    #[serde(default)]
+    pub next_free_at: Option<String>,
+    /// #3416: every charged creation ever, shown beside the window count.
+    /// Informational: it is never compared with `limit`.
+    #[serde(default)]
+    pub lifetime_total: Option<i64>,
+}
+
+/// #3416: the one phrase every surface shows for a windowed creation cap,
+/// `N of M created in the last 24 h; next slot frees at <time>`.
+#[must_use]
+pub fn creation_window_summary(
+    used: i64,
+    limit: i64,
+    window_hours: u16,
+    next_free_at: Option<&str>,
+) -> String {
+    let base = format!("{used} of {limit} created in the last {window_hours} h");
+    match next_free_at {
+        Some(at) => {
+            let shown = chrono::DateTime::parse_from_rfc3339(at).map_or_else(
+                |_| at.to_string(),
+                |t| {
+                    t.with_timezone(&chrono::Utc)
+                        .format("%Y-%m-%d %H:%M UTC")
+                        .to_string()
+                },
+            );
+            format!("{base}; next slot frees at {shown}")
+        }
+        None => base,
+    }
+}
+
+impl CreationCapUsageV1 {
+    /// The windowed phrase, or `None` for a lifetime (container) cap.
+    #[must_use]
+    pub fn window_summary(&self) -> Option<String> {
+        Some(creation_window_summary(
+            self.used,
+            self.limit,
+            self.window_hours?,
+            self.next_free_at.as_deref(),
+        ))
+    }
+
+    /// True at or above [`CREATION_CAP_WARN_PCT`] of a nonzero limit. A zero
+    /// limit is the operator's explicit "no creations", not an approaching wall.
+    pub fn near_limit(&self) -> bool {
+        self.limit > 0 && self.used.saturating_mul(100) >= self.limit * CREATION_CAP_WARN_PCT
+    }
 }
 
 impl CreationCapRefusalV1 {
@@ -236,8 +318,14 @@ impl CreationCapRefusalV1 {
     /// fallback. Only the pushed fields (`max_created_sessions`,
     /// `max_active_sessions`) can be raised that way.
     pub fn hub_report_path(cap_field: &str, used: i64, limit: i64, operator_path: &str) -> String {
+        // #3416: the session cap is a per-window allowance that refills.
+        let per_window = if cap_field == "max_created_sessions" {
+            " in the last created_sessions_window_hours (it refills as creations leave the window)"
+        } else {
+            ""
+        };
         format!(
-            "report to the hub: AgentReportToHub kind=result naming {cap_field} used {used} of {limit}, so the hub PM can raise it with AgentPushSatelliteManagerPolicy; fallback: {operator_path}"
+            "report to the hub: AgentReportToHub kind=result naming {cap_field} used {used} of {limit}{per_window}, so the hub PM can raise it with AgentPushSatelliteManagerPolicy; fallback: {operator_path}"
         )
     }
 
@@ -247,10 +335,22 @@ impl CreationCapRefusalV1 {
         matches!(cap_field, "max_created_sessions" | "max_active_sessions")
     }
 
+    /// #3416: the windowed phrase (see [`creation_window_summary`]), or
+    /// `None` for a lifetime cap.
+    #[must_use]
+    pub fn window_summary(&self) -> Option<String> {
+        Some(creation_window_summary(
+            self.used,
+            self.limit,
+            self.window_hours?,
+            self.next_free_at.as_deref(),
+        ))
+    }
+
     /// The refusal message: `code: key=value ...`, `raise_in` quoted last.
     pub fn message(&self) -> String {
         format!(
-            "{}: node_kind={} node_id={} project_id={} cap_field={} used={} limit={} needed={} counted={} window_start={} raise_in=\"{}\"",
+            "{}: node_kind={} node_id={} project_id={} cap_field={} used={} limit={} needed={} counted={} window_start={}{} raise_in=\"{}\"",
             self.code,
             self.node_kind.as_str(),
             self.node_id,
@@ -261,6 +361,14 @@ impl CreationCapRefusalV1 {
             self.needed,
             self.counted,
             self.window_start.as_deref().unwrap_or("scope_start"),
+            self.window_hours
+                .map(|hours| {
+                    format!(
+                        " window_hours={hours} next_free_at={}",
+                        self.next_free_at.as_deref().unwrap_or("none")
+                    )
+                })
+                .unwrap_or_default(),
             self.raise_in,
         )
     }
@@ -298,6 +406,11 @@ impl CreationCapRefusalV1 {
             counted: int("counted")?,
             window_start: (window_start != "scope_start").then(|| window_start.to_string()),
             raise_in,
+            window_hours: map.get("window_hours").and_then(|v| v.parse().ok()),
+            next_free_at: map
+                .get("next_free_at")
+                .filter(|v| **v != "none")
+                .map(|v| (*v).to_string()),
         })
     }
 }
@@ -451,7 +564,7 @@ pub struct GlobalManagerBudgetV1 {
 /// creation counts restart on any operator edit of a portfolio grant; spend
 /// is not reset (historical spend of work the node still covers stays
 /// counted), and a raise changes only the limit.
-pub const BUDGET_RESETS_TEXT: &str = "no timed reset: a portfolio node counts created sessions and containers since its current grant began (any operator edit of that grant, a raise here included, starts a new count of creations); spend is NOT reset by an edit: it stays the spend of the work the node still covers, so a raise changes the limit only; a PM counts over its current scope; active sessions are live";
+pub const BUDGET_RESETS_TEXT: &str = "no timed reset of containers or spend, but created sessions refill: a node counts the sessions created in the last created_sessions_window_hours (default 24), the oldest creation leaves the window and frees a slot, and a seat rotation never resets it; created containers count since the node's current grant began (any operator edit of that grant, a raise here included, starts a new count of creations); spend is NOT reset by an edit: it stays the spend of the work the node still covers, so a raise changes the limit only; a PM counts over its current scope; active sessions are live";
 
 /// Mark, per cap field, the node with the lowest headroom along `chain`
 /// (ties go to the upper node: raising a lower one admits nothing).
@@ -545,7 +658,35 @@ mod tests {
                 node,
                 "max_created_sessions",
             ),
+            window_hours: None,
+            next_free_at: None,
         }
+    }
+
+    /// #3416: a windowed refusal names the window, the count and when a slot
+    /// frees, and an old message without them still parses.
+    #[test]
+    fn a_windowed_refusal_names_the_window_the_count_and_the_next_free_time() {
+        let mut detail = refusal();
+        detail.window_hours = Some(24);
+        detail.next_free_at = Some("2026-10-21T04:12:00.000000000Z".into());
+        let message = detail.message();
+        assert!(
+            message
+                .contains("window_hours=24 next_free_at=2026-10-21T04:12:00.000000000Z raise_in="),
+            "{message}"
+        );
+        assert_eq!(CreationCapRefusalV1::parse(&message), Some(detail.clone()));
+        assert_eq!(
+            detail.window_summary().as_deref(),
+            Some("388 of 388 created in the last 24 h; next slot frees at 2026-10-21 04:12 UTC")
+        );
+        detail.next_free_at = None;
+        assert!(detail.message().contains("next_free_at=none"));
+        assert_eq!(CreationCapRefusalV1::parse(&detail.message()), Some(detail));
+        // A lifetime (container) cap has no window phrase.
+        assert_eq!(refusal().window_summary(), None);
+        assert!(!refusal().message().contains("window_hours"));
     }
 
     #[test]

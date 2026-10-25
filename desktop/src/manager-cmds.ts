@@ -15,6 +15,7 @@ import {
 import { managersApi } from './managers-api.js';
 import { ask, chooseProject, openList, openTree, refreshWorkspaceIfOpen, seatCandidate } from './managers.js';
 import { state } from './state.js';
+import { loadView } from './view-load.js';
 
 type Json = Record<string, unknown>;
 
@@ -251,10 +252,18 @@ async function nodeCommand(arg: string | undefined): Promise<string | null> {
 
 // ---------- :manager restart ----------
 
-async function restartCommand(arg: string | undefined): Promise<string> {
+async function restartCommand(arg: string | undefined): Promise<string | null> {
   const cmd = parseRestart(arg);
   if (typeof cmd !== 'string') throw new Error(cmd.error);
-  const s = cmd === 'status' ? await managersApi.restartStatus() : cmd === 'now' ? await managersApi.restartForce() : await managersApi.restartCancel();
+  if (cmd === 'status') {
+    await loadView({
+      key: 'mgr-restart', title: 'Operator quiet-point restart', failed: 'Restart status unavailable',
+      read: () => managersApi.restartStatus(),
+      open: (status) => report(restartDescribe(status)),
+    });
+    return null;
+  }
+  const s = cmd === 'now' ? await managersApi.restartForce() : await managersApi.restartCancel();
   return restartDescribe(s);
 }
 

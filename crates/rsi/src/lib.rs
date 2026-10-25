@@ -7,15 +7,19 @@ pub mod client;
 pub mod clipboard;
 pub mod cold_storage;
 pub mod commands;
+#[cfg(test)]
+mod ctrl_c_tests;
 pub mod daemon_resources;
 pub mod draw_stats;
 pub mod editing_mode_prompt;
 pub mod efficiency_stats;
 pub mod event;
+pub mod external_reports; // #3789: `:external-reports` operator view.
 pub mod field_edit;
 pub mod file_utils;
 pub mod file_viewer;
 pub mod file_viewer_commands;
+pub mod form_text;
 pub mod git_gutter;
 pub mod input_bar;
 pub mod input_surface;
@@ -35,8 +39,10 @@ pub mod profiling;
 pub mod prompt_creator;
 pub mod prompt_creator_keys;
 pub mod prompt_processor;
+mod provider_billing_view;
 pub mod provider_credential_rows;
 pub mod provider_profile_view;
+pub mod report_issue; // #3789: `rsi report-issue`, upstream harness reports via gh.
 pub mod settings;
 pub mod settings_keys;
 pub mod settings_registry;

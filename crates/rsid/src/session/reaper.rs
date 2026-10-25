@@ -951,6 +951,55 @@ pub(super) fn scoped_startup_settlement_scan_proof_failure(
 
 type StartupAfterScanHook = Option<Box<dyn FnOnce()>>;
 
+/// A live process of this uid that the settlement orphan scan could neither
+/// prove nor signal: the kernel withheld its environment, so its RSI stamps
+/// are unread (#149, macOS platform and hardened binaries). Paths are what
+/// libproc reports, `None` when unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnprovenProcess {
+    pub(super) pid: u32,
+    pub(super) start_time_micros: u64,
+    pub(super) executable: Option<std::path::PathBuf>,
+    pub(super) working_directory: Option<std::path::PathBuf>,
+}
+
+/// What a settlement orphan reap did: the exact owners it killed, and the
+/// processes it left alone because it could not prove them (#149). Kill
+/// authority is unchanged: an unproven process is only reported.
+#[derive(Debug, Default)]
+pub(super) struct SettlementOrphanReap {
+    pub(super) reaped: usize,
+    pub(super) unproven: Vec<UnprovenProcess>,
+}
+
+/// Test seam (#149): the unproven processes a settlement reap whose
+/// candidates include the keyed Session reports in place of the real scan's,
+/// so a test drives the receipt without a withheld process (and no real
+/// process is touched: an injected process is never signalled).
+#[cfg(test)]
+static INJECTED_UNPROVEN_PROCESSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<Uuid, Vec<UnprovenProcess>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(super) fn inject_unproven_settlement_processes(
+    candidate_id: Uuid,
+    processes: Vec<UnprovenProcess>,
+) {
+    INJECTED_UNPROVEN_PROCESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(candidate_id, processes);
+}
+
+#[cfg(test)]
+fn take_injected_unproven_processes(candidate_ids: &[Uuid]) -> Option<Vec<UnprovenProcess>> {
+    let mut registry = INJECTED_UNPROVEN_PROCESSES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    candidate_ids.iter().find_map(|id| registry.remove(id))
+}
+
 #[cfg(test)]
 pub(super) struct StartupReaperChild {
     child: Option<std::process::Child>,
@@ -1734,15 +1783,35 @@ struct StartupOrphanIdentity {
 pub(super) fn reap_startup_settlement_orphans_checked(
     candidate_ids: &[Uuid],
 ) -> crate::error::Result<usize> {
+    reap_startup_settlement_orphans_reporting(candidate_ids).map(|reap| reap.reaped)
+}
+
+/// [`reap_startup_settlement_orphans_checked`] that also returns the processes
+/// the scan could not prove (#149). Only macOS reports any: there the kernel
+/// withholds the environment of platform and hardened binaries.
+pub(super) fn reap_startup_settlement_orphans_reporting(
+    candidate_ids: &[Uuid],
+) -> crate::error::Result<SettlementOrphanReap> {
     #[cfg(test)]
     if take_startup_settlement_fault(StartupSettlementFaultKind::Reap, candidate_ids) {
         return Err(crate::error::DaemonError::Process(
             "injected startup settlement orphan reap failure".into(),
         ));
     }
-    reap_startup_owned_orphans_checked(&StartupProcessOwnership::for_sessions(
-        candidate_ids.iter().copied().collect(),
-    ))
+    let ownership = StartupProcessOwnership::for_sessions(candidate_ids.iter().copied().collect());
+    #[cfg(target_os = "macos")]
+    let reap = orphans_macos::reap_owned_orphans(&ownership, None)?;
+    #[cfg(not(target_os = "macos"))]
+    let reap = SettlementOrphanReap {
+        reaped: reap_startup_owned_orphans_checked(&ownership)?,
+        unproven: Vec::new(),
+    };
+    #[cfg(test)]
+    let reap = match take_injected_unproven_processes(candidate_ids) {
+        Some(unproven) => SettlementOrphanReap { unproven, ..reap },
+        None => reap,
+    };
+    Ok(reap)
 }
 
 /// Compatibility seam for focused tests and the older session-only recovery
@@ -1948,7 +2017,8 @@ fn reap_startup_owned_orphans_at(
     #[cfg(target_os = "macos")]
     {
         let _ = proc_root;
-        return orphans_macos::reap_owned_orphans(ownership, after_scan_hook);
+        return orphans_macos::reap_owned_orphans(ownership, after_scan_hook)
+            .map(|reap| reap.reaped);
     }
     // No process inventory: refuse, so settlement keeps its durable fences.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2268,10 +2338,10 @@ fn shared_quarantine_holder_source(
             uid: context.uid,
         });
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(test)]
     if let Some(context) = trees
         .first()
-        .and_then(|tree| archive_cleanup_test_proc_for_tree(tree.root()))
+        .and_then(|tree| registered_holder_test_proc_for_tree(tree.root()))
     {
         return Ok(SharedQuarantineHolderSource::Proc {
             root: context.proc_root,
@@ -2646,8 +2716,8 @@ fn prove_quarantine_holders_within(
         );
         limits
     };
-    #[cfg(all(test, target_os = "linux"))]
-    if let Some(context) = archive_cleanup_test_proc_for_tree(tree.root()) {
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if let Some(context) = registered_holder_test_proc_for_tree(tree.root()) {
         return prove_quarantine_has_no_untrusted_same_uid_holders_at(
             &context.proc_root,
             context.uid,
@@ -2942,18 +3012,20 @@ fn archive_cleanup_test_proc_for_session(candidate_ids: &[Uuid]) -> Option<PathB
 // `/proc` belongs to the host: one unoptimized pass over a busy host takes
 // seconds and the proof needs two inside its 10 s deadline, so the proof
 // failed closed (#2090). A fixture registers its synthetic holder inventory
-// for every quarantine under its directory, whatever thread proves it.
-#[cfg(all(test, target_os = "linux"))]
+// for every quarantine under its directory, whatever thread proves it. macOS
+// needs the same seam (#220): without it the proof reads the host's libproc
+// inventory, so a fixture's synthetic holder is invisible to the RPC path.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 static FIXTURE_HOLDER_TEST_PROCS: std::sync::Mutex<
     Vec<(PathBuf, QuarantineHolderTestProcContext)>,
 > = std::sync::Mutex::new(Vec::new());
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) struct FixtureHolderTestProcGuard {
     fixture_root: PathBuf,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl Drop for FixtureHolderTestProcGuard {
     fn drop(&mut self) {
         FIXTURE_HOLDER_TEST_PROCS
@@ -2963,7 +3035,7 @@ impl Drop for FixtureHolderTestProcGuard {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn register_fixture_holder_test_proc(
     fixture_root: &Path,
     holder: &SyntheticQuarantineHolderProc,
@@ -2987,15 +3059,34 @@ pub(crate) fn register_fixture_holder_test_proc(
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-fn archive_cleanup_test_proc_for_tree(root: &Path) -> Option<QuarantineHolderTestProcContext> {
-    if let Some(context) = FIXTURE_HOLDER_TEST_PROCS
+/// The synthetic holder inventory a settlement fixture registered for `root`.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn fixture_holder_test_proc_for_tree(root: &Path) -> Option<QuarantineHolderTestProcContext> {
+    FIXTURE_HOLDER_TEST_PROCS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .find(|(fixture_root, _)| root.starts_with(fixture_root))
         .map(|(_, context)| context.clone())
+}
+
+/// The synthetic holder inventory a test registered for `root`: a settlement
+/// fixture's (Linux and macOS) or, on Linux, an RPC archive fixture's.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+fn registered_holder_test_proc_for_tree(root: &Path) -> Option<QuarantineHolderTestProcContext> {
+    #[cfg(target_os = "linux")]
     {
+        archive_cleanup_test_proc_for_tree(root)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        fixture_holder_test_proc_for_tree(root)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn archive_cleanup_test_proc_for_tree(root: &Path) -> Option<QuarantineHolderTestProcContext> {
+    if let Some(context) = fixture_holder_test_proc_for_tree(root) {
         return Some(context);
     }
     ARCHIVE_CLEANUP_TEST_PROCS

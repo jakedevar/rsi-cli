@@ -153,6 +153,7 @@
 <tr><td></td><td><code>:project-new [arg]</code></td><td>Create project</td><td>Creates a project: <code>:project-new &lt;name&gt; [path]</code>, or opens the form.</td></tr>
 <tr><td></td><td><code>:project-edit [arg]</code></td><td>Edit project</td><td>Edits the named or current project.</td></tr>
 <tr><td></td><td><code>:project-delete &lt;arg&gt;</code></td><td>Delete project</td><td>Deletes the named project; the name argument is required.</td></tr>
+<tr><td></td><td><code>:intake &lt;arg&gt;</code></td><td>Operator intake</td><td>Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager.</td></tr>
 <tr><td></td><td><code>:card [arg]</code></td><td>Edit entity card</td><td>Opens the entity card editor for the current project or the named entity.</td></tr>
 <tr><td><code>&lt;Space&gt;C</code></td><td></td><td>Change session project</td><td>Moves the selected session to another project.</td></tr>
 </tbody>
@@ -171,12 +172,13 @@
 <tr><td></td><td><code>:manager inbox</code></td><td>Open manager inbox</td><td>Opens the harness manager inbox of lead requests and replies.</td></tr>
 <tr><td></td><td><code>:manager inspect</code></td><td>Open manager inspect</td><td>Opens the harness manager inspect view (workers, work, requests, topology and events).</td></tr>
 <tr><td><code>gL</code></td><td><code>:lead</code> <code>:setlead</code></td><td>Set Epic lead</td><td>Sets the focused leaf session as the lead of its parent Epic.</td></tr>
-<tr><td></td><td><code>:manager</code></td><td>Open harness manager</td><td>Opens the harness manager overlay.</td></tr>
+<tr><td></td><td><code>:manager</code></td><td>Open harness manager</td><td>Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor.</td></tr>
 <tr><td></td><td><code>:manager appoint</code></td><td>Appoint harness manager</td><td>Appoints the selected session as the harness manager.</td></tr>
 <tr><td></td><td><code>:manager scope</code></td><td>Edit manager scope</td><td>Edits the harness manager's scope.</td></tr>
 <tr><td></td><td><code>:manager clear</code></td><td>Clear manager scope</td><td>Clears the harness manager's scope.</td></tr>
 <tr><td></td><td><code>:fleet</code></td><td>Open fleet workspace</td><td>Shows active agents and usage rates across all projects.</td></tr>
 <tr><td><code>gm</code></td><td><code>:global-manager</code> <code>:gm</code> <code>:manager workspace</code></td><td>Open global manager workspace</td><td>Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session.</td></tr>
+<tr><td><code>gd</code></td><td><code>:dashboard</code> <code>:gd</code></td><td>Open global dashboard</td><td>Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project.</td></tr>
 <tr><td></td><td><code>:manager global [arg]</code></td><td>Show global manager grant</td><td>Shows the active global manager grant; <code>:manager global set &lt;active|sessions|containers|spend|groups&gt; &lt;value&gt;</code> changes one per-project cap; <code>:manager global add-project &lt;names...&gt;</code> adds projects to the grant; <code>:manager global configure &lt;JSON&gt;</code> sends a full typed grant request.</td></tr>
 <tr><td></td><td><code>:manager global appoint [arg]</code></td><td>Appoint global manager</td><td>Appoints the focused session as the global manager over the named projects (comma-separated; default: every project).</td></tr>
 <tr><td></td><td><code>:manager global revoke</code></td><td>Revoke global manager</td><td>Revokes the active global manager grant; the seat keeps its session but loses its authority.</td></tr>
@@ -268,6 +270,7 @@
 <tr><td><code>X</code></td><td></td><td>INTERRUPT NOW</td><td>Press twice within five seconds to cancel the active turn and mark it HARD.</td></tr>
 <tr><td><code>&lt;Space&gt;hs</code></td><td><code>:pause soft</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
 <tr><td><code>&lt;Space&gt;hc</code></td><td><code>:pause clear</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm.</td></tr>
+<tr><td><code>&lt;Space&gt;hu</code></td><td><code>:provider-clear-hold</code></td><td>Clear provider usage hold</td><td>After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits.</td></tr>
 <tr><td><code>&lt;Space&gt;c</code></td><td><code>:continue [arg]</code> <code>:cont [arg]</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>P</code></td><td></td><td>Pin or unpin selected session</td><td>Pins or unpins the selected session at the top of the list.</td></tr>
 <tr><td><code>&lt;Space&gt;a</code></td><td><code>:archive</code> <code>:arc</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
@@ -320,6 +323,7 @@
 <tr><td><code>&lt;Space&gt;i</code></td><td><code>:issues</code></td><td>Open or focus Issues workspace</td><td>Opens the Issues workspace pane for the current project, or focuses it if already open.</td></tr>
 <tr><td></td><td><code>:issue [arg]</code></td><td>Open an issue by number</td><td>Opens the Issues workspace on the issue with the given number (<code>:issue 2377</code> or <code>:issue #2377</code>), including closed and archived issues; without a number it opens the go-to-number prompt.</td></tr>
 <tr><td></td><td><code>:cold-archive [arg]</code></td><td>Cold-storage archive</td><td><code>:cold-archive</code> shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); <code>:cold-archive run</code> starts a stage pass (copy and verify, delete nothing), <code>move</code> also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, <code>verify</code> re-reads every archived chunk and <code>compact</code> schedules the one-time database compaction for the next supervised restart.</td></tr>
+<tr><td></td><td><code>:external-reports [arg]</code></td><td>External reports</td><td><code>:external-reports</code> shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; <code>:external-reports sync</code> runs one import pass now with the hub's own gh login; <code>:external-reports filter</code> filters the focused Issues pane to the <code>external-report</code> label. Imported reports are untrusted P4 Issues until triage promotes them.</td></tr>
 <tr><td></td><td><code>:diagnostics</code> <code>:diag</code></td><td>Open diagnostics</td><td>Opens the diagnostics overlay.</td></tr>
 <tr><td><code>&lt;Space&gt;v</code></td><td><code>:graph</code></td><td>Open graph review</td><td>Opens the visual workflow graph review editor.</td></tr>
 <tr><td></td><td><code>:topology-resolve [arg]</code></td><td>Resolve preserved topology work</td><td>Inspects, accepts, retries or discards preserved work on a blocked durable topology execution: <code>:topology-resolve [&lt;execution_id&gt;] inspect|accept|retry|discard [&lt;commit&gt;]</code> (the id may be omitted when exactly one is blocked; discard needs the full preserved commit).</td></tr>
@@ -392,9 +396,9 @@
 <table>
 <thead><tr><th>Keys</th><th>Command</th><th>Action</th><th>What it does</th></tr></thead>
 <tbody>
-<tr><td>Settings: <code>h</code> <code>Left</code></td><td></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail.</td></tr>
-<tr><td>Settings: <code>l</code> <code>Right</code></td><td></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items.</td></tr>
-<tr><td>Settings: <code>Space</code></td><td></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, or activates the selected settings row.</td></tr>
+<tr><td>Settings: <code>h</code> <code>Left</code></td><td></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row.</td></tr>
+<tr><td>Settings: <code>l</code> <code>Right</code></td><td></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w.</td></tr>
+<tr><td>Settings: <code>Space</code></td><td></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row.</td></tr>
 <tr><td>Settings: <code>a</code></td><td></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
 <tr><td>Settings: <code>d</code></td><td></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td>Settings: <code>e</code></td><td></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
@@ -548,13 +552,16 @@
 </tbody>
 </table>
 <h4>Cloud Spend</h4>
-<p>Daily cap and stop line for remote (cloud) gate spend.</p>
+<p>Spend ceilings: the remote (cloud) gate daily cap and stop line, and the OpenRouter account ceiling.</p>
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
 <tr><td>Cloud spend</td><td>Remote-gate spend estimate for today (UTC) and in total, with the last run, against the caps below. Read from the spend ledger (~/.rsi/cloud/spend.md). The full per-run and per-day view is the GetCloudSpend RPC.</td><td>read-only</td><td>daemon (cloud spend)</td><td>when applied · no restart</td></tr>
-<tr><td>Cloud spend stop line (USD)</td><td>Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; scripts/cloud-spend.py reads it from the caps file the daemon writes.</td><td>choice</td><td>daemon field <code>cloud_spend_stop_line_usd</code></td><td>when applied · no restart</td></tr>
+<tr><td>Cloud spend stop line (USD)</td><td>Cumulative remote-gate spend at which a new remote run is refused. Whole dollars. Replaces the stop line in the spend ledger header; rsi-cloud spend reads it from the caps file the daemon writes.</td><td>choice</td><td>daemon field <code>cloud_spend_stop_line_usd</code></td><td>when applied · no restart</td></tr>
 <tr><td>Cloud spend daily cap (USD)</td><td>Remote-gate spend per UTC day at which a new remote run is refused. Whole dollars. The AWS Budget rsi-cloud-us-west-1-daily ($15) stays the external backstop.</td><td>choice</td><td>daemon field <code>cloud_spend_daily_cap_usd</code></td><td>when applied · no restart</td></tr>
+<tr><td>OpenRouter spend ceiling</td><td>The armed OpenRouter ceiling: spent since arming, what is left and the state (off, ok, warn, reached, probe_stale). Spend is the OpenRouter account usage the daemon probes (at most once a minute) plus the cost of the calls settled since, minus the usage recorded when the cap was armed. The agent read is spend_cap on the openrouter entry of AgentGetProviderStatus.</td><td>read-only</td><td>daemon (openrouter spend)</td><td>when applied · no restart</td></tr>
+<tr><td>OpenRouter spend cap (USD)</td><td>USD of OpenRouter spend, counted from the moment this is armed, at which the daemon stops OpenRouter-billed work. 0 (the default) is off. Enter opens a text editor. Arming (0 to a positive amount) takes a fresh probe of the OpenRouter account usage and records it as the baseline; the stop line is baseline + cap, and a failed probe refuses to arm. Changing an armed cap keeps its baseline; 0 turns it off and forgets the baseline. While armed, OpenRouter-billed launches (the OpenRouter provider on any route, and Harness sessions on the OpenRouter endpoint) are refused with openrouter_spend_cap_reached once spend plus a small per-launch reserve reaches the stop line, and also refused (openrouter_spend_cap_probe_stale) whenever the account usage could not be probed for five minutes; a running Harness session ends at its next model call past the line.</td><td>action</td><td>daemon field <code>openrouter_spend_cap_usd</code></td><td>when activated</td></tr>
+<tr><td>OpenRouter spend warn line (%)</td><td>Percent of the OpenRouter cap at which the manager gets one notice per arming.</td><td>choice</td><td>daemon field <code>openrouter_spend_warn_pct</code></td><td>when applied · no restart</td></tr>
 </tbody>
 </table>
 <h3>AGENT AUTOMATION — What does the daemon do on its own when agents fail?</h3>
@@ -579,8 +586,9 @@
 <tr><td>Context rotation threshold (Claude Code)</td><td>Claude Code rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_claude_pct</code></td><td>when applied · no restart</td></tr>
 <tr><td>Context rotation threshold (Codex)</td><td>Codex, Pioneer and Codex App Server rotation threshold when no global override is set. Default uses the built-in 65%; choose 1–99%.</td><td>choice</td><td>daemon field <code>context_rotation_codex_pct</code></td><td>when applied · no restart</td></tr>
 <tr><td>Coordinator context cap (0 off, 1-100 = % of window)</td><td>Live context at which a manager seat, area manager, Epic lead or global manager is rotated with a daemon-written handoff. Read or set a provider or model override with :context-cap &lt;Provider[/model]&gt; [pct|tokens|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. An unknown window disables percentage caps. Needs context rotation on.</td><td>choice</td><td>daemon field <code>coordinator_context_cap_tokens</code></td><td>when applied · no restart</td></tr>
+<tr><td>Manager wake-turn cap (per hour, 0 off)</td><td>Wake-driven turns a manager seat may start per rolling hour before the daemon coalesces its routine notices (a lead's state, work rows, non-blocked intents) into the next free slot (0 off, else 1-60, default 0). A manager cannot refuse a wake, so a turn-rate cap in prose does not hold. With a cap set, a seat that has used it keeps routine-only deliveries armed and reads them in one coalesced turn when a turn ages out of the hour. Mail, operator answers, failures, gates, merge-queue and satellite outcomes and safety anomalies are never held; one delivered past a spent cap is counted as a bypass. The seat's turns used, coalesced wakes and bypasses show in its coordinator budget (authority catalog and the global manager seat views). It applies to the next delivery; a self-armed wake (a job end or timer the seat set) is not held.</td><td>choice</td><td>daemon field <code>manager_max_turns_per_hour</code></td><td>when applied · no restart</td></tr>
 <tr><td>Worker context cap (0 off, 1-100 = % of window)</td><td>Live context at which a worker with a launching manager or Epic lead is told to pass the baton (commit, append a handoff to its Issue, end its turn) and its launcher gets a worker_context_cap notice. Read or set a provider or model override with :worker-context-cap &lt;Provider[/model]&gt; [pct|tokens|default]. Default 60 (60% of the session's known context window). Values 1-100 are a percentage of the window, 32000-2000000 are tokens, 0 turns it off. Managers may propose it within operator bounds.</td><td>choice</td><td>daemon field <code>worker_context_cap_tokens</code></td><td>when applied · no restart</td></tr>
-<tr><td>Provider lifecycle hooks</td><td>Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart. StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, when it fits the provider's 10,000-character hook-context cap; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks.</td><td>choice</td><td>daemon field <code>provider_lifecycle_hooks</code></td><td>next spawn</td></tr>
+<tr><td>Provider lifecycle hooks</td><td>Lifecycle hooks a new Claude or Codex session installs beyond the custody and mail hooks: none (default), or any set of StopFailure, PreCompact and SessionStart. StopFailure (Claude) records an API error that ended a turn as a typed provider-error row; PreCompact (Claude and Codex) records that the provider is about to compact the context, so the baton/handoff logic can act before it does. SessionStart (Claude and Codex) delivers the session's RSI preamble as hook context instead of the start of the first prompt, within the provider's 10,000-character cap per hook. Claude splits long preambles at startup part boundaries into labelled chunks with one handler each; an indivisible part that cannot fit stays in the prompt. Delivery is recorded after every chunk is claimed; a preamble the hook did not deliver goes back in the next turn's prompt. Each hook runs RSI's own rsi-rpc hook command through the same per-session --settings / -c hooks.* path as the custody and mail hooks (Codex trusts it by key and hash, checked by the contract canary). A hook that fails to run is skipped: it never blocks or ends a session. none installs exactly the custody and mail hooks.</td><td>choice</td><td>daemon field <code>provider_lifecycle_hooks</code></td><td>next spawn</td></tr>
 </tbody>
 </table>
 <h4>Stall Detection</h4>
@@ -625,6 +633,7 @@
 <tr><td>Follow agent-created projects</td><td>Switches to the new project's tab when an agent creates a project (AgentCreateProject). On (default): the TUI jumps to the tab of a project an agent just created and offers, in one key, to add it to the creating global manager's grant. Off: the project still appears in the tab bar and the grant offer still shows, but the view stays where it is.</td><td>toggle</td><td>daemon field <code>follow_agent_created_projects</code></td><td>when applied · no restart</td></tr>
 <tr><td>Health alert: hub disk used (%)</td><td>Hub root filesystem use at or above which a manager's armed health_anomaly wake fires (0 off, else 50-99 %, default 90). A manager (project manager or portfolio seat) arms one <code>health_anomaly</code> wake instead of an hourly check-in turn. The daemon evaluates it every minute with no model call and resumes the manager once, naming each condition, when one holds: this one, a PM seat stuck behind a refused succession or over its rotation threshold, blocked or overrun topology work, a hot CPU, a satellite below its disk floor, a provider fault, or a red rolling QA no Issue tracks. Takes effect at the next evaluation.</td><td>choice</td><td>daemon field <code>health_disk_used_pct</code></td><td>when applied · no restart</td></tr>
 <tr><td>Health alert: CPU hot (C)</td><td>CPU temperature that, held for three minutes, fires a manager's armed health_anomaly wake (0 off, else 60-110 C, default 80). Read from the hub's hottest CPU sensor (Linux hwmon). A host with no readable sensor never fires. This is separate from the job thermal hold, which stops new jobs at a higher temperature. Takes effect at the next evaluation.</td><td>choice</td><td>daemon field <code>health_thermal_c</code></td><td>when applied · no restart</td></tr>
+<tr><td>Health alert: provider window used (%)</td><td>Warn when a provider plan window is projected to exhaust before reset, above this utilization (0 off, else 1-100, default 70). Uses the faster of average burn since the window opened and recent observed burn, up to 24 hours. The warning names the provider, window, projected exhaustion and reset. Takes effect at the next health evaluation.</td><td>choice</td><td>daemon field <code>health_provider_window_used_pct</code></td><td>when applied · no restart</td></tr>
 <tr><td>Health alert: work stuck (min)</td><td>Minutes a topology execution may stay blocked, a node attempt may run past its wall limit, or a red rolling QA may go untracked before health_anomaly fires (0 off, else 5-720, default 30). Counted from the moment the execution blocked, the attempt's execution deadline passed, or the red full-library QA run finished with no open Issue tracking it. Takes effect at the next evaluation.</td><td>choice</td><td>daemon field <code>health_stuck_minutes</code></td><td>when applied · no restart</td></tr>
 </tbody>
 </table>
@@ -653,6 +662,18 @@
 </tbody>
 </table>
 <h3>PROVIDERS &amp; SANDBOXES — Where and how do agents run?</h3>
+<h4>Provider Billing</h4>
+<p>Subscription plan usage and metered billing classification.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>Claude billing mode</td><td>Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.</td><td>choice</td><td>daemon field <code>claude_billing_mode</code></td><td>when applied · no restart</td></tr>
+<tr><td>Codex billing mode</td><td>Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.</td><td>choice</td><td>daemon field <code>codex_billing_mode</code></td><td>when applied · no restart</td></tr>
+<tr><td>CodexAppServer billing mode</td><td>Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.</td><td>choice</td><td>daemon field <code>codexappserver_billing_mode</code></td><td>when applied · no restart</td></tr>
+<tr><td>Pioneer billing mode</td><td>Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.</td><td>choice</td><td>daemon field <code>pioneer_billing_mode</code></td><td>when applied · no restart</td></tr>
+<tr><td>Antigravity billing mode</td><td>Auto detects CLI login billing; subscription usage contributes tokens and plan windows, never billed dollars. Override auto with subscription, metered_api or cloud. Auto treats Claude OAuth and Codex ChatGPT as subscription, API-key logins as metered, and Bedrock routes as cloud. Unprobed CLI logins conservatively use subscription. This changes historical reads and budget gates immediately; stored provider estimates stay intact. Cloud routes always retain their dollar caps.</td><td>choice</td><td>daemon field <code>antigravity_billing_mode</code></td><td>when applied · no restart</td></tr>
+</tbody>
+</table>
 <h4>Provider Isolation</h4>
 <p>How provider processes are sandboxed and isolated.</p>
 <table>
@@ -667,7 +688,7 @@
 <tr><td>Codex user config isolation</td><td>Isolation of the operator's Codex config for new Codex processes: off, user (ignore config.toml), rules (ignore execpolicy rules) or all. user passes --ignore-user-config so $CODEX_HOME/config.toml (model, profile, mcp_servers, hooks, approval_policy) is not loaded; rules passes --ignore-rules so user and project execpolicy .rules files are not loaded; all passes both. Auth still uses CODEX_HOME and every override RSI passes still applies. off adds no flag.</td><td>choice</td><td>daemon field <code>codex_config_isolation</code></td><td>next spawn</td></tr>
 <tr><td>Provider launch overrides</td><td>Extra Claude Code / Codex CLI launch options, from an allowlist (default none). Enter opens a JSON editor; the daemon checks each option and the editor shows its reason when it refuses. A JSON object of per-provider lists, e.g. {&quot;codex&quot;:[&quot;model_reasoning_summary=concise&quot;],&quot;claude&quot;:[&quot;--append-system-prompt=Be terse.&quot;]}. Claude takes the flags --append-system-prompt and --betas (passed as --flag=value; the fallback chain and spend cap have their own settings); Codex takes the config keys model_reasoning_summary, model_verbosity, service_tier, web_search, hide_agent_reasoning, show_raw_agent_reasoning and agents.enabled (passed as -c key=value). Anything that widens privilege (--dangerously-skip-permissions, --permission-mode, --add-dir, permissions.*, sandbox.*, hooks.*, approval_policy, sandbox_mode, mcp_servers.*) or that RSI sets itself (model, effort, resume, --fallback-model, --max-budget-usd, and the Codex subagent model and concurrency cap, which have their own settings) is refused with provider_launch_override_denied; any other key with provider_launch_override_unknown_key, as is a Claude flag the installed CLI does not know. Applied at the next CLI launch (each Claude turn) and recorded on the session as a launch-overrides row. Empty clears.</td><td>action</td><td>daemon field <code>provider_launch_overrides</code></td><td>when activated</td></tr>
 <tr><td>Claude fallback models</td><td>Ordered models a Claude session falls back to when its model is overloaded or unavailable, comma-separated, at most three. Default is empty (no fallback). Enter opens a text editor. Passed as --fallback-model=a,b to each new Claude CLI session (#2762); the CLI tries them in order per turn and retries the primary at the start of each turn. It does not apply to auth, billing or rate-limit errors, and is not passed to Bedrock-routed models or when the list names only the session's own model. A result that shows a chain member served part of the run adds a model_fallback_used row (from, to) to the session transcript. Running sessions keep the value they started with.</td><td>action</td><td>daemon field <code>claude_fallback_models</code></td><td>when activated</td></tr>
-<tr><td>Claude spend cap per session (USD)</td><td>Estimated spend, in USD, at which a new Claude CLI session stops. 0 (the default) is off. Enter opens a text editor. Passed as --max-budget-usd=&lt;n&gt; to each new Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Meant for API- or Bedrock-billed sessions; a subscription login is not billed per token, so leave it 0 there. Running sessions keep the value they started with.</td><td>action</td><td>daemon field <code>claude_max_budget_usd</code></td><td>when activated</td></tr>
+<tr><td>Claude spend cap per session (USD)</td><td>Metered usage, in USD, at which a new API- or cloud-billed Claude CLI session stops. 0 (the default) is off. Enter opens a text editor. Passed as --max-budget-usd=&lt;n&gt; to each new metered Claude CLI session (#2762), subagents included; the CLI's own cost estimate decides, and the run ends with the typed stop reason provider_budget_exceeded, which is never retried automatically. Subscription billing mode ignores this dollar cap and uses plan windows instead. API- and Bedrock-billed sessions keep the cap. Running sessions keep the value they started with.</td><td>action</td><td>daemon field <code>claude_max_budget_usd</code></td><td>when activated</td></tr>
 <tr><td>Vault: legacy env fallback</td><td>Allow provider keys from legacy environment variables when no vault credential exists.</td><td>toggle</td><td>daemon field <code>vault.env_compat</code></td><td>when applied · no restart</td></tr>
 <tr><td>Vault: check TTL</td><td>Cache provider key check results for this many seconds.</td><td>choice</td><td>daemon field <code>vault.check_ttl_secs</code></td><td>when applied · no restart</td></tr>
 </tbody>
@@ -723,6 +744,17 @@
 <tr><td>Harness iterations per turn</td><td>Agent-loop steps one Harness or OpenRouter turn may take before it wraps up (10-1000).</td><td>choice</td><td>daemon field <code>harness_max_iterations_per_turn</code></td><td>next spawn</td></tr>
 </tbody>
 </table>
+<h4>Benchmarks</h4>
+<p>Container hosts and limits for benchmark Harness runs.</p>
+<table>
+<thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
+<tbody>
+<tr><td>Benchmark docker hosts</td><td>Docker hosts a benchmark Harness session may run its shell tools on, comma-separated (for example ssh://arch-laptop). Default is empty: every container exec target is refused. Enter opens a text editor. A Harness session bound to a benchmark container runs shell, exec_command and write_stdin through docker -H &lt;host&gt; exec instead of on the daemon host (#3176). The daemon only accepts a host listed here, and also checks that the container is running, belongs to the registered compose project as service main and uses a pinned image digest. Checked at every launch, continuation and rotation, so a change applies to the next one.</td><td>action</td><td>daemon field <code>bench.docker_hosts</code></td><td>when activated</td></tr>
+<tr><td>Benchmark jobs enabled</td><td>Master switch of the bench job kind: when off (the default) no benchmark run is admitted. A run also needs the docker host allowlist, a launch grant and, for a paid run, an armed OpenRouter spend cap. The appointed manager or an Epic lead runs one pinned Terminal-Bench configuration with one bench job (#3181). The daemon checks this switch at submit and again when the job starts, so turning it off stops a queued run from starting. A run never spends beyond the budget it was admitted with.</td><td>toggle</td><td>daemon field <code>bench.enabled</code></td><td>next spawn</td></tr>
+<tr><td>Benchmark concurrency</td><td>Most Terminal-Bench trials a bench job runs at once on the laptop (1 to 8, default 4). The laptop needs 4 GB of free memory per trial plus 4 GB.</td><td>choice</td><td>daemon field <code>bench.max_concurrency</code></td><td>next spawn</td></tr>
+<tr><td>Benchmark laptop host</td><td>The ssh host that runs Harbor and the task containers for a bench job (default arch-laptop). A run config's docker host must be ssh:// plus this host. Enter opens a text editor. The job reaches the laptop over ssh with the hub's existing access, forwards the run's adapter socket to it, and copies the Harbor job directory back. Use a plain host name or alias, optionally user@host; options and URLs are refused.</td><td>action</td><td>daemon field <code>bench.laptop_host</code></td><td>when activated</td></tr>
+</tbody>
+</table>
 <h4>Claude Hooks</h4>
 <p>Claude Code hooks.</p>
 <table>
@@ -741,7 +773,7 @@
 </table>
 <h3>HOST &amp; BUILD — What do agents, builds and the merge queue use of this machine?</h3>
 <h4>Resource Limits</h4>
-<p>Memory and CPU limits for the daemon, workers and build slice.</p>
+<p>Memory and CPU limits. :manager tune opens this host's resource probe, profile and presets.</p>
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
@@ -753,7 +785,7 @@
 <tr><td>Worker slice MemoryMax (MiB)</td><td>Aggregate worker MemoryMax, initially 70% of host RAM; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_max_mib</code></td><td>after daemon restart</td></tr>
 <tr><td>Worker slice MemorySwapMax (MiB)</td><td>Aggregate worker swap ceiling; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_memory_swap_max_mib</code></td><td>after daemon restart</td></tr>
 <tr><td>Worker slice CPUWeight</td><td>Relative CPU weight of the aggregate worker slice; applies after restarting rsid.</td><td>choice</td><td>daemon field <code>worker_scope_cpu_weight</code></td><td>after daemon restart</td></tr>
-<tr><td>Worker CPU quota</td><td>CPU cap of each worker, as a percentage of one CPU (400 = four cores, default 400; 0 disables the cap). Each worker session runs in its own systemd scope; this sets that scope's CPUQuota, so one worker's builds, tests or runaway loops cannot take more than this share of the host. A halted worker's whole scope is killed, so no descendant outlives it. Applies to workers started after the change; running workers keep their quota. Linux only: other platforms have no scope and ignore it.</td><td>choice</td><td>daemon field <code>worker_cpu_quota_percent</code></td><td>when applied · no restart</td></tr>
+<tr><td>Worker CPU quota</td><td>CPU cap of each worker, as a percentage of one CPU (400 = four cores, default 400; 0 disables the cap). Each worker session runs in its own systemd scope; this sets that scope's CPUQuota, so one worker's builds, tests or runaway loops cannot take more than this share of the host. A halted worker's whole scope is killed, so no descendant outlives it. Applies to workers started after the change; running workers keep their quota. Linux only: other platforms have no scope and ignore it.</td><td>choice</td><td>daemon field <code>worker_cpu_quota_percent</code></td><td>next spawn</td></tr>
 <tr><td>Hub build CPU budget</td><td>Share of the host's CPUs that all cargo builds and tests RSI starts may use together, as a percentage of its logical CPUs (default 50, range 10-100). Every cargo build and test unit RSI starts (job units, scoped-test, merge-queue gates, the library QA run) runs in one systemd user slice, rsi-build.slice, whose CPUQuota is this share of the host's logical CPUs (50% of 32 threads is 16 cores) at a low CPUWeight, so concurrent jobs share one budget and the desktop stays responsive. Each job also sizes its own thread count from the budget. Applying a change rewrites the slice at once, including for units already running; read it back with systemctl --user show rsi-build.slice -p CPUQuotaPerSecUSec. Linux only: other platforms have no slice and report that no budget is available.</td><td>choice</td><td>daemon field <code>hub_build_cpu_percent</code></td><td>when applied · no restart</td></tr>
 <tr><td>Completed transcript cache (bytes)</td><td>Daemon RAM limit for completed transcript reads; 0 disables retention.</td><td>choice</td><td>daemon field <code>completed_transcript_cache_max_bytes</code></td><td>when applied · no restart</td></tr>
 </tbody>
@@ -764,6 +796,7 @@
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
 <tr><td>Host load limit for new launches</td><td>Hold a manager's new worker launches while the host's 1-minute load average is above this (0-1024, default 40; 0 never holds). Several projects' managers share one host, and their workers build and test, so a dozen started together push the load far past the core count. While the 1-minute load plus the launches admitted in the last minute is above this limit, the daemon holds a manager's create_session (Issue workers and topology nodes included): it stays queued, never refused, shows as held: host_load in AgentManagerGetAction and AgentGetDaemonInfo, and starts on its own when the load drops, oldest first. Operator sessions, a worker's own spawns, retries and lead recovery are never held. Platforms without a load average admit everything.</td><td>choice</td><td>daemon field <code>host_load_admission_threshold</code></td><td>when applied · no restart</td></tr>
+<tr><td>Worker build reserve (GiB)</td><td>Free disk reserved above the governor floor before a new worker launch (0-64, default 8; 0 disables reserve). Holds new manager workers and topology launches until free disk reaches the governor floor plus this target estimate. Build and test jobs use the governor floor alone. Lead recovery and worker-owned children remain exempt.</td><td>choice</td><td>daemon field <code>worker_build_reserve_gb</code></td><td>when applied · no restart</td></tr>
 <tr><td>CPU andon: CPU-minutes per tree</td><td>One agent process tree (a session's provider scope or a job unit) past this many CPU-minutes is a runaway (0 off, default 240). The daemon samples cgroup CPU time once a minute (Linux; unsupported elsewhere), records a runaway_process friction event and tells the owning manager the session and a suggested halt. It never stops the tree itself.</td><td>choice</td><td>daemon field <code>cpu_andon_cpu_minutes</code></td><td>when applied · no restart</td></tr>
 <tr><td>CPU andon: host load</td><td>At or above this 1-minute host load, one agent process tree using a dominant share of it is a runaway (0 off, default 40). Same andon as the CPU-minutes trigger: a runaway_process friction event and one manager notice per tree, never an automatic stop.</td><td>choice</td><td>daemon field <code>cpu_andon_host_load</code></td><td>when applied · no restart</td></tr>
 <tr><td>Build slots</td><td>Concurrent cargo build/test runs the resource governor admits (1-16); default 4.</td><td>choice</td><td>daemon field <code>governor_build_slots</code></td><td>when applied · no restart</td></tr>
@@ -782,7 +815,7 @@
 <tbody>
 <tr><td>Rolling merge queue</td><td>Daemon-owned queue that gates each enqueued source once and fast-forwards it onto rolling; off refuses new enqueues. When on, the current manager or an Epic lead enqueues an accepted source and ends the turn; the daemon runs the lander gate and wakes the owner once with the landed SHA, refusal or failing tests. Turning it off stops new enqueues and claims; entries already gating finish.</td><td>toggle</td><td>daemon field <code>rolling_queue_enabled</code></td><td>when applied · no restart</td></tr>
 <tr><td>Merge queue batch size</td><td>Maximum ready sources merged into one candidate and gated together (1-8).</td><td>choice</td><td>daemon field <code>rolling_queue_batch_size</code></td><td>when applied · no restart</td></tr>
-<tr><td>Merge queue gate timeout (min)</td><td>Wall-time budget of one merge-queue batch's gating, bisect included (30-1440 minutes, default 60). When a batch runs past it, the running lander is stopped and every member not yet settled is refused with queue_gate_timeout, which wakes its owner; the queue then moves on to the next batch.</td><td>choice</td><td>daemon field <code>rolling_queue_gate_timeout_mins</code></td><td>when applied · no restart</td></tr>
+<tr><td>Merge queue gate timeout (min)</td><td>Wall-time budget of one lander run of a merge-queue batch; each bisect step gets it too (30-1440 minutes, default 60). When a lander run goes past it, the running lander is stopped and every member still suspect is refused with queue_gate_timeout, which wakes its owner; members an earlier red run had already left out go back to the queue at their position; the queue then moves on.</td><td>choice</td><td>daemon field <code>rolling_queue_gate_timeout_mins</code></td><td>when applied · no restart</td></tr>
 <tr><td>Merge queue full-QA interval (min)</td><td>Minimum time between two starts of the merge queue's async full-library QA run (0-240 minutes, default 60). A landing gated on queue-derived filters or a bounded selection owes one full rsid and rsid-store library, bin and integration test run; landings published in between coalesce into the next run, which runs at a lower CPU weight than gates. 0 starts it as soon as the previous run ends.</td><td>choice</td><td>daemon field <code>rolling_queue_full_qa_interval_mins</code></td><td>when applied · no restart</td></tr>
 <tr><td>QA target size cap (GiB)</td><td>Size above which the shared full-library QA build target is emptied before the next run (0 off, else 10-500 GiB, default 30). Each QA run removes the build artifacts a newer run superseded, so the target stays near one commit's footprint (about 15-20 GiB). This cap is the backstop: a target still over it is emptied before the next run starts, which then rebuilds cold. It applies on the hub and on a satellite running a QA run for the hub, and takes effect at the next QA start.</td><td>choice</td><td>daemon field <code>qa_target_max_gib</code></td><td>when applied · no restart</td></tr>
 <tr><td>Job thermal hold (C)</td><td>CPU temperature at or above which no new build or test job starts (0 off, else 60-110 C, default 85). A job submitted while the host's hottest CPU sensor (Linux hwmon: k10temp Tctl/Tdie, coretemp) is at or above this temperature is held, shown as held_for_thermal, with no unit and no timeout clock; it starts, in submission order, once the host is below the ceiling. It applies on the hub and on a satellite alike. Running jobs are not stopped. Hosts without a readable CPU sensor, and other platforms, never hold. Takes effect at the next job start.</td><td>choice</td><td>daemon field <code>job_thermal_ceiling_c</code></td><td>when applied · no restart</td></tr>
@@ -795,7 +828,7 @@
 </tbody>
 </table>
 <h4>Sandbox Storage</h4>
-<p>Sandbox disk use, source-worktree settlement, archived sandbox purge and the stored tool-result cap.</p>
+<p>Sandbox disk use, source-worktree settlement, archived sandbox purge, the stored tool-result cap and pasted-image retention.</p>
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
@@ -807,6 +840,7 @@
 <tr><td>Disk pressure free space (GB)</td><td>Free-space threshold for automatic source settlement; default 100 GB (1024³ bytes per GB), capped at 25% of disk size. Machine local setting, from 1 to 4096 GB. Uses the smaller of this value and 25% of the filesystem: a 192 GB disk has a 48 GB default threshold. Settlement retains untouched roots once free space reaches the effective threshold. Pool trimming has separate controls.</td><td>choice</td><td>daemon field <code>disk_pressure_min_free_gb</code></td><td>when applied · no restart</td></tr>
 <tr><td>Purge archived sandboxes</td><td>Every 10 minutes deletes up to 32 archived sandboxes whose commits are on rolling, or preserved on origin after 24 h unlanded. <strong>Destructive.</strong></td><td>toggle</td><td>daemon field <code>archived_sandbox_purge_enabled</code></td><td>when applied · no restart</td></tr>
 <tr><td>Stored tool-result cap (KiB)</td><td>Largest body of a tool result kept in the database, in KiB (0 or 4-1024, default 32); a longer one keeps its first and last half around a marker that records its original size. Tool output such as raw cargo logs is most of the database and grows it about 2 GB a month. The cap applies to every provider as a tool result is stored: only the stored copy is cut, so the live session and the TUI still see the whole output. It applies to results stored after the change; rows already stored are never rewritten. A resumed Harness session replays the stored body, marker included. 0 stores every result whole.</td><td>choice</td><td>daemon field <code>tool_result_storage_cap_kib</code></td><td>when applied · no restart</td></tr>
+<tr><td>Keep referenced pasted images (days)</td><td>Days the daemon keeps a pasted image that a message or conversation named (0 keeps it forever, the default; else 7-3650). Applies to images pasted through the daemon (~/.rsi/paste/rsid). An image no message, conversation or enabled scheduled job ever named is removed 7 days after its last upload whatever this says. A named image is part of your conversation history, so it is removed only when this is above 0 and its last upload is older than that, and never while a queued message, a running session or an enabled scheduled job still names it. Read at each retention pass (daemon start, and after an upload at most hourly). <strong>Destructive.</strong></td><td>choice</td><td>daemon field <code>paste_retention_referenced_days</code></td><td>when applied · no restart</td></tr>
 </tbody>
 </table>
 <h4>Cold Storage</h4>
@@ -814,6 +848,9 @@
 <table>
 <thead><tr><th>Setting</th><th>What it does</th><th>Kind</th><th>Stored in</th><th>Applies</th></tr></thead>
 <tbody>
+<tr><td>Resolve errored sessions</td><td>Automatically soft-delete empty failures, resume infrastructure interruptions and archive final errors while retaining diagnosis and work.</td><td>toggle</td><td>daemon field <code>error_disposition_enabled</code></td><td>when applied · no restart</td></tr>
+<tr><td>Error grace (minutes)</td><td>Minimum terminal age before disposition (1-1440 minutes, default 15).</td><td>choice</td><td>daemon field <code>error_disposition_grace_minutes</code></td><td>when applied · no restart</td></tr>
+<tr><td>Error continuations per day</td><td>Maximum daemon continuations per session in 24 hours (0-10, default 3); drains hold continuations.</td><td>choice</td><td>daemon field <code>error_disposition_continuation_budget</code></td><td>when applied · no restart</td></tr>
 <tr><td>Cold-storage archive</td><td>Moves the bulky rows of old Archived and Deleted sessions into verified, compressed archive files and out of rsi.db (default on). A background pass runs at most every 6 hours at the lowest CPU and I/O priority, outside startup. It writes each cold session's tool rows to an append-only archive file under the archive directory, fsyncs it and reads it back against its checksums; only then, and only while a backup of rsi.db younger than 24 hours exists in ~/.rsi/backups (the pass takes one itself when none does), it deletes those rows from the live database and returns the freed space in small steps. Transcripts still open whole; :cold-restore puts a session's rows back. Shrinking the file once happens at the next supervised restart (:cold-archive compact asks for it). A weekly pass re-reads every archived chunk, and every failure raises an operator to-do. The archive directory is the row below; back it up with the rest of ~/.rsi. The status rows below show what the archive holds and the last pass; the run row (or :cold-archive run) starts a copy-only pass now, :cold-archive move a full one.</td><td>toggle</td><td>daemon field <code>cold_archive_enabled</code></td><td>when applied · no restart</td></tr>
 <tr><td>Cold-storage age (days)</td><td>A session is cold when its newest event is at least this many days old (3-3650, default 14). Age is measured by the newest conversation event, not the session's updated time, which sandbox maintenance bumps in bulk. Only Archived and Deleted sessions qualify, and a session that a live manager, worker, wake, job, queue entry or topology still references is never cold. Read at the start of each pass.</td><td>choice</td><td>daemon field <code>cold_archive_after_days</code></td><td>when applied · no restart</td></tr>
 <tr><td>Cold-storage directory</td><td>Where archive files are written: an absolute path outside every sandbox root, or empty for &lt;data dir&gt;/archive. Enter opens a text editor. The daemon checks the path before saving it and again when a pass starts: a symlink or .. that leads into a sandbox root or a .git directory is refused, and the editor shows the reason and keeps your text. Existing archive files keep their recorded path, so a change only affects new files. Back the directory up with the rest of ~/.rsi.</td><td>action</td><td>daemon field <code>cold_archive_dir</code></td><td>when activated</td></tr>
@@ -893,6 +930,8 @@
 <thead><tr><th>Daemon field</th><th>How it is set today</th><th>Tracking</th></tr></thead>
 <tbody>
 <tr><td><code>retry_max_default</code></td><td><code>RSI_RETRY_MAX_DEFAULT</code> at daemon start, or <code>UpdateDaemonConfig</code>; stored, not applied to default launches (only seeds the retry kill-switch)</td><td>#2236</td></tr>
+<tr><td><code>openrouter_spend_baseline_usd</code></td><td>written by arming openrouter_spend_cap_usd (a fresh probe of the account usage)</td><td>#3154</td></tr>
+<tr><td><code>openrouter_spend_armed_at</code></td><td>written by arming openrouter_spend_cap_usd (the time of that probe)</td><td>#3154</td></tr>
 <tr><td><code>api_route.fallback</code></td><td><code>UpdateDaemonConfig</code> (legacy alias of <code>api_route.fallback.bedrock</code>; never touches OpenRouter); the Bedrock fallback row is the editor</td><td>#3141</td></tr>
 </tbody>
 </table>
@@ -920,6 +959,7 @@
 <tr><td><code>:kill</code></td><td><code>:ki</code></td><td>Soft interrupt running session</td><td>Requests a soft stop (currently SIGINT fallback) and marks the session SOFT; a granted manager may restart it.</td></tr>
 <tr><td><code>:pause soft</code></td><td></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
 <tr><td><code>:pause clear</code></td><td></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm.</td></tr>
+<tr><td><code>:provider-clear-hold</code></td><td></td><td>Clear provider usage hold</td><td>After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits.</td></tr>
 <tr><td><code>:continue [arg]</code></td><td><code>:cont [arg]</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>:archive</code></td><td><code>:arc</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
 <tr><td><code>:delete</code></td><td><code>:del</code></td><td>Delete selected session</td><td>Deletes the selected session after the double-tap <code>DD</code> (moves it to the trash).</td></tr>
@@ -928,6 +968,7 @@
 <tr><td><code>:manager-reseat [arg]</code></td><td></td><td>Reseat failed manager</td><td>Replaces the selected session's project manager seat, whose provider is down, with a new session on another provider that keeps the seat's scope, policy, lineage and the hub's dispatch reach; <code>:manager-reseat &lt;provider&gt;[/&lt;model&gt;] &lt;reason&gt;</code>. Run twice to confirm.</td></tr>
 <tr><td><code>:cold-restore</code></td><td></td><td>Restore from cold storage</td><td>Puts the focused archived session's rows back from the cold-storage archive into the live database (<code>:cold-restore</code>). A session that is not in cold storage answers that it is already live. Reading a cold session needs no restore: its transcript is whole either way.</td></tr>
 <tr><td><code>:cold-archive [arg]</code></td><td></td><td>Cold-storage archive</td><td><code>:cold-archive</code> shows the archive's state (live database and archive sizes, sessions staged, verified and cold, the last pass and any problem); <code>:cold-archive run</code> starts a stage pass (copy and verify, delete nothing), <code>move</code> also deletes the verified rows from the live database (only while a fresh rsi.db backup exists) and reclaims their pages, <code>verify</code> re-reads every archived chunk and <code>compact</code> schedules the one-time database compaction for the next supervised restart.</td></tr>
+<tr><td><code>:external-reports [arg]</code></td><td></td><td>External reports</td><td><code>:external-reports</code> shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; <code>:external-reports sync</code> runs one import pass now with the hub's own gh login; <code>:external-reports filter</code> filters the focused Issues pane to the <code>external-report</code> label. Imported reports are untrusted P4 Issues until triage promotes them.</td></tr>
 <tr><td><code>:archives</code></td><td></td><td>Open archives</td><td>Switches the session list to the Archive zone.</td></tr>
 <tr><td><code>:model [arg]</code></td><td><code>:mod [arg]</code></td><td>Choose model</td><td>Opens the model picker, or <code>:model &lt;name&gt;</code> selects a model for new launches.</td></tr>
 <tr><td><code>:sessions</code></td><td><code>:ls</code></td><td>List sessions</td><td>Lists sessions in the session list.</td></tr>
@@ -939,6 +980,7 @@
 <tr><td><code>:project-new [arg]</code></td><td></td><td>Create project</td><td>Creates a project: <code>:project-new &lt;name&gt; [path]</code>, or opens the form.</td></tr>
 <tr><td><code>:project-edit [arg]</code></td><td></td><td>Edit project</td><td>Edits the named or current project.</td></tr>
 <tr><td><code>:project-delete &lt;arg&gt;</code></td><td></td><td>Delete project</td><td>Deletes the named project; the name argument is required.</td></tr>
+<tr><td><code>:intake &lt;arg&gt;</code></td><td></td><td>Operator intake</td><td>Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager.</td></tr>
 <tr><td><code>:set</code></td><td><code>:settings</code></td><td>Open settings</td><td>Opens the settings pane.</td></tr>
 <tr><td><code>:stopall</code></td><td><code>:stop-all</code></td><td>Emergency stop all</td><td>Emergency HARD stop: denies new paid work, cancels active model invocations, and marks interrupted sessions HARD.</td></tr>
 <tr><td><code>:hooks</code></td><td></td><td>Open hook settings</td><td>Opens settings at the Claude hooks list.</td></tr>
@@ -954,12 +996,13 @@
 <tr><td><code>:ask [arg]</code></td><td></td><td>Ask a question</td><td>Opens the dialectic question overlay; <code>:ask &lt;question&gt;</code> asks directly.</td></tr>
 <tr><td><code>:term</code></td><td><code>:terminal</code> <code>:shell</code></td><td>Toggle terminal</td><td>Toggles the embedded terminal overlay (the shell keeps running when hidden).</td></tr>
 <tr><td><code>:lead</code></td><td><code>:setlead</code></td><td>Set Epic lead</td><td>Sets the focused leaf session as the lead of its parent Epic.</td></tr>
-<tr><td><code>:manager</code></td><td></td><td>Open harness manager</td><td>Opens the harness manager overlay.</td></tr>
+<tr><td><code>:manager</code></td><td></td><td>Open harness manager</td><td>Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor.</td></tr>
 <tr><td><code>:manager appoint</code></td><td></td><td>Appoint harness manager</td><td>Appoints the selected session as the harness manager.</td></tr>
 <tr><td><code>:manager scope</code></td><td></td><td>Edit manager scope</td><td>Edits the harness manager's scope.</td></tr>
 <tr><td><code>:manager clear</code></td><td></td><td>Clear manager scope</td><td>Clears the harness manager's scope.</td></tr>
 <tr><td><code>:fleet</code></td><td></td><td>Open fleet workspace</td><td>Shows active agents and usage rates across all projects.</td></tr>
 <tr><td><code>:global-manager</code></td><td><code>:gm</code> <code>:manager workspace</code></td><td>Open global manager workspace</td><td>Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session.</td></tr>
+<tr><td><code>:dashboard</code></td><td><code>:gd</code></td><td>Open global dashboard</td><td>Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project.</td></tr>
 <tr><td><code>:manager global [arg]</code></td><td></td><td>Show global manager grant</td><td>Shows the active global manager grant; <code>:manager global set &lt;active|sessions|containers|spend|groups&gt; &lt;value&gt;</code> changes one per-project cap; <code>:manager global add-project &lt;names...&gt;</code> adds projects to the grant; <code>:manager global configure &lt;JSON&gt;</code> sends a full typed grant request.</td></tr>
 <tr><td><code>:manager global appoint [arg]</code></td><td></td><td>Appoint global manager</td><td>Appoints the focused session as the global manager over the named projects (comma-separated; default: every project).</td></tr>
 <tr><td><code>:manager global revoke</code></td><td></td><td>Revoke global manager</td><td>Revokes the active global manager grant; the seat keeps its session but loses its authority.</td></tr>
@@ -1013,6 +1056,7 @@
 <tr><td><code>X</code></td><td>INTERRUPT NOW</td><td>Press twice within five seconds to cancel the active turn and mark it HARD.</td></tr>
 <tr><td><code>&lt;Space&gt;hs</code></td><td>Downgrade hard pause to soft</td><td>Changes the selected session's HARD marker to SOFT so a granted manager may restart it.</td></tr>
 <tr><td><code>&lt;Space&gt;hc</code></td><td>Clear operator pause</td><td>Clears the selected session's SOFT or HARD marker; a manager seat shows its age and any held succession, and the key must be pressed twice to confirm.</td></tr>
+<tr><td><code>&lt;Space&gt;hu</code></td><td>Clear provider usage hold</td><td>After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits.</td></tr>
 <tr><td><code>&lt;Space&gt;c</code></td><td>Continue selected session</td><td><code>&lt;Space&gt;c</code> sends literal <code>continue</code>; <code>:continue</code> opens a prompt, and <code>:continue &lt;text&gt;</code> sends text directly.</td></tr>
 <tr><td><code>P</code></td><td>Pin or unpin selected session</td><td>Pins or unpins the selected session at the top of the list.</td></tr>
 <tr><td><code>&lt;Space&gt;a</code></td><td>Archive selected session</td><td>Archives the selected session (reversible with U from the Archive zone).</td></tr>
@@ -1034,6 +1078,7 @@
 <tr><td><code>&lt;Space&gt;v</code></td><td>Open graph review</td><td>Opens the visual workflow graph review editor.</td></tr>
 <tr><td><code>gL</code></td><td>Set Epic lead</td><td>Sets the focused leaf session as the lead of its parent Epic.</td></tr>
 <tr><td><code>gm</code></td><td>Open global manager workspace</td><td>Opens the global manager workspace above all projects: the grant, the global seat and each granted project's PM health; Enter opens the seat or a PM session.</td></tr>
+<tr><td><code>gd</code></td><td>Open global dashboard</td><td>Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project.</td></tr>
 <tr><td><code>&lt;Space&gt;q</code></td><td>Close pane</td><td>Closes the focused pane.</td></tr>
 <tr><td><code>&gt;</code></td><td>Next tab</td><td>Switches to the next tab.</td></tr>
 <tr><td><code>&lt;</code></td><td>Previous tab</td><td>Switches to the previous tab.</td></tr>
@@ -1165,11 +1210,11 @@
 <tr><td><code>k</code></td><td>Move selection or scroll up</td><td>Moves the selection up one row, or scrolls the focused view up.</td></tr>
 <tr><td><code>Enter</code></td><td>Open or activate selection</td><td>Opens the selected row: drills into a Group or Epic in place (from session detail it folds open or shut in the sidebar tree), opens a leaf session's detail, or activates the selected setting.</td></tr>
 <tr><td><code>Delete</code></td><td>Reset selected role</td><td>Resets the selected theme role to the active theme's default color.</td></tr>
-<tr><td><code>h</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail.</td></tr>
-<tr><td><code>Left</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail.</td></tr>
-<tr><td><code>l</code></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items.</td></tr>
-<tr><td><code>Right</code></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items.</td></tr>
-<tr><td><code>Space</code></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, or activates the selected settings row.</td></tr>
+<tr><td><code>h</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row.</td></tr>
+<tr><td><code>Left</code></td><td>Return to categories</td><td>Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row.</td></tr>
+<tr><td><code>l</code></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w.</td></tr>
+<tr><td><code>Right</code></td><td>Enter selected category</td><td>Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w.</td></tr>
+<tr><td><code>Space</code></td><td>Toggle or activate setting</td><td>Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row.</td></tr>
 <tr><td><code>a</code></td><td>Add item</td><td>Adds an item to the selected settings list (hooks, providers, budgets and similar lists).</td></tr>
 <tr><td><code>d</code></td><td>Delete item</td><td>Deletes the selected item from a settings list; in Provider Keys, d arms and a second d confirms clearing the slot.</td></tr>
 <tr><td><code>e</code></td><td>Enable or disable skill</td><td>Enables or disables the selected Claude skill.</td></tr>
@@ -1314,7 +1359,7 @@
 <tbody>
 <tr><td><code>Ctrl-Alt-G</code></td><td>any context</td><td>toggle contextual help without typing into the active editor</td></tr>
 <tr><td><code>Ctrl-C</code></td><td>embedded terminal open</td><td>send SIGINT to the embedded terminal's shell</td></tr>
-<tr><td><code>Ctrl-C</code></td><td>any context</td><td>quit rsi</td></tr>
+<tr><td><code>Ctrl-C</code></td><td>any context</td><td>does not quit; shows the hint naming the proper exit (:q or ZZ)</td></tr>
 <tr><td><code>Ctrl-\</code></td><td>any context</td><td>toggle the embedded terminal overlay (the shell keeps running)</td></tr>
 <tr><td><code>Ctrl-O</code></td><td>normal mode, no overlay, not inserting</td><td>jump back in the session jumplist</td></tr>
 <tr><td><code>Ctrl-I</code></td><td>normal mode, no overlay, not inserting</td><td>jump forward in the session jumplist</td></tr>
@@ -1799,8 +1844,8 @@
 <table>
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
-<tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
+<tr><td><code>Home / End</code></td><td>Jump to first / last</td></tr>
 <tr><td><code>Type, Backspace</code></td><td>Filter projects</td></tr>
 <tr><td><code>Enter</code></td><td>Select project</td></tr>
 <tr><td><code>Ctrl-N</code></td><td>New project</td></tr>
@@ -1817,8 +1862,8 @@
 <table>
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
-<tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
+<tr><td><code>Home / End</code></td><td>Jump to first / last</td></tr>
 <tr><td><code>Type, Backspace</code></td><td>Filter labels</td></tr>
 <tr><td><code>Enter</code></td><td>Assign label</td></tr>
 <tr><td><code>Ctrl-N</code></td><td>New label</td></tr>
@@ -1835,8 +1880,8 @@
 <table>
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
-<tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
+<tr><td><code>Home / End</code></td><td>Jump to first / last</td></tr>
 <tr><td><code>Type, Backspace</code></td><td>Filter parents</td></tr>
 <tr><td><code>Enter</code></td><td>Set parent</td></tr>
 <tr><td><code>Esc</code></td><td>Close picker</td></tr>
@@ -1852,9 +1897,10 @@
 <tbody>
 <tr><td><code>Tab / Shift-Tab</code></td><td>Next / previous field</td></tr>
 <tr><td><code>Type, Backspace</code></td><td>Edit focused field</td></tr>
+<tr><td><code>Esc, h j k l w b e 0 $, x dd cw ciw, u</code></td><td>Vim editing in Name and Path: Esc leaves insert mode</td></tr>
 <tr><td><code>Left / Right</code></td><td>Cycle color (color field)</td></tr>
 <tr><td><code>Enter</code></td><td>Save project</td></tr>
-<tr><td><code>Esc</code></td><td>Cancel</td></tr>
+<tr><td><code>Esc</code></td><td>Cancel (from normal mode)</td></tr>
 </tbody>
 </table>
 </div>
@@ -1960,6 +2006,7 @@
 <tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
 <tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
 <tr><td><code>Enter / Space</code></td><td>Edit selected policy field</td></tr>
+<tr><td><code>x / Delete</code></td><td>Remove the focused allowed model (draft only)</td></tr>
 <tr><td><code>s</code></td><td>Save policy</td></tr>
 <tr><td><code>r</code></td><td>Reload policy</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close manager</td></tr>
@@ -2051,6 +2098,7 @@
 <tr><td><code>x</code></td><td>Halt the selected seat session (soft stop)</td></tr>
 <tr><td><code>X</code></td><td>Halt the selected seat session now (press twice)</td></tr>
 <tr><td><code>a</code></td><td>Archive the selected earlier seat session</td></tr>
+<tr><td><code>g e</code></td><td>Edit global manager coverage and permissions; b views budget; y on Review saves</td></tr>
 <tr><td><code>n</code></td><td>Launch and appoint a manager (seat, launch, scope, grant)</td></tr>
 <tr><td><code>b</code></td><td>Budget panel: every cap of the global node and each PM as used / limit, binding cap marked</td></tr>
 <tr><td><code>b: + / 0-9</code></td><td>Raise the selected cap one step, or type a new limit; Enter saves the right grant and reads it back</td></tr>
@@ -2060,6 +2108,27 @@
 <tr><td><code>p</code></td><td>Open the selected project's tab</td></tr>
 <tr><td><code>T</code></td><td>Open the manager tree</td></tr>
 <tr><td><code>F</code></td><td>Open the fleet workspace</td></tr>
+<tr><td><code>r</code></td><td>Refresh the snapshot</td></tr>
+<tr><td><code>:</code></td><td>Open the command palette</td></tr>
+<tr><td><code>Esc / q</code></td><td>Close (Esc leaves typing or the conversation first)</td></tr>
+</tbody>
+</table>
+</div>
+<h4>Global Dashboard</h4>
+<div class="region" id="overlay-global-dashboard">
+<table>
+<thead><tr><th>Keys</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
+<tr><td><code>g / G</code></td><td>Jump to first / last</td></tr>
+<tr><td><code>w</code></td><td>Cycle the window: 1h, 24h, 7d</td></tr>
+<tr><td><code>s</code></td><td>Cycle the sort: agents, tokens, cost, Issues</td></tr>
+<tr><td><code>Enter / l</code></td><td>Open the selected project's tab and session list</td></tr>
+<tr><td><code>t</code></td><td>Show or hide the conversation pane</td></tr>
+<tr><td><code>i</code></td><td>Type to the top-level manager; Enter sends</td></tr>
+<tr><td><code>n</code></td><td>Start a top-level manager (the appoint flow) when none is live</td></tr>
+<tr><td><code>Tab</code></td><td>Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends</td></tr>
+<tr><td><code>gm</code></td><td>Open the global manager workspace</td></tr>
 <tr><td><code>r</code></td><td>Refresh the snapshot</td></tr>
 <tr><td><code>:</code></td><td>Open the command palette</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close (Esc leaves typing or the conversation first)</td></tr>
@@ -2102,6 +2171,7 @@
 <tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
 <tr><td><code>J / K, PageDown / PageUp</code></td><td>Page selection</td></tr>
 <tr><td><code>Enter</code></td><td>Audit selected worktree</td></tr>
+<tr><td><code>n</code></td><td>Audit next custody page</td></tr>
 <tr><td><code>A</code></td><td>Begin authorization</td></tr>
 <tr><td><code>r</code></td><td>Refresh receipt</td></tr>
 <tr><td><code>Esc / q</code></td><td>Close</td></tr>
@@ -2341,8 +2411,8 @@
 <thead><tr><th>Keys</th><th>Action</th></tr></thead>
 <tbody>
 <tr><td><code>Type, Backspace</code></td><td>Search memory</td></tr>
-<tr><td><code>j / k, Down / Up</code></td><td>Move selection</td></tr>
-<tr><td><code>Esc / q</code></td><td>Close</td></tr>
+<tr><td><code>Down / Up, Ctrl-J / Ctrl-K</code></td><td>Move selection</td></tr>
+<tr><td><code>Esc</code></td><td>Close</td></tr>
 </tbody>
 </table>
 </div>
@@ -2511,6 +2581,7 @@
 <tr><td>Remote settings</td><td>The page owns its enable, device and project keys.</td><td>keybindings.md § Remote Settings</td></tr>
 <tr><td>Manager tree (:manager tree)</td><td>The tree owns its fold, paging, jump and in-tree action keys.</td><td>keybindings.md § Manager Tree</td></tr>
 <tr><td>Legacy scratch adoption</td><td>The browser owns its select, adopt and refresh keys.</td><td>keybindings.md § Legacy Scratch Adoption</td></tr>
+<tr><td>Host tuning (:manager tune)</td><td>The panel owns its profile, preset, bounds and apply/undo keys.</td><td>keybindings.md § Host Tuning</td></tr>
 </tbody>
 </table>
 </div>

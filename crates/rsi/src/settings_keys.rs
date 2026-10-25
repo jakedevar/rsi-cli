@@ -9,8 +9,7 @@ use crate::model_control_stats::stats_row_action;
 use crate::overlay::mcp_server_form::{open_mcp_server_form, open_mcp_server_secret_form};
 use crate::overlay::{
     open_budget_policy_form, open_hook_form, open_message_bridge_form,
-    open_provider_credential_form, open_provider_form, open_skill_preview,
-    open_text_area_bg_editor,
+    open_provider_credential_form, open_provider_form, open_text_area_bg_editor,
 };
 use crate::settings::{DaemonFeatureEntry, MessageBridgeKind, UserSettings};
 #[cfg(test)]
@@ -44,11 +43,13 @@ pub const DAEMON_FEATURE_SECTIONS: &[SettingsSection] = &[
     SettingsSection::Scheduling,
     SettingsSection::RecursiveDag,
     SettingsSection::CodeIntelligence,
+    SettingsSection::ProviderBilling,
     SettingsSection::ProviderIsolation,
     SettingsSection::ProviderSubagents,
     SettingsSection::ProviderSkills,
     SettingsSection::ApiRoutes,
     SettingsSection::HarnessTools,
+    SettingsSection::Benchmarks,
     SettingsSection::ResourceLimits,
     SettingsSection::BuildGovernor,
     SettingsSection::MergeQueue,
@@ -73,6 +74,7 @@ pub(crate) fn daemon_feature_field_for(id: SettingId) -> Option<&'static str> {
         SettingId::ColdArchiveRunNow => Some("cold_archive_run_now"),
         SettingId::TargetPoolStatus => Some("target_pool_status"),
         SettingId::CloudSpendStatus => Some("cloud_spend_status"),
+        SettingId::OpenRouterSpendStatus => Some("openrouter_spend_status"),
         SettingId::PreviewReclaim => Some("sandbox_build_cache_dry_run"),
         SettingId::ReclaimNow => Some("sandbox_build_cache_reclaim_now"),
         SettingId::SourceWorktreeSettlement => Some("source_worktree_settlement"),
@@ -557,7 +559,8 @@ fn toggle_selected_mcp_server(app: &mut App) {
 
 // --- Skills helpers --------------------------------------------------------
 
-/// Open the read-only SKILL.md viewer for the currently selected skill row.
+/// Open the read-only SKILL.md viewer for the currently selected skill row
+/// (read through the daemon's `GetSkill`).
 fn open_skill_preview_for_selected_index(app: &mut App) {
     let idx = app.settings_state.selected_index;
     let name = {
@@ -565,43 +568,33 @@ fn open_skill_preview_for_selected_index(app: &mut App) {
         skills.get(idx).map(|s| s.name.clone())
     };
     if let Some(name) = name {
-        open_skill_preview(app, &name);
+        app.pending_lc_actions
+            .push(LcAction::OpenSkillPreview { name });
     }
 }
 
-/// Toggle enabled/disabled state of the selected skill via directory rename.
+/// Enable or disable the selected skill through the daemon's
+/// `SetSkillEnabled` (the rename to or from `<name>.disabled`).
 fn toggle_skill_at_selected_index(app: &mut App) {
     let idx = app.settings_state.selected_index;
-    let name = {
+    let selected = {
         let skills = app.cached_user_skills();
-        skills.get(idx).map(|s| s.name.clone())
+        skills.get(idx).map(|s| (s.name.clone(), s.enabled))
     };
-    let name = match name {
-        Some(n) => n,
-        None => return,
-    };
-    match claude_config::toggle_skill(&name) {
-        Ok(now_enabled) => {
-            app.invalidate_claude_skills_cache();
-            let verb = if now_enabled { "Enabled" } else { "Disabled" };
-            app.notify_success(format!("{} skill: {}", verb, name));
-        }
-        Err(e) => {
-            app.notify_error(format!("Toggle failed: {}", e));
-        }
+    if let Some((name, enabled)) = selected {
+        app.pending_lc_actions.push(LcAction::SetSkillEnabled {
+            name,
+            enabled: !enabled,
+        });
     }
 }
 
 /// `d` on a Skills row: the first press arms a "press d again" confirmation
 /// for the selected skill; a second `d` on the SAME skill within
-/// `CLEAR_CONFIRM_TTL_MS` deletes it. Deletion is permanent (no trash), so
-/// both frontends ask twice. Same arm-then-confirm shape as
-/// `arm_or_confirm_clear_selected_credential`.
+/// `CLEAR_CONFIRM_TTL_MS` asks the daemon to delete it (`DeleteSkill`, which
+/// moves it into the daemon's skill trash, local #91). Same arm-then-confirm
+/// shape as `arm_or_confirm_clear_selected_credential`.
 fn arm_or_confirm_delete_selected_skill(app: &mut App) {
-    arm_or_confirm_delete_selected_skill_in(app, &claude_config::skills_home());
-}
-
-fn arm_or_confirm_delete_selected_skill_in(app: &mut App, home: &std::path::Path) {
     let idx = app.settings_state.selected_index;
     let name = {
         let skills = app.cached_user_skills();
@@ -624,25 +617,12 @@ fn arm_or_confirm_delete_selected_skill_in(app: &mut App, home: &std::path::Path
             armed_at_ms: now,
         });
         app.notify(format!(
-            "Delete skill {name} permanently? Press d again to confirm"
+            "Delete skill {name} (moved to the trash)? Press d again to confirm"
         ));
         return;
     }
     app.settings_state.skill_delete_confirmation = None;
-    match claude_config::delete_skill_in(home, &name) {
-        Ok(()) => {
-            // Re-list under the same `home` the delete used.
-            app.cached_user_skills = Some(claude_config::list_skills_in(home).unwrap_or_default());
-            let new_max = app.cached_user_skills().len().saturating_sub(1);
-            if app.settings_state.selected_index > new_max {
-                app.settings_state.selected_index = new_max;
-            }
-            app.notify_success(format!("Deleted skill: {}", name));
-        }
-        Err(e) => {
-            app.notify_error(format!("Delete failed: {}", e));
-        }
-    }
+    app.pending_lc_actions.push(LcAction::DeleteSkill { name });
 }
 
 /// Handle a key event while a Settings pane is focused.
@@ -782,6 +762,21 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // A numeric daemon row is a slider: `h` / `l` (`Left` / `Right`) step it
+        // through its presets and the live value, staged like `-` / `+`; Enter
+        // types any value (#3468).
+        KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
+            if app.settings_state.focus == SettingsFocus::Items && selected_row_is_numeric(app) =>
+        {
+            let step = if matches!(key.code, KeyCode::Char('l') | KeyCode::Right) {
+                Step::Next
+            } else {
+                Step::Previous
+            };
+            stage_selected_row(app, step);
+            true
+        }
+
         KeyCode::Char('h') | KeyCode::Left => {
             app.settings_state.focus = SettingsFocus::Categories;
             true
@@ -837,6 +832,16 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
                         // A free-text value (a path, a URL): edited in its own
                         // overlay, written when saved (#2438, #2393).
                         Some(field) if crate::overlay::daemon_text_field(field).is_some() => {
+                            crate::overlay::open_daemon_text_editor(app, field);
+                        }
+                        // A numeric value types into the same overlay: any
+                        // number the daemon accepts, not only a preset (#3468).
+                        Some(field)
+                            if app
+                                .daemon_features
+                                .get(vec_idx)
+                                .is_some_and(crate::overlay::daemon_number_entry) =>
+                        {
                             crate::overlay::open_daemon_text_editor(app, field);
                         }
                         // Switches and choices stage; the daemon hears of them
@@ -990,7 +995,7 @@ pub fn handle_settings_key(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
-        // Skills-specific: 'd' to delete selected skill (press twice: permanent)
+        // Skills-specific: 'd' to delete selected skill (press twice; to the trash)
         KeyCode::Char('d')
             if app.settings_state.section == SettingsSection::ClaudeSkills
                 && app.settings_state.focus == SettingsFocus::Items =>
@@ -1452,11 +1457,13 @@ pub fn item_count(section: SettingsSection, settings: &UserSettings) -> usize {
         | SettingsSection::Scheduling
         | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
+        | SettingsSection::ProviderBilling
         | SettingsSection::ProviderIsolation
         | SettingsSection::ProviderSubagents
         | SettingsSection::ProviderSkills
         | SettingsSection::ApiRoutes
         | SettingsSection::HarnessTools
+        | SettingsSection::Benchmarks
         | SettingsSection::ResourceLimits
         | SettingsSection::BuildGovernor
         | SettingsSection::MergeQueue
@@ -1568,6 +1575,15 @@ pub(crate) fn stage_selected_row(app: &mut App, step: Step) -> bool {
         Some(RowTarget::Local(pref)) => stage_local_pref(app, pref, step),
         None => false,
     }
+}
+
+/// True when the selected row is a numeric daemon setting (#3468).
+fn selected_row_is_numeric(app: &App) -> bool {
+    let section = app.settings_state.section;
+    DAEMON_FEATURE_SECTIONS.contains(&section)
+        && daemon_feature_vec_index(app, section, app.settings_state.selected_index)
+            .and_then(|vec_idx| app.daemon_features.get(vec_idx))
+            .is_some_and(crate::overlay::daemon_number_entry)
 }
 
 /// Tell the operator a numeric row is at the end of its range.
@@ -2083,11 +2099,13 @@ fn toggle_setting(settings: &mut UserSettings, state: &SettingsState) {
         | SettingsSection::Scheduling
         | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
+        | SettingsSection::ProviderBilling
         | SettingsSection::ProviderIsolation
         | SettingsSection::ProviderSubagents
         | SettingsSection::ProviderSkills
         | SettingsSection::ApiRoutes
         | SettingsSection::HarnessTools
+        | SettingsSection::Benchmarks
         | SettingsSection::ResourceLimits
         | SettingsSection::BuildGovernor
         | SettingsSection::MergeQueue
@@ -2146,33 +2164,45 @@ mod tests {
         );
     }
 
-    fn skills_app_with_home(label: &str, names: &[&str]) -> (App, std::path::PathBuf) {
-        let home = std::env::temp_dir().join(format!(
-            "rsi-skill-delete-{}-{}-{}",
-            label,
-            std::process::id(),
-            now_ms()
-        ));
-        let dir = home.join(".claude").join("skills");
-        for name in names {
-            std::fs::create_dir_all(dir.join(name)).unwrap();
-            std::fs::write(dir.join(name).join("SKILL.md"), "hello\n").unwrap();
-        }
+    fn skills_app(names: &[&str]) -> App {
         let mut app = crate::app::app_test_helpers::with_session_list(0);
         app.settings_state.section = SettingsSection::ClaudeSkills;
         app.settings_state.focus = SettingsFocus::Items;
         app.settings_state.selected_index = 0;
-        app.cached_user_skills = Some(claude_config::list_skills_in(&home).unwrap());
-        (app, home)
+        let listing: rsi_common::input_assets::ListSkillsResponseV1 =
+            serde_json::from_value(serde_json::json!({
+                "skills_dir": "/home/op/.claude/skills",
+                "skills": names.iter().map(|name| serde_json::json!({
+                    "name": name, "enabled": true, "description": null, "has_skill_md": true
+                })).collect::<Vec<_>>(),
+                "truncated": false,
+                "skipped_outside_root": 0
+            }))
+            .unwrap();
+        app.set_user_skills(&listing);
+        app
+    }
+
+    fn skill_deletes(app: &App) -> Vec<String> {
+        app.pending_lc_actions
+            .iter()
+            .filter_map(|action| match action {
+                LcAction::DeleteSkill { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
     fn skill_delete_needs_a_second_d_within_the_window() {
-        let (mut app, home) = skills_app_with_home("twice", &["alpha", "beta"]);
-        let dir = home.join(".claude").join("skills");
+        let mut app = skills_app(&["alpha", "beta"]);
 
-        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
-        assert!(dir.join("alpha").exists(), "a single d deletes nothing");
+        arm_or_confirm_delete_selected_skill(&mut app);
+        assert_eq!(
+            skill_deletes(&app),
+            Vec::<String>::new(),
+            "a single d deletes nothing"
+        );
         assert_eq!(
             app.settings_state
                 .skill_delete_confirmation
@@ -2187,31 +2217,30 @@ mod tests {
             "the hint names the second press"
         );
 
-        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
-        assert!(!dir.join("alpha").exists(), "the second d deletes");
-        assert!(dir.join("beta").exists());
+        arm_or_confirm_delete_selected_skill(&mut app);
+        assert_eq!(
+            skill_deletes(&app),
+            vec!["alpha".to_string()],
+            "the second d deletes"
+        );
         assert!(app.settings_state.skill_delete_confirmation.is_none());
-        let names: Vec<_> = app
-            .cached_user_skills()
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        assert_eq!(names, vec!["beta".to_string()]);
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
     fn skill_delete_confirmation_times_out_and_is_per_skill() {
-        let (mut app, home) = skills_app_with_home("ttl", &["alpha", "beta"]);
-        let dir = home.join(".claude").join("skills");
+        let mut app = skills_app(&["alpha", "beta"]);
 
         // An arm older than the window does not confirm; it re-arms.
         app.settings_state.skill_delete_confirmation = Some(SkillDeleteConfirmation {
             name: "alpha".into(),
             armed_at_ms: now_ms() - CLEAR_CONFIRM_TTL_MS - 1_000,
         });
-        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
-        assert!(dir.join("alpha").exists(), "an expired arm deletes nothing");
+        arm_or_confirm_delete_selected_skill(&mut app);
+        assert_eq!(
+            skill_deletes(&app),
+            Vec::<String>::new(),
+            "an expired arm deletes nothing"
+        );
         assert!(
             app.settings_state
                 .skill_delete_confirmation
@@ -2222,9 +2251,12 @@ mod tests {
 
         // An arm for another skill does not confirm this one.
         app.settings_state.selected_index = 1;
-        arm_or_confirm_delete_selected_skill_in(&mut app, &home);
-        assert!(dir.join("alpha").exists());
-        assert!(dir.join("beta").exists(), "moving rows re-arms");
+        arm_or_confirm_delete_selected_skill(&mut app);
+        assert_eq!(
+            skill_deletes(&app),
+            Vec::<String>::new(),
+            "moving rows re-arms"
+        );
         assert_eq!(
             app.settings_state
                 .skill_delete_confirmation
@@ -2232,19 +2264,38 @@ mod tests {
                 .map(|c| c.name.as_str()),
             Some("beta")
         );
-        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `e` and Enter go to the daemon (`SetSkillEnabled`, `GetSkill`).
+    #[test]
+    fn skill_toggle_and_preview_queue_daemon_actions() {
+        let mut app = skills_app(&["alpha"]);
+        toggle_skill_at_selected_index(&mut app);
+        open_skill_preview_for_selected_index(&mut app);
+        assert_eq!(
+            app.pending_lc_actions,
+            vec![
+                LcAction::SetSkillEnabled {
+                    name: "alpha".to_string(),
+                    enabled: false,
+                },
+                LcAction::OpenSkillPreview {
+                    name: "alpha".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
     fn skill_d_key_first_press_only_arms() {
-        let (mut app, home) = skills_app_with_home("key", &["alpha"]);
+        let mut app = skills_app(&["alpha"]);
         assert!(handle_settings_key(&mut app, key(KeyCode::Char('d'))));
-        assert!(
-            home.join(".claude").join("skills").join("alpha").exists(),
+        assert_eq!(
+            skill_deletes(&app),
+            Vec::<String>::new(),
             "the d key alone deletes nothing"
         );
         assert!(app.settings_state.skill_delete_confirmation.is_some());
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2462,8 +2513,9 @@ mod tests {
         assert!(handle_settings_key(&mut app, key(KeyCode::Enter)));
         assert_eq!(app.settings_state.section, SettingsSection::ClaudeSkills);
         assert!(
-            app.cached_user_skills.is_some(),
-            "skills cache loaded on jump"
+            app.pending_lc_actions
+                .contains(&LcAction::RefreshClaudeSkills),
+            "skills listing requested on jump"
         );
 
         app.pending_lc_actions.clear();
@@ -2560,12 +2612,13 @@ mod tests {
 
     #[test]
     fn test_settings_category_all_count() {
-        // Eight rail groups and thirty-nine section tabs (#2236 split the
+        // Eight rail groups and forty-one section tabs (#2236 split the
         // oversized Orchestration, Sandbox Storage and Retries sections; #2384
         // gave the cold-storage archive its own tab; #2763 gave the subagent
-        // governance rows theirs; #2767 the provider skill delivery row).
+        // governance rows theirs; #2767 the provider skill delivery row; #3176
+        // the benchmark rows).
         assert_eq!(SettingsGroup::ALL.len(), 8);
-        assert_eq!(SettingsSection::ALL.len(), 39);
+        assert_eq!(SettingsSection::ALL.len(), 41);
     }
 
     /// #2236: splitting a section into tabs must not hide a row from search.
@@ -2613,6 +2666,8 @@ mod tests {
             ("cache reclaim ttl", SettingsSection::BuildCache),
             ("sccache cap", SettingsSection::AgentBuilds),
             ("harness search call cap", SettingsSection::HarnessTools),
+            ("benchmark docker hosts", SettingsSection::Benchmarks),
+            ("benchmark laptop host", SettingsSection::Benchmarks),
             ("durable topology executor", SettingsSection::Scheduling),
             ("recursive dag run lease", SettingsSection::RecursiveDag),
             ("rotation threshold codex", SettingsSection::ContextRotation),
@@ -2695,7 +2750,7 @@ mod tests {
             SettingsSection::ModelRoles,
             SettingsSection::ModelControl,
             SettingsSection::RetriesRecovery,
-            SettingsSection::ProviderIsolation,
+            SettingsSection::ProviderBilling,
             SettingsSection::ResourceLimits,
             SettingsSection::MessageBridges,
         ] {
@@ -3394,7 +3449,8 @@ mod tests {
     async fn run_classifier_response_test(response: Option<serde_json::Value>) -> App {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let temp_dir = tempfile::tempdir().expect("temporary classifier socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary classifier socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("classifier listener");
         let server = tokio::spawn(async move {

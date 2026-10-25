@@ -26,6 +26,13 @@ const LEAD_PAUSE_KIND: &str = "manager_lead_pause";
 /// unbounded wake, so a wake that never fires cannot hide a stranded Epic.
 const PARKED_WAKE_HORIZON_SECS: i64 = 3600;
 
+/// #3896: why a Completed lead counts as parked in the intent pass.
+enum LeadParking {
+    Wake(ResultWakeBound),
+    Job,
+    Queue,
+}
+
 pub(crate) mod idle;
 pub use idle::{IntentInputPin, IntentInputVersion};
 
@@ -69,6 +76,25 @@ pub struct ManagerIntentReconciliationV2 {
     /// Store guard (no usable off-lock observation, no memo hit). The
     /// coordinator logs it with the hold time of a slow pass.
     pub read_under_lock: bool,
+    /// #3486: why an offered off-lock observation was not used (what moved
+    /// since its pin, or that the appointment changed). `None` when none was
+    /// offered or it was used.
+    pub observation_rejected: Option<String>,
+    /// #3486: the pass was skipped under [`ObservationFallback::DeferWithin`]
+    /// instead of reading under the lock; the next tick observes again.
+    pub deferred: bool,
+}
+
+/// #3486: what a pass does when the off-lock observation it was offered no
+/// longer matches the inputs (so it would read them again under the Store lock,
+/// seconds on a busy hub).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationFallback {
+    /// Read under the caller's guard.
+    ReadUnderLock,
+    /// Skip the pass (nothing written, no memo) while this project's last
+    /// completed pass is younger than the window; read under the guard after.
+    DeferWithin(chrono::Duration),
 }
 
 /// Operator spend cap hold: unknown spend or known spend at/above the cap
@@ -374,33 +400,80 @@ impl Store {
         config: &HarnessManagerConfigV1,
         epic: Uuid,
     ) -> Result<()> {
+        match self.manager_v2_epic_decision_block(config, epic)? {
+            None => Ok(()),
+            // #3240: named by who can answer it.
+            Some(block) => Err(refused(super::decision_block_reason(Some(
+                block.answerable_by,
+            )))),
+        }
+    }
+
+    /// The pending decision that holds `epic`'s launches, if any (#3240): an
+    /// operator-answerable one wins over a manager-answerable one. A
+    /// daemon-authored topology question holds only its asking run, never the
+    /// Epic (the executor keeps that run parked while it waits).
+    pub(crate) fn manager_v2_epic_decision_block(
+        &self,
+        config: &HarnessManagerConfigV1,
+        epic: Uuid,
+    ) -> Result<Option<super::PendingDecisionSummary>> {
         let mut statement = self.conn.prepare(
             "SELECT record_key,payload_json FROM harness_manager_v2_records WHERE project_id=?1
              AND manager_session_id=?2 AND scope_version=?3 AND epic_id=?4 AND kind='decision'
-             AND archived=0 AND json_extract(payload_json,'$.status') IN ('pending','answer_queued')",
+             AND archived=0 AND json_extract(payload_json,'$.status') IN ('pending','answer_queued')
+             ORDER BY created_at,record_key",
         )?;
-        let pending = statement.query_map(
-            params![
-                config.project_id.to_string(),
-                config.manager_session_id.to_string(),
-                config.row_version,
-                epic.to_string()
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?;
-        for row in pending {
-            let (key, payload) = row?;
+        let pending = statement
+            .query_map(
+                params![
+                    config.project_id.to_string(),
+                    config.manager_session_id.to_string(),
+                    config.row_version,
+                    epic.to_string()
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut manager_answerable = None;
+        for (key, payload) in pending {
             let payload: Value = serde_json::from_str(&payload)?;
-            // The executor holds the asking run while it waits. This must
-            // not hold unrelated work under the same Epic, even for a real
-            // operator gate: only the operator can release that run's wait.
             if super::manager_decision_rulings::topology_decision_execution(&key, &payload)
-                .is_none()
+                .is_some()
             {
-                return Err(refused("manager_v2_pending_operator_decision"));
+                continue;
             }
+            let has_target = self
+                .manager_v2_record(config, "decision_target", &key)?
+                .is_some();
+            let gated = self
+                .manager_v2_classify_decision(&key, &payload, has_target)?
+                .is_some();
+            let manager = !gated && payload["status"] == "pending";
+            let summary = super::PendingDecisionSummary {
+                answerable_by: if manager { "manager" } else { "operator" },
+                question: payload["question"]
+                    .as_str()
+                    .and_then(|q| q.lines().find(|l| !l.trim().is_empty()))
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect(),
+                created_at: String::new(),
+                age_seconds: 0,
+                execution_id: None,
+                target_digest: payload["target_digest"].as_str().map(str::to_owned),
+                epic_id: Some(epic),
+                key,
+            };
+            if !manager {
+                return Ok(Some(summary));
+            }
+            manager_answerable.get_or_insert(summary);
         }
-        Ok(())
+        Ok(manager_answerable)
     }
 
     fn manager_v2_intent_hold(
@@ -491,14 +564,32 @@ impl Store {
     pub fn reconcile_manager_intent_observed(
         &self,
         project: Uuid,
+        retry_enabled: bool,
+        observed: Option<ManagerIntentObservation>,
+    ) -> Result<ManagerIntentReconciliationV2> {
+        self.reconcile_manager_intent_observed_with(
+            project,
+            retry_enabled,
+            observed,
+            ObservationFallback::ReadUnderLock,
+        )
+    }
+
+    /// [`Self::reconcile_manager_intent_observed`] with the rejected-observation
+    /// policy spelled out (#3486).
+    pub fn reconcile_manager_intent_observed_with(
+        &self,
+        project: Uuid,
         _retry_enabled: bool,
         observed: Option<ManagerIntentObservation>,
+        fallback: ObservationFallback,
     ) -> Result<ManagerIntentReconciliationV2> {
         // This is an observation cache, never an authority or admission cache.
         // Only a pass that performed no writes can be reused. Effects, seat
         // recovery, action claims and their live fences still run separately.
         let observed_at = chrono::Utc::now();
         if let Some(result) = self.manager_intent_memo(project, observed_at)? {
+            self.manager_intent_note_applied(project, observed_at);
             return Ok(result);
         }
         let pin = self.manager_intent_input_pin()?;
@@ -512,32 +603,51 @@ impl Store {
         if grant.revoked {
             return Ok(result);
         };
+        let mut rejection: Option<String> = None;
         let mut observed = match observed {
             Some(observation)
                 if observation.project == project
                     && observation.manager_session_id == config.manager_session_id
-                    && observation.scope_version == config.row_version
-                    && self.manager_intent_inputs_unchanged(&observation.pin, &[])? =>
+                    && observation.scope_version == config.row_version =>
             {
-                Some(observation)
+                rejection = self.manager_intent_input_change(&observation.pin, &[])?;
+                rejection.is_none().then_some(observation)
             }
-            _ => None,
+            Some(_) => {
+                rejection = Some("appointment_changed".to_owned());
+                None
+            }
+            None => None,
         };
+        if rejection.is_some() && self.defer_rejected_observation(project, observed_at, fallback) {
+            result.observation_rejected = rejection;
+            result.deferred = true;
+            return Ok(result);
+        }
         // #2494: one cohort read serves the question refresh, the epic
         // loop and the resource snapshot of this pass.
         let cohort = match observed.as_mut() {
             Some(observation) => std::mem::take(&mut observation.cohort),
             None => self.manager_v2_cohort(&config)?,
         };
+        // #3518: the refresh commits its own decision writes, so no deferral may
+        // follow it: a deferred pass is strictly write-free (the check above is
+        // the only deferral point) and a refresh that moved an input reads again
+        // below, projecting the new decision into the intent and lifecycle holds
+        // in the same pass.
         result.changed += self.manager_v2_refresh_question_decisions_in(&config, &cohort)?;
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         // The refresh may have written an input: then read again, as before.
         let observed = match observed {
-            Some(observation) if self.manager_intent_inputs_unchanged(&observation.pin, &[])? => {
-                Some(observation)
+            Some(observation) => {
+                rejection = self
+                    .manager_intent_input_change(&observation.pin, &[])?
+                    .map(|reason| format!("after_refresh:{reason}"));
+                rejection.is_none().then_some(observation)
             }
-            _ => None,
+            None => None,
         };
+        result.observation_rejected = rejection;
         let (work, requests, resources) = match observed {
             Some(observation) => (
                 observation.work,
@@ -605,7 +715,14 @@ impl Store {
                 .map(|m| m.session.id)
                 .collect();
             let lead = self.manager_lead(project, epic).ok();
-            let pending_decision = self.manager_v2_decision_gate(&config, epic).is_err();
+            // #3240: the block is named by who can answer it. A read error
+            // fails closed as the operator spelling.
+            let decision_block = self.manager_v2_epic_decision_block(&config, epic);
+            let pending_decision = !matches!(decision_block, Ok(None));
+            let decision_reason = match &decision_block {
+                Ok(Some(block)) if block.answerable_by == "manager" => "pending_manager_decision",
+                _ => "pending_operator_decision",
+            };
             self.manager_v2_intent_hold(
                 &config,
                 ManagerActionHoldReasonV2::Decision,
@@ -660,7 +777,12 @@ impl Store {
                 );
             } else if pending_decision {
                 state["state"] = json!("blocked");
-                state["reason"] = json!("pending_operator_decision");
+                state["reason"] = json!(decision_reason);
+                if let Ok(Some(block)) = &decision_block {
+                    state["decision_key"] = json!(block.key);
+                    state["answerable_by"] = json!(block.answerable_by);
+                    state["summary"] = json!(block.question);
+                }
             } else if grant.policy.mode == ManagerOperatingModeV2::Status {
                 state["state"] = json!("status_only");
             } else if !active.is_empty() {
@@ -687,31 +809,48 @@ impl Store {
                 // is `stale_lead` whatever old wake it still owns.
                 lead.status == SessionStatus::Completed
                     && !self.manager_v2_lead_stale(&config, lead).unwrap_or(false)
-            }) && let Some(bound) = self.owner_result_wake_bound(
-                lead.id,
-                chrono::Duration::seconds(PARKED_WAKE_HORIZON_SECS),
-                observed_at,
-            )? {
-                // A completed provider turn with a bounded own wake is parked,
-                // not idle work requiring another recovery owner. Preserve
-                // genuine operator/daemon holds even while a wake is armed.
+            }) && let Some(parking) =
+                self.manager_v2_lead_parking(lead.id, observed_at)?
+            {
+                // A completed provider turn with a bounded own wake, an open job
+                // or a live queue entry the daemon will wake it for is parked,
+                // not idle work requiring another recovery owner (#3896): no
+                // recovery resume and nothing counted against the budget.
+                // Preserve genuine operator/daemon holds even while parked.
                 // #3209: a wake nothing bounds (a predicate without a deadline,
                 // past the horizon) may never fire, so it is not "parked": the
                 // manager is told, naming the wake.
                 match self.manager_action_operator_gate(lead.id) {
-                    Ok(()) => match bound {
-                        ResultWakeBound::Bounded(_) => {
+                    Ok(()) => match parking {
+                        LeadParking::Wake(ResultWakeBound::Bounded(_)) => {
                             state["state"] = json!("parked");
+                            state["parked_on"] = json!("wake");
                             state["reason"] = json!(with_overdue_requests(
                                 "lead parked on its own wakes; it will see pending requests on its next wake",
                                 &state,
                             ));
                         }
-                        ResultWakeBound::Unbounded {
+                        LeadParking::Job => {
+                            state["state"] = json!("parked");
+                            state["parked_on"] = json!("job");
+                            state["reason"] = json!(with_overdue_requests(
+                                "lead parked on its own open job; it will see pending requests when the job settles",
+                                &state,
+                            ));
+                        }
+                        LeadParking::Queue => {
+                            state["state"] = json!("parked");
+                            state["parked_on"] = json!("queue");
+                            state["reason"] = json!(with_overdue_requests(
+                                "lead parked on its own rolling-queue entry; it will see pending requests when the entry settles",
+                                &state,
+                            ));
+                        }
+                        LeadParking::Wake(ResultWakeBound::Unbounded {
                             wake_id,
                             predicate,
                             armed_at,
-                        } => {
+                        }) => {
                             state["state"] = json!("blocked");
                             state["reason"] = json!(with_overdue_requests(
                                 "lead_parked_on_unbounded_wake",
@@ -864,15 +1003,38 @@ impl Store {
             )?);
             tx.commit()?;
         }
+        self.finish_intent_pass(project, pin, stale_leads, observed_at, valid_until, &result)?;
+        Ok(result)
+    }
+
+    /// The tail of a successful pass. Every fallible check runs before the
+    /// completion time is published (#3519): a pass that returns `Err` is not a
+    /// completed pass and must not extend the window that bounds deferral.
+    fn finish_intent_pass(
+        &self,
+        project: Uuid,
+        pin: Option<IntentInputPin>,
+        stale_leads: Vec<Uuid>,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        valid_until: chrono::DateTime<chrono::Utc>,
+        result: &ManagerIntentReconciliationV2,
+    ) -> Result<()> {
         // Do not publish a memo after writes (including our own projections
         // and admissions), concurrent commits, errors, or an outer transaction
         // that could roll back. The next pass must observe those effects.
-        if let Some(pin) = pin
-            && result.changed == 0
-            && result.queued == 0
-            && self.conn.is_autocommit()
-            && self.manager_intent_inputs_unchanged(&pin, &stale_leads)?
-        {
+        let memo_pin = match pin {
+            Some(pin)
+                if result.changed == 0
+                    && result.queued == 0
+                    && self.conn.is_autocommit()
+                    && self.manager_intent_inputs_unchanged(&pin, &stale_leads)? =>
+            {
+                Some(pin)
+            }
+            _ => None,
+        };
+        self.manager_intent_note_applied(project, observed_at);
+        if let Some(pin) = memo_pin {
             self.manager_intent_idle.borrow_mut().remember(
                 project,
                 pin,
@@ -882,7 +1044,23 @@ impl Store {
                 result.clone(),
             );
         }
-        Ok(result)
+        Ok(())
+    }
+
+    /// #3486: whether a pass whose offered observation was rejected is skipped
+    /// rather than read again under the caller's guard.
+    fn defer_rejected_observation(
+        &self,
+        project: Uuid,
+        at: chrono::DateTime<chrono::Utc>,
+        fallback: ObservationFallback,
+    ) -> bool {
+        match fallback {
+            ObservationFallback::ReadUnderLock => false,
+            ObservationFallback::DeferWithin(window) => {
+                self.manager_intent_applied_within(project, at, window)
+            }
+        }
     }
 
     /// Newest of the lead row's own update stamp and its last conversation
@@ -910,6 +1088,42 @@ impl Store {
         lead: &rsi_common::types::Session,
     ) -> Result<bool> {
         Ok(self.manager_v2_lead_last_activity(lead)? < config.updated_at)
+    }
+
+    /// #3896: what the daemon will wake the Completed lead for. A bounded own
+    /// wake, an open job it owns (the worker roster's `parked_on_job`) or a
+    /// live rolling-queue entry that names it as the wake session each count as
+    /// parked, in that order; an unbounded wake only when none of them holds,
+    /// so a lead that also has a job or entry in flight is not reported blocked.
+    /// This reads `agent_jobs` and `rolling_queue_entries`, which are not memo
+    /// inputs (#2939): a job or entry settling writes the lead's wake row or its
+    /// session, and the memo's backstop bounds any other change.
+    fn manager_v2_lead_parking(
+        &self,
+        lead: Uuid,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<LeadParking>> {
+        let wake = self.owner_result_wake_bound(
+            lead,
+            chrono::Duration::seconds(PARKED_WAKE_HORIZON_SECS),
+            now,
+        )?;
+        if let Some(bound @ ResultWakeBound::Bounded(_)) = wake {
+            return Ok(Some(LeadParking::Wake(bound)));
+        }
+        if self.owner_running_job_has_completion_wake(lead)? {
+            return Ok(Some(LeadParking::Job));
+        }
+        let queued: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rolling_queue_entries
+              WHERE wake_session_id=?1 AND state IN ('queued','admitted','gating'))",
+            params![lead.to_string()],
+            |row| row.get(0),
+        )?;
+        if queued {
+            return Ok(Some(LeadParking::Queue));
+        }
+        Ok(wake.map(LeadParking::Wake))
     }
 
     fn manager_v2_pending_intent_actions(
@@ -978,6 +1192,9 @@ impl Store {
         // an unbounded root policy still cannot select a launch automatically.
         let mut choices =
             self.manager_effective_launches(config, &grant.policy.allowed_launches)?;
+        // #3417: a provider grant's any-model entry names no launchable model,
+        // so recovery never selects it.
+        choices.retain(|choice| !choice.is_provider_wide());
         if choices.is_empty() {
             return Err(refused("manager_v2_intent_launch_allowlist_required"));
         }

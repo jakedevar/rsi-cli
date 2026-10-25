@@ -20,7 +20,6 @@ use rsi_common::types::{
 use rsi_graph::data::{NodeData, Value as GraphValue};
 use rsi_graph::format::{EdgeDef, NodeDef, RepeatPolicy, WorkflowDefinition};
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::error::{DaemonError, Result};
@@ -85,6 +84,8 @@ struct World {
     sessions: HashMap<Uuid, FakeSession>,
     /// `(dedup_key, session_id, base_commit)` per real launch.
     launches: Vec<(String, Uuid, String)>,
+    /// #3222: the explicit title each real launch carried, by session.
+    launch_titles: HashMap<Uuid, Option<String>>,
     interrupts: Vec<Uuid>,
     /// #3038: node sessions whose open jobs a cancelling execution stopped.
     job_cancels: Vec<Uuid>,
@@ -177,7 +178,7 @@ const FAKE_PGID: i32 = 4242;
 
 pub(super) struct Fake {
     world: Arc<StdMutex<World>>,
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     allocator: SandboxAllocator,
     enabled: AtomicBool,
     published: StdMutex<Vec<GraphExecutionUpdate>>,
@@ -414,7 +415,28 @@ impl NodeEffects for Fake {
     }
 
     async fn launch(&self, request: LaunchRequest) -> Result<Uuid> {
+        // Exercise the production admission predicate when a fixture supplies
+        // provider telemetry, including account-switch invalidation (#3568).
+        if let Some(provider) = request.config.provider
+            && self
+                .store
+                .lock()
+                .await
+                .provider_usage_window_hold_until(provider, chrono::Utc::now())?
+                .is_some()
+        {
+            return Err(DaemonError::PolicyDenied(
+                crate::provider_exhaustion::PROVIDER_USAGE_WINDOW_REFUSAL_CODE.into(),
+            ));
+        }
+
         if let Some(code) = *self.capacity_refusal.lock().unwrap() {
+            if code == "restart_drain" {
+                return Err(crate::deploy_drain::restart_drain_error());
+            }
+            if code == "deploy_draining" {
+                return Err(crate::deploy_drain::draining_error());
+            }
             if code == "provider_usage_window" {
                 // The manager policy gate's plan-window refusal (#3066).
                 return Err(DaemonError::PolicyDenied(format!(
@@ -451,6 +473,9 @@ impl NodeEffects for Fake {
         world
             .launches
             .push((key, request.session_id, request.fork.commit().to_owned()));
+        world
+            .launch_titles
+            .insert(request.session_id, request.config.title.clone());
         world.sessions.insert(
             request.session_id,
             FakeSession {
@@ -963,6 +988,17 @@ impl Harness {
         rows::current_row_version(&store, execution_id).unwrap()
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+    pub(super) fn launch_title(&self, session_id: Uuid) -> Option<String> {
+        self.world
+            .lock()
+            .unwrap()
+            .launch_titles
+            .get(&session_id)
+            .cloned()
+            .flatten()
+    }
+
     pub(super) fn launches(&self) -> Vec<(String, Uuid, String)> {
         self.world.lock().unwrap().launches.clone()
     }
@@ -1079,13 +1115,26 @@ impl Harness {
     /// #2651: the node's agent changes nothing and hands off
     /// `already_satisfied` naming `evidence`.
     pub(super) fn complete_already_satisfied(&self, session_id: Uuid, evidence: &str) {
+        self.complete_already_satisfied_with(
+            session_id,
+            evidence,
+            "summary:\n- AC1: the three tests pass on the base (crates/x/src/lib.rs:10)\ntests:\n- cargo test -p x: ok 3/3\n",
+        );
+    }
+
+    /// [`Self::complete_already_satisfied`] with an explicit handoff `body` (#3772).
+    pub(super) fn complete_already_satisfied_with(
+        &self,
+        session_id: Uuid,
+        evidence: &str,
+        body: &str,
+    ) {
         let mut world = self.world.lock().unwrap();
         let session = world.sessions.get_mut(&session_id).unwrap();
         session.status = SessionStatus::Completed;
         session.content = format!(
             "PIPELINE HANDOFF — IMPLEMENTATION:\ndoc_path: inline\nmanifest_path: inline\n\
-             status: already_satisfied\nevidence_commit: {evidence}\n\
-             summary: the three tests pass on the base\ntests: cargo test -p x ok 3/3\n"
+             status: already_satisfied\nevidence_commit: {evidence}\n{body}"
         );
     }
 
@@ -1332,7 +1381,7 @@ impl Harness {
 fn boot(db: &Path, sandboxes: &Path, world: &Arc<StdMutex<World>>) -> Executor<Fake> {
     let store = Store::open_test_fixture(db).unwrap();
     let boot_id = store.program_run_boot_id();
-    let store = Arc::new(Mutex::new(store));
+    let store = Arc::new(rsid_core::store_lock::Mutex::new(store));
     let fake = Fake {
         world: Arc::clone(world),
         store: Arc::clone(&store),
@@ -2345,6 +2394,34 @@ async fn restart_lease_claim_launches_no_node_session() {
     assert_eq!(harness.launches().len(), 1);
 }
 
+/// #3222: a node session launches with the deterministic title
+/// `<node> #<issue>: <issue title>`, not a model summary of its query.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn node_session_launches_with_deterministic_title() {
+    let harness = Harness::new();
+    let execution = harness
+        .start_with_input(
+            workflow(&["A"], &[]),
+            serde_json::json!({"issue": {
+                "display_number": 3222,
+                "title": "kaizen: topology node titles",
+                "body": "Untrusted copied Issue data",
+                "project_id": Uuid::new_v4(),
+            }}),
+        )
+        .await;
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let launched = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(
+        harness.launch_title(launched.session_id),
+        Some("A #3222: kaizen: topology node titles".to_owned())
+    );
+}
+
 /// T2-A1: a restart adopts the running node session instead of relaunching,
 /// including a crash between the launch and the `running` record.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -3194,6 +3271,92 @@ async fn provider_usage_window_refusal_holds_node_reserved_then_launches() {
     let launched = harness.attempt(execution, "A", 0, 1).await;
     assert_eq!(launched.status, AttemptStatus::Running);
     assert_eq!(harness.launches().len(), 1);
+}
+
+/// #3426: a launch refused by a restart or deploy drain is a hold, never a node
+/// failure: the first launch stays `Reserved` with one
+/// `admission_hold{restart_drain}` event, charges no attempt, and launches once
+/// the drain is over.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_drain_refusal_holds_first_launch_then_launches() {
+    for code in ["restart_drain", "deploy_draining"] {
+        let harness = Harness::new();
+        let effects = Arc::clone(&harness.executor.effects);
+        *effects.capacity_refusal.lock().unwrap() = Some(code);
+        let execution = harness.start(workflow(&["A"], &[])).await;
+        for _ in 0..6 {
+            assert_eq!(
+                harness.executor.advance(execution).await.unwrap(),
+                Step::Wait
+            );
+            let attempts = harness.attempts(execution).await;
+            assert_eq!(attempts.len(), 1, "held, never failed or re-reserved");
+            assert_eq!(attempts[0].status, AttemptStatus::Reserved);
+            assert_eq!(attempts[0].failure_class, None);
+            assert!(harness.launches().is_empty());
+        }
+        assert_eq!(event_count(&harness, execution, "admission_hold").await, 1);
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Running
+        );
+
+        *effects.capacity_refusal.lock().unwrap() = None;
+        harness.executor.advance(execution).await.unwrap();
+        assert_eq!(
+            harness.attempt(execution, "A", 0, 1).await.status,
+            AttemptStatus::Running
+        );
+        assert_eq!(harness.launches().len(), 1);
+    }
+}
+
+/// #3426: the #2549 preserved-work retry launched while the new daemon is
+/// itself draining stays `Reserved` (no failed node, no failed execution, no
+/// charged attempt) and launches after the drain.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn restart_drain_refusal_holds_the_preserved_work_retry() {
+    let mut harness = Harness::new();
+    let execution = harness.start(workflow(&["implement"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let first = harness.attempt(execution, "implement", 0, 1).await;
+    let sandbox = harness.sandbox(first.session_id);
+    std::fs::write(sandbox.join("partial.txt"), "unsaved work\n").unwrap();
+    harness.restart();
+    harness.set_status(first.session_id, SessionStatus::Interrupted);
+    harness.set_stop_reason(first.session_id, "interrupted:deploy_drain");
+    let effects = Arc::clone(&harness.executor.effects);
+    *effects.capacity_refusal.lock().unwrap() = Some("restart_drain");
+    recover_after_restart(&harness.executor, 8, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+
+    let preserved = harness.attempt(execution, "implement", 0, 1).await;
+    assert_eq!(preserved.status, AttemptStatus::Interrupted);
+    let commit = preserved.preserved_commit.clone().unwrap();
+    let second = harness.attempt(execution, "implement", 0, 2).await;
+    assert_eq!(second.status, AttemptStatus::Reserved, "held, not failed");
+    assert_eq!(second.failure_class, None);
+    assert_eq!(second.base_commit, commit);
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Running
+    );
+    assert_eq!(event_count(&harness, execution, "admission_hold").await, 1);
+
+    *effects.capacity_refusal.lock().unwrap() = None;
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(
+        harness.attempt(execution, "implement", 0, 2).await.status,
+        AttemptStatus::Running
+    );
+    assert_eq!(
+        harness.attempts(execution).await.len(),
+        2,
+        "no extra attempt"
+    );
 }
 
 /// #1641 S4b: an operator execution's first launch starts when asked, but its
@@ -5356,6 +5519,60 @@ async fn review_unsettled_retries_once_then_blocks() {
     );
 }
 
+/// #3640: a review whose allocation launch ended in the catch-all keeps the
+/// launch's own reason on a typed `review_launch_refused` class (not a bare
+/// `review_unsettled`), with the same one-retry-then-block budget, and a usable
+/// verdict on the replacement still completes the review.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_review_launch_refusal_is_typed_and_keeps_the_retry_budget() {
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.script_reviews([
+        ReviewScript::Unsettled(
+            "manager_v2_lifecycle_unconfirmed: injected provider launch refusal",
+        ),
+        ReviewScript::Unsettled(
+            "manager_v2_lifecycle_unconfirmed: injected provider launch refusal",
+        ),
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let first = harness.attempt(execution, "Review", 0, 1).await;
+    let second = harness.attempt(execution, "Review", 0, 2).await;
+    assert_eq!(first.status, AttemptStatus::Failed);
+    assert_eq!(second.status, AttemptStatus::Blocked);
+    for attempt in [&first, &second] {
+        assert_eq!(
+            attempt.failure_class.as_deref(),
+            Some(rows::failure::REVIEW_LAUNCH_REFUSED)
+        );
+        assert!(
+            attempt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("injected provider launch refusal")),
+            "the attempt keeps the launch's own reason: {:?}",
+            attempt.error
+        );
+    }
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+
+    let harness = Harness::new();
+    let execution = harness.start(review_loop(2, 3)).await;
+    harness.script_reviews([
+        ReviewScript::Unsettled("manager_v2_lifecycle_unconfirmed"),
+        ReviewScript::Accept,
+    ]);
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    assert_eq!(
+        harness.attempt(execution, "Review", 0, 2).await.status,
+        AttemptStatus::Succeeded
+    );
+}
+
 /// #2280: a reviewer that ended `blocked` (the host was full) is retried only
 /// after a backoff, so the retry budget is not spent in the same instant.
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -5937,6 +6154,9 @@ async fn review_request_marks_missing_foreign_stale_failed_and_warning_receipts_
         "failed",
         "warnings",
         "no_receipt",
+        "candidate_tool",
+        "sandbox_tool",
+        "legacy_tool",
     ] {
         let harness = Harness::new();
         let execution = harness.start(review_loop(2, 3)).await;
@@ -5966,6 +6186,19 @@ async fn review_request_marks_missing_foreign_stale_failed_and_warning_receipts_
             if case == "no_receipt" {
                 result = serde_json::json!({"exit_code": 0});
             }
+            if matches!(case, "candidate_tool" | "sandbox_tool" | "legacy_tool") {
+                // Receipt claims cannot replace the daemon's launch stamp.
+                result["receipt"]["tool"] = serde_json::json!({"source":"rolling"});
+                match case {
+                    "candidate_tool" => {
+                        result["scoped_tool"]["source"] = serde_json::json!("candidate")
+                    }
+                    "sandbox_tool" => {
+                        result["scoped_tool"]["source"] = serde_json::json!("sandbox")
+                    }
+                    _ => result["scoped_tool"] = serde_json::Value::Null,
+                }
+            }
             scoped_test_job(&harness, owner, state, result).await;
         }
         harness.executor.advance(execution).await.unwrap();
@@ -5979,6 +6212,17 @@ async fn review_request_marks_missing_foreign_stale_failed_and_warning_receipts_
         };
         assert_eq!(snapshot["trust"], expected, "{case}");
         assert!(snapshot["reason"].is_string(), "{case}");
+        if matches!(case, "candidate_tool" | "sandbox_tool" | "legacy_tool") {
+            assert_eq!(snapshot["reason"], "candidate_tool_untrusted", "{case}");
+        }
+        assert!(
+            requests[0]
+                .1
+                .query
+                .contains("trust: trusted_with_baseline_reds")
+                && requests[0].1.query.contains("tracked baseline red"),
+            "{case}: the brief names the accepted baseline reds"
+        );
         assert!(
             requests[0]
                 .1
@@ -6230,6 +6474,130 @@ async fn land_enqueues_once_and_mirrors_published() {
         rows::ExecutionStatus::Succeeded
     );
     assert_eq!(harness.land_requests().len(), 1);
+}
+
+/// #3358: a queued entry replaced in place by a descendant source keeps its
+/// position and wake, so the waiting land node follows the successor (one
+/// `land_entry_followed` event, no repair round, no second enqueue) and settles
+/// on its outcome instead of failing `land_refused`.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_follows_a_superseding_entry_and_publishes_on_its_landing_3358() {
+    let harness = Harness::new();
+    let (execution, land) = land_waiting(&harness).await;
+    let first = land.land_entry_id.unwrap();
+    let second = Uuid::new_v4();
+    let third = Uuid::new_v4();
+
+    // Superseded, successor still queued: the node follows and keeps waiting.
+    harness.set_land_state(first, LandStatus::Superseded { successor: second });
+    harness.set_land_state(second, LandStatus::Pending);
+    assert_eq!(
+        harness.executor.advance(execution).await.unwrap(),
+        Step::Wait
+    );
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Waiting);
+    assert_eq!(land.land_entry_id, Some(second));
+
+    // The successor is itself replaced: the node follows the chain.
+    harness.set_land_state(second, LandStatus::Superseded { successor: third });
+    harness.set_land_state(
+        third,
+        LandStatus::Published {
+            landed_sha: Some("e".repeat(40)),
+        },
+    );
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Succeeded);
+    assert_eq!(land.land_entry_id, Some(third));
+    let output = land.output.unwrap();
+    assert_eq!(output["fields"]["state"], "published");
+    assert_eq!(output["fields"]["landed_sha"], "e".repeat(40));
+    assert_eq!(output["fields"]["entry_id"], third.to_string());
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Succeeded
+    );
+    // One land attempt and one enqueue: no repair round.
+    assert_eq!(harness.land_requests().len(), 1);
+    assert!(
+        harness
+            .attempts(execution)
+            .await
+            .iter()
+            .all(|a| a.node_id != "Land" || a.attempt_no == 1)
+    );
+    let followed = {
+        let store = harness.executor.store.lock().await;
+        let events: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM topology_events WHERE execution_id=?1 AND kind='land_entry_followed'",
+                [execution.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        events
+    };
+    assert_eq!(followed, 2);
+}
+
+/// #3358: only an entry replaced in place carries a successor; a cancel
+/// (no `superseded_by`) still mirrors as a refusal.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[test]
+fn queue_supersession_maps_to_a_followable_status_only_with_a_successor_3358() {
+    use rsi_common::rolling_queue::{
+        QUEUE_ENTRY_CANCELLED, QUEUE_ENTRY_SUPERSEDED, RollingQueueEntryState, RollingQueueOutcome,
+    };
+    let successor = Uuid::new_v4();
+    let replaced = RollingQueueOutcome {
+        refusal: Some(QUEUE_ENTRY_SUPERSEDED.into()),
+        superseded_by: Some(successor),
+        ..RollingQueueOutcome::default()
+    };
+    assert_eq!(
+        LandStatus::from_queue(RollingQueueEntryState::Superseded, Some(replaced)),
+        LandStatus::Superseded { successor }
+    );
+    let cancelled = RollingQueueOutcome {
+        refusal: Some(QUEUE_ENTRY_CANCELLED.into()),
+        ..RollingQueueOutcome::default()
+    };
+    assert!(matches!(
+        LandStatus::from_queue(RollingQueueEntryState::Superseded, Some(cancelled)),
+        LandStatus::Refused { .. }
+    ));
+}
+
+/// #3358: a successor that is refused still fails the land node on that
+/// outcome (the follow is not a retry or a success).
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn land_follows_a_superseding_entry_and_fails_on_its_refusal_3358() {
+    let harness = Harness::new();
+    let (execution, land) = land_waiting(&harness).await;
+    let first = land.land_entry_id.unwrap();
+    let second = Uuid::new_v4();
+    harness.set_land_state(first, LandStatus::Superseded { successor: second });
+    harness.set_land_state(
+        second,
+        LandStatus::Refused {
+            state: "refused".into(),
+            reason: "queue_test_failed".into(),
+        },
+    );
+    assert_eq!(harness.run_to_end(execution).await, Step::Done);
+    let land = harness.attempt(execution, "Land", 0, 1).await;
+    assert_eq!(land.status, AttemptStatus::Failed);
+    assert_eq!(
+        land.failure_class.as_deref(),
+        Some(rows::failure::LAND_REFUSED)
+    );
+    assert!(land.error.unwrap().contains("queue_test_failed"));
+    assert_eq!(land.land_entry_id, Some(second));
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
@@ -6734,14 +7102,12 @@ pub(super) async fn scoped_test_job(
             chrono::Utc::now(),
         )
         .unwrap();
+    let result: rsi_common::agent_jobs::AgentJobResultV1 = serde_json::from_value(result).unwrap();
+    if let Some(provenance) = &result.scoped_tool {
+        store.record_agent_job_scoped_tool(id, provenance).unwrap();
+    }
     store
-        .settle_agent_job(
-            id,
-            state,
-            &serde_json::from_value(result).unwrap(),
-            false,
-            chrono::Utc::now(),
-        )
+        .settle_agent_job(id, state, &result, false, chrono::Utc::now())
         .unwrap();
     id
 }
@@ -6749,6 +7115,8 @@ pub(super) async fn scoped_test_job(
 pub(super) fn green_receipt(head: &str) -> serde_json::Value {
     serde_json::json!({
         "exit_code": 0, "failing_tests": [], "refusal": null,
+        "scoped_tool": {"source":"rolling", "path":"/daemon/tool/scripts/scoped-test", "rev":head,
+            "files":[{"path":"/daemon/tool/scripts/scoped-test", "blob":"a".repeat(40)}]},
         "receipt": {"schema": 1, "base": "origin/rolling", "head": head, "ok": true,
             "exit_code": 0, "plan": "precise", "failures": [], "packages": []},
     })
@@ -6757,6 +7125,8 @@ pub(super) fn green_receipt(head: &str) -> serde_json::Value {
 fn red_receipt(head: &str, tests: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "exit_code": 1, "refusal": null,
+        "scoped_tool": {"source":"rolling", "path":"/daemon/tool/scripts/scoped-test", "rev":head,
+            "files":[{"path":"/daemon/tool/scripts/scoped-test", "blob":"a".repeat(40)}]},
         "failing_tests": tests.iter().map(|test| format!("rsid {test}")).collect::<Vec<_>>(),
         "receipt": {"schema": 1, "base": "origin/rolling", "head": head, "ok": false,
             "exit_code": 1, "plan": "targeted_subset",
@@ -7681,6 +8051,7 @@ fn insert_owned_job(db: &Path, owner: Uuid, wake: rsi_common::agent_jobs::JobWak
                 project_id: None,
                 name: Some("scoped-test".into()),
                 params: JobParams::Build(BuildJobParams {
+                    release_members: Vec::new(),
                     command: BuildCommand::Check,
                     package: None,
                     workspace: true,
@@ -7689,6 +8060,7 @@ fn insert_owned_job(db: &Path, owner: Uuid, wake: rsi_common::agent_jobs::JobWak
                     no_default_features: false,
                     features: Vec::new(),
                     shards: Vec::new(),
+                    bins: Vec::new(),
                     cpu_quota_percent: None,
                     sha: None,
                 }),
@@ -7728,6 +8100,322 @@ fn settle_owned_job(db: &Path, job: Uuid, wake: bool) {
             chrono::Utc::now(),
         )
         .unwrap();
+}
+
+/// #3687: both daemon-held jobs and units waiting inside cargo-slot pause a
+/// parked node. Admission credit persists after the grant and across restart;
+/// actual execution still exhausts the node's budget.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn build_admission_wait_does_not_spend_parked_node_wall_time() {
+    for phase in [
+        None,
+        Some("slot"),
+        Some("artifact-lock"),
+        Some("sandbox-lock"),
+    ] {
+        let mut harness = Harness::new();
+        let execution = harness.start(workflow(&["A"], &[])).await;
+        harness.executor.advance(execution).await.unwrap();
+        let attempt = harness.attempt(execution, "A", 0, 1).await;
+        let job = insert_owned_job(
+            &harness.db,
+            attempt.session_id,
+            rsi_common::agent_jobs::JobWake::None,
+        );
+        arm_job_completion_wake(&harness.db, attempt.session_id, job);
+        end_turn_without_handoff(&harness, attempt.session_id);
+        let now = chrono::Utc::now();
+        let since = now - chrono::Duration::hours(2);
+        let log = harness.db.with_extension("admission.log");
+        {
+            let store = harness.executor.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE topology_node_attempts SET started_at=?2 WHERE id=?1",
+                    rusqlite::params![
+                        attempt.id.to_string(),
+                        (now - chrono::Duration::hours(5))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET state=?2,created_at=?3,started_at=?4,log_path=?5,\
+                 params_json=json_set(params_json,'$.held','held_for_capacity') WHERE id=?1",
+                    rusqlite::params![
+                        job.to_string(),
+                        if phase.is_some() { "running" } else { "queued" },
+                        since.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                        phase.map(|_| since.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)),
+                        log.to_str().unwrap()
+                    ],
+                )
+                .unwrap();
+            let wake = store
+                .owner_armed_result_wake(attempt.session_id)
+                .unwrap()
+                .unwrap();
+            let mut state = store.wake_when_state(wake).unwrap().unwrap();
+            state.armed_at = since;
+            store.set_wake_when_state_for_test(wake, &state).unwrap();
+        }
+        if let Some(phase) = phase {
+            std::fs::write(
+                &log,
+                format!(
+                    "rsi-phase {} {phase}-wait: busy\nrsi-phase {} {phase}-wait: still waiting\n",
+                    since.timestamp(),
+                    (since + chrono::Duration::minutes(30)).timestamp(),
+                ),
+            )
+            .unwrap();
+        }
+        // First observation is already past the wall limit. Recover the real
+        // admission start, rather than starting the pause at this observation.
+        harness.executor.advance(execution).await.unwrap();
+        harness.executor.advance(execution).await.unwrap();
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Running
+        );
+        assert_eq!(
+            harness.attempt(execution, "A", 0, 1).await.status,
+            AttemptStatus::Running
+        );
+        assert!(harness.interrupts().is_empty());
+
+        // Restart while the admission interval is open, then grant the slot.
+        // An hour of that admission wait also belongs to the daemon gap:
+        // credit it once, rather than extending the budget twice.
+        {
+            let store = harness.executor.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE topology_node_attempts SET updated_at=?2 WHERE id=?1",
+                    rusqlite::params![
+                        attempt.id.to_string(),
+                        (now - chrono::Duration::hours(1))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        }
+        harness.restart();
+        harness.executor.advance(execution).await.unwrap();
+        {
+            let store = harness.executor.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE agent_jobs SET state='running',started_at=?2 WHERE id=?1",
+                    rusqlite::params![
+                        job.to_string(),
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        }
+        if let Some(phase) = phase {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new().append(true).open(&log).unwrap(),
+                "rsi-phase {} {}: running",
+                chrono::Utc::now().timestamp(),
+                if phase == "slot" {
+                    "slot-granted"
+                } else if phase == "artifact-lock" {
+                    "artifact-lock-held"
+                } else {
+                    "sandbox-lock-held"
+                },
+            )
+            .unwrap();
+        }
+        harness.executor.advance(execution).await.unwrap();
+        harness.restart();
+        harness.executor.advance(execution).await.unwrap();
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Running
+        );
+        // Ninety more minutes of actual runtime exceed the budget despite the
+        // still-armed jobs-terminal wake and the now-running job.
+        {
+            let store = harness.executor.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE topology_node_attempts SET started_at=?2 WHERE id=?1",
+                    rusqlite::params![
+                        attempt.id.to_string(),
+                        (now - chrono::Duration::minutes(390))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        }
+        harness.executor.advance(execution).await.unwrap();
+        assert_eq!(
+            harness
+                .attempt(execution, "A", 0, 1)
+                .await
+                .failure_class
+                .as_deref(),
+            Some("timeout")
+        );
+        harness.executor.advance(execution).await.unwrap();
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Failed
+        );
+    }
+}
+
+/// #3687: exhausting active runtime with committed or dirty work blocks on a
+/// verified preservation point, usable by the normal attempt resolver.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn timed_out_node_preserves_work_for_attempt_resolution() {
+    for dirty in [false, true] {
+        let harness = Harness::new();
+        let execution = harness.start(workflow(&["A"], &[])).await;
+        harness.executor.advance(execution).await.unwrap();
+        let attempt = harness.attempt(execution, "A", 0, 1).await;
+        harness.commit_while_running(attempt.session_id, "result");
+        let sandbox = harness.sandbox(attempt.session_id);
+        let committed = git(&sandbox, &["rev-parse", "HEAD"]);
+        if dirty {
+            std::fs::write(sandbox.join("pending.txt"), "pending work").unwrap();
+        }
+        {
+            let store = harness.executor.store.lock().await;
+            store
+                .conn
+                .execute(
+                    "UPDATE topology_node_attempts SET started_at=?2 WHERE id=?1",
+                    rusqlite::params![
+                        attempt.id.to_string(),
+                        (chrono::Utc::now() - chrono::Duration::hours(5))
+                            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                    ],
+                )
+                .unwrap();
+        }
+        harness.executor.advance(execution).await.unwrap();
+        harness.executor.advance(execution).await.unwrap();
+        let blocked = harness.attempt(execution, "A", 0, 1).await;
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Blocked
+        );
+        assert_eq!(blocked.status, AttemptStatus::Blocked);
+        assert_eq!(blocked.failure_class.as_deref(), Some("preserved_work"));
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("wall-time limit")
+        );
+        let preserved = blocked.preserved_commit.as_deref().unwrap();
+        if dirty {
+            assert_eq!(
+                git(&sandbox, &["show", &format!("{preserved}:pending.txt")]),
+                "pending work"
+            );
+        } else {
+            assert_eq!(preserved, committed);
+        }
+        let inspected = harness
+            .resolve(
+                execution,
+                blocked.id,
+                TopologyAttemptAction::Inspect,
+                "inspect-timeout",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inspected.report.unwrap().preserved_commit.as_deref(),
+            Some(preserved)
+        );
+        if !dirty {
+            let accepted = harness
+                .resolve(
+                    execution,
+                    blocked.id,
+                    TopologyAttemptAction::Accept,
+                    "accept-timeout",
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(accepted.attempt.status, "succeeded");
+        }
+    }
+}
+
+/// #3687: a worker that keeps running after arming a wake still spends its
+/// budget, even if that wake watches an owned queued job.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn active_node_with_queued_job_still_spends_wall_time() {
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let attempt = harness.attempt(execution, "A", 0, 1).await;
+    let job = insert_owned_job(
+        &harness.db,
+        attempt.session_id,
+        rsi_common::agent_jobs::JobWake::None,
+    );
+    arm_job_completion_wake(&harness.db, attempt.session_id, job);
+    {
+        let store = harness.executor.store.lock().await;
+        let since = chrono::Utc::now() - chrono::Duration::hours(5);
+        store
+            .conn
+            .execute(
+                "UPDATE topology_node_attempts SET started_at=?2 WHERE id=?1",
+                rusqlite::params![
+                    attempt.id.to_string(),
+                    since.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE agent_jobs SET state='queued',started_at=NULL,created_at=?2 WHERE id=?1",
+                rusqlite::params![
+                    job.to_string(),
+                    since.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .unwrap();
+        let wake = store
+            .owner_armed_result_wake(attempt.session_id)
+            .unwrap()
+            .unwrap();
+        let mut state = store.wake_when_state(wake).unwrap().unwrap();
+        state.armed_at = since;
+        store.set_wake_when_state_for_test(wake, &state).unwrap();
+    }
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(
+        harness
+            .attempt(execution, "A", 0, 1)
+            .await
+            .failure_class
+            .as_deref(),
+        Some("timeout")
+    );
 }
 
 /// #2262: `AgentSubmitJob` with the default `wake:"owner"` arms its resume wake
@@ -7998,6 +8686,7 @@ fn arm_job_completion_wake(db: &Path, owner: Uuid, job: Uuid) {
         armed_at: now,
         deadline: None,
         repo_dir: None,
+        delivered_shas: Vec::new(),
     };
     Store::open(db)
         .unwrap()
@@ -8881,4 +9570,152 @@ async fn accept_of_a_preserved_attempt_without_a_matching_receipt_is_refused() {
     let after = harness.attempt(execution, "Impl", 0, 1).await;
     assert_eq!(after.status, AttemptStatus::Blocked);
     assert!(harness.land_requests().is_empty());
+}
+
+/// #3340: a node session that crossed the context cap ends with the baton
+/// marker, which is the node's outcome: its commit is preserved and the node
+/// is relaunched from it with the baton as context, with no format
+/// continuation of the full session. Each continuation is uncharged and
+/// replaces the earlier baton; past the budget the work blocks for a manager.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn context_cap_baton_continues_the_node_from_its_commit_until_the_budget_is_spent() {
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let limit = crate::topology::baton::MAX_CONTEXT_CAP_CONTINUATIONS;
+    for n in 1..=limit {
+        let n_attempt = u32::try_from(n).unwrap();
+        let attempt = harness.attempt(execution, "A", 0, n_attempt).await;
+        let head = harness.commit_and_complete(attempt.session_id, &format!("wip{n}"));
+        harness.complete_with_content(
+            attempt.session_id,
+            &format!(
+                "PIPELINE HANDOFF — BATON {}\nleft: part {n}\nFriction: none",
+                &head[..9]
+            ),
+        );
+        harness.executor.advance(execution).await.unwrap();
+
+        let settled = harness.attempt(execution, "A", 0, n_attempt).await;
+        assert_eq!(settled.status, AttemptStatus::Interrupted);
+        assert_eq!(
+            settled.failure_class.as_deref(),
+            Some(rows::failure::CONTEXT_CAP_CONTINUED)
+        );
+        assert_eq!(settled.preserved_commit.as_deref(), Some(head.as_str()));
+        assert!(rows::failure::is_infrastructure(
+            settled.failure_class.as_deref()
+        ));
+        let next = harness.attempt(execution, "A", 0, n_attempt + 1).await;
+        assert_eq!(next.status, AttemptStatus::Running);
+        assert_eq!(next.base_commit, head, "the node continues from the commit");
+        assert!(
+            next.query()
+                .contains(&format!("Context-cap continuation ({n} of {limit})")),
+            "{}",
+            next.query()
+        );
+        assert!(next.query().contains(&format!("left: part {n}")));
+        assert!(next.query().contains("do A"), "{}", next.query());
+        if n > 1 {
+            assert!(
+                !next.query().contains(&format!("left: part {}", n - 1)),
+                "an earlier baton is replaced, not accumulated"
+            );
+        }
+        assert!(
+            harness.continues().is_empty(),
+            "the full session is not re-prompted to repeat its handoff"
+        );
+        assert_eq!(
+            harness.status(execution).await,
+            rows::ExecutionStatus::Running
+        );
+    }
+
+    // The next baton is past the budget: the work is preserved and blocks.
+    let last_no = u32::try_from(limit).unwrap() + 1;
+    let last = harness.attempt(execution, "A", 0, last_no).await;
+    let head = harness.commit_and_complete(last.session_id, "wip-last");
+    harness.complete_with_content(
+        last.session_id,
+        &format!("PIPELINE HANDOFF — BATON {}\nleft: more", &head[..9]),
+    );
+    harness.executor.advance(execution).await.unwrap();
+    let blocked = harness.attempt(execution, "A", 0, last_no).await;
+    assert_eq!(blocked.status, AttemptStatus::Blocked);
+    assert_eq!(
+        blocked.failure_class.as_deref(),
+        Some(rows::failure::PRESERVED_WORK)
+    );
+    assert_eq!(blocked.preserved_commit.as_deref(), Some(head.as_str()));
+    assert!(
+        blocked
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("context-cap baton")),
+        "{:?}",
+        blocked.error
+    );
+    assert_eq!(
+        harness.status(execution).await,
+        rows::ExecutionStatus::Blocked
+    );
+    assert!(harness.continues().is_empty());
+}
+
+/// #3340: a baton written over uncommitted paths still continues the node:
+/// the paths are snapshotted into the preserved commit instead of blocking.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn context_cap_baton_with_uncommitted_paths_snapshots_them_and_continues() {
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let attempt = harness.attempt(execution, "A", 0, 1).await;
+    std::fs::write(
+        harness.sandbox(attempt.session_id).join("loose.txt"),
+        "half done\n",
+    )
+    .unwrap();
+    harness.complete_with_content(
+        attempt.session_id,
+        "PIPELINE HANDOFF — BATON abc1234\nleft: the rest",
+    );
+    harness.executor.advance(execution).await.unwrap();
+    let settled = harness.attempt(execution, "A", 0, 1).await;
+    assert_eq!(settled.status, AttemptStatus::Interrupted);
+    let commit = settled.preserved_commit.clone().unwrap();
+    assert_eq!(
+        git(&harness.repo, &["show", &format!("{commit}:loose.txt")]),
+        "half done"
+    );
+    let next = harness.attempt(execution, "A", 0, 2).await;
+    assert_eq!(next.base_commit, commit);
+}
+
+/// #3340: the baton is read only when it opens the message; a stage handoff
+/// that merely mentions it, or a quoted marker, keeps the #2584 format path.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn a_message_that_only_mentions_the_baton_marker_is_not_a_baton() {
+    let harness = Harness::new();
+    let execution = harness.start(workflow(&["A"], &[])).await;
+    harness.executor.advance(execution).await.unwrap();
+    let attempt = harness.attempt(execution, "A", 0, 1).await;
+    harness.complete_with_content(
+        attempt.session_id,
+        "I will end with PIPELINE HANDOFF — BATON abc1234 soon",
+    );
+    harness.executor.advance(execution).await.unwrap();
+    assert_eq!(
+        harness.attempt(execution, "A", 0, 1).await.status,
+        AttemptStatus::Running
+    );
+    assert_eq!(harness.continues().len(), 1);
+    assert_eq!(
+        event_count(&harness, execution, "node_handoff_format_continued").await,
+        1
+    );
 }

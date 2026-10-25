@@ -39,7 +39,8 @@ test('questionKey changes only when the request changes', () => {
 
 test('pauseLabel', () => {
   assert.equal(pauseLabel('none'), '');
-  assert.equal(pauseLabel('hard'), 'hard pause');
+  assert.equal(pauseLabel('hard'), 'Paused until you resume');
+  assert.equal(pauseLabel('soft'), 'Stopped; a manager may restart it');
 });
 
 test('attention sessions sort to the top of the list', () => {

@@ -129,7 +129,7 @@ impl Drop for ColdArchiveRunGuard {
 /// it to (a supervised restart is draining); it opens every SQLite handle it
 /// uses itself and has dropped them all when this returns.
 fn run_pass_blocking(
-    store: &Arc<tokio::sync::Mutex<crate::store::Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
     database_path: &Path,
     run_id: Uuid,
     mode: ColdMode,

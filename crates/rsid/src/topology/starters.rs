@@ -16,6 +16,12 @@
 //!   head the queue refuses `land_requires_review` takes the same route out of
 //!   `land_repair` (#2699): `repair_review` reviews the exact repair head,
 //!   `repair_fix` fixes within the loop bound, `repair_land` lands what was accepted.
+//!   A refused or cancelled `pre_land` takes `pre_land_repair_1..3`, each
+//!   followed by a focused `pre_land_review_N` and `pre_land_N`. The review
+//!   opts into `review_repair_delta`: only a verified repair of a failed,
+//!   already reviewed source qualifies. Proven clean rolling merges reuse
+//!   that acceptance; any code or conflict resolution gets a delta review.
+//!   The third refusal fails with its queue detail; no cycle extends the cap.
 //!   A repaired head the queue refuses again (rolling advanced in the same file
 //!   while it waited, #2892) is repaired again by `repair_2` -> `land_repair_2`,
 //!   then `repair_3` -> `land_repair_3`: three repairs in all, each its own
@@ -43,8 +49,12 @@
 //! wrote, and an operator update rewrites `definition_json` without touching
 //! it. Any other row is kept, logged `starter_drift` with both digests and
 //! flagged `starter_drift` on `AgentTopologyList` (#2660). Private manager/Epic
-//! rows are never adopted by the seeder, so their names cannot hide the shared
-//! fixed-ID starter and their definitions remain untouched (hub #3157).
+//! rows are never adopted or rewritten by the seeder, so their names cannot
+//! hide the shared fixed-ID starter (hub #3157). The one exception is a private
+//! row whose text is exactly an older shipped definition (`SHIPPED_BEFORE`): it
+//! is an unedited stale seed that would shadow the current shared starter by
+//! name, so the seeder archives it (hub #3257). Edited private rows and private
+//! copies of the current text stay.
 //!
 //! Every topology digest is taken over the canonical (key-sorted) definition
 //! text (`store::definition_digest`, #2693), so `validate_only`, the stored
@@ -184,8 +194,8 @@ pub(crate) fn canonical_digest(text: &str) -> Option<String> {
 /// shipped definition; private manager/Epic rows are left untouched. A change
 /// to a starter's JSON appends the digest it replaces here (the value its test pin held) and moves that pin in `starters_tests.rs`
 /// to the new canonical digest (the failing fixture test prints it).
-/// `tools/check_starter_pins.py` (the `starter_pins` static guard of
-/// `scripts/scoped-test`, also run by the pre-push hook) refuses a changed
+/// The `starter_pins` static guard (`scripts/repo-guard starter-pins`, crate
+/// `rsi-repo-guards`; run by `scripts/scoped-test` and the pre-push hook) refuses a changed
 /// starter JSON whose two pins did not move together, before any test runs
 /// (#3070).
 pub(crate) const SHIPPED_BEFORE: &[(&str, &[&str])] = &[
@@ -197,6 +207,7 @@ pub(crate) const SHIPPED_BEFORE: &[(&str, &[&str])] = &[
             "sha256:65f9c4dffe623fd578bc5ce81786c0ab64f0590b583d2759a2278e7fec1daa6d",
             "sha256:afc8726c358fee100f0da6a7a56dadadccbae4d6cc721f3f584e101b347c96cf",
             "sha256:61013886be5913c6923de5df843ad6f099b28f4d389c3d9d1da301e8d7ebb442",
+            "sha256:960c08847f32fada6c1a72d68aaf5b11c6a00f3cd39b9f013e4bb95e4be76d51",
         ],
     ),
     (
@@ -215,6 +226,17 @@ pub(crate) const SHIPPED_BEFORE: &[(&str, &[&str])] = &[
             "sha256:4d65b01f2d56950870db728ec930bafc911fabcad2921ed74b9a2ad1e9163d0d",
             "sha256:beece521a509608557056ab773588e8d6a67b71c85933e33af49053d34ca85b7",
             "sha256:e7039d2be6ef42a12aaf009a98f4436fe1003badd4a50e8dd9a030f5678bd37b",
+            "sha256:4d63a05f378390ad5ea1a785891d5653148fd5fff891e3056d28fe0f22704ef7",
+            "sha256:1bb617206fb48ca19644d587bb6d6b2f799912b2f2da11ddf708d16bb86ea38e",
+            "sha256:22d537b8a3a6f47186d7ccdec70d505094bfe166462f3419c329d02909cb5e68",
+            "sha256:6591a7d987cd8af0ebc9b42d6661552b95f2e8c69f8e3f8d64d4d7e52b78cf04",
+            "sha256:12008cc5d8f9a89525427b240627251b718cd8c23d133f30077d9a2d3e47eff4",
+            "sha256:659b75440a11479e0a2f131975d1b98752eb7668efb8639140260bea0f2dfd63",
+            "sha256:f94b796362617379d62e73f676d6670bf4031bfb189656d4f872d824e228f263",
+            "sha256:71a4c3b615d222a831f52a9fa94ef4ca0f9b956dbb096d90d605076b8efde78e",
+            "sha256:a4ddfa85fad7c5a64b5548ef948d2f10bb5d1904c30a55a549c97c90d1e1ce99",
+            "sha256:7972326ee096e0fc911deefd0f96efe991c45751388daf53ff7de0aa0efb3813",
+            "sha256:fa02d84b2eca3cf66a496f4125abc114e050bb393ce443b8a5709824b9ae8030",
         ],
     ),
     (
@@ -226,6 +248,16 @@ pub(crate) const SHIPPED_BEFORE: &[(&str, &[&str])] = &[
             "sha256:d0135a0322249d4e3f30cb06c652eb03ff11498bdf74db00f6a40f232a14580e",
             "sha256:b8a085a9f457d9f194a2ac14604b92b6278d8abf944ebcfb70e633be0433f7b0",
             "sha256:d78517e1e45ce25dd1560c855960bf0831268e6ebb1837fc901ec3f81e276f0e",
+            "sha256:0e93e7c928315ce23da0a955e64d23ea552bede7c2e62ac97de949a30ff9c5ce",
+            "sha256:0fc6a634857d942d01904b08a5914bb1e06bce7739ddb19d7d374601b6250514",
+            "sha256:5e196f6db8cb2c2c5a0b1a3b5c1f3eb3c3eb148154e296374270b314633ff971",
+            "sha256:7aa83f30592c08da218c75609e00693e48f4de48fb24055ec75e00254c9e85b5",
+            "sha256:4f8c46bf4e59cb7544d2973bf7b0f5014106093af37674ff1f7af2f9b1b12522",
+            "sha256:9a7e179dfe8f2ef5d1e986d3e0d16e3f7ca0989108fc5a55aa0ce42c113e68ad",
+            "sha256:afc524791683d45592519735f9f7d6db8b1bdf6e1d7f79e0e94bb69d55f3fb7f",
+            "sha256:774442e1cf40dcc5d829030b4e005fc14cd808bf984f12531a875493cf47ca78",
+            "sha256:2c0b9d2bcca690d1fafe26edc01c1f94a7a11cfd74a5e21646164260e7238b95",
+            "sha256:92b54f2cdbe768d7904c4663fc3bca9e64733eabe4bfad62f5cc5c43a2401873",
         ],
     ),
     (
@@ -242,6 +274,17 @@ pub(crate) const SHIPPED_BEFORE: &[(&str, &[&str])] = &[
             "sha256:6ae9e409915117c5503d8abc6d79ea774c97e5aeec9cfc77c353fa317e2a37ed",
             "sha256:2d6e599f8ec296ff8fe818c1ce915b9a22f56935f83414f6d6073911defd64bd",
             "sha256:c88c506c0b28adc9ed767c35c4dc3ca9ea06f155db6e8a998a5931f8c469cc66",
+            "sha256:5d7e93f6fa4b8b8903a6f796de1e111b37c2d925a34f0655eec3e78aa21cc014",
+            "sha256:a9f05bafa87c246f9f288de491784838f15543d9e6c6cd6f2938d75031ad06a5",
+            "sha256:a4781bbf75fbea025869ad631cca5fc430a0b09b21924686bf6f794ce05a05fc",
+            "sha256:06ee1aada70857fb6625e215d7d479a362b21349e56021af91fdfae988e1574f",
+            "sha256:e84ca600c0a4527b4ba7936309d547c9844d227a521b0e6a5b1bdb90a092c0b7",
+            "sha256:31a07d3829baa963cedd5e99a32cfbc6f66d57e211de83bb841371f19711d0f1",
+            "sha256:8ad0a9f8c326c8be30bcc38f318769fc126ba1470bb0dd124986d159b2677723",
+            "sha256:49dfbdbb598df10c2ea67c818f29fd297e40e62351b64502edb2b0bc7384e96f",
+            "sha256:a5d2142b9106029970c6f22b8ed90c2c8ab55963e0ce71cdff93150fec8ea99e",
+            "sha256:0b6ffab3fca700755d3b6daf6b7017b7ddec95b3d6fda3b4728ca422eb163aaf",
+            "sha256:29f54f75deedc85d8e81720c2d778f6ba12189812a0bfc53ac48cd859a289be3",
         ],
     ),
 ];
@@ -313,11 +356,76 @@ fn find_row(store: &Store, starter: &Starter) -> Result<Option<StarterRow>> {
         .optional()?)
 }
 
+/// Seed the shared starter row, then retire the private copies of an older
+/// shipped definition that would shadow it by name (hub #3257).
 pub(crate) fn seed_one(
     store: &Store,
     starter: &Starter,
     shipped_before: &[&str],
 ) -> Result<SeedOutcome> {
+    let outcome = seed_shared(store, starter, shipped_before)?;
+    if matches!(
+        outcome,
+        SeedOutcome::Inserted | SeedOutcome::Updated | SeedOutcome::Unchanged
+    ) {
+        retire_stale_private_copies(store, starter, shipped_before)?;
+    }
+    Ok(outcome)
+}
+
+/// Archive every unarchived manager/Epic row named like the starter whose
+/// canonical text is a definition the daemon shipped earlier. A private row
+/// outranks the shared one by name (hub #3157), so an unedited stale copy of
+/// an older seed would keep every manager on the old definition while the
+/// shared row holds the current one. Only a row whose text is exactly an old
+/// shipped digest is touched: an edited private row, and a private copy of the
+/// current text, stay as they are. The row is archived, never deleted, and the
+/// write is guarded by the text read.
+fn retire_stale_private_copies(
+    store: &Store,
+    starter: &Starter,
+    shipped_before: &[&str],
+) -> Result<()> {
+    if shipped_before.is_empty() {
+        return Ok(());
+    }
+    let mut statement = store.conn.prepare(
+        "SELECT id,definition_json,owner_kind FROM topologies \
+         WHERE name=?1 AND owner_kind IN ('manager','epic') AND archived_at IS NULL",
+    )?;
+    let private = statement
+        .query_map([starter.name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let now = rows::now_text();
+    for (id, text, owner_kind) in private {
+        let stale = canonical_digest(&text).is_some_and(|c| shipped_before.contains(&c.as_str()));
+        if !stale {
+            continue;
+        }
+        let archived = store.conn.execute(
+            "UPDATE topologies SET archived_at=?2,updated_at=?2 \
+             WHERE id=?1 AND definition_json=?3 AND archived_at IS NULL",
+            rusqlite::params![id, now, text],
+        )?;
+        if archived == 1 {
+            tracing::info!(
+                starter = starter.name,
+                topology_id = id.as_str(),
+                owner_kind = owner_kind.as_str(),
+                "starter topology: archived an unedited private copy of an older shipped definition that shadowed the shared starter"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn seed_shared(store: &Store, starter: &Starter, shipped_before: &[&str]) -> Result<SeedOutcome> {
     let definition = starter.definition()?;
     // A bundled definition that fails structural validation is never stored.
     let checked = crate::topology::agent::check_definition(
@@ -445,16 +553,136 @@ pub(crate) fn resolve_issue_input(
                 "inputs.{ISSUE_INPUT_KEY}: no open Issue #{number} in the execution's project"
             ))
         })?;
-    object.insert(
-        ISSUE_INPUT_KEY.into(),
-        json!({
-            "display_number": issue.display_number,
-            "title": issue.title,
-            "body": issue.body,
-            "project_id": issue.project_id,
-        }),
-    );
+    let (handoffs, handoff_total) = recent_issue_handoffs(store, project_id, issue.id)?;
+    let mut snapshot = json!({
+        "display_number": issue.display_number,
+        "title": issue.title,
+        "body": issue.body,
+        "project_id": issue.project_id,
+    });
+    if !handoffs.is_empty() {
+        snapshot["handoffs"] = Value::Array(handoffs);
+        snapshot["handoff_total"] = json!(handoff_total);
+    }
+    object.insert(ISSUE_INPUT_KEY.into(), snapshot);
     Ok(Some(Value::Object(object)))
+}
+
+/// #3757: how many of an Issue's newest handoff records the snapshot copies.
+pub(crate) const ISSUE_HANDOFFS_MAX: usize = 5;
+
+/// Maximum bytes of one copied handoff record before quoting.
+pub(crate) const ISSUE_HANDOFF_MAX_BYTES: usize = 4 * 1024;
+
+/// The newest [`ISSUE_HANDOFFS_MAX`] append-only handoff records of the Issue
+/// (oldest first) and the Issue's total record count. Managers publish
+/// rulings and reopen evidence with `AgentUpdateIssue {handoff}`, so a worker
+/// that only saw the body would miss them. Each record carries its author's
+/// role (`session` when the author has none) so the worker can tell a manager
+/// ruling from an earlier worker's report.
+fn recent_issue_handoffs(
+    store: &Store,
+    project_id: Uuid,
+    issue_id: Uuid,
+) -> Result<(Vec<Value>, i64)> {
+    let ids = rusqlite::params![project_id.to_string(), issue_id.to_string()];
+    let total: i64 = store.conn.query_row(
+        "SELECT COUNT(*) FROM issue_handoffs WHERE project_id=?1 AND issue_id=?2",
+        ids,
+        |row| row.get(0),
+    )?;
+    let mut statement = store.conn.prepare(
+        "SELECT h.sequence, h.body, h.created_at, s.agent_role
+         FROM issue_handoffs h LEFT JOIN sessions s ON s.id = h.author_session_id
+         WHERE h.project_id=?1 AND h.issue_id=?2
+         ORDER BY h.sequence DESC LIMIT ?3",
+    )?;
+    let mut records = statement
+        .query_map(
+            rusqlite::params![
+                project_id.to_string(),
+                issue_id.to_string(),
+                i64::try_from(ISSUE_HANDOFFS_MAX).unwrap_or(i64::MAX)
+            ],
+            |row| {
+                let role: Option<String> = row.get(3)?;
+                Ok(json!({
+                    "sequence": row.get::<_, i64>(0)?,
+                    "body": row.get::<_, String>(1)?,
+                    "created_at": row.get::<_, String>(2)?,
+                    "author_role": role.filter(|role| !role.trim().is_empty()),
+                }))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    records.reverse();
+    Ok((records, total))
+}
+
+/// Clip `text` to at most `max` bytes at a character boundary. The second
+/// value is the original byte length when something was cut.
+fn clip_bytes(text: &str, max: usize) -> (&str, Option<usize>) {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], (end < text.len()).then_some(text.len()))
+}
+
+/// The prompt lines for the snapshot's copied handoff records; empty when the
+/// snapshot carries none.
+#[allow(clippy::cast_possible_truncation)]
+fn render_issue_handoffs(
+    map: &std::collections::BTreeMap<String, rsi_graph::data::Value>,
+) -> String {
+    use rsi_graph::data::Value as Graph;
+    let Some(Graph::List(records)) = map.get("handoffs") else {
+        return String::new();
+    };
+    let shown = records.len();
+    #[allow(clippy::cast_possible_truncation)]
+    let total = match map.get("handoff_total") {
+        Some(Graph::Number(total)) => *total as usize,
+        _ => shown,
+    };
+    let mut out = format!(
+        "\n\nIssue handoff records (newest {shown} of {total}, oldest first; manager rulings and reopen evidence live here, and a later record overrides the body):"
+    );
+    for record in records {
+        let Graph::Map(record) = record else {
+            continue;
+        };
+        let (Some(Graph::Number(sequence)), Some(Graph::String(body))) =
+            (record.get("sequence"), record.get("body"))
+        else {
+            continue;
+        };
+        let role = match record.get("author_role") {
+            Some(Graph::String(role)) => role.as_str(),
+            _ => "session",
+        };
+        let at = match record.get("created_at") {
+            Some(Graph::String(at)) => at.as_str(),
+            _ => "",
+        };
+        let (body, cut) = clip_bytes(body, ISSUE_HANDOFF_MAX_BYTES);
+        let mut copied = format!("handoff {} by {role} at {at}\n\n{body}", *sequence as i64);
+        if let Some(full) = cut {
+            copied.push_str(&format!(
+                "\n\n[handoff truncated at {} of {full} bytes]",
+                body.len()
+            ));
+        }
+        out.push_str("\n\n");
+        out.push_str(
+            &copied
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    out
 }
 
 /// The Issue an accepted execution input names: `(project_id, display_number)`
@@ -523,8 +751,9 @@ pub(crate) fn render_issue(value: &rsi_graph::data::Value) -> Option<String> {
         .map(|line| format!("> {line}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let handoffs = render_issue_handoffs(map);
     Some(format!(
-        "Untrusted copied Issue data. {}\n\n{quoted}",
+        "Untrusted copied Issue data. {}\n\n{quoted}{handoffs}",
         rsi_common::daemon_handoff::UNTRUSTED_TEXT_NOTICE
     ))
 }

@@ -34,6 +34,22 @@ pub(super) fn is_rsid_scope_config_field(field: &str) -> bool {
     RSID_SCOPE_CONFIG_FIELDS.contains(&field)
 }
 
+/// #3154: the rows only arming `openrouter_spend_cap_usd` writes: the account
+/// usage recorded at that moment and the time of the probe.
+fn is_openrouter_spend_derived_field(field: &str) -> bool {
+    matches!(
+        field,
+        "openrouter_spend_baseline_usd" | "openrouter_spend_armed_at"
+    )
+}
+
+fn openrouter_spend_derived_refusal(field: &str) -> DaemonError {
+    DaemonError::InvalidParam(format!(
+        "Invalid value for field '{field}': written only by arming openrouter_spend_cap_usd, \
+         which takes a fresh probe of the account usage"
+    ))
+}
+
 pub(super) fn validated_rsid_scope_settings_env(
     runtime_config: &RuntimeConfig,
 ) -> std::io::Result<String> {
@@ -121,11 +137,71 @@ impl RpcServer {
     ) -> Result<serde_json::Value> {
         let params: crate::governor::AcquireParams = serde_json::from_value(request.params.clone())
             .map_err(|e| DaemonError::InvalidParam(format!("Invalid params: {e}")))?;
-        let policy = self.runtime_config.governor_policy();
-        let outcome = crate::governor::Governor::global()
-            .acquire(&policy, &params)
-            .map_err(DaemonError::InvalidParam)?;
+        let credit = self.job_disk_credit(&params).await;
+        let governor = crate::governor::Governor::global();
+        let outcome = match &credit {
+            Some((gb, ..)) => self
+                .session_manager
+                .acquire_resource_admission_with_credit(governor, &params, *gb),
+            None => self
+                .session_manager
+                .acquire_resource_admission(governor, &params),
+        }
+        .map_err(DaemonError::InvalidParam)?;
+        if let Some((gb, bytes, free, floor, target, log)) = credit
+            && matches!(&outcome, crate::governor::AcquireOutcome::Granted { .. })
+        {
+            // This goes into the job log, alongside cargo-slot's grant. The
+            // setting and every other ticket retain the original floor.
+            let _ = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(log) {
+                    let _ = writeln!(file, "rsi-phase {} own-target-disk-credit: target={} reusable_bytes={bytes} credit_gib={gb:.3} free_gib={free:.3} floor_gib={floor}; quarter of own target, capped at 2 GiB and half the floor; reuse lowers only this job's estimated growth; physical and projected free space satisfy the floor", chrono::Utc::now().timestamp(), target.display());
+                }
+            }).await;
+        }
         Ok(serde_json::to_value(outcome)?)
+    }
+
+    async fn job_disk_credit(
+        &self,
+        params: &crate::governor::AcquireParams,
+    ) -> Option<(f64, u64, f64, u64, std::path::PathBuf, String)> {
+        use crate::governor::own_target;
+        if params.class == crate::governor::AdmissionClass::Lander {
+            return None;
+        }
+        let floor = self.runtime_config.governor_policy().min_free_disk_gb;
+        let pid = params.pid;
+        let (free, (job_id, target, cwd)) = tokio::task::spawn_blocking(move || {
+            let free = crate::host_pressure::disk_free_gb();
+            // Below the physical floor no amount of target reuse admits work.
+            // Above it, reuse may lower this job's projected growth.
+            (crate::host_pressure::own_target_credit_gb(free, floor, 8 * 1_073_741_824) > 0.0)
+                .then(|| own_target::process_context(pid).map(|context| (free, context)))
+                .flatten()
+        })
+        .await
+        .ok()??;
+        let (job, sandbox) = {
+            let store =
+                crate::store_lock::lock(self.session_manager.store(), "rpc::job_disk_credit").await;
+            let job = store.get_agent_job(job_id).ok()??.job;
+            let sandbox = store
+                .get_session(job.owner_session_id)
+                .ok()??
+                .sandbox_root?;
+            (job, sandbox)
+        };
+        tokio::task::spawn_blocking(move || {
+            let target =
+                own_target::eligible_target(&job, std::path::Path::new(&sandbox), &target, &cwd)?;
+            let bytes = own_target::reusable_bytes(&target);
+            let credit = crate::host_pressure::own_target_credit_gb(free, floor, bytes);
+            (credit > 0.0).then_some((credit, bytes, free, floor, target, job.log_path))
+        })
+        .await
+        .ok()?
     }
 
     pub(super) async fn handle_release_admission(
@@ -366,6 +442,8 @@ impl RpcServer {
         _request: &RpcRequest,
     ) -> Result<serde_json::Value> {
         let mut config = self.runtime_config.to_json();
+        config["billing_modes"] =
+            serde_json::to_value(self.session_manager.store().lock().await.billing_modes()?)?;
         config["coordinator_context_budgets"] = serde_json::to_value(
             self.session_manager
                 .agent_control()
@@ -380,7 +458,126 @@ impl RpcServer {
                 rsi_common::cloud_spend::summary_line(&report).into(),
             );
         }
+        // #3154: the OpenRouter spend ceiling for the Settings row: cap, spent
+        // since arming, remainder and state, from the last probe the daemon's
+        // background loop keeps fresh (a settings read never waits on the
+        // network).
+        let spend = self.openrouter_spend_state(false).await;
+        if let Some(map) = config.as_object_mut() {
+            map.insert(
+                "openrouter_spend_status".to_string(),
+                rsi_common::openrouter_spend::summary_line(&spend).into(),
+            );
+            map.insert(
+                "openrouter_spend".to_string(),
+                serde_json::to_value(&spend)?,
+            );
+        }
         Ok(config)
+    }
+
+    /// #3154: the live state of the OpenRouter spend ceiling.
+    pub(super) async fn openrouter_spend_state(
+        &self,
+        refresh: bool,
+    ) -> rsi_common::openrouter_spend::OpenRouterSpendCapV1 {
+        crate::openrouter_spend::SpendEnforcer::production(
+            Arc::clone(&self.runtime_config),
+            self.session_manager.store().clone(),
+        )
+        .state(refresh)
+        .await
+    }
+
+    /// #3154: `UpdateDaemonConfig openrouter_spend_cap_usd`. Turning the cap on
+    /// (from off) takes a FRESH probe of the account `total_usage` and records
+    /// it as the baseline with the time; the stop line is baseline + cap. A
+    /// cap that cannot get a baseline is not armed. Changing the amount of an
+    /// armed cap keeps its baseline (the spend so far stays counted); `0`
+    /// turns it off and forgets the baseline, so the next arming re-baselines.
+    /// The baseline, the arming time and the cap are persisted (cap last) so
+    /// the ceiling survives a restart.
+    async fn update_openrouter_spend_cap(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let enforcer = crate::openrouter_spend::SpendEnforcer::production(
+            Arc::clone(&self.runtime_config),
+            self.session_manager.store().clone(),
+        );
+        self.update_openrouter_spend_cap_with(value, &enforcer)
+            .await
+    }
+
+    /// [`Self::update_openrouter_spend_cap`] with the enforcer injected, so a
+    /// test arms against a mock OpenRouter account.
+    pub(super) async fn update_openrouter_spend_cap_with(
+        &self,
+        value: &serde_json::Value,
+        enforcer: &crate::openrouter_spend::SpendEnforcer<'_>,
+    ) -> Result<serde_json::Value> {
+        const FIELD: &str = "openrouter_spend_cap_usd";
+        const ROWS: [&str; 4] = [
+            "openrouter_spend_baseline_usd",
+            "openrouter_spend_armed_at",
+            FIELD,
+            "openrouter_spend_warn_pct",
+        ];
+        let cap = crate::config::parse_openrouter_spend_cap_usd(value).map_err(|error| {
+            DaemonError::InvalidParam(format!("Invalid value for field '{FIELD}': {error}"))
+        })?;
+        let previous = self.runtime_config.to_json();
+        let previous_rows: Vec<(&str, serde_json::Value)> = ROWS
+            .iter()
+            .map(|field| (*field, previous[*field].clone()))
+            .collect();
+        let was_armed = {
+            let config = self.runtime_config.openrouter_spend_config();
+            config.cap_usd > 0.0 && config.baseline.is_some()
+        };
+        if cap > 0.0 && !was_armed {
+            let probe = enforcer.fresh_baseline().await?;
+            self.runtime_config
+                .arm_openrouter_spend_cap(cap, probe.total_usage, probe.at);
+        } else {
+            self.runtime_config
+                .update_field(FIELD, &serde_json::json!(cap))
+                .map_err(|error| {
+                    DaemonError::InvalidParam(format!("Invalid value for field '{FIELD}': {error}"))
+                })?;
+        }
+        let persisted = {
+            let guard = self.session_manager.store().lock().await;
+            ROWS.iter().try_for_each(|field| {
+                crate::store::daemon_settings::persist_runtime_config_field(
+                    &guard,
+                    &self.runtime_config,
+                    field,
+                )
+                .map(|_| ())
+            })
+        };
+        if let Err(error) = persisted {
+            for (field, value) in &previous_rows {
+                let _ = self.runtime_config.update_field(field, value);
+            }
+            let guard = self.session_manager.store().lock().await;
+            for (field, _) in &previous_rows {
+                let _ = crate::store::daemon_settings::persist_runtime_config_field(
+                    &guard,
+                    &self.runtime_config,
+                    field,
+                );
+            }
+            return Err(DaemonError::Store(format!(
+                "Failed to persist daemon config field '{FIELD}': {error}"
+            )));
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "field": FIELD,
+            "spend_cap": enforcer.state(false).await,
+        }))
     }
 
     pub(super) fn cloud_spend_report(&self) -> rsi_common::cloud_spend::CloudSpendReport {
@@ -714,6 +911,13 @@ impl RpcServer {
             }
         }
 
+        if params.field == "openrouter_spend_cap_usd" {
+            return self.update_openrouter_spend_cap(&params.value).await;
+        }
+        if is_openrouter_spend_derived_field(&params.field) {
+            return Err(openrouter_spend_derived_refusal(&params.field));
+        }
+
         if params.field == "codegraph_indexing_enabled" {
             let enabled = params.value.as_bool().ok_or_else(|| {
                 DaemonError::InvalidParam(format!(
@@ -775,7 +979,7 @@ impl RpcServer {
                     params.field.as_str(),
                     "cloud_spend_stop_line_usd" | "cloud_spend_daily_cap_usd"
                 ) {
-                    // Mirror the caps for scripts/cloud-spend.py. The scripts
+                    // Mirror the caps for rsi-cloud spend. The scripts
                     // keep the previous caps if this fails, so say so.
                     crate::cloud_spend::write_caps_file(
                         &self.cloud_dir,
@@ -865,12 +1069,33 @@ impl RpcServer {
                 )));
             }
         }
-        let invalid = |field: &str, error: String| {
-            DaemonError::InvalidParam(format!("Invalid value for field '{field}': {error}"))
-        };
+        // #3154: arming the spend cap takes a fresh probe, which a batch
+        // cannot do atomically; its baseline rows are written only by arming.
+        if let Some(update) = updates.iter().find(|update| {
+            update.field == "openrouter_spend_cap_usd"
+                || is_openrouter_spend_derived_field(&update.field)
+        }) {
+            return Err(DaemonError::InvalidParam(format!(
+                "Invalid value for field '{}': set the OpenRouter spend cap with its own \
+                 UpdateDaemonConfig call (arming takes a fresh probe of the account usage); \
+                 the baseline rows are written only by arming",
+                update.field
+            )));
+        }
         let _update_guard = self.session_manager.daemon_config_update.lock().await;
 
         // Phase 1: validate everything before any live state moves.
+        self.apply_daemon_config_batch_locked(updates).await
+    }
+
+    /// Caller holds daemon_config_update across snapshot, durable undo and apply.
+    pub(super) async fn apply_daemon_config_batch_locked(
+        &self,
+        updates: Vec<UpdateDaemonConfigParams>,
+    ) -> Result<serde_json::Value> {
+        let invalid = |field: &str, error: String| {
+            DaemonError::InvalidParam(format!("Invalid value for field '{field}': {error}"))
+        };
         let scratch = RuntimeConfig::from_config(&crate::config::Config::default());
         let scope_in_batch = updates
             .iter()

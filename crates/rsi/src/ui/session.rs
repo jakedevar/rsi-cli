@@ -3630,6 +3630,15 @@ fn daemon_resource_lines(
                 memory.push(Span::styled(" · ", dim));
                 memory.push(colored(format_bytes(heap), theme::peach()));
                 memory.push(Span::styled(" heap", dim));
+                if let Some(age) = crate::daemon_resources::heap_age_note(sample.heap_age_secs) {
+                    memory.push(Span::styled(format!(" ({age})"), dim));
+                }
+            }
+            // The peak is history, not use: label it so a freed start-up spike
+            // is never read as the daemon's current footprint (#3491).
+            if let Some(peak) = crate::daemon_resources::peak_note(rss, sample.rss_peak_bytes) {
+                memory.push(Span::styled(" · ", dim));
+                memory.push(Span::styled(peak, dim));
             }
         }
         None => memory.push(Span::styled("unreported", dim)),
@@ -6947,6 +6956,8 @@ mod tests {
                 uptime_secs: None,
                 rss_bytes: None,
                 heap_in_use_bytes: None,
+                rss_peak_bytes: None,
+                heap_age_secs: None,
                 persistence_queue_depth: 0,
                 persistence_queue_capacity: 0,
                 last_command_duration_ms: 0,
@@ -6983,6 +6994,61 @@ mod tests {
             supervised.lines().count() + 2,
             "{supervised}"
         );
+    }
+
+    /// #3491: the operator read a stale 2.3G heap sample next to a 357M live
+    /// RSS as current use. The line now shows the live size, the sampled heap
+    /// (with its age once it is stale) and the process peak as history.
+    #[test]
+    fn rsid_memory_line_labels_the_peak_and_a_stale_heap_sample_3491() {
+        const MIB: u64 = 1024 * 1024;
+        let view = |heap_age_secs: Option<u64>, peak: Option<u64>| {
+            crate::daemon_resources::DaemonResourceView {
+                sample: crate::daemon_resources::DaemonResourceSample {
+                    sampled_at: std::time::Instant::now(),
+                    pid: None,
+                    proc_counters: None,
+                    open_fds: None,
+                    uptime_secs: None,
+                    rss_bytes: Some(357 * MIB),
+                    heap_in_use_bytes: Some(90 * MIB),
+                    rss_peak_bytes: peak,
+                    heap_age_secs,
+                    persistence_queue_depth: 0,
+                    persistence_queue_capacity: 0,
+                    last_command_duration_ms: 0,
+                    queue_pending: 0,
+                    queue_claimed: 0,
+                    queue_failed: 0,
+                    supervisor_mode: None,
+                    codegraph_unhealthy: Vec::new(),
+                },
+                cpu_percent: None,
+                restart_pending: None,
+            }
+        };
+        let mem_line = |view: &crate::daemon_resources::DaemonResourceView| {
+            daemon_resource_lines(Some(view), 120, Color::Reset)
+                .iter()
+                .map(Line::to_string)
+                .find(|line| line.starts_with("mem"))
+                .unwrap_or_default()
+        };
+        let spiked = mem_line(&view(Some(12), Some(2_817_788 * 1024)));
+        assert_eq!(
+            spiked.trim_end(),
+            "mem   357M rss · 90M heap · peak 2.7G",
+            "{spiked}"
+        );
+        let stale = mem_line(&view(Some(200), Some(2_817_788 * 1024)));
+        assert_eq!(
+            stale.trim_end(),
+            "mem   357M rss · 90M heap (3m old) · peak 2.7G",
+            "{stale}"
+        );
+        // A peak equal to the present size is not history worth a column.
+        let steady = mem_line(&view(Some(12), Some(360 * MIB)));
+        assert_eq!(steady.trim_end(), "mem   357M rss · 90M heap", "{steady}");
     }
 
     #[test]
@@ -7126,6 +7192,7 @@ mod tests {
 
     #[test]
     fn truly_transparent_browser_metadata_keeps_colors_and_terminal_background() {
+        let _billing = crate::provider_billing_view::metered_mode_for_test("codex");
         use crate::app::app_test_helpers::{baseline_session, with_session_list};
         use rsi_common::types::{SessionKind, SessionProvider};
         let _guard = theme::pin_theme_state();

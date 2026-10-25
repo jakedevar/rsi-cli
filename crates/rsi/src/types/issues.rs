@@ -272,6 +272,64 @@ pub struct IssueEditorState {
     pub retry_key: String,
     pub error: Option<String>,
     pub submitted: bool,
+    /// The vim textarea behind the focused text field (#3421). View state:
+    /// the fields above stay the source of truth.
+    pub text: crate::form_text::FormText,
+}
+
+impl IssueEditorState {
+    /// How the focused field is edited, or `None` when it is not a text field
+    /// (a choice, a status, the candidate list). The Issue title is limited
+    /// here, in the TUI editor only; the daemon's own limit is unchanged.
+    #[must_use]
+    pub fn text_field_spec(&self) -> Option<crate::form_text::FieldSpec> {
+        use crate::form_text::FieldSpec;
+        match self.mode {
+            IssueEditorMode::Status { .. } => None,
+            IssueEditorMode::Dependency { .. } => {
+                (self.active_field == 1).then_some(FieldSpec::SINGLE_LINE)
+            }
+            IssueEditorMode::Filter => {
+                matches!(self.active_field, 1 | 2 | 3 | 5 | 6 | 7).then_some(FieldSpec::SINGLE_LINE)
+            }
+            IssueEditorMode::Create | IssueEditorMode::Edit { .. } => {
+                Some(match self.active_field {
+                    0 => FieldSpec {
+                        multiline: false,
+                        max_chars: Some(crate::form_text::ISSUE_TITLE_LIMIT),
+                    },
+                    1 => FieldSpec::MULTILINE,
+                    _ => FieldSpec::SINGLE_LINE,
+                })
+            }
+        }
+    }
+
+    /// Point the text surface at the focused field, or drop it when the focused
+    /// field is not a text field. A surface that already shows the field's text
+    /// keeps its cursor, mode and undo history.
+    pub fn sync_text(&mut self, standard: bool) {
+        match self.text_field_spec() {
+            Some(spec) => {
+                let value = self.active_text().to_string();
+                self.text.load(self.active_field, &value, spec, standard);
+            }
+            None => self.text.clear(),
+        }
+    }
+
+    /// The text of the focused field (the same string the key handler edits).
+    #[must_use]
+    pub fn active_text(&self) -> &str {
+        match self.mode {
+            IssueEditorMode::Dependency { .. } | IssueEditorMode::Filter => &self.dependency_text,
+            _ => match self.active_field {
+                0 => &self.title,
+                1 => &self.body,
+                _ => &self.dependency_text,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

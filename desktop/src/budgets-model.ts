@@ -121,5 +121,33 @@ export function policyLine(p: BudgetPolicy): string {
   return parts.join(' · ');
 }
 
-/** The empty list's line: it is not "unlimited" (the TUI's placeholder). */
-export const EMPTY_BUDGETS = 'No explicit budget policies: the daemon’s built-in per-scope defaults apply (a adds one)';
+/** What the Budgets list can do; each button and each key runs one of these (local #208). */
+export type BudgetAction = 'add' | 'edit' | 'delete' | 'refresh' | 'close' | 'down' | 'up';
+
+/** The Budgets list's buttons, in order: label, the key shown in the label, and the action both run. */
+export const BUDGET_BUTTONS: readonly { readonly action: BudgetAction; readonly label: string; readonly key: string }[] = [
+  { action: 'add', label: 'Add policy', key: 'a' },
+  { action: 'edit', label: 'Edit', key: 'Enter' },
+  { action: 'delete', label: 'Delete', key: 'd' },
+  { action: 'refresh', label: 'Refresh', key: 'R' },
+  { action: 'close', label: 'Close', key: 'q' },
+];
+
+/** The Budgets list's keys: j/k and arrows move, Enter / Space edit, a add, d delete, R refresh, q close. */
+export function budgetListKey(key: string): BudgetAction | null {
+  switch (key) {
+    case 'j': case 'ArrowDown': return 'down';
+    case 'k': case 'ArrowUp': return 'up';
+    case 'Enter': case ' ': return 'edit';
+    case 'a': return 'add';
+    case 'd': return 'delete';
+    case 'R': return 'refresh';
+    case 'q': return 'close';
+    default: return null;
+  }
+}
+
+/** A button label with its key in secondary text ("Add (a)"); the key-hints pass drops a Vim-only "(a)" with Vim keys off. */
+export function budgetButtonLabel(b: { readonly label: string; readonly key: string }): string {
+  return b.key === 'Enter' ? b.label : `${b.label} (${b.key})`;
+}

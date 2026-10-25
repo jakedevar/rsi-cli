@@ -400,6 +400,8 @@ export interface SatLink {
 export interface SatObservation {
   state: string; installation_id: string | null; incarnation_id: string | null; last_observed_at: string | null;
   last_error: string | null; cached_session_count: number; stale: boolean;
+  /** Activity from the satellite's last reported health; absent until a successful poll (#423). */
+  sessions_running?: number | null; workers_parked?: number | null; open_jobs?: number | null;
 }
 export interface SatPeerConfig {
   peer_id: string; label: string; expected_installation_id: string | null; enabled: boolean; read_enabled: boolean; dispatch_enabled?: boolean;
@@ -456,12 +458,19 @@ export function parseIdList(text: string): { ok: true; ids: string[] } | { ok: f
   return { ok: true, ids: r.sessions };
 }
 
+/** The TUI's `activity_summary`: each count, or `unknown` when the satellite has not reported it. */
+export function activitySummary(o: SatObservation | null): string {
+  const n = (v: number | null | undefined): string => (v === null || v === undefined ? 'unknown' : String(v));
+  return `running: ${n(o?.sessions_running)} · parked: ${n(o?.workers_parked)} · open jobs: ${n(o?.open_jobs)}`;
+}
+
 export function peerRow(p: SatPeer): { label: string; value: string } {
   const c = p.config;
   const o = p.observation;
   const parts = [
     `enabled:${c.enabled ? 'on' : 'off'}`, `read:${c.read_enabled ? 'on' : 'off'}`, `dispatch:${c.dispatch_enabled ? 'on' : 'off'}`,
     `state:${o ? `${o.state}${o.stale ? ' (stale)' : ''}` : 'unobserved'}`, `links:${p.links.length}`, `cached:${o?.cached_session_count ?? 0}`,
+    activitySummary(o),
   ];
   if (o?.last_error) parts.push(`error:${o.last_error}`);
   return { label: c.label, value: parts.join('  ') };
@@ -665,11 +674,185 @@ export function adoptSummary(results: readonly AdoptResult[]): string {
 
 export interface Cohort { repository_identity: string; canonical_repo_dir: string; live_roots: number; terminal_roots: number }
 export interface SettlementCounts { observed: number; eligible: number; retained: number; settled: number; refused: number; recovery_required: number; unattempted: number }
+/** One root the read-only audit looked at (`SourceWorktreeAuditItemV1`): what the daemon would do with it and why. */
+export interface AuditItem { session_id: string; disposition: string; proof?: string; diagnostic?: string | null; source_ref?: string; sandbox_root?: string }
 export interface CohortAudit {
   repository_identity: string; canonical_repo_dir: string; target_ref: string | null; target_oid: string | null; plan_digest: string;
-  authorization_phrase: string | null; applyable: boolean; counts: SettlementCounts; items: unknown[]; run_id?: string | null; refusal?: string | null;
+  authorization_phrase: string | null; applyable: boolean; counts: SettlementCounts; items: AuditItem[]; run_id?: string | null; refusal?: string | null;
 }
 export interface SettlementRunSummary { run_id: string; repository_identity: string; state: string; counts: SettlementCounts; created_at: string }
+
+/** #149: a process a settlement run could not prove and so left running. */
+export interface UnprovenSurvivor {
+  sequence: number; pid: number; start_time_micros: number; executable?: string | null;
+  session_id?: string | null; custody_id?: string | null; sandbox_root?: string | null; reason: string;
+}
+/** One root a settlement run worked on (`SourceWorktreeSettlementItemV1`). */
+export interface SettlementItem {
+  sequence: number; session_id?: string | null; custody_id?: string | null; source_ref: string; phase: string;
+  refusal_code?: string | null; before_observation?: string | null; after_observation?: string | null;
+}
+export interface SettlementAttribution { origin: string; agent_session_id?: string | null }
+/** The part of a full settlement receipt (`GetSourceWorktreeSettlementRun`) the view reads. */
+export interface SettlementReceipt {
+  run_id: string; repository_identity: string; canonical_repo_dir: string;
+  state?: string; counts?: SettlementCounts; attribution?: SettlementAttribution | null; updated_at?: string;
+  terminal_error?: string | null; items?: SettlementItem[]; unproven_survivors?: UnprovenSurvivor[];
+}
+
+const UNPROVEN_REASONS: Record<string, string> = { environment_withheld_by_macos: 'environment withheld by macOS' };
+/** What an unproven reason means, in plain words. */
+const UNPROVEN_MEANING: Record<string, string> = {
+  environment_withheld_by_macos: 'macOS would not let settlement read this program\'s details, so it could not tell whether the settled work started it.',
+};
+
+/** What each phase of one root means. `tone` drives the badge: ok, warn (needs a look), bad (nothing was removed) or muted. */
+const PHASES: Record<string, { label: string; tone: ReceiptTone }> = {
+  planned: { label: 'Planned, not started', tone: 'muted' },
+  intent_committed: { label: 'Started', tone: 'warn' },
+  worktree_removed: { label: 'Work folder removed, branch still to remove', tone: 'warn' },
+  branch_removed: { label: 'Branch removed, finishing', tone: 'warn' },
+  settled: { label: 'Settled', tone: 'ok' },
+  refused: { label: 'Refused', tone: 'bad' },
+  recovery_required: { label: 'Needs recovery', tone: 'warn' },
+  unattempted: { label: 'Not attempted', tone: 'muted' },
+};
+
+/** Why a root was refused, in plain words (the closed `SourceWorktreeSettlementRefusalV1`). */
+const REFUSALS: Record<string, string> = {
+  audit_drift: 'The repository changed after the check, so nothing was removed',
+  idempotency_conflict: 'That request key was already used for a different plan',
+  custody_drift: "The session's ownership record changed after the check",
+  runtime_owner_active: 'The session is still running',
+  runtime_state_contended: 'The daemon was busy with this session; try again',
+  worktree_remove_failed: 'Git could not remove the work folder',
+  worktree_residue: 'Files were left behind in the work folder',
+  target_drift: 'The target branch moved after the check',
+  source_ref_drift: 'The branch moved after the check',
+  source_ref_in_use: 'Another work folder still uses the branch',
+  ref_delete_failed: 'Git could not delete the branch',
+  external_registration_race: 'Another Git work folder claimed the branch during the run',
+  database_settlement_failed: 'The daemon could not record the result',
+  recovery_target_unavailable: 'The target branch needed to finish recovery is missing',
+  recovery_proof_failed: 'Recovery could not prove the work was already merged',
+};
+
+const RUN_STATES: Record<string, string> = {
+  intent_committed: 'Started', applying: 'In progress', settled: 'Finished', partial: 'Partly finished',
+  recovery_required: 'Needs recovery', refused: 'Refused',
+};
+
+const words = (code: string): string => code.replace(/_/g, ' ');
+
+export type ReceiptTone = 'ok' | 'warn' | 'bad' | 'muted';
+export interface ReceiptItemView { title: string; status: string; tone: ReceiptTone; reason: string | null; detail: string | null; hint: string | null }
+export interface ReceiptView {
+  facts: [string, string][]; error: string | null; items: ReceiptItemView[]; itemsEmpty: string | null;
+  survivorsTitle: string; survivorsNote: string; survivors: string[]; survivorMeanings: string[];
+}
+
+/** The TUI's origin wording, in plain words: who started the run. */
+export function settlementOrigin(a: SettlementAttribution | null | undefined): string {
+  if (!a) return 'Unknown (a run from before origins were recorded)';
+  if (a.origin === 'automatic') return 'The daemon, automatically';
+  if (a.origin === 'operator') return 'You (the operator)';
+  if (a.origin === 'agent') return a.agent_session_id ? `An agent session (${a.agent_session_id})` : 'An agent session';
+  return words(a.origin);
+}
+
+/** `null` when the receipt is the run and cohort asked for, else why it must not be shown (the TUI's `validate_matching_receipt`). */
+export function receiptMismatch(r: SettlementReceipt, runId: string, repositoryIdentity: string, canonicalRepoDir: string): string | null {
+  if (r.run_id !== runId) return 'The run ID does not match the run that was requested';
+  if (r.repository_identity !== repositoryIdentity) return 'The repository does not match the selected cohort';
+  if (r.canonical_repo_dir !== canonicalRepoDir) return 'The repository folder does not match the selected cohort';
+  return null;
+}
+
+/** One line per unproven survivor, as the TUI receipt shows it: pid, executable, root (or the cohort repository), reason. */
+export function unprovenSurvivorLines(receipt: SettlementReceipt | null | undefined): string[] {
+  if (!receipt) return [];
+  return (receipt.unproven_survivors ?? []).map((s) => [
+    `pid ${s.pid}`,
+    s.executable ?? '<executable unknown>',
+    s.sandbox_root ? `root ${s.sandbox_root}` : `cohort repository ${receipt.canonical_repo_dir}`,
+    UNPROVEN_REASONS[s.reason] ?? words(s.reason),
+  ].join(' · '));
+}
+
+export function receiptItemView(i: SettlementItem): ReceiptItemView {
+  const phase = PHASES[i.phase] ?? { label: words(i.phase), tone: 'muted' as ReceiptTone };
+  const reason = i.refusal_code ? (REFUSALS[i.refusal_code] ?? words(i.refusal_code)) : null;
+  return {
+    title: `#${i.sequence} ${i.source_ref}`, status: phase.label, tone: phase.tone, reason,
+    detail: i.after_observation ?? null,
+    hint: i.phase === 'recovery_required' ? 'Settlement stopped part-way. Audit this repository again to see what is left to recover.' : null,
+  };
+}
+
+/** Everything the receipt block of the dialog shows: the run, each root with its reason, and the unproven survivors (#149, #276). */
+export function receiptView(r: SettlementReceipt): ReceiptView {
+  const c = r.counts;
+  const facts: [string, string][] = [
+    ['Started by', settlementOrigin(r.attribution)],
+    ['Outcome', r.state ? (RUN_STATES[r.state] ?? words(r.state)) : 'Unknown'],
+  ];
+  if (c) facts.push(['Roots', `${c.settled} settled · ${c.refused} refused · ${c.recovery_required} need recovery · ${c.unattempted} not attempted`]);
+  if (r.updated_at) facts.push(['Updated', r.updated_at]);
+  const items = (r.items ?? []).map(receiptItemView);
+  const survivors = unprovenSurvivorLines(r);
+  const kinds = [...new Set((r.unproven_survivors ?? []).map((s) => s.reason))];
+  return {
+    facts, error: r.terminal_error ? `Last error: ${r.terminal_error}` : null, items,
+    itemsEmpty: items.length ? null : 'This run recorded no roots.',
+    survivorsTitle: 'Programs left running (unproven survivors)',
+    survivorsNote: 'Settlement never stops a program it cannot prove belongs to the settled work. Stop these by hand if they belong to it.',
+    survivors, survivorMeanings: kinds.map((k) => UNPROVEN_MEANING[k] ?? words(k)),
+  };
+}
+
+/** What the audit would do with a root, in plain words (the closed `SourceWorktreeDispositionV1`). */
+const DISPOSITIONS: Record<string, string> = {
+  eligible_integrated_ancestor: 'Can be settled: its work is already merged',
+  active_owner: 'Kept: a session still owns it',
+  nonterminal_status: 'Kept: its session has not finished',
+  dirty_worktree: 'Kept: the work folder has uncommitted changes',
+  missing_root: 'Kept: the work folder is missing',
+  outside_sandbox_base: 'Kept: the work folder is outside the sandbox area',
+  symlink_identity: 'Kept: the work folder path goes through a symlink',
+  worktree_unregistered: 'Kept: Git does not know this work folder',
+  head_mismatch: 'Kept: the folder is not at the commit the session recorded',
+  missing_source_ref: 'Kept: the session branch is missing',
+  source_ref_mismatch: 'Kept: the session branch moved',
+  custody_unverified: 'Kept: its ownership record could not be verified',
+  custody_generation_drift: 'Kept: its ownership record changed',
+  shared_participant: 'Kept: another session shares it',
+  reserved_effect: 'Kept: work is reserved against it',
+  active_effect: 'Kept: work is running against it',
+  scheduled_dependency: 'Kept: a scheduled job depends on it',
+  session_path_dependency: 'Kept: a session uses its path',
+  protected_ref: 'Kept: its branch is protected',
+  target_unavailable: 'Kept: the target branch is unavailable',
+  target_ambiguous: 'Kept: the target branch is ambiguous',
+  retained_non_ancestor: 'Kept: its work is not merged yet',
+  retained_foreign_owner: 'Kept: it belongs to another owner',
+  retained_unknown_owner: 'Kept: its owner is unknown',
+  invalid_source_ref: 'Kept: the session branch name is invalid',
+  incomplete_enumeration: 'Kept: the check could not list everything',
+  bound_exceeded: 'Kept: there were too many roots to check',
+  no_action: 'Nothing to do',
+};
+
+export interface AuditItemView { title: string; verdict: string; tone: ReceiptTone; detail: string | null }
+
+/** One entry per root of a fresh audit, as the TUI lists them (session, disposition, proof, diagnostic). */
+export function auditItemViews(audit: CohortAudit | null | undefined): AuditItemView[] {
+  return (audit?.items ?? []).map((i) => ({
+    title: i.sandbox_root ? `${i.session_id} · ${i.sandbox_root}` : i.session_id,
+    verdict: DISPOSITIONS[i.disposition] ?? words(i.disposition),
+    tone: i.disposition === 'eligible_integrated_ancestor' ? 'ok' : 'warn',
+    detail: [i.proof ? `proof: ${words(i.proof)}` : '', i.diagnostic ?? ''].filter(Boolean).join(' · ') || null,
+  }));
+}
 
 export function countsLine(c: SettlementCounts): string {
   return `observed ${c.observed} · eligible ${c.eligible} · retained ${c.retained} · settled ${c.settled} · refused ${c.refused} · recovery ${c.recovery_required} · unattempted ${c.unattempted}`;

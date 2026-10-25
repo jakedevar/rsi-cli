@@ -169,7 +169,9 @@ pub(crate) trait ApiProvider: Send + Sync {
 /// Resolve which ApiProvider backend to use for a given model and config.
 ///
 /// Routing order (first match wins):
-/// 1. Explicit `openai_base_url` in config -> OpenAI-compatible provider.
+/// 1. Explicit `openai_base_url` in config: a native Anthropic Messages
+///    endpoint (path `/v1/messages`, #595) -> AnthropicProvider at its API
+///    root; any other URL -> OpenAI-compatible provider.
 /// 2. Model prefix "claude-" -> AnthropicProvider.
 /// 3. Model prefix "gpt-", "o1-", "o3-", "o4-" -> OpenAiApiProvider.
 /// 4. Lookup in COMPATIBLE_TABLE -> OpenAI-compatible provider with preset URL.
@@ -200,6 +202,11 @@ pub(crate) fn resolve_provider(
     }
 
     if let Some(url) = base_url {
+        if let Some(api_root) = anthropic_messages_api_root(url)? {
+            return Ok(Box::new(anthropic_messages_endpoint_provider(
+                &api_root, api_key,
+            )?));
+        }
         return Ok(Box::new(OpenAiApiProvider::with_config(
             url.to_string(),
             super::api_key::ApiCredential::explicit(api_key),
@@ -257,6 +264,99 @@ pub(crate) fn resolve_provider(
     )))
 }
 
+/// The native Anthropic Messages path. The Messages provider appends it to the
+/// API root it is given.
+const ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
+
+/// #595: the API root of a configured endpoint that is a native Anthropic
+/// Messages URL (`<root>/v1/messages`, one trailing `/` allowed), or `None`.
+/// Native URLs with query, fragment or inline credentials are refused before
+/// launch: the Messages client appends a path to the root and cannot preserve
+/// those components. Never echo the URL, which may contain a secret.
+///
+/// Classified by the URL path alone, never by model name: an OpenAI-compatible
+/// base (including Anthropic's own compatibility root `…/v1`) never ends in
+/// `/v1/messages`, because RSI appends `/chat/completions` to it, so every
+/// existing OpenAI-compatible route keeps its protocol.
+pub(crate) fn anthropic_messages_api_root(base_url: &str) -> Result<Option<String>> {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return Ok(None);
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Ok(None);
+    }
+    let path = url.path().strip_suffix('/').unwrap_or(url.path());
+    if !path.ends_with(ANTHROPIC_MESSAGES_PATH) {
+        return Ok(None);
+    }
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(DaemonError::InvalidParam(
+            "anthropic_endpoint_components_unsupported: native Anthropic Messages URLs \
+             cannot contain a query, fragment or inline credentials; configure a URL \
+             ending in /v1/messages without these components in Settings > API Providers, \
+             and set the key in the provider's API key field"
+                .into(),
+        ));
+    }
+    // Components have been checked independently. Strip the path suffix from
+    // the parsed URL so prefixes, ports and normalized paths remain intact.
+    Ok(Some(
+        url.as_str()
+            .strip_suffix('/')
+            .unwrap_or(url.as_str())
+            .strip_suffix(ANTHROPIC_MESSAGES_PATH)
+            .expect("the parsed path ends in the Messages suffix")
+            .to_owned(),
+    ))
+}
+
+/// #595: the provider a launch with an explicit endpoint runs on. A Local
+/// launch (the OpenAI-compatible Chat Completions client) cannot speak a
+/// native Anthropic Messages endpoint, so it runs on Harness, whose
+/// AnthropicProvider does; every other launch keeps its provider.
+pub(crate) fn provider_for_explicit_endpoint(
+    requested: Option<rsi_common::types::SessionProvider>,
+    base_url: Option<&str>,
+) -> Result<Option<rsi_common::types::SessionProvider>> {
+    use rsi_common::types::SessionProvider;
+    if matches!(
+        requested,
+        Some(SessionProvider::Local | SessionProvider::Harness)
+    ) {
+        if let Some(url) = base_url {
+            if anthropic_messages_api_root(url)?.is_some() {
+                return Ok(Some(SessionProvider::Harness));
+            }
+        }
+    }
+    Ok(requested)
+}
+
+/// A configured native Anthropic Messages endpoint with its own key. Only the
+/// endpoint's own key is used (no Anthropic vault-slot fallback), so the
+/// operator's global Anthropic key is never sent to a custom host.
+fn anthropic_messages_endpoint_provider(
+    api_root: &str,
+    api_key: Option<&str>,
+) -> Result<super::providers::anthropic::AnthropicProvider> {
+    let credential = super::api_key::ApiCredential::explicit(api_key);
+    if credential.current().is_none() {
+        return Err(DaemonError::InvalidParam(format!(
+            "anthropic_endpoint_key_missing: the Anthropic Messages endpoint \
+             {api_root}{ANTHROPIC_MESSAGES_PATH} has no API key; set the key on this \
+             custom provider (Settings > API Providers)"
+        )));
+    }
+    super::providers::anthropic::AnthropicProvider::with_credential(
+        api_root.to_string(),
+        credential,
+    )
+}
+
 /// The Harness Bedrock credential. A vault or env-compat key resolves per
 /// request so a rotation reaches the live session; a generator token is minted
 /// once per launch (the generator is a subprocess, too slow per request).
@@ -303,6 +403,116 @@ mod tests {
         let provider = resolve_provider("mercury-2", None, Some("test-key")).unwrap();
         assert_eq!(provider.name(), "openai");
         assert!(provider.supports_native_tools());
+    }
+
+    /// #595: only a native Messages URL is classified native; every
+    /// OpenAI-compatible base, Anthropic's own compatibility root included,
+    /// keeps its protocol whatever the model is called.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn classifies_native_anthropic_messages_endpoints_by_path() {
+        for (url, root) in [
+            (
+                "https://api.anthropic.com/v1/messages",
+                "https://api.anthropic.com",
+            ),
+            (
+                "https://api.anthropic.com/v1/messages/",
+                "https://api.anthropic.com",
+            ),
+            (
+                " https://proxy.example.invalid/anthropic/v1/messages ",
+                "https://proxy.example.invalid/anthropic",
+            ),
+            ("http://127.0.0.1:4010/v1/messages", "http://127.0.0.1:4010"),
+        ] {
+            assert_eq!(
+                anthropic_messages_api_root(url).unwrap().as_deref(),
+                Some(root),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+            "https://api.anthropic.com",
+            "https://api.example.invalid/openai/v1",
+            "https://api.example.invalid/v1/messages/chat/completions",
+            "https://api.example.invalid/v1/messagesx",
+            "https://api.example.invalid/v1?route=/v1/messages",
+            "https://api.example.invalid/v1#route/v1/messages",
+            "https://api.example.invalid/v1/messagesx?route=/v1/messages/",
+            "https://api.example.invalid/v1/messages//",
+            "https:///v1/messages",
+            "/v1/messages",
+        ] {
+            assert_eq!(anthropic_messages_api_root(url).unwrap(), None, "{url}");
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn only_a_local_launch_of_a_native_messages_endpoint_moves_to_harness() {
+        use rsi_common::types::SessionProvider;
+        let native = Some("https://api.anthropic.com/v1/messages");
+        let compatible = Some("https://api.anthropic.com/v1");
+        assert_eq!(
+            provider_for_explicit_endpoint(Some(SessionProvider::Local), native).unwrap(),
+            Some(SessionProvider::Harness)
+        );
+        for (requested, url) in [
+            (Some(SessionProvider::Local), compatible),
+            (Some(SessionProvider::Local), None),
+            (Some(SessionProvider::Harness), native),
+            (Some(SessionProvider::Codex), native),
+            (Some(SessionProvider::Claude), native),
+            (None, native),
+        ] {
+            assert_eq!(
+                provider_for_explicit_endpoint(requested, url).unwrap(),
+                requested
+            );
+        }
+    }
+
+    /// #595: an explicit native Messages URL runs on the Anthropic provider
+    /// with the endpoint's own key; Anthropic's OpenAI-compatible root stays
+    /// OpenAI-compatible for a claude model; a native endpoint without a key
+    /// is refused with the fix, not sent unauthenticated.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]
+    #[test]
+    fn explicit_endpoints_pick_the_protocol_their_url_names() {
+        let native = resolve_provider(
+            "claude-opus-5-5",
+            Some("https://api.anthropic.com/v1/messages"),
+            Some("sk-ant-api03-inert-595"),
+        )
+        .unwrap();
+        assert_eq!(native.name(), "anthropic");
+        let compatible = resolve_provider(
+            "claude-opus-5-5",
+            Some("https://api.anthropic.com/v1"),
+            Some("sk-ant-api03-inert-595"),
+        )
+        .unwrap();
+        assert_eq!(compatible.name(), "openai");
+
+        for key in [None, Some("")] {
+            let error = match resolve_provider(
+                "claude-opus-5-5",
+                Some("https://api.anthropic.com/v1/messages"),
+                key,
+            ) {
+                Ok(_) => panic!("a keyless native endpoint must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("anthropic_endpoint_key_missing")
+                    && error.contains("https://api.anthropic.com/v1/messages")
+                    && error.contains("Settings > API Providers"),
+                "{error}"
+            );
+        }
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-02"))]

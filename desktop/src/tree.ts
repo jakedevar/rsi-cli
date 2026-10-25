@@ -4,7 +4,7 @@
 // node stay visible. Sessions whose parent is not in the list are roots.
 import { needsAttention } from './approvals-model.js';
 import type { Session } from './api.js';
-import { ACTIVE_STATUSES, HIDDEN_BY_DEFAULT, isActive, sessionLabel } from './model.js';
+import { ACTIVE_STATUSES, HIDDEN_BY_DEFAULT, isActive, matchesFilterText, passesFinished, type HiddenMatches } from './model.js';
 
 export const CONTAINER_KINDS = new Set(['Group', 'Epic']);
 
@@ -16,6 +16,8 @@ export interface TreeFilter {
   projectId: string | null;
   text: string;
   showFinished: boolean;
+  /** The open session: never hidden by the finished filter (it stays listed when it finishes). */
+  keepId?: string | null;
   /** `archived` lists archived sessions (status Archived) with no finished filter. */
   mode?: 'active' | 'archived';
   /**
@@ -52,21 +54,56 @@ export interface TreeRow {
   anyAttention: boolean;
 }
 
+/** A root session a scheduled job launched (the Jobs zone, G2). */
+function isJob(s: Session): boolean {
+  return !!s.scheduled_job_id && !s.parent_id;
+}
+
+function inZone(s: Session, f: Pick<TreeFilter, 'zone'>): boolean {
+  return f.zone === 'jobs' ? isJob(s) : f.zone === 'main' ? !isJob(s) : true;
+}
+
 function passesLeaf(s: Session, f: TreeFilter): boolean {
   const archived = f.mode === 'archived';
-  const job = !!s.scheduled_job_id && !s.parent_id;
-  if (!archived && f.zone === 'jobs' && !job) return false;
-  if (!archived && f.zone === 'main' && job) return false;
+  if (!archived && !inZone(s, f)) return false;
   if (!archived && HIDDEN_BY_DEFAULT.has(s.status)) return false;
-  if (!archived && f.zone !== 'jobs' && !f.showFinished && !isActive(s) && s.status !== 'Interrupted' && s.status !== 'Failed') {
-    return false;
-  }
+  if (!archived && f.zone !== 'jobs' && !passesFinished(s, f.showFinished, f.keepId)) return false;
   if (f.projectId && s.project_id !== f.projectId) return false;
+  return matchesFilterText(s, f.text.trim().toLowerCase());
+}
+
+/**
+ * How many sessions the current filter text matches that the other filters hide, so an empty list can
+ * say so and offer them: finished ones (Show completed off), archived ones, and other projects'.
+ * `archived` is the Archived tab's list; either list may repeat a session.
+ */
+export function countHiddenMatches(active: Session[], archived: Session[], f: TreeFilter): HiddenMatches {
   const needle = f.text.trim().toLowerCase();
-  if (!needle) return true;
-  return sessionLabel(s).toLowerCase().includes(needle) ||
-    s.id.startsWith(needle) ||
-    s.provider.toLowerCase().includes(needle);
+  const out: HiddenMatches = { finished: 0, archived: 0, otherProjects: 0 };
+  const seenArchived = new Set<string>();
+  const countArchived = (s: Session): void => {
+    // The Archived tab lists every zone together, so Jobs offers no archived hint.
+    if (seenArchived.has(s.id) || f.zone === 'jobs' || !matchesFilterText(s, needle)) return;
+    seenArchived.add(s.id);
+    if (!f.projectId || s.project_id === f.projectId) out.archived += 1;
+  };
+  for (const s of active) {
+    if (s.status === 'Archived') { countArchived(s); continue; }
+    if (HIDDEN_BY_DEFAULT.has(s.status) || !inZone(s, f) || !matchesFilterText(s, needle)) continue;
+    if (f.zone !== 'jobs' && !passesFinished(s, f.showFinished, f.keepId)) {
+      if (!f.projectId || s.project_id === f.projectId) out.finished += 1;
+    } else if (f.projectId && s.project_id !== f.projectId) {
+      out.otherProjects += 1;
+    }
+  }
+  for (const s of archived) if (s.status === 'Archived') countArchived(s);
+  return out;
+}
+
+/** Sessions this tab could list with no filter on: the empty text's "yet" versus "match". */
+export function countZoneSessions(all: Session[], f: Pick<TreeFilter, 'zone' | 'mode'>): number {
+  if (f.mode === 'archived') return all.length;
+  return all.filter((s) => !HIDDEN_BY_DEFAULT.has(s.status) && inZone(s, f)).length;
 }
 
 function byActivity(a: TreeNode, b: TreeNode): number {

@@ -21,7 +21,7 @@ use rsi_common::types::{Project, SessionKind, SessionProvider, SessionStatus, Wa
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-type SharedStore = Arc<tokio::sync::Mutex<Store>>;
+type SharedStore = Arc<rsid_core::store_lock::Mutex<Store>>;
 
 struct Portfolio {
     a: Uuid,
@@ -1964,4 +1964,79 @@ async fn rotated_codex_pm_budget_and_fill_match_parent_catalog_and_operator() {
         .unwrap();
     assert_eq!(unknown.context_fill_pct, None);
     assert_eq!(runtime.to_json()["coordinator_context_cap_tokens"], 40);
+}
+
+/// #3765: a PM seat whose turn ended with no enabled wake stays live: the
+/// daemon arms a `health_anomaly` backstop (once), the status stays idle
+/// `Completed`, and the next manager mail still wakes the seat. A worker is
+/// left alone.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-05"))]
+#[tokio::test]
+async fn an_idle_pm_keeps_a_backstop_and_the_next_mail_wakes_it_3765() {
+    use crate::session::manager_idle::{
+        IDLE_BACKSTOP_NAME_PREFIX, IdleBackstop, guard_idle_manager,
+    };
+    let (control, store) = control_handle_with_store();
+    let p = portfolio(&store).await;
+    let (pm, worker) = {
+        let guard = store.lock().await;
+        guard
+            .update_session_status(p.pm_a, SessionStatus::Completed)
+            .unwrap();
+        guard
+            .update_session_status(p.worker, SessionStatus::Completed)
+            .unwrap();
+        (
+            guard.get_session(p.pm_a).unwrap().unwrap(),
+            guard.get_session(p.worker).unwrap().unwrap(),
+        )
+    };
+    assert_eq!(
+        guard_idle_manager(&store, &worker).await,
+        IdleBackstop::NotManager
+    );
+    assert_eq!(guard_idle_manager(&store, &pm).await, IdleBackstop::Armed);
+    assert_eq!(
+        guard_idle_manager(&store, &pm).await,
+        IdleBackstop::HoldsWake,
+        "a second turn end re-arms nothing while the backstop is enabled"
+    );
+    {
+        let guard = store.lock().await;
+        assert!(!guard.session_has_enabled_resume_wake(p.worker).unwrap());
+        let backstop = guard
+            .list_owned_scheduled_jobs(p.pm_a, false, 50)
+            .unwrap()
+            .into_iter()
+            .map(|(job, _)| job)
+            .find(|job| job.name.starts_with(IDLE_BACKSTOP_NAME_PREFIX))
+            .expect("backstop armed");
+        assert_eq!(backstop.wake_mode, WakeMode::Resume);
+        assert!(
+            guard
+                .wake_when_state(backstop.id)
+                .unwrap()
+                .is_some_and(|state| state.predicate.health_anomaly.is_some())
+        );
+        assert_eq!(
+            guard.get_session(p.pm_a).unwrap().unwrap().status,
+            SessionStatus::Completed,
+            "an idle manager is Completed, not Interrupted"
+        );
+    }
+    // The next manager mail wakes the seat.
+    let receipt = control
+        .agent_global_send(p.seat, send(p.a, "idle-1"))
+        .await
+        .unwrap();
+    assert_eq!(receipt.target_session_id, p.pm_a);
+    let mail = store
+        .lock()
+        .await
+        .get_scheduled_job(&receipt.message_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mail.wake_session_id, Some(p.pm_a));
+    assert_eq!(mail.wake_mode, WakeMode::Resume);
+    assert!(mail.enabled);
 }

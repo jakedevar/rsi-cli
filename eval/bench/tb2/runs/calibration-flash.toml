@@ -1,0 +1,18 @@
+# Run config (#3181): the S10 calibration of the program plan (D8). RSI's native harness
+# on the 10 calibration tasks with `deepseek/deepseek-v4.1-flash`, k=1, a $0.40 cap per
+# task. Needs `bench.enabled`, `bench.docker_hosts` and `allowed_launches` for
+# (OpenRouter, deepseek/deepseek-v4.1-flash, high), and an armed OpenRouter spend cap
+# with headroom for the job's budget_usd (the plan caps the calibration at $6).
+schema_version = 1
+name = "calibration-flash"
+description = "RSI harness, deepseek-v4.1-flash, 10 calibration tasks, k=1"
+host = "ssh://arch-laptop"
+split = "calibration"
+k = 1
+concurrency = 4
+
+[agent]
+kind = "rsi"
+model = "deepseek/deepseek-v4.1-flash"
+effort = "high"
+per_task_cap_usd = 0.40

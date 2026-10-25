@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ACTIONS, appMenuModel, keyHints, unavailable } from '../dist/registry.js';
+import { ACTIONS, appMenuModel, menuItems, keyHints, unavailable } from '../dist/registry.js';
 import { TODO_ACTIONS, TODO_KEY_BINDINGS, TODO_RULES } from '../dist/actions/todo.js';
 import { desktopKeymap } from '../dist/keybindings.js';
 import { KeyEngine } from '../dist/keyengine.js';
@@ -49,7 +49,7 @@ test('the chords and :todo run the to-do actions', () => {
   assert.equal(new KeyEngine(desktopKeymap()).runCommand('todo').action, 'todo-toggle');
   assert.deepEqual(keyHints('todo-copy'), ['<Space>dy', '<Space>dc']);
   const view = appMenuModel('other', snap({ todo: { open: true, selected: false, undo: false } })).find((m) => m.id === 'view');
-  const toggle = view.items.find((i) => i.kind === 'item' && i.id === 'act:todo-toggle');
+  const toggle = menuItems(view.items).find((i) => i.id === 'act:todo-toggle');
   assert.equal(toggle.checked, true);
 });
 
@@ -210,7 +210,7 @@ test('the Tauri commands forward the operator-only methods and are in the handle
   }
   const handlers = readFileSync(here('../src-tauri/src/handlers.generated.rs'), 'utf8');
   for (const cmd of ['operator_todo_list', 'operator_todo_close', 'operator_todo_reopen']) assert.match(handlers, new RegExp(`todo::${cmd}\\b`));
-  assert.match(readFileSync(here('../src-tauri/src/lib.rs'), 'utf8'), /^pub mod todo;$/m);
+  assert.match(readFileSync(here('../src-tauri/src/modules.generated.rs'), 'utf8'), /^pub mod todo;$/m);
   const ts = readFileSync(here('../src/todo.ts'), 'utf8');
   assert.match(ts, /invoke<unknown>\('operator_todo_list', \{ closedSince: panel\.closedSince\(\) \}\)/);
   assert.match(ts, /invoke<unknown>\('operator_todo_close', \{ todoId: t\.id, status: t\.status \}\)/);

@@ -255,6 +255,11 @@ pub trait LoopTools: Send + Sync {
     fn specs(&self) -> Vec<HarnessToolSpec>;
     fn filter_hosted_specs(&self, specs: Vec<HarnessToolSpec>) -> Vec<HarnessToolSpec>;
     fn context_editing_enabled(&self) -> bool;
+    /// The launch's output-token ceiling for a length-stop recovery call (#4028);
+    /// `None` is the loop's own default.
+    fn recovery_max_output_tokens(&self) -> Option<u32> {
+        None
+    }
     fn execution_mode(&self, name: &str) -> Option<ToolExecutionMode>;
     /// Whether the session policy admits a provider-run call; `Err` is the denial text.
     fn admit_hosted_call(&self, name: &str) -> Result<(), String>;

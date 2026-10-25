@@ -17,7 +17,7 @@ test('with Vim keys off the Settings pane keeps standard keys and drops its moda
     assert.equal(paneKeyAllowed(true, keydown(key)), true, `on: ${key}`);
     assert.equal(paneKeyAllowed(false, keydown(key)), false, `off: ${key}`);
   }
-  for (const key of ['ArrowDown', 'ArrowUp', 'Enter', 'Escape', 'Tab', 'PageDown', 'Home']) {
+  for (const key of ['ArrowDown', 'ArrowUp', 'Enter', 'Escape', 'F6', 'PageDown', 'Home']) {
     assert.equal(paneKeyAllowed(false, keydown(key)), true, `off keeps ${key}`);
     assert.equal(paneKeyAllowed(true, keydown(key)), true, `on keeps ${key}`);
   }
@@ -27,9 +27,9 @@ test('with Vim keys off the Settings pane keeps standard keys and drops its moda
 
 test('every pane window keydown handler asks paneKeyAllowed first', () => {
   const src = fileURLToPath(new URL('../src/', import.meta.url));
-  // Not pane handlers: the key engine itself, the palette chord (works with Vim keys off by
-  // design) and the prompt editors, which consult isVimKeysOn() for their own normal mode.
-  const exempt = new Set(['vimkeys.ts', 'palette.ts', 'prompts.ts', 'prompt-creator.ts']);
+  // Not pane handlers: the key engine itself, the palette and New session chords (they work with Vim keys
+  // off by design, #305) and the prompt editors, which consult isVimKeysOn() for their own normal mode.
+  const exempt = new Set(['vimkeys.ts', 'palette.ts', 'menus.ts', 'prompts.ts', 'prompt-creator.ts']);
   const gated = [];
   for (const file of readdirSync(src).filter((f) => f.endsWith('.ts')).sort()) {
     const text = readFileSync(src + file, 'utf8');
@@ -39,7 +39,7 @@ test('every pane window keydown handler asks paneKeyAllowed first', () => {
     assert.match(head, /if \(!paneKeyAllowed\(isVimKeysOn\(\), ev\)\) return;/, `${file} pane handler ignores the Vim keys switch`);
     gated.push(file);
   }
-  assert.deepEqual(gated, ['dag.ts', 'esp.ts', 'files.ts', 'graphs.ts', 'issues.ts', 'managers.ts', 'settings.ts']);
+  assert.deepEqual(gated, ['dag.ts', 'dashboard.ts', 'esp.ts', 'files.ts', 'graphs.ts', 'issues.ts', 'managers.ts', 'settings.ts']);
 });
 
 // A stand-in for a DOM element: closest() answers for the selectors it is inside of.

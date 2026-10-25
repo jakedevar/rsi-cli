@@ -77,6 +77,7 @@ pub(crate) fn seat(
         rotation_threshold_pct: Some(40.0),
         coordinator_budget: None,
         cost_usd: Some(4.2),
+        launch_turn: None,
         updated_at: Utc::now(),
         pending_question: false,
         succession_refusal: None,
@@ -111,6 +112,7 @@ pub(crate) fn policy(paused: bool, revoked: bool) -> GlobalPmPolicyV1 {
         revoked,
         paused,
         capabilities: vec![],
+        creation_caps: vec![],
     }
 }
 
@@ -914,6 +916,15 @@ fn launched_snapshot(f: &Fixture, seat_id: Uuid) -> GlobalManagerWorkspaceV1 {
     snapshot
 }
 
+async fn review_and_save_coverage(app: &mut App) {
+    assert!(
+        workspace(app).coverage.is_some(),
+        "shared coverage draft opens"
+    );
+    handle_key(app, key(KeyCode::Char('r'))).await;
+    handle_key(app, key(KeyCode::Char('y'))).await;
+}
+
 #[tokio::test]
 async fn n_launches_and_appoints_a_global_manager_in_one_flow() {
     let f = fixture();
@@ -949,6 +960,13 @@ async fn n_launches_and_appoints_a_global_manager_in_one_flow() {
         "the grant's projects"
     );
     handle_key(&mut app, key(KeyCode::Enter)).await;
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
 
     assert_eq!(daemon.calls("LaunchSession"), 1);
     let launch = daemon.last_params("LaunchSession").unwrap();
@@ -994,12 +1012,22 @@ async fn a_refused_appointment_stays_inline_and_enter_retries_only_the_appointme
     open_with(&mut app, GlobalManagerWorkspaceV1::default());
     handle_key(&mut app, key(KeyCode::Char('n'))).await;
     handle_key(&mut app, key(KeyCode::Enter)).await;
-    let form = workspace(&app).launch.clone().expect("the form stays open");
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
+    let form = workspace(&app)
+        .coverage
+        .clone()
+        .expect("the shared draft stays open");
     let error = form.error.clone().unwrap();
-    assert!(error.contains("Launched session"), "{error}");
-    assert!(error.contains("Enter retries the appointment"), "{error}");
+    assert!(error.contains("Draft retained"), "{error}");
+    assert!(error.contains("Esc edits"), "{error}");
     assert_eq!(form.launched, Some(new_seat));
-    assert_eq!(form.value(LaunchField::Submit), "[ Retry the appointment ]");
+    assert_eq!(form.step, 4);
 
     let mut granted = f.snapshot.grant.clone().unwrap();
     granted.seat_session_id = new_seat;
@@ -1013,6 +1041,14 @@ async fn a_refused_appointment_stays_inline_and_enter_retries_only_the_appointme
         serde_json::to_value(launched_snapshot(&f, new_seat)).unwrap(),
     );
     handle_key(&mut app, key(KeyCode::Enter)).await;
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
+    handle_key(&mut app, key(KeyCode::Char('y'))).await;
     assert_eq!(daemon.calls("LaunchSession"), 1, "not relaunched");
     assert_eq!(daemon.calls("ConfigureGlobalManager"), 2);
     let configure = daemon.last_params("ConfigureGlobalManager").unwrap();
@@ -1072,6 +1108,13 @@ async fn launch_form_prefills_the_global_appointment_from_the_revoked_grant() {
     );
 
     handle_key(&mut app, key(KeyCode::Enter)).await;
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
     let sent = daemon.last_params("ConfigureGlobalManager").unwrap();
     assert_eq!(
         sent["project_policy"],
@@ -1115,8 +1158,18 @@ async fn launch_and_appoint_previews_a_cap_reduction_and_y_confirms_it() {
     open_with(&mut app, GlobalManagerWorkspaceV1::default());
     handle_key(&mut app, key(KeyCode::Char('n'))).await;
     handle_key(&mut app, key(KeyCode::Enter)).await;
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
 
-    let form = workspace(&app).launch.clone().expect("the form stays open");
+    let form = workspace(&app)
+        .coverage
+        .clone()
+        .expect("the shared draft stays open");
     assert!(form.cap_confirm);
     let error = form.error.clone().unwrap();
     assert!(error.contains("Koplik: active sessions: 20 → 4"), "{error}");
@@ -1124,13 +1177,20 @@ async fn launch_and_appoint_previews_a_cap_reduction_and_y_confirms_it() {
         error.contains("Other: created sessions: 50 → 10"),
         "{error}"
     );
-    assert!(error.contains("Press y to confirm"), "{error}");
+    assert!(error.contains("y confirms"), "{error}");
     assert_eq!(form.launched, Some(new_seat));
 
     // Enter must not repeat the refused request.
     handle_key(&mut app, key(KeyCode::Enter)).await;
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
     assert_eq!(daemon.calls("ConfigureGlobalManager"), 1);
-    assert!(workspace(&app).launch.as_ref().unwrap().cap_confirm);
+    assert!(workspace(&app).coverage.as_ref().unwrap().cap_confirm);
 
     handle_key(&mut app, key(KeyCode::Char('y'))).await;
     assert_eq!(daemon.calls("LaunchSession"), 1, "not relaunched");
@@ -1156,12 +1216,19 @@ async fn n_leaves_the_cap_preview_and_esc_keeps_the_session_unappointed() {
     open_with(&mut app, GlobalManagerWorkspaceV1::default());
     handle_key(&mut app, key(KeyCode::Char('n'))).await;
     handle_key(&mut app, key(KeyCode::Enter)).await;
-    handle_key(&mut app, key(KeyCode::Char('n'))).await;
-    let form = workspace(&app).launch.clone().unwrap();
-    assert!(!form.cap_confirm);
-    assert_eq!(form.error, None);
+    if workspace(&app)
+        .coverage
+        .as_ref()
+        .is_some_and(|form| form.step == 0)
+    {
+        review_and_save_coverage(&mut app).await;
+    }
+    handle_key(&mut app, key(KeyCode::Esc)).await;
+    let form = workspace(&app).coverage.clone().unwrap();
+    assert_eq!(form.step, 0);
     assert_eq!(form.launched, Some(new_seat));
     handle_key(&mut app, key(KeyCode::Esc)).await;
+    assert!(workspace(&app).coverage.is_none());
     assert!(workspace(&app).launch.is_none());
     assert_eq!(daemon.calls("ConfigureGlobalManager"), 1);
 }
@@ -1716,6 +1783,7 @@ fn prior(id: Uuid, project_id: Uuid, status: SessionStatus) -> SeatPredecessorV1
         model: Some("claude-opus-5-5".into()),
         context_fill_pct: Some(91.0),
         cost_usd: Some(7.5),
+        launch_turn: None,
         updated_at: Utc::now(),
     }
 }
@@ -1943,4 +2011,110 @@ fn workspace_grant_display_and_overview_show_any_effort() {
             .grant_line(&[f.a.clone(), f.b.clone()])
             .contains("any effort")
     );
+}
+
+#[tokio::test]
+async fn g_e_edits_coverage_with_one_review_and_preserves_the_grant() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    app.projects = vec![f.a.clone(), f.b.clone()];
+    let daemon = fake_daemon(&mut app).await;
+    let mut grant = f.snapshot.grant.clone().unwrap();
+    grant.project_ids = vec![f.a.id];
+    grant.project_policy.paused = true;
+    grant.project_policy.created_sessions_window_hours = 72;
+    grant.project_policy.allowed_launches = vec![grant.allowed_launches[0].clone()];
+    daemon.serve("GetGlobalManager", serde_json::to_value(&grant).unwrap());
+    daemon.serve(
+        "ConfigureGlobalManager",
+        serde_json::to_value(&grant).unwrap(),
+    );
+    daemon.serve(
+        "GetGlobalManagerWorkspace",
+        serde_json::to_value(&f.snapshot).unwrap(),
+    );
+    open_with(&mut app, f.snapshot.clone());
+    handle_key(&mut app, key(KeyCode::Char('g'))).await;
+    handle_key(&mut app, key(KeyCode::Char('e'))).await;
+    handle_key(&mut app, key(KeyCode::Char('j'))).await;
+    handle_key(&mut app, key(KeyCode::Char(' '))).await;
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 0);
+    handle_key(&mut app, key(KeyCode::Char('r'))).await;
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 0);
+    handle_key(&mut app, key(KeyCode::Char('y'))).await;
+    let saved = daemon.last_params("ConfigureGlobalManager").unwrap();
+    assert_eq!(
+        saved["project_policy"],
+        serde_json::json!(grant.project_policy)
+    );
+    assert_eq!(
+        saved["allowed_launches"],
+        serde_json::json!(grant.allowed_launches)
+    );
+    assert_eq!(saved["project_ids"], serde_json::json!([f.a.id, f.b.id]));
+    assert_eq!(
+        saved["session_id"],
+        serde_json::json!(grant.seat_session_id)
+    );
+    assert_eq!(saved["expected_grant_version"], grant.grant_version);
+    assert!(workspace(&app).coverage.is_none());
+}
+
+#[tokio::test]
+async fn coverage_budget_is_read_only_and_returns_to_the_same_draft() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let daemon = fake_daemon(&mut app).await;
+    open_with(&mut app, f.snapshot.clone());
+    let grant = f.snapshot.grant.as_ref().unwrap();
+    let request =
+        crate::overlay::global_manager_command::grant_addition_request(grant, &[]).unwrap();
+    open_coverage_request(&mut app, request, None);
+    handle_key(&mut app, key(KeyCode::Char('r'))).await;
+    let before = workspace(&app).coverage.as_ref().unwrap().prepared.clone();
+    handle_key(&mut app, key(KeyCode::Char('b'))).await;
+    assert!(workspace(&app).budget.is_some());
+    for code in [
+        KeyCode::Char('+'),
+        KeyCode::Char('9'),
+        KeyCode::Enter,
+        KeyCode::Char('y'),
+    ] {
+        handle_key(&mut app, key(code)).await;
+    }
+    assert!(workspace(&app).budget.as_ref().unwrap().pending.is_none());
+    assert!(workspace(&app).budget.as_ref().unwrap().entry.is_none());
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 0);
+    assert_eq!(daemon.calls("ConfigurePortfolioNode"), 0);
+    handle_key(&mut app, key(KeyCode::Esc)).await;
+    assert!(workspace(&app).budget.is_none());
+    assert_eq!(workspace(&app).coverage.as_ref().unwrap().step, 4);
+    assert_eq!(workspace(&app).coverage.as_ref().unwrap().prepared, before);
+}
+
+#[tokio::test]
+async fn coverage_stale_version_keeps_review_and_fence_without_relaunching() {
+    let f = fixture();
+    let mut app = app_on_a(&f);
+    let daemon = fake_daemon(&mut app).await;
+    daemon.serve_error(
+        "ConfigureGlobalManager",
+        "global_manager_stale_grant_version",
+    );
+    open_with(&mut app, f.snapshot.clone());
+    let grant = f.snapshot.grant.as_ref().unwrap();
+    let request =
+        crate::overlay::global_manager_command::grant_addition_request(grant, &[]).unwrap();
+    open_coverage_request(&mut app, request, None);
+    review_and_save_coverage(&mut app).await;
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 1);
+    assert_eq!(daemon.calls("LaunchSession"), 0);
+    let first = daemon.last_params("ConfigureGlobalManager").unwrap();
+    let form = workspace(&app).coverage.as_ref().unwrap();
+    assert_eq!(form.step, 4);
+    assert!(form.error.as_ref().unwrap().contains("stale_grant_version"));
+    handle_key(&mut app, key(KeyCode::Enter)).await;
+    assert_eq!(daemon.calls("ConfigureGlobalManager"), 1);
+    handle_key(&mut app, key(KeyCode::Char('y'))).await;
+    assert_eq!(daemon.last_params("ConfigureGlobalManager").unwrap(), first);
 }

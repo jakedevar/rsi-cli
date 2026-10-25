@@ -4,7 +4,6 @@ use std::{
 };
 
 use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
-use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use super::exec::{self, ProcessRegistry};
@@ -21,7 +20,7 @@ pub(crate) struct HarnessProcessRegistryManager {
 }
 
 struct ProcessRegistryRuntime {
-    store: std::sync::OnceLock<Arc<TokioMutex<crate::store::Store>>>,
+    store: std::sync::OnceLock<Arc<rsid_core::store_lock::Mutex<crate::store::Store>>>,
     scheduler: std::sync::OnceLock<crate::scheduler::SchedulerHandle>,
 }
 
@@ -36,7 +35,10 @@ impl HarnessProcessRegistryManager {
         })
     }
 
-    pub(crate) fn install_store(&self, store: Arc<TokioMutex<crate::store::Store>>) {
+    pub(crate) fn install_store(
+        &self,
+        store: Arc<rsid_core::store_lock::Mutex<crate::store::Store>>,
+    ) {
         let _ = self.runtime.store.set(store);
     }
 
@@ -237,7 +239,7 @@ mod tests {
         store.insert_scheduled_job(&job).expect("wake");
 
         let manager = HarnessProcessRegistryManager::new();
-        manager.install_store(Arc::new(TokioMutex::new(store)));
+        manager.install_store(Arc::new(rsid_core::store_lock::Mutex::new(store)));
         manager.clear_stale_wakes().await;
 
         let store = manager.runtime.store.get().expect("installed store");
@@ -275,7 +277,7 @@ mod tests {
         );
 
         let manager = HarnessProcessRegistryManager::new();
-        manager.install_store(Arc::new(TokioMutex::new(store)));
+        manager.install_store(Arc::new(rsid_core::store_lock::Mutex::new(store)));
         manager.clear_stale_wakes().await;
 
         let store = manager.runtime.store.get().expect("installed store");

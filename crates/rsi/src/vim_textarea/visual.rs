@@ -1,8 +1,8 @@
 //! Visual mode handling for vim emulation.
 
 use super::motions::{
-    execute_char_search, move_cursor_to, move_paragraph_backward, move_paragraph_forward,
-    move_to_first_non_blank, move_to_matching_bracket,
+    clamp_word_cursor, execute_char_search, move_cursor_to, move_paragraph_backward,
+    move_paragraph_forward, move_to_first_non_blank, move_to_matching_bracket, move_word,
 };
 use super::state::{CharSearch, CharSearchDir, VimAction, VimState, VisualMode};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -116,21 +116,24 @@ pub(super) fn handle_visual_mode(
             }
             VimAction::Consumed
         }
-        KeyCode::Char('w') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordForward);
+        KeyCode::Char(ch @ ('w' | 'W')) => {
+            move_word(textarea, CursorMove::WordForward, count, ch == 'W');
+            if ch == 'W' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }
-        KeyCode::Char('b') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordBack);
+        KeyCode::Char(ch @ ('b' | 'B')) => {
+            move_word(textarea, CursorMove::WordBack, count, ch == 'B');
+            if ch == 'B' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }
-        KeyCode::Char('e') => {
-            for _ in 0..count {
-                textarea.move_cursor(CursorMove::WordEnd);
+        KeyCode::Char(ch @ ('e' | 'E')) => {
+            move_word(textarea, CursorMove::WordEnd, count, ch == 'E');
+            if ch == 'E' {
+                clamp_word_cursor(textarea);
             }
             VimAction::Consumed
         }

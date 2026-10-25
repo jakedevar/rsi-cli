@@ -22,13 +22,14 @@
 use super::{
     STARTUP_ORPHAN_ENV_MAX_BYTES, STARTUP_ORPHAN_FIXED_POINT_MAX_PASSES,
     STARTUP_ORPHAN_POST_KILL_GRACE, STARTUP_ORPHAN_POST_KILL_POLL, STARTUP_ORPHAN_PROC_ENTRY_MAX,
-    STARTUP_ORPHAN_STAMP_TUPLE_MAX, STARTUP_ORPHAN_TOTAL_DEADLINE, StartupAfterScanHook,
-    StartupOrphanIdentity, StartupProcessOwnership, StartupStampObservation,
-    parse_startup_stamp_observation, run_startup_provider_after_scan_hook,
+    STARTUP_ORPHAN_STAMP_TUPLE_MAX, STARTUP_ORPHAN_TOTAL_DEADLINE, SettlementOrphanReap,
+    StartupAfterScanHook, StartupOrphanIdentity, StartupProcessOwnership, StartupStampObservation,
+    UnprovenProcess, parse_startup_stamp_observation, run_startup_provider_after_scan_hook,
 };
 use nix::libc;
 use rsid_core::libproc_macos::{
-    credentials, errno, exited, list_pids, procargs_environment, process_arguments, process_start,
+    credentials, errno, executable, exited, list_pids, procargs_environment, process_arguments,
+    process_start, working_directory,
 };
 use std::time::Instant as StdInstant;
 
@@ -36,6 +37,36 @@ struct ObservedProcess {
     pid: libc::pid_t,
     started_micros: u64,
     stamps: StartupStampObservation,
+}
+
+/// One inventory pass: the stamped processes, and the live processes of this
+/// uid whose environment the kernel withheld (an errno, or a record with no
+/// environment at all) by pid and start time, which the pass can neither prove
+/// nor signal (#149).
+struct Inventory {
+    processes: Vec<ObservedProcess>,
+    withheld: Vec<(libc::pid_t, u64)>,
+}
+
+/// What one `KERN_PROCARGS2` read of a process's environment found.
+#[derive(Debug, PartialEq, Eq)]
+enum EnvironmentRead {
+    /// The environment, in Linux `environ` layout.
+    Shown(Vec<u8>),
+    /// The process exited or turned zombie: it holds nothing.
+    Gone,
+    /// The kernel withheld it (`EPERM`, or `EINVAL` for a protected
+    /// process): unproven, never signalled.
+    Withheld,
+}
+
+impl EnvironmentRead {
+    fn shown(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Shown(environment) => Some(environment),
+            Self::Gone | Self::Withheld => None,
+        }
+    }
 }
 
 /// Attempts at an environment read that fails without explanation.
@@ -46,6 +77,10 @@ const ENVIRONMENT_READ_BACKOFF: std::time::Duration = std::time::Duration::from_
 /// process exited or withholds it (`EPERM`, or `EINVAL` for a protected or
 /// exiting process): an unproven process, never one to signal.
 pub(super) fn read_environment(pid: libc::pid_t) -> crate::error::Result<Option<Vec<u8>>> {
+    read_environment_classified(pid).map(EnvironmentRead::shown)
+}
+
+fn read_environment_classified(pid: libc::pid_t) -> crate::error::Result<EnvironmentRead> {
     read_environment_with(
         pid,
         || process_arguments(pid, STARTUP_ORPHAN_ENV_MAX_BYTES),
@@ -62,31 +97,33 @@ fn read_environment_with(
     pid: libc::pid_t,
     mut read: impl FnMut() -> Result<Vec<u8>, i32>,
     mut live: impl FnMut() -> Result<bool, i32>,
-) -> crate::error::Result<Option<Vec<u8>>> {
+) -> crate::error::Result<EnvironmentRead> {
     let mut attempt = 1;
     loop {
         let code = match read() {
             Ok(record) => {
-                return procargs_environment(&record).map(Some).ok_or_else(|| {
-                    crate::error::DaemonError::Process(format!(
-                        "startup provider argument record is malformed for pid {pid}"
-                    ))
-                });
+                return procargs_environment(&record)
+                    .map(EnvironmentRead::Shown)
+                    .ok_or_else(|| {
+                        crate::error::DaemonError::Process(format!(
+                            "startup provider argument record is malformed for pid {pid}"
+                        ))
+                    });
             }
-            Err(code) if exited(code) => return Ok(None),
+            Err(code) if exited(code) => return Ok(EnvironmentRead::Gone),
             Err(code) if code == libc::EPERM || code == libc::EINVAL => {
                 tracing::debug!(
                     pid,
                     code,
                     "startup provider environment is withheld; skipping unproven process"
                 );
-                return Ok(None);
+                return Ok(EnvironmentRead::Withheld);
             }
             Err(code) => code,
         };
         match live() {
-            Ok(false) => return Ok(None),
-            Err(gone) if exited(gone) => return Ok(None),
+            Ok(false) => return Ok(EnvironmentRead::Gone),
+            Err(gone) if exited(gone) => return Ok(EnvironmentRead::Gone),
             Ok(true) | Err(_) => {}
         }
         if attempt >= ENVIRONMENT_READ_ATTEMPTS {
@@ -100,12 +137,12 @@ fn read_environment_with(
 }
 
 /// One bounded pass over every process of this effective uid that carries an
-/// RSI stamp.
+/// RSI stamp, noting each one whose environment is withheld.
 fn scan_inventory(
     self_pid: libc::pid_t,
     self_uid: u32,
     deadline: StdInstant,
-) -> crate::error::Result<Vec<ObservedProcess>> {
+) -> crate::error::Result<Inventory> {
     let pids = list_pids().ok_or_else(|| {
         crate::error::DaemonError::Process(format!(
             "startup provider process list failed: errno {}",
@@ -118,6 +155,7 @@ fn scan_inventory(
         ));
     }
     let mut processes = Vec::new();
+    let mut withheld = Vec::new();
     let mut stamp_token_count = 0_usize;
     for pid in pids {
         if StdInstant::now() >= deadline {
@@ -147,7 +185,8 @@ fn scan_inventory(
             Ok(start) => start.started_micros,
             Err(code) if exited(code) => continue,
             // Its own user may not read it: a protected process, whose
-            // environment is withheld too. Unproven, never signalled.
+            // environment is withheld too. Unproven, never signalled, and with
+            // no start time it has no stable identity to report (#149).
             Err(code) if code == libc::EPERM => continue,
             Err(code) => {
                 return Err(crate::error::DaemonError::Process(format!(
@@ -155,8 +194,20 @@ fn scan_inventory(
                 )));
             }
         };
-        let Some(environment) = read_environment(pid)? else {
-            continue;
+        let environment = match read_environment_classified(pid)? {
+            // The kernel answers for a platform or hardened binary with its
+            // arguments and no environment at all (observed: `/bin/sleep`);
+            // every process RSI launches has one. Unproven either way (#149).
+            EnvironmentRead::Shown(environment) if environment.is_empty() => {
+                withheld.push((pid, started_micros));
+                continue;
+            }
+            EnvironmentRead::Shown(environment) => environment,
+            EnvironmentRead::Gone => continue,
+            EnvironmentRead::Withheld => {
+                withheld.push((pid, started_micros));
+                continue;
+            }
         };
         let stamps = parse_startup_stamp_observation(&environment)?;
         if stamps.is_empty() {
@@ -182,7 +233,32 @@ fn scan_inventory(
             stamps,
         });
     }
-    Ok(processes)
+    Ok(Inventory {
+        processes,
+        withheld,
+    })
+}
+
+/// Name the withheld processes of the final inventory pass (#149): the
+/// executable and working directory libproc still reports for them. A process
+/// that exited or was replaced since the pass is left out; an unreadable path
+/// is reported as unknown. Read-only: nothing here signals.
+fn describe_unproven(withheld: Vec<(libc::pid_t, u64)>) -> Vec<UnprovenProcess> {
+    withheld
+        .into_iter()
+        .filter_map(|(pid, started_micros)| {
+            let executable = executable(pid).ok().flatten();
+            let working_directory = working_directory(pid).ok().map(|cwd| cwd.path);
+            let same = process_start(pid)
+                .is_ok_and(|start| start.started_micros == started_micros && !start.zombie);
+            same.then(|| UnprovenProcess {
+                pid: pid as u32,
+                start_time_micros: started_micros,
+                executable,
+                working_directory,
+            })
+        })
+        .collect()
 }
 
 fn self_identity() -> (libc::pid_t, u32) {
@@ -197,7 +273,7 @@ fn self_identity() -> (libc::pid_t, u32) {
 pub(super) fn prove_scan_readable(ownership: &StartupProcessOwnership) -> crate::error::Result<()> {
     let (self_pid, self_uid) = self_identity();
     let deadline = StdInstant::now() + STARTUP_ORPHAN_TOTAL_DEADLINE;
-    for process in scan_inventory(self_pid, self_uid, deadline)? {
+    for process in scan_inventory(self_pid, self_uid, deadline)?.processes {
         process
             .stamps
             .authorized_exact_stamp(process.pid, ownership)?;
@@ -206,11 +282,12 @@ pub(super) fn prove_scan_readable(ownership: &StartupProcessOwnership) -> crate:
 }
 
 /// Reap the exact-stamped processes of `ownership` to two consecutive complete
-/// empty inventories, as the Linux fixed point does.
+/// empty inventories, as the Linux fixed point does. The final pass's withheld
+/// processes come back unsignalled as `unproven` (#149).
 pub(super) fn reap_owned_orphans(
     ownership: &StartupProcessOwnership,
     mut after_scan_hook: StartupAfterScanHook,
-) -> crate::error::Result<usize> {
+) -> crate::error::Result<SettlementOrphanReap> {
     if ownership.session_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
         || ownership.invocation_ids.len() > crate::store::STARTUP_PROVIDER_CANDIDATE_MAX
     {
@@ -220,7 +297,7 @@ pub(super) fn reap_owned_orphans(
         )));
     }
     if ownership.is_empty() {
-        return Ok(0);
+        return Ok(SettlementOrphanReap::default());
     }
     // Detached-turn adoption reads Linux `/proc`; only the runtime reaper (a
     // no-op here) carries such turns. Refuse rather than signal a turn that
@@ -241,7 +318,8 @@ pub(super) fn reap_owned_orphans(
             ));
         }
         let mut observed = Vec::new();
-        for process in scan_inventory(self_pid, self_uid, deadline)? {
+        let inventory = scan_inventory(self_pid, self_uid, deadline)?;
+        for process in inventory.processes {
             if let Some(stamps) = process
                 .stamps
                 .authorized_exact_stamp(process.pid, ownership)?
@@ -261,7 +339,10 @@ pub(super) fn reap_owned_orphans(
                 consecutive_empty_passes.saturating_add(1)
             };
             if consecutive_empty_passes >= 2 {
-                return Ok(reaped);
+                return Ok(SettlementOrphanReap {
+                    reaped,
+                    unproven: describe_unproven(inventory.withheld),
+                });
             }
             continue;
         }
@@ -456,19 +537,24 @@ mod tests {
         };
         assert_eq!(
             read_environment_with(7, read, || Ok(true)).expect("recovered"),
-            Some(b"A=b\0".to_vec())
+            EnvironmentRead::Shown(b"A=b\0".to_vec())
         );
         // A process that exits or turns zombie meanwhile holds nothing.
         assert_eq!(
             read_environment_with(7, || Err(libc::EIO), || Ok(false)).expect("zombie"),
-            None
+            EnvironmentRead::Gone
         );
         assert_eq!(
             read_environment_with(7, || Err(libc::EIO), || Err(libc::ESRCH)).expect("gone"),
-            None
+            EnvironmentRead::Gone
         );
-        // Withheld or exited: unproven, no retry.
-        for code in [libc::EPERM, libc::EINVAL, libc::ESRCH] {
+        // Withheld or exited: unproven, no retry. Only a withheld one is
+        // reported as an unproven survivor (#149).
+        for (code, expected) in [
+            (libc::EPERM, EnvironmentRead::Withheld),
+            (libc::EINVAL, EnvironmentRead::Withheld),
+            (libc::ESRCH, EnvironmentRead::Gone),
+        ] {
             let mut reads = 0;
             let result = read_environment_with(
                 7,
@@ -478,7 +564,7 @@ mod tests {
                 },
                 || Ok(true),
             );
-            assert_eq!(result.expect("unproven"), None);
+            assert_eq!(result.expect("unproven"), expected);
             assert_eq!(reads, 1);
         }
         // A live process that stays unreadable fails closed after the bound.
@@ -509,13 +595,17 @@ mod tests {
         prove_scan_readable(&ownership).expect("the inventory is readable");
         owned.assert_alive("the read-only proof signals nothing");
         assert_eq!(
-            reap_owned_orphans(&ownership, None).expect("reap the exact owner"),
+            reap_owned_orphans(&ownership, None)
+                .expect("reap the exact owner")
+                .reaped,
             1
         );
         owned.wait_signalled("exact owner");
         foreign.assert_alive("another Session's process is never signalled");
         assert_eq!(
-            reap_owned_orphans(&ownership, None).expect("the fixed point is empty"),
+            reap_owned_orphans(&ownership, None)
+                .expect("the fixed point is empty")
+                .reaped,
             0
         );
     }
@@ -524,7 +614,7 @@ mod tests {
     #[test]
     fn macos_settlement_reaper_refuses_detached_turns_and_empty_ownership_is_inert() {
         let empty = StartupProcessOwnership::for_sessions(HashSet::new());
-        assert_eq!(reap_owned_orphans(&empty, None).expect("inert"), 0);
+        assert_eq!(reap_owned_orphans(&empty, None).expect("inert").reaped, 0);
         let owner = Uuid::new_v4();
         let mut ownership = StartupProcessOwnership::for_sessions(HashSet::from([owner]));
         let now = chrono::Utc::now();
@@ -569,7 +659,8 @@ mod tests {
                 .any(|variable| variable == stamp.as_bytes())
         });
         let ownership = StartupProcessOwnership::for_sessions(HashSet::from([session_id]));
-        let reaped = reap_owned_orphans(&ownership, None).expect("reap");
+        let reap = reap_owned_orphans(&ownership, None).expect("reap");
+        let reaped = reap.reaped;
         let alive = child.try_wait().expect("probe child").is_none();
         child.kill().ok();
         child.wait().ok();
@@ -577,5 +668,18 @@ mod tests {
         // withheld one leaves the process unproven and untouched.
         assert_eq!(reaped, usize::from(shown));
         assert_eq!(alive, !shown);
+        // #149: a withheld one is reported, named by its executable, and
+        // still alive when the reap returned.
+        if !shown {
+            let unproven = reap
+                .unproven
+                .iter()
+                .find(|process| process.pid == pid as u32)
+                .expect("the withheld child is reported unproven");
+            assert_eq!(
+                unproven.executable.as_deref(),
+                Some(std::path::Path::new("/bin/sleep"))
+            );
+        }
     }
 }

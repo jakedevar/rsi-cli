@@ -1,0 +1,262 @@
+{
+  "crates/rsid-store/src/sandbox/git_worktree.rs": {
+    "entries": ["authored.txt"],
+    "reason": "Isolated temporary Makefile-only settlement fixture deliberately puts authored data under target to prove retention (#401). Never a production target writer; this exception does not make the entry reclaimable."
+  },
+  "crates/rsi-repo-guards/src/touched_shards/derive_tests.rs": {
+    "entries": ["generated.rs"],
+    "reason": "A literal fixture path (a nested crate target/ directory the manifest-dir scanner must exempt); the test only classifies it and never writes the production target root."
+  },
+  "crates/rsi-repo-guards/src/guard_regressions_tests.rs": {
+    "entries": ["new-thing", "other"],
+    "reason": "Exact literal source-string names in the historical target detector regression. These fixture detector inputs do not write the production target root."
+  },
+  "crates/rsi-repo-guards/src/desktop_execution_tests.rs": {
+    "entries": ["a", "b"],
+    "reason": "Isolated temporary test fixtures (a scratch directory, never this workspace target); the names are literal fixture data. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/landing_guard_cli.rs": {
+    "entries": ["new-other", "new-thing"],
+    "reason": "Literal shell text committed into a temporary Git fixture to prove the landing guard's static target-writer policy reads the committed candidate. The fixture is a scratch repository, never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/rolling_qa_cli_tests.rs": {
+    "entries": ["run", "x"],
+    "reason": "Isolated temporary test fixtures (a scratch directory, never this workspace target); the names are literal evidence-directory data for the QA orchestration tests. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/rolling_qa_tests.rs": {
+    "entries": ["link", "qa"],
+    "reason": "Isolated temporary test fixtures (a scratch directory, never this workspace target); the names are literal fixture data. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/scoped_runner/baseline.rs": {
+    "entries": ["scoped-baselines"],
+    "reason": "Isolated temporary test fixtures (a scratch directory, never this workspace target); the names are literal fixture data. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/scoped_runner/linux_check.rs": {
+    "entries": ["check-stub.sh", "logs"],
+    "reason": "Isolated temporary test fixtures (a scratch directory, never this workspace target); the names are literal fixture data. Keep these names scoped to this source file."
+  },
+  "crates/rsi-repo-guards/src/target_reclaim_tests.rs": {
+    "entries": ["authored.txt", "nested", "new-other", "new-thing", "scoped-baselines", "target"],
+    "reason": "Literal source strings in the Rust port of the target writer guard's refusal fixtures. The fixture names are data being scanned; filesystem fixtures are temporary. Exact names are scoped to this test file, not to production writers."
+  },
+  "crates/rsid/src/governor/own_target.rs": {
+    "entries": ["artifact", "nested", "sibling", "target"],
+    "reason": "Isolated temporary own-target admission fixtures, including sibling and symlink refusal checks; never production target writers. The lexical guard also carries target aliases across fixture scopes (#515)."
+  },
+  "crates/rsi/examples/visual_parity.rs": {
+    "entries": [
+      "visual-parity"
+    ],
+    "reason": "Keep generated visual-parity SVGs for operator comparison; existing evidence output intentionally pins the target until removed."
+  },
+  "crates/rsid-store/src/sandbox/target_reclaim.rs": {
+    "entries": [
+      "a",
+      "aarch64-unknown-linux-gnu",
+      "b",
+      "baseline-1632",
+      "cache",
+      "data",
+      "data-link",
+      "external",
+      "held",
+      "lander",
+      "nested",
+      "new-owner",
+      "new-source",
+      "one",
+      "original",
+      "other",
+      "outside-sentinel",
+      "oversized-leaf",
+      "python-discover.other",
+      "raced",
+      "replacement",
+      "review-1885-source",
+      "scoped-baselines",
+      "shared",
+      "sparse",
+      "unreadable",
+      "wasm32-unknown-unknown",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid-store/src/sandbox/target_reclaim/process_scan_macos.rs": {
+    "entries": [
+      "held.rlib"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid-store/src/store/cold_archive/read_classes.rs": {
+    "entries": [
+      "rsi-rolling-land-X1",
+      "skipped.rs"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid-store/src/store/manager_decision_history.rs": {
+    "entries": [
+      "kind"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid-store/src/store/sandbox_stray.rs": {
+    "entries": [
+      "scoped-baselines"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid-store/src/store/tests.rs": {
+    "entries": [
+      "nested-sentinel"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/agent_jobs.rs": {
+    "entries": [
+      "own",
+      "sibling"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/agent_scratch_reclaim/tests.rs": {
+    "entries": [
+      "scratch-test-tmp"
+    ],
+    "reason": "Existing filesystem-capability test scratch parent is retained; TempDir removes its children. This legacy parent still pins target until explicitly cleaned."
+  },
+  "crates/rsid/src/bin/rsi-rolling-land.rs": {
+    "entries": [
+      "candidate"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/codegraph/discovery.rs": {
+    "entries": [
+      "generated.rs"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/codegraph/watcher.rs": {
+    "entries": [
+      "generated.rs"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/rolling_queue/satellite_qa.rs": {
+    "entries": [
+      "blob"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/session/launch.rs": {
+    "entries": [
+      "artifact.bin",
+      "cache",
+      "new-owner"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/session/sandbox_purge.rs": {
+    "entries": [
+      "artifact",
+      "late"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/session/tests/manager_issue_worker.rs": {
+    "entries": [
+      "seed-head"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "crates/rsid/src/stray_target_reclaim.rs": {
+    "entries": [
+      "scoped-baselines"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/candidate-receipt.sh": {
+    "entries": [
+      ".lock"
+    ],
+    "reason": "Existing per-receipt cache lock beside its Cargo target; this is a separate cache root protected by its own lock, not a sandbox target entry."
+  },
+  "scripts/recursive-dag-live-dogfood.sh": {
+    "entries": [
+      "recursive-dag-live-dogfood.env"
+    ],
+    "reason": "Keep the existing live-dogfood environment file for subsequent invocations; operator workflow state must not become automatically reclaimable."
+  },
+  "scripts/refresh-baseline.sh": {
+    "entries": [
+      "mutants"
+    ],
+    "reason": "Keep mutation-testing reports for baseline review; existing tool output intentionally remains until removed."
+  },
+  "scripts/rolling-health-observer.py": {
+    "entries": [
+      "test"
+    ],
+    "reason": "Read-only package/target/test identity text, not a filesystem writer."
+  },
+  "scripts/rsid-sample-stacks": {
+    "entries": [
+      "executable",
+      "thread"
+    ],
+    "reason": "Read-only diagnostic text about the sampled process target, not a filesystem writer."
+  },
+  "scripts/scoped-test": {
+    "entries": [
+      "scoped-baselines"
+    ],
+    "reason": "Nested baseline Cargo targets are recognized structurally by dir_is_nested_target_tree, not by the name allow-list; the baseline owner removes these runs after settlement."
+  },
+  "scripts/test-suite-benchmark.sh": {
+    "entries": [
+      "test-suite-benchmark"
+    ],
+    "reason": "Keep benchmark calibration and measurement evidence for comparison across runs; existing evidence intentionally remains until removed."
+  },
+  "scripts/tests/test_check_target_reclaim.py": {
+    "entries": [
+      "new-other",
+      "new-thing"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/tests/test_check_touched_shards.py": {
+    "entries": [
+      "generated.rs"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/tests/test_clean_target.sh": {
+    "entries": [
+      ".hidden"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/tests/test_rolling_landing_guard.py": {
+    "entries": [
+      "new-other",
+      "new-thing"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/tests/test_rsi_stash.sh": {
+    "entries": [
+      "large.bin"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  },
+  "scripts/tests/test_scoped_test.py": {
+    "entries": [
+      "dep-layout",
+      "scoped-baselines"
+    ],
+    "reason": "Isolated temporary test fixtures (including deliberate unknown entries for refusal/retention tests), never this workspace target. Keep these names scoped to this source file."
+  }
+}

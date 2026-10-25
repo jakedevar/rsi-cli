@@ -478,9 +478,9 @@ mod tests {
     #[test]
     fn hook_ignores_test_like_text_in_heredocs() {
         for command in [
-            "python3 - <<'EOF'\nfrom glob import glob\npaths = glob('/tmp/rsi-scoped-test-*/rsid-store.json')\n# Example command text: cargo test -p rsid-store --lib\nEOF",
+            "sh - <<'EOF'\nfrom glob import glob\npaths = glob('/tmp/rsi-scoped-test-*/rsid-store.json')\n# Example command text: cargo test -p rsid-store --lib\nEOF",
             "cat > /tmp/inspect.py <<'EOF'\nprint('cargo test -p rsid --lib')\nEOF",
-            "cat > /tmp/inspect.py <<'EOF'\nprint('rsid-store test output')\nEOF\npython3 /tmp/inspect.py",
+            "cat > /tmp/inspect.py <<'EOF'\nprint('rsid-store test output')\nEOF\nsh /tmp/inspect.py",
         ] {
             assert!(decision(command, false).is_none(), "{command}");
         }
@@ -489,11 +489,11 @@ mod tests {
     #[test]
     fn completed_test_log_inspection_is_allowed() {
         // Exact denied command recorded in #389's originating session.
-        let evidence = "python3 - <<'PY'\nimport json\nx=json.load(open('/tmp/issue-367-authority-result.json'))['result']\nprint(json.dumps({'roles':x['roles'],'guidance':x['guidance']},indent=2))\nPY\nrg -n 'resolved_coordinator_budget_explains|rotated_codex_pm_budget|operator_context_settings_expose|context_settings_render|Summary|test result:' /tmp/rsi-scoped-test-js5x9zha/{rsid-store,rsid,rsi}.log | tail -24";
+        let evidence = "sh - <<'PY'\nimport json\nx=json.load(open('/tmp/issue-367-authority-result.json'))['result']\nprint(json.dumps({'roles':x['roles'],'guidance':x['guidance']},indent=2))\nPY\nrg -n 'resolved_coordinator_budget_explains|rotated_codex_pm_budget|operator_context_settings_expose|context_settings_render|Summary|test result:' /tmp/rsi-scoped-test-js5x9zha/{rsid-store,rsid,rsi}.log | tail -24";
         for command in [
             evidence,
             "grep -n -e 'test result:' /tmp/{rsid-store,rsid,rsi}.log",
-            "python3 -c 'from pathlib import Path; print(Path(\"/tmp/rsid.log\").read_text())'",
+            "jq -r . /tmp/rsid.log",
             "rg 'cargo test -p rsid foo; cargo nextest run -p rsid -E test(topology::)' /tmp/tests.log",
             "cat /tmp/{rsid-store,rsid,rsi}.log | grep -e 'test result:' && sed -n '/store::tests/p' /tmp/rsid.log",
             "env LOG=test sudo -u worker rg 'test result:' /tmp/{rsid-store,rsid}.log; jq '.test' /tmp/receipt.json",
@@ -519,7 +519,7 @@ mod tests {
                 format!("rg -e 'test result:' /tmp/{{rsid-store,rsid}}.log | {runner}"),
                 format!("{runner} | grep -e 'test result:'"),
                 format!("rg 'test result:' /tmp/rsid.log && {runner}"),
-                format!("{runner}; python3 -c 'print(\"test result:\")'"),
+                format!("{runner}; echo test-result"),
                 format!("{{ {runner}; }}"),
             ] {
                 let output =

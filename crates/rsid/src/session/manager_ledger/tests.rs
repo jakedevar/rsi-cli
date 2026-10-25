@@ -27,10 +27,18 @@ mod review_infra_retry;
 /// Disk-backed (never tmpfs) and outside every repository, so the
 /// GIT_CEILING_DIRECTORIES fence in `command` holds. A fresh host has no such
 /// directory until a test creates it (Issue #935).
+///
+/// The root is returned canonical: the custody check compares the persisted
+/// sandbox root with its canonical form, and on macOS `/var` is a symlink to
+/// `/private/var`, so a non-canonical fixture root would look like a changed
+/// custody path.
 fn evidence_temp_root() -> &'static Path {
-    const ROOT: &str = "/var/tmp/ham-v2-fd23a414";
-    std::fs::create_dir_all(ROOT).expect("create the evidence temp root");
-    Path::new(ROOT)
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        const DIR: &str = "/var/tmp/ham-v2-fd23a414";
+        std::fs::create_dir_all(DIR).expect("create the evidence temp root");
+        std::fs::canonicalize(DIR).expect("canonicalize the evidence temp root")
+    })
 }
 
 fn command(root: &Path, args: &[&str]) -> String {
@@ -777,8 +785,11 @@ async fn inherited_request_denies_reassignment_retired_ambiguous_and_revoked_rec
                     caller = f.reviewer;
                 }
                 "retired" => {
+                    // #667 fences the API writers while a rotation receipt is
+                    // current; the raw seam simulates the unfenced restore
+                    // that retires it (#4005).
                     store
-                        .update_session_status(f.source, SessionStatus::Completed)
+                        .unfenced_status_write_for_test(f.source, SessionStatus::Completed)
                         .unwrap();
                     store
                         .update_session_status(f.source, SessionStatus::Archived)
@@ -1399,6 +1410,102 @@ async fn db_native_review_accepts_only_the_bound_exact_source_receipt() {
     assert_eq!(rows[0]["integrated"], true);
     assert!(rows[0]["integration"]["verification"].is_null());
     assert!(rows[0]["integration_evidence_policy_digest"].is_null());
+}
+
+/// #3213: a bound reviewer that mistypes its assignment id is refused with its
+/// own live assignment id in the detail, and nothing is recorded.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn db_native_review_wrong_assignment_id_is_refused_naming_the_bound_one() {
+    let f = fixture().await;
+    let assignment_id = request_and_activate_db_review(&f, "db-review-wrong-id").await;
+    let mut typo = assignment_id.to_string().into_bytes();
+    typo[0] = if typo[0] == b'0' { b'1' } else { b'0' };
+    let typo = Uuid::parse_str(std::str::from_utf8(&typo).unwrap()).unwrap();
+    assert_ne!(typo, assignment_id);
+
+    let request = AgentSubmitReviewReceiptRequestV1 {
+        assignment_id: typo,
+        verdict: ManagerReviewVerdictV1::Accepted,
+        findings: vec![],
+        idempotency_key: "receipt-wrong-id".into(),
+    };
+    let refusal = f
+        .handle
+        .agent_submit_review_receipt(f.reviewer, request.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("manager_review_assignment_missing")
+            && refusal.contains(&format!("your_assignment_id={assignment_id}")),
+        "{refusal}"
+    );
+    let receipts: i64 = f
+        .handle
+        .store
+        .lock()
+        .await
+        .conn
+        .query_row("SELECT count(*) FROM manager_review_receipts", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(receipts, 0);
+
+    // The retry with the id the refusal named is accepted.
+    let receipt = f
+        .handle
+        .agent_submit_review_receipt(
+            f.reviewer,
+            AgentSubmitReviewReceiptRequestV1 {
+                assignment_id,
+                ..request
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt.assignment_id, assignment_id);
+}
+
+/// #3213: a bound reviewer may omit the assignment id; the receipt is
+/// recorded against its binding, and a caller bound to nothing is refused.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn db_native_review_without_assignment_id_resolves_from_the_binding() {
+    let f = fixture().await;
+    let assignment_id = request_and_activate_db_review(&f, "db-review-no-id").await;
+    let request = AgentSubmitReviewReceiptRequestV1 {
+        assignment_id: Uuid::nil(),
+        verdict: ManagerReviewVerdictV1::Accepted,
+        findings: vec![],
+        idempotency_key: "receipt-no-id".into(),
+    };
+    let refusal = f
+        .handle
+        .agent_submit_review_receipt(f.source, request.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refusal.contains("manager_review_assignment_missing"),
+        "{refusal}"
+    );
+    let receipt = f
+        .handle
+        .agent_submit_review_receipt(f.reviewer, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(receipt.assignment_id, assignment_id);
+    assert_eq!(receipt.source_commit, f.source_head);
+    assert!(!receipt.deduplicated);
+    let replay = f
+        .handle
+        .agent_submit_review_receipt(f.reviewer, request)
+        .await
+        .unwrap();
+    assert_eq!(replay.receipt_id, receipt.receipt_id);
+    assert!(replay.deduplicated);
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
@@ -3439,6 +3546,39 @@ async fn read_only_git_rejects_changed_branch_dirty_source_and_wrong_inventory()
     );
 }
 
+#[cfg(unix)]
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn custody_accepts_the_canonical_root_and_refuses_a_changed_path() {
+    let f = fixture().await;
+    let identity = std::fs::canonicalize(f.dir.path().join("repo").join(".git"))
+        .unwrap()
+        .display()
+        .to_string();
+    let custody_at = |root: &std::path::Path| crate::store::sandbox_custody::PersistedCustody {
+        custody_id: Uuid::new_v4(),
+        allocation_session_id: f.source,
+        allocation_id: Uuid::new_v4(),
+        owner_session_id: f.source,
+        generation: 1,
+        canonical_repo_dir: f.dir.path().join("repo").display().to_string(),
+        sandbox_root: root.display().to_string(),
+        sandbox_branch: "source".into(),
+        repository_identity: identity.clone(),
+        source_commit: f.allocation_commit.clone(),
+    };
+    git::custody(&custody_at(&f.source_root)).await.unwrap();
+    // A path that resolves through a symlink is a changed custody path.
+    let link = f.dir.path().join("link-to-source");
+    std::os::unix::fs::symlink(&f.source_root, &link).unwrap();
+    let error = git::custody(&custody_at(&link)).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("manager_v2_custody_path_changed")
+    );
+}
+
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
 #[tokio::test]
 async fn independent_acceptance_and_combined_evidence_record_real_integration() {
@@ -4822,3 +4962,165 @@ async fn review_failure_without_resolvable_lead_still_settles_the_assignment() {
 }
 
 mod review_source;
+
+/// #3787: an operator intake seat files `operator-request` Issues with a
+/// required priority, and only a P1 (or the explicit `notify-manager` label)
+/// mails the manager, once, naming the Issue. A session without the intake role
+/// is unchanged: no forced label, no notice.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-01"))]
+#[tokio::test]
+async fn intake_seat_mails_the_manager_only_for_p1() {
+    use rsi_common::rpc::AgentCreateIssueParams;
+
+    let f = fixture().await;
+    // The role is immutable once a session exists, so the seat is its own row.
+    let intake = {
+        let store = f.handle.store.lock().await;
+        let mut seat = store.get_session(f.manager).unwrap().unwrap();
+        seat.id = Uuid::new_v4();
+        seat.status = SessionStatus::Running;
+        seat.agent_role = Some(rsi_common::intake_agent::INTAKE_AGENT_ROLE.to_string());
+        store.insert_session(&seat).unwrap();
+        seat.id
+    };
+    let params =
+        |title: &str, key: &str, priority: Option<u8>, labels: &[&str]| AgentCreateIssueParams {
+            project_id: None,
+            title: title.into(),
+            body: "the operator asked".into(),
+            priority,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            assignee: None,
+            idempotency_key: key.into(),
+            harness: false,
+            source_issue: None,
+        };
+    let intake_notices = |store: &crate::store::Store| -> Vec<String> {
+        let mut statement = store
+            .conn
+            .prepare(
+                "SELECT subject_id FROM harness_manager_notices \
+                 WHERE subject_id LIKE 'operator_intake:%' ORDER BY subject_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    // P2, P3 and P4 file a well-formed Issue and mail nobody.
+    for (n, priority) in [2u8, 3, 4].into_iter().enumerate() {
+        let filed = f
+            .handle
+            .agent_create_issue(
+                intake,
+                params(
+                    &format!("low priority request {n}"),
+                    &format!("low-{n}"),
+                    Some(priority),
+                    &["tui", "held:phone-app"],
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filed.issue.priority, Some(priority));
+        assert_eq!(
+            filed.issue.labels,
+            vec!["operator-request", "tui", "held:phone-app"]
+        );
+        assert!(
+            filed
+                .issue
+                .body
+                .contains("Filed by the operator intake agent")
+        );
+    }
+    assert!(intake_notices(&*f.handle.store.lock().await).is_empty());
+
+    // A P1 mails exactly once, naming the Issue; a replay adds nothing.
+    let urgent = f
+        .handle
+        .agent_create_issue(intake, params("the TUI will not start", "p1", Some(1), &[]))
+        .await
+        .unwrap();
+    assert!(!urgent.deduplicated);
+    let subject = format!("operator_intake:{}", urgent.issue.display_number);
+    assert_eq!(
+        intake_notices(&*f.handle.store.lock().await),
+        vec![subject.clone()]
+    );
+    let replay = f
+        .handle
+        .agent_create_issue(intake, params("the TUI will not start", "p1", Some(1), &[]))
+        .await
+        .unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(intake_notices(&*f.handle.store.lock().await), vec![subject]);
+
+    // The explicit label mails below P1.
+    let told = f
+        .handle
+        .agent_create_issue(
+            intake,
+            params("tell the manager now", "told", Some(3), &["notify-manager"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(intake_notices(&*f.handle.store.lock().await).len(), 2);
+    assert!(told.issue.labels.contains(&"notify-manager".to_string()));
+
+    // The grant refuses what a triaged filing cannot be.
+    for (bad, code) in [
+        (
+            params("no priority", "np", None, &[]),
+            "intake_priority_required",
+        ),
+        (
+            params("bad priority", "bp", Some(9), &[]),
+            "intake_priority_out_of_range",
+        ),
+        (
+            params("bad hold", "bh", Some(2), &["held:Phone App"]),
+            "intake_held_label_malformed",
+        ),
+    ] {
+        let error = f.handle.agent_create_issue(intake, bad).await.unwrap_err();
+        assert!(error.to_string().contains(code), "{code}: {error}");
+    }
+    let mut harness = params("harness filing", "hf", Some(1), &[]);
+    harness.harness = true;
+    let error = f
+        .handle
+        .agent_create_issue(intake, harness)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("intake_harness_filing_denied"));
+    let mut other_project = params("other project", "op", Some(1), &[]);
+    other_project.project_id = Some(Uuid::new_v4());
+    let error = f
+        .handle
+        .agent_create_issue(intake, other_project)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("intake_cross_project_filing_denied")
+    );
+    assert_eq!(intake_notices(&*f.handle.store.lock().await).len(), 2);
+
+    // A session without the intake role keeps the old behaviour: a P1 filing
+    // adds neither the label nor a notice.
+    let plain = f
+        .handle
+        .agent_create_issue(
+            f.reviewer,
+            params("plain finding", "plain", Some(1), &["bug"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plain.issue.labels, vec!["bug"]);
+    assert_eq!(intake_notices(&*f.handle.store.lock().await).len(), 2);
+}

@@ -1,0 +1,25 @@
+{
+  "complete": false,
+  "extra_lanes": [
+    {
+      "exit_code": 100,
+      "failing_tests": [
+        "store::fails"
+      ],
+      "name": "rolling-library-qa"
+    }
+  ],
+  "lanes": [],
+  "provenance": {
+    "finished_at": "2026-09-27T00:01:00Z",
+    "host": "fixture-host",
+    "kind": "qa_sweep",
+    "report_ref": $RESULT,
+    "runner": "scripts/cloud-sweep.sh -> scripts/run-rsid-test-shards.sh shard --jobs 4",
+    "started_at": "2026-09-27T00:00:00Z"
+  },
+  "schema_version": 1,
+  "shards": [],
+  "swept_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "swept_tree": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

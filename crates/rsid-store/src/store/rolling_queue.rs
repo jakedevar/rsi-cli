@@ -12,10 +12,12 @@ use crate::error::{DaemonError, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rsi_common::harness_manager_v2::ManagerOperatingModeV2;
 use rsi_common::rolling_queue::{
-    AgentRollingQueueEntryV1, QUEUE_DUPLICATE_SOURCE, QUEUE_ENTRY_CANCELLED, QUEUE_ENTRY_IN_FLIGHT,
-    QUEUE_ENTRY_NOT_FOUND, QUEUE_ENTRY_SETTLED, QUEUE_ENTRY_SUPERSEDED, QUEUE_INVALID_REQUEST,
-    QUEUE_SUPERSEDES_NOT_DESCENDANT, RollingQaGreenV1, RollingQueueBinding, RollingQueueEntryState,
-    RollingQueueEntryV1, RollingQueueOutcome, RollingQueueOutcomeSummaryV1,
+    AgentListRollingQueueRequestV1, AgentRollingQueueEntryV1, QUEUE_DUPLICATE_SOURCE,
+    QUEUE_ENTRY_CANCELLED, QUEUE_ENTRY_IN_FLIGHT, QUEUE_ENTRY_NOT_FOUND, QUEUE_ENTRY_SETTLED,
+    QUEUE_ENTRY_SUPERSEDED, QUEUE_EXPEDITE_CAP_REACHED, QUEUE_INVALID_REQUEST,
+    QUEUE_SUPERSEDES_NOT_DESCENDANT, QueueFiltersState, ROLLING_QUEUE_MAX_EXPEDITED,
+    RollingQaGreenV1, RollingQueueBinding, RollingQueueEntryState, RollingQueueEntryV1,
+    RollingQueueOutcome, RollingQueueOutcomeSummaryV1,
 };
 use rsi_common::types::{Recurrence, ScheduleSpec, ScheduledJob, WakeMode};
 use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
@@ -181,15 +183,117 @@ pub(crate) fn transfer_manager_queue_wakes_on(
     Ok(())
 }
 
-/// The stored filter list of an entry: its filters (none while the derivation
-/// is pending) and fix claims, then the #2993 marker while it is.
+/// The stored filter list of an entry: its filters and fix claims, then the
+/// #2993 marker while the derivation is pending. #3264: while it is pending the
+/// filters are the caller's extra ones alone (none when it named none); the
+/// derivation's end merges the derived set into them.
 fn stored_filters(filters: &[String], fixes: &[String], pending: bool) -> Vec<String> {
-    let mut stored =
-        rsi_common::rolling_queue::encode_fix_claims(if pending { &[] } else { filters }, fixes);
+    let mut stored = rsi_common::rolling_queue::encode_fix_claims(filters, fixes);
     if pending {
         stored.push(rsi_common::rolling_queue::FILTERS_DERIVING_MARKER.to_owned());
     }
     stored
+}
+
+/// [`stored_filters`] for an entry whose derivation exceeded its budget (#3372):
+/// the caller's filters and claims, then the lander-selects marker.
+fn stored_filters_lander_selects(filters: &[String], fixes: &[String]) -> Vec<String> {
+    let mut stored = rsi_common::rolling_queue::encode_fix_claims(filters, fixes);
+    stored.push(rsi_common::rolling_queue::FILTERS_LANDER_SELECTS_MARKER.to_owned());
+    stored
+}
+
+fn with_derived_filters(mut stored: Vec<String>, derived: &[String]) -> Vec<String> {
+    stored.extend(derived.iter().map(|filter| {
+        format!(
+            "{}{filter}",
+            rsi_common::rolling_queue::DERIVED_FILTER_PREFIX
+        )
+    }));
+    stored
+}
+
+/// #648: `stored` with the marker that makes the entry resume the queue
+/// position of the refused entry it replaces (that entry's own resumed
+/// position when it was itself a resumed successor).
+fn with_resumed_position(mut stored: Vec<String>, refused: Option<&EntryRow>) -> Vec<String> {
+    if let Some(row) = refused {
+        let position = row
+            .resume
+            .map_or(row.entry.sequence, |(position, _)| position);
+        stored.push(rsi_common::rolling_queue::encode_resume_position(
+            position,
+            row.entry.id,
+        ));
+    }
+    stored
+}
+
+/// #648: whether a descendant already took over the refused entry `prior`
+/// (any state: the refused row cannot be marked, so the successor carries the
+/// link and a second supersede of the same entry is settled).
+fn resumed_successor_exists(tx: &Transaction<'_>, prior: Uuid) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rolling_queue_entries, json_each(test_filters_json) AS j \
+         WHERE substr(j.value, 1, 16) = 'resume_position=' AND substr(j.value, -36) = ?1)",
+        [prior.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+/// #648: the refusal already woke the enqueuer, or its wake job has not fired
+/// yet. The successor's settlement is the one wake from here on, so a refusal
+/// wake that never fired is disabled and cannot fire after it.
+fn silence_unfired_refusal_wake(
+    tx: &Transaction<'_>,
+    refused: &EntryRow,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE scheduled_jobs SET enabled=0, updated_at=?2 \
+         WHERE id=(SELECT wake_job_id FROM rolling_queue_entries WHERE id=?1) \
+           AND enabled=1 AND last_fired_at IS NULL",
+        params![refused.entry.id.to_string(), stamp(now)],
+    )?;
+    Ok(())
+}
+
+/// #3487: `stored` with the expedite marker appended when the entry is expedited.
+fn with_expedite(mut stored: Vec<String>, reason: Option<&str>) -> Vec<String> {
+    if let Some(reason) = reason {
+        stored.push(rsi_common::rolling_queue::encode_expedite(reason));
+    }
+    stored
+}
+
+/// #648: the queue position an entry is admitted at: the position it resumes
+/// when it carries a `resume_position=` marker (a descendant of an entry
+/// refused `queue_conflicts_with_rolling`), else its own `sequence`.
+macro_rules! queue_position_sql {
+    () => {
+        "COALESCE((SELECT CAST(substr(j.value, 17) AS INTEGER) FROM json_each(test_filters_json) AS j \
+         WHERE substr(j.value, 1, 16) = 'resume_position='), sequence)"
+    };
+}
+
+/// #3487: the order the queue admits `queued` entries in: expedited entries
+/// first, then everything else, each group in enqueue (`sequence`) order. One
+/// expression for every query that picks the claim window, so the repository
+/// probe, the lane candidates and the claim see the same order.
+const QUEUED_ADMISSION_ORDER: &str = concat!(
+    "(test_filters_json LIKE '%\"expedited=%') DESC, ",
+    queue_position_sql!(),
+    ", sequence"
+);
+
+/// #3487: how an enqueue asks to be expedited.
+#[derive(Debug, Clone)]
+pub struct ExpediteAdmission {
+    /// Recorded on the entry.
+    pub reason: String,
+    /// The automatic `qa` rule rather than a manager's `expedite`: past the cap
+    /// the entry stays ordinary instead of being refused.
+    pub automatic: bool,
 }
 
 /// Everything the enqueue verb resolves before the store write.
@@ -221,7 +325,7 @@ pub struct ClaimedQueueBatch {
     /// Each member's own checkout, parallel to `entries` (members of one
     /// repository come from different worktrees, #1945).
     pub repo_paths: Vec<String>,
-    /// FIFO (enqueue) order.
+    /// Admission order: expedited entries (#3487), then FIFO (enqueue) order.
     pub entries: Vec<RollingQueueEntryV1>,
     /// The batch was claimed while another batch was gating, because its
     /// packages are disjoint from every gating batch's (#1224).
@@ -243,6 +347,62 @@ pub const ROLLING_QUEUE_MAX_LANES: usize = 2;
 /// batch (an entry further back waits for a later claim).
 pub const ROLLING_QUEUE_CLAIM_WINDOW: usize = 256;
 
+/// #4007: most test filters one batch may sum before the claim stops adding
+/// members. Recent lander logs: about 3.8k tests took 2400 s of gate wall time
+/// (base and candidate runs) and about 1.3k took 1636 s, so 4000 keeps a batch
+/// well under the default 60-minute `rolling_queue_gate_timeout_mins`; the batch
+/// that timed out summed about 10k. The head entry is always admitted, so one
+/// wide entry still gates alone.
+pub const ROLLING_QUEUE_BATCH_FILTER_BUDGET: usize = 4000;
+
+/// #4007: an expedited entry, or one that claims to fix known-red tests
+/// (`fixes_issue` / `fixes_tests`), shares a gate only with entries whose
+/// filter count is at most this, and itself gates alone when it is wider.
+pub const ROLLING_QUEUE_PRIORITY_COMPANION_FILTERS: usize = 600;
+
+/// #4007 (review #4027): how many filters an entry weighs against the batch
+/// budget. Normally its filter count. An entry whose derivation went over
+/// budget (`lander_selects`) and that carries no filters of its own is
+/// unbounded: the lander selects its tests itself, and `union_filters` gives a
+/// Rust-touching member with no filters a full affected gate for the whole
+/// batch. It counts as infinitely wide, so it gates alone and nothing (an
+/// expedited fix above all) is batched with it. A docs-only entry in that
+/// state is treated the same: the store holds no diff, so it cannot tell, and
+/// gating alone is the safe side.
+fn batch_width(entry: &RollingQueueEntryV1) -> usize {
+    if entry.filters_state == Some(QueueFiltersState::LanderSelects)
+        && entry.test_filters.is_empty()
+    {
+        usize::MAX
+    } else {
+        entry.test_filters.len()
+    }
+}
+
+/// #4007: whether `next` may join a batch already holding `members` (a
+/// non-empty list; the head is always admitted). Admission order is kept: the
+/// claim stops at the first entry that does not fit.
+fn batch_admits(members: &[RollingQueueEntryV1], next: &RollingQueueEntryV1) -> bool {
+    let priority = |entry: &RollingQueueEntryV1| {
+        entry.expedite_reason.is_some() || !entry.fixes_tests.is_empty()
+    };
+    let width = batch_width;
+    let total = members
+        .iter()
+        .chain([next])
+        .fold(0usize, |sum, entry| sum.saturating_add(width(entry)));
+    if total > ROLLING_QUEUE_BATCH_FILTER_BUDGET {
+        return false;
+    }
+    if members.iter().chain([next]).any(priority) {
+        return members
+            .iter()
+            .chain([next])
+            .all(|entry| width(entry) <= ROLLING_QUEUE_PRIORITY_COMPANION_FILTERS);
+    }
+    true
+}
+
 /// One entry claimed for a run, with the batch that records it.
 #[derive(Debug, Clone)]
 pub struct ClaimedQueueEntry {
@@ -251,10 +411,12 @@ pub struct ClaimedQueueEntry {
     pub batch_id: Uuid,
 }
 
-const ENTRY_COLUMNS: &str = "sequence, id, project_id, repo_path, source_commit, source_session_id, owner_epic_id, binding, work_key, migration_version, hot_files_json, test_filters_json, state, outcome_json, enqueued_at, finished_at, wake_session_id, batch_id";
+const ENTRY_COLUMNS: &str = "sequence, id, project_id, repo_path, source_commit, source_session_id, owner_epic_id, binding, work_key, migration_version, hot_files_json, test_filters_json, state, outcome_json, enqueued_at, finished_at, wake_session_id, batch_id, issue";
 
 struct EntryRow {
     entry: RollingQueueEntryV1,
+    /// #648: the `(position, refused entry)` this entry resumes.
+    resume: Option<(i64, Uuid)>,
     repo_path: String,
     project_id: Option<String>,
     wake_session_id: Option<Uuid>,
@@ -293,8 +455,12 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<EntryRow> {
     let (stored, filters_state) = rsi_common::rolling_queue::split_filters_state(
         serde_json::from_str(&row.get::<_, String>(11)?).map_err(json_error)?,
     );
+    let (stored, derived_test_filters) = rsi_common::rolling_queue::split_derived_filters(stored);
+    let (stored, expedite_reason) = rsi_common::rolling_queue::split_expedite(stored);
+    let (stored, resume) = rsi_common::rolling_queue::split_resume_position(stored);
     let (test_filters, fixes_tests) = rsi_common::rolling_queue::split_fix_claims(stored);
     Ok(EntryRow {
+        resume,
         wake_session_id: row
             .get::<_, Option<String>>(16)?
             .as_deref()
@@ -308,6 +474,7 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<EntryRow> {
         repo_path: row.get(3)?,
         project_id: row.get(2)?,
         entry: RollingQueueEntryV1 {
+            issue: row.get(18)?,
             sequence: row.get(0)?,
             id: parse_uuid(&row.get::<_, String>(1)?)?,
             source_commit: row.get(4)?,
@@ -321,8 +488,10 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<EntryRow> {
             migration_version: row.get::<_, Option<u32>>(9)?,
             hot_files: serde_json::from_str(&row.get::<_, String>(10)?).map_err(json_error)?,
             test_filters,
+            derived_test_filters,
             fixes_tests,
             filters_state,
+            expedite_reason,
             state,
             outcome,
             enqueued_at: row.get(14)?,
@@ -348,6 +517,9 @@ fn entry_by_key(
         .optional()?
         .map(|row| row.entry))
 }
+
+/// The event kind that counts remote-read requeues of one entry (hub #3873).
+const REMOTE_READ_REQUEUE_EVENT: &str = "requeued_remote_read";
 
 fn record_event(
     tx: &Transaction<'_>,
@@ -463,13 +635,14 @@ impl Store {
         supersedes: Option<(Uuid, &str)>,
         now: DateTime<Utc>,
     ) -> Result<(RollingQueueEntryV1, bool)> {
-        self.enqueue_source_with_filters_state(new, wake_session_id, supersedes, false, now)
+        self.enqueue_rolling_queue_source_linked(new, wake_session_id, supersedes, false, None, now)
     }
 
     /// [`Self::enqueue_rolling_queue_source_superseding`] for an entry whose
-    /// filter derivation is still running (#2993): `new.test_filters` is
-    /// ignored (the entry is stored with `filters_state: deriving` and no
-    /// filters) and the lander admits nothing carrying that state. The
+    /// filter derivation is still running (#2993): the entry is stored with
+    /// `filters_state: deriving` and `new.test_filters` as its extra filters
+    /// only (#3264: the derived set joins them at the derivation's end), and
+    /// the lander admits nothing carrying that state. The
     /// derivation's end calls [`Self::finish_rolling_queue_filter_derivation`]
     /// or [`Self::refuse_rolling_queue_filter_derivation`]. A replay of the key
     /// returns the existing entry whatever its filters have become.
@@ -480,29 +653,117 @@ impl Store {
         supersedes: Option<(Uuid, &str)>,
         now: DateTime<Utc>,
     ) -> Result<(RollingQueueEntryV1, bool)> {
-        self.enqueue_source_with_filters_state(new, wake_session_id, supersedes, true, now)
+        self.enqueue_rolling_queue_source_linked(new, wake_session_id, supersedes, true, None, now)
     }
 
-    fn enqueue_source_with_filters_state(
+    /// Admit a source with its optional project-local Issue display number.
+    /// Existing callers omit the link; hand-enqueued sources pass it explicitly.
+    pub fn enqueue_rolling_queue_source_linked(
         &self,
         new: &NewQueueEntry,
         wake_session_id: Option<Uuid>,
         supersedes: Option<(Uuid, &str)>,
         filters_pending: bool,
+        issue: Option<i64>,
         now: DateTime<Utc>,
     ) -> Result<(RollingQueueEntryV1, bool)> {
+        self.enqueue_rolling_queue_source_with_filter_provenance(
+            new,
+            wake_session_id,
+            supersedes,
+            filters_pending,
+            issue,
+            &[],
+            now,
+        )
+    }
+
+    /// Admit with the derived-only subset, excluding every caller-named filter.
+    /// Persist it atomically so a restart cannot reinterpret handwritten filters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_rolling_queue_source_with_filter_provenance(
+        &self,
+        new: &NewQueueEntry,
+        wake_session_id: Option<Uuid>,
+        supersedes: Option<(Uuid, &str)>,
+        filters_pending: bool,
+        issue: Option<i64>,
+        derived_filters: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(RollingQueueEntryV1, bool)> {
+        self.enqueue_rolling_queue_source_expediting(
+            new,
+            wake_session_id,
+            supersedes,
+            filters_pending,
+            issue,
+            derived_filters,
+            None,
+            now,
+        )
+    }
+
+    /// [`Self::enqueue_rolling_queue_source_with_filter_provenance`] with an
+    /// optional expedite (#3487). The cap of
+    /// [`ROLLING_QUEUE_MAX_EXPEDITED`] live expedited entries per project is
+    /// checked in the insert's own transaction, so two concurrent enqueues cannot
+    /// both take the last slot. A manual expedite over the cap is refused
+    /// `queue_expedite_cap_reached`, naming the live expedited entries; an
+    /// automatic one is recorded as an ordinary entry (the caller reads that off
+    /// the returned entry). The entry being superseded does not count against
+    /// the cap: its replacement takes its place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_rolling_queue_source_expediting(
+        &self,
+        new: &NewQueueEntry,
+        wake_session_id: Option<Uuid>,
+        supersedes: Option<(Uuid, &str)>,
+        filters_pending: bool,
+        issue: Option<i64>,
+        derived_filters: &[String],
+        expedite: Option<&ExpediteAdmission>,
+        now: DateTime<Utc>,
+    ) -> Result<(RollingQueueEntryV1, bool)> {
+        // #655: caller fields cannot supply metadata, including on a pending
+        // derivation replay. The store appends its own markers after this guard.
+        if new
+            .test_filters
+            .iter()
+            .chain(&new.fixes_tests)
+            .any(|value| rsi_common::rolling_queue::is_reserved_queue_marker(value))
+        {
+            return Err(refused(QUEUE_INVALID_REQUEST));
+        }
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some(existing) = entry_by_key(&tx, new.source_session_id, &new.idempotency_key)? {
             // A derivation that was pending when the caller asked has no
             // filters to compare: the key replays the commit and the claims.
             let same = existing.source_commit == new.source_commit
                 && (filters_pending || existing.test_filters == new.test_filters)
-                && existing.fixes_tests == new.fixes_tests;
+                && existing.fixes_tests == new.fixes_tests
+                && existing.issue == issue;
             return if same {
                 Ok((existing, true))
             } else {
                 Err(refused("queue_idempotency_conflict"))
             };
+        }
+        if issue.is_some_and(|number| number < 1) || (issue.is_some() && new.project_id.is_none()) {
+            return Err(refused(QUEUE_INVALID_REQUEST));
+        }
+        // The link names an Issue of the source's own project; a number that
+        // resolves nowhere, or only in another project, is never stored.
+        if let (Some(number), Some(project)) = (issue, new.project_id) {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM issues WHERE project_id=?1 AND display_number=?2)",
+                params![project.to_string(), number],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(refused(&format!(
+                    "{QUEUE_INVALID_REQUEST}: issue {number} is not an Issue of this project"
+                )));
+            }
         }
         let prior = if let Some((id, probed_commit)) = supersedes {
             let row = tx
@@ -512,11 +773,11 @@ impl Store {
                     map_entry,
                 )
                 .optional()?
-                .ok_or_else(|| refused(QUEUE_ENTRY_NOT_FOUND))?;
-            if row.entry.source_session_id != new.source_session_id
+                .ok_or_else(|| self.queue_entry_not_found_refusal(new.source_session_id, id))?;
+            if !self.may_supersede_rolling_queue_entry(new.source_session_id, &row)?
                 || row.project_id != new.project_id.map(|id| id.to_string())
             {
-                return Err(refused(QUEUE_ENTRY_NOT_FOUND));
+                return Err(self.queue_entry_not_found_refusal(new.source_session_id, id));
             }
             match row.entry.state {
                 RollingQueueEntryState::Queued => {}
@@ -524,6 +785,12 @@ impl Store {
                     return Err(refused(&format!(
                         "{QUEUE_ENTRY_IN_FLIGHT}: enqueue normally without supersedes; the lander owns this entry"
                     )));
+                }
+                _ if rsi_common::rolling_queue::resumable_conflict_refusal(&row.entry, now) => {
+                    // #648: a repeat supersede of the same refused entry is settled.
+                    if resumed_successor_exists(&tx, row.entry.id)? {
+                        return Err(refused(QUEUE_ENTRY_SETTLED));
+                    }
                 }
                 _ => return Err(refused(QUEUE_ENTRY_SETTLED)),
             }
@@ -543,13 +810,42 @@ impl Store {
         if live {
             return Err(refused(QUEUE_DUPLICATE_SOURCE));
         }
+        // #3487: the entry is expedited unless the project's cap is spent.
+        let expedite_reason = match expedite {
+            None => None,
+            Some(request) => {
+                let held = live_expedited_in(&tx, new.project_id)?
+                    .into_iter()
+                    .filter(|held| Some(held.id) != supersedes.map(|(id, _)| id))
+                    .collect::<Vec<_>>();
+                if held.len() < ROLLING_QUEUE_MAX_EXPEDITED {
+                    Some(request.reason.as_str())
+                } else if request.automatic {
+                    None
+                } else {
+                    return Err(refused(&expedite_cap_detail(&held)));
+                }
+            }
+        };
         // sequence is the existing FIFO key. Move the old row to a fresh key
         // before freezing it, then insert its replacement at the vacated key.
         // No row is deleted and a claim sees the whole swap or none of it.
-        if let Some(prior) = &prior {
+        let id = Uuid::new_v4();
+        // #648: a refused entry is terminal and immutable, so its successor takes
+        // a fresh key and resumes the refused entry's position by marker.
+        let resumed = prior
+            .as_ref()
+            .filter(|row| row.entry.state == RollingQueueEntryState::Refused);
+        if let Some(refused_row) = resumed {
+            silence_unfired_refusal_wake(&tx, refused_row, now)?;
+        }
+        if let Some(prior) = prior.as_ref().filter(|_| resumed.is_none()) {
+            // #3358: the outcome names the successor entry so a land node that
+            // waits on the old entry follows it instead of failing.
             let outcome = RollingQueueOutcome {
                 refusal: Some(QUEUE_ENTRY_SUPERSEDED.into()),
                 detail: Some(format!("replaced by {}", new.source_commit)), // sql-dynamic-ok: outcome prose, not SQL
+                superseded_by: Some(id),
                 ..RollingQueueOutcome::default()
             };
             tx.execute(
@@ -568,13 +864,12 @@ impl Store {
             || wake_session_id.map(|target| self.queue_wake_target(target)),
             |row| row.wake_session_id,
         );
-        let id = Uuid::new_v4();
         tx.execute(
             "INSERT INTO rolling_queue_entries(sequence, id, project_id, repo_path, source_commit, \
              source_session_id, owner_epic_id, binding, work_key, migration_version, \
              hot_files_json, test_filters_json, state, idempotency_key, enqueued_at, row_version, \
-             wake_session_id) \
-             VALUES (?15,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',?12,?13,1,?14)",
+             wake_session_id, issue) \
+             VALUES (?15,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued',?12,?13,1,?14,?16)",
             params![
                 id.to_string(),
                 new.project_id.map(|value| value.to_string()),
@@ -587,16 +882,25 @@ impl Store {
                 new.migration_version,
                 serde_json::to_string(&new.hot_files)
                     .map_err(|e| DaemonError::Store(e.to_string()))?,
-                serde_json::to_string(&stored_filters(
-                    &new.test_filters,
-                    &new.fixes_tests,
-                    filters_pending
+                serde_json::to_string(&with_resumed_position(
+                    with_expedite(
+                        with_derived_filters(
+                            stored_filters(&new.test_filters, &new.fixes_tests, filters_pending),
+                            derived_filters,
+                        ),
+                        expedite_reason,
+                    ),
+                    resumed,
                 ))
                 .map_err(|e| DaemonError::Store(e.to_string()))?,
                 new.idempotency_key,
                 stamp(now),
                 wake_session_id.map(|value| value.to_string()),
-                prior.as_ref().map(|row| row.entry.sequence),
+                prior
+                    .as_ref()
+                    .filter(|_| resumed.is_none())
+                    .map(|row| row.entry.sequence),
+                issue,
             ],
         )?;
         let entry = tx
@@ -608,6 +912,15 @@ impl Store {
             .entry;
         tx.commit()?;
         Ok((entry, false))
+    }
+
+    /// #3487: the live expedited entries of `project` (what the automatic
+    /// expedite's cap warning lists).
+    pub fn live_expedited_rolling_queue_entries(
+        &self,
+        project: Option<Uuid>,
+    ) -> Result<Vec<RollingQueueEntryV1>> {
+        live_expedited_in(&self.conn, project)
     }
 
     /// Claim the FIFO head for a run. Single-flight: nothing is claimed while
@@ -632,7 +945,8 @@ impl Store {
     }
 
     /// Claim the first `max` queued entries that share the head's project and
-    /// checkout path, in FIFO (enqueue) order, as one batch. See
+    /// checkout path, in admission order (expedited entries first, #3487, then
+    /// FIFO by enqueue order), as one batch. See
     /// [`Self::claim_rolling_queue_batch_by`] for a repository identity wider
     /// than the checkout path.
     pub fn claim_rolling_queue_batch(
@@ -644,7 +958,8 @@ impl Store {
     }
 
     /// Claim the first `max` queued entries of the head's project and
-    /// repository, in FIFO (enqueue) order, as one batch. `repository_of` names
+    /// repository, in admission order (expedited entries first, #3487, then FIFO
+    /// by enqueue order), as one batch. `repository_of` names
     /// the repository a queued entry's checkout path belongs to: two entries
     /// batch together only when their project ids are equal and it returns the
     /// same key for both. Every Issue worker lands from its own sandbox
@@ -656,7 +971,10 @@ impl Store {
     /// migration-carrying entry is only ever claimed together with, or after,
     /// every earlier entry of its repository, so migration numbers are assigned
     /// in queue order and never skip ahead of a predecessor. Only the oldest
-    /// [`ROLLING_QUEUE_CLAIM_WINDOW`] queued entries are considered.
+    /// [`ROLLING_QUEUE_CLAIM_WINDOW`] queued entries in admission order are
+    /// considered. An expedited entry (#3487) heads that order, so it is claimed
+    /// by the next batch ahead of ordinary entries; a gating batch is never
+    /// preempted, and a lane claim still needs its disjoint packages.
     pub fn claim_rolling_queue_batch_by(
         &self,
         now: DateTime<Utc>,
@@ -685,6 +1003,24 @@ impl Store {
         max: usize,
         repository_of: &dyn Fn(&str) -> String,
         packages_of: &dyn Fn(&str) -> LanePackages,
+    ) -> Result<Option<ClaimedQueueBatch>> {
+        self.claim_rolling_queue_batch_lanes_held(now, max, repository_of, packages_of, &|_| false)
+    }
+
+    /// [`Self::claim_rolling_queue_batch_lanes`] that does not claim the first
+    /// queued entry `held` names (a source commit), nor anything behind it
+    /// (#3394): the daemon holds a wide entry until its compile probe has a
+    /// verdict, and a later entry may not overtake it, because the probe judges
+    /// the entry against the ones ahead of it. Entries ahead of the held one
+    /// are claimed as usual. `held` runs inside the write transaction, so it
+    /// must be a lookup, never a probe.
+    pub fn claim_rolling_queue_batch_lanes_held(
+        &self,
+        now: DateTime<Utc>,
+        max: usize,
+        repository_of: &dyn Fn(&str) -> String,
+        packages_of: &dyn Fn(&str) -> LanePackages,
+        held: &dyn Fn(&str) -> bool,
     ) -> Result<Option<ClaimedQueueBatch>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if max == 0 {
@@ -728,13 +1064,16 @@ impl Store {
             let mut statement = tx.prepare(&format!(
                 "SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries \
                  WHERE state='queued' AND test_filters_json NOT LIKE '%\"filters_state=deriving\"%' \
-                 ORDER BY sequence LIMIT ?1"
+                 ORDER BY {QUEUED_ADMISSION_ORDER} LIMIT ?1"
             ))?;
             let rows =
                 statement.query_map(params![ROLLING_QUEUE_CLAIM_WINDOW as i64], map_entry)?;
             for row in rows {
                 window.push(row?);
             }
+        }
+        if let Some(at) = window.iter().position(|row| held(&row.entry.source_commit)) {
+            window.truncate(at);
         }
         let Some(head) = window.first() else {
             return Ok(None);
@@ -776,6 +1115,7 @@ impl Store {
                     }
                     None => false,
                 };
+                let fits = fits && (members.is_empty() || batch_admits(&members, &row.entry));
                 match packages {
                     Some(set) if fits => {
                         if anchor.is_none() {
@@ -800,6 +1140,9 @@ impl Store {
                 if row.project_id == head_project
                     && repository_of(&row.repo_path) == head_repository
                 {
+                    if !members.is_empty() && !batch_admits(&members, &row.entry) {
+                        break;
+                    }
                     repo_paths.push(row.repo_path);
                     members.push(row.entry);
                 }
@@ -860,12 +1203,16 @@ impl Store {
     /// appearance in FIFO order: what the daemon resolves to repositories
     /// before [`Self::claim_rolling_queue_batch_by`] (the same window).
     pub fn queued_rolling_queue_repo_paths(&self) -> Result<Vec<String>> {
-        let mut statement = self.conn.prepare(
-            "SELECT repo_path FROM (SELECT repo_path, sequence FROM rolling_queue_entries \
+        let mut statement = self.conn.prepare(concat!(
+            "SELECT repo_path FROM (SELECT repo_path, ",
+            queue_position_sql!(),
+            " AS position, \
+                    (test_filters_json LIKE '%\"expedited=%') AS expedited \
+             FROM rolling_queue_entries \
              WHERE state='queued' AND test_filters_json NOT LIKE '%\"filters_state=deriving\"%' \
-             ORDER BY sequence LIMIT ?1) \
-             GROUP BY repo_path ORDER BY MIN(sequence)",
-        )?;
+                 ORDER BY expedited DESC, position LIMIT ?1) \
+                 GROUP BY repo_path ORDER BY MAX(expedited) DESC, MIN(position)"
+        ))?;
         let rows = statement.query_map([ROLLING_QUEUE_CLAIM_WINDOW as i64], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<String>, _>>()?)
     }
@@ -893,11 +1240,11 @@ impl Store {
             ROLLING_QUEUE_CLAIM_WINDOW as i64,
         )?;
         let queued = rows(
-            self.conn.prepare(
+            self.conn.prepare(&format!(
                 "SELECT source_commit, repo_path FROM rolling_queue_entries \
                  WHERE state='queued' AND test_filters_json NOT LIKE '%\"filters_state=deriving\"%' \
-                 ORDER BY sequence LIMIT ?1",
-            )?,
+                 ORDER BY {QUEUED_ADMISSION_ORDER} LIMIT ?1"
+            ))?,
             queued_limit.min(ROLLING_QUEUE_CLAIM_WINDOW) as i64,
         )?;
         Ok((gating, queued))
@@ -1038,6 +1385,19 @@ impl Store {
             .and_then(|version| u32::try_from(version).ok()))
     }
 
+    /// #3480: how many daemon restarts have already found `id` `gating` and
+    /// re-driven it (`requeued_after_restart` events, one per entry per
+    /// restart). The crash-loop breaker reads it before re-gating again.
+    pub fn rolling_queue_restart_requeues(&self, id: Uuid) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rolling_queue_events \
+             WHERE kind='requeued_after_restart' AND entry_id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     /// Return a `gating` entry to `queued` (restart re-drive). The crashed
     /// run's batch is refused with an audit event.
     pub fn requeue_gating_rolling_queue_entry(&self, id: Uuid, now: DateTime<Utc>) -> Result<bool> {
@@ -1067,6 +1427,102 @@ impl Store {
         record_event(&tx, batch_id, "requeued_after_restart", Some(id), None, now)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Return members of a still-open batch to `queued` (#3267): a bisect that
+    /// ran out of wall time proved these members were not the cause of the red,
+    /// so they are neither refused nor re-gated by this batch. Each keeps its
+    /// `sequence`, so it is claimed again at its original FIFO position. Only
+    /// an entry that is `gating` in `batch_id` moves; the batch row is left
+    /// open unless this was its last open member (it then settles exactly as
+    /// the last `settle_rolling_queue_entries` would). One `requeued_after_bisect`
+    /// event per entry carries `detail`. Returns the entries returned.
+    pub fn requeue_bisected_rolling_queue_entries(
+        &self,
+        batch_id: Uuid,
+        ids: &[Uuid],
+        detail: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        self.requeue_open_batch_entries(batch_id, ids, "requeued_after_bisect", detail, now)
+    }
+
+    /// Hub #3873: return members of a still-open batch to `queued` because the
+    /// lander could not read the remote `rolling` ref. It is infrastructure, not a
+    /// verdict on the sources, so each keeps its `sequence` (its FIFO position)
+    /// and one `requeued_remote_read` event per entry carries `detail`; the
+    /// events are what [`Self::rolling_queue_remote_read_requeues`] counts to
+    /// bound the retries. Returns the entries returned.
+    pub fn requeue_remote_read_rolling_queue_entries(
+        &self,
+        batch_id: Uuid,
+        ids: &[Uuid],
+        detail: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        self.requeue_open_batch_entries(batch_id, ids, REMOTE_READ_REQUEUE_EVENT, detail, now)
+    }
+
+    /// Hub #3873: how many times `id` was returned to the queue because the
+    /// remote `rolling` ref could not be read.
+    pub fn rolling_queue_remote_read_requeues(&self, id: Uuid) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM rolling_queue_events \
+             WHERE kind='requeued_remote_read' AND entry_id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    fn requeue_open_batch_entries(
+        &self,
+        batch_id: Uuid,
+        ids: &[Uuid],
+        event_kind: &str,
+        detail: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Uuid>> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut returned = Vec::new();
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE rolling_queue_entries SET state='queued', batch_id=NULL, \
+                 admitted_at=NULL, row_version=row_version+1 \
+                 WHERE id=?1 AND state='gating' AND batch_id=?2",
+                params![id.to_string(), batch_id.to_string()],
+            )?;
+            if changed == 1 {
+                record_event(
+                    &tx,
+                    batch_id,
+                    event_kind,
+                    Some(*id),
+                    Some(detail.clone()),
+                    now,
+                )?;
+                returned.push(*id);
+            }
+        }
+        if !returned.is_empty() {
+            let batch = batch_id.to_string();
+            let (open, landed): (i64, bool) = tx.query_row(
+                "SELECT COUNT(*) FILTER (WHERE state='gating'), \
+                 COALESCE(MAX(state='published'), 0) \
+                 FROM rolling_queue_entries WHERE batch_id=?1",
+                [&batch],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if open == 0 {
+                tx.execute(
+                    "UPDATE rolling_queue_batches SET state=?2, settled_at=?3, \
+                     row_version=row_version+1 WHERE id=?1 AND state NOT IN ('published','refused')",
+                    params![batch, if landed { "published" } else { "refused" }, stamp(now)],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(returned)
     }
 
     /// CAS `gating -> terminal` and insert the owner's single wake in the same
@@ -1400,6 +1856,22 @@ impl Store {
             .map(|row| row.entry))
     }
 
+    /// `(repo_path, source_commit)` of queue entry `id` (#3369: the daemon reads
+    /// the commits a publication put on rolling from that repository).
+    pub fn rolling_queue_entry_repo_and_source(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT repo_path, source_commit FROM rolling_queue_entries WHERE id=?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// The batch that gated queue entry `id`, or `None` before it was claimed
     /// (#2570: it names the gate's log file).
     pub fn rolling_queue_entry_batch_id(&self, id: Uuid) -> Result<Option<Uuid>> {
@@ -1412,6 +1884,23 @@ impl Store {
             )
             .optional()?
             .and_then(|row| row.batch_id))
+    }
+
+    /// Live entries linked to an Issue in this project, FIFO and bounded for
+    /// topology admission warnings. A terminal entry no longer warns.
+    pub fn live_rolling_queue_entries_for_issue(
+        &self,
+        project: Uuid,
+        issue: i64,
+    ) -> Result<Vec<AgentRollingQueueEntryV1>> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries \
+             WHERE project_id=?1 AND issue=?2 AND state IN ('queued','admitted','gating') \
+             ORDER BY sequence LIMIT 32"
+        ))?;
+        let rows = statement.query_map(params![project.to_string(), issue], map_entry)?;
+        rows.map(|row| row.map(|row| agent_view(&row)).map_err(DaemonError::from))
+            .collect()
     }
 
     /// #2118: the `(id, sequence, source_commit)` of every live entry
@@ -1534,9 +2023,176 @@ impl Store {
             .collect())
     }
 
+    /// The `queue_entry_not_found` refusal of a cancel or supersede (#3331).
+    /// The code stays one for "no such entry" and "outside your scope" (the
+    /// verb never confirms an entry the caller cannot see), but the text now
+    /// says what was checked and, when an entry the caller CAN see shares the
+    /// first eight characters of the id, names it: a mistyped or truncated id
+    /// was the commonest cause and was otherwise impossible to tell from a
+    /// scope refusal. Only entries inside the caller's own scope are named.
+    pub fn queue_entry_not_found_refusal(&self, caller: Uuid, id: Uuid) -> DaemonError {
+        let mut text = format!(
+            "{QUEUE_ENTRY_NOT_FOUND}: no queue entry {id} is in your scope \
+             (it does not exist, or it belongs to another project or session \
+             that you may not act on). Copy the full entry id from \
+             AgentListRollingQueue (`id`, not `sequence`). Scope checks \
+             that did not match: {}",
+            self.failed_scope_checks(caller)
+        );
+        if let Ok(similar) = self.in_scope_entries_sharing_id_prefix(caller, id)
+            && !similar.is_empty()
+        {
+            text.push_str("; did you mean ");
+            text.push_str(&similar.join(", "));
+            text.push('?');
+        }
+        refused(&text)
+    }
+
+    /// The scope checks the caller's authority could pass, each named with
+    /// its own verdict (#3392). A scope refusal and a missing entry read the
+    /// same, so this describes only the caller, never the entry.
+    fn failed_scope_checks(&self, caller: Uuid) -> String {
+        let project = self
+            .get_session(caller)
+            .ok()
+            .flatten()
+            .and_then(|row| row.project_id);
+        let seat = match project {
+            None => "project manager seat: this session has no project".to_owned(),
+            Some(project) => {
+                let current = self
+                    .get_harness_manager(project)
+                    .ok()
+                    .flatten()
+                    .and_then(|config| config.current_session_id);
+                if current == Some(caller) {
+                    format!("project manager seat: yes, but only for project {project}")
+                } else {
+                    format!(
+                        "project manager seat: this session is not the current seat of \
+                         project {project}"
+                    )
+                }
+            }
+        };
+        let grant = match self.portfolio_seat_grant(caller) {
+            Ok(Some(grant)) => format!(
+                "portfolio grant: covers {} project(s), the entry is in none of them",
+                grant.project_ids.len()
+            ),
+            _ => "portfolio grant: none".to_owned(),
+        };
+        format!(
+            "{seat}; {grant}; enqueuer or outcome-wake holder: this session is neither \
+             for the entry"
+        )
+    }
+
+    fn in_scope_entries_sharing_id_prefix(&self, caller: Uuid, id: Uuid) -> Result<Vec<String>> {
+        let scope = self.rolling_queue_scope(caller)?;
+        let projects = serde_json::json!(
+            scope
+                .read
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<String>>()
+        )
+        .to_string();
+        let prefix = id.to_string()[..8].to_string();
+        let mut statement = self.conn.prepare(
+            "SELECT id, sequence, state FROM rolling_queue_entries \
+             WHERE substr(id, 1, 8)=?1 AND id<>?2 \
+               AND (project_id IN (SELECT value FROM json_each(?3)) \
+                    OR COALESCE(wake_session_id, source_session_id)=?4) \
+             ORDER BY sequence DESC LIMIT 3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![prefix, id.to_string(), projects, caller.to_string()],
+                |row| {
+                    Ok(format!(
+                        "{} (sequence {}, {})",
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn may_cancel_rolling_queue_entry(&self, caller: Uuid, row: &EntryRow) -> Result<bool> {
+        let scope = self.rolling_queue_scope(caller)?;
+        let owner = row.wake_session_id.unwrap_or(row.entry.source_session_id);
+        let in_project = row
+            .project_id
+            .as_deref()
+            .and_then(|project| Uuid::parse_str(project).ok())
+            .is_some_and(|project| scope.cancel.contains(&project));
+        Ok(in_project || owner == caller)
+    }
+
+    /// Who may replace a queued entry: the session that enqueued it, the
+    /// session its outcome wakes (a manager seat transfer moves that column to
+    /// the successor), or the project's current manager seat when the enqueuer
+    /// is an earlier seat of that same manager lineage. Project-wide cancel
+    /// scope is deliberately not enough: it would let a manager replace an Epic
+    /// lead's or another worker's entry.
+    fn may_supersede_rolling_queue_entry(&self, caller: Uuid, row: &EntryRow) -> Result<bool> {
+        if row.entry.source_session_id == caller || row.wake_session_id == Some(caller) {
+            return Ok(true);
+        }
+        let Some(project) = row
+            .project_id
+            .as_deref()
+            .and_then(|project| Uuid::parse_str(project).ok())
+        else {
+            return Ok(false);
+        };
+        if self
+            .get_harness_manager(project)?
+            .and_then(|config| config.current_session_id)
+            != Some(caller)
+        {
+            return Ok(false);
+        }
+        Ok(
+            super::harness_manager::manager_lineage_tip_on(&self.conn, row.entry.source_session_id)
+                .ok()
+                == Some(caller),
+        )
+    }
+
+    /// Supersession authority is [`Self::may_supersede_rolling_queue_entry`].
+    /// Admission rechecks it transactionally.
+    pub fn get_rolling_queue_entry_for_supersession(
+        &self,
+        caller: Uuid,
+        id: Uuid,
+    ) -> Result<Option<RollingQueueEntryV1>> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries WHERE id=?1"),
+                [id.to_string()],
+                map_entry,
+            )
+            .optional()?;
+        match row {
+            Some(row) if self.may_supersede_rolling_queue_entry(caller, &row)? => {
+                Ok(Some(row.entry))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// `AgentListRollingQueue` (#1964): the caller's scope of the queue,
     /// newest first, at most `limit` entries (one more is read to tell whether
-    /// an older page exists).
+    /// an older page exists). The default filters before paging to live entries
+    /// and refusals/failures finished in the last hour, with compact outcomes.
+    /// Full or state-filtered reads preserve the historical output.
     ///
     /// # Errors
     /// `manager_project_not_in_scope` when `project` is neither inside the
@@ -1544,12 +2200,23 @@ impl Store {
     pub fn list_rolling_queue_for_agent(
         &self,
         caller: Uuid,
-        state: Option<RollingQueueEntryState>,
-        project: Option<Uuid>,
-        before_sequence: Option<i64>,
-        limit: usize,
+        request: &AgentListRollingQueueRequestV1,
     ) -> Result<(Vec<AgentRollingQueueEntryV1>, Option<i64>)> {
-        let limit = limit.max(1);
+        self.list_rolling_queue_for_agent_at(caller, request, Utc::now())
+    }
+
+    fn list_rolling_queue_for_agent_at(
+        &self,
+        caller: Uuid,
+        request: &AgentListRollingQueueRequestV1,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<AgentRollingQueueEntryV1>, Option<i64>)> {
+        request
+            .validate()
+            .map_err(|code| DaemonError::InvalidParam(code.into()))?;
+        let limit = request.page_size();
+        let project = request.project_id;
+        let full = request.full_output();
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         let scope = self.rolling_queue_scope(caller)?;
         if let Some(project) = project
@@ -1575,22 +2242,30 @@ impl Store {
                AND (?3 IS NULL OR state=?3) \
                AND (?4 IS NULL OR project_id=?4) \
                AND (?5 IS NULL OR sequence<?5) \
+               AND (?7 OR state IN ('queued','admitted','gating') \
+                    OR (state IN ('refused','failed') AND finished_at>=?8)) \
              ORDER BY sequence DESC LIMIT ?6"
         ))?;
         let rows = statement.query_map(
             params![
                 projects,
                 caller.to_string(),
-                state.map(RollingQueueEntryState::as_str),
+                request.state.map(RollingQueueEntryState::as_str),
                 project.map(|value| value.to_string()),
-                before_sequence,
+                request.before_sequence,
                 (limit + 1) as i64,
+                full,
+                (now - chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Nanos, true),
             ],
             map_entry,
         )?;
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(agent_view(&row?));
+            let mut entry = agent_view(&row?);
+            if !full && let Some(outcome) = &mut entry.outcome {
+                outcome.clip_for_default();
+            }
+            entries.push(entry);
         }
         let next = (entries.len() > limit).then(|| entries[limit - 1].sequence);
         entries.truncate(limit);
@@ -1673,7 +2348,6 @@ impl Store {
         now: DateTime<Utc>,
     ) -> Result<(AgentRollingQueueEntryV1, bool)> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let scope = self.rolling_queue_scope(caller)?;
         let row = tx
             .query_row(
                 &format!("SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries WHERE id=?1"),
@@ -1681,15 +2355,10 @@ impl Store {
                 map_entry,
             )
             .optional()?
-            .ok_or_else(|| refused(QUEUE_ENTRY_NOT_FOUND))?;
+            .ok_or_else(|| self.queue_entry_not_found_refusal(caller, id))?;
         let owner = row.wake_session_id.unwrap_or(row.entry.source_session_id);
-        let in_project = row
-            .project_id
-            .as_deref()
-            .and_then(|project| Uuid::parse_str(project).ok())
-            .is_some_and(|project| scope.cancel.contains(&project));
-        if !in_project && owner != caller {
-            return Err(refused(QUEUE_ENTRY_NOT_FOUND));
+        if !self.may_cancel_rolling_queue_entry(caller, &row)? {
+            return Err(self.queue_entry_not_found_refusal(caller, id));
         }
         match row.entry.state {
             RollingQueueEntryState::Queued => {}
@@ -1716,6 +2385,8 @@ impl Store {
                 Some(reason) => format!("cancelled by {caller}: {reason}"),
                 None => format!("cancelled by {caller}"),
             }),
+            superseded_by: None,
+            published_commits: Vec::new(),
         };
         let target = self.queue_wake_target(owner);
         let wake_id = (target != caller).then(Uuid::new_v4);
@@ -1811,11 +2482,68 @@ impl Store {
         else {
             return Ok(false);
         };
-        if row.entry.filters_state.is_none() {
+        if row.entry.filters_state != Some(QueueFiltersState::Deriving) {
             return Ok(false);
         }
-        let stored = serde_json::to_string(&stored_filters(filters, &row.entry.fixes_tests, false))
-            .map_err(|e| DaemonError::Store(e.to_string()))?;
+        // #3264: the filters the caller named stay; the derived set joins them.
+        let merged =
+            rsi_common::rolling_queue::merge_filters(filters.to_vec(), &row.entry.test_filters);
+        let derived: Vec<String> = filters
+            .iter()
+            .filter(|filter| !row.entry.test_filters.contains(filter))
+            .cloned()
+            .collect();
+        let stored = serde_json::to_string(&with_expedite(
+            with_derived_filters(
+                stored_filters(&merged, &row.entry.fixes_tests, false),
+                &derived,
+            ),
+            row.entry.expedite_reason.as_deref(),
+        ))
+        .map_err(|e| DaemonError::Store(e.to_string()))?;
+        let changed = tx.execute(
+            "UPDATE rolling_queue_entries SET test_filters_json=?2, row_version=row_version+1 \
+             WHERE id=?1 AND state='queued'",
+            params![id.to_string(), stored],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// #3372: the filter derivation of `id` exceeded its budget (it timed out,
+    /// or the diff is too wide to derive in time). Instead of refusing the
+    /// entry, keep it with no derived filters: the caller's own filters stay,
+    /// the marker is replaced by `lander_selects`, so the lander admits it and
+    /// selects the tests itself (its bounded closure selection plus the
+    /// automatic full-library QA). A CAS on the entry still being `queued`:
+    /// `from_deriving` expects the pending marker (the background path);
+    /// otherwise the entry must carry no filters-state marker yet (the inline
+    /// path, right after the insert). Returns whether it applied.
+    pub fn mark_rolling_queue_filters_lander_selects(
+        &self,
+        id: Uuid,
+        from_deriving: bool,
+    ) -> Result<bool> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(row) = tx
+            .query_row(
+                &format!("SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries WHERE id=?1 AND state='queued'"),
+                [id.to_string()],
+                map_entry,
+            )
+            .optional()?
+        else {
+            return Ok(false);
+        };
+        let expected = from_deriving.then_some(QueueFiltersState::Deriving);
+        if row.entry.filters_state != expected {
+            return Ok(false);
+        }
+        let stored = serde_json::to_string(&with_expedite(
+            stored_filters_lander_selects(&row.entry.test_filters, &row.entry.fixes_tests),
+            row.entry.expedite_reason.as_deref(),
+        ))
+        .map_err(|e| DaemonError::Store(e.to_string()))?;
         let changed = tx.execute(
             "UPDATE rolling_queue_entries SET test_filters_json=?2, row_version=row_version+1 \
              WHERE id=?1 AND state='queued'",
@@ -1837,6 +2565,57 @@ impl Store {
         detail: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<Uuid>> {
+        self.refuse_queued_rolling_queue_entry(id, None, true, refusal, detail, now)
+    }
+
+    /// #3293: settle a still-`queued` entry `refused` before any batch claims
+    /// it, because its source (`expected_commit`) conflicts with the rolling
+    /// tip, and wake its enqueuer once. The same CAS as the derivation refusal
+    /// (the entry must still be `queued`, so a claimed, cancelled, superseded
+    /// or already refused entry writes nothing) plus the source commit the
+    /// caller probed, so a superseding entry on the same id can never be
+    /// refused for another commit's conflict. Returns the wake job id.
+    pub fn refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+        &self,
+        id: Uuid,
+        expected_commit: &str,
+        detail: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        self.refuse_queued_rolling_queue_entry(
+            id,
+            Some(expected_commit),
+            false,
+            rsi_common::rolling_queue::QUEUE_CONFLICTS_WITH_ROLLING,
+            detail,
+            now,
+        )
+    }
+
+    /// #3346: [`Self::refuse_queued_rolling_queue_entry_conflicting_with_rolling`]
+    /// with the refusal `code` the sweep settles it under (a declared
+    /// provisional migration the lander could not prove is
+    /// `provisional_unprovable`), under the same CAS and the one wake.
+    pub fn refuse_queued_rolling_queue_entry_for_source(
+        &self,
+        id: Uuid,
+        expected_commit: &str,
+        code: &str,
+        detail: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
+        self.refuse_queued_rolling_queue_entry(id, Some(expected_commit), false, code, detail, now)
+    }
+
+    fn refuse_queued_rolling_queue_entry(
+        &self,
+        id: Uuid,
+        expected_commit: Option<&str>,
+        require_deriving: bool,
+        refusal: &str,
+        detail: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Uuid>> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let Some(row) = tx
             .query_row(
@@ -1848,7 +2627,9 @@ impl Store {
         else {
             return Ok(None);
         };
-        if row.entry.filters_state.is_none() {
+        if (require_deriving && row.entry.filters_state != Some(QueueFiltersState::Deriving))
+            || expected_commit.is_some_and(|commit| row.entry.source_commit != commit)
+        {
             return Ok(None);
         }
         let outcome = RollingQueueOutcome {
@@ -1856,6 +2637,8 @@ impl Store {
             refusal: Some(refusal.to_owned()),
             failing_tests: Vec::new(),
             detail: Some(detail.to_owned()),
+            superseded_by: None,
+            published_commits: Vec::new(),
         };
         let owner = row.wake_session_id.unwrap_or(row.entry.source_session_id);
         let target = self.queue_wake_target(owner);
@@ -1908,6 +2691,52 @@ impl Store {
     }
 }
 
+/// #3487: the live (`queued`, `admitted` or `gating`) expedited entries of
+/// `project`, in admission order.
+fn live_expedited_in(
+    tx: &rusqlite::Connection,
+    project: Option<Uuid>,
+) -> Result<Vec<RollingQueueEntryV1>> {
+    let mut statement = tx.prepare(&format!(
+        "SELECT {ENTRY_COLUMNS} FROM rolling_queue_entries \
+         WHERE state IN ('queued','admitted','gating') AND project_id IS ?1 \
+           AND test_filters_json LIKE '%\"expedited=%' ORDER BY sequence"
+    ))?;
+    let rows = statement.query_map(params![project.map(|id| id.to_string())], map_entry)?;
+    let mut live = Vec::new();
+    for row in rows {
+        let entry = row?.entry;
+        if entry.expedite_reason.is_some() {
+            live.push(entry);
+        }
+    }
+    Ok(live)
+}
+
+/// #3487: the `queue_expedite_cap_reached` refusal text: the code, the cap, then
+/// each live expedited entry with its state, source and recorded reason.
+#[must_use]
+pub fn expedite_cap_detail(live: &[RollingQueueEntryV1]) -> String {
+    let listed = live
+        .iter()
+        .map(|entry| {
+            format!(
+                "entry {} (queue #{}, {}, source {}): {}",
+                entry.id,
+                entry.sequence,
+                entry.state.as_str(),
+                &entry.source_commit[..entry.source_commit.len().min(9)],
+                entry.expedite_reason.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{QUEUE_EXPEDITE_CAP_REACHED}: the project already holds {} live expedited entries (the cap is {ROLLING_QUEUE_MAX_EXPEDITED}): {listed}",
+        live.len()
+    )
+}
+
 /// The queue entries a session may act on (see [`Store::rolling_queue_scope`]).
 #[derive(Default)]
 struct QueueScope {
@@ -1919,6 +2748,7 @@ struct QueueScope {
 fn agent_view(row: &EntryRow) -> AgentRollingQueueEntryV1 {
     let entry = &row.entry;
     AgentRollingQueueEntryV1 {
+        issue: entry.issue,
         id: entry.id,
         sequence: entry.sequence,
         state: entry.state,
@@ -1933,6 +2763,8 @@ fn agent_view(row: &EntryRow) -> AgentRollingQueueEntryV1 {
         batch_id: row.batch_id,
         migration_version: entry.migration_version,
         test_filter_count: u32::try_from(entry.test_filters.len()).unwrap_or(u32::MAX),
+        expedited: entry.expedite_reason.is_some(),
+        expedite_reason: entry.expedite_reason.clone(),
         outcome: entry.outcome.as_ref().map(RollingQueueOutcomeSummaryV1::of),
         enqueued_at: entry.enqueued_at.clone(),
         finished_at: entry.finished_at.clone(),
@@ -1970,11 +2802,272 @@ mod tests {
         }
     }
 
+    /// An Issue of `project`, created through the store (the project row is
+    /// added when the test has not made one). Returns its display number.
+    fn open_issue(store: &Store, project: Uuid) -> i64 {
+        let _ = store.insert_project(&rsi_common::types::Project {
+            id: project,
+            name: format!("queue project {project}"),
+            path: None,
+            description: None,
+            color: rsi_common::types::Project::DEFAULT_COLOR.into(),
+            context_files: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        store
+            .create_issue(&rsi_common::types::NewIssue {
+                project_id: project,
+                title: "queue link".into(),
+                body: String::new(),
+                priority: None,
+                labels: Vec::new(),
+                created_by_session_id: None,
+                assignee: None,
+                idea_id: None,
+                source_event_id: None,
+                source_finding_ref: None,
+            })
+            .unwrap()
+            .display_number
+    }
+
     fn published(sha: &str) -> RollingQueueOutcome {
         RollingQueueOutcome {
             landed_sha: Some(sha.into()),
             ..RollingQueueOutcome::default()
         }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn issue_link_migration_replays_without_changing_existing_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue-upgrade.sqlite");
+        let store = Store::open_test_fixture(&path).unwrap();
+        let new = new_entry(Uuid::new_v4(), 'a', "legacy-entry");
+        let before = store
+            .enqueue_rolling_queue_source(&new, Utc::now())
+            .unwrap()
+            .0;
+        crate::store::tests::rewind_post_v121_tail_to(&store.conn, 185 - 1);
+        let catalog = crate::store::catalog_sql_by_name(&store.conn);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_rolling_queue_entry(before.id).unwrap().unwrap(),
+            before
+        );
+        crate::store::assert_catalog_preserved_across_replay(&catalog, &store.conn, 185 - 1);
+        assert_eq!(list(&store, new.source_session_id)[0].issue, None);
+        let number = open_issue(&store, shared_project());
+        let linked = new_entry(new.source_session_id, 'b', "after-upgrade");
+        let after = store
+            .enqueue_rolling_queue_source_linked(
+                &linked,
+                None,
+                None,
+                false,
+                Some(number),
+                Utc::now(),
+            )
+            .unwrap()
+            .0;
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_rolling_queue_entry(after.id)
+                .unwrap()
+                .unwrap()
+                .issue,
+            Some(number)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn linked_issue_roundtrips_lists_and_is_part_of_the_replay_identity() {
+        let store = store();
+        let number = open_issue(&store, shared_project());
+        let owner = Uuid::new_v4();
+        let new = new_entry(owner, 'a', "linked");
+        let (entry, replayed) = store
+            .enqueue_rolling_queue_source_linked(&new, None, None, false, Some(number), Utc::now())
+            .unwrap();
+        assert!(!replayed);
+        assert_eq!(entry.issue, Some(number));
+        assert_eq!(
+            store
+                .get_rolling_queue_entry(entry.id)
+                .unwrap()
+                .unwrap()
+                .issue,
+            Some(number)
+        );
+        assert_eq!(list(&store, owner)[0].issue, Some(number));
+        let (replay, replayed) = store
+            .enqueue_rolling_queue_source_linked(&new, None, None, false, Some(number), Utc::now())
+            .unwrap();
+        assert!(replayed);
+        assert_eq!(replay.id, entry.id);
+        for different in [None, Some(number + 1)] {
+            assert_eq!(
+                code_of(
+                    store
+                        .enqueue_rolling_queue_source_linked(
+                            &new,
+                            None,
+                            None,
+                            false,
+                            different,
+                            Utc::now(),
+                        )
+                        .unwrap_err()
+                ),
+                "queue_idempotency_conflict"
+            );
+        }
+        assert_eq!(
+            store
+                .live_rolling_queue_entries_for_issue(shared_project(), number)
+                .unwrap()[0]
+                .id,
+            entry.id
+        );
+        assert!(
+            store
+                .live_rolling_queue_entries_for_issue(Uuid::new_v4(), number)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .live_rolling_queue_entries_for_issue(shared_project(), number + 1)
+                .unwrap()
+                .is_empty()
+        );
+        cancel(&store, owner, entry.id).unwrap();
+        assert!(
+            store
+                .live_rolling_queue_entries_for_issue(shared_project(), number)
+                .unwrap()
+                .is_empty()
+        );
+        let old = store
+            .enqueue_rolling_queue_source(&new_entry(owner, 'b', "unlinked"), Utc::now())
+            .unwrap()
+            .0;
+        assert_eq!(old.issue, None);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn linked_issue_must_be_an_issue_of_the_source_project() {
+        let store = store();
+        let own = open_issue(&store, shared_project());
+        let other_project = Uuid::new_v4();
+        let foreign = open_issue(&store, other_project);
+        let owner = Uuid::new_v4();
+        // An unknown number, and a number that exists only in another
+        // project, are refused and leave no row behind.
+        for (key, number) in [("unknown", own + 1000), ("foreign", foreign)] {
+            let error = store
+                .enqueue_rolling_queue_source_linked(
+                    &new_entry(owner, 'a', key),
+                    None,
+                    None,
+                    false,
+                    Some(number),
+                    Utc::now(),
+                )
+                .unwrap_err();
+            assert!(code_of(error).starts_with(QUEUE_INVALID_REQUEST), "{key}");
+        }
+        assert!(list(&store, owner).is_empty());
+        let (entry, _) = store
+            .enqueue_rolling_queue_source_linked(
+                &new_entry(owner, 'a', "own"),
+                None,
+                None,
+                false,
+                Some(own),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(entry.issue, Some(own));
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn supersession_is_limited_to_the_enqueuer_its_wake_target_and_the_managers_lineage() {
+        use crate::store::manager_coordinator::tests::fixture;
+        let store = store();
+        let (config, _) = fixture(&store, Default::default());
+        let seat = config.current_session_id.unwrap();
+        let project = config.project_id;
+        let lead = Uuid::new_v4();
+        let supersede = |caller: Uuid, entry: &RollingQueueEntryV1, commit: char, key: &str| {
+            let mut replacement = new_entry(caller, commit, key);
+            replacement.project_id = Some(project);
+            store.enqueue_rolling_queue_source_superseding(
+                &replacement,
+                None,
+                Some((entry.id, &entry.source_commit)),
+                Utc::now(),
+            )
+        };
+
+        // The project's manager holds cancel scope over a lead's entry, but
+        // that is not authority to replace it.
+        let leads = enqueue_in(&store, project, lead, 'a', "lead-entry");
+        assert!(
+            store
+                .get_rolling_queue_entry_for_supersession(seat, leads.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            code_of(supersede(seat, &leads, 'b', "seat-replaces-lead").unwrap_err()),
+            QUEUE_ENTRY_NOT_FOUND
+        );
+        assert_eq!(
+            store
+                .get_rolling_queue_entry(leads.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RollingQueueEntryState::Queued
+        );
+        assert!(
+            cancel(&store, seat, leads.id).is_ok(),
+            "cancel scope is unchanged"
+        );
+
+        // The session an entry's outcome wakes may replace it.
+        let mut woken = new_entry(lead, 'c', "wakes-seat");
+        woken.project_id = Some(project);
+        let (woken, _) = store
+            .enqueue_rolling_queue_source(&woken, Utc::now())
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE rolling_queue_entries SET wake_session_id=?2 WHERE id=?1",
+                params![woken.id.to_string(), seat.to_string()],
+            )
+            .unwrap();
+        assert!(
+            store
+                .get_rolling_queue_entry_for_supersession(seat, woken.id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(supersede(seat, &woken, 'd', "seat-replaces-woken").is_ok());
+
+        // The enqueuer replaces its own entry.
+        let own = enqueue_in(&store, project, lead, 'e', "lead-own");
+        assert!(supersede(lead, &own, 'f', "lead-replaces-own").is_ok());
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -2010,10 +3103,10 @@ mod tests {
         let retired = store.get_rolling_queue_entry(old.id).unwrap().unwrap();
         assert_eq!(retired.state, RollingQueueEntryState::Superseded);
         assert!(retired.finished_at.is_some());
-        assert_eq!(
-            retired.outcome.unwrap().refusal.as_deref(),
-            Some(QUEUE_ENTRY_SUPERSEDED)
-        );
+        // #3358: the retired entry names its successor so a land node follows it.
+        let outcome = retired.outcome.unwrap();
+        assert_eq!(outcome.refusal.as_deref(), Some(QUEUE_ENTRY_SUPERSEDED));
+        assert_eq!(outcome.superseded_by, Some(new.id));
         assert!(retired.sequence > later.sequence);
         assert!(queue_wakes(&store).is_empty());
         let replay = store
@@ -2285,6 +3378,77 @@ mod tests {
         assert!(error.to_string().contains("queue_idempotency_conflict"));
     }
 
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn derived_filter_provenance_survives_store_reload_and_legacy_stays_strict() {
+        let store = store();
+        let new = new_entry(Uuid::new_v4(), 'a', "derived-provenance");
+        let (entry, _) = store
+            .enqueue_rolling_queue_source_with_filter_provenance(
+                &new,
+                None,
+                None,
+                false,
+                None,
+                &new.test_filters,
+                Utc::now(),
+            )
+            .unwrap();
+        let loaded = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(loaded.derived_test_filters, new.test_filters);
+        assert_eq!(loaded.test_filters, new.test_filters);
+        let legacy = new_entry(Uuid::new_v4(), 'b', "legacy-provenance");
+        let (legacy, _) = store
+            .enqueue_rolling_queue_source(&legacy, Utc::now())
+            .unwrap();
+        assert_eq!(legacy.derived_test_filters, Vec::<String>::new());
+    }
+
+    /// #3264: the extra filters a caller names beside `derive_filters` are kept
+    /// on the pending entry and the derived set joins them (never replaces them)
+    /// when the derivation lands; the lander still admits nothing meanwhile.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_pending_derivation_keeps_the_extra_filters_and_the_derived_set_joins_them_3264() {
+        use rsi_common::rolling_queue::QueueFiltersState;
+        let store = store();
+        let mut new = new_entry(Uuid::new_v4(), 'a', "k-extra");
+        new.test_filters = vec!["rsi-common=test:manifest_dir_guard".to_owned()];
+        new.fixes_tests = vec!["manifest_dir_guard::guard".to_owned()];
+        let (entry, _) = store
+            .enqueue_rolling_queue_source_deriving(&new, None, None, Utc::now())
+            .unwrap();
+        assert_eq!(entry.filters_state, Some(QueueFiltersState::Deriving));
+        assert_eq!(entry.test_filters, new.test_filters, "the extras are kept");
+        assert!(
+            store
+                .claim_rolling_queue_batch(Utc::now(), 4)
+                .unwrap()
+                .is_none(),
+            "a pending entry is never admitted, extras or not"
+        );
+        let derived = vec![
+            "rsid=test:e2e_seed".to_owned(),
+            "rsi-common=test:manifest_dir_guard".to_owned(),
+        ];
+        assert!(
+            store
+                .finish_rolling_queue_filter_derivation(entry.id, &derived)
+                .unwrap()
+        );
+        let done = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(done.filters_state, None);
+        assert_eq!(
+            done.test_filters, derived,
+            "derived plus extra, no duplicate"
+        );
+        assert_eq!(
+            done.derived_test_filters,
+            vec!["rsid=test:e2e_seed".to_owned()]
+        );
+        assert_eq!(done.fixes_tests, new.fixes_tests);
+    }
+
     /// #2993: an entry recorded with its filters pending carries
     /// `filters_state: deriving` and no filters, is never claimed, replays by
     /// key whatever its filters have become, takes its filters once (a CAS), and
@@ -2295,7 +3459,8 @@ mod tests {
         use rsi_common::rolling_queue::QueueFiltersState;
         let store = store();
         let session = Uuid::new_v4();
-        let new = new_entry(session, 'a', "k-deriving");
+        let mut new = new_entry(session, 'a', "k-deriving");
+        new.test_filters.clear();
         let (entry, replayed) = store
             .enqueue_rolling_queue_source_deriving(&new, None, None, Utc::now())
             .unwrap();
@@ -2419,6 +3584,466 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// #3293: a queued entry whose source conflicts with the rolling tip is
+    /// refused `queue_conflicts_with_rolling` with one wake; an entry already
+    /// claimed, a different commit and a second call write nothing.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_queued_entry_conflicting_with_rolling_is_refused_once_3293() {
+        let store = store();
+        let session = Uuid::new_v4();
+        let (entry, _) = store
+            .enqueue_rolling_queue_source(&new_entry(session, 'a', "k-conflict"), Utc::now())
+            .unwrap();
+        let commit = entry.source_commit.clone();
+        assert_eq!(
+            store
+                .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                    entry.id,
+                    &"f".repeat(40),
+                    "other commit",
+                    Utc::now(),
+                )
+                .unwrap(),
+            None,
+            "a verdict about another commit never refuses this entry"
+        );
+        assert_eq!(queue_wakes(&store).len(), 0);
+        let wake = store
+            .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                entry.id,
+                &commit,
+                "conflict_paths=a.rs,b.rs",
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(wake.is_some());
+        let refused = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(refused.state, RollingQueueEntryState::Refused);
+        let outcome = refused.outcome.expect("outcome");
+        assert_eq!(
+            outcome.refusal.as_deref(),
+            Some("queue_conflicts_with_rolling")
+        );
+        assert_eq!(outcome.detail.as_deref(), Some("conflict_paths=a.rs,b.rs"));
+        assert_eq!(queue_wakes(&store).len(), 1);
+        assert_eq!(
+            store
+                .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                    entry.id,
+                    &commit,
+                    "again",
+                    Utc::now(),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(queue_wakes(&store).len(), 1, "settled once, woken once");
+
+        // A claimed (gating) entry is never refused by the sweep.
+        let (gating, _) = store
+            .enqueue_rolling_queue_source(&new_entry(session, 'b', "k-gating"), Utc::now())
+            .unwrap();
+        store
+            .claim_rolling_queue_batch(Utc::now(), 4)
+            .unwrap()
+            .expect("claimed");
+        assert_eq!(
+            store
+                .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                    gating.id,
+                    &gating.source_commit,
+                    "late",
+                    Utc::now(),
+                )
+                .unwrap(),
+            None
+        );
+    }
+
+    /// #648 (hub #3721): a refused-`queue_conflicts_with_rolling` entry, its
+    /// owner and a refused-at time to supersede it from.
+    fn refused_for_conflict(
+        store: &Store,
+        owner: Uuid,
+        commit: char,
+        key: &str,
+        at: DateTime<Utc>,
+    ) -> RollingQueueEntryV1 {
+        let (entry, _) = store
+            .enqueue_rolling_queue_source(&new_entry(owner, commit, key), at)
+            .unwrap();
+        store
+            .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                entry.id,
+                &entry.source_commit,
+                "conflict_paths=a.rs",
+                at,
+            )
+            .unwrap()
+            .expect("refused");
+        store.get_rolling_queue_entry(entry.id).unwrap().unwrap()
+    }
+
+    fn supersede_refused(
+        store: &Store,
+        owner: Uuid,
+        old: &RollingQueueEntryV1,
+        commit: char,
+        key: &str,
+        at: DateTime<Utc>,
+    ) -> Result<(RollingQueueEntryV1, bool)> {
+        store.enqueue_rolling_queue_source_superseding(
+            &new_entry(owner, commit, key),
+            None,
+            Some((old.id, &old.source_commit)),
+            at,
+        )
+    }
+
+    fn claimed_commits(store: &Store) -> Vec<String> {
+        store
+            .claim_rolling_queue_batch(Utc::now(), 8)
+            .unwrap()
+            .expect("claimed")
+            .entries
+            .into_iter()
+            .map(|entry| entry.source_commit[..1].to_owned())
+            .collect()
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_descendant_of_a_conflict_refused_entry_resumes_its_position_and_single_wake_648() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let refused = refused_for_conflict(&store, owner, 'a', "a", now);
+        let later_b = store
+            .enqueue_rolling_queue_source(&new_entry(owner, 'b', "b"), now)
+            .unwrap()
+            .0;
+        let later_c = store
+            .enqueue_rolling_queue_source(&new_entry(owner, 'c', "c"), now)
+            .unwrap()
+            .0;
+        assert_eq!(queue_wakes(&store).len(), 1, "the refusal wakes once");
+
+        let (resumed, replayed) =
+            supersede_refused(&store, owner, &refused, 'd', "d", now).unwrap();
+        assert!(!replayed);
+        assert_eq!(resumed.state, RollingQueueEntryState::Queued);
+        assert_eq!(resumed.test_filters, vec!["rsid=rolling_queue".to_string()]);
+        // Nobody else moves, the refused row stays what it was.
+        let b_now = store.get_rolling_queue_entry(later_b.id).unwrap().unwrap();
+        let c_now = store.get_rolling_queue_entry(later_c.id).unwrap().unwrap();
+        assert_eq!(
+            (b_now.sequence, c_now.sequence),
+            (later_b.sequence, later_c.sequence)
+        );
+        assert_eq!(
+            store.get_rolling_queue_entry(refused.id).unwrap().unwrap(),
+            refused
+        );
+        // The successor is admitted at the refused entry's place, ahead of the
+        // entries that were queued after it.
+        assert_eq!(claimed_commits(&store), vec!["d", "b", "c"]);
+        let replay = supersede_refused(&store, owner, &refused, 'd', "d", now).unwrap();
+        assert!(replay.1);
+        assert_eq!(replay.0.id, resumed.id);
+
+        // One wake in all: the refusal's unfired wake is retired and the
+        // successor's settlement is the single wake that fires.
+        let enabled = |store: &Store| {
+            queue_wakes(store)
+                .into_iter()
+                .filter(|job| job.enabled)
+                .count()
+        };
+        assert_eq!(enabled(&store), 0);
+        store
+            .settle_rolling_queue_entry(
+                resumed.id,
+                RollingQueueEntryState::Published,
+                &published(&"1".repeat(40)),
+                now,
+            )
+            .unwrap()
+            .expect("settled");
+        assert_eq!(enabled(&store), 1);
+        assert_eq!(
+            queue_wakes(&store)
+                .iter()
+                .filter(|job| job.enabled)
+                .map(|job| job.wake_session_id)
+                .collect::<Vec<_>>(),
+            vec![Some(owner)]
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_refusal_wake_that_already_fired_is_left_alone_when_the_descendant_resumes_648() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let refused = refused_for_conflict(&store, owner, 'a', "a", now);
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_jobs SET last_fired_at=?1 WHERE name LIKE 'merge-queue-%'",
+                [stamp(now)],
+            )
+            .unwrap();
+        let before = queue_wakes(&store);
+        supersede_refused(&store, owner, &refused, 'd', "d", now).unwrap();
+        let wakes = queue_wakes(&store);
+        assert_eq!(wakes.len(), 1);
+        assert!(wakes[0].last_fired_at.is_some());
+        assert_eq!(
+            wakes[0].enabled, before[0].enabled,
+            "a fired wake is untouched"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_resumed_successor_that_conflicts_again_hands_the_same_position_on_648() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let refused = refused_for_conflict(&store, owner, 'a', "a", now);
+        store
+            .enqueue_rolling_queue_source(&new_entry(owner, 'b', "b"), now)
+            .unwrap();
+        let first = supersede_refused(&store, owner, &refused, 'c', "c", now)
+            .unwrap()
+            .0;
+        store
+            .refuse_queued_rolling_queue_entry_conflicting_with_rolling(
+                first.id,
+                &first.source_commit,
+                "conflict_paths=a.rs",
+                now,
+            )
+            .unwrap()
+            .expect("refused again");
+        let first = store.get_rolling_queue_entry(first.id).unwrap().unwrap();
+        supersede_refused(&store, owner, &first, 'd', "d", now).unwrap();
+        assert_eq!(claimed_commits(&store), vec!["d", "b"]);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn only_one_descendant_resumes_a_refused_entry_and_the_window_is_bounded_648() {
+        let store = store();
+        let owner = Uuid::new_v4();
+        let now = Utc::now();
+        let refused = refused_for_conflict(&store, owner, 'a', "a", now);
+        let inside =
+            now + chrono::Duration::seconds(rsi_common::rolling_queue::QUEUE_RESUME_WINDOW_SECS);
+        let past = inside + chrono::Duration::seconds(1);
+        assert_eq!(
+            code_of(supersede_refused(&store, owner, &refused, 'd', "late", past).unwrap_err()),
+            QUEUE_ENTRY_SETTLED
+        );
+        // The source must still descend from the refused entry's commit.
+        assert_eq!(
+            code_of(
+                store
+                    .enqueue_rolling_queue_source_superseding(
+                        &new_entry(owner, 'd', "stranger"),
+                        None,
+                        Some((refused.id, &"f".repeat(40))),
+                        now,
+                    )
+                    .unwrap_err()
+            ),
+            QUEUE_SUPERSEDES_NOT_DESCENDANT
+        );
+        // A caller outside the entry's authority cannot see it at all.
+        assert_eq!(
+            code_of(
+                supersede_refused(&store, Uuid::new_v4(), &refused, 'd', "foreign", now)
+                    .unwrap_err()
+            ),
+            QUEUE_ENTRY_NOT_FOUND
+        );
+        supersede_refused(&store, owner, &refused, 'd', "edge", inside).unwrap();
+        assert_eq!(
+            code_of(supersede_refused(&store, owner, &refused, 'e', "second", now).unwrap_err()),
+            QUEUE_ENTRY_SETTLED,
+            "an entry a descendant already took over stays settled"
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn no_other_settled_class_can_be_resumed_by_a_descendant_648() {
+        let now = Utc::now();
+        let cases = [
+            ("refused", "gate_failed"),
+            ("refused", "queue_conflicts_with_entry"),
+            ("refused", "provisional_unprovable"),
+            ("failed", "queue_conflicts_with_rolling"),
+            ("superseded", "queue_entry_cancelled"),
+            ("superseded", "queue_conflicts_with_rolling"),
+            ("published", "queue_conflicts_with_rolling"),
+        ];
+        for (state, refusal) in cases {
+            let store = store();
+            let owner = Uuid::new_v4();
+            let old = store
+                .enqueue_rolling_queue_source(&new_entry(owner, 'a', "old"), now)
+                .unwrap()
+                .0;
+            store
+                .conn
+                .execute(
+                    "UPDATE rolling_queue_entries SET state=?2, outcome_json=?3, finished_at=?4 WHERE id=?1",
+                    params![
+                        old.id.to_string(),
+                        state,
+                        serde_json::json!({ "refusal": refusal }).to_string(),
+                        stamp(now),
+                    ],
+                )
+                .unwrap();
+            let old = store.get_rolling_queue_entry(old.id).unwrap().unwrap();
+            assert_eq!(
+                code_of(supersede_refused(&store, owner, &old, 'b', "new", now).unwrap_err()),
+                QUEUE_ENTRY_SETTLED,
+                "{state} {refusal}"
+            );
+            assert!(
+                store
+                    .get_rolling_queue_entry_by_key(owner, "new")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    fn assert_caller_marker_is_refused(marker: &str) {
+        let store = store();
+        let mut seed = new_entry(Uuid::new_v4(), 'a', "pending");
+        seed.fixes_tests = vec!["tests::red".to_owned()];
+        let (entry, _) = store
+            .enqueue_rolling_queue_source_deriving(&seed, None, None, Utc::now())
+            .unwrap();
+        for value in [marker.to_owned(), format!("{marker}forged")] {
+            for fixes in [false, true] {
+                for pending in [false, true] {
+                    for replay in [false, true] {
+                        let mut new = seed.clone();
+                        if !replay {
+                            new.idempotency_key = "forged".to_owned();
+                        }
+                        if fixes {
+                            new.fixes_tests.push(value.clone());
+                        } else {
+                            new.test_filters.push(value.clone());
+                        }
+                        assert_eq!(
+                            code_of(
+                                store
+                                    .enqueue_rolling_queue_source_expediting(
+                                        &new,
+                                        None,
+                                        None,
+                                        pending,
+                                        None,
+                                        &[],
+                                        None,
+                                        Utc::now(),
+                                    )
+                                    .unwrap_err()
+                            ),
+                            QUEUE_INVALID_REQUEST,
+                            "{value}, fixes={fixes}, pending={pending}, replay={replay}"
+                        );
+                    }
+                }
+            }
+        }
+        let loaded = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(loaded.test_filters, seed.test_filters);
+        assert_eq!(loaded.fixes_tests, seed.fixes_tests);
+        assert_eq!(loaded.filters_state, Some(QueueFiltersState::Deriving));
+        assert!(
+            store
+                .get_rolling_queue_entry_by_key(seed.source_session_id, "forged")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn caller_expedited_marker_is_refused_655() {
+        assert_caller_marker_is_refused("expedited=");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn caller_derived_filter_marker_is_refused_655() {
+        assert_caller_marker_is_refused("derived_filter=");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn caller_filters_state_marker_is_refused_655() {
+        assert_caller_marker_is_refused("filters_state=");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn caller_fixes_test_marker_is_refused_655() {
+        assert_caller_marker_is_refused("fixes_test=");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn caller_resume_position_marker_is_refused_655() {
+        assert_caller_marker_is_refused("resume_position=");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_caller_cannot_inject_the_resume_marker_648() {
+        let store = store();
+        let mut new = new_entry(Uuid::new_v4(), 'a', "k");
+        new.test_filters = vec![format!("resume_position=1:{}", Uuid::new_v4())];
+        assert!(!rsi_common::rolling_queue::valid_test_filter(
+            &new.test_filters[0]
+        ));
+        assert!(
+            code_of(
+                store
+                    .enqueue_rolling_queue_source(&new, Utc::now())
+                    .unwrap_err()
+            )
+            .starts_with(QUEUE_INVALID_REQUEST)
+        );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_resume_marker_round_trips_and_a_malformed_one_is_dropped_648() {
+        let prior = Uuid::new_v4();
+        let item = rsi_common::rolling_queue::encode_resume_position(41, prior);
+        let (rest, found) =
+            rsi_common::rolling_queue::split_resume_position(vec!["rsid=a".to_string(), item]);
+        assert_eq!(rest, vec!["rsid=a".to_string()]);
+        assert_eq!(found, Some((41, prior)));
+        let (rest, found) = rsi_common::rolling_queue::split_resume_position(vec![
+            "resume_position=nope".to_string(),
+        ]);
+        assert!(rest.is_empty());
+        assert_eq!(found, None);
     }
 
     /// #2167: fix claims ride in the stored filter list without a schema
@@ -4053,14 +5678,27 @@ mod tests {
 
     fn list(store: &Store, caller: Uuid) -> Vec<AgentRollingQueueEntryV1> {
         store
-            .list_rolling_queue_for_agent(caller, None, None, None, 100)
+            .list_rolling_queue_for_agent(
+                caller,
+                &AgentListRollingQueueRequestV1 {
+                    fields: Some(rsi_common::rolling_queue::RollingQueueFieldsV1::Full),
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            )
             .unwrap()
             .0
     }
 
     fn code_of(error: DaemonError) -> String {
         match error {
-            DaemonError::InvalidParam(code) | DaemonError::PolicyDenied(code) => code,
+            // The not-found refusal carries a diagnostic after its code (#3331).
+            DaemonError::InvalidParam(code) | DaemonError::PolicyDenied(code) => {
+                match code.strip_prefix(QUEUE_ENTRY_NOT_FOUND) {
+                    Some(_) => QUEUE_ENTRY_NOT_FOUND.to_string(),
+                    None => code,
+                }
+            }
             other => panic!("not a refusal code: {other:?}"),
         }
     }
@@ -4101,12 +5739,25 @@ mod tests {
 
         // A page of two, then the cursor yields the rest.
         let (page, next) = store
-            .list_rolling_queue_for_agent(seat, None, None, None, 2)
+            .list_rolling_queue_for_agent(
+                seat,
+                &AgentListRollingQueueRequestV1 {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(next, Some(second.sequence));
         let (rest, next) = store
-            .list_rolling_queue_for_agent(seat, None, None, next, 2)
+            .list_rolling_queue_for_agent(
+                seat,
+                &AgentListRollingQueueRequestV1 {
+                    limit: Some(2),
+                    before_sequence: next,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(
             rest.iter().map(|e| e.id).collect::<Vec<_>>(),
@@ -4117,10 +5768,12 @@ mod tests {
         let queued = store
             .list_rolling_queue_for_agent(
                 seat,
-                Some(RollingQueueEntryState::Queued),
-                Some(project),
-                None,
-                100,
+                &AgentListRollingQueueRequestV1 {
+                    state: Some(RollingQueueEntryState::Queued),
+                    project_id: Some(project),
+                    limit: Some(100),
+                    ..Default::default()
+                },
             )
             .unwrap()
             .0;
@@ -4128,7 +5781,14 @@ mod tests {
 
         // A project outside the manager's scope is named, not silently empty.
         let refusal = store
-            .list_rolling_queue_for_agent(seat, None, Some(foreign_project), None, 10)
+            .list_rolling_queue_for_agent(
+                seat,
+                &AgentListRollingQueueRequestV1 {
+                    project_id: Some(foreign_project),
+                    limit: Some(10),
+                    ..Default::default()
+                },
+            )
             .unwrap_err();
         assert_eq!(
             code_of(refusal),
@@ -4153,7 +5813,7 @@ mod tests {
         let settled = list(&store, seat).pop().unwrap();
         let summary = settled.outcome.unwrap();
         assert_eq!(summary.refusal.as_deref(), Some("gate_failed"));
-        assert_eq!(summary.failing_test_count, 2);
+        assert_eq!(summary.failing_test_count, Some(2));
         assert_eq!(
             summary.detail.unwrap().len(),
             rsi_common::rolling_queue::ROLLING_QUEUE_OUTCOME_DETAIL_BYTES
@@ -4162,6 +5822,123 @@ mod tests {
 
         // A session that is neither the manager nor an owner sees nothing.
         assert!(list(&store, Uuid::new_v4()).is_empty());
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn agent_list_defaults_to_live_and_recent_problems_with_compact_outcomes() {
+        use crate::store::manager_coordinator::tests::fixture;
+        use rsi_common::rolling_queue::RollingQueueFieldsV1;
+        let store = store();
+        let (config, _) = fixture(&store, Default::default());
+        let seat = config.current_session_id.unwrap();
+        let project = config.project_id;
+        let now = Utc::now();
+        let mut ids = Vec::new();
+        for (index, (state, age)) in [
+            (RollingQueueEntryState::Queued, 7200),
+            (RollingQueueEntryState::Admitted, 7200),
+            (RollingQueueEntryState::Gating, 7200),
+            (RollingQueueEntryState::Refused, 3600),
+            (RollingQueueEntryState::Failed, 3599),
+            (RollingQueueEntryState::Refused, 3601),
+            (RollingQueueEntryState::Failed, 7200),
+            (RollingQueueEntryState::Published, 1),
+            (RollingQueueEntryState::Superseded, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let commit = char::from(b'0' + u8::try_from(index).unwrap());
+            let entry = enqueue_in(&store, project, seat, commit, &format!("view-{index}"));
+            let detail = if index == 3 {
+                format!(
+                    "gate refused: {}\ngate_timing: noisy diagnostics",
+                    "界".repeat(100)
+                )
+            } else {
+                format!(
+                    "gate refused: summary\n{}",
+                    "gate_timing: noisy diagnostics ".repeat(30)
+                )
+            };
+            let outcome = serde_json::json!({
+                "refusal": "gate_failed", "landed_sha": "f".repeat(40),
+                "failing_tests": ["one::test", "other::test"], "detail": detail,
+            });
+            // Seed lifecycle rows without running a lander; terminal rows are
+            // written once so the immutability guards remain active.
+            store.conn.execute(
+                "UPDATE rolling_queue_entries SET state=?2,outcome_json=?3,finished_at=?4 WHERE id=?1",
+                params![entry.id.to_string(), state.as_str(),
+                    state.is_terminal().then(|| outcome.to_string()),
+                    state.is_terminal().then(|| (now - chrono::Duration::seconds(age)).to_rfc3339_opts(SecondsFormat::Nanos, true))],
+            ).unwrap();
+            ids.push(entry.id);
+        }
+        let read = |request: AgentListRollingQueueRequestV1| {
+            store
+                .list_rolling_queue_for_agent_at(seat, &request, now)
+                .unwrap()
+        };
+        let (default, _) = read(Default::default());
+        assert_eq!(
+            default.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            ids[..5].iter().rev().copied().collect::<Vec<_>>()
+        );
+        let outcome = serde_json::to_value(default[0].outcome.as_ref().unwrap()).unwrap();
+        assert_eq!(outcome["refusal"], "gate_failed");
+        assert_eq!(outcome["landed_sha"], "f".repeat(40));
+        let detail = outcome["detail"].as_str().unwrap();
+        assert_eq!(detail, "gate refused: summary");
+        let unicode = default[1]
+            .outcome
+            .as_ref()
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap();
+        assert!(unicode.starts_with("gate refused: 界"));
+        assert!(unicode.len() <= 160 && unicode.lines().count() == 1);
+        assert_eq!(outcome.as_object().unwrap().len(), 3);
+        let (page, next) = read(AgentListRollingQueueRequestV1 {
+            limit: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(page.len(), 2);
+        let (rest, _) = read(AgentListRollingQueueRequestV1 {
+            before_sequence: next,
+            ..Default::default()
+        });
+        assert_eq!(rest.len(), 3);
+        let (full, _) = read(AgentListRollingQueueRequestV1 {
+            fields: Some(RollingQueueFieldsV1::Full),
+            ..Default::default()
+        });
+        assert_eq!(full.len(), ids.len());
+        let full_outcome = full[0].outcome.as_ref().unwrap();
+        assert_eq!(full_outcome.failing_test_count, Some(2));
+        assert_eq!(full_outcome.detail.as_ref().unwrap().len(), 240);
+        let (history, _) = read(AgentListRollingQueueRequestV1 {
+            state: Some(RollingQueueEntryState::Refused),
+            ..Default::default()
+        });
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0].outcome.as_ref().unwrap().failing_test_count,
+            Some(2)
+        );
+        assert_eq!(
+            history[0]
+                .outcome
+                .as_ref()
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .len(),
+            240
+        );
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
@@ -4375,7 +6152,44 @@ mod tests {
         let carried = seen.iter().find(|e| e.id == entry.id).unwrap();
         assert_eq!(carried.enqueuer_session_id, seat_a);
         assert_eq!(carried.wake_session_id, Some(seat_b));
-        let (cancelled, replayed) = cancel(&store, seat_b, entry.id).unwrap();
+        assert_eq!(
+            store
+                .get_rolling_queue_entry_for_supersession(seat_b, entry.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            entry.id
+        );
+        let mut replacement = new_entry(seat_b, 'c', "successor-replacement");
+        replacement.project_id = Some(project);
+        let (new, replayed) = store
+            .enqueue_rolling_queue_source_superseding(
+                &replacement,
+                None,
+                Some((entry.id, &entry.source_commit)),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(!replayed);
+        assert_eq!(new.sequence, entry.sequence);
+        assert!(new.sequence < worker_entry.sequence);
+        assert_eq!(
+            store
+                .get_rolling_queue_entry(entry.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            RollingQueueEntryState::Superseded
+        );
+        assert_eq!(
+            list(&store, seat_b)
+                .iter()
+                .find(|e| e.id == new.id)
+                .unwrap()
+                .wake_session_id,
+            Some(seat_b)
+        );
+        let (cancelled, replayed) = cancel(&store, seat_b, new.id).unwrap();
         assert!(!replayed);
         assert_eq!(cancelled.state, RollingQueueEntryState::Superseded);
         // The wake target was the successor itself: no extra wake.
@@ -4389,5 +6203,661 @@ mod tests {
                 .source_session_id,
             seat_a
         );
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn not_found_refusal_names_the_checked_id_and_a_visible_near_match_3331() {
+        use crate::store::manager_coordinator::tests::fixture;
+        let store = store();
+        let (config, _) = fixture(&store, Default::default());
+        let seat = config.current_session_id.unwrap();
+        let entry = enqueue_in(&store, config.project_id, seat, 'a', "k-3331");
+        // A wrong id that shares the first eight characters of a real entry
+        // (the id the PM typed in #3331 diverged after the first group).
+        let mut wrong = entry.id.to_string();
+        wrong.replace_range(
+            9..13,
+            if &wrong[9..13] == "0000" {
+                "1111"
+            } else {
+                "0000"
+            },
+        );
+        let wrong = Uuid::parse_str(&wrong).unwrap();
+        assert_ne!(wrong, entry.id);
+
+        let text = cancel(&store, seat, wrong).unwrap_err().to_string();
+        assert!(text.contains(QUEUE_ENTRY_NOT_FOUND), "{text}");
+        assert!(text.contains(&wrong.to_string()), "{text}");
+        assert!(text.contains("AgentListRollingQueue"), "{text}");
+        assert!(
+            text.contains(&format!("did you mean {}", entry.id)),
+            "{text}"
+        );
+
+        // A caller with no scope over the entry is told no near match, so the
+        // refusal never confirms an entry it cannot see.
+        let stranger = Uuid::new_v4();
+        let text = cancel(&store, stranger, wrong).unwrap_err().to_string();
+        assert!(text.contains(QUEUE_ENTRY_NOT_FOUND), "{text}");
+        assert!(!text.contains(&entry.id.to_string()), "{text}");
+        assert!(!text.contains("did you mean"), "{text}");
+        let text = cancel(&store, stranger, entry.id).unwrap_err().to_string();
+        assert!(!text.contains("did you mean"), "{text}");
+    }
+    /// #3487: enqueue `commit` in `project`, optionally expedited.
+    fn enqueue_expediting(
+        store: &Store,
+        project: Uuid,
+        commit: char,
+        key: &str,
+        expedite: Option<(&str, bool)>,
+        supersedes: Option<(Uuid, &str)>,
+    ) -> Result<RollingQueueEntryV1> {
+        let mut new = new_entry(Uuid::from_u128(0x3487), commit, key);
+        new.project_id = Some(project);
+        let admission = expedite.map(|(reason, automatic)| ExpediteAdmission {
+            reason: reason.into(),
+            automatic,
+        });
+        store
+            .enqueue_rolling_queue_source_expediting(
+                &new,
+                None,
+                supersedes,
+                false,
+                None,
+                &[],
+                admission.as_ref(),
+                Utc::now(),
+            )
+            .map(|(entry, _)| entry)
+    }
+
+    /// #3487: an expedited entry is claimed ahead of every ordinary queued entry,
+    /// expedited entries keep their enqueue order among themselves, and ordinary
+    /// entries stay FIFO.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn expedited_entries_are_claimed_first_and_the_rest_stay_fifo_3487() {
+        let store = store();
+        let project = shared_project();
+        let a = enqueue_expediting(&store, project, 'a', "ka", None, None).unwrap();
+        let b = enqueue_expediting(&store, project, 'b', "kb", None, None).unwrap();
+        let c = enqueue_expediting(&store, project, 'c', "kc", Some(("incident", false)), None)
+            .unwrap();
+        let d = enqueue_expediting(&store, project, 'd', "kd", None, None).unwrap();
+        let e =
+            enqueue_expediting(&store, project, 'e', "ke", Some(("qa fix", true)), None).unwrap();
+        assert_eq!(c.expedite_reason.as_deref(), Some("incident"));
+        assert_eq!(e.expedite_reason.as_deref(), Some("qa fix"));
+        assert_eq!(a.expedite_reason, None);
+        // The marker is bookkeeping, never a filter the gate would run.
+        assert_eq!(c.test_filters, vec!["rsid=rolling_queue".to_string()]);
+
+        let first = store
+            .claim_rolling_queue_batch(Utc::now(), 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.entries.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![c.id, e.id, a.id],
+            "expedited in enqueue order, then the oldest ordinary entry"
+        );
+        // A gating batch is never preempted: nothing else is claimed beside it,
+        // and once it settles the next claim sees only what is left.
+        assert!(
+            store
+                .claim_rolling_queue_batch(Utc::now(), 3)
+                .unwrap()
+                .is_none()
+        );
+        let settled: Vec<_> = first
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    RollingQueueEntryState::Published,
+                    published(&"9".repeat(40)),
+                )
+            })
+            .collect();
+        store
+            .settle_rolling_queue_entries(&settled, Utc::now())
+            .unwrap();
+        let second = store
+            .claim_rolling_queue_batch(Utc::now(), 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.entries.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![b.id, d.id]
+        );
+    }
+
+    /// #4007: enqueue `commit` carrying `width` distinct filters (and the given
+    /// fix claims), optionally expedited, in the shared project.
+    fn enqueue_wide(
+        store: &Store,
+        commit: char,
+        width: usize,
+        fixes: &[&str],
+        expedite: bool,
+    ) -> RollingQueueEntryV1 {
+        let mut new = new_entry(Uuid::from_u128(0x4007), commit, &format!("wide-{commit}"));
+        new.migration_version = None;
+        new.test_filters = (0..width)
+            .map(|index| format!("rsid=t{commit}{index}"))
+            .collect();
+        new.fixes_tests = fixes.iter().map(|name| (*name).to_owned()).collect();
+        let admission = expedite.then(|| ExpediteAdmission {
+            reason: "red fix".into(),
+            automatic: false,
+        });
+        store
+            .enqueue_rolling_queue_source_expediting(
+                &new,
+                None,
+                None,
+                false,
+                None,
+                &[],
+                admission.as_ref(),
+                Utc::now(),
+            )
+            .map(|(entry, _)| entry)
+            .unwrap()
+    }
+
+    fn claimed_ids(store: &Store) -> Vec<Uuid> {
+        store
+            .claim_rolling_queue_batch(Utc::now(), 8)
+            .unwrap()
+            .map(|batch| batch.entries.iter().map(|entry| entry.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// #4007: a batch whose summed filters would pass the budget is split before
+    /// it is admitted; the entry that does not fit heads the next batch.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_batch_is_split_when_its_summed_filters_pass_the_budget_4007() {
+        let store = store();
+        let a = enqueue_wide(&store, 'a', 2500, &[], false);
+        let b = enqueue_wide(&store, 'b', 1400, &[], false);
+        let c = enqueue_wide(&store, 'c', 300, &[], false);
+        let d = enqueue_wide(&store, 'd', 20, &[], false);
+        assert_eq!(
+            claimed_ids(&store),
+            vec![a.id, b.id],
+            "2500 + 1400 fits, +300 does not"
+        );
+        let first = [a.id, b.id];
+        let settled: Vec<_> = first
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    RollingQueueEntryState::Published,
+                    published(&"9".repeat(40)),
+                )
+            })
+            .collect();
+        store
+            .settle_rolling_queue_entries(&settled, Utc::now())
+            .unwrap();
+        assert_eq!(claimed_ids(&store), vec![c.id, d.id]);
+    }
+
+    /// #4007: one entry wider than the whole budget still gates (alone).
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn an_entry_wider_than_the_budget_gates_alone_4007() {
+        let store = store();
+        let wide = enqueue_wide(
+            &store,
+            'a',
+            ROLLING_QUEUE_BATCH_FILTER_BUDGET + 500,
+            &[],
+            false,
+        );
+        let _small = enqueue_wide(&store, 'b', 5, &[], false);
+        assert_eq!(claimed_ids(&store), vec![wide.id]);
+    }
+
+    /// #4007: an expedited red-fix entry and a fix-claiming entry never share a
+    /// gate with a wide entry, but still batch with small ones.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn an_expedited_or_fix_claiming_entry_gates_alone_or_with_small_entries_4007() {
+        let store = store();
+        let fix = enqueue_wide(&store, 'a', 500, &["x::y"], true);
+        let small = enqueue_wide(&store, 'b', 40, &[], false);
+        let wide = enqueue_wide(&store, 'c', 2000, &[], false);
+        let wide2 = enqueue_wide(&store, 'd', 900, &[], false);
+        // The expedited fix heads the order, takes the small entry behind it and
+        // stops at the wide one (admission order is kept).
+        assert_eq!(claimed_ids(&store), vec![fix.id, small.id]);
+        let settled: Vec<_> = [fix.id, small.id]
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    RollingQueueEntryState::Published,
+                    published(&"9".repeat(40)),
+                )
+            })
+            .collect();
+        store
+            .settle_rolling_queue_entries(&settled, Utc::now())
+            .unwrap();
+        // With no priority entry left the ordinary batch forms as before.
+        assert_eq!(claimed_ids(&store), vec![wide.id, wide2.id]);
+    }
+
+    /// #4007: a fix claim that is not expedited behaves the same: it is not
+    /// added to a batch of wide entries.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn a_fix_claim_is_not_batched_behind_a_wide_entry_4007() {
+        let store = store();
+        let wide = enqueue_wide(&store, 'a', 1000, &[], false);
+        let fix = enqueue_wide(&store, 'b', 100, &["x::y"], false);
+        assert_eq!(claimed_ids(&store), vec![wide.id]);
+        let settled = [(
+            wide.id,
+            RollingQueueEntryState::Published,
+            published(&"9".repeat(40)),
+        )];
+        store
+            .settle_rolling_queue_entries(&settled, Utc::now())
+            .unwrap();
+        assert_eq!(claimed_ids(&store), vec![fix.id]);
+    }
+
+    /// Review #4027 of #4007: enqueue `commit` with no filters of its own and
+    /// `hot` changed files, whose filter derivation went over budget, so it is
+    /// stored `lander_selects` (a Rust diff the lander must select tests for).
+    fn enqueue_lander_selects(store: &Store, commit: char, hot: usize) -> RollingQueueEntryV1 {
+        let mut new = new_entry(Uuid::from_u128(0x4007), commit, &format!("sel-{commit}"));
+        new.migration_version = None;
+        new.test_filters = Vec::new();
+        new.hot_files = (0..hot)
+            .map(|i| format!("crates/rsid/src/f{i}.rs"))
+            .collect();
+        let (entry, _) = store
+            .enqueue_rolling_queue_source(&new, Utc::now())
+            .unwrap();
+        assert!(
+            store
+                .mark_rolling_queue_filters_lander_selects(entry.id, false)
+                .unwrap()
+        );
+        let marked = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(marked.filters_state, Some(QueueFiltersState::LanderSelects));
+        assert!(marked.test_filters.is_empty());
+        marked
+    }
+
+    fn settle_published(store: &Store, ids: &[Uuid]) {
+        let settled: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    RollingQueueEntryState::Published,
+                    published(&"9".repeat(40)),
+                )
+            })
+            .collect();
+        store
+            .settle_rolling_queue_entries(&settled, Utc::now())
+            .unwrap();
+    }
+
+    /// Review #4027: the 502-filter expedited fix and an unfiltered
+    /// `lander_selects` entry of 400 files never share a gate, whichever was
+    /// enqueued first.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn an_expedited_fix_is_not_batched_with_an_unfiltered_rust_entry_4027() {
+        let store = store();
+        let fix = enqueue_wide(&store, 'a', 502, &[], true);
+        let unfiltered = enqueue_lander_selects(&store, 'b', 400);
+        let small = enqueue_wide(&store, 'c', 10, &[], false);
+        assert_eq!(
+            claimed_ids(&store),
+            vec![fix.id],
+            "the fix stops at the unfiltered entry behind it"
+        );
+        settle_published(&store, &[fix.id]);
+        assert_eq!(
+            claimed_ids(&store),
+            vec![unfiltered.id],
+            "the unfiltered entry gates alone, not with the small one behind it"
+        );
+        settle_published(&store, &[unfiltered.id]);
+        assert_eq!(claimed_ids(&store), vec![small.id]);
+
+        // The reverse order: the unfiltered head takes nobody with it.
+        let store = self::store();
+        let unfiltered = enqueue_lander_selects(&store, 'd', 400);
+        let fix = enqueue_wide(&store, 'e', 502, &[], true);
+        // Expedited entries claim first, so the fix heads and the unfiltered
+        // entry stays behind; the fix still gates alone.
+        assert_eq!(claimed_ids(&store), vec![fix.id]);
+        settle_published(&store, &[fix.id]);
+        assert_eq!(claimed_ids(&store), vec![unfiltered.id]);
+    }
+
+    /// Review #4027: an unfiltered entry counts as over budget, so it gates
+    /// alone behind and ahead of ordinary small entries, and a fix claim is not
+    /// batched with it. A filtered entry of the same diff size is unaffected.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn an_unfiltered_rust_entry_gates_alone_4027() {
+        let store = store();
+        let first = enqueue_wide(&store, 'a', 20, &[], false);
+        let unfiltered = enqueue_lander_selects(&store, 'b', 400);
+        let after = enqueue_wide(&store, 'c', 20, &[], false);
+        assert_eq!(claimed_ids(&store), vec![first.id]);
+        settle_published(&store, &[first.id]);
+        assert_eq!(claimed_ids(&store), vec![unfiltered.id]);
+        settle_published(&store, &[unfiltered.id]);
+        assert_eq!(claimed_ids(&store), vec![after.id]);
+
+        let store = self::store();
+        let unfiltered = enqueue_lander_selects(&store, 'd', 400);
+        let fix = enqueue_wide(&store, 'e', 100, &["x::y"], false);
+        assert_eq!(claimed_ids(&store), vec![unfiltered.id]);
+        settle_published(&store, &[unfiltered.id]);
+        assert_eq!(claimed_ids(&store), vec![fix.id]);
+    }
+
+    /// Review #4027: the width of a `lander_selects` entry is unbounded and sums
+    /// without overflow; any other entry weighs its filter count.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn batch_width_is_unbounded_only_for_an_unfiltered_lander_selects_entry_4027() {
+        let store = store();
+        let unfiltered = enqueue_lander_selects(&store, 'a', 3);
+        let plain = enqueue_wide(&store, 'b', 7, &[], false);
+        assert_eq!(batch_width(&unfiltered), usize::MAX);
+        assert_eq!(batch_width(&plain), 7);
+        assert!(!batch_admits(
+            &[unfiltered.clone(), unfiltered.clone()],
+            &unfiltered
+        ));
+        assert!(!batch_admits(&[plain.clone()], &unfiltered));
+        assert!(!batch_admits(&[unfiltered], &plain));
+    }
+
+    /// #3487: with nothing expedited the order is the enqueue order, and the
+    /// repository probe and the lane candidates see the same order as the claim.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_probes_see_the_claim_order_and_ordinary_entries_stay_fifo_3487() {
+        let store = store();
+        let project = shared_project();
+        let mut ordinary = Vec::new();
+        for (index, commit) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let mut new = new_entry(Uuid::new_v4(), commit, &format!("k{index}"));
+            new.repo_path = format!("/tmp/repo-{commit}");
+            ordinary.push(
+                store
+                    .enqueue_rolling_queue_source(&new, Utc::now())
+                    .unwrap()
+                    .0,
+            );
+        }
+        assert_eq!(
+            store.queued_rolling_queue_repo_paths().unwrap(),
+            vec!["/tmp/repo-a", "/tmp/repo-b", "/tmp/repo-c"]
+        );
+        let mut urgent = new_entry(Uuid::new_v4(), 'f', "kz");
+        urgent.repo_path = "/tmp/repo-f".into();
+        store
+            .enqueue_rolling_queue_source_expediting(
+                &urgent,
+                None,
+                None,
+                false,
+                None,
+                &[],
+                Some(&ExpediteAdmission {
+                    reason: "incident".into(),
+                    automatic: false,
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.queued_rolling_queue_repo_paths().unwrap(),
+            vec!["/tmp/repo-f", "/tmp/repo-a", "/tmp/repo-b", "/tmp/repo-c"]
+        );
+        let (_, queued) = store.rolling_queue_lane_candidates(8).unwrap();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|(_, path)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/tmp/repo-f", "/tmp/repo-a", "/tmp/repo-b", "/tmp/repo-c"]
+        );
+        let _ = (project, ordinary);
+    }
+
+    /// #3487: at most two live expedited entries per project. A manual expedite
+    /// over the cap is refused with the live entries named; an automatic one
+    /// stays ordinary; another project is unaffected; a superseded expedited
+    /// entry does not count against its replacement; a settled one frees a slot.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_expedite_cap_is_two_live_entries_per_project_3487() {
+        let store = store();
+        let project = shared_project();
+        let one =
+            enqueue_expediting(&store, project, 'a', "ka", Some(("one", false)), None).unwrap();
+        let two =
+            enqueue_expediting(&store, project, 'b', "kb", Some(("two", false)), None).unwrap();
+        let refusal = enqueue_expediting(&store, project, 'c', "kc", Some(("three", false)), None)
+            .unwrap_err();
+        let text = code_of(refusal);
+        assert!(text.starts_with(QUEUE_EXPEDITE_CAP_REACHED), "{text}");
+        for held in [&one, &two] {
+            assert!(text.contains(&held.id.to_string()), "{text}");
+            assert!(
+                text.contains(held.expedite_reason.as_deref().unwrap()),
+                "{text}"
+            );
+        }
+        assert!(
+            store
+                .get_rolling_queue_entry_by_key(Uuid::from_u128(0x3487), "kc")
+                .unwrap()
+                .is_none(),
+            "a refused enqueue records nothing"
+        );
+
+        // The automatic rule never refuses: it is queued as an ordinary entry.
+        let auto =
+            enqueue_expediting(&store, project, 'd', "kd", Some(("qa", true)), None).unwrap();
+        assert_eq!(auto.expedite_reason, None);
+        assert_eq!(auto.state, RollingQueueEntryState::Queued);
+        assert_eq!(
+            store
+                .live_expedited_rolling_queue_entries(Some(project))
+                .unwrap()
+                .iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>(),
+            vec![one.id, two.id]
+        );
+
+        // Another project has its own cap.
+        let other = Uuid::new_v4();
+        assert!(
+            enqueue_expediting(&store, other, 'e', "ke", Some(("other", false)), None)
+                .unwrap()
+                .expedite_reason
+                .is_some()
+        );
+
+        // A replacement of an expedited entry takes its slot instead of needing a third.
+        let replacement = enqueue_expediting(
+            &store,
+            project,
+            'f',
+            "kf",
+            Some(("one, rebased", false)),
+            Some((one.id, &one.source_commit)),
+        )
+        .unwrap();
+        assert_eq!(replacement.expedite_reason.as_deref(), Some("one, rebased"));
+        assert_eq!(
+            store
+                .live_expedited_rolling_queue_entries(Some(project))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // A settled expedited entry frees its slot.
+        let claimed = store
+            .claim_rolling_queue_batch(Utc::now(), 1)
+            .unwrap()
+            .unwrap();
+        store
+            .settle_rolling_queue_entries(
+                &[(
+                    claimed.entries[0].id,
+                    RollingQueueEntryState::Published,
+                    published(&"9".repeat(40)),
+                )],
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            enqueue_expediting(&store, project, '1', "kg", Some(("again", false)), None)
+                .unwrap()
+                .expedite_reason
+                .is_some()
+        );
+    }
+
+    /// #3487: the expedite survives the filter derivation finishing and the
+    /// lander-selects fallback, which both rewrite the stored filter list.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_expedite_survives_a_filter_derivation_rewrite_3487() {
+        let store = store();
+        let project = shared_project();
+        let mut new = new_entry(Uuid::new_v4(), 'a', "ka");
+        new.project_id = Some(project);
+        let admission = ExpediteAdmission {
+            reason: "incident".into(),
+            automatic: false,
+        };
+        let (pending, _) = store
+            .enqueue_rolling_queue_source_expediting(
+                &new,
+                None,
+                None,
+                true,
+                None,
+                &[],
+                Some(&admission),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(pending.filters_state, Some(QueueFiltersState::Deriving));
+        assert_eq!(pending.expedite_reason.as_deref(), Some("incident"));
+        assert!(
+            store
+                .finish_rolling_queue_filter_derivation(pending.id, &["rsid=derived".to_string()])
+                .unwrap()
+        );
+        let finished = store.get_rolling_queue_entry(pending.id).unwrap().unwrap();
+        assert_eq!(finished.expedite_reason.as_deref(), Some("incident"));
+        assert!(finished.test_filters.contains(&"rsid=derived".to_string()));
+
+        let mut other = new_entry(Uuid::new_v4(), 'b', "kb");
+        other.project_id = Some(project);
+        let (entry, _) = store
+            .enqueue_rolling_queue_source_expediting(
+                &other,
+                None,
+                None,
+                false,
+                None,
+                &[],
+                Some(&admission),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .mark_rolling_queue_filters_lander_selects(entry.id, false)
+                .unwrap()
+        );
+        let marked = store.get_rolling_queue_entry(entry.id).unwrap().unwrap();
+        assert_eq!(marked.filters_state, Some(QueueFiltersState::LanderSelects));
+        assert_eq!(marked.expedite_reason.as_deref(), Some("incident"));
+    }
+
+    /// #3487: `AgentListRollingQueue` rows (summary and full) say whether an
+    /// entry is expedited and why; an ordinary row says neither.
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-04"))]
+    #[test]
+    fn the_agent_list_shows_expedited_and_its_reason_3487() {
+        use crate::store::manager_coordinator::tests::fixture;
+        let store = store();
+        let (config, _) = fixture(&store, Default::default());
+        let seat = config.current_session_id.unwrap();
+        let project = config.project_id;
+        let ordinary = enqueue_in(&store, project, seat, 'a', "k-a");
+        let mut new = new_entry(seat, 'b', "k-b");
+        new.project_id = Some(project);
+        let (urgent, _) = store
+            .enqueue_rolling_queue_source_expediting(
+                &new,
+                None,
+                None,
+                false,
+                None,
+                &[],
+                Some(&ExpediteAdmission {
+                    reason: "hub rsid SIGINT loop".into(),
+                    automatic: false,
+                }),
+                Utc::now(),
+            )
+            .unwrap();
+        for fields in [
+            None,
+            Some(rsi_common::rolling_queue::RollingQueueFieldsV1::Summary),
+            Some(rsi_common::rolling_queue::RollingQueueFieldsV1::Full),
+        ] {
+            let rows = store
+                .list_rolling_queue_for_agent(
+                    seat,
+                    &AgentListRollingQueueRequestV1 {
+                        fields,
+                        limit: Some(100),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .0;
+            let find = |id: Uuid| rows.iter().find(|row| row.id == id).unwrap();
+            assert!(find(urgent.id).expedited, "{fields:?}");
+            assert_eq!(
+                find(urgent.id).expedite_reason.as_deref(),
+                Some("hub rsid SIGINT loop")
+            );
+            assert!(!find(ordinary.id).expedited);
+            assert_eq!(find(ordinary.id).expedite_reason, None);
+        }
     }
 }

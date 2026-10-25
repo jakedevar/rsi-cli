@@ -32,7 +32,7 @@ export interface DetailSnapshot {
 
 type Rule = (s: UiSnapshot) => string | null;
 
-const NEED_OPEN = 'Open a session first (j/k, then Enter)';
+const NEED_OPEN = 'Open a session first: click one in the list (j/k, then Enter)';
 const NO_EVENTS = 'This session has no events to move through';
 
 const needOpen: Rule = (s) => (s.open ? null : NEED_OPEN);
@@ -132,6 +132,8 @@ export const SLICE: SliceSpec<DetailActionId> = {
   order: 10,
   actions: DETAIL_ACTIONS,
   rules: DETAIL_RULES,
+  // routeDetailKey (detail-model.ts), run from the document keydown listener in actions/detail.ts.
+  rawKeys: ['Up', 'Down', 'S-Up', 'S-Down'],
   keys: DETAIL_KEY_BINDINGS,
   commands: DETAIL_COMMAND_BINDINGS,
 };

@@ -13,8 +13,10 @@ import {
 } from '../scripts/smoke-bridge.mjs';
 import { OFFLINE_KEY_CHECK, judgeEgress, parseLsofDirect, parseProxyRequest, startEgressGuard } from '../scripts/smoke-egress.mjs';
 import {
-  MARKER_FILE, MARKER_TEXT, assertIsolatedSocket, findRsid, findSeeder, isOwnedIsolatedSocket, seedSynthetic, startIsolatedRsid,
+  MARKER_FILE, MARKER_TEXT, SEEDED_GRAPH_RUN, assertIsolatedSocket, findRsid, findSeeder, isOwnedIsolatedSocket, seedSynthetic,
+  seededGraphDefinition, startIsolatedRsid,
 } from '../scripts/smoke-isolated.mjs';
+import { generate as generateParity } from '../scripts/parity.mjs';
 import { paritySections } from '../scripts/smoke-e2e.mjs';
 import { E2E_EXTRAS, E2E_SECTIONS, SYNTHETIC_KEY } from '../scripts/smoke-e2e-sections.mjs';
 import { findChrome } from '../scripts/smoke-lib.mjs';
@@ -176,6 +178,25 @@ test('local #128: the graph-run extra is registered, binds through the keys, and
   assert.equal(audit.groups['graph-review-dashboard'].interaction, 'dom-e2e');
 });
 
+test('local #150: the graph PARITY row names both steps, and the seeded run is checked in the DOM against rsid', () => {
+  const extra = E2E_EXTRAS.find((e) => e.id === 'graph-run');
+  assert.match(extra.interaction, /Step 1 \(#128, drive and read back\).*ExecuteWorkflow.*UpdateSessionWorkflow/);
+  assert.match(extra.interaction, /Step 2 \(#150, seeded succeeded run\).*GetWorkflowExecution/);
+  const body = readFileSync(here('../scripts/smoke-e2e-sections.mjs'), 'utf8');
+  const helper = body.slice(body.indexOf('async function seededRunSteps'));
+  for (const id of ['seeded-daemon', 'seeded-pick', 'seeded-render', 'seeded-readback']) assert.ok(helper.includes(`'${id}'`), `step ${id}`);
+  for (const read of ["'GetWorkflowExecution'", '.gv-run-title', '.gv-run-node', '.gv-node-badge']) assert.ok(helper.includes(read), `the step reads ${read}`);
+  // The page reopens a workflow's last run from the same key the desktop writes (graphs.ts, the TUI's last_execution_id).
+  const graphs = readFileSync(here('../src/graphs.ts'), 'utf8');
+  assert.match(graphs, /const LAST_RUN_KEY = 'rsi\.graph\.lastExecution'/);
+  assert.ok(helper.includes("'rsi.graph.lastExecution'"));
+  // A clean pass of a two-node, session-only workflow: plan -> build.
+  const def = seededGraphDefinition();
+  assert.deepEqual(def.nodes.map((n) => n.id), SEEDED_GRAPH_RUN.nodes.map((n) => n.id));
+  assert.deepEqual(def.edges, [{ source: 'plan', target: 'build' }]);
+  assert.deepEqual(JSON.parse(def.metadata.topology_steps), { plan: { kind: 'session' }, build: { kind: 'session' } });
+});
+
 test('isolated-write still refuses what starts a provider, deletes, or is not in the table', async () => {
   const stub = stubRsid();
   const h = await startIsolatedRsid(stub.bin);
@@ -224,7 +245,7 @@ test('the default bridge (and --live) never gains a write: the table is only rea
   assert.deepEqual(calls, []);
   for (const m of WRITE_METHODS) assert.ok(!READ_METHODS.has(m), `${m} is on both lists`);
   assert.throws(() => parseArgs(['--live', '--isolated-write']), /cannot be combined/);
-  assert.deepEqual(parseArgs(['--isolated-write', '--rsid', '/r', '--only', 'a,b']), { live: false, out: '/tmp/desktop-smoke', chrome: null, isolatedWrite: true, rsid: '/r', only: ['a', 'b'], firstRun: false });
+  assert.deepEqual(parseArgs(['--isolated-write', '--rsid', '/r', '--only', 'a,b']), { live: false, out: '/tmp/desktop-smoke', chrome: null, isolatedWrite: true, rsid: '/r', only: ['a', 'b'], firstRun: false, steps: null });
 });
 
 test('redactCredentialList keeps only the metadata the desktop shows', () => {
@@ -239,7 +260,7 @@ test('findRsid honours an explicit path, then $RSI_E2E_RSID, and reports nothing
 });
 
 test('every H2 section of the generated PARITY.md has an end-to-end interaction, and each names a real row', () => {
-  const md = readFileSync(here('../PARITY.md'), 'utf8');
+  const md = generateParity({ root: here('../..'), sidecarDir: here('../parity-status.d') }).text;
   const sections = paritySections(md);
   assert.equal(sections.length, 10, 'PARITY.md has ten sections');
   assert.deepEqual(E2E_SECTIONS.map((s) => s.section), sections, 'one end-to-end section per PARITY section, in file order');
@@ -291,16 +312,16 @@ test('the egress verdict requires zero attempts from first boot, no direct conne
     assert.equal(verdict.ok, false, host);
     assert.match(verdict.problems[0], new RegExp(host.replace(/\./g, '\\.')));
   }
-  assert.equal(judgeEgress({ attempts: [], direct: ['203.0.113.10:443'], sampled: true }).ok, false, 'a direct connection bypassing the proxy');
+  assert.equal(judgeEgress({ attempts: [], direct: ['203.0.113.4:443'], sampled: true }).ok, false, 'a direct connection bypassing the proxy');
   assert.equal(judgeEgress({ attempts: [], direct: [], keyCheck: { set: true, detail: null }, sampled: true }).ok, false, 'a key was set but no offline check was recorded');
   assert.equal(judgeEgress({ attempts: [], direct: [], keyCheck: { set: true, detail: 'connect_error' }, sampled: true }).ok, false, 'a key check that tried the network');
   assert.equal(judgeEgress({ attempts: [], direct: [], sampled: false }).socketSample, 'skipped (lsof unavailable)');
   const lsof = [
     'rsid 1 u IPv4 0x1 0t0 TCP 127.0.0.1:50000->127.0.0.1:60000 (ESTABLISHED)',
-    'rsid 1 u IPv4 0x2 0t0 TCP 10.0.0.5:50001->203.0.113.11:443 (ESTABLISHED)',
+    'rsid 1 u IPv4 0x2 0t0 TCP 10.0.0.5:50001->198.51.100.7:443 (ESTABLISHED)',
     'rsid 1 u IPv4 0x3 0t0 TCP *:8080 (LISTEN)',
   ].join('\n');
-  assert.deepEqual(parseLsofDirect(lsof), ['203.0.113.11:443']);
+  assert.deepEqual(parseLsofDirect(lsof), ['198.51.100.7:443']);
 });
 
 // ---------- the seeded finished session (local #122) ----------
@@ -341,6 +362,16 @@ test('the isolated state directory is marked, and the finished session is seeded
     assert.equal(r.spec.session.working_dir, seed.root);
     assert.deepEqual(r.spec.events.map((e) => [e.event_type, e.role, e.tool_name ?? null]), [['Message', 'User', null], ['ToolUse', 'Assistant', 'Edit'], ['Message', 'Assistant', null]]);
     assert.equal(r.spec.events[1].tool_input.file_path, join(seed.root, 'src', 'lib.rs'));
+    // Local #150: the same seed writes a finished, succeeded graph run of a saved two-node workflow.
+    const run = r.spec.graph_run;
+    assert.equal(run.workflow_id, SEEDED_GRAPH_RUN.workflowId);
+    assert.equal(run.execution_id, SEEDED_GRAPH_RUN.executionId);
+    assert.equal(run.project_id, seed.projectId);
+    assert.equal(run.repo_root, seed.root);
+    assert.match(run.base_commit, /^[0-9a-f]{40}$/, 'the run is based on the synthetic project\'s HEAD');
+    assert.deepEqual(run.definition, seededGraphDefinition());
+    assert.deepEqual(run.node_results, Object.fromEntries(SEEDED_GRAPH_RUN.nodes.map((n) => [n.id, n.result])));
+    assert.equal(seed.graphRun, SEEDED_GRAPH_RUN);
     assert.equal(isOwnedIsolatedSocket(h.socket), true, 'the daemon is running again after the seed');
   } finally {
     await h.stop();

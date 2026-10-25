@@ -16,7 +16,7 @@ impl PolicyState {
                     )
                 });
                 format!(
-                    "Saved{}: {} · scope {} · policy {}{}",
+                    "Saved{}: {} · scope {} / policy {}{}",
                     if saved.revoked { " — revoked" } else { "" },
                     classify_manager_policy(&saved.policy, self.config.scope_mode)
                         .preset
@@ -28,22 +28,25 @@ impl PolicyState {
             }
         }
     }
-    pub fn draft_summary(&self) -> String {
+    /// Preset of the draft, with the permission profile when validation or
+    /// explicit overrides make it Custom.
+    fn draft_preset_label(&self) -> String {
         let c = self.classification();
         format!(
-            "Draft: {}{} · {} · scope {} / policy {}{}",
+            "{}{}",
             c.preset.label(),
             c.permission_profile
                 .filter(|p| *p != c.preset)
                 .map(|p| format!(" / {} permissions", p.label()))
-                .unwrap_or_default(),
-            if self.draft == self.opened_draft {
-                "unchanged"
-            } else {
-                "unsaved changes"
-            },
-            self.config.row_version,
-            self.policy_version,
+                .unwrap_or_default()
+        )
+    }
+    /// Summary block line 1: the mode and preset the draft would save.
+    pub fn mode_summary(&self) -> String {
+        format!(
+            "Mode {:?} · Preset {}{}",
+            self.draft.mode,
+            self.draft_preset_label(),
             if self.draft.paused {
                 " · OPERATOR PAUSE"
             } else {
@@ -51,27 +54,130 @@ impl PolicyState {
             }
         )
     }
+    /// Summary block line 3: the spend cap and how many models are allowed.
+    pub fn limits_summary(&self) -> String {
+        let models = if self.draft.allowed_launches.is_empty() {
+            "Allowed models: not restricted (any valid manual choice)".to_string()
+        } else {
+            format!(
+                "Allowed models: {} ({})",
+                self.draft.allowed_launches.len(),
+                self.launch_counts()
+            )
+        };
+        format!(
+            "Spend {} · {models}",
+            self.draft
+                .max_spend_usd
+                .map_or_else(|| "uncapped".into(), |v| format!("cap USD {v}")),
+        )
+    }
+    /// The saved line, ending in whether the draft still equals it.
+    pub fn saved_line(&self) -> String {
+        format!(
+            "{}{}",
+            self.saved_summary(),
+            if self.draft == self.opened_draft {
+                " · draft unchanged"
+            } else {
+                ""
+            }
+        )
+    }
+    /// What the draft changes against the saved policy, one entry per change.
+    pub fn draft_diff(&self) -> Vec<String> {
+        let (d, o) = (&self.draft, &self.opened_draft);
+        let state = |v: &str| match v {
+            "true" => "on".to_string(),
+            "false" => "off".to_string(),
+            other => other.to_string(),
+        };
+        let mut diff = vec![];
+        for row in self.rows() {
+            if !row.modified
+                || matches!(
+                    row.field,
+                    Field::Capability(_)
+                        | Field::EditLaunch(_)
+                        | Field::LaunchProvider(_)
+                        | Field::LaunchModel(_)
+                        | Field::LaunchEffort(_)
+                        | Field::AddLaunch
+                )
+            {
+                continue;
+            }
+            if let Some(saved) = &row.saved {
+                diff.push(format!(
+                    "{} {}→{}",
+                    row.label,
+                    state(saved),
+                    state(&row.value)
+                ));
+            }
+        }
+        let grants = |from: &[ManagerCapabilityV2], to: &[ManagerCapabilityV2], sign: char| {
+            to.iter()
+                .filter(|c| !from.contains(c))
+                .map(|c| format!("{sign}{}", capability_label(*c)))
+                .collect::<Vec<_>>()
+        };
+        let mut changed = grants(&o.capabilities, &d.capabilities, '+');
+        changed.extend(grants(&d.capabilities, &o.capabilities, '−'));
+        if !changed.is_empty() {
+            diff.push(format!("grants {}", changed.join(" ")));
+        }
+        let added = d
+            .allowed_launches
+            .iter()
+            .filter(|c| !o.allowed_launches.contains(c))
+            .count();
+        let removed = o
+            .allowed_launches
+            .iter()
+            .filter(|c| !d.allowed_launches.contains(c))
+            .count();
+        if added + removed > 0 {
+            diff.push(format!("allowed models +{added} −{removed}"));
+        }
+        diff
+    }
+    /// Summary block diff line; present only while the draft differs from the
+    /// saved policy.
+    pub fn draft_line(&self) -> Option<String> {
+        if self.draft == self.opened_draft {
+            return None;
+        }
+        let diff = self.draft_diff();
+        Some(format!(
+            "Draft: {} · unsaved changes: {}",
+            self.draft_preset_label(),
+            if diff.is_empty() {
+                "see the * rows".to_string()
+            } else {
+                diff.join(" · ")
+            }
+        ))
+    }
     pub fn suggestions(&self) -> Vec<ManagerAllowanceSuggestion> {
         self.classification()
             .permission_profile
             .map(|p| suggested_manager_allowances(&self.draft, p))
             .unwrap_or_default()
     }
-    pub fn choice_status(&self, choice: &ManagerLaunchChoiceV2) -> String {
+    /// What the list shows beside a launch choice's effort: the catalog label
+    /// or why the choice cannot be checked. Silent until a catalog was read.
+    pub fn choice_note(&self, choice: &ManagerLaunchChoiceV2) -> Option<String> {
         if let Some(label) = self
             .choice_labels
             .get(&(choice.provider, choice.model.clone()))
         {
-            return label.clone();
+            return Some(label.clone());
         }
         match self.catalog_status.get(&choice.provider) {
-            Some(CatalogStatus::Loaded) => {
-                "Retained exact restriction; unavailable in current catalog".into()
-            }
-            Some(CatalogStatus::Failed(_)) => {
-                "Retained exact restriction; catalog unavailable".into()
-            }
-            _ => "Retained exact restriction; catalog not checked".into(),
+            Some(CatalogStatus::Loaded) => Some("not in the current catalog".into()),
+            Some(CatalogStatus::Failed(_)) => Some("catalog unavailable".into()),
+            _ => None,
         }
     }
     pub fn preview_rows(&self) -> Vec<(String, String)> {

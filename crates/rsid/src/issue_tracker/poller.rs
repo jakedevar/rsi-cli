@@ -12,7 +12,6 @@ pub use crate::store_support::issue_tracker::UnconsumedDelivery;
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Outcome of a terminal-watch fire attempt (A8 `WakeMode::OnTerminal`).
@@ -189,7 +188,7 @@ pub async fn tick(
     config: &IssueTrackerConfig,
     state: &mut PollerState,
     session_launcher: &dyn SessionLauncher,
-    store: &Arc<Mutex<Store>>,
+    store: &Arc<rsid_core::store_lock::Mutex<Store>>,
     event_bus: &EventBus,
 ) -> Result<TickResult> {
     let mut result = TickResult {
@@ -389,6 +388,9 @@ pub async fn tick(
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         };
 
         match session_launcher.launch(launch_config).await {
@@ -563,7 +565,9 @@ mod tests {
     async fn tick_dispatches_up_to_max_concurrent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_test_fixture(&db_path).unwrap(),
+        ));
         let event_bus = EventBus::new(16);
 
         let tracker = MockTracker {
@@ -594,7 +598,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::unwrap_used)]
     async fn local_dispatch_mismatch_is_rejected_before_launch_or_state_mutation() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let issue = store
             .lock()
             .await
@@ -648,7 +654,9 @@ mod tests {
     async fn tick_reconciles_terminal_issues() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_test_fixture(&db_path).unwrap(),
+        ));
         let event_bus = EventBus::new(16);
 
         // Pre-populate running state
@@ -697,7 +705,9 @@ mod tests {
     async fn tick_with_zero_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let store = Arc::new(Mutex::new(Store::open_test_fixture(&db_path).unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_test_fixture(&db_path).unwrap(),
+        ));
         let event_bus = EventBus::new(16);
 
         let tracker = MockTracker {

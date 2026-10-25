@@ -4,6 +4,7 @@
 // the New session prompt's settings side (crates/rsi/src/overlay/prompt.rs,
 // launch_settings.rs). The DOM side is prompts.ts; tests/prompts.test.mjs.
 import { effortLadder } from './detail-model.js';
+import { NO_FOLDER_WORDS, providerLabel } from './launch-model.js';
 
 export type PromptKind = 'launch' | 'continue' | 'modal';
 
@@ -72,7 +73,80 @@ export interface LaunchSettings {
   effort: string;
   sandbox: boolean;
   /** A planned appointment (blank prompts with a project). */
-  manager: { scope: ScopeChoice; preset: PolicyPreset } | null;
+  manager: ManagerPlan | null;
+}
+
+/**
+ * A planned appointment. `presetChosen` is the TUI's `preset_chosen`: the
+ * operator stepped the Policy row, so the appointment grants that preset
+ * instead of re-granting the project's saved grant (#3270, desktop #204).
+ */
+export interface ManagerPlan { scope: ScopeChoice; preset: PolicyPreset; presetChosen: boolean }
+
+/** A fresh plan (`ManagerLaunchPlan` with `DEFAULT_MANAGER_LAUNCH_PRESET`): nothing chosen yet. */
+export function freshPlan(): ManagerPlan {
+  return { scope: { kind: 'project' }, preset: 'execute', presetChosen: false };
+}
+
+/** Policy row h/l (`step_preset`): the next preset, now chosen on purpose. */
+export function stepPlanPreset(plan: ManagerPlan, by: 1 | -1): ManagerPlan {
+  return { ...plan, preset: stepPreset(plan.preset, by), presetChosen: true };
+}
+
+/**
+ * The read state of the project's saved grant (`GrantContextState`): only a
+ * successful read permits the launch. `saved` is the stored policy config
+ * (`GetHarnessManagerPolicy`), `null` when the project has none.
+ */
+export type GrantContext =
+  | { state: 'loading'; projectId: string }
+  | { state: 'loaded'; projectId: string; saved: unknown }
+  | { state: 'failed'; projectId: string; reason: string };
+
+/** `GrantContextState::status_message`: why the launch waits, else null. */
+export function grantStatus(ctx: GrantContext | null): string | null {
+  if (!ctx || ctx.state === 'loading') return 'Loading saved grant…';
+  if (ctx.state === 'failed') return `Saved grant unavailable: ${ctx.reason}. Press p on the Grant row to retry.`;
+  return null;
+}
+
+/**
+ * `block_unloaded_grant`: a planned manager blocks every launch until the
+ * saved grant of the launch's project has loaded. The message, else null.
+ */
+export function launchBlock(plan: ManagerPlan | null, ctx: GrantContext | null, projectId: string): string | null {
+  if (!plan) return null;
+  if (!projectId) return 'Choose a project first: the manager is appointed for the launched session’s project';
+  if (ctx && ctx.projectId !== projectId) return grantStatus(null);
+  return grantStatus(ctx);
+}
+
+/** `regrants_saved_grant`: the launch re-grants the saved grant (one exists, no preset chosen). */
+export function regrantsSaved(plan: ManagerPlan | null, ctx: GrantContext | null): boolean {
+  return !!plan && !plan.presetChosen && ctx?.state === 'loaded' && ctx.saved !== null && ctx.saved !== undefined;
+}
+
+/** The Policy row's value: "Saved grant" while it re-grants it, else the preset. */
+export function policyLabel(plan: ManagerPlan, ctx: GrantContext | null): string {
+  return regrantsSaved(plan, ctx) ? 'Saved grant' : PRESET_LABELS[plan.preset];
+}
+
+/**
+ * The `appoint_launched_manager` arguments. Like the TUI's appointment, the
+ * Rust side re-reads `GetHarnessManagerPolicy` and sends the saved policy
+ * unless `presetChosen`; the preset applies when chosen or nothing is saved.
+ */
+export function appointArgs(plan: ManagerPlan, projectId: string, sessionId: string): {
+  projectId: string; sessionId: string; scopeKind: ScopeChoice['kind']; scopeId: string | null; preset: PolicyPreset; presetChosen: boolean;
+} {
+  return {
+    projectId,
+    sessionId,
+    scopeKind: plan.scope.kind,
+    scopeId: plan.scope.kind === 'project' ? null : plan.scope.id,
+    preset: plan.preset,
+    presetChosen: plan.presetChosen,
+  };
 }
 
 export type SettingRow = 'model' | 'effort' | 'sandbox' | 'manager' | 'scope' | 'policy' | 'grant';
@@ -88,8 +162,8 @@ export const ROW_HELP: Readonly<Record<SettingRow, string>> = {
   sandbox: 'Run in its own git worktree on an rsi/<session> branch.',
   manager: 'Appoint this session as the project manager at launch.',
   scope: 'What the manager supervises: project, Group or Epic.',
-  policy: 'The grant preset: Observe, Execute or Full project control.',
-  grant: 'The preset’s policy is granted at launch; p opens the full policy editor once the manager is appointed.',
+  policy: 'The grant preset: Observe, Execute or Full project control. Untouched, the project’s saved grant is re-granted.',
+  grant: 'The saved grant (or the chosen preset) is granted at launch; p opens the full policy editor once the manager is appointed.',
 };
 
 /** The rows shown, top to bottom (`launch_setting_rows`). */
@@ -148,12 +222,12 @@ export function stepEffort(model: string, current: string, by: 1 | -1): string {
   return steps[((i < 0 ? 0 : i) + by + steps.length) % steps.length]!;
 }
 
-/** Effort bars for the header: one per ladder step, filled to the level. */
+/** Effort dots for the header: one per ladder step, filled to the level (● and ○ are in every UI font; ▮▯ and ⊡ drew as boxes, local #283). */
 export function effortBars(model: string, effort: string): string {
   const ladder = effortLadder(model).filter((e) => LAUNCH_EFFORTS.includes(e));
   const steps = ladder.length ? ladder : LAUNCH_EFFORTS;
   const at = steps.indexOf(effort);
-  return steps.map((_, i) => (i <= at ? '▮' : '▯')).join('');
+  return steps.map((_, i) => (i <= at ? '●' : '○')).join('');
 }
 
 interface ScopeSession { id: string; session_kind?: string | null; parent_id?: string | null; project_id?: string | null; status: string; title?: string | null; name?: string | null }
@@ -191,13 +265,18 @@ export function stepPreset(p: PolicyPreset, by: 1 | -1): PolicyPreset {
   return POLICY_PRESETS[(i + by + POLICY_PRESETS.length) % POLICY_PRESETS.length]!;
 }
 
-/** The header row of a New session prompt: working dir, model, effort, sandbox, manager. */
-export function launchSummary(s: LaunchSettings, workingDir: string): string {
-  const parts = [workingDir || '(no working directory)', s.model ? `${s.provider} · ${s.model}` : `${s.provider} · default model`];
-  parts.push(`${effortBars(s.model, s.effort)} ${s.effort || 'default effort'}`);
-  parts.push(s.sandbox ? '⊡ sandbox' : '⊡ no sandbox');
-  if (s.manager) parts.push(`★ manager · ${PRESET_LABELS[s.manager.preset]}`);
-  return parts.join('  ');
+/** The header row of a New session prompt, in plain words: what will start, and where (local #289). */
+export function launchSummary(s: LaunchSettings, workingDir: string, grant: GrantContext | null = null, projectName = ''): string {
+  const model = s.model ? `model ${s.model}` : 'the default model';
+  const effort = s.effort ? `, ${effortBars(s.model, s.effort)} ${s.effort} effort` : '';
+  const parts = [
+    `Starts ${providerLabel(s.provider)} with ${model}${effort}.`,
+    `Project: ${projectName || 'none'}.`,
+    `Folder: ${workingDir || NO_FOLDER_WORDS}.`,
+    `Own git worktree: ${s.sandbox ? 'yes' : 'no'}.`,
+  ];
+  if (s.manager) parts.push(`Manager: ${grant && regrantsSaved(s.manager, grant) ? 'saved grant' : PRESET_LABELS[s.manager.preset]}.`);
+  return parts.join(' ');
 }
 
 /** The session id in a LaunchSession answer (a Session, or `{session_id}`), else null. */

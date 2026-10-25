@@ -95,7 +95,7 @@ struct KnownRoots {
 enum RegistryStoreSource<'a> {
     #[cfg(test)]
     Direct(&'a Store),
-    Shared(&'a Arc<tokio::sync::Mutex<Store>>),
+    Shared(&'a Arc<rsid_core::store_lock::Mutex<Store>>),
 }
 
 impl RegistryStoreSource<'_> {
@@ -330,7 +330,7 @@ impl IndexRuntime {
     /// custody settlement. Changes are admitted without restarting the writer.
     pub fn attach_registry(
         &mut self,
-        store: Arc<tokio::sync::Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         allowed_roots: Vec<PathBuf>,
     ) {
         let handle = self.handle.clone();
@@ -751,6 +751,10 @@ fn primary_workspaces_reported(
         let Some(path) = project.path.as_ref() else {
             continue;
         };
+        // Hub #3315: the home project is `$HOME`, never a workspace to index.
+        if Project::is_home_id(project.id) {
+            continue;
+        }
         match RegisteredWorkspace::primary(project.id, &path) {
             Ok(workspace) if allowed(&workspace, allowed_roots) => {
                 workspaces.push(workspace);
@@ -1331,7 +1335,7 @@ mod tests {
                 &base.path().join(format!("missing-root-{ordinal}")),
             );
         }
-        let shared = Arc::new(tokio::sync::Mutex::new(store));
+        let shared = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let mut page_count = 0;
         let mut changed = false;
         let (workspaces, _) = registry_snapshot_with_source(
@@ -1394,7 +1398,7 @@ mod tests {
             .insert_project(&project(project_id, repo.clone()))
             .unwrap();
         stored_custody(&store, &external, project_id, 0, &repo, &root);
-        let shared = Arc::new(tokio::sync::Mutex::new(store));
+        let shared = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let mut page_count = 0;
         let (workspaces, _) = registry_snapshot_with_source(
             RegistryStoreSource::Shared(&shared),
@@ -2190,7 +2194,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let indexes = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("lib.rs"), "pub fn later() {}\n").unwrap();
-        let store = Arc::new(tokio::sync::Mutex::new(Store::open_in_memory().unwrap()));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
         let mut runtime = IndexRuntime::start(indexes.path().to_path_buf(), vec![], &[]).unwrap();
         runtime.handle().set_enabled(true);
         runtime.attach_registry(store.clone(), Vec::new());
@@ -2320,7 +2326,7 @@ mod tests {
         );
         let handle = runtime.handle().clone();
         runtime.attach_registry(
-            Arc::new(tokio::sync::Mutex::new(store)),
+            Arc::new(rsid_core::store_lock::Mutex::new(store)),
             vec![base.path().to_path_buf()],
         );
         assert!(!runtime.startup_pending, "the registry task owns it");
@@ -2379,7 +2385,7 @@ mod tests {
         assert_eq!(admitted[0].workspace.workspace_id(), primary.workspace_id());
 
         let handle = runtime.handle().clone();
-        let shared = Arc::new(tokio::sync::Mutex::new(store));
+        let shared = Arc::new(rsid_core::store_lock::Mutex::new(store));
         let sandbox_workspace = rsi_codegraph::CodegraphStore::workspace_id(
             project_id,
             &format!("rsi-sandbox:{sandbox_id}"),

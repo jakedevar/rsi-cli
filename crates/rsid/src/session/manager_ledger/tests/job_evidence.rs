@@ -7,7 +7,9 @@ use super::*;
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 use crate::store::agent_jobs::NewAgentJob;
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
-use rsi_common::agent_jobs::{AgentJobResultV1, JobParams, JobState, JobWake};
+use rsi_common::agent_jobs::{
+    AgentJobResultV1, JobParams, JobState, JobWake, ScopedToolProvenanceV1, ScopedToolSource,
+};
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
 const REPORT: &str = "thoughts/shared/qa/job-evidence-report.md";
@@ -84,11 +86,26 @@ async fn job_in(
         )
         .unwrap();
     if let Some((state, result)) = settled {
+        // The daemon records the tool provenance before launch; settlement keeps it.
+        if let Some(provenance) = &result.scoped_tool {
+            store.record_agent_job_scoped_tool(id, provenance).unwrap();
+        }
         store
             .settle_agent_job(id, state, &result, false, Utc::now())
             .unwrap();
     }
     id
+}
+
+/// The daemon's recorded tool identity for a `scoped_test` run.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+fn tool(source: ScopedToolSource) -> ScopedToolProvenanceV1 {
+    ScopedToolProvenanceV1 {
+        source,
+        path: "/tool/scripts/scoped-test".into(),
+        rev: None,
+        files: Vec::new(),
+    }
 }
 
 /// What a scoped-test receipt records: the tested `head`, the verdict and the
@@ -107,6 +124,7 @@ fn finished(head: &str, exit_code: i32, failing: &[&str]) -> (JobState, AgentJob
             "head": head, "filters": [], "plan": "precise", "schema": 1, "packages": [],
             "failures": failures, "baseline_reds": [],
         })),
+        scoped_tool: Some(tool(ScopedToolSource::Rolling)),
         ..Default::default()
     };
     let state = if exit_code == 0 {
@@ -216,6 +234,38 @@ async fn a_caller_owned_green_job_is_reported_stage_evidence_never_an_admission(
     assert!(stage.admission.is_none() && stage.evidence.is_none());
     assert!(work.source_session_id.is_none() && work.source_commit.is_none());
     assert!(work.acceptance.is_none());
+}
+
+/// #3793: a green receipt printed by a candidate-tool, sandbox-tool or unstamped
+/// (legacy) run is tool-under-test evidence, never a verified pass.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]
+#[tokio::test]
+async fn a_non_rolling_tool_green_job_is_never_a_verified_pass() {
+    let f = fixture().await;
+    let tested = f.source_head.clone();
+    let report = commit_report(&f);
+    for (label, source) in [
+        ("candidate", Some(ScopedToolSource::Candidate)),
+        ("sandbox", Some(ScopedToolSource::Sandbox)),
+        ("missing", None),
+    ] {
+        let (state, mut result) = finished(&tested, 0, &[]);
+        result.scoped_tool = source.map(tool);
+        let forged = job(&f, f.source, true, Some((state, result))).await;
+        let claim = verification(
+            1,
+            ManagerStageStateV2::Passed,
+            cite(forged, &tested, &report),
+            &format!("forged-{label}"),
+        );
+        assert!(
+            refusal(&f, f.source, claim)
+                .await
+                .contains("manager_v2_job_evidence_state_mismatch"),
+            "{label}"
+        );
+        assert_eq!(product(&f).await.0, 1, "{label}");
+    }
 }
 
 #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-session-04"))]

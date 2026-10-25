@@ -1128,12 +1128,28 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        if !seat.is_some_and(|(project, kind, parent, predecessor)| {
-            project == request.project_id.to_string()
-                && kind == "Standard"
-                && parent.is_none()
-                && predecessor.is_none()
-        }) {
+        let valid_seat = match seat {
+            Some((project, kind, parent, predecessor))
+                if project == request.project_id.to_string() && predecessor.is_none() =>
+            {
+                if kind == "Standard" && parent.is_none() {
+                    true
+                } else if kind == "Task" {
+                    // Managers create leaf seats under Epics. Accept only a
+                    // direct child of a live Epic in the new node's selector.
+                    parent.is_some_and(|parent| {
+                        epics.iter().any(|(epic, group)| {
+                            epic.to_string() == parent
+                                && request.selector.covers_epic(*epic, *group)
+                        })
+                    })
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !valid_seat {
             return Err(node_refused("manager_node_invalid_seat"));
         }
         let committed_predecessor: bool = tx.query_row(
@@ -1834,6 +1850,132 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(store.list_area_nodes(project).unwrap().len(), 3);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn manager_delegates_task_seat_under_selected_epic() {
+        let (store, project, root, _, epics) = area_fixture(true);
+        store
+            .update_session_status(root.seat_root_session_id, SessionStatus::Running)
+            .unwrap();
+        let mut request = area_request(
+            &store,
+            project,
+            &root,
+            ManagerNodeSelectorV1::Selected {
+                group_ids: vec![],
+                epic_ids: vec![epics[0]],
+            },
+        );
+        let seat = request.seat_root_session_id;
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET session_kind='Task',parent_id=?2,status='Running' WHERE id=?1",
+                params![seat.to_string(), epics[0].to_string()],
+            )
+            .unwrap();
+        request.idempotency_key = Some("task-seat".into());
+        let child = store
+            .delegate_area_node(root.seat_root_session_id, &request)
+            .unwrap();
+        assert_eq!(
+            store
+                .delegate_area_node(root.seat_root_session_id, &request)
+                .unwrap()
+                .id,
+            child.id
+        );
+        // The observed fallback in #3438 had already made this Task a lead.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET lead_session_id=?2 WHERE id=?1",
+                params![epics[0].to_string(), seat.to_string()],
+            )
+            .unwrap();
+        let authority = store.manager_area_authority_current(seat).unwrap().unwrap();
+        assert_eq!(authority.config.epic_ids, vec![epics[0]]);
+        assert_eq!(authority.grant.manager_session_id, child.id);
+        let authorized = store
+            .manager_v2_authorize(
+                seat,
+                &rsi_common::harness_manager_v2::ManagerFenceV2 {
+                    scope_version: child.authority_epoch,
+                    policy_version: child.policy_version,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(authorized.is_manager);
+        assert_eq!(authorized.grant.manager_session_id, child.id);
+        let projection = store.agent_authority_projection(seat).unwrap();
+        assert!(projection.is_manager);
+        assert!(!projection.update_variants.is_empty());
+        store
+            .update_session_status(seat, SessionStatus::Starting)
+            .unwrap();
+        let starting = store.agent_authority_projection(seat).unwrap();
+        assert!(starting.is_manager);
+        assert!(!starting.pending);
+        assert!(
+            projection.verbs.contains(
+                &rsi_common::agent_control_schema::AgentControlVerbV1::ManagerDelegateNode
+            )
+        );
+        // Moving the Task outside the selected area cannot retain its seat grant.
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET parent_id=?2 WHERE id=?1",
+                params![seat.to_string(), epics[1].to_string()],
+            )
+            .unwrap();
+        assert!(store.manager_area_authority_current(seat).is_err());
+        assert!(!store.agent_authority_projection(seat).unwrap().is_manager);
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn task_seat_requires_same_project_selected_epic_and_no_predecessor() {
+        let (store, project, root, group, epics) = area_fixture(true);
+        let request = area_request(
+            &store,
+            project,
+            &root,
+            ManagerNodeSelectorV1::Selected {
+                group_ids: vec![],
+                epic_ids: vec![epics[0]],
+            },
+        );
+        let foreign_project = add_legacy_root(&store, false);
+        let seat = request.seat_root_session_id.to_string();
+        for (kind, parent, predecessor, seat_project) in [
+            ("Task", Some(epics[1]), None, project),
+            ("Task", Some(group), None, project),
+            ("Task", None, None, project),
+            ("Standard", Some(epics[0]), None, project),
+            (
+                "Task",
+                Some(epics[0]),
+                Some(root.seat_root_session_id),
+                project,
+            ),
+            ("Task", Some(epics[0]), None, foreign_project),
+        ] {
+            store.conn.execute("UPDATE sessions SET session_kind=?2,parent_id=?3,continued_from=?4,project_id=?5 WHERE id=?1",
+                params![seat,kind,parent.map(|id|id.to_string()),predecessor.map(|id|id.to_string()),seat_project.to_string()]).unwrap();
+            let error = store.appoint_area_node(&request).unwrap_err();
+            assert!(
+                error.to_string().contains("manager_node_invalid_seat"),
+                "{error}"
+            );
+        }
+        store.conn.execute("UPDATE sessions SET session_kind='Task',parent_id=?2,continued_from=NULL,project_id=?3 WHERE id=?1",
+            params![seat,epics[0].to_string(),project.to_string()]).unwrap();
+        let child = store.appoint_area_node(&request).unwrap();
+        assert_eq!(child.seat_root_session_id, request.seat_root_session_id);
     }
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]

@@ -80,17 +80,22 @@ fn circuit_open() -> DaemonError {
 }
 
 struct Fixture {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     bus: Arc<EventBus>,
     owner: Uuid,
 }
 
 impl Fixture {
     fn new() -> Self {
+        let store = Store::open_in_memory().expect("store");
+        let mut owner = rsid_store::test_support::make_test_session();
+        owner.id = Uuid::new_v4();
+        owner.status = SessionStatus::Running;
+        store.insert_session(&owner).unwrap();
         Self {
-            store: Arc::new(Mutex::new(Store::open_in_memory().expect("store"))),
+            store: Arc::new(rsid_core::store_lock::Mutex::new(store)),
             bus: Arc::new(EventBus::new(64)),
-            owner: Uuid::new_v4(),
+            owner: owner.id,
         }
     }
 
@@ -347,16 +352,65 @@ fn usage_window_refusal() -> DaemonError {
     ))
 }
 
+/// #360: admission capacity is an account condition, not a failed delivery.
+/// Both a plain resume and a satisfied predicate stay armed beyond the retry
+/// limit, then deliver once admission succeeds.
+#[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-03"))]
+#[tokio::test]
+async fn provider_capacity_holds_resume_and_when_wakes_without_spending_retries() {
+    for predicate in [false, true] {
+        let world = Fixture::new();
+        let wake = if predicate {
+            world.satisfied_wake("capacity").await
+        } else {
+            let mut wake = world.satisfied_wake("capacity").await;
+            // Keep the same ordinary Resume row, without its predicate state.
+            world.store.lock().await.conn.execute(
+                "UPDATE scheduled_jobs SET schedule_json=json_remove(schedule_json,'$.wake_when') WHERE id=?1",
+                [wake.id.to_string()],
+            ).unwrap();
+            wake.message = "resume after provider capacity clears".into();
+            wake
+        };
+        let launcher = ScriptedLauncher::new(
+            (0..12)
+                .map(|_| DaemonError::PolicyDenied("manager_v2_provider_capacity".into()))
+                .collect(),
+        );
+        let dynamic: Arc<dyn SessionLauncher> = launcher.clone();
+        for _ in 0..12 {
+            fire_job(&world.store, &world.bus, &dynamic, &wake).await;
+            assert!(world.enabled(&wake).await);
+            let store = world.store.lock().await;
+            assert_eq!(store.continuation_retry(wake.id).unwrap(), None);
+            assert!(
+                store
+                    .get_scheduled_job(&wake.id)
+                    .unwrap()
+                    .unwrap()
+                    .next_fire_at
+                    > Utc::now()
+            );
+        }
+        assert_eq!(open_todo_count(&world, &wake).await, 0);
+        fire_job(&world.store, &world.bus, &dynamic, &wake).await;
+        fire_job(&world.store, &world.bus, &dynamic, &wake).await;
+        assert_eq!(launcher.delivered().len(), 1);
+        assert!(!world.enabled(&wake).await);
+    }
+}
+
 /// A Claude worker session as the wake's target, and an exhausted five-hour
 /// window that resets at `reset`.
 async fn exhaust_claude_window(world: &Fixture, reset: chrono::DateTime<Utc>) {
     use rsi_common::rpc::{ProviderRateLimitSnapshot, ProviderRateLimitWindow};
     use rsi_common::types::SessionProvider;
     let store = world.store.lock().await;
-    let mut session = rsid_store::test_support::make_test_session();
-    session.id = world.owner;
-    session.provider = SessionProvider::Claude;
-    store.insert_session(&session).unwrap();
+    let session = store
+        .get_session(world.owner)
+        .unwrap()
+        .expect("fixture owner");
+    assert_eq!(session.provider, SessionProvider::Claude);
     store
         .upsert_provider_rate_limit_snapshot(
             &ProviderRateLimitSnapshot {

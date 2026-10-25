@@ -404,6 +404,13 @@ pub mod tests {
     use std::path::PathBuf;
 
     pub fn fixture(store: &Store, policy: ManagerPolicyV2) -> (HarnessManagerConfigV1, Session) {
+        // The resource-cap fixtures model metered accounts explicitly.
+        store
+            .set_daemon_setting("claude_billing_mode", "metered_api")
+            .unwrap();
+        store
+            .set_daemon_setting("codex_billing_mode", "metered_api")
+            .unwrap();
         let stamp = Utc::now();
         let project = Uuid::new_v4();
         store

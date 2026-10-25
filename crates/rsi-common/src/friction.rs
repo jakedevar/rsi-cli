@@ -82,7 +82,10 @@ pub enum FrictionKind {
     /// #1337: an agent-owned process tree passed the CPU-time andon, or a
     /// test job ran past its timeout: `runaway_process:<tree>:<reason>`.
     RunawayProcess,
-    /// One sandbox Cargo cache was staged for reclamation.
+    /// A staged sandbox Cargo cache stopped before removal for a reason a
+    /// later pass does not clear: `sandbox_target_reclaim:pending:<reason>`
+    /// (a per-pass budget stop is resumed by the next pass and is not
+    /// friction, #222).
     SandboxTargetReclaim,
     /// #2384: a cold-archive pass, verification, read, restore or compaction
     /// failed: `cold_archive:<code>`.
@@ -93,6 +96,10 @@ pub enum FrictionKind {
     /// #2603: one helper-LLM purpose (title, description, memory, dream, ...)
     /// failed many calls in a row: `helper_llm:<purpose>:<cause>`.
     HelperLlm,
+    /// #3640: a manager action ended with the catch-all
+    /// `manager_v2_lifecycle_unconfirmed`: `manager_launch:<action_kind>:<code>`;
+    /// the error text is on the action receipt's `outcome_detail`.
+    ManagerLaunch,
 }
 
 impl FrictionKind {
@@ -112,6 +119,7 @@ impl FrictionKind {
             Self::ColdArchive => "cold_archive",
             Self::ForcedShutdown => "forced_shutdown",
             Self::HelperLlm => "helper_llm",
+            Self::ManagerLaunch => "manager_launch",
         }
     }
 }

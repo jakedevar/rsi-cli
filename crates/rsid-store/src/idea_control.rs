@@ -18,7 +18,7 @@ use rsi_common::types::{
 };
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 /// The daemon owns issuance; the store only compares an opaque installed
@@ -170,7 +170,7 @@ impl BoundIdeaWriteAuthority {
     reason = "explicit crate barrier preserves the construction-only D02 authority boundary"
 )]
 pub struct IdeaControlHandle {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     authority: BoundIdeaWriteAuthority,
 }
 
@@ -345,7 +345,7 @@ impl BoundControllerWriteAuthority {
     reason = "explicit crate barrier prevents transport construction of transfer handles"
 )]
 pub struct IdeaControllerTransferHandle {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     authority: BoundIdeaControllerTransferAuthority,
     clock: Arc<dyn IdeaControllerClock>,
 }
@@ -353,7 +353,7 @@ pub struct IdeaControllerTransferHandle {
 impl IdeaControllerTransferHandle {
     /// Bind an operator to the current server-read Idea epoch.
     pub(crate) async fn for_operator(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         project_id: Uuid,
         idea_id: Uuid,
         actor_id: impl Into<String>,
@@ -379,7 +379,7 @@ impl IdeaControllerTransferHandle {
     /// other than `rsid` depends on this one, and `rsid` re-exports
     /// `idea_control` crate-private.
     pub async fn for_system(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         project_id: Uuid,
         idea_id: Uuid,
         clock: Arc<dyn IdeaControllerClock>,
@@ -397,7 +397,7 @@ impl IdeaControllerTransferHandle {
     }
 
     async fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         project_id: Uuid,
         idea_id: Uuid,
         actor_kind: IdeaActorKind,
@@ -616,14 +616,14 @@ impl IdeaControllerTransferHandle {
     reason = "explicit crate barrier prevents transport code from widening the controller action set"
 )]
 pub(crate) struct IdeaControllerHandle {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     authority: BoundControllerWriteAuthority,
     clock: Arc<dyn IdeaControllerClock>,
 }
 
 impl IdeaControllerHandle {
     pub(crate) fn from_bound(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         authority: BoundControllerWriteAuthority,
         clock: Arc<dyn IdeaControllerClock>,
     ) -> Self {
@@ -700,7 +700,7 @@ impl IdeaControlError {
 impl IdeaControlHandle {
     /// Bind one Store handle to one project and validated operator identity.
     pub fn for_operator(
-        store: Arc<Mutex<Store>>,
+        store: Arc<rsid_core::store_lock::Mutex<Store>>,
         project_id: Uuid,
         actor_id: impl Into<String>,
     ) -> Result<Self, IdeaControlError> {
@@ -770,7 +770,7 @@ impl IdeaControlHandle {
 // a transport or a second writer.
 #[allow(dead_code)]
 async fn d02_internal_surface_compile_anchor(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Uuid,
     actor_id: String,
     idea_id: Uuid,
@@ -789,7 +789,7 @@ async fn d02_internal_surface_compile_anchor(
 // authority surface type-checked and considered reachable from one scoped
 // anchor until a later slice supplies an authorized consumer.
 async fn d03_internal_surface_compile_anchor(
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
     project_id: Uuid,
     idea_id: Uuid,
     session_id: Uuid,
@@ -891,7 +891,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn idea_control_binds_operator_and_project_before_store_writes() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("open store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("open store"),
+        ));
         let project_a = project("A");
         let project_b = project("B");
         let capture_a = capture(project_a.id);

@@ -7,8 +7,8 @@ import { confirmDialog } from '../approvals.js';
 import { $, toast } from '../dom.js';
 import {
   type FoldOp, LABEL_COLORS, PROJECT_COLORS, SORT_ORDERS, applyFold, ascendTarget, attentionQueue, attentionSlot,
-  findProject, labelBoundary, labelCounts, matchIndices, parentChoices, parseProjectArg, parseSortOrder,
-  sessionInfoRows, sortInfo, stepMatch, validateLabel, validateProject,
+  findProject, labelBoundary, labelCounts, parentChoices, parseProjectArg, parseSortOrder,
+  sessionInfoRows, sortInfo, validateLabel, validateProject,
 } from '../listmodel.js';
 import { type PickItem, openForm, openInfo, openPicker } from '../pickers.js';
 import type { ActionId } from '../registry.js';
@@ -17,10 +17,12 @@ import {
   visibleContainers, visibleRows,
 } from '../sessions.js';
 import { collapsedIds, setCollapsed } from '../sessionTree.js';
+import { HOME_LOCKED_WHY, isHomeProjectId, projectLabel } from '../project-model.js';
 import { currentSessions, selected, state } from '../state.js';
 import { type SliceRuntime, dispatch } from '../commands.js';
 import { type ListSnapshot, SLICE } from './sessionlist.js';
 import { focusOwnsKey } from '../modal-gate.js';
+import { findActive, findStepKey } from './find-run.js';
 
 /** The slice of commands.ts's Invocation these actions read. */
 interface Inv {
@@ -72,6 +74,7 @@ export function listSnapshot(): ListSnapshot {
     attentionQueue: attentionQueue(rows).length,
     search: needle,
     detailSearchable: selected() !== undefined && needle.trim() !== '',
+    findActive: findActive(),
     projects: state.projects.length,
     labelGroups: rows.some((r) => (r.session.group_id ?? null) !== first),
     openHasParent: !!selected()?.parent_id,
@@ -115,21 +118,32 @@ function setProjectFilter(id: string): void {
 }
 
 const projectItem = (p: Project, current: boolean): PickItem => ({
-  id: p.id, label: p.name, color: p.color, ...(p.path ? { detail: p.path } : {}), current,
+  id: p.id, label: projectLabel(p), color: p.color, ...(p.path ? { detail: p.path } : {}), current,
 });
 
 // ---------- projects ----------
 
-function openProjectForm(p: Project | null): void {
+/**
+ * The New / Edit project form. `onSaved` runs after the daemon accepted it and
+ * the project list reloaded (the launch dialog selects the new project there).
+ */
+export function openProjectForm(p: Project | null, onSaved?: (made: Project) => void): void {
+  if (p && isHomeProjectId(p.id)) { toast(HOME_LOCKED_WHY); return; }
   openForm({
     title: p ? 'Edit project' : 'New project',
+    keyTable: 'Project Form',
     submit: 'Save',
     fields: [
-      { name: 'name', label: 'Name', value: p?.name ?? '', type: 'text' },
-      { name: 'path', label: 'Path', value: p?.path ?? '', type: 'text', placeholder: 'optional' },
+      { name: 'name', label: 'Name', value: p?.name ?? '', type: 'text', wrap: true, placeholder: 'for example: my-app',
+        hint: 'A short name for this project. You pick it from lists, so make it easy to recognize.' },
+      { name: 'path', label: 'Folder', value: p?.path ?? '', type: 'text', wrap: true, placeholder: '/Users/you/code/my-app (optional)',
+        hint: 'The folder with your code. New sessions in this project start here unless you choose another folder. Type or paste the full path; you can leave it empty and set a folder per session.' },
       { name: 'color', label: 'Color', value: (p?.color ?? PROJECT_COLORS[0]!.hex).toLowerCase(), type: 'color', palette: PROJECT_COLORS },
     ],
-    validate: (v) => validateProject({ name: v.name ?? '', path: v.path ?? '', color: v.color ?? '' }),
+    validate: (v) => validateProject(
+      { name: v.name ?? '', path: v.path ?? '', color: v.color ?? '' },
+      state.projects.filter((x) => x.id !== p?.id).map((x) => x.name),
+    ),
     onSubmit: async (v) => {
       const path = (v.path ?? '').trim() || null;
       const made = p
@@ -138,12 +152,14 @@ function openProjectForm(p: Project | null): void {
       await refreshProjects();
       void refreshSessions();
       toast(`${p ? 'Saved' : 'Created'} project ${made.name}`, true);
+      onSaved?.(made);
     },
   });
 }
 
 async function deleteProject(p: Project): Promise<void> {
-  if (!(await confirmDialog(`Delete project “${p.name}”?`, 'Delete'))) return;
+  if (isHomeProjectId(p.id)) { toast(HOME_LOCKED_WHY); return; }
+  if (!(await confirmDialog(`Delete project “${p.name}”? Its sessions stay in the list, just without a project, and nothing in its folder is deleted. A project that still has Issues may be refused.`, 'Delete'))) return;
   try {
     await listApi.deleteProject(p.id);
     if (projectFilter() === p.id) $<HTMLSelectElement>('project-filter').value = '';
@@ -160,6 +176,7 @@ function pickProject(title: string, then: (p: Project) => void): void {
   if (state.projects.length === 0) { toast('There are no projects yet'); return; }
   openPicker({
     title,
+    keyTable: 'Project Picker',
     hint: 'Type to filter · Enter choose · Esc cancel',
     filterable: true,
     items: state.projects.map((p) => projectItem(p, false)),
@@ -175,6 +192,7 @@ function projectPicker(): void {
   const projectOf = (it: PickItem | null): Project | undefined => state.projects.find((p) => p.id === it?.id);
   openPicker({
     title: 'Choose project',
+    keyTable: 'Project Picker',
     hint: 'Type to filter · Enter show that project · Esc cancel',
     filterable: true,
     items: [
@@ -183,7 +201,7 @@ function projectPicker(): void {
     ],
     emptyText: 'No project matches',
     buttons: [
-      { text: 'New', ctrl: 'n', run: () => { openProjectForm(null); } },
+      { text: 'New project…', ctrl: 'n', run: () => { openProjectForm(null); } },
       { text: 'Edit', ctrl: 'e', needsItem: 'Pick a project to edit', run: (it) => {
         const p = projectOf(it);
         if (p) openProjectForm(p);
@@ -238,6 +256,7 @@ function runProject(id: 'choose-project' | 'project-new' | 'project-edit' | 'pro
 function changeSessionProject(s: Session): void {
   openPicker({
     title: 'Change session project',
+    keyTable: 'Project Picker',
     hint: 'Type to filter · Enter move the session · Esc cancel',
     filterable: true,
     items: [
@@ -257,6 +276,7 @@ function changeSessionProject(s: Session): void {
 function openLabelForm(l: SessionLabel | null, done: () => void): void {
   openForm({
     title: l ? 'Edit label' : 'New label',
+    keyTable: 'Label Form',
     submit: 'Save',
     fields: [
       { name: 'name', label: 'Name', value: l?.name ?? '', type: 'text' },
@@ -281,6 +301,7 @@ function labelPicker(s: Session): void {
   const sorted = [...state.labels].sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   openPicker({
     title: 'Set session label',
+    keyTable: 'Label Picker',
     hint: 'Type to filter · Enter assign · Esc cancel',
     filterable: true,
     items: [
@@ -325,6 +346,7 @@ function labelPicker(s: Session): void {
 function sortPicker(): void {
   openPicker({
     title: 'Sort sessions',
+    keyTable: 'Sort Picker',
     hint: 'j/k or arrows choose · Enter apply · Esc cancel',
     vimKeys: true,
     items: SORT_ORDERS.map((o) => ({ id: o.id, label: o.label, detail: o.description, current: o.id === state.sortOrder })),
@@ -352,6 +374,7 @@ function sessionInfo(s: Session): void {
 function parentPicker(s: Session): void {
   openPicker({
     title: 'Move under a Group or Epic',
+    keyTable: 'Parent Picker',
     hint: 'Type to filter · Enter move · Esc cancel',
     filterable: true,
     items: parentChoices(currentSessions(), s.id).map((c) => ({ id: c.id ?? '', label: c.label, current: c.current })),
@@ -392,29 +415,6 @@ function attentionPicker(): void {
 }
 
 // ---------- search ----------
-
-let searchAt: number | null = null;
-let searchEpoch = -1;
-let searchNeedle = '';
-
-function stepSearch(dir: 1 | -1): void {
-  const needle = $<HTMLInputElement>('search').value;
-  if (state.selectionEpoch !== searchEpoch || needle !== searchNeedle) {
-    searchAt = null;
-    searchEpoch = state.selectionEpoch;
-    searchNeedle = needle;
-  }
-  const evs = [...$('events').querySelectorAll<HTMLElement>('.ev')];
-  const matches = matchIndices(evs.map((e) => e.textContent ?? ''), needle);
-  const next = stepMatch(matches, searchAt, dir);
-  for (const e of evs) e.classList.remove('search-hit');
-  if (next === null) { toast('No match in this conversation'); return; }
-  searchAt = next;
-  const hit = evs[next]!;
-  hit.classList.add('search-hit');
-  hit.scrollIntoView({ block: 'center' });
-  toast(`Match ${matches.indexOf(next) + 1} of ${matches.length}`, true);
-}
 
 function clearSearch(): void {
   const box = $<HTMLInputElement>('search');
@@ -465,8 +465,10 @@ export function runSessionList(id: ActionId, inv: Inv): boolean {
     case 'search-next':
     case 'search-prev': {
       const dir = id === 'search-next' ? 1 : -1;
-      if (s) { stepSearch(dir); return true; }
-      // No conversation open: the filtered rows are the matches (G2).
+      // A conversation's find (/ with the transcript keyed, Cmd-F) steps its own matches; the list filter steps rows.
+      const filtering = $<HTMLInputElement>('search').value.trim() !== '';
+      if (s && !(filtering && lastPane === 'list') && findStepKey(dir)) return true;
+      // The filtered rows are the matches (G2).
       const ids = visibleRows().map((r) => r.session.id);
       const at = ids.indexOf(cursor() ?? '');
       const to = ids[((at < 0 ? (dir > 0 ? -1 : 0) : at) + dir + ids.length) % Math.max(1, ids.length)];

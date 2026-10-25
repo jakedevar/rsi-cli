@@ -19,7 +19,6 @@ use rsi_common::program_runs::{
     ProgramRunActionV1,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -38,11 +37,11 @@ pub(crate) trait ProgramRunActionPublisher: Send + Sync {
 }
 
 pub(crate) struct ScheduledJobWakeAdapter {
-    store: Arc<Mutex<Store>>,
+    store: Arc<rsid_core::store_lock::Mutex<Store>>,
 }
 
 impl ScheduledJobWakeAdapter {
-    pub(crate) const fn new(store: Arc<Mutex<Store>>) -> Self {
+    pub(crate) const fn new(store: Arc<rsid_core::store_lock::Mutex<Store>>) -> Self {
         Self { store }
     }
 }

@@ -68,7 +68,7 @@ pub(super) fn authorize_area_node(
     if seat.project_id != Some(project_id) {
         return Err(refused("manager_node_project_denied"));
     }
-    if seat.session_kind != SessionKind::Standard
+    if !matches!(seat.session_kind, SessionKind::Standard | SessionKind::Task)
         || matches!(
             seat.status,
             SessionStatus::Archived | SessionStatus::Deleted
@@ -128,6 +128,11 @@ pub(super) fn authorize_area_node(
     let selector: ManagerNodeSelectorV1 = serde_json::from_str(&row.5)
         .map_err(|_| refused("manager_node_invalid_stored_selector"))?;
     let epic_ids = live_selected_epics(store, project_id, &selector)?;
+    if seat.session_kind == SessionKind::Task
+        && seat.parent_id.is_none_or(|epic| !epic_ids.contains(&epic))
+    {
+        return Err(refused("manager_node_custody_changed"));
+    }
     let mut config: HarnessManagerConfigV1 = root_config;
     // Existing V2 record/event/operation tables require a Session FK. The
     // root of this node's seat lineage is stable across succession; Work facts
@@ -169,7 +174,7 @@ pub(super) fn authorize_area_node(
 impl Store {
     /// Resolve the current area grant for read surfaces. The same effect-time
     /// checks used by mutations reject retired seats and changed ancestry.
-    pub(crate) fn manager_area_authority_current(
+    pub fn manager_area_authority_current(
         &self,
         caller: Uuid,
     ) -> Result<Option<ManagerAuthorityV2>> {

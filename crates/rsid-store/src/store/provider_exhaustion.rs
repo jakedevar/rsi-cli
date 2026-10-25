@@ -123,7 +123,7 @@ impl Store {
 
 /// The daemon renders a provider diagnostic as ``**heading**\n```\n<text>\n```
 /// ``; the exact provider text is the fenced body.
-fn strip_event_frame(content: &str) -> String {
+pub(super) fn strip_event_frame(content: &str) -> String {
     let body = content
         .split_once("```\n")
         .map_or(content, |(_, rest)| rest);

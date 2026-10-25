@@ -5,7 +5,7 @@
 
 use super::Store;
 use crate::error::{DaemonError, Result};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -15,11 +15,33 @@ use crate::store_support::satellite_registry::{
     LinkDirection, MAX_LINKS_PER_PEER, RegistryLink, RegistryPeer,
 };
 use rsi_common::satellite::{
-    SatelliteHubSessionV1, SatelliteHubSessionsPageV1, SatelliteHubSessionsRequestV1,
-    SatelliteLinkConfigV1, SatelliteLinkDirectionV1, SatelliteObservationV1, SatellitePeerConfigV1,
-    SatellitePeerV1, SatellitePutLinkRequestV1, SatellitePutPeerRequestV1, SatelliteRegistryV1,
-    SatelliteSessionKeyV1, SatelliteSessionSummaryV1, SatelliteUuidV1,
+    ProviderUsageRollupV1, SATELLITE_MAX_USAGE_ROWS, SatelliteHubSessionV1,
+    SatelliteHubSessionsPageV1, SatelliteHubSessionsRequestV1, SatelliteLinkConfigV1,
+    SatelliteLinkDirectionV1, SatelliteObservationV1, SatellitePeerConfigV1, SatellitePeerV1,
+    SatellitePutLinkRequestV1, SatellitePutPeerRequestV1, SatelliteRegistryV1,
+    SatelliteSessionKeyV1, SatelliteSessionSummaryV1, SatelliteUuidV1, USAGE_WINDOW_1H,
+    USAGE_WINDOW_24H,
 };
+
+/// Providers reported per usage window (#4008); two windows fill [`SATELLITE_MAX_USAGE_ROWS`].
+const USAGE_PROVIDER_LIMIT: usize = SATELLITE_MAX_USAGE_ROWS / 2;
+
+const USAGE_ROLLUP_SQL: &str = "SELECT COALESCE(provider,'Unknown'), count(*),
+        COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
+        COALESCE(SUM(cache_creation_tokens),0), COALESCE(SUM(cache_read_tokens),0),
+        COALESCE(SUM(reasoning_tokens),0)
+     FROM model_invocations
+     WHERE admission_status='admitted' AND created_at>=?1
+     GROUP BY 1 ORDER BY 1 LIMIT ?2";
+
+/// Live activity counts from one satellite store snapshot.
+pub struct SatelliteHealthCounts {
+    pub sessions_running: u32,
+    pub sessions_waiting_approval: u32,
+    pub workers_parked: u32,
+    pub open_jobs: u32,
+    pub schema_version: i32,
+}
 
 // RSI-RELEASED-MIGRATION-BEGIN: satellite-registry-catalog
 const REGISTRY_SQL: &str = "CREATE TABLE satellite_registry (
@@ -262,6 +284,9 @@ impl Store {
             .find(|peer| peer.config.peer_id == request.peer_id)
             .ok_or_else(|| DaemonError::InvalidParam("satellite peer does not exist".into()))?;
         let observation = peer.observation.unwrap_or(SatelliteObservationV1 {
+            sessions_running: None,
+            workers_parked: None,
+            open_jobs: None,
             platform: None,
             state: "unconfigured".into(),
             installation_id: None,
@@ -409,7 +434,13 @@ impl Store {
             }
             None => 0,
         };
+        let health = crate::store_support::satellite::reported_health(peer_id);
         Ok(Some(SatelliteObservationV1 {
+            sessions_running: health.as_ref().map(|value| value.health.sessions_running),
+            workers_parked: health
+                .as_ref()
+                .and_then(|value| value.health.workers_parked),
+            open_jobs: health.as_ref().and_then(|value| value.health.open_jobs),
             platform: crate::store_support::satellite::reported_platform(peer_id),
             stale: state != "healthy",
             state,
@@ -634,9 +665,11 @@ impl Store {
         Ok(())
     }
 
-    /// Running and approval-waiting session counts plus the database schema
-    /// version, for the health a satellite reports on its identity.
-    pub fn satellite_health_counts(&self) -> Result<(u32, u32, i32)> {
+    /// Activity and schema version from one consistent snapshot. Parked workers
+    /// use the roster's classification, including its final-handoff rules.
+    pub fn satellite_health_counts(&self) -> Result<SatelliteHealthCounts> {
+        use rsi_common::agent_worker_roster::WorkerRosterStateV1;
+        let _snapshot = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
         let (running, waiting): (i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(status='Running'),0),COALESCE(SUM(status='WaitingApproval'),0)
              FROM sessions WHERE status IN ('Running','WaitingApproval')",
@@ -646,11 +679,76 @@ impl Store {
         let schema: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        Ok((
-            u32::try_from(running).unwrap_or(u32::MAX),
-            u32::try_from(waiting).unwrap_or(u32::MAX),
-            schema,
-        ))
+        // Only inspect completed leaves with possible continuation evidence;
+        // history without wakes or open jobs never needs transcript reads.
+        let mut candidates = self.conn.prepare(
+            "SELECT s.id FROM sessions s WHERE s.status='Completed'
+               AND s.session_kind NOT IN ('Group','Epic')
+               AND (EXISTS(SELECT 1 FROM scheduled_jobs w
+                            WHERE w.wake_session_id=s.id AND w.enabled=1)
+                 OR EXISTS(SELECT 1 FROM agent_jobs j
+                            WHERE j.owner_session_id=s.id AND j.state IN ('queued','running')))",
+        )?;
+        let ids = candidates.query_map([], |row| row.get::<_, String>(0))?;
+        let mut workers_parked = 0u32;
+        for id in ids {
+            let id = parse_stored_uuid(&id?)?;
+            if let Some(session) = self.get_session(id)?
+                && matches!(
+                    self.worker_roster_state(&session)?,
+                    Some((
+                        WorkerRosterStateV1::ParkedOnJob | WorkerRosterStateV1::ParkedOnWake,
+                        _
+                    ))
+                )
+            {
+                workers_parked = workers_parked.saturating_add(1);
+            }
+        }
+        let open_jobs: i64 = self.conn.query_row(
+            "SELECT count(*) FROM agent_jobs WHERE state IN ('queued','running')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(SatelliteHealthCounts {
+            sessions_running: u32::try_from(running).unwrap_or(u32::MAX),
+            sessions_waiting_approval: u32::try_from(waiting).unwrap_or(u32::MAX),
+            workers_parked,
+            open_jobs: u32::try_from(open_jobs).unwrap_or(u32::MAX),
+            schema_version: schema,
+        })
+    }
+
+    /// #4008: admitted model invocations and token totals per provider over the
+    /// last hour and the last 24 hours, read from this host's own
+    /// `model_invocations`. Counts only; at most [`USAGE_PROVIDER_LIMIT`]
+    /// providers per window, ordered by provider name.
+    pub fn provider_usage_rollup(&self, now: DateTime<Utc>) -> Result<Vec<ProviderUsageRollupV1>> {
+        let mut rows = Vec::new();
+        for (window, span) in [
+            (USAGE_WINDOW_1H, Duration::hours(1)),
+            (USAGE_WINDOW_24H, Duration::hours(24)),
+        ] {
+            let since = (now - span).to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let mut statement = self.conn.prepare(USAGE_ROLLUP_SQL)?;
+            let found = statement.query_map(params![since, USAGE_PROVIDER_LIMIT], |row| {
+                let count = |index: usize| row.get::<_, i64>(index).map(|n| n.max(0) as u64);
+                Ok(ProviderUsageRollupV1 {
+                    provider: row.get(0)?,
+                    window: window.to_owned(),
+                    invocations: count(1)?,
+                    input_tokens: count(2)?,
+                    output_tokens: count(3)?,
+                    cache_creation_tokens: count(4)?,
+                    cache_read_tokens: count(5)?,
+                    reasoning_tokens: count(6)?,
+                })
+            })?;
+            for row in found {
+                rows.push(row?);
+            }
+        }
+        Ok(rows)
     }
 
     /// Persist only bounded read summaries. The peer's conversation bodies are
@@ -1235,5 +1333,99 @@ mod tests {
             .observation
             .unwrap();
         assert_eq!(healthy.state, "healthy");
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-store-01"))]
+    #[test]
+    fn provider_usage_rollup_splits_hour_and_day_by_provider_4008() {
+        let store = Store::open_in_memory().unwrap();
+        let now = Utc::now();
+        let insert = |provider: Option<&str>, admission: &str, age: Duration, tokens: [i64; 5]| {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO model_invocations (id,purpose,invocation_kind,foreground,paid_risk,
+                         admission_status,status,trigger_source,provider,created_at,input_tokens,
+                         output_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens)
+                     VALUES (?1,'session','cli','foreground','paid',?2,'completed','test',?3,?4,
+                         ?5,?6,?7,?8,?9)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        admission,
+                        provider,
+                        (now - age).to_rfc3339_opts(SecondsFormat::Nanos, true),
+                        tokens[0],
+                        tokens[1],
+                        tokens[2],
+                        tokens[3],
+                        tokens[4],
+                    ],
+                )
+                .unwrap();
+        };
+        insert(
+            Some("Claude"),
+            "admitted",
+            Duration::minutes(10),
+            [10, 20, 30, 40, 50],
+        );
+        insert(
+            Some("Claude"),
+            "admitted",
+            Duration::minutes(50),
+            [1, 2, 3, 4, 5],
+        );
+        insert(
+            Some("Claude"),
+            "admitted",
+            Duration::hours(5),
+            [100, 0, 0, 1000, 0],
+        );
+        insert(Some("Claude"), "admitted", Duration::hours(30), [9_999; 5]);
+        insert(
+            Some("Codex"),
+            "admitted",
+            Duration::minutes(5),
+            [7, 8, 0, 0, 9],
+        );
+        insert(Some("Codex"), "denied", Duration::minutes(5), [5_000; 5]);
+        insert(None, "admitted", Duration::hours(2), [0; 5]);
+        let rows = store.provider_usage_rollup(now).unwrap();
+        let find = |provider: &str, window: &str| {
+            rows.iter()
+                .find(|row| row.provider == provider && row.window == window)
+                .cloned()
+        };
+        assert_eq!(
+            find("Claude", "1h"),
+            Some(ProviderUsageRollupV1 {
+                provider: "Claude".into(),
+                window: "1h".into(),
+                invocations: 2,
+                input_tokens: 11,
+                output_tokens: 22,
+                cache_creation_tokens: 33,
+                cache_read_tokens: 44,
+                reasoning_tokens: 55,
+            })
+        );
+        let day = find("Claude", "24h").unwrap();
+        assert_eq!(
+            (day.invocations, day.input_tokens, day.cache_read_tokens),
+            (3, 111, 1044)
+        );
+        let codex = find("Codex", "24h").unwrap();
+        assert_eq!(
+            (
+                codex.invocations,
+                codex.input_tokens,
+                codex.reasoning_tokens
+            ),
+            (1, 7, 9)
+        );
+        assert_eq!(find("Unknown", "1h"), None);
+        assert_eq!(find("Unknown", "24h").unwrap().invocations, 1);
+        assert_eq!(rows.len(), 5);
+        assert!(rows.len() <= SATELLITE_MAX_USAGE_ROWS);
     }
 }

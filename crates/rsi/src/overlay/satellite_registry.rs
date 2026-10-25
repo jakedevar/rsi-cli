@@ -914,6 +914,9 @@ mod tests {
         let remote_id = SatelliteUuidV1(uuid::Uuid::new_v4());
         let now = chrono::Utc::now();
         let observation = SatelliteObservationV1 {
+            sessions_running: None,
+            workers_parked: None,
+            open_jobs: None,
             platform: None,
             state: "healthy".into(),
             installation_id: None,

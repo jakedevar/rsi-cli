@@ -280,7 +280,49 @@ impl RpcServer {
             .lock()
             .await
             .configure_harness_manager_policy(&params)?;
+        self.enable_bench_for_provider_grants(&result.policy)
+            .await?;
         Ok(serde_json::to_value(result)?)
+    }
+
+    /// #3417: a provider grant that asks for bench work turns the daemon
+    /// setting `bench.enabled` on in the same save (the setting stays a daemon
+    /// setting; the policy screen only ties its first enabling to the grant).
+    /// An already-enabled setting is left alone, and a grant never turns it
+    /// off.
+    async fn enable_bench_for_provider_grants(
+        &self,
+        policy: &rsi_common::harness_manager_v2::ManagerPolicyV2,
+    ) -> Result<()> {
+        if !policy
+            .provider_grants
+            .iter()
+            .any(|grant| grant.enable_bench)
+            || self.runtime_config.bench_enabled()
+        {
+            return Ok(());
+        }
+        let _guard = self.session_manager.daemon_config_update.lock().await;
+        self.runtime_config
+            .update_field("bench.enabled", &serde_json::json!(true))
+            .map_err(|error| {
+                DaemonError::InvalidParam(format!(
+                    "Invalid value for field 'bench.enabled': {error}"
+                ))
+            })?;
+        let store = self.session_manager.store().clone();
+        let store = store.lock().await;
+        crate::store::daemon_settings::persist_runtime_config_field(
+            &store,
+            &self.runtime_config,
+            "bench.enabled",
+        )
+        .map_err(|error| {
+            DaemonError::Store(format!(
+                "Failed to persist daemon config field 'bench.enabled': {error}"
+            ))
+        })?;
+        Ok(())
     }
 
     /// #2237 (operator-only): appoint a manager and grant its policy in one
@@ -303,6 +345,8 @@ impl RpcServer {
             .lock()
             .await
             .configure_harness_manager_with_policy(&params)?;
+        self.enable_bench_for_provider_grants(&policy.policy)
+            .await?;
         Ok(serde_json::to_value(
             rsi_common::harness_manager_v2::ConfigureHarnessManagerWithPolicyResultV2 {
                 config,

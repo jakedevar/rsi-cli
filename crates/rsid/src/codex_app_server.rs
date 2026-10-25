@@ -36,7 +36,7 @@ use std::sync::{
 };
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 pub(crate) mod wire;
 use wire::{
@@ -1142,7 +1142,7 @@ impl CodexAppServerClient {
     }
 
     pub(crate) async fn new_after_admission(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<crate::bus::EventBus>,
         permit: &AdmissionPermit,
     ) -> Result<Self> {
@@ -1153,7 +1153,7 @@ impl CodexAppServerClient {
     /// and JSON-RPC handshake without locating or invoking a live provider.
     #[cfg(test)]
     pub(crate) async fn new_after_admission_with_test_binary(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<crate::bus::EventBus>,
         permit: &AdmissionPermit,
         binary_path: PathBuf,
@@ -1162,7 +1162,7 @@ impl CodexAppServerClient {
     }
 
     async fn new_after_admission_with<F>(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         event_bus: &Arc<crate::bus::EventBus>,
         permit: &AdmissionPermit,
         resolve: F,
@@ -1696,7 +1696,6 @@ mod tests {
     use rsi_common::types::SessionKind;
     use serde_json::json;
     use std::time::Duration;
-    use tokio::sync::Mutex;
     use uuid::Uuid;
 
     /// A fixed attempt fence, so ingress tests can register a real attempt and
@@ -1714,7 +1713,7 @@ mod tests {
     }
 
     async fn root_permit(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
     ) -> crate::model_control::AdmissionPermit {
         let request = crate::model_control::ModelAdmissionRequest {
@@ -1757,7 +1756,7 @@ mod tests {
     }
 
     fn turn_control(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
         permit: crate::model_control::AdmissionPermit,
     ) -> Arc<dyn ModelCallControl> {
@@ -1843,6 +1842,9 @@ mod tests {
             topology_iteration: 0,
             closure_selector: None,
             structured_handoff: false,
+            exec_target: rsi_common::exec_target::ExecTarget::Host,
+            bench_profile: None,
+            loop_knobs: rsi_common::bench_profile::LoopKnobs::default(),
         }
     }
 
@@ -2140,7 +2142,9 @@ mod tests {
                 "thread_start_missing_thread_id",
             ),
         ] {
-            let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+            let store = Arc::new(rsid_core::store_lock::Mutex::new(
+                Store::open_in_memory().expect("store"),
+            ));
             let session_id = uuid::Uuid::new_v4();
             let permit = root_permit(&store, session_id).await;
             let invocation_id = permit.invocation_id();
@@ -2221,7 +2225,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn post_admission_missing_binary_settles_before_client_ownership_is_released() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let bus = Arc::new(crate::bus::EventBus::new(8));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
@@ -2434,7 +2440,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_start_turn_denial_prevents_second_send() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         {
             let guard = store.lock().await;
@@ -2487,7 +2495,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_turn_completed_settles_current_turn_exactly_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let invocation_id = permit.invocation_id();
@@ -2559,7 +2569,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn turn_completed_settles_per_turn_last_usage_not_cumulative_total() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let invocation_id = permit.invocation_id();
@@ -2665,7 +2677,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn completed_turn_requires_a_new_admission_for_the_next_send() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let root_invocation_id = permit.invocation_id();
@@ -2742,7 +2756,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn real_completion_notification_settles_initial_thread_start_and_allows_followup() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let root_invocation_id = permit.invocation_id();
@@ -2862,7 +2878,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn denied_followup_turn_performs_zero_additional_sends() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         {
             let guard = store.lock().await;
@@ -2924,7 +2942,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn dropping_session_settles_the_in_flight_turn() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let invocation_id = permit.invocation_id();
@@ -2980,7 +3000,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn turn_start_send_failure_settles_the_admitted_permit() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let invocation_id = permit.invocation_id();
@@ -3022,7 +3044,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn test_process_error_settles_current_turn_once() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let permit = root_permit(&store, session_id).await;
         let invocation_id = permit.invocation_id();
@@ -3474,7 +3498,7 @@ mod tests {
     /// Build a real admitted delivery call bound to its own attempt fence,
     /// exactly as `deliver_at_idle_boundary` does before it dispatches.
     async fn admitted_delivery_turn(
-        store: &Arc<Mutex<Store>>,
+        store: &Arc<rsid_core::store_lock::Mutex<Store>>,
         session_id: uuid::Uuid,
         attempt_number: u32,
     ) -> (NativeMessageTurnRequest, uuid::Uuid) {
@@ -3564,7 +3588,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn an_admitted_message_turn_is_refused_before_any_effect_while_a_turn_is_live() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(4);
         let (_, event_rx) = mpsc::channel::<StreamEvent>(4);
@@ -3654,7 +3680,9 @@ mod tests {
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-04"))]
     #[tokio::test]
     async fn a_refused_enqueue_maps_to_rejected_before_effect_rather_than_dispatched() {
-        let store = Arc::new(Mutex::new(Store::open_in_memory().expect("store")));
+        let store = Arc::new(rsid_core::store_lock::Mutex::new(
+            Store::open_in_memory().expect("store"),
+        ));
         let session_id = uuid::Uuid::new_v4();
         let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(4);
         let (_, event_rx) = mpsc::channel::<StreamEvent>(4);

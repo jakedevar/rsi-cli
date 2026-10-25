@@ -111,6 +111,7 @@ pub enum ActionId {
     HardInterruptSession,
     DowngradeOperatorPause,
     ClearOperatorPause,
+    ClearProviderUsageHold,
     ContinueSession,
     TogglePin,
     ArchiveSession,
@@ -124,6 +125,7 @@ pub enum ActionId {
     ReseatManager,
     ColdRestore,
     ColdArchive,
+    ExternalReports,
     Archives,
     Model,
     Sessions,
@@ -135,6 +137,7 @@ pub enum ActionId {
     ProjectNew,
     ProjectEdit,
     ProjectDelete,
+    Intake,
     SettingsCommand,
     StopAll,
     Hooks,
@@ -159,6 +162,7 @@ pub enum ActionId {
     /// command dropdown.
     Fleet,
     GlobalManagerWorkspace,
+    GlobalDashboard,
     ManagerGlobal,
     ManagerGlobalAppoint,
     ManagerGlobalRevoke,
@@ -314,6 +318,7 @@ pub enum AvailabilitySelector {
     ContextualOpen,
     SettingsCategories,
     SettingsItems,
+    SettingsForward,
     SettingsEditable,
     SettingsAdd,
     SettingsDelete,
@@ -541,6 +546,9 @@ pub struct ActionContext {
     pub settings_row_editable: bool,
     pub settings_row_deletable: bool,
     pub settings_row_enableable: bool,
+    /// The selected row is a numeric daemon setting: `h`/`l` (`Left`/`Right`) step it
+    /// like a slider instead of moving between the rail and the rows (#3468).
+    pub settings_row_numeric: bool,
     /// Staged Settings edits not yet applied (#2241).
     pub settings_pending: usize,
 }
@@ -600,6 +608,7 @@ impl Default for ActionContext {
             settings_row_editable: false,
             settings_row_deletable: false,
             settings_row_enableable: false,
+            settings_row_numeric: false,
             settings_pending: 0,
         }
     }
@@ -611,6 +620,7 @@ struct SettingsRowFacts {
     editable: bool,
     deletable: bool,
     enableable: bool,
+    numeric: bool,
 }
 
 fn daemon_feature_is_editable(entry: &crate::settings::DaemonFeatureEntry) -> bool {
@@ -623,6 +633,9 @@ fn daemon_feature_is_editable(entry: &crate::settings::DaemonFeatureEntry) -> bo
             | "sandbox_build_cache_dry_run"
             | "sandbox_build_cache_reclaim_now"
     )
+        // A free-text value (a path, a URL, docker hosts, a model) opens the
+        // daemon text editor on Enter (#3430).
+        || crate::overlay::daemon_text_field(&entry.field).is_some()
 }
 
 fn settings_row_facts(app: &App) -> SettingsRowFacts {
@@ -636,6 +649,7 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
         {
             facts.exists = true;
             facts.editable = app.authoritative_config_ready() && daemon_feature_is_editable(entry);
+            facts.numeric = crate::overlay::daemon_number_entry(entry);
         }
         return facts;
     }
@@ -747,11 +761,13 @@ fn settings_row_facts(app: &App) -> SettingsRowFacts {
         | SettingsSection::Scheduling
         | SettingsSection::RecursiveDag
         | SettingsSection::CodeIntelligence
+        | SettingsSection::ProviderBilling
         | SettingsSection::ProviderIsolation
         | SettingsSection::ProviderSubagents
         | SettingsSection::ProviderSkills
         | SettingsSection::ApiRoutes
         | SettingsSection::HarnessTools
+        | SettingsSection::Benchmarks
         | SettingsSection::ResourceLimits
         | SettingsSection::BuildGovernor
         | SettingsSection::MergeQueue
@@ -920,6 +936,7 @@ impl ActionContext {
                 context.settings_row_editable = facts.editable;
                 context.settings_row_deletable = facts.deletable;
                 context.settings_row_enableable = facts.enableable;
+                context.settings_row_numeric = facts.numeric;
                 context.settings_pending = crate::settings_staging::pending_count(app);
                 if app.settings_state.section == SettingsSection::ThemeColors {
                     context.selected_theme_role =
@@ -1225,6 +1242,9 @@ const NORMAL_ISSUES_WORKSPACE: &[ActionBinding] = &[binding("<Space>i", ActionRo
 // #1213: `gm` (the g leader, then m) opens the global manager workspace; it was
 // a retired merge-queue no-op.
 const NORMAL_GLOBAL_MANAGER_WORKSPACE: &[ActionBinding] = &[binding("gm", ActionRoute::Normal)];
+// #3317: `gd` (the g leader, then d) opens the RSI-wide metrics dashboard; it
+// was intentionally unused.
+const NORMAL_GLOBAL_DASHBOARD: &[ActionBinding] = &[binding("gd", ActionRoute::Normal)];
 // Manager views live under the `<Space>g` leader subnamespace (`<Space>gg` already
 // owns the Git panel, `gs`.. under the bare g leader are untouched) so the existing
 // two-key Space chords keep their muscle memory. Chords dispatch the same LcAction
@@ -1235,6 +1255,7 @@ const NORMAL_MANAGER_DECISIONS: &[ActionBinding] = &[binding("<Space>gd", Action
 const NORMAL_INTERRUPT: &[ActionBinding] = &[binding("x", ActionRoute::Normal)];
 const NORMAL_HARD_INTERRUPT: &[ActionBinding] = &[binding("X", ActionRoute::Normal)];
 const NORMAL_DOWNGRADE_PAUSE: &[ActionBinding] = &[binding("<Space>hs", ActionRoute::Normal)];
+const NORMAL_CLEAR_PROVIDER_HOLD: &[ActionBinding] = &[binding("<Space>hu", ActionRoute::Normal)];
 const NORMAL_CLEAR_PAUSE: &[ActionBinding] = &[binding("<Space>hc", ActionRoute::Normal)];
 const NORMAL_CONTINUE: &[ActionBinding] = &[binding("<Space>c", ActionRoute::Normal)];
 const NORMAL_TOGGLE_PIN: &[ActionBinding] = &[binding("P", ActionRoute::Normal)];
@@ -1795,6 +1816,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::ClearProviderUsageHold,
+        label: "Clear provider usage hold",
+        summary: "After switching accounts, ignores the selected session’s provider’s old plan windows and releases held work. Fresh usage readings still enforce limits.",
+        category: "SESSION",
+        bindings: NORMAL_CLEAR_PROVIDER_HOLD,
+        command_aliases: &["provider-clear-hold"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::PinSessionMutation,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::ContinueSession,
         label: "Continue selected session",
         summary: "`<Space>c` sends literal `continue`; `:continue` opens a prompt, and `:continue <text>` sends text directly.",
@@ -1874,7 +1906,7 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::NavigateBack,
         label: "Return to categories",
-        summary: "Returns focus from the settings items to the category rail.",
+        summary: "Returns focus from the settings items to the category rail. On a numeric setting row it steps the value down like a slider (l / Right step up); use Tab or Esc to leave such a row.",
         category: "SETTINGS",
         bindings: SETTINGS_BACK,
         command_aliases: &[],
@@ -1885,18 +1917,18 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::NavigateForward,
         label: "Enter selected category",
-        summary: "Moves focus from the category rail into the selected category's items.",
+        summary: "Moves focus from the category rail into the selected category's items. On a numeric setting row it steps the value up like a slider (h / Left step down), staged until you apply with w.",
         category: "SETTINGS",
         bindings: SETTINGS_FORWARD,
         command_aliases: &[],
         command_argument: CommandArgument::None,
-        availability: AvailabilitySelector::SettingsCategories,
+        availability: AvailabilitySelector::SettingsForward,
         show_in_help: true,
     },
     ActionDescriptor {
         id: ActionId::ToggleSetting,
         label: "Toggle or activate setting",
-        summary: "Toggles a boolean setting, cycles a choice, or activates the selected settings row.",
+        summary: "Toggles a boolean setting, cycles a choice, types a number into a numeric row, or activates the selected settings row.",
         category: "SETTINGS",
         bindings: SETTINGS_TOGGLE,
         command_aliases: &[],
@@ -2732,6 +2764,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         show_in_help: true,
     },
     ActionDescriptor {
+        id: ActionId::ExternalReports,
+        label: "External reports",
+        summary: "`:external-reports` shows the external harness-report import (#3789): the last sync, reports seen, imported and linked as duplicates, and any error; `:external-reports sync` runs one import pass now with the hub's own gh login; `:external-reports filter` filters the focused Issues pane to the `external-report` label. Imported reports are untrusted P4 Issues until triage promotes them.",
+        category: "OPERATOR VIEWS",
+        bindings: &[],
+        command_aliases: &["external-reports"],
+        command_argument: CommandArgument::Optional,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
         id: ActionId::Archives,
         label: "Open archives",
         summary: "Switches the session list to the Archive zone.",
@@ -2848,6 +2891,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         category: "PROJECT",
         bindings: &[],
         command_aliases: &["project-delete"],
+        command_argument: CommandArgument::Required,
+        availability: AvailabilitySelector::Always,
+        show_in_help: false,
+    },
+    ActionDescriptor {
+        id: ActionId::Intake,
+        label: "Operator intake",
+        summary: "Hands a request to the small-model intake agent, which files it as a triaged Issue without involving the manager; only a P1 mails the manager.",
+        category: "PROJECT",
+        bindings: &[],
+        command_aliases: &["intake"],
         command_argument: CommandArgument::Required,
         availability: AvailabilitySelector::Always,
         show_in_help: false,
@@ -3020,13 +3074,13 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
     ActionDescriptor {
         id: ActionId::Manager,
         label: "Open harness manager",
-        summary: "Opens the harness manager overlay.",
+        summary: "Opens the harness manager overlay; :manager tune opens this host's resource probe, profile and saved preset editor.",
         category: "MANAGER",
         bindings: &[],
         command_aliases: &["manager"],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
-        show_in_help: false,
+        show_in_help: true,
     },
     ActionDescriptor {
         id: ActionId::ManagerAppoint,
@@ -3079,6 +3133,17 @@ pub static ACTION_DESCRIPTORS: &[ActionDescriptor] = &[
         category: "MANAGER",
         bindings: NORMAL_GLOBAL_MANAGER_WORKSPACE,
         command_aliases: &["global-manager", "gm", "manager workspace"],
+        command_argument: CommandArgument::None,
+        availability: AvailabilitySelector::Always,
+        show_in_help: true,
+    },
+    ActionDescriptor {
+        id: ActionId::GlobalDashboard,
+        label: "Open global dashboard",
+        summary: "Opens the RSI-wide dashboard above all projects: a row per project with live agents by role and provider, tokens, cost, Issue flow, landings and QA, plus a conversation with the global manager; Enter opens the selected project.",
+        category: "MANAGER",
+        bindings: NORMAL_GLOBAL_DASHBOARD,
+        command_aliases: &["dashboard", "gd"],
         command_argument: CommandArgument::None,
         availability: AvailabilitySelector::Always,
         show_in_help: true,
@@ -4338,6 +4403,13 @@ pub fn availability(descriptor: &ActionDescriptor, context: &ActionContext) -> A
             context.surface == ActionSurface::Settings
                 && context.settings_focus == SettingsFocus::Items
         }
+        SettingsForward => {
+            context.surface == ActionSurface::Settings
+                && (context.settings_focus == SettingsFocus::Categories
+                    || (context.settings_focus == SettingsFocus::Items
+                        && context.settings_row_editable
+                        && context.settings_row_numeric))
+        }
         SettingsEditable => {
             context.surface == ActionSurface::Settings
                 && context.settings_focus == SettingsFocus::Items
@@ -4745,6 +4817,7 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::HardInterruptSession => ActionId::HardInterruptSession,
         LcAction::DowngradeOperatorPause => ActionId::DowngradeOperatorPause,
         LcAction::ClearOperatorPause => ActionId::ClearOperatorPause,
+        LcAction::ClearProviderUsageHold => ActionId::ClearProviderUsageHold,
         LcAction::QuickContinue => ActionId::ContinueSession,
         LcAction::TogglePinSession => ActionId::TogglePin,
         LcAction::ArchiveSession => ActionId::ArchiveSession,
@@ -4758,6 +4831,7 @@ pub fn request_from_lc_action(action: &LcAction) -> Option<ActionRequest> {
         LcAction::OpenHarnessManagerInspect => ActionId::ManagerInspect,
         LcAction::OpenFleet => ActionId::Fleet,
         LcAction::OpenGlobalManagerWorkspace => ActionId::GlobalManagerWorkspace,
+        LcAction::OpenGlobalDashboard => ActionId::GlobalDashboard,
         _ => return None,
     };
     Some(ActionRequest::plain(id))
@@ -4939,6 +5013,8 @@ pub enum OverlayHelpClass {
     ContinuePrompt,
     /// Global manager workspace (`gm`, #1213).
     GlobalManagerWorkspace,
+    /// Global dashboard (`gd`, #3317).
+    GlobalDashboard,
     Fleet,
     FleetFilter,
     FleetSort,
@@ -5016,6 +5092,7 @@ impl OverlayHelpClass {
         Self::ModelSwitch,
         Self::DaemonTextEditor,
         Self::TodoPopup,
+        Self::GlobalDashboard,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -5089,6 +5166,7 @@ impl OverlayHelpClass {
             Self::ModelSwitch => 64,
             Self::DaemonTextEditor => 65,
             Self::TodoPopup => 66,
+            Self::GlobalDashboard => 67,
         }
     }
 }
@@ -5164,6 +5242,7 @@ fn standard_rewrite(entry: &OverlayHelpEntry) -> StandardRow {
         ("Type, Backspace" | "Type / Backspace", label) => {
             StandardRow::Replace(edit("Type, arrows, Backspace / Delete, Ctrl-A", label))
         }
+        ("Home / End", "Jump to first / last") => StandardRow::Drop,
         ("? (normal)", _) => StandardRow::Replace(act("Ctrl-Alt-G", "Show this help")),
         ("Space N (normal)", _) | ("Space e", "Close explorer (viewer normal mode)") => {
             StandardRow::Drop
@@ -5172,6 +5251,12 @@ fn standard_rewrite(entry: &OverlayHelpEntry) -> StandardRow {
     }
 }
 
+/// `overlay::list::handle_filter_list_nav_key`: navigation for a picker whose
+/// list is filtered by typing. Printable keys (j, k, g, G) type into the filter.
+const FILTER_LIST_NAV: &[OverlayHelpEntry] = &[
+    nav("Down / Up, Ctrl-J / Ctrl-K", "Move selection"),
+    nav("Home / End", "Jump to first / last"),
+];
 /// `overlay::list::handle_list_nav_key`.
 const LIST_NAV: &[OverlayHelpEntry] = &[
     nav("j / k, Down / Up", "Move selection"),
@@ -5394,7 +5479,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         class: OverlayHelpClass::ProjectPicker,
         title: "Project Picker",
         groups: &[
-            LIST_NAV,
+            FILTER_LIST_NAV,
             &[
                 edit("Type, Backspace", "Filter projects"),
                 act("Enter", "Select project"),
@@ -5410,7 +5495,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         class: OverlayHelpClass::LabelPicker,
         title: "Label Picker",
         groups: &[
-            LIST_NAV,
+            FILTER_LIST_NAV,
             &[
                 edit("Type, Backspace", "Filter labels"),
                 act("Enter", "Assign label"),
@@ -5426,7 +5511,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         class: OverlayHelpClass::ParentPicker,
         title: "Parent Picker",
         groups: &[
-            LIST_NAV,
+            FILTER_LIST_NAV,
             &[
                 edit("Type, Backspace", "Filter parents"),
                 act("Enter", "Set parent"),
@@ -5596,6 +5681,10 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
             LIST_NAV,
             &[
                 edit("Enter / Space", "Edit selected policy field"),
+                act(
+                    "x / Delete",
+                    "Remove the focused allowed model (draft only)",
+                ),
                 act("s", "Save policy"),
                 act("r", "Reload policy"),
                 close("Esc / q", "Close manager"),
@@ -5690,6 +5779,7 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 nav("j / k, Down / Up", "Move selection"),
                 nav("J / K, PageDown / PageUp", "Page selection"),
                 act("Enter", "Audit selected worktree"),
+                act("n", "Audit next custody page"),
                 act("A", "Begin authorization"),
                 act("r", "Refresh receipt"),
                 close("Esc / q", "Close"),
@@ -5841,6 +5931,10 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 act("X", "Halt the selected seat session now (press twice)"),
                 act("a", "Archive the selected earlier seat session"),
                 act(
+                    "g e",
+                    "Edit global manager coverage and permissions; b views budget; y on Review saves",
+                ),
+                act(
                     "n",
                     "Launch and appoint a manager (seat, launch, scope, grant)",
                 ),
@@ -5864,6 +5958,38 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
                 act("p", "Open the selected project's tab"),
                 act("T", "Open the manager tree"),
                 act("F", "Open the fleet workspace"),
+                act("r", "Refresh the snapshot"),
+                act(":", "Open the command palette"),
+                close(
+                    "Esc / q",
+                    "Close (Esc leaves typing or the conversation first)",
+                ),
+            ],
+        ],
+    },
+    OverlayHelpRoute {
+        class: OverlayHelpClass::GlobalDashboard,
+        title: "Global Dashboard",
+        groups: &[
+            LIST_NAV,
+            &[
+                act("w", "Cycle the window: 1h, 24h, 7d"),
+                act("s", "Cycle the sort: agents, tokens, cost, Issues"),
+                act(
+                    "Enter / l",
+                    "Open the selected project's tab and session list",
+                ),
+                act("t", "Show or hide the conversation pane"),
+                act("i", "Type to the top-level manager; Enter sends"),
+                act(
+                    "n",
+                    "Start a top-level manager (the appoint flow) when none is live",
+                ),
+                act(
+                    "Tab",
+                    "Focus the conversation: j/k, Ctrl-D/U scroll, g/G ends",
+                ),
+                act("gm", "Open the global manager workspace"),
                 act("r", "Refresh the snapshot"),
                 act(":", "Open the command palette"),
                 close(
@@ -5902,9 +6028,13 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         groups: &[
             FORM_FIELDS,
             &[
+                edit(
+                    "Esc, h j k l w b e 0 $, x dd cw ciw, u",
+                    "Vim editing in Name and Path: Esc leaves insert mode",
+                ),
                 edit("Left / Right", "Cycle color (color field)"),
                 act("Enter", "Save project"),
-                close("Esc", "Cancel"),
+                close("Esc", "Cancel (from normal mode)"),
             ],
         ],
     },
@@ -6140,8 +6270,8 @@ pub static OVERLAY_HELP_ROUTES: &[OverlayHelpRoute] = &[
         title: "Memory Search",
         groups: &[&[
             edit("Type, Backspace", "Search memory"),
-            nav("j / k, Down / Up", "Move selection"),
-            close("Esc / q", "Close"),
+            nav("Down / Up, Ctrl-J / Ctrl-K", "Move selection"),
+            close("Esc", "Close"),
         ]],
     },
     OverlayHelpRoute {
@@ -6374,6 +6504,8 @@ pub enum OverlayHelpExemption {
     ManagerTree,
     /// Operator legacy-scratch adoption owns its select, adopt and refresh keys.
     LegacyScratchBrowser,
+    /// Host tuning owns its profile, preset and bounds editor keys.
+    HostTuning,
 }
 
 impl OverlayHelpExemption {
@@ -6391,6 +6523,7 @@ impl OverlayHelpExemption {
         Self::RemoteSettings,
         Self::ManagerTree,
         Self::LegacyScratchBrowser,
+        Self::HostTuning,
     ];
 
     /// Exhaustive position in `ALL` (guards `ALL` against omissions).
@@ -6409,6 +6542,7 @@ impl OverlayHelpExemption {
             Self::RemoteSettings => 9,
             Self::ManagerTree => 10,
             Self::LegacyScratchBrowser => 11,
+            Self::HostTuning => 12,
         }
     }
 
@@ -6428,6 +6562,7 @@ impl OverlayHelpExemption {
             Self::RemoteSettings => "Remote settings",
             Self::ManagerTree => "Manager tree (:manager tree)",
             Self::LegacyScratchBrowser => "Legacy scratch adoption",
+            Self::HostTuning => "Host tuning (:manager tune)",
         }
     }
 
@@ -6453,6 +6588,7 @@ impl OverlayHelpExemption {
             Self::RemoteSettings => "The page owns its enable, device and project keys.",
             Self::ManagerTree => "The tree owns its fold, paging, jump and in-tree action keys.",
             Self::LegacyScratchBrowser => "The browser owns its select, adopt and refresh keys.",
+            Self::HostTuning => "The panel owns its profile, preset, bounds and apply/undo keys.",
         }
     }
 
@@ -6481,6 +6617,7 @@ impl OverlayHelpExemption {
             Self::RemoteSettings => DocAnchor::Narrative("Remote Settings"),
             Self::ManagerTree => DocAnchor::Narrative("Manager Tree"),
             Self::LegacyScratchBrowser => DocAnchor::Narrative("Legacy Scratch Adoption"),
+            Self::HostTuning => DocAnchor::Narrative("Host Tuning"),
         }
     }
 }
@@ -6612,6 +6749,7 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
             }
         }
         OverlayState::LegacyScratch(..) => Exempt(X::LegacyScratchBrowser),
+        OverlayState::HostTuning(..) => Exempt(X::HostTuning),
         OverlayState::SatelliteRegistry(..) => Exempt(X::SatelliteBrowser),
         OverlayState::Remote(..) => Exempt(X::RemoteSettings),
         OverlayState::ManagerTree(..) => Exempt(X::ManagerTree),
@@ -6625,6 +6763,7 @@ pub fn overlay_help_routing(app: &App, overlay: &OverlayState) -> HelpRouting {
             C::Fleet
         }),
         OverlayState::GlobalManagerWorkspace(..) => Routed(C::GlobalManagerWorkspace),
+        OverlayState::GlobalDashboard(..) => Routed(C::GlobalDashboard),
         OverlayState::GraphReview {
             dashboard_focused: true,
             ..
@@ -8183,6 +8322,7 @@ mod tests {
                 ActionId::Graph,
                 ActionId::Lead,
                 ActionId::GlobalManagerWorkspace,
+                ActionId::GlobalDashboard,
                 ActionId::ClosePane,
                 ActionId::TabNext,
                 ActionId::TabPrev,
@@ -8333,11 +8473,13 @@ mod tests {
             OverlayState::PromptPreview { .. } => "PromptPreview",
             OverlayState::SourceWorktreeSettlement(..) => "SourceWorktreeSettlement",
             OverlayState::LegacyScratch(..) => "LegacyScratch",
+            OverlayState::HostTuning(..) => "HostTuning",
             OverlayState::SatelliteRegistry(..) => "SatelliteRegistry",
             OverlayState::Remote(..) => "Remote",
             OverlayState::ManagerTree(..) => "ManagerTree",
             OverlayState::Fleet(..) => "Fleet",
             OverlayState::GlobalManagerWorkspace(..) => "GlobalManagerWorkspace",
+            OverlayState::GlobalDashboard(..) => "GlobalDashboard",
             OverlayState::TrashBrowser { .. } => "TrashBrowser",
             OverlayState::NotificationBrowser { .. } => "NotificationBrowser",
             OverlayState::RecentCompletions { .. } => "RecentCompletions",
@@ -8795,6 +8937,12 @@ mod tests {
             Exempt(X::LegacyScratchBrowser),
         );
         push(
+            "Host tuning panel",
+            &app,
+            OverlayState::HostTuning(Box::new(crate::overlay::host_tuning::test_state())),
+            Exempt(X::HostTuning),
+        );
+        push(
             "SatelliteRegistry browser",
             &app,
             OverlayState::SatelliteRegistry(Box::new(
@@ -8872,6 +9020,12 @@ mod tests {
             &app,
             OverlayState::GlobalManagerWorkspace(Box::default()),
             Routed(C::GlobalManagerWorkspace),
+        );
+        push(
+            "Global dashboard",
+            &app,
+            OverlayState::GlobalDashboard(Box::default()),
+            Routed(C::GlobalDashboard),
         );
     }
 
@@ -9226,7 +9380,7 @@ mod tests {
             "DaemonTextEditor",
             &app,
             OverlayState::DaemonTextEditor {
-                field: "cold_archive_dir",
+                field: "cold_archive_dir".to_string(),
                 input: String::new(),
                 error: None,
             },
@@ -9319,6 +9473,7 @@ mod tests {
                 path: String::new(),
                 color_index: 0,
                 editing_id: None,
+                text: Default::default(),
             },
             Routed(C::ProjectForm),
         );

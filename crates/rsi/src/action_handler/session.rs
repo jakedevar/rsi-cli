@@ -37,6 +37,27 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
                 .await;
         }
 
+        LcAction::ClearProviderUsageHold => {
+            let provider = app
+                .selected_session_id_for_lifecycle_action()
+                .and_then(|id| app.sessions.get(&id).map(|state| state.session.provider));
+            if let Some(provider) = provider {
+                match app.client.clear_provider_usage_hold(provider).await {
+                    Ok(()) => {
+                        app.provider_rate_limits.remove(&provider);
+                        app.notify(format!(
+                            "{provider:?} usage hold cleared; held work can retry"
+                        ));
+                    }
+                    Err(error) => {
+                        app.notify(format!("Could not clear provider usage hold: {error}"))
+                    }
+                }
+            } else {
+                app.notify("Select a session for the provider whose account changed");
+            }
+        }
+
         LcAction::QuickContinue => {
             let session_id = app.selected_session_id_for_lifecycle_action();
             if let Some(sid) = session_id {
@@ -387,6 +408,10 @@ pub(super) async fn dispatch(app: &mut App, action: LcAction) {
             crate::cold_storage::cold_archive_command(app, args.as_deref()).await;
         }
 
+        LcAction::ExternalReports(args) => {
+            crate::external_reports::external_reports_command(app, args.as_deref()).await;
+        }
+
         _ => unreachable!("session::dispatch called with non-session action"),
     }
 }
@@ -538,6 +563,44 @@ async fn open_create_entity_form_with_kind(app: &mut App, kind: rsi_common::type
 mod tests {
     use super::*;
     // Inline-build a minimal App for these tests via app_test_helpers.
+
+    #[tokio::test]
+    async fn clear_usage_hold_sends_selected_provider_to_operator_rpc() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = crate::test_support::socket_tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let request: serde_json::Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert_eq!(request["method"], "ClearProviderUsageHold");
+            assert_eq!(request["params"]["provider"], "Claude");
+            let response = serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":{"provider":"Claude", "cleared":true}});
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let (mut app, session_id) = terminal_docreg_detail_app();
+        app.client = crate::client::DaemonClient::new(socket);
+        app.client.connect().await.unwrap();
+        app.sessions.get_mut(&session_id).unwrap().session.provider =
+            rsi_common::types::SessionProvider::Claude;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            dispatch(&mut app, LcAction::ClearProviderUsageHold).await;
+            server.await.unwrap();
+        })
+        .await
+        .expect("clear-hold RPC fixture finishes");
+        assert!(
+            app.notifications
+                .iter()
+                .any(|notification| notification.message.contains("Claude usage hold cleared"))
+        );
+    }
 
     fn terminal_docreg_detail_app() -> (App, uuid::Uuid) {
         let mut app = crate::app::app_test_helpers::with_focused_kind(
@@ -818,7 +881,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let temp_dir = tempfile::tempdir().expect("temporary docreg socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary docreg socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("docreg listener");
         let requests = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -979,7 +1043,8 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::sync::{Notify, mpsc};
 
-        let temp_dir = tempfile::tempdir().expect("temporary docreg socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary docreg socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("docreg listener");
         let requests = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1100,7 +1165,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-        let temp_dir = tempfile::tempdir().expect("temporary docreg socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary docreg socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("docreg listener");
         let requests = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1222,7 +1288,8 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::sync::Notify;
 
-        let temp_dir = tempfile::tempdir().expect("temporary docreg socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary docreg socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("docreg listener");
         let requests = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1392,7 +1459,8 @@ mod tests {
     #[tokio::test]
     async fn docreg_protocol_accepts_archive_push_and_response_in_both_orders_without_unarchive() {
         for event_first in [true, false] {
-            let temp_dir = tempfile::tempdir().expect("temporary archive-order socket directory");
+            let temp_dir = crate::test_support::socket_tempdir()
+                .expect("temporary archive-order socket directory");
             let socket_path = temp_dir.path().join("daemon.sock");
             let listener =
                 tokio::net::UnixListener::bind(&socket_path).expect("archive-order listener");
@@ -1477,7 +1545,8 @@ mod tests {
 
     #[tokio::test]
     async fn docreg_protocol_s1_push_then_archive_push_preserves_exact_s1_for_compensation() {
-        let temp_dir = tempfile::tempdir().expect("temporary S1 archive socket directory");
+        let temp_dir =
+            crate::test_support::socket_tempdir().expect("temporary S1 archive socket directory");
         let socket_path = temp_dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("S1 archive listener");
         let (mut app, session_id) = terminal_docreg_detail_app();

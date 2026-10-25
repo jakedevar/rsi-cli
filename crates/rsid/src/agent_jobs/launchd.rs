@@ -1,7 +1,10 @@
 //! Transient per-user launchd services. No PID files or daemon-held children:
 //! launchd owns the job process group across session and daemon termination.
+//! A stop also ends what the job started outside that group (#286, [`sweep`]).
 
-use super::{JobParams, JobRuntime, LaunchSpec, WRAPPER, job_env, s, tail};
+mod sweep;
+
+use super::{JobParams, JobRuntime, LaunchSpec, WRAPPER, job_env, s, tail, test_containment};
 use rsi_common::agent_jobs::JOB_PLATFORM_UNSUPPORTED;
 use std::io::Write;
 use std::path::PathBuf;
@@ -55,6 +58,8 @@ fn xml_string(value: &str) -> String {
 /// The watchdog targets the launchd service, never a captured PID. On normal
 /// completion or timeout bootout removes the service, and launchd kills its
 /// remaining process group (including the watchdog). No KeepAlive/relaunch.
+/// A child in its own session or group outlives that bootout; the daemon ends
+/// it when it stops the job or settles it (#286, [`sweep`]).
 fn wrapper() -> String {
     format!(
         r#"target=$1; timeout=$2; shift 2
@@ -104,8 +109,18 @@ fn plist(spec: &LaunchSpec, target: &str) -> String {
         spec.status_path.display().to_string(),
         spec.command.log_max_bytes.to_string(),
     ];
-    argv.extend(spec.command.argv.iter().cloned());
+    // The wrapper/watchdog keep service custody. Only the payload enters the
+    // inherited fence, regardless of which source or adapter produced it.
+    argv.extend(test_containment::payload(spec.kind, &spec.command.argv));
     let mut env = String::new();
+    // #286: the marker by which a stop finds every process the job started,
+    // whatever session, group or parent it ends up in.
+    let label = target.rsplit('/').next().unwrap_or(&spec.unit_name);
+    env.push_str(&format!(
+        "<key>{}</key>{}",
+        sweep::MARKER_ENV,
+        xml_string(label)
+    ));
     for key in [job_env::HOME, job_env::PATH] {
         if let Ok(value) = std::env::var(key) {
             env.push_str(&format!("<key>{key}</key>{}", xml_string(&value)));
@@ -144,7 +159,7 @@ fn plist(spec: &LaunchSpec, target: &str) -> String {
 {nice}<key>StandardErrorPath</key>{errors}
 </dict></plist>
 "#,
-        label = xml_string(target.rsplit('/').next().unwrap_or(&spec.unit_name)),
+        label = xml_string(label),
         args = argv.iter().map(|arg| xml_string(arg)).collect::<String>(),
         cwd = xml_string(&spec.cwd.display().to_string()),
         stop_timeout = spec.command.stop_timeout_secs,
@@ -172,6 +187,24 @@ enum ServiceState {
     Absent,
     Inactive,
     Active,
+}
+
+/// The service's own process (`pid = N` in the top-level dictionary), while it
+/// runs.
+fn service_pid(output: &Output) -> Option<i32> {
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("\tpid = "))
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 1)
+}
+
+/// The job label (`rsi-job-<id>`) of a service target.
+fn job_label(target: &str) -> &str {
+    target.rsplit('/').next().unwrap_or(target)
 }
 
 /// An unknown/control failure is an error, never proof that a service died.
@@ -232,6 +265,20 @@ impl LaunchdJobRuntime {
     fn state(&self, target: &str) -> Result<ServiceState, String> {
         service_state(&self.control(&["print", target])?)
     }
+
+    /// #286: end the job's processes the service's bootout did not.
+    fn end_leftovers(&self, job: &str, custody: &mut sweep::Custody) -> Result<(), String> {
+        let ended = sweep::end_live_job_processes(job, custody)
+            .map_err(|error| format!("job {job} stopped but its processes did not: {error}"))?;
+        if ended > 0 {
+            tracing::warn!(
+                job,
+                ended,
+                "ended processes the job started outside its launchd process group"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl JobRuntime for LaunchdJobRuntime {
@@ -256,6 +303,13 @@ impl JobRuntime for LaunchdJobRuntime {
     }
 
     fn launch(&self, spec: &LaunchSpec) -> Result<(), String> {
+        // Recheck held jobs and the actual launch, including rows admitted by
+        // an older daemon. Never dispatch an uncontained test payload.
+        test_containment::check(
+            spec.kind,
+            std::path::Path::new(test_containment::SANDBOX_EXEC).is_file(),
+        )
+        .map_err(|error| error.to_string())?;
         let target = self.target(&spec.unit_name)?;
         let domain = target
             .rsplit_once('/')
@@ -306,20 +360,43 @@ impl JobRuntime for LaunchdJobRuntime {
             .map_or(true, |state| state == ServiceState::Active)
     }
 
+    /// Bootout the service, then end every process the job started that the
+    /// bootout left (#286): `Ok` only once none remains.
     fn stop_unit(&self, label: &str) -> Result<(), String> {
         let target = self.target(label)?;
-        if self.state(&target)? == ServiceState::Absent {
-            return Ok(());
+        let job = job_label(&target);
+        let printed = self.control(&["print", &target])?;
+        let mut custody = sweep::Custody::default();
+        if service_state(&printed)? != ServiceState::Absent {
+            // Read the service's tree before bootout, while its children are
+            // still linked to it; a failed read leaves the marker to find them.
+            match sweep::read_table(&sweep::marker(job)) {
+                Ok(rows) => {
+                    custody.absorb(&rows, service_pid(&printed), std::process::id() as i32);
+                }
+                Err(error) => {
+                    tracing::warn!(%target, %error, "cannot read the job's process tree before bootout");
+                }
+            }
+            let output = self.control(&["bootout", &target])?;
+            if self.state(&target)? != ServiceState::Absent {
+                return Err(format!(
+                    "service {target} still registered after launchctl bootout ({}): {}",
+                    output.status,
+                    tail(&String::from_utf8_lossy(&output.stderr))
+                ));
+            }
         }
-        let output = self.control(&["bootout", &target])?;
-        if self.state(&target)? == ServiceState::Absent {
-            return Ok(());
+        self.end_leftovers(job, &mut custody)
+    }
+
+    fn reap_unit_leftovers(&self, label: &str) {
+        let Ok(target) = self.target(label) else {
+            return;
+        };
+        if let Err(error) = self.end_leftovers(job_label(&target), &mut sweep::Custody::default()) {
+            tracing::warn!(%target, %error, "cannot end processes a finished job left behind");
         }
-        Err(format!(
-            "service {target} still registered after launchctl bootout ({}): {}",
-            output.status,
-            tail(&String::from_utf8_lossy(&output.stderr))
-        ))
     }
 }
 
@@ -377,6 +454,145 @@ mod tests {
 
     #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
     #[test]
+    fn the_service_pid_is_read_from_the_top_level_dictionary_only() {
+        assert_eq!(
+            service_pid(&output(
+                0,
+                "svc = {\n\tstate = running\n\tpid = 4242\n}",
+                ""
+            )),
+            Some(4242)
+        );
+        assert_eq!(
+            service_pid(&output(
+                0,
+                "svc = {\n\tenvironment = {\n\t\tpid = 7\n\t}\n}",
+                ""
+            )),
+            None
+        );
+        assert_eq!(service_pid(&output(113, "\tpid = 9\n", "")), None);
+        assert_eq!(job_label("gui/501/rsi-job-x"), "rsi-job-x");
+    }
+
+    /// Ends the fixture's own processes and service if the test fails midway.
+    #[cfg(target_os = "macos")]
+    struct FixtureGuard<'a> {
+        runtime: &'a LaunchdJobRuntime,
+        unit: String,
+        pids: Vec<i32>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for FixtureGuard<'_> {
+        fn drop(&mut self) {
+            let _ = self.runtime.control(&["bootout", &self.unit]);
+            for pid in &self.pids {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(*pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_alive(pid: i32) -> bool {
+        rsid_core::libproc_macos::process_start(pid).is_ok_and(|start| !start.zombie)
+    }
+
+    /// #286: a real launchd job whose child starts grandchildren in their own
+    /// sessions (as `scripts/scoped-test` starts cargo): one keeps the job's
+    /// environment, one clears it (`env -i`), so only the process tree read
+    /// before bootout and its session tie it to the job. Bootout alone leaves
+    /// both running; the stop must end both.
+    #[cfg(target_os = "macos")]
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
+    fn stopping_a_launchd_job_ends_its_new_session_grandchildren() {
+        let runtime = LaunchdJobRuntime::default();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = runtime.unit_name(uuid::Uuid::new_v4());
+        let marked = dir.path().join("marked.pid");
+        let cleared = dir.path().join("cleared.pid");
+        // setsid() succeeds: a background child of a non-interactive shell is
+        // not a group leader. Each grandchild records its pid, then sleeps.
+        let grandchild = r#"use POSIX; POSIX::setsid() or die "setsid: $!"; open(my $f, ">", "$ARGV[0].tmp") or die; print $f $$; close $f; rename("$ARGV[0].tmp", $ARGV[0]); sleep 600"#;
+        let script = format!(
+            "/usr/bin/perl -e '{grandchild}' '{marked}' </dev/null >/dev/null 2>&1 &\n\
+             /usr/bin/env -i /usr/bin/perl -e '{grandchild}' '{cleared}' </dev/null >/dev/null 2>&1 &\n\
+             wait",
+            marked = marked.display(),
+            cleared = cleared.display(),
+        );
+        let spec = LaunchSpec {
+            kind: super::super::JobKind::Test,
+            unit_name: unit.clone(),
+            cwd: dir.path().to_path_buf(),
+            log_path: dir.path().join("job.log"),
+            status_path: dir.path().join("job.status"),
+            command: super::super::JobCommand {
+                argv: vec!["/bin/sh".into(), "-c".into(), script],
+                runtime_max_secs: 300,
+                stop_timeout_secs: 2,
+                log_max_bytes: 1 << 20,
+                memory_max_gib: 1,
+                cpu_quota_percent: 100,
+                background: false,
+                admission_max_secs: None,
+                scoped_tool: None,
+            },
+            build_environment: None,
+        };
+        let mut guard = FixtureGuard {
+            runtime: &runtime,
+            unit: unit.clone(),
+            pids: Vec::new(),
+        };
+        runtime.launch(&spec).expect("launch the fixture job");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let read_pid = |path: &std::path::Path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        };
+        let pids = loop {
+            if let (Some(a), Some(b)) = (read_pid(&marked), read_pid(&cleared)) {
+                break [a, b];
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture's grandchildren never started: {}",
+                std::fs::read_to_string(spec.log_path.with_extension("launchd.log"))
+                    .unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        guard.pids.extend(pids);
+        for pid in pids {
+            assert!(process_alive(pid), "grandchild {pid} runs before the stop");
+            // SAFETY: getsid reads one process's session id.
+            assert_eq!(
+                unsafe { nix::libc::getsid(pid) },
+                pid,
+                "{pid} leads its own session"
+            );
+        }
+        assert!(runtime.unit_active(&unit));
+
+        runtime.stop_unit(&unit).expect("the stop ends the job");
+
+        assert!(!runtime.unit_active(&unit));
+        for pid in pids {
+            assert!(
+                !process_alive(pid),
+                "grandchild {pid} is gone after the stop"
+            );
+        }
+    }
+
+    #[cfg(any(not(feature = "test-shard-mode"), feature = "test-shard-other-01"))]
+    #[test]
     fn launchd_control_handles_are_canonical_job_labels() {
         let runtime = LaunchdJobRuntime::default();
         let label = format!("rsi-job-{}", uuid::Uuid::new_v4());
@@ -425,6 +641,7 @@ mod tests {
     #[test]
     fn launchd_plist_escapes_literal_argv_and_uses_one_shot_group_custody() {
         let spec = LaunchSpec {
+            kind: super::super::JobKind::Test,
             unit_name: format!("rsi-job-{}", uuid::Uuid::new_v4()),
             cwd: PathBuf::from("/tmp/a & <b>"),
             log_path: PathBuf::from("/tmp/log"),
@@ -441,6 +658,7 @@ mod tests {
                 cpu_quota_percent: 100,
                 background: false,
                 admission_max_secs: None,
+                scoped_tool: None,
             },
             build_environment: Some(super::super::BuildEnvironment {
                 admission_lock: None,
@@ -465,6 +683,8 @@ mod tests {
         // #2612: Git does not look above the private TMPDIR.
         assert!(xml.contains("<key>GIT_CEILING_DIRECTORIES</key><string>/tmp/private</string>"));
         assert!(xml.contains("<key>RunAtLoad</key><false/>"));
+        // #286: every process the job starts inherits its stop marker.
+        assert!(xml.contains("<key>RSI_JOB_UNIT</key><string>rsi-job-example</string>"));
         assert!(xml.contains("<key>KeepAlive</key><false/>"));
         assert!(xml.contains("<key>AbandonProcessGroup</key><false/>"));
         assert!(xml.contains("<key>CARGO_BUILD_JOBS</key><string>2</string>"));
@@ -487,7 +707,8 @@ mod tests {
         for key in &keys {
             assert!(
                 JOB_UNIT_ENV_NAMES.contains(key)
-                    || LAUNCHD_BUILD_TUNING.iter().any(|(name, _)| name == key),
+                    || LAUNCHD_BUILD_TUNING.iter().any(|(name, _)| name == key)
+                    || *key == sweep::MARKER_ENV,
                 "{key} is neither shared nor launchd tuning: {keys:?}"
             );
         }
@@ -499,6 +720,14 @@ mod tests {
             );
         }
         assert!(xml.contains("<string>-u</string><string>RSI_SESSION_TOKEN</string>"));
+        assert!(xml.contains(&xml_string(test_containment::SANDBOX_EXEC)));
+        // The sandbox is the payload prefix; the custody/watchdog shell is
+        // outside it. Installing a build keeps the original payload argv.
+        spec.kind = super::super::JobKind::Build;
+        assert!(
+            plist(&spec, "user/501/rsi-job-example")
+                .contains("<string>/bin/echo</string><string>literal &amp;")
+        );
         assert!(wrapper().contains("exec /bin/launchctl bootout \"$target\""));
     }
 }
